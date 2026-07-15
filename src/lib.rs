@@ -1,5 +1,6 @@
 //! Foundation types and durable storage for the pufferclone v0 engine.
 
+pub mod segment;
 pub mod store;
 pub mod types;
 pub mod wal;

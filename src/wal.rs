@@ -43,6 +43,15 @@ pub struct SegmentMeta {
     pub id: String,
     /// The number of documents represented by the segment.
     pub doc_count: usize,
+    /// The first WAL sequence included in the segment.
+    #[serde(default)]
+    pub first_wal_seq: u64,
+    /// The last WAL sequence included in the segment.
+    #[serde(default)]
+    pub last_wal_seq: u64,
+    /// Names of opaque index sections stored alongside the documents.
+    #[serde(default)]
+    pub sections: Vec<String>,
 }
 
 /// The atomically swapped namespace manifest.
@@ -202,6 +211,9 @@ mod tests {
             segments: vec![SegmentMeta {
                 id: "segment-1".to_owned(),
                 doc_count: 10,
+                first_wal_seq: 0,
+                last_wal_seq: 0,
+                sections: Vec::new(),
             }],
             last_wal_seq: 4,
         };
