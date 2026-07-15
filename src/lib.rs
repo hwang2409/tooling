@@ -6,6 +6,7 @@ pub mod index;
 pub mod namespace;
 pub mod segment;
 pub mod store;
+pub mod store_s3;
 pub mod types;
 pub mod wal;
 

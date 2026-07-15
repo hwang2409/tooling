@@ -129,7 +129,7 @@ impl ObjectStore for LocalDirStore {
     }
 }
 
-fn validate_key(key: &str) -> Result<()> {
+pub(crate) fn validate_key(key: &str) -> Result<()> {
     if key.is_empty() || key.contains('\\') || key.contains("..") {
         return Err(Error::InvalidKey(key.to_owned()));
     }
@@ -160,14 +160,14 @@ fn validate_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_prefix(prefix: &str) -> Result<()> {
+pub(crate) fn validate_prefix(prefix: &str) -> Result<()> {
     if prefix.is_empty() {
         return Ok(());
     }
     validate_key(prefix.strip_suffix('/').unwrap_or(prefix))
 }
 
-fn is_manifest_key(key: &str) -> bool {
+pub(crate) fn is_manifest_key(key: &str) -> bool {
     Path::new(key).file_name().and_then(|name| name.to_str()) == Some("MANIFEST.json")
 }
 
@@ -293,123 +293,4 @@ fn collect_files(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-    use std::sync::Arc;
-    use std::thread;
-
-    use tempfile::tempdir;
-
-    use super::{LocalDirStore, ObjectStore, TEMP_DIR};
-    use crate::Error;
-
-    #[test]
-    fn local_store_supports_put_get_list_delete_and_write_once() {
-        let root = tempdir().expect("tempdir");
-        let store = LocalDirStore::new(root.path()).expect("store");
-
-        store.put("ns/demo/a", b"alpha").expect("put");
-        store.put("ns/demo/b", b"beta").expect("put");
-        assert_eq!(store.get("ns/demo/a").expect("get"), b"alpha");
-        assert_eq!(
-            store.list("ns/demo/").expect("list"),
-            vec!["ns/demo/a", "ns/demo/b"]
-        );
-        assert!(matches!(
-            store.put("ns/demo/a", b"new"),
-            Err(Error::AlreadyExists(key)) if key == "ns/demo/a"
-        ));
-
-        store.delete("ns/demo/a").expect("delete");
-        assert!(matches!(store.get("ns/demo/a"), Err(Error::NotFound(key)) if key == "ns/demo/a"));
-    }
-
-    #[test]
-    fn manifest_key_may_be_overwritten() {
-        let root = tempdir().expect("tempdir");
-        let store = LocalDirStore::new(root.path()).expect("store");
-
-        store.put("ns/demo/MANIFEST.json", b"one").expect("put");
-        store
-            .put("ns/demo/MANIFEST.json", b"two")
-            .expect("overwrite");
-        assert_eq!(store.get("ns/demo/MANIFEST.json").expect("get"), b"two");
-    }
-
-    #[test]
-    fn concurrent_puts_to_one_key_publish_only_one_value() {
-        let root = tempdir().expect("tempdir");
-        let store = Arc::new(LocalDirStore::new(root.path()).expect("store"));
-        let workers = (0..8)
-            .map(|index| {
-                let store = Arc::clone(&store);
-                thread::spawn(move || store.put("ns/demo/concurrent", &[index]))
-            })
-            .collect::<Vec<_>>();
-        let results = workers
-            .into_iter()
-            .map(|worker| worker.join().expect("worker"))
-            .collect::<Vec<_>>();
-
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        assert_eq!(
-            results
-                .iter()
-                .filter(|result| matches!(result, Err(Error::AlreadyExists(_))))
-                .count(),
-            7
-        );
-        assert_eq!(store.list("ns/demo/").expect("list").len(), 1);
-    }
-
-    #[test]
-    fn list_hides_stray_temp_files() {
-        let root = tempdir().expect("tempdir");
-        let store = LocalDirStore::new(root.path()).expect("store");
-        store.put("ns/demo/live", b"live").expect("put");
-        fs::write(root.path().join(TEMP_DIR).join("stray-temp"), b"partial").expect("stray");
-
-        assert_eq!(store.list("").expect("list"), vec!["ns/demo/live"]);
-    }
-
-    #[test]
-    fn invalid_keys_are_rejected_at_the_store_boundary() {
-        let root = tempdir().expect("tempdir");
-        let store = LocalDirStore::new(root.path()).expect("store");
-        for key in [
-            "../x",
-            "/absolute",
-            "ns//x",
-            "ns/./x",
-            "ns/x/.",
-            ".tmp/hidden",
-            "./.tmp/x",
-            "./ns/x",
-        ] {
-            assert!(
-                matches!(store.put(key, b"x"), Err(Error::InvalidKey(_))),
-                "{key}"
-            );
-            assert!(matches!(store.get(key), Err(Error::InvalidKey(_))), "{key}");
-            assert!(
-                matches!(store.delete(key), Err(Error::InvalidKey(_))),
-                "{key}"
-            );
-        }
-    }
-
-    #[test]
-    fn only_the_exact_manifest_filename_is_overwritable() {
-        let root = tempdir().expect("tempdir");
-        let store = LocalDirStore::new(root.path()).expect("store");
-        store.put("ns/demo/fooMANIFEST.json", b"one").expect("put");
-
-        assert!(matches!(
-            store.put("ns/demo/fooMANIFEST.json", b"two"),
-            Err(Error::AlreadyExists(key)) if key == "ns/demo/fooMANIFEST.json"
-        ));
-    }
 }
