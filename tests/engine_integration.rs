@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{mpsc, Arc, Barrier, Mutex as StdMutex};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -63,11 +63,47 @@ struct FailWalDeleteStore {
     fail_once: AtomicBool,
 }
 
+struct FailSegmentDeleteStore {
+    inner: LocalDirStore,
+    fail_next: AtomicBool,
+}
+
+struct BlockingCompactionStore {
+    inner: LocalDirStore,
+    block_next: AtomicBool,
+    started: StdMutex<Option<mpsc::Sender<()>>>,
+    release: StdMutex<mpsc::Receiver<()>>,
+}
+
 impl FailWalDeleteStore {
     fn new(dir: &TempDir) -> Self {
         Self {
             inner: LocalDirStore::new(dir.path()).expect("store"),
             fail_once: AtomicBool::new(true),
+        }
+    }
+}
+
+impl FailSegmentDeleteStore {
+    fn new(dir: &TempDir) -> Self {
+        Self {
+            inner: LocalDirStore::new(dir.path()).expect("store"),
+            fail_next: AtomicBool::new(false),
+        }
+    }
+
+    fn fail_next_delete(&self) {
+        self.fail_next.store(true, Ordering::Release);
+    }
+}
+
+impl BlockingCompactionStore {
+    fn new(dir: &TempDir, started: mpsc::Sender<()>, release: mpsc::Receiver<()>) -> Self {
+        Self {
+            inner: LocalDirStore::new(dir.path()).expect("store"),
+            block_next: AtomicBool::new(false),
+            started: StdMutex::new(Some(started)),
+            release: StdMutex::new(release),
         }
     }
 }
@@ -89,6 +125,62 @@ impl ObjectStore for FailWalDeleteStore {
         if key.ends_with(".wal") && self.fail_once.swap(false, Ordering::AcqRel) {
             return Err(Error::Store("injected WAL retirement failure".to_owned()));
         }
+        self.inner.delete(key)
+    }
+}
+
+impl ObjectStore for FailSegmentDeleteStore {
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.put(key, bytes)
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>> {
+        self.inner.get(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        if key.contains("/segments/") && self.fail_next.swap(false, Ordering::AcqRel) {
+            return Err(Error::Store("injected segment deletion failure".to_owned()));
+        }
+        self.inner.delete(key)
+    }
+}
+
+impl ObjectStore for BlockingCompactionStore {
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        if key.contains("/segments/compact-")
+            && key.ends_with("/docs.bin")
+            && self.block_next.swap(false, Ordering::AcqRel)
+        {
+            self.started
+                .lock()
+                .expect("started lock")
+                .take()
+                .expect("started sender")
+                .send(())
+                .expect("started receiver");
+            self.release
+                .lock()
+                .expect("release lock")
+                .recv()
+                .expect("release sender");
+        }
+        self.inner.put(key, bytes)
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>> {
+        self.inner.get(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
         self.inner.delete(key)
     }
 }
@@ -329,6 +421,328 @@ async fn namespace_hnsw_path_retains_recall_after_flush() {
         .collect::<HashSet<_>>();
     let hits = expected_ids.intersection(&actual_ids).count();
     assert!(hits as f32 / expected_ids.len() as f32 >= 0.9);
+}
+
+#[tokio::test]
+async fn compaction_merges_newest_wins_deletes_and_indexes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = open_engine(&dir);
+    engine
+        .upsert(
+            "compact",
+            vec![
+                doc("a", &[1.0, 0.0], "old shared", "keep"),
+                doc("b", &[0.0, 1.0], "deleted shared", "drop"),
+            ],
+            Vec::new(),
+            BTreeMap::from([("text".to_owned(), true)]),
+        )
+        .await
+        .expect("first upsert");
+    engine.force_flush("compact").await.expect("first flush");
+    engine
+        .upsert(
+            "compact",
+            vec![doc("a", &[0.0, 1.0], "new shared", "keep")],
+            vec!["b".to_owned()],
+            BTreeMap::new(),
+        )
+        .await
+        .expect("second upsert");
+
+    let before = engine
+        .query(
+            "compact",
+            &Query {
+                text: Some("new".to_owned()),
+                filter: Some(Filter::Eq {
+                    field: "category".to_owned(),
+                    value: AttrValue::String("keep".to_owned()),
+                }),
+                top_k: 10,
+                include_attributes: true,
+                vector: None,
+            },
+        )
+        .await
+        .expect("query before compaction");
+    engine
+        .force_flush("compact")
+        .await
+        .expect("compacting flush");
+    let after = engine
+        .query(
+            "compact",
+            &Query {
+                text: Some("new".to_owned()),
+                filter: Some(Filter::Eq {
+                    field: "category".to_owned(),
+                    value: AttrValue::String("keep".to_owned()),
+                }),
+                top_k: 10,
+                include_attributes: true,
+                vector: None,
+            },
+        )
+        .await
+        .expect("query after compaction");
+    assert_eq!(after, before);
+    assert_eq!(after[0].id, "a");
+    assert_eq!(
+        after[0].attributes.as_ref().expect("attributes")["text"],
+        AttrValue::String("new shared".to_owned())
+    );
+    let vector_results = engine
+        .query("compact", &vector_query(&[1.0, 0.0]))
+        .await
+        .expect("deleted vector query");
+    assert_eq!(vector_results.len(), 1);
+    assert_eq!(vector_results[0].id, "a");
+
+    let store = LocalDirStore::new(dir.path()).expect("store");
+    let manifest = Manifest::load(&store, "compact").expect("manifest");
+    assert_eq!(manifest.segments.len(), 1);
+    let reader = SegmentReader::open(&store, "compact", &manifest.segments[0].id)
+        .expect("compacted segment");
+    assert_eq!(
+        reader
+            .documents()
+            .map(|doc| doc.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a"]
+    );
+    for section in ["vectors", "text", "tombstones"] {
+        reader
+            .section_bytes(section)
+            .expect("valid section checksum");
+    }
+    assert!(reader.section_bytes("hnsw").is_err());
+    drop(engine);
+    let cold = open_engine(&dir);
+    let cold_new = cold
+        .query("compact", &text_query("new"))
+        .await
+        .expect("cold newest query");
+    assert_eq!(cold_new.len(), 1);
+    assert_eq!(cold_new[0].id, "a");
+    assert!(cold
+        .query("compact", &text_query("deleted"))
+        .await
+        .expect("cold deleted query")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn four_segment_trigger_compacts_and_reopens_equivalently() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = open_engine(&dir);
+    for batch in 0..3 {
+        let documents = (0..64)
+            .map(|offset| {
+                let index = batch * 64 + offset;
+                doc(
+                    &format!("doc-{index:03}"),
+                    &[1.0, 0.0],
+                    "common term",
+                    if index % 2 == 0 { "keep" } else { "drop" },
+                )
+            })
+            .collect();
+        engine
+            .upsert(
+                "four",
+                documents,
+                Vec::new(),
+                BTreeMap::from([("text".to_owned(), true)]),
+            )
+            .await
+            .expect("upsert");
+        engine.force_flush("four").await.expect("flush");
+    }
+
+    engine
+        .upsert(
+            "four",
+            (0..64)
+                .map(|offset| {
+                    let index = 192 + offset;
+                    doc(
+                        &format!("doc-{index:03}"),
+                        &[1.0, 0.0],
+                        "common term",
+                        if index % 2 == 0 { "keep" } else { "drop" },
+                    )
+                })
+                .collect(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("fourth segment upsert");
+    let before = engine
+        .query(
+            "four",
+            &Query {
+                vector: Some(vec![1.0, 0.0]),
+                text: Some("common".to_owned()),
+                filter: Some(Filter::Eq {
+                    field: "category".to_owned(),
+                    value: AttrValue::String("keep".to_owned()),
+                }),
+                top_k: 10,
+                include_attributes: false,
+            },
+        )
+        .await
+        .expect("query before compaction");
+    engine.force_flush("four").await.expect("compaction");
+    let after = engine
+        .query(
+            "four",
+            &Query {
+                vector: Some(vec![1.0, 0.0]),
+                text: Some("common".to_owned()),
+                filter: Some(Filter::Eq {
+                    field: "category".to_owned(),
+                    value: AttrValue::String("keep".to_owned()),
+                }),
+                top_k: 10,
+                include_attributes: false,
+            },
+        )
+        .await
+        .expect("query after compaction");
+    assert_eq!(after, before);
+
+    let store = LocalDirStore::new(dir.path()).expect("store");
+    assert_eq!(
+        Manifest::load(&store, "four")
+            .expect("manifest")
+            .segments
+            .len(),
+        1
+    );
+    drop(engine);
+    let cold = open_engine(&dir);
+    assert_eq!(
+        cold.query("four", &text_query("common"))
+            .await
+            .expect("cold query")
+            .len(),
+        10
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_queries_continue_during_compaction_build() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let store = Arc::new(BlockingCompactionStore::new(&dir, started_tx, release_rx));
+    let engine = Arc::new(Engine::with_store(Arc::clone(&store)));
+    for index in 0..3 {
+        engine
+            .upsert(
+                "concurrent",
+                vec![doc(
+                    &format!("doc-{index}"),
+                    &[1.0, 0.0],
+                    "concurrent merge",
+                    "keep",
+                )],
+                Vec::new(),
+                BTreeMap::from([("text".to_owned(), true)]),
+            )
+            .await
+            .expect("upsert");
+        engine.force_flush("concurrent").await.expect("flush");
+    }
+    engine
+        .upsert(
+            "concurrent",
+            vec![doc("doc-3", &[1.0, 0.0], "concurrent merge", "keep")],
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("fourth upsert");
+    store.block_next.store(true, Ordering::Release);
+
+    let flush_engine = Arc::clone(&engine);
+    let flush = tokio::spawn(async move { flush_engine.force_flush("concurrent").await });
+    tokio::task::spawn_blocking(move || started_rx.recv().expect("compaction started"))
+        .await
+        .expect("started task");
+
+    let mut queries = Vec::new();
+    for _ in 0..16 {
+        let query_engine = Arc::clone(&engine);
+        queries.push(tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                query_engine.query("concurrent", &text_query("concurrent")),
+            )
+            .await
+            .expect("query completed during compaction")
+            .expect("query");
+        }));
+    }
+    for query in queries {
+        query.await.expect("query task");
+    }
+    release_tx.send(()).expect("release compaction");
+    flush.await.expect("flush task").expect("compaction");
+}
+
+#[tokio::test]
+async fn compaction_orphan_cleanup_repairs_failed_input_deletes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(FailSegmentDeleteStore::new(&dir));
+    let engine = Engine::with_store(Arc::clone(&store));
+    for index in 0..3 {
+        engine
+            .upsert(
+                "orphans",
+                vec![doc(
+                    &format!("doc-{index}"),
+                    &[1.0, index as f32 + 1.0],
+                    "orphan test",
+                    "keep",
+                )],
+                Vec::new(),
+                BTreeMap::from([("text".to_owned(), true)]),
+            )
+            .await
+            .expect("upsert");
+        engine.force_flush("orphans").await.expect("flush");
+    }
+    store.fail_next_delete();
+    engine
+        .upsert(
+            "orphans",
+            vec![doc("doc-3", &[1.0, 4.0], "orphan test", "keep")],
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("fourth upsert");
+    assert!(engine.force_flush("orphans").await.is_err());
+    drop(engine);
+
+    let reopened = Engine::with_store(Arc::clone(&store));
+    let results = reopened
+        .query("orphans", &text_query("orphan"))
+        .await
+        .expect("reopen query");
+    assert_eq!(results.len(), 4);
+    let manifest = Manifest::load(store.as_ref(), "orphans").expect("manifest");
+    let keys = store.list("ns/orphans/segments/").expect("segments");
+    assert!(keys.iter().all(|key| {
+        manifest
+            .segments
+            .iter()
+            .any(|segment| key.contains(&format!("/{}/", segment.id)))
+    }));
 }
 
 #[tokio::test]

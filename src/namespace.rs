@@ -11,7 +11,9 @@ use crate::index::hnsw::Hnsw;
 use crate::index::text::{TextIndex, TextStats};
 use crate::index::vector::ExactScan;
 use crate::index::{rrf_default, sort_scores};
-use crate::segment::{SegmentBuilder, SegmentReader};
+use crate::segment::{
+    list_namespace_segment_objects, list_segment_objects, SegmentBuilder, SegmentReader,
+};
 use crate::store::ObjectStore;
 use crate::wal::{wal_key, Manifest, SegmentMeta, WalBatch};
 use crate::{AttrValue, Doc, Error, Result};
@@ -68,6 +70,13 @@ struct LoadedSegment {
     text: TextIndex,
     indexed_fields: Vec<String>,
     tombstones: BTreeMap<String, u64>,
+}
+
+pub(crate) struct CompactionPlan {
+    candidate: Manifest,
+    output: LoadedSegment,
+    input_objects: Vec<String>,
+    selected: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +140,7 @@ impl Namespace {
     pub fn open(store: SharedStore, name: impl Into<String>) -> Result<Self> {
         let name = validate_namespace(name.into())?;
         let manifest = Manifest::load(store.as_ref(), &name)?;
+        cleanup_orphan_segments(store.as_ref(), &name, &manifest)?;
         let mut segments = Vec::with_capacity(manifest.segments.len());
         let mut tombstones: BTreeMap<String, u64> = BTreeMap::new();
         for meta in &manifest.segments {
@@ -237,7 +247,8 @@ impl Namespace {
     /// Force a synchronous segment build. This is primarily useful to tests
     /// and operational callers that need a durable segment immediately.
     pub fn force_flush(&mut self) -> Result<()> {
-        self.flush_inner()
+        self.flush_inner()?;
+        self.compact_if_needed()
     }
 
     /// Return the most recent background flush error, if any. A subsequent
@@ -462,6 +473,201 @@ impl Namespace {
         Ok(())
     }
 
+    /// Run the intentionally simple v1 compaction policy. Once a trigger
+    /// fires, every segment participates in one full merge. Leveled and
+    /// tiered policies are future work.
+    fn compact_if_needed(&mut self) -> Result<()> {
+        let Some(plan) = self.prepare_compaction()? else {
+            return Ok(());
+        };
+        let input_objects = self.publish_compaction(plan)?;
+        if let Err(error) = self.finish_compaction(&input_objects) {
+            self.last_flush_error = Some(error.to_string());
+            return Err(error);
+        }
+        self.last_flush_error = None;
+        Ok(())
+    }
+
+    pub(crate) fn flush_only(&mut self) -> Result<()> {
+        self.flush_inner()
+    }
+
+    /// Build and validate the replacement segment without taking the
+    /// namespace write lock. The caller publishes the returned plan under a
+    /// short write section after all merge I/O has completed.
+    pub(crate) fn prepare_compaction(&self) -> Result<Option<CompactionPlan>> {
+        let Some(selected) = self.compaction_selection() else {
+            return Ok(None);
+        };
+
+        // Compaction is invoked after flush. Keep this guard so a future
+        // caller cannot publish a compacted manifest while a WAL tail is
+        // still represented only by the memtable.
+        if !self.memtable.is_empty() {
+            return Ok(None);
+        }
+
+        let logical = self.logical_documents();
+        if logical
+            .values()
+            .any(|(_, source)| matches!(source, Source::Memtable))
+        {
+            return Ok(None);
+        }
+
+        let input_metas = selected
+            .iter()
+            .map(|&index| self.segments[index].meta.clone())
+            .collect::<Vec<_>>();
+        let input_objects = input_metas
+            .iter()
+            .try_fold(Vec::new(), |mut objects, meta| {
+                let keys = list_segment_objects(self.store.as_ref(), &self.name, &meta.id)
+                    .map_err(|error| Error::Store(error.to_string()))?;
+                objects.extend(keys);
+                Ok::<_, Error>(objects)
+            })?;
+        let first_wal_seq = input_metas
+            .iter()
+            .map(|meta| meta.first_wal_seq)
+            .min()
+            .expect("compaction selection is non-empty");
+        let last_wal_seq = input_metas
+            .iter()
+            .map(|meta| meta.last_wal_seq)
+            .max()
+            .expect("compaction selection is non-empty");
+        let docs = logical
+            .into_values()
+            .map(|(doc, _)| doc)
+            .collect::<Vec<_>>();
+        let vectors = ExactScan::build(docs.iter().filter_map(|doc| {
+            doc.vector
+                .as_ref()
+                .map(|vector| (doc.id.clone(), vector.clone()))
+        }));
+        let text = build_text_index(&docs, &self.manifest.full_text_fields);
+        let tombstone_bytes = bincode::serialize(&BTreeMap::<String, u64>::new())?;
+        let mut sections = vec![
+            ("vectors", vectors.to_bytes()?),
+            ("text", text.to_bytes()?),
+            ("tombstones", tombstone_bytes),
+        ];
+        if docs.len() >= HNSW_MIN_DOCS {
+            let hnsw = Hnsw::build(docs.iter().filter_map(|doc| {
+                doc.vector
+                    .as_ref()
+                    .map(|vector| (doc.id.clone(), vector.clone()))
+            }));
+            sections.push(("hnsw", hnsw.to_bytes()?));
+        }
+
+        let segment_id = format!(
+            "compact-{first_wal_seq}-{last_wal_seq}-{}-{}",
+            std::process::id(),
+            SEGMENT_ATTEMPT.fetch_add(1, Ordering::Relaxed)
+        );
+        let output_meta = SegmentBuilder::new(
+            self.store.as_ref(),
+            &self.name,
+            (first_wal_seq, last_wal_seq),
+        )
+        .with_id(segment_id)
+        .build_allow_empty(docs, sections)
+        .map_err(|error| Error::Store(error.to_string()))?;
+        let output = load_segment(
+            self.store.as_ref(),
+            &self.name,
+            &output_meta,
+            &self.manifest.full_text_fields,
+        )?;
+
+        let selected_set = selected.iter().copied().collect::<HashSet<_>>();
+        let first_selected = selected[0];
+        let mut candidate = self.manifest.clone();
+        candidate.segments.clear();
+        for (index, meta) in self.manifest.segments.iter().enumerate() {
+            if index == first_selected {
+                candidate.segments.push(output_meta.clone());
+            }
+            if !selected_set.contains(&index) {
+                candidate.segments.push(meta.clone());
+            }
+        }
+        // The output covers exactly the sequence range of the replaced
+        // segments; the namespace's WAL high-water mark is unchanged.
+        candidate.last_wal_seq = self.manifest.last_wal_seq;
+        Ok(Some(CompactionPlan {
+            candidate,
+            output,
+            input_objects,
+            selected,
+        }))
+    }
+
+    /// Publish a validated compaction plan and return the old objects for
+    /// deletion. Manifest publication is the commit point; no in-memory state
+    /// changes before it succeeds.
+    pub(crate) fn publish_compaction(&mut self, plan: CompactionPlan) -> Result<Vec<String>> {
+        let CompactionPlan {
+            candidate,
+            output,
+            input_objects,
+            selected,
+        } = plan;
+        candidate.store(self.store.as_ref(), &self.name)?;
+
+        let selected_set = selected.iter().copied().collect::<HashSet<_>>();
+        let first_selected = selected[0];
+        let old_segments = std::mem::take(&mut self.segments);
+        let mut output = Some(output);
+        let mut next_segments = Vec::with_capacity(candidate.segments.len());
+        for (index, segment) in old_segments.into_iter().enumerate() {
+            if index == first_selected {
+                next_segments.push(output.take().expect("output inserted once"));
+            }
+            if !selected_set.contains(&index) {
+                next_segments.push(segment);
+            }
+        }
+        self.manifest = candidate;
+        self.segments = next_segments;
+        // All current segments were selected by the full-compaction policy,
+        // so no older object can still resurrect an ID after this swap.
+        self.tombstones.clear();
+        Ok(input_objects)
+    }
+
+    /// Delete input objects after the manifest swap. This method only needs a
+    /// shared namespace reference, so queries can continue while cleanup runs.
+    pub(crate) fn finish_compaction(&self, input_objects: &[String]) -> Result<()> {
+        for key in input_objects {
+            self.store.delete(key)?;
+        }
+        Ok(())
+    }
+
+    fn compaction_selection(&self) -> Option<Vec<usize>> {
+        if self.segments.is_empty() {
+            return None;
+        }
+        let logical = self.logical_documents();
+        let has_stale_segment = self.segments.iter().enumerate().any(|(index, segment)| {
+            let dead_docs = segment
+                .docs
+                .iter()
+                .filter(|doc| {
+                    !logical
+                        .get(&doc.id)
+                        .is_some_and(|(_, source)| *source == Source::Segment(index))
+                })
+                .count();
+            dead_docs > segment.docs.len() / 2
+        });
+        (self.segments.len() >= 4 || has_stale_segment).then(|| (0..self.segments.len()).collect())
+    }
+
     fn retry_wal_retirement(&mut self) -> Result<()> {
         let Some(through) = self.pending_retire_through else {
             return Ok(());
@@ -636,6 +842,33 @@ fn load_segment(
         indexed_fields: fields.to_vec(),
         tombstones,
     })
+}
+
+fn cleanup_orphan_segments(
+    store: &dyn ObjectStore,
+    namespace: &str,
+    manifest: &Manifest,
+) -> Result<()> {
+    let referenced = manifest
+        .segments
+        .iter()
+        .map(|segment| segment.id.as_str())
+        .collect::<HashSet<_>>();
+    let keys = list_namespace_segment_objects(store, namespace)
+        .map_err(|error| Error::Store(error.to_string()))?;
+    let prefix = format!("ns/{namespace}/segments/");
+    for key in keys {
+        let Some(segment_id) = key
+            .strip_prefix(&prefix)
+            .and_then(|suffix| suffix.split('/').next())
+        else {
+            continue;
+        };
+        if !referenced.contains(segment_id) {
+            store.delete(&key)?;
+        }
+    }
+    Ok(())
 }
 
 fn build_text_index(docs: &[Doc], fields: &[String]) -> TextIndex {

@@ -8,6 +8,11 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::sync::{watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
 
+#[cfg(test)]
+use std::sync::OnceLock;
+#[cfg(test)]
+use tokio::sync::Notify;
+
 use crate::namespace::{Namespace, Query, QueryResult, Schema, SharedStore, WriteSummary};
 use crate::store::{LocalDirStore, ObjectStore};
 use crate::{Error, Result};
@@ -27,6 +32,16 @@ struct NamespaceEntry {
     closing: AtomicBool,
     worker: StdMutex<Option<Worker>>,
 }
+
+#[cfg(test)]
+struct WorkerRaceHook {
+    before_operation: Notify,
+    release_before_operation: Notify,
+    shutdown_operation_acquired: Notify,
+}
+
+#[cfg(test)]
+static WORKER_RACE_HOOK: OnceLock<Arc<WorkerRaceHook>> = OnceLock::new();
 
 struct Registry {
     entries: HashMap<String, Arc<NamespaceEntry>>,
@@ -116,22 +131,16 @@ impl Engine {
         ef_search: usize,
     ) -> Result<Vec<QueryResult>> {
         let entry = self.get_or_open(namespace).await?;
-        let _operation = entry.operation.lock().await;
+        let loaded = entry.namespace.read().await;
         ensure_open(&entry, namespace)?;
-        let result = entry
-            .namespace
-            .read()
-            .await
-            .query_with_ef_search(query, ef_search);
-        result
+        loaded.query_with_ef_search(query, ef_search)
     }
 
     pub async fn force_flush(&self, namespace: &str) -> Result<()> {
         let entry = self.get_or_open(namespace).await?;
         let _operation = entry.operation.lock().await;
         ensure_open(&entry, namespace)?;
-        let result = entry.namespace.write().await.force_flush();
-        result
+        flush_and_compact(&entry).await
     }
 
     /// Inspect the most recent background flush failure for a loaded
@@ -208,6 +217,10 @@ impl Engine {
         if let Some(entry) = registry.entries.remove(&namespace) {
             entry.closing.store(true, Ordering::Release);
             let _operation = entry.operation.lock().await;
+            #[cfg(test)]
+            if let Some(hook) = WORKER_RACE_HOOK.get() {
+                hook.shutdown_operation_acquired.notify_one();
+            }
             entry.stop_worker().await;
             registry.lru.retain(|candidate| candidate != &namespace);
         }
@@ -287,6 +300,36 @@ impl Engine {
     }
 }
 
+async fn flush_and_compact(entry: &Arc<NamespaceEntry>) -> Result<()> {
+    {
+        let mut namespace = entry.namespace.write().await;
+        namespace.flush_only()?
+    }
+
+    let plan = {
+        let namespace = entry.namespace.read().await;
+        namespace.prepare_compaction()?
+    };
+    let Some(plan) = plan else {
+        return Ok(());
+    };
+
+    let input_objects = {
+        let mut namespace = entry.namespace.write().await;
+        namespace.publish_compaction(plan)?
+    };
+    let cleanup_result = {
+        let namespace = entry.namespace.read().await;
+        namespace.finish_compaction(&input_objects)
+    };
+    if let Err(error) = cleanup_result {
+        let mut namespace = entry.namespace.write().await;
+        namespace.record_flush_error(&error);
+        return Err(error);
+    }
+    Ok(())
+}
+
 impl NamespaceEntry {
     fn start_worker(self: &Arc<Self>) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -321,9 +364,29 @@ impl NamespaceEntry {
                 if entry.closing.load(Ordering::Acquire) {
                     break;
                 }
-                let mut namespace = entry.namespace.write().await;
-                if namespace.should_flush() {
-                    if let Err(error) = namespace.force_flush() {
+                let should_flush = entry.namespace.read().await.should_flush();
+                if should_flush {
+                    #[cfg(test)]
+                    if let Some(hook) = WORKER_RACE_HOOK.get() {
+                        hook.before_operation.notify_one();
+                        hook.release_before_operation.notified().await;
+                    }
+                    // Shutdown acquires this mutex before joining the worker;
+                    // cancellation must win if the worker is queued here.
+                    let _operation = tokio::select! {
+                        operation = entry.operation.lock() => operation,
+                        changed = cancelled.changed() => {
+                            if changed.is_err() || *cancelled.borrow() {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    if entry.closing.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if let Err(error) = flush_and_compact(&entry).await {
+                        let mut namespace = entry.namespace.write().await;
                         namespace.record_flush_error(&error);
                         eprintln!(
                             "namespace {} background flush failed: {error}",
@@ -379,4 +442,53 @@ fn validate_name(name: &str) -> Result<String> {
         return Err(Error::InvalidKey(format!("invalid namespace: {name}")));
     }
     Ok(name.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use tempfile::tempdir;
+
+    use super::{Engine, WorkerRaceHook, WORKER_RACE_HOOK};
+    use crate::Doc;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_cancels_worker_waiting_for_operation_lock() {
+        let hook = std::sync::Arc::new(WorkerRaceHook {
+            before_operation: tokio::sync::Notify::new(),
+            release_before_operation: tokio::sync::Notify::new(),
+            shutdown_operation_acquired: tokio::sync::Notify::new(),
+        });
+        assert!(WORKER_RACE_HOOK.set(std::sync::Arc::clone(&hook)).is_ok());
+
+        let root = tempdir().expect("tempdir");
+        let engine = std::sync::Arc::new(Engine::new(root.path()).expect("engine"));
+        let documents = (0..1_000)
+            .map(|index| Doc {
+                id: format!("doc-{index}"),
+                vector: None,
+                attributes: BTreeMap::new(),
+            })
+            .collect();
+        engine
+            .upsert("race", documents, Vec::new(), BTreeMap::new())
+            .await
+            .expect("upsert");
+
+        // The worker has passed its closing check and is paused immediately
+        // before waiting for the operation mutex.
+        hook.before_operation.notified().await;
+        let evict_engine = std::sync::Arc::clone(&engine);
+        let evict = tokio::spawn(async move { evict_engine.evict("race").await });
+        hook.shutdown_operation_acquired.notified().await;
+        hook.release_before_operation.notify_one();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), evict)
+            .await
+            .expect("eviction did not deadlock")
+            .expect("eviction task panicked");
+        assert!(result.is_ok(), "eviction failed: {result:?}");
+    }
 }

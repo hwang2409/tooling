@@ -478,6 +478,27 @@ fn segment_prefix(namespace: &str, segment_id: &str) -> String {
     format!("ns/{namespace}/segments/{segment_id}")
 }
 
+/// List every object belonging to one segment.
+pub(crate) fn list_segment_objects(
+    store: &dyn ObjectStore,
+    namespace: &str,
+    segment_id: &str,
+) -> Result<Vec<String>> {
+    store
+        .list(&format!("{}/", segment_prefix(namespace, segment_id)))
+        .map_err(SegmentError::Store)
+}
+
+/// List every object below a namespace's segment prefix.
+pub(crate) fn list_namespace_segment_objects(
+    store: &dyn ObjectStore,
+    namespace: &str,
+) -> Result<Vec<String>> {
+    store
+        .list(&format!("ns/{namespace}/segments/"))
+        .map_err(SegmentError::Store)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
