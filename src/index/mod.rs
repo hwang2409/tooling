@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod filter;
+pub mod hnsw;
 pub mod text;
 pub mod vector;
 

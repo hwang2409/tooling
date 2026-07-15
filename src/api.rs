@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use crate::engine::Engine;
 use crate::index::filter::Filter;
-use crate::namespace::{Query, QueryResult};
+use crate::namespace::{Query, QueryResult, DEFAULT_EF_SEARCH, MAX_EF_SEARCH};
 use crate::{AttrValue, Doc, Error, Result};
 
 /// Build the application router for an engine.
@@ -63,6 +63,8 @@ pub struct QueryRequest {
     top_k: Option<usize>,
     #[serde(default)]
     include_attributes: bool,
+    #[serde(default)]
+    ef_search: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -142,6 +144,10 @@ async fn query(
     let top_k = request
         .top_k
         .ok_or_else(|| Error::Validation("top_k is required".to_owned()))?;
+    if top_k > MAX_EF_SEARCH {
+        return Err(Error::Validation(format!("top_k must not exceed {MAX_EF_SEARCH}")).into());
+    }
+    let ef_search = request.ef_search.unwrap_or(DEFAULT_EF_SEARCH);
     let query = Query {
         vector: request.vector,
         text: request.text,
@@ -149,7 +155,9 @@ async fn query(
         top_k,
         include_attributes: request.include_attributes,
     };
-    let results = engine.query(&namespace, &query).await?;
+    let results = engine
+        .query_with_ef_search(&namespace, &query, ef_search)
+        .await?;
     Ok(Json(QueryResponse {
         results: results.into_iter().map(api_result).collect(),
     }))

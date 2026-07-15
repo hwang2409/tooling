@@ -131,7 +131,7 @@ impl VectorIndex for ExactScan {
     }
 }
 
-fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
+pub(crate) fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
     let mut dot = 0.0f64;
     let mut left_norm = 0.0f64;
     let mut right_norm = 0.0f64;

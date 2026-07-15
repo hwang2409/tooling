@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 
 use crate::index::filter::Filter;
+use crate::index::hnsw::Hnsw;
 use crate::index::text::{TextIndex, TextStats};
 use crate::index::vector::ExactScan;
 use crate::index::{rrf_default, sort_scores};
@@ -17,6 +18,9 @@ use crate::{AttrValue, Doc, Error, Result};
 
 const DOC_FLUSH_THRESHOLD: usize = 1_000;
 const WAL_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
+const HNSW_MIN_DOCS: usize = 256;
+pub const DEFAULT_EF_SEARCH: usize = 64;
+pub const MAX_EF_SEARCH: usize = 512;
 static SEGMENT_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 
 /// A store handle shared by the engine and its namespaces.
@@ -60,6 +64,7 @@ struct LoadedSegment {
     meta: SegmentMeta,
     docs: Vec<Doc>,
     vectors: ExactScan,
+    hnsw: Option<Hnsw>,
     text: TextIndex,
     indexed_fields: Vec<String>,
     tombstones: BTreeMap<String, u64>,
@@ -247,7 +252,18 @@ impl Namespace {
 
     /// Execute a strongly consistent query over segment and memtable state.
     pub fn query(&self, query: &Query) -> Result<Vec<QueryResult>> {
+        self.query_with_ef_search(query, DEFAULT_EF_SEARCH)
+    }
+
+    /// Query with an explicit HNSW traversal breadth. Exact scans and the
+    /// memtable ignore this parameter.
+    pub fn query_with_ef_search(
+        &self,
+        query: &Query,
+        ef_search: usize,
+    ) -> Result<Vec<QueryResult>> {
         validate_query(query, self.manifest.vector_dim)?;
+        let ef_search = clamp_ef_search(ef_search, query.top_k);
         let logical = self.logical_documents();
         let live_ids = logical.keys().cloned().collect::<HashSet<_>>();
         let allowed = logical
@@ -264,7 +280,7 @@ impl Namespace {
         let vector_results = query
             .vector
             .as_deref()
-            .map(|vector| self.vector_search(vector, query.top_k, &allowed, &logical));
+            .map(|vector| self.vector_search(vector, query.top_k, ef_search, &allowed, &logical));
         let text_results = query
             .text
             .as_deref()
@@ -399,6 +415,19 @@ impl Namespace {
         let vector_bytes = vectors.to_bytes()?;
         let text_bytes = text.to_bytes()?;
         let tombstone_bytes = bincode::serialize(&self.tombstones)?;
+        let mut sections = vec![
+            ("vectors", vector_bytes),
+            ("text", text_bytes),
+            ("tombstones", tombstone_bytes),
+        ];
+        if docs.len() >= HNSW_MIN_DOCS {
+            let hnsw = Hnsw::build(docs.iter().filter_map(|doc| {
+                doc.vector
+                    .as_ref()
+                    .map(|vector| (doc.id.clone(), vector.clone()))
+            }));
+            sections.push(("hnsw", hnsw.to_bytes()?));
+        }
         let segment_id = format!(
             "seg-{first_seq}-{last_seq}-{}-{}",
             std::process::id(),
@@ -406,14 +435,7 @@ impl Namespace {
         );
         let meta = SegmentBuilder::new(self.store.as_ref(), &self.name, (first_seq, last_seq))
             .with_id(segment_id)
-            .build_allow_empty(
-                docs,
-                [
-                    ("vectors", vector_bytes),
-                    ("text", text_bytes),
-                    ("tombstones", tombstone_bytes),
-                ],
-            )
+            .build_allow_empty(docs, sections)
             .map_err(|error| Error::Store(error.to_string()))?;
         let loaded = load_segment(
             self.store.as_ref(),
@@ -488,13 +510,18 @@ impl Namespace {
         &self,
         query: &[f32],
         top_k: usize,
+        ef_search: usize,
         allowed: &HashSet<String>,
         logical: &BTreeMap<String, (Doc, Source)>,
     ) -> Vec<(String, f32)> {
         let mut results = Vec::new();
         for (index, segment) in self.segments.iter().enumerate() {
             let ids = source_ids(logical, allowed, Source::Segment(index));
-            results.extend(segment.vectors.search_filtered(query, top_k, Some(&ids)));
+            if let Some(hnsw) = &segment.hnsw {
+                results.extend(hnsw.search_filtered_with_ef(query, top_k, ef_search, Some(&ids)));
+            } else {
+                results.extend(segment.vectors.search_filtered(query, top_k, Some(&ids)));
+            }
         }
         let memtable_index = ExactScan::build(logical.iter().filter_map(|(id, (doc, source))| {
             (*source == Source::Memtable)
@@ -578,6 +605,13 @@ fn load_segment(
         }
         Err(error) => return Err(Error::Store(error.to_string())),
     };
+    let hnsw = match reader.section_bytes("hnsw") {
+        Ok(bytes) => {
+            Some(Hnsw::from_bytes(&bytes).map_err(|error| Error::Store(error.to_string()))?)
+        }
+        Err(crate::segment::SegmentError::SectionNotFound(_)) => None,
+        Err(error) => return Err(Error::Store(error.to_string())),
+    };
     let _persisted_text = match reader.section_bytes("text") {
         Ok(bytes) => {
             TextIndex::from_bytes(&bytes).map_err(|error| Error::Store(error.to_string()))?
@@ -597,6 +631,7 @@ fn load_segment(
         meta: meta.clone(),
         docs,
         vectors,
+        hnsw,
         text,
         indexed_fields: fields.to_vec(),
         tombstones,
@@ -677,6 +712,11 @@ fn validate_query(query: &Query, vector_dim: Option<usize>) -> Result<()> {
             "top_k must be greater than zero".to_owned(),
         ));
     }
+    if query.top_k > MAX_EF_SEARCH {
+        return Err(Error::Validation(format!(
+            "top_k must not exceed {MAX_EF_SEARCH}"
+        )));
+    }
     if let (Some(expected), Some(vector)) = (vector_dim, &query.vector) {
         if vector.len() != expected {
             return Err(Error::Validation(format!(
@@ -695,4 +735,8 @@ fn validate_query(query: &Query, vector_dim: Option<usize>) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn clamp_ef_search(requested: usize, top_k: usize) -> usize {
+    requested.clamp(top_k.max(1), MAX_EF_SEARCH)
 }

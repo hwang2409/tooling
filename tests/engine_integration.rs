@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
@@ -9,8 +9,9 @@ use pufferclone::api::router;
 use pufferclone::engine::Engine;
 use pufferclone::index::filter::Filter;
 use pufferclone::namespace::Query;
+use pufferclone::segment::SegmentReader;
 use pufferclone::store::{LocalDirStore, ObjectStore};
-use pufferclone::{AttrValue, Doc, Error, Result};
+use pufferclone::{AttrValue, Doc, Error, Manifest, Result};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -197,6 +198,137 @@ async fn upsert_query_and_flush_segment_paths_are_consistent() {
             .id,
         "a"
     );
+}
+
+#[tokio::test]
+async fn hnsw_sections_are_thresholded_and_match_exact_results() {
+    let large_dir = tempfile::tempdir().expect("tempdir");
+    let large_engine = open_engine(&large_dir);
+    let large_docs = (0..256)
+        .map(|index| {
+            let angle = index as f32 * 0.01;
+            doc(
+                &format!("doc-{index:03}"),
+                &[angle.cos(), angle.sin()],
+                "value",
+                "code",
+            )
+        })
+        .collect::<Vec<_>>();
+    large_engine
+        .upsert("large", large_docs, Vec::new(), BTreeMap::new())
+        .await
+        .expect("upsert");
+    let expected = large_engine
+        .query("large", &vector_query(&[1.0, 0.0]))
+        .await
+        .expect("memtable query");
+    large_engine.force_flush("large").await.expect("flush");
+    let actual = large_engine
+        .query("large", &vector_query(&[1.0, 0.0]))
+        .await
+        .expect("hnsw query");
+    assert_eq!(actual, expected);
+    drop(large_engine);
+    let large_engine = open_engine(&large_dir);
+    assert_eq!(
+        large_engine
+            .query("large", &vector_query(&[1.0, 0.0]))
+            .await
+            .expect("cold hnsw query"),
+        expected
+    );
+
+    let store = LocalDirStore::new(large_dir.path()).expect("store");
+    let manifest = Manifest::load(&store, "large").expect("manifest");
+    assert_eq!(manifest.segments.len(), 1);
+    assert!(manifest.segments[0]
+        .sections
+        .iter()
+        .any(|name| name == "hnsw"));
+    let reader = SegmentReader::open(&store, "large", &manifest.segments[0].id).expect("segment");
+    assert!(reader.section_bytes("hnsw").is_ok());
+
+    let small_dir = tempfile::tempdir().expect("tempdir");
+    let small_engine = open_engine(&small_dir);
+    let small_docs = (0..255)
+        .map(|index| {
+            let angle = index as f32 * 0.01;
+            doc(
+                &format!("doc-{index:03}"),
+                &[angle.cos(), angle.sin()],
+                "value",
+                "code",
+            )
+        })
+        .collect::<Vec<_>>();
+    small_engine
+        .upsert("small", small_docs, Vec::new(), BTreeMap::new())
+        .await
+        .expect("upsert");
+    let expected = small_engine
+        .query("small", &vector_query(&[1.0, 0.0]))
+        .await
+        .expect("memtable query");
+    small_engine.force_flush("small").await.expect("flush");
+    assert_eq!(
+        small_engine
+            .query("small", &vector_query(&[1.0, 0.0]))
+            .await
+            .expect("exact segment query"),
+        expected
+    );
+    let store = LocalDirStore::new(small_dir.path()).expect("store");
+    let manifest = Manifest::load(&store, "small").expect("manifest");
+    assert!(!manifest.segments[0]
+        .sections
+        .iter()
+        .any(|name| name == "hnsw"));
+}
+
+#[tokio::test]
+async fn namespace_hnsw_path_retains_recall_after_flush() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = open_engine(&dir);
+    let mut state = 0x1234_5678_9abc_def0_u64;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        ((state >> 32) as u32) as f32 / u32::MAX as f32 * 2.0 - 1.0
+    };
+    let documents = (0..256)
+        .map(|index| {
+            let vector = (0..16).map(|_| next()).collect::<Vec<_>>();
+            doc(&format!("doc-{index:03}"), &vector, "value", "code")
+        })
+        .collect::<Vec<_>>();
+    let query = (0..16)
+        .map(|dimension| (dimension as f32 * 0.37).cos())
+        .collect::<Vec<_>>();
+    engine
+        .upsert("recall", documents, Vec::new(), BTreeMap::new())
+        .await
+        .expect("upsert");
+    let expected = engine
+        .query("recall", &vector_query(&query))
+        .await
+        .expect("exact memtable query");
+    engine.force_flush("recall").await.expect("flush");
+    let actual = engine
+        .query("recall", &vector_query(&query))
+        .await
+        .expect("hnsw query");
+    let expected_ids = expected
+        .iter()
+        .map(|result| result.id.clone())
+        .collect::<HashSet<_>>();
+    let actual_ids = actual
+        .iter()
+        .map(|result| result.id.clone())
+        .collect::<HashSet<_>>();
+    let hits = expected_ids.intersection(&actual_ids).count();
+    assert!(hits as f32 / expected_ids.len() as f32 >= 0.9);
 }
 
 #[tokio::test]
@@ -737,6 +869,18 @@ async fn http_upsert_query_and_error_mapping() {
             Request::post("/v1/namespaces/demo/query")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"vector":[1],"top_k":1}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/namespaces/demo/query")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"vector":[1,0],"top_k":513}"#))
                 .expect("request"),
         )
         .await

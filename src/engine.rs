@@ -104,10 +104,25 @@ impl Engine {
     }
 
     pub async fn query(&self, namespace: &str, query: &Query) -> Result<Vec<QueryResult>> {
+        self.query_with_ef_search(namespace, query, crate::namespace::DEFAULT_EF_SEARCH)
+            .await
+    }
+
+    /// Query a namespace with an explicit HNSW traversal breadth.
+    pub async fn query_with_ef_search(
+        &self,
+        namespace: &str,
+        query: &Query,
+        ef_search: usize,
+    ) -> Result<Vec<QueryResult>> {
         let entry = self.get_or_open(namespace).await?;
         let _operation = entry.operation.lock().await;
         ensure_open(&entry, namespace)?;
-        let result = entry.namespace.read().await.query(query);
+        let result = entry
+            .namespace
+            .read()
+            .await
+            .query_with_ef_search(query, ef_search);
         result
     }
 
