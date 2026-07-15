@@ -1,11 +1,16 @@
 //! Foundation types and durable storage for the pufferclone v0 engine.
 
+pub mod api;
+pub mod engine;
 pub mod index;
+pub mod namespace;
 pub mod segment;
 pub mod store;
 pub mod types;
 pub mod wal;
 
+pub use engine::Engine;
+pub use namespace::{Query, QueryResult, WriteSummary};
 pub use types::{AttrValue, Doc};
 pub use wal::{Manifest, SegmentMeta, WalBatch};
 
@@ -42,4 +47,8 @@ pub enum Error {
     /// An internal store invariant or synchronization operation failed.
     #[error("internal store error: {0}")]
     Store(String),
+
+    /// A caller supplied an invalid request.
+    #[error("validation error: {0}")]
+    Validation(String),
 }

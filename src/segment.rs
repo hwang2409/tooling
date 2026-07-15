@@ -101,6 +101,7 @@ pub struct SegmentBuilder<'a> {
     store: &'a dyn ObjectStore,
     namespace: String,
     wal_range: WalSeqRange,
+    custom_id: Option<String>,
 }
 
 impl<'a> SegmentBuilder<'a> {
@@ -113,11 +114,41 @@ impl<'a> SegmentBuilder<'a> {
             store,
             namespace: namespace.into(),
             wal_range: range.into(),
+            custom_id: None,
         }
+    }
+
+    /// Use a caller-generated ID for retryable publication attempts. The
+    /// default remains the stable WAL-range ID for compatibility.
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.custom_id = Some(id.into());
+        self
     }
 
     /// Write the documents and opaque index sections, returning manifest metadata.
     pub fn build<I, S, N, B>(self, docs: I, sections: S) -> Result<SegmentMeta>
+    where
+        I: IntoIterator<Item = Doc>,
+        S: IntoIterator<Item = (N, B)>,
+        N: AsRef<str>,
+        B: AsRef<[u8]>,
+    {
+        self.build_inner(docs, sections, false)
+    }
+
+    /// Build a segment that may contain zero documents, for a tombstone-only
+    /// WAL checkpoint. Ordinary index segments retain the non-empty invariant.
+    pub fn build_allow_empty<I, S, N, B>(self, docs: I, sections: S) -> Result<SegmentMeta>
+    where
+        I: IntoIterator<Item = Doc>,
+        S: IntoIterator<Item = (N, B)>,
+        N: AsRef<str>,
+        B: AsRef<[u8]>,
+    {
+        self.build_inner(docs, sections, true)
+    }
+
+    fn build_inner<I, S, N, B>(self, docs: I, sections: S, allow_empty: bool) -> Result<SegmentMeta>
     where
         I: IntoIterator<Item = Doc>,
         S: IntoIterator<Item = (N, B)>,
@@ -147,7 +178,7 @@ impl<'a> SegmentBuilder<'a> {
                 )));
             }
         }
-        if encoded_docs.is_empty() {
+        if encoded_docs.is_empty() && !allow_empty {
             return Err(SegmentError::InvalidSegment(
                 "cannot build an empty segment".to_owned(),
             ));
@@ -167,7 +198,12 @@ impl<'a> SegmentBuilder<'a> {
             }
         }
 
-        let id = segment_id(self.wal_range);
+        let id = self.custom_id.unwrap_or_else(|| segment_id(self.wal_range));
+        if id.is_empty() || id.contains('/') || id.contains('\\') {
+            return Err(SegmentError::InvalidSegment(
+                "segment id must be a non-empty path component".to_owned(),
+            ));
+        }
         let prefix = segment_prefix(&self.namespace, &id);
         let docs_bytes = bincode::serialize(&encoded_docs)?;
 
