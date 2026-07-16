@@ -1,3 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/gauge-exporters"]
+members = [
+    "crates/gauge-exporters",
+    "crates/gauge-store",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"

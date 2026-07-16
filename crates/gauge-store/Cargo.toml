@@ -1,0 +1,10 @@
+[package]
+name = "gauge-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A small Prometheus-compatible time-series storage engine"
+
+[dependencies]
+regex = "1"
+thiserror = "2"
