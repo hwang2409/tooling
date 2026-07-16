@@ -2,7 +2,7 @@
 
 v1 (see 2026-07-15-pufferclone-v1-design.md) completed the engine: HNSW, compaction, S3Store, non-blocking cold loads with bounded admission and a lifecycle coordinator (main@87cad8d). v2 validates it against real object storage, measures it, and adds the memory-management layer that makes the cold/hot split real.
 
-Out of scope for v2: NVMe segment cache tier (candidate PUF-12 once PUF-11 numbers exist), typed attribute schema, auth/API keys, multi-node, wiki semantic-search integration.
+Out of scope for v2: NVMe segment cache tier (candidate PUF-13 once PUF-11 numbers exist), typed attribute schema, auth/API keys, multi-node, wiki semantic-search integration.
 
 ## PUF-9: MinIO end-to-end
 
@@ -41,8 +41,24 @@ Eviction mechanics exist (lifecycle coordinator handles evict/load races, drains
 - Eviction from policy goes through the same coordinator path as explicit eviction — no second eviction mechanism.
 - Tests: deterministic accounting (fixed corpus → expected estimate range), LRU order correctness, budget-triggered evict then reload works, in-flight-load protected from policy evict (barrier-gated), unlimited default preserves current behavior, budget + admission stress (loads under both semaphore cap and budget churn).
 
+## PUF-12: `puf` CLI (parallel, independent)
+
+CLI-first direction (Henry 2026-07-16): services get CLIs before any web UI — the terminal is the primary client for the local-cloud stack.
+
+- New binary `src/bin/puf.rs` (clap): thin client over the existing HTTP API. No engine changes; reuse request/response types from the lib.
+- Server address: `--url` flag > `PUFFERCLONE_URL` env > default matching main.rs's default bind.
+- Commands:
+  - `puf ns ls` — list namespaces.
+  - `puf ns rm <ns>` — delete namespace (confirm flag `--yes` for scripts).
+  - `puf upsert <ns> [-f docs.jsonl|-]` — JSONL from file or stdin, one doc per line (id, optional vector, optional text, optional attrs object); batches requests; prints summary.
+  - `puf query <ns>` — `--text "q"` and/or `--vector-file f`/`--vector "0.1,0.2,..."` (both = hybrid RRF), `--top-k N`, `--ef-search N`, repeatable `--filter field=value` (eq) with `--filter-in field=v1,v2`, deletes/attrs shown in output.
+  - Global `--json` for machine output; human tables default.
+- Errors: non-zero exit, server error body surfaced, connection-refused message names the URL tried.
+- Tests: integration test starts the real server (LocalDirStore, tempdir, ephemeral port), drives the compiled `puf` binary (assert_cmd or std::process), covers upsert→query round-trip (text, vector, hybrid, filtered), ns ls/rm, --json shape, error paths (bad ns, server down). No MinIO/docker dependency.
+
 ## Delivery
 
 Wave 1 (parallel, disjoint): PUF-9 (docker/tests/scripts, no engine changes), PUF-10 (benches/, testkit, bin — no engine behavior changes; instrumentation hooks read-only).
 Wave 2 (serial, touches engine/lifecycle): PUF-11 after PUF-10 merges (policy tuning wants bench numbers; accounting hooks may touch the same files PUF-10 instruments).
+PUF-12 (added mid-v2): independent of both waves — new bin only; Cargo.toml conflicts with PUF-10's criterion dev-deps resolved at merge.
 Same review pipeline as v0/v1: sol deep review per round pinned at SHA, orchestrator merges locally on clean pass.
