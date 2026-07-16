@@ -1,10 +1,14 @@
 use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Barrier, Mutex as StdMutex};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex as StdMutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use futures_util::future::poll_fn;
 use pufferclone::api::router;
 use pufferclone::engine::Engine;
 use pufferclone::index::filter::Filter;
@@ -53,6 +57,21 @@ fn open_engine(dir: &TempDir) -> Engine {
     Engine::new(dir.path()).expect("engine")
 }
 
+async fn poll_once_until_pending<F>(future: &mut Pin<Box<F>>)
+where
+    F: Future,
+{
+    let pending = poll_fn(|cx| match future.as_mut().poll(cx) {
+        Poll::Pending => Poll::Ready(true),
+        Poll::Ready(_) => Poll::Ready(false),
+    })
+    .await;
+    assert!(
+        pending,
+        "future completed before its transition could be cancelled"
+    );
+}
+
 struct FailOnceStore {
     inner: LocalDirStore,
     fail_segment_meta: AtomicBool,
@@ -73,6 +92,32 @@ struct BlockingCompactionStore {
     block_next: AtomicBool,
     started: StdMutex<Option<mpsc::Sender<()>>>,
     release: StdMutex<mpsc::Receiver<()>>,
+}
+
+struct ColdLoadStore {
+    inner: LocalDirStore,
+    get_count: AtomicUsize,
+    block_next_get: AtomicBool,
+    blocked_namespace: StdMutex<Option<String>>,
+    started: StdMutex<Option<mpsc::Sender<()>>>,
+    release: StdMutex<Option<mpsc::Receiver<()>>>,
+    fail_next_get: AtomicBool,
+    fail_next_get_as_io: AtomicBool,
+    failed_namespace: StdMutex<Option<String>>,
+    block_next_delete: AtomicBool,
+    blocked_delete_namespace: StdMutex<Option<String>>,
+    delete_started: StdMutex<Option<mpsc::Sender<()>>>,
+    delete_release: StdMutex<Option<mpsc::Receiver<()>>>,
+    all_get_gate: StdMutex<Option<Arc<AllGetGate>>>,
+    active_gets: AtomicUsize,
+    max_active_gets: AtomicUsize,
+    compact_puts: AtomicUsize,
+}
+
+struct AllGetGate {
+    released: StdMutex<bool>,
+    wake: Condvar,
+    started: mpsc::Sender<()>,
 }
 
 impl FailWalDeleteStore {
@@ -105,6 +150,111 @@ impl BlockingCompactionStore {
             started: StdMutex::new(Some(started)),
             release: StdMutex::new(release),
         }
+    }
+}
+
+impl ColdLoadStore {
+    fn new(dir: &TempDir) -> Self {
+        Self {
+            inner: LocalDirStore::new(dir.path()).expect("store"),
+            get_count: AtomicUsize::new(0),
+            block_next_get: AtomicBool::new(false),
+            blocked_namespace: StdMutex::new(None),
+            started: StdMutex::new(None),
+            release: StdMutex::new(None),
+            fail_next_get: AtomicBool::new(false),
+            fail_next_get_as_io: AtomicBool::new(false),
+            failed_namespace: StdMutex::new(None),
+            block_next_delete: AtomicBool::new(false),
+            blocked_delete_namespace: StdMutex::new(None),
+            delete_started: StdMutex::new(None),
+            delete_release: StdMutex::new(None),
+            all_get_gate: StdMutex::new(None),
+            active_gets: AtomicUsize::new(0),
+            max_active_gets: AtomicUsize::new(0),
+            compact_puts: AtomicUsize::new(0),
+        }
+    }
+
+    fn reset_get_count(&self) {
+        self.get_count.store(0, Ordering::Release);
+    }
+
+    fn get_count(&self) -> usize {
+        self.get_count.load(Ordering::Acquire)
+    }
+
+    fn block_next_get_for(&self, namespace: &str) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *self
+            .blocked_namespace
+            .lock()
+            .expect("blocked namespace lock") = Some(namespace.to_owned());
+        *self.started.lock().expect("started lock") = Some(started_tx);
+        *self.release.lock().expect("release lock") = Some(release_rx);
+        self.block_next_get.store(true, Ordering::Release);
+        (started_rx, release_tx)
+    }
+
+    fn fail_next_get_for(&self, namespace: &str) {
+        *self.failed_namespace.lock().expect("failed namespace lock") = Some(namespace.to_owned());
+        self.fail_next_get.store(true, Ordering::Release);
+    }
+
+    fn fail_next_get_as_io_for(&self, namespace: &str) {
+        *self.failed_namespace.lock().expect("failed namespace lock") = Some(namespace.to_owned());
+        self.fail_next_get_as_io.store(true, Ordering::Release);
+    }
+
+    fn block_next_delete_for(&self, namespace: &str) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *self
+            .blocked_delete_namespace
+            .lock()
+            .expect("blocked delete namespace lock") = Some(namespace.to_owned());
+        *self.delete_started.lock().expect("delete started lock") = Some(started_tx);
+        *self.delete_release.lock().expect("delete release lock") = Some(release_rx);
+        self.block_next_delete.store(true, Ordering::Release);
+        (started_rx, release_tx)
+    }
+
+    fn block_all_gets(&self) -> mpsc::Receiver<()> {
+        let (started_tx, started_rx) = mpsc::channel();
+        *self.all_get_gate.lock().expect("all-get gate lock") = Some(Arc::new(AllGetGate {
+            released: StdMutex::new(false),
+            wake: Condvar::new(),
+            started: started_tx,
+        }));
+        started_rx
+    }
+
+    fn release_all_gets(&self) {
+        let gate = self
+            .all_get_gate
+            .lock()
+            .expect("all-get gate lock")
+            .clone()
+            .expect("all-get gate");
+        *gate.released.lock().expect("all-get release lock") = true;
+        gate.wake.notify_all();
+    }
+
+    fn max_active_gets(&self) -> usize {
+        self.max_active_gets.load(Ordering::Acquire)
+    }
+
+    fn active_gets(&self) -> usize {
+        self.active_gets.load(Ordering::Acquire)
+    }
+
+    fn reset_compact_puts(&self) {
+        self.compact_puts.store(0, Ordering::Release);
+    }
+
+    fn compact_puts(&self) -> usize {
+        self.compact_puts.load(Ordering::Acquire)
     }
 }
 
@@ -181,6 +331,117 @@ impl ObjectStore for BlockingCompactionStore {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key)
+    }
+}
+
+impl ObjectStore for ColdLoadStore {
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        if key.contains("/segments/compact-") {
+            self.compact_puts.fetch_add(1, Ordering::AcqRel);
+        }
+        self.inner.put(key, bytes)
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>> {
+        self.get_count.fetch_add(1, Ordering::AcqRel);
+        let active = self.active_gets.fetch_add(1, Ordering::AcqRel) + 1;
+        self.max_active_gets.fetch_max(active, Ordering::AcqRel);
+        let all_get_gate = self.all_get_gate.lock().expect("all-get gate lock").clone();
+        if let Some(gate) = &all_get_gate {
+            let _ = gate.started.send(());
+            let mut released = gate.released.lock().expect("all-get release lock");
+            while !*released {
+                released = gate.wake.wait(released).expect("all-get wait");
+            }
+        }
+        let blocked_namespace = self
+            .blocked_namespace
+            .lock()
+            .expect("blocked namespace lock")
+            .clone();
+        if self.block_next_get.load(Ordering::Acquire)
+            && blocked_namespace
+                .as_deref()
+                .is_some_and(|namespace| key.starts_with(&format!("ns/{namespace}/")))
+            && self.block_next_get.swap(false, Ordering::AcqRel)
+        {
+            self.started
+                .lock()
+                .expect("started lock")
+                .take()
+                .expect("started sender")
+                .send(())
+                .expect("started receiver");
+            self.release
+                .lock()
+                .expect("release lock")
+                .take()
+                .expect("release sender")
+                .recv()
+                .expect("release sender");
+        }
+
+        let failed_namespace = self
+            .failed_namespace
+            .lock()
+            .expect("failed namespace lock")
+            .clone();
+        let result = if self.fail_next_get_as_io.load(Ordering::Acquire)
+            && failed_namespace
+                .as_deref()
+                .is_some_and(|namespace| key.starts_with(&format!("ns/{namespace}/")))
+            && self.fail_next_get_as_io.swap(false, Ordering::AcqRel)
+        {
+            Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected cold-load I/O failure",
+            )))
+        } else if self.fail_next_get.load(Ordering::Acquire)
+            && failed_namespace
+                .as_deref()
+                .is_some_and(|namespace| key.starts_with(&format!("ns/{namespace}/")))
+            && self.fail_next_get.swap(false, Ordering::AcqRel)
+        {
+            Err(Error::Store("injected cold-load failure".to_owned()))
+        } else {
+            self.inner.get(key)
+        };
+        self.active_gets.fetch_sub(1, Ordering::AcqRel);
+        result
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let blocked_namespace = self
+            .blocked_delete_namespace
+            .lock()
+            .expect("blocked delete namespace lock")
+            .clone();
+        if self.block_next_delete.load(Ordering::Acquire)
+            && blocked_namespace
+                .as_deref()
+                .is_some_and(|namespace| key.starts_with(&format!("ns/{namespace}/")))
+            && self.block_next_delete.swap(false, Ordering::AcqRel)
+        {
+            self.delete_started
+                .lock()
+                .expect("delete started lock")
+                .take()
+                .expect("delete started sender")
+                .send(())
+                .expect("delete started receiver");
+            self.delete_release
+                .lock()
+                .expect("delete release lock")
+                .take()
+                .expect("delete release sender")
+                .recv()
+                .expect("delete release sender");
+        }
         self.inner.delete(key)
     }
 }
@@ -906,6 +1167,683 @@ async fn cold_start_replays_an_unflushed_wal_tail() {
             .expect("cold query")[0]
             .id,
         "a"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_cold_queries_share_one_store_load() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(ColdLoadStore::new(&dir));
+    {
+        let engine = Engine::with_store(Arc::clone(&store));
+        engine
+            .upsert(
+                "cold",
+                vec![doc("a", &[1.0, 0.0], "cold", "code")],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("upsert");
+        engine.force_flush("cold").await.expect("flush");
+    }
+
+    store.reset_get_count();
+    let baseline = Engine::with_store(Arc::clone(&store));
+    baseline
+        .query("cold", &vector_query(&[1.0, 0.0]))
+        .await
+        .expect("baseline cold query");
+    let one_load_gets = store.get_count();
+    drop(baseline);
+
+    store.reset_get_count();
+    let (started_rx, release_tx) = store.block_next_get_for("cold");
+    let engine = Arc::new(Engine::with_store(Arc::clone(&store)));
+    let first_engine = Arc::clone(&engine);
+    let first =
+        tokio::spawn(async move { first_engine.query("cold", &vector_query(&[1.0, 0.0])).await });
+    tokio::task::spawn_blocking(move || started_rx.recv().expect("cold load started"))
+        .await
+        .expect("started task");
+
+    let mut queries = Vec::new();
+    for _ in 0..15 {
+        let query_engine = Arc::clone(&engine);
+        queries.push(tokio::spawn(async move {
+            query_engine.query("cold", &vector_query(&[1.0, 0.0])).await
+        }));
+    }
+    release_tx.send(()).expect("release cold load");
+    assert!(first.await.expect("first query task").is_ok());
+    for query in queries {
+        assert!(query.await.expect("query task").is_ok());
+    }
+    assert_eq!(store.get_count(), one_load_gets);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn cold_load_admission_bounds_blocking_store_work() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(ColdLoadStore::new(&dir));
+    {
+        let engine = Engine::with_store(Arc::clone(&store));
+        for index in 0..(Engine::cold_load_concurrency() + 2) {
+            let namespace = format!("admission-{index}");
+            engine
+                .upsert(
+                    &namespace,
+                    vec![doc("a", &[1.0, 0.0], "admission", "code")],
+                    Vec::new(),
+                    BTreeMap::new(),
+                )
+                .await
+                .expect("upsert");
+            engine.force_flush(&namespace).await.expect("flush");
+        }
+    }
+
+    let expected_bound = Engine::cold_load_concurrency();
+    let started_rx = store.block_all_gets();
+    let engine = Engine::with_store(Arc::clone(&store));
+    let mut queries = Vec::new();
+    for index in 0..expected_bound {
+        let namespace = format!("admission-{index}");
+        let engine_ref = &engine;
+        let mut query = Box::pin(async move {
+            engine_ref
+                .query(&namespace, &vector_query(&[1.0, 0.0]))
+                .await
+        });
+        poll_once_until_pending(&mut query).await;
+        queries.push(query);
+    }
+
+    tokio::task::spawn_blocking(move || {
+        for _ in 0..expected_bound {
+            started_rx.recv().expect("cold load entered store");
+        }
+    })
+    .await
+    .expect("started receiver task");
+
+    assert_eq!(
+        store.active_gets(),
+        expected_bound,
+        "the admission slots were not all occupied before overflow loads"
+    );
+
+    let mut overflow = Vec::new();
+    for index in expected_bound..(expected_bound + 2) {
+        let namespace = format!("admission-{index}");
+        let engine_ref = &engine;
+        let mut query = Box::pin(async move {
+            engine_ref
+                .query(&namespace, &vector_query(&[1.0, 0.0]))
+                .await
+        });
+        poll_once_until_pending(&mut query).await;
+        overflow.push(query);
+    }
+    assert_eq!(
+        store.active_gets(),
+        expected_bound,
+        "overflow loads entered blocking store work before a permit was released"
+    );
+    assert_eq!(
+        store.max_active_gets(),
+        expected_bound,
+        "blocking cold-load high-water mark exceeded admission capacity before release"
+    );
+
+    store.release_all_gets();
+
+    for query in queries {
+        assert!(query.await.is_ok());
+    }
+    for query in overflow {
+        assert!(query.await.is_ok());
+    }
+    assert!(
+        store.max_active_gets() <= expected_bound,
+        "blocking cold loads exceeded admission bound: {} > {expected_bound}",
+        store.max_active_gets()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn evict_cancels_a_cold_load_queued_for_admission() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(ColdLoadStore::new(&dir));
+    {
+        let engine = Engine::with_store(Arc::clone(&store));
+        for index in 0..=Engine::cold_load_concurrency() {
+            let namespace = format!("queued-{index}");
+            engine
+                .upsert(
+                    &namespace,
+                    vec![doc("a", &[1.0, 0.0], "queued", "code")],
+                    Vec::new(),
+                    BTreeMap::new(),
+                )
+                .await
+                .expect("upsert");
+            engine.force_flush(&namespace).await.expect("flush");
+        }
+    }
+
+    let expected_bound = Engine::cold_load_concurrency();
+    let started_rx = store.block_all_gets();
+    let engine = Arc::new(Engine::with_store(Arc::clone(&store)));
+    let mut active_queries = Vec::new();
+    for index in 0..expected_bound {
+        let namespace = format!("queued-{index}");
+        let query_engine = Arc::clone(&engine);
+        let mut query = Box::pin(async move {
+            query_engine
+                .query(&namespace, &vector_query(&[1.0, 0.0]))
+                .await
+        });
+        poll_once_until_pending(&mut query).await;
+        active_queries.push(query);
+    }
+    tokio::task::spawn_blocking(move || {
+        for _ in 0..expected_bound {
+            started_rx.recv().expect("cold load entered store");
+        }
+    })
+    .await
+    .expect("started receiver task");
+
+    let queued_namespace = format!("queued-{expected_bound}");
+    let queued_engine = Arc::clone(&engine);
+    let queued_name = queued_namespace.clone();
+    let mut queued = Box::pin(async move {
+        queued_engine
+            .query(&queued_name, &vector_query(&[1.0, 0.0]))
+            .await
+    });
+    poll_once_until_pending(&mut queued).await;
+    assert_eq!(store.active_gets(), expected_bound);
+
+    let evict_engine = Arc::clone(&engine);
+    let evict = Box::pin(async move { evict_engine.evict(&queued_namespace).await });
+    let (evict_result, queued_result) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(evict, queued)
+    })
+    .await
+    .expect("eviction remained behind a queued cold load");
+    evict_result.expect("eviction failed");
+    assert!(matches!(queued_result, Err(Error::NotFound(_))));
+
+    store.release_all_gets();
+    for query in active_queries {
+        assert!(query.await.is_ok());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn other_namespace_queries_do_not_wait_for_a_cold_load() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(ColdLoadStore::new(&dir));
+    {
+        let engine = Engine::with_store(Arc::clone(&store));
+        for namespace in ["cold", "hot"] {
+            engine
+                .upsert(
+                    namespace,
+                    vec![doc("a", &[1.0, 0.0], namespace, "code")],
+                    Vec::new(),
+                    BTreeMap::new(),
+                )
+                .await
+                .expect("upsert");
+            engine.force_flush(namespace).await.expect("flush");
+        }
+    }
+
+    let (started_rx, release_tx) = store.block_next_get_for("cold");
+    let engine = Arc::new(Engine::with_store(Arc::clone(&store)));
+    let cold_engine = Arc::clone(&engine);
+    let cold =
+        tokio::spawn(async move { cold_engine.query("cold", &vector_query(&[1.0, 0.0])).await });
+    tokio::task::spawn_blocking(move || started_rx.recv().expect("cold load started"))
+        .await
+        .expect("started task");
+
+    let hot_engine = Arc::clone(&engine);
+    let hot =
+        tokio::spawn(async move { hot_engine.query("hot", &vector_query(&[1.0, 0.0])).await });
+    let hot_result = tokio::time::timeout(Duration::from_secs(1), hot)
+        .await
+        .expect("hot query serialized behind cold load")
+        .expect("hot query task")
+        .expect("hot query");
+    assert_eq!(hot_result[0].id, "a");
+
+    release_tx.send(()).expect("release cold load");
+    assert!(cold.await.expect("cold query task").is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_waits_for_a_cold_load_before_removing_storage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(ColdLoadStore::new(&dir));
+    {
+        let engine = Engine::with_store(Arc::clone(&store));
+        engine
+            .upsert(
+                "cold",
+                vec![doc("a", &[1.0, 0.0], "cold", "code")],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("upsert");
+        engine.force_flush("cold").await.expect("flush");
+    }
+
+    let (started_rx, release_tx) = store.block_next_get_for("cold");
+    let engine = Arc::new(Engine::with_store(Arc::clone(&store)));
+    let query_engine = Arc::clone(&engine);
+    let query =
+        tokio::spawn(async move { query_engine.query("cold", &vector_query(&[1.0, 0.0])).await });
+    tokio::task::spawn_blocking(move || started_rx.recv().expect("cold load started"))
+        .await
+        .expect("started task");
+
+    let delete_engine = Arc::clone(&engine);
+    let delete = tokio::spawn(async move { delete_engine.delete_namespace("cold").await });
+    tokio::task::yield_now().await;
+    release_tx.send(()).expect("release cold load");
+    assert!(matches!(
+        query.await.expect("query task"),
+        Err(Error::NotFound(_))
+    ));
+    assert!(delete.await.expect("delete task").is_ok());
+    assert!(store.list("ns/cold/").expect("list objects").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn evict_cancels_a_cold_load_without_losing_storage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(ColdLoadStore::new(&dir));
+    {
+        let engine = Engine::with_store(Arc::clone(&store));
+        engine
+            .upsert(
+                "cold",
+                vec![doc("a", &[1.0, 0.0], "cold", "code")],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("upsert");
+        engine.force_flush("cold").await.expect("flush");
+    }
+
+    let (started_rx, release_tx) = store.block_next_get_for("cold");
+    let engine = Arc::new(Engine::with_store(Arc::clone(&store)));
+    let query_engine = Arc::clone(&engine);
+    let query =
+        tokio::spawn(async move { query_engine.query("cold", &vector_query(&[1.0, 0.0])).await });
+    tokio::task::spawn_blocking(move || started_rx.recv().expect("cold load started"))
+        .await
+        .expect("started task");
+
+    let evict_engine = Arc::clone(&engine);
+    let evict = tokio::spawn(async move { evict_engine.evict("cold").await });
+    tokio::task::yield_now().await;
+    release_tx.send(()).expect("release cold load");
+    assert!(matches!(
+        query.await.expect("query task"),
+        Err(Error::NotFound(_))
+    ));
+    assert!(evict.await.expect("evict task").is_ok());
+    assert_eq!(
+        engine
+            .query("cold", &vector_query(&[1.0, 0.0]))
+            .await
+            .expect("retry after evict")[0]
+            .id,
+        "a"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_cold_load_is_retryable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(ColdLoadStore::new(&dir));
+    {
+        let engine = Engine::with_store(Arc::clone(&store));
+        engine
+            .upsert(
+                "retry",
+                vec![doc("a", &[1.0, 0.0], "retry", "code")],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("upsert");
+        engine.force_flush("retry").await.expect("flush");
+    }
+
+    store.fail_next_get_for("retry");
+    let engine = Engine::with_store(Arc::clone(&store));
+    assert!(matches!(
+        engine.query("retry", &vector_query(&[1.0, 0.0])).await,
+        Err(Error::Store(_))
+    ));
+    assert_eq!(
+        engine
+            .query("retry", &vector_query(&[1.0, 0.0]))
+            .await
+            .expect("retry cold load")[0]
+            .id,
+        "a"
+    );
+
+    engine.evict("retry").await.expect("evict before I/O retry");
+    store.fail_next_get_as_io_for("retry");
+    assert!(matches!(
+        engine.query("retry", &vector_query(&[1.0, 0.0])).await,
+        Err(Error::Io(_))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_cold_load_fans_out_one_error_to_all_waiters() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(ColdLoadStore::new(&dir));
+    {
+        let engine = Engine::with_store(Arc::clone(&store));
+        engine
+            .upsert(
+                "fanout",
+                vec![doc("a", &[1.0, 0.0], "fanout", "code")],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("upsert");
+        engine.force_flush("fanout").await.expect("flush");
+    }
+
+    let (started_rx, release_tx) = store.block_next_get_for("fanout");
+    store.fail_next_get_for("fanout");
+    let engine = Arc::new(Engine::with_store(Arc::clone(&store)));
+    let first_engine = Arc::clone(&engine);
+    let first = tokio::spawn(async move {
+        first_engine
+            .query("fanout", &vector_query(&[1.0, 0.0]))
+            .await
+    });
+    tokio::task::spawn_blocking(move || started_rx.recv().expect("cold load started"))
+        .await
+        .expect("started task");
+
+    // Poll every waiter into the shared slot before releasing the one store
+    // load. This makes the fanout ordering channel-driven, not scheduler- or
+    // sleep-dependent.
+    let mut waiters = Vec::new();
+    for _ in 0..3 {
+        let waiter_engine = Arc::clone(&engine);
+        let mut waiter = Box::pin(async move {
+            waiter_engine
+                .query("fanout", &vector_query(&[1.0, 0.0]))
+                .await
+        });
+        poll_once_until_pending(&mut waiter).await;
+        waiters.push(waiter);
+    }
+    release_tx.send(()).expect("release cold load");
+
+    assert!(matches!(
+        first.await.expect("first query task"),
+        Err(Error::Store(_))
+    ));
+    for waiter in waiters {
+        assert!(matches!(waiter.await, Err(Error::Store(_))));
+    }
+    assert_eq!(
+        engine
+            .query("fanout", &vector_query(&[1.0, 0.0]))
+            .await
+            .expect("retry after fanout failure")[0]
+            .id,
+        "a"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_evict_finishes_and_reload_joins_the_transition() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(ColdLoadStore::new(&dir));
+    {
+        let engine = Engine::with_store(Arc::clone(&store));
+        engine
+            .upsert(
+                "evict-race",
+                vec![doc("a", &[1.0, 0.0], "evict", "code")],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("upsert");
+        engine.force_flush("evict-race").await.expect("flush");
+    }
+
+    let (started_rx, release_tx) = store.block_next_get_for("evict-race");
+    let engine = Arc::new(Engine::with_store(Arc::clone(&store)));
+    let query_engine = Arc::clone(&engine);
+    let query = tokio::spawn(async move {
+        query_engine
+            .query("evict-race", &vector_query(&[1.0, 0.0]))
+            .await
+    });
+    tokio::task::spawn_blocking(move || started_rx.recv().expect("cold load started"))
+        .await
+        .expect("started task");
+
+    let mut evict = Box::pin(engine.evict("evict-race"));
+    poll_once_until_pending(&mut evict).await;
+    // Dropping the caller future must not cancel the detached finalizer.
+    drop(evict);
+
+    let reload_query = vector_query(&[1.0, 0.0]);
+    let mut reload = Box::pin(engine.query("evict-race", &reload_query));
+    poll_once_until_pending(&mut reload).await;
+    release_tx.send(()).expect("release cold load");
+
+    assert!(matches!(
+        query.await.expect("query task"),
+        Err(Error::NotFound(_))
+    ));
+    assert_eq!(reload.await.expect("reload after eviction")[0].id, "a");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_delete_finishes_after_the_caller_future_is_dropped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(ColdLoadStore::new(&dir));
+    let engine = Arc::new(Engine::with_store(Arc::clone(&store)));
+    engine
+        .upsert(
+            "delete-cancel",
+            vec![doc("a", &[1.0, 0.0], "delete", "code")],
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("upsert");
+    engine.force_flush("delete-cancel").await.expect("flush");
+
+    let (started_rx, release_tx) = store.block_next_delete_for("delete-cancel");
+    let mut delete = Box::pin(engine.delete_namespace("delete-cancel"));
+    poll_once_until_pending(&mut delete).await;
+    tokio::task::spawn_blocking(move || started_rx.recv().expect("delete started"))
+        .await
+        .expect("started task");
+    drop(delete);
+    release_tx.send(()).expect("release delete");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        engine.query("delete-cancel", &vector_query(&[1.0, 0.0])),
+    )
+    .await
+    .expect("query remained behind cancelled delete")
+    .expect_err("deleted namespace unexpectedly reloaded");
+    assert!(matches!(result, Error::NotFound(_)));
+    assert!(store
+        .list("ns/delete-cancel/")
+        .expect("list objects")
+        .is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn channel_orchestrated_six_operation_lifecycle_interleaving() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(ColdLoadStore::new(&dir));
+    let engine = Arc::new(Engine::with_store(Arc::clone(&store)));
+
+    engine
+        .upsert(
+            "load-evict",
+            vec![doc("a", &[1.0, 0.0], "load", "code")],
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("seed load-evict");
+    engine
+        .force_flush("load-evict")
+        .await
+        .expect("flush load-evict");
+    engine
+        .upsert(
+            "delete",
+            vec![doc("a", &[1.0, 0.0], "delete", "code")],
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("seed delete");
+    engine.force_flush("delete").await.expect("flush delete");
+
+    // Build three segments; the single force_flush operation below creates
+    // the fourth and must enter compaction.
+    for index in 0..3 {
+        engine
+            .upsert(
+                "compact",
+                vec![doc(
+                    &format!("seed-{index}"),
+                    &[1.0, 0.0],
+                    "compact",
+                    "code",
+                )],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("seed compact upsert");
+        engine
+            .force_flush("compact")
+            .await
+            .expect("seed compact flush");
+    }
+    store.reset_compact_puts();
+
+    // Exact load-vs-evict-vs-reload ordering. The cold load cannot publish,
+    // eviction cannot drain, and reload cannot bypass the registered
+    // transition until this channel is released.
+    engine
+        .evict("load-evict")
+        .await
+        .expect("evict before cold race");
+    let (load_started_rx, load_release_tx) = store.block_next_get_for("load-evict");
+    let cold_engine = Arc::clone(&engine);
+    let cold_query = tokio::spawn(async move {
+        cold_engine
+            .query("load-evict", &vector_query(&[1.0, 0.0]))
+            .await
+    });
+    tokio::task::spawn_blocking(move || load_started_rx.recv().expect("cold load started"))
+        .await
+        .expect("load marker task");
+
+    let mut evict = Box::pin(engine.evict("load-evict"));
+    poll_once_until_pending(&mut evict).await;
+    let reload_query = vector_query(&[1.0, 0.0]);
+    let mut reload = Box::pin(engine.query("load-evict", &reload_query));
+    poll_once_until_pending(&mut reload).await;
+    load_release_tx.send(()).expect("release cold load");
+
+    assert!(matches!(
+        cold_query.await.expect("cold query task"),
+        Err(Error::NotFound(_))
+    ));
+    evict.await.expect("evict future");
+    assert_eq!(reload.await.expect("reload future")[0].id, "a");
+
+    // Upsert + flush/compaction are real operations, and the store marker
+    // proves the force_flush call crossed the compaction publication path.
+    engine
+        .upsert(
+            "compact",
+            vec![doc("fourth", &[1.0, 0.0], "compact", "code")],
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("fourth upsert");
+    engine
+        .force_flush("compact")
+        .await
+        .expect("flush and compaction");
+    assert!(
+        store.compact_puts() > 0,
+        "compaction publication was not entered"
+    );
+    assert!(engine
+        .last_flush_error("compact")
+        .await
+        .expect("last flush error")
+        .is_none());
+
+    // Delete is held in storage after its lifecycle transition is registered.
+    // Query and upsert must both join that transition; the latter recreates
+    // the namespace only after deletion has fully completed.
+    let (delete_started_rx, delete_release_tx) = store.block_next_delete_for("delete");
+    let mut delete = Box::pin(engine.delete_namespace("delete"));
+    poll_once_until_pending(&mut delete).await;
+    tokio::task::spawn_blocking(move || delete_started_rx.recv().expect("delete started"))
+        .await
+        .expect("delete marker task");
+
+    let delete_query_spec = vector_query(&[1.0, 0.0]);
+    let mut delete_query = Box::pin(engine.query("delete", &delete_query_spec));
+    poll_once_until_pending(&mut delete_query).await;
+    let mut recreate = Box::pin(engine.upsert(
+        "delete",
+        vec![doc("recreated", &[1.0, 0.0], "recreated", "code")],
+        Vec::new(),
+        BTreeMap::new(),
+    ));
+    poll_once_until_pending(&mut recreate).await;
+    delete_release_tx.send(()).expect("release delete");
+
+    delete.await.expect("delete future");
+    assert!(matches!(delete_query.await, Err(Error::NotFound(_))));
+    recreate.await.expect("recreate upsert future");
+    assert_eq!(
+        engine
+            .query("delete", &vector_query(&[1.0, 0.0]))
+            .await
+            .expect("query recreated namespace")[0]
+            .id,
+        "recreated"
     );
 }
 
