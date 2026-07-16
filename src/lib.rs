@@ -8,6 +8,7 @@ pub mod namespace;
 pub mod segment;
 pub mod store;
 pub mod store_s3;
+pub mod testkit;
 pub mod types;
 pub mod wal;
 

@@ -15,6 +15,7 @@ thiserror = "1"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
+criterion = "0.5"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
@@ -25,3 +26,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "pufferclone"
 path = "src/main.rs"
+
+[[bin]]
+name = "bench_recall"
+path = "src/bin/bench_recall.rs"
+
+[[bench]]
+name = "benchmarks"
+harness = false
