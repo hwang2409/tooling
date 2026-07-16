@@ -1,7 +1,8 @@
 //! Namespace lifecycle coordination and bounded hot-cache admission.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::env;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use tokio::sync::{watch, Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
@@ -15,6 +16,7 @@ use crate::{Error, Result};
 
 pub(crate) const HOT_CACHE_CAPACITY: usize = 8;
 pub(crate) const COLD_LOAD_CONCURRENCY: usize = 4;
+pub(crate) const MEMORY_BUDGET_ENV: &str = "PUFFERCLONE_MEMORY_BUDGET_BYTES";
 
 type Loaded = Arc<RwLock<Namespace>>;
 
@@ -27,6 +29,7 @@ struct NamespaceEntry {
     namespace: Loaded,
     operation: Mutex<()>,
     closing: AtomicBool,
+    memory_bytes: AtomicUsize,
     worker: StdMutex<Option<Worker>>,
 }
 
@@ -71,6 +74,8 @@ struct LoadingSlot {
     notify: Notify,
     cancelled: AtomicBool,
     cancel_notify: Notify,
+    #[cfg(test)]
+    admission_waiting: Notify,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -117,6 +122,8 @@ impl LoadingSlot {
             notify: Notify::new(),
             cancelled: AtomicBool::new(false),
             cancel_notify: Notify::new(),
+            #[cfg(test)]
+            admission_waiting: Notify::new(),
         }
     }
 
@@ -260,6 +267,8 @@ struct Registry {
     loading: HashMap<String, Arc<LoadingSlot>>,
     transitions: HashMap<String, Arc<LifecycleTransition>>,
     lru: VecDeque<String>,
+    total_memory_bytes: usize,
+    memory_budget: Option<usize>,
 }
 
 /// Coordinates namespace loads, lifecycle transitions, and the hot cache.
@@ -267,10 +276,20 @@ pub(crate) struct Coordinator {
     store: SharedStore,
     registry: Arc<Mutex<Registry>>,
     cold_load_admission: Arc<Semaphore>,
+    memory_budget: Option<usize>,
 }
 
 impl Coordinator {
+    #[cfg(test)]
     pub(crate) fn new(store: SharedStore) -> Self {
+        Self::with_memory_budget(store, None)
+    }
+
+    pub(crate) fn from_env(store: SharedStore) -> Result<Self> {
+        Ok(Self::with_memory_budget(store, memory_budget_from_env()?))
+    }
+
+    fn with_memory_budget(store: SharedStore, memory_budget: Option<usize>) -> Self {
         Self {
             store,
             registry: Arc::new(Mutex::new(Registry {
@@ -278,8 +297,11 @@ impl Coordinator {
                 loading: HashMap::new(),
                 transitions: HashMap::new(),
                 lru: VecDeque::new(),
+                total_memory_bytes: 0,
+                memory_budget,
             })),
             cold_load_admission: Arc::new(Semaphore::new(COLD_LOAD_CONCURRENCY)),
+            memory_budget,
         }
     }
 
@@ -299,17 +321,30 @@ impl Coordinator {
         deletes: Vec<String>,
         schema: Schema,
     ) -> Result<WriteSummary> {
-        let entry = match self.get_or_open(namespace).await {
-            Ok(entry) => entry,
-            Err(Error::NotFound(_)) => {
-                return self
-                    .create_and_upsert(namespace, upserts, deletes, schema)
-                    .await;
+        loop {
+            let entry = match self.get_or_open(namespace).await {
+                Ok(entry) => entry,
+                Err(Error::NotFound(_)) => {
+                    return self
+                        .create_and_upsert(namespace, upserts, deletes, schema)
+                        .await;
+                }
+                Err(error) => return Err(error),
+            };
+            match self
+                .upsert_loaded(
+                    entry,
+                    namespace,
+                    upserts.clone(),
+                    deletes.clone(),
+                    schema.clone(),
+                )
+                .await
+            {
+                Err(Error::NotFound(_)) => continue,
+                result => return result,
             }
-            Err(error) => return Err(error),
-        };
-        self.upsert_loaded(entry, namespace, upserts, deletes, schema)
-            .await
+        }
     }
 
     async fn upsert_loaded(
@@ -320,13 +355,24 @@ impl Coordinator {
         deletes: Vec<String>,
         schema: Schema,
     ) -> Result<WriteSummary> {
-        let _operation = entry.operation.lock().await;
-        ensure_open(&entry, namespace)?;
-        let result = entry
-            .namespace
-            .write()
-            .await
-            .upsert(upserts, deletes, schema);
+        let result = {
+            let _operation = entry.operation.lock().await;
+            ensure_open(&entry, namespace)?;
+            let result = entry
+                .namespace
+                .write()
+                .await
+                .upsert(upserts, deletes, schema);
+            if result.is_ok() && self.memory_budget.is_some() {
+                refresh_memory_and_schedule_evictions(
+                    self.registry.clone(),
+                    namespace.to_owned(),
+                    entry.clone(),
+                )
+                .await;
+            }
+            result
+        };
         result
     }
 
@@ -342,17 +388,33 @@ impl Coordinator {
         query: &Query,
         ef_search: usize,
     ) -> Result<Vec<QueryResult>> {
-        let entry = self.get_or_open(namespace).await?;
-        let loaded = entry.namespace.read().await;
-        ensure_open(&entry, namespace)?;
-        loaded.query_with_ef_search(query, ef_search)
+        loop {
+            let entry = self.get_or_open(namespace).await?;
+            let loaded = entry.namespace.read().await;
+            if entry.closing.load(Ordering::Acquire) {
+                continue;
+            }
+            return loaded.query_with_ef_search(query, ef_search);
+        }
     }
 
     pub(crate) async fn force_flush(&self, namespace: &str) -> Result<()> {
         let entry = self.get_or_open(namespace).await?;
-        let _operation = entry.operation.lock().await;
-        ensure_open(&entry, namespace)?;
-        flush_and_compact(&entry).await
+        let result = {
+            let _operation = entry.operation.lock().await;
+            ensure_open(&entry, namespace)?;
+            let result = flush_and_compact(&entry).await;
+            if self.memory_budget.is_some() {
+                refresh_memory_and_schedule_evictions(
+                    self.registry.clone(),
+                    namespace.to_owned(),
+                    entry.clone(),
+                )
+                .await;
+            }
+            result
+        };
+        result
     }
 
     /// Inspect the most recent background flush failure for a loaded
@@ -491,6 +553,10 @@ impl Coordinator {
         let mut names = registry.entries.keys().cloned().collect::<Vec<_>>();
         names.sort();
         Ok(names)
+    }
+
+    pub(crate) async fn loaded_memory_bytes(&self) -> usize {
+        self.registry.lock().await.total_memory_bytes
     }
 
     async fn get_or_open(&self, name: &str) -> Result<Arc<NamespaceEntry>> {
@@ -704,6 +770,8 @@ async fn acquire_admission(
     loading: &Arc<LoadingSlot>,
 ) -> Result<OwnedSemaphorePermit> {
     #[cfg(test)]
+    loading.admission_waiting.notify_waiters();
+    #[cfg(test)]
     if let Some(hook) = ADMISSION_WAIT_HOOK
         .get()
         .filter(|hook| Arc::ptr_eq(&hook.loading, loading))
@@ -803,6 +871,10 @@ async fn complete_transition(
             {
                 registry.entries.remove(&name);
                 registry.lru.retain(|candidate| candidate != &name);
+                // Keep draining bytes in the global ledger until the
+                // operation lock and worker have both been drained.
+                let bytes = current.memory_bytes.swap(0, Ordering::AcqRel);
+                registry.total_memory_bytes = registry.total_memory_bytes.saturating_sub(bytes);
             }
         }
         if loading.as_ref().is_some_and(|loading| {
@@ -835,6 +907,7 @@ async fn finish_load(
     loading: Arc<LoadingSlot>,
     result: Result<(Namespace, Option<WriteSummary>)>,
 ) {
+    let registry_handle = registry.clone();
     let (outcome, evicted) = {
         let mut registry = registry.lock().await;
         let active = registry
@@ -846,6 +919,12 @@ async fn finish_load(
         if active && !cancelled {
             match result {
                 Ok((namespace, summary)) => {
+                    let accounting_enabled = registry.memory_budget.is_some();
+                    let memory_bytes = if accounting_enabled {
+                        namespace.memory_bytes()
+                    } else {
+                        0
+                    };
                     let closing = registry
                         .transitions
                         .get(&name)
@@ -854,37 +933,20 @@ async fn finish_load(
                         namespace: Arc::new(RwLock::new(namespace)),
                         operation: Mutex::new(()),
                         closing: AtomicBool::new(closing),
+                        memory_bytes: AtomicUsize::new(memory_bytes),
                         worker: StdMutex::new(None),
                     });
-                    entry.start_worker();
+                    entry.start_worker(
+                        Arc::downgrade(&registry_handle),
+                        name.clone(),
+                        accounting_enabled,
+                    );
                     registry.entries.insert(name.clone(), entry.clone());
+                    registry.total_memory_bytes =
+                        registry.total_memory_bytes.saturating_add(memory_bytes);
                     touch_locked(&mut registry, &name);
 
-                    let evicted = if registry.lru.len() > HOT_CACHE_CAPACITY {
-                        registry.lru.pop_front().and_then(|evicted_name| {
-                            let entry = registry.entries.get(&evicted_name).cloned()?;
-                            entry.closing.store(true, Ordering::Release);
-                            let transition =
-                                Arc::new(LifecycleTransition::new(LifecycleKind::Evict));
-                            registry
-                                .transitions
-                                .insert(evicted_name.clone(), transition.clone());
-                            let loading = registry.loading.get(&evicted_name).cloned();
-                            if let Some(loading) = &loading {
-                                loading.cancel();
-                            }
-                            Some((
-                                evicted_name,
-                                LifecycleAction {
-                                    transition,
-                                    entry: Some(entry),
-                                    loading,
-                                },
-                            ))
-                        })
-                    } else {
-                        None
-                    };
+                    let evicted = policy_evictions_locked(&mut registry, &name);
                     (
                         LoadOutcome {
                             entry: Some(entry),
@@ -900,7 +962,7 @@ async fn finish_load(
                         summary: None,
                         error: Some(load_failure(&name, error)),
                     },
-                    None,
+                    Vec::new(),
                 ),
             }
         } else {
@@ -912,7 +974,7 @@ async fn finish_load(
                         "namespace not found: {name}"
                     ))),
                 },
-                None,
+                Vec::new(),
             )
         }
     };
@@ -940,8 +1002,132 @@ async fn finish_load(
             registry.loading.remove(&name);
         }
     }
-    if let Some((evicted_name, action)) = evicted {
-        start_evict_transition(registry, evicted_name, action);
+    for (evicted_name, action) in evicted {
+        start_evict_transition(registry.clone(), evicted_name, action);
+    }
+}
+
+fn begin_evict_locked(registry: &mut Registry, name: &str) -> Option<(String, LifecycleAction)> {
+    if registry.transitions.contains_key(name) {
+        return None;
+    }
+    let entry = registry.entries.get(name).cloned()?;
+    if entry.closing.load(Ordering::Acquire) {
+        return None;
+    }
+    let transition = Arc::new(LifecycleTransition::new(LifecycleKind::Evict));
+    registry
+        .transitions
+        .insert(name.to_owned(), transition.clone());
+    entry.closing.store(true, Ordering::Release);
+    registry.lru.retain(|candidate| candidate != name);
+    // Do not release this entry's bytes until complete_transition, after the
+    // coordinator has drained its in-flight operation and worker.
+    let loading = registry.loading.get(name).cloned();
+    if let Some(loading) = &loading {
+        loading.cancel();
+    }
+    Some((
+        name.to_owned(),
+        LifecycleAction {
+            transition,
+            entry: Some(entry),
+            loading,
+        },
+    ))
+}
+
+fn policy_evictions_locked(
+    registry: &mut Registry,
+    touched: &str,
+) -> Vec<(String, LifecycleAction)> {
+    let mut evicted = Vec::new();
+    loop {
+        let over_capacity = registry.lru.len() > HOT_CACHE_CAPACITY;
+        let projected_memory_bytes = registry
+            .total_memory_bytes
+            .saturating_sub(draining_memory_bytes(registry));
+        let over_budget = registry
+            .memory_budget
+            .is_some_and(|budget| projected_memory_bytes > budget);
+        if !over_capacity && !over_budget {
+            break;
+        }
+
+        let candidate = registry
+            .lru
+            .iter()
+            .find(|name| {
+                name.as_str() != touched
+                    && registry
+                        .entries
+                        .get(*name)
+                        .is_some_and(|entry| !entry.closing.load(Ordering::Acquire))
+            })
+            .cloned();
+        let Some(candidate) = candidate else {
+            break;
+        };
+        let Some(action) = begin_evict_locked(registry, &candidate) else {
+            registry.lru.retain(|name| name != &candidate);
+            continue;
+        };
+        evicted.push(action);
+    }
+    evicted
+}
+
+/// The global ledger retains bytes until a transition has drained the
+/// operation lock and worker. Policy decisions should nevertheless project
+/// those already-registered drains out of the snapshot, or one policy pass
+/// would schedule every older namespace instead of only the bytes needed to
+/// get back under budget.
+fn draining_memory_bytes(registry: &Registry) -> usize {
+    registry
+        .transitions
+        .keys()
+        .filter_map(|name| {
+            registry
+                .entries
+                .get(name)
+                .map(|entry| entry.memory_bytes.load(Ordering::Acquire))
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
+async fn refresh_memory_and_schedule_evictions(
+    registry: Arc<Mutex<Registry>>,
+    name: String,
+    entry: Arc<NamespaceEntry>,
+) {
+    // Every caller holds entry.operation while sampling and committing this
+    // estimate. That keeps the ledger update in the same order as the
+    // namespace mutation that produced it.
+    let memory_bytes = entry.namespace.read().await.memory_bytes();
+    let evicted = {
+        let mut registry = registry.lock().await;
+        let current = registry
+            .entries
+            .get(&name)
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, &entry));
+        if !current || entry.closing.load(Ordering::Acquire) {
+            Vec::new()
+        } else {
+            let previous = entry.memory_bytes.swap(memory_bytes, Ordering::AcqRel);
+            if memory_bytes >= previous {
+                registry.total_memory_bytes = registry
+                    .total_memory_bytes
+                    .saturating_add(memory_bytes - previous);
+            } else {
+                registry.total_memory_bytes = registry
+                    .total_memory_bytes
+                    .saturating_sub(previous - memory_bytes);
+            }
+            policy_evictions_locked(&mut registry, &name)
+        }
+    };
+    for (evicted_name, action) in evicted {
+        start_evict_transition(registry.clone(), evicted_name, action);
     }
 }
 
@@ -989,7 +1175,12 @@ async fn flush_and_compact(entry: &Arc<NamespaceEntry>) -> Result<()> {
 }
 
 impl NamespaceEntry {
-    fn start_worker(self: &Arc<Self>) {
+    fn start_worker(
+        self: &Arc<Self>,
+        registry: Weak<Mutex<Registry>>,
+        name: String,
+        accounting_enabled: bool,
+    ) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -1043,7 +1234,20 @@ impl NamespaceEntry {
                     if entry.closing.load(Ordering::Acquire) {
                         break;
                     }
-                    if let Err(error) = flush_and_compact(&entry).await {
+                    let flush_result = flush_and_compact(&entry).await;
+                    if accounting_enabled {
+                        let Some(registry) = registry.upgrade() else {
+                            break;
+                        };
+                        refresh_memory_and_schedule_evictions(
+                            registry,
+                            name.clone(),
+                            entry.clone(),
+                        )
+                        .await;
+                    }
+                    drop(_operation);
+                    if let Err(error) = flush_result {
                         let mut namespace = entry.namespace.write().await;
                         namespace.record_flush_error(&error);
                         eprintln!(
@@ -1072,6 +1276,23 @@ fn touch_locked(registry: &mut Registry, name: &str) {
     registry.lru.push_back(name.to_owned());
 }
 
+fn memory_budget_from_env() -> Result<Option<usize>> {
+    let Ok(value) = env::var(MEMORY_BUDGET_ENV) else {
+        return Ok(None);
+    };
+    let budget = value.parse::<usize>().map_err(|_| {
+        Error::Validation(format!(
+            "{MEMORY_BUDGET_ENV} must be a positive integer number of bytes"
+        ))
+    })?;
+    if budget == 0 {
+        return Err(Error::Validation(format!(
+            "{MEMORY_BUDGET_ENV} must be greater than zero"
+        )));
+    }
+    Ok(Some(budget))
+}
+
 fn ensure_open(entry: &NamespaceEntry, name: &str) -> Result<()> {
     if entry.closing.load(Ordering::Acquire) {
         Err(Error::NotFound(format!("namespace not found: {name}")))
@@ -1095,14 +1316,185 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        start_open_load, AdmissionWaitHook, ColdLoadContext, Coordinator, LoadFinalizeHook,
-        LoadingSlot, WorkerRaceHook, ADMISSION_WAIT_HOOK, COLD_LOAD_CONCURRENCY,
-        LOAD_FINALIZE_HOOK, WORKER_RACE_HOOK,
+        start_evict_transition, start_open_load, AdmissionWaitHook, ColdLoadContext, Coordinator,
+        LoadFinalizeHook, LoadingSlot, WorkerRaceHook, ADMISSION_WAIT_HOOK, COLD_LOAD_CONCURRENCY,
+        HOT_CACHE_CAPACITY, LOAD_FINALIZE_HOOK, WORKER_RACE_HOOK,
     };
     use crate::engine::Engine;
     use crate::namespace::{Query, SharedStore};
-    use crate::store::LocalDirStore;
+    use crate::store::{LocalDirStore, ObjectStore};
     use crate::Doc;
+
+    struct LoadGate {
+        block_next: std::sync::atomic::AtomicBool,
+        entered: std::sync::Barrier,
+        release: std::sync::Barrier,
+    }
+
+    struct GatedStore {
+        inner: LocalDirStore,
+        gate: std::sync::Arc<LoadGate>,
+    }
+
+    struct AdmissionStore {
+        inner: LocalDirStore,
+        enabled: std::sync::atomic::AtomicBool,
+        block_remaining: std::sync::atomic::AtomicUsize,
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
+        entered: std::sync::Arc<std::sync::Barrier>,
+        released: std::sync::Arc<std::sync::Barrier>,
+    }
+
+    impl AdmissionStore {
+        fn set_enabled(&self) {
+            self.enabled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        fn update_max(&self, active: usize) {
+            let mut current = self.max_active.load(std::sync::atomic::Ordering::Acquire);
+            while active > current {
+                match self.max_active.compare_exchange(
+                    current,
+                    active,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
+        }
+
+        fn take_block(&self) -> bool {
+            let mut remaining = self
+                .block_remaining
+                .load(std::sync::atomic::Ordering::Acquire);
+            loop {
+                if remaining == 0 {
+                    return false;
+                }
+                match self.block_remaining.compare_exchange(
+                    remaining,
+                    remaining - 1,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                ) {
+                    Ok(_) => return true,
+                    Err(observed) => remaining = observed,
+                }
+            }
+        }
+    }
+
+    impl ObjectStore for GatedStore {
+        fn put(&self, key: &str, bytes: &[u8]) -> crate::Result<()> {
+            self.inner.put(key, bytes)
+        }
+
+        fn get(&self, key: &str) -> crate::Result<Vec<u8>> {
+            if key.starts_with("ns/a/")
+                && self
+                    .gate
+                    .block_next
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                self.gate.entered.wait();
+                self.gate.release.wait();
+            }
+            self.inner.get(key)
+        }
+
+        fn list(&self, prefix: &str) -> crate::Result<Vec<String>> {
+            self.inner.list(prefix)
+        }
+
+        fn delete(&self, key: &str) -> crate::Result<()> {
+            self.inner.delete(key)
+        }
+    }
+
+    impl ObjectStore for AdmissionStore {
+        fn put(&self, key: &str, bytes: &[u8]) -> crate::Result<()> {
+            self.inner.put(key, bytes)
+        }
+
+        fn get(&self, key: &str) -> crate::Result<Vec<u8>> {
+            let active = self
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                + 1;
+            self.update_max(active);
+            let first_manifest = self.enabled.load(std::sync::atomic::Ordering::Acquire)
+                && key.ends_with("/MANIFEST.json")
+                && self.take_block();
+            if first_manifest {
+                self.entered.wait();
+                self.released.wait();
+            }
+            let result = self.inner.get(key);
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            result
+        }
+
+        fn list(&self, prefix: &str) -> crate::Result<Vec<String>> {
+            self.inner.list(prefix)
+        }
+
+        fn delete(&self, key: &str) -> crate::Result<()> {
+            self.inner.delete(key)
+        }
+    }
+
+    async fn wait_for_transition(coordinator: &Coordinator, name: &str) {
+        for _ in 0..1_000 {
+            if coordinator
+                .registry
+                .lock()
+                .await
+                .transitions
+                .contains_key(name)
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("policy did not register a transition for {name}");
+    }
+
+    async fn wait_for_transition_cleared(coordinator: &Coordinator, name: &str) {
+        for _ in 0..1_000 {
+            if !coordinator
+                .registry
+                .lock()
+                .await
+                .transitions
+                .contains_key(name)
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("transition for {name} did not complete");
+    }
+
+    async fn wait_for_no_transitions(coordinator: &Coordinator) {
+        let mut clear_rounds = 0;
+        for _ in 0..1_000 {
+            if coordinator.registry.lock().await.transitions.is_empty() {
+                clear_rounds += 1;
+                if clear_rounds == 3 {
+                    return;
+                }
+            } else {
+                clear_rounds = 0;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("lifecycle transitions did not complete");
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn evict_cancels_worker_waiting_for_operation_lock() {
@@ -1259,5 +1651,512 @@ mod tests {
             .await
             .expect("reload after cancelled finalization");
         assert_eq!(result[0].id, "a");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn budget_eviction_is_lru_and_reloads_through_the_coordinator() {
+        let root = tempdir().expect("tempdir");
+        let store = std::sync::Arc::new(LocalDirStore::new(root.path()).expect("store"));
+        let shared_store: SharedStore = store.clone();
+        let seed = Coordinator::new(shared_store.clone());
+        for name in ["a", "b"] {
+            seed.upsert(
+                name,
+                vec![Doc {
+                    id: "doc".to_owned(),
+                    vector: Some(vec![1.0, 0.0]),
+                    attributes: BTreeMap::new(),
+                }],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("seed upsert");
+            seed.force_flush(name).await.expect("seed flush");
+            seed.evict(name).await.expect("seed eviction");
+        }
+
+        let probe = Coordinator::with_memory_budget(shared_store.clone(), Some(usize::MAX));
+        probe
+            .query(
+                "a",
+                &Query {
+                    vector: Some(vec![1.0, 0.0]),
+                    text: None,
+                    filter: None,
+                    top_k: 1,
+                    include_attributes: false,
+                },
+            )
+            .await
+            .expect("probe a");
+        let a_bytes = probe.loaded_memory_bytes().await;
+        probe.evict("a").await.expect("probe eviction");
+        probe
+            .query(
+                "b",
+                &Query {
+                    vector: Some(vec![1.0, 0.0]),
+                    text: None,
+                    filter: None,
+                    top_k: 1,
+                    include_attributes: false,
+                },
+            )
+            .await
+            .expect("probe b");
+        let b_bytes = probe.loaded_memory_bytes().await;
+        probe.evict("b").await.expect("probe eviction");
+
+        assert_eq!(
+            a_bytes, b_bytes,
+            "identical loaded state must account identically"
+        );
+        let budget = a_bytes.max(b_bytes) + a_bytes.min(b_bytes) - 1;
+        let coordinator = Coordinator::with_memory_budget(shared_store, Some(budget));
+        let query = Query {
+            vector: Some(vec![1.0, 0.0]),
+            text: None,
+            filter: None,
+            top_k: 1,
+            include_attributes: false,
+        };
+        coordinator.query("a", &query).await.expect("load a");
+        let a_entry = coordinator
+            .registry
+            .lock()
+            .await
+            .entries
+            .get("a")
+            .cloned()
+            .expect("loaded a entry");
+        let a_operation = a_entry.operation.lock().await;
+        coordinator.query("b", &query).await.expect("load b");
+        wait_for_transition(&coordinator, "a").await;
+        assert!(coordinator.loaded_memory_bytes().await > budget);
+
+        let b_entry = coordinator
+            .registry
+            .lock()
+            .await
+            .entries
+            .get("b")
+            .cloned()
+            .expect("loaded b entry");
+        let b_operation = b_entry.operation.lock().await;
+        drop(a_operation);
+        coordinator.query("a", &query).await.expect("reload a");
+        wait_for_transition(&coordinator, "b").await;
+        drop(b_operation);
+        wait_for_transition_cleared(&coordinator, "b").await;
+        assert_eq!(
+            coordinator.loaded_namespaces().await.expect("loaded"),
+            vec!["a"]
+        );
+        assert!(coordinator.loaded_memory_bytes().await <= budget);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn budget_policy_projects_draining_bytes_and_evicts_once() {
+        let root = tempdir().expect("tempdir");
+        let store = std::sync::Arc::new(LocalDirStore::new(root.path()).expect("store"));
+        let shared_store: SharedStore = store;
+        let coordinator = Coordinator::with_memory_budget(shared_store, Some(usize::MAX));
+        let query = Query {
+            vector: Some(vec![1.0, 0.0]),
+            text: None,
+            filter: None,
+            top_k: 1,
+            include_attributes: false,
+        };
+
+        for name in ["a", "b", "c"] {
+            coordinator
+                .upsert(
+                    name,
+                    vec![Doc {
+                        id: "doc".to_owned(),
+                        vector: Some(vec![1.0, 0.0]),
+                        attributes: BTreeMap::new(),
+                    }],
+                    Vec::new(),
+                    BTreeMap::new(),
+                )
+                .await
+                .expect("seed upsert");
+            coordinator.force_flush(name).await.expect("seed flush");
+            coordinator.evict(name).await.expect("seed eviction");
+        }
+
+        coordinator.query("a", &query).await.expect("load a");
+        let namespace_bytes = coordinator.loaded_memory_bytes().await;
+        coordinator.query("b", &query).await.expect("load b");
+        coordinator.query("c", &query).await.expect("load c");
+        coordinator.query("b", &query).await.expect("touch b");
+
+        let a_entry = coordinator
+            .registry
+            .lock()
+            .await
+            .entries
+            .get("a")
+            .cloned()
+            .expect("loaded a entry");
+        let a_operation = a_entry.operation.lock().await;
+        let budget = namespace_bytes.saturating_mul(2);
+        let actions = {
+            let mut registry = coordinator.registry.lock().await;
+            registry.memory_budget = Some(budget);
+            super::policy_evictions_locked(&mut registry, "b")
+        };
+
+        assert_eq!(actions.len(), 1, "policy scheduled more than one eviction");
+        assert_eq!(actions[0].0, "a", "policy must choose the LRU namespace");
+        for (name, action) in actions {
+            start_evict_transition(coordinator.registry.clone(), name, action);
+        }
+        assert_eq!(
+            coordinator.registry.lock().await.transitions.len(),
+            1,
+            "one over-budget decision should register one drain"
+        );
+        assert!(coordinator.loaded_memory_bytes().await > budget);
+
+        drop(a_operation);
+        wait_for_transition_cleared(&coordinator, "a").await;
+        assert_eq!(
+            coordinator.loaded_namespaces().await.expect("loaded"),
+            vec!["b", "c"]
+        );
+        assert!(coordinator.loaded_memory_bytes().await <= budget);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn policy_keeps_an_inflight_load_out_of_eviction_candidates() {
+        let root = tempdir().expect("tempdir");
+        let gate = std::sync::Arc::new(LoadGate {
+            block_next: std::sync::atomic::AtomicBool::new(false),
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        });
+        let store = std::sync::Arc::new(GatedStore {
+            inner: LocalDirStore::new(root.path()).expect("store"),
+            gate: gate.clone(),
+        });
+        let shared_store: SharedStore = store.clone();
+        let seed = Coordinator::new(shared_store.clone());
+        for name in ["a", "b", "c"] {
+            seed.upsert(
+                name,
+                vec![Doc {
+                    id: "doc".to_owned(),
+                    vector: Some(vec![1.0, 0.0]),
+                    attributes: BTreeMap::new(),
+                }],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("seed upsert");
+            seed.force_flush(name).await.expect("seed flush");
+            seed.evict(name).await.expect("seed eviction");
+        }
+
+        let probe = Coordinator::with_memory_budget(shared_store.clone(), Some(usize::MAX));
+        let query = Query {
+            vector: Some(vec![1.0, 0.0]),
+            text: None,
+            filter: None,
+            top_k: 1,
+            include_attributes: false,
+        };
+        probe.query("b", &query).await.expect("probe load");
+        let namespace_bytes = probe.loaded_memory_bytes().await;
+        probe.evict("b").await.expect("probe eviction");
+
+        let coordinator = std::sync::Arc::new(Coordinator::with_memory_budget(
+            shared_store,
+            Some(namespace_bytes + 1),
+        ));
+        coordinator.query("b", &query).await.expect("load b");
+        let b_entry = coordinator
+            .registry
+            .lock()
+            .await
+            .entries
+            .get("b")
+            .cloned()
+            .expect("loaded b entry");
+        let b_operation = b_entry.operation.lock().await;
+
+        gate.block_next
+            .store(true, std::sync::atomic::Ordering::Release);
+        let loading = std::sync::Arc::new(LoadingSlot::new());
+        coordinator
+            .registry
+            .lock()
+            .await
+            .loading
+            .insert("a".to_owned(), loading.clone());
+        let context = ColdLoadContext {
+            registry: coordinator.registry.clone(),
+            store: coordinator.store.clone(),
+            admission: coordinator.cold_load_admission.clone(),
+        };
+        let admission_waiting = loading.admission_waiting.notified();
+        let a_load = tokio::spawn({
+            let loading = loading.clone();
+            async move {
+                start_open_load(context, "a".to_owned(), loading.clone()).await;
+                loading.wait().await
+            }
+        });
+        admission_waiting.await;
+        let entered_gate = {
+            let gate = gate.clone();
+            tokio::task::spawn_blocking(move || gate.entered.wait())
+        };
+        entered_gate.await.expect("load gate task");
+
+        coordinator.query("c", &query).await.expect("load c");
+        wait_for_transition(&coordinator, "b").await;
+        {
+            let registry = coordinator.registry.lock().await;
+            assert!(registry.loading.contains_key("a"));
+            assert!(!registry.transitions.contains_key("a"));
+        }
+
+        drop(b_operation);
+        wait_for_transition_cleared(&coordinator, "b").await;
+        let release_gate = {
+            let gate = gate.clone();
+            tokio::task::spawn_blocking(move || gate.release.wait())
+        };
+        release_gate.await.expect("release gate task");
+        assert!(a_load.await.expect("load task").is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn budget_churn_preserves_admission_bound() {
+        let root = tempdir().expect("tempdir");
+        let admission = COLD_LOAD_CONCURRENCY;
+        let store = std::sync::Arc::new(AdmissionStore {
+            inner: LocalDirStore::new(root.path()).expect("store"),
+            enabled: std::sync::atomic::AtomicBool::new(false),
+            block_remaining: std::sync::atomic::AtomicUsize::new(admission),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            max_active: std::sync::atomic::AtomicUsize::new(0),
+            entered: std::sync::Arc::new(std::sync::Barrier::new(admission + 1)),
+            released: std::sync::Arc::new(std::sync::Barrier::new(admission + 1)),
+        });
+        let shared_store: SharedStore = store.clone();
+        let seed = Coordinator::new(shared_store.clone());
+        let names = (0..admission + 2)
+            .map(|index| format!("admission-{index}"))
+            .collect::<Vec<_>>();
+        for name in &names {
+            seed.upsert(
+                name,
+                vec![Doc {
+                    id: "doc".to_owned(),
+                    vector: Some(vec![1.0, 0.0]),
+                    attributes: BTreeMap::new(),
+                }],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("seed upsert");
+            seed.force_flush(name).await.expect("seed flush");
+            seed.evict(name).await.expect("seed eviction");
+        }
+
+        let probe = Coordinator::with_memory_budget(shared_store.clone(), Some(usize::MAX));
+        let query = Query {
+            vector: Some(vec![1.0, 0.0]),
+            text: None,
+            filter: None,
+            top_k: 1,
+            include_attributes: false,
+        };
+        probe.query(&names[0], &query).await.expect("probe load");
+        let namespace_bytes = probe.loaded_memory_bytes().await;
+        probe.evict(&names[0]).await.expect("probe eviction");
+        let budget = namespace_bytes.saturating_mul(2).saturating_add(1);
+        let coordinator =
+            std::sync::Arc::new(Coordinator::with_memory_budget(shared_store, Some(budget)));
+        store.set_enabled();
+
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(names.len() + 1));
+        let mut loads = Vec::new();
+        for name in names {
+            let coordinator = coordinator.clone();
+            let start = start.clone();
+            let query = query.clone();
+            loads.push(tokio::spawn(async move {
+                start.wait().await;
+                coordinator.query(&name, &query).await
+            }));
+        }
+        start.wait().await;
+        let entered = {
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || store.entered.wait())
+        };
+        entered.await.expect("admission gate task");
+        let released = {
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || store.released.wait())
+        };
+        released.await.expect("release gate task");
+
+        for load in loads {
+            let result = load.await.expect("load task");
+            assert!(result.is_ok(), "budget churn query failed: {result:?}");
+        }
+        wait_for_no_transitions(&coordinator).await;
+        assert!(
+            store.max_active.load(std::sync::atomic::Ordering::Acquire) <= admission,
+            "admission high-water mark exceeded: {} > {admission}",
+            store.max_active.load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(coordinator.loaded_memory_bytes().await <= budget);
+    }
+
+    #[tokio::test]
+    async fn oversized_namespace_is_the_budget_soft_floor() {
+        let root = tempdir().expect("tempdir");
+        let store = std::sync::Arc::new(LocalDirStore::new(root.path()).expect("store"));
+        let shared_store: SharedStore = store;
+        let coordinator = Coordinator::with_memory_budget(shared_store, Some(1));
+        coordinator
+            .upsert(
+                "oversized",
+                vec![Doc {
+                    id: "doc".to_owned(),
+                    vector: Some(vec![1.0, 0.0]),
+                    attributes: BTreeMap::new(),
+                }],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("upsert oversized namespace");
+
+        assert_eq!(
+            coordinator.loaded_namespaces().await.expect("loaded"),
+            vec!["oversized"]
+        );
+        assert!(coordinator.loaded_memory_bytes().await > 1);
+    }
+
+    #[tokio::test]
+    async fn tombstones_are_included_in_memory_accounting() {
+        let root = tempdir().expect("tempdir");
+        let store = std::sync::Arc::new(LocalDirStore::new(root.path()).expect("store"));
+        let shared_store: SharedStore = store;
+        let coordinator = Coordinator::with_memory_budget(shared_store, Some(usize::MAX));
+        coordinator
+            .upsert(
+                "tombstones",
+                vec![Doc {
+                    id: "doc".to_owned(),
+                    vector: Some(vec![1.0, 0.0]),
+                    attributes: BTreeMap::new(),
+                }],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("upsert");
+        coordinator.force_flush("tombstones").await.expect("flush");
+        let before_delete = coordinator.loaded_memory_bytes().await;
+
+        coordinator
+            .upsert(
+                "tombstones",
+                Vec::new(),
+                vec!["doc".to_owned()],
+                BTreeMap::new(),
+            )
+            .await
+            .expect("delete");
+        assert!(coordinator.loaded_memory_bytes().await > before_delete);
+    }
+
+    #[tokio::test]
+    async fn unlimited_default_preserves_hot_cache_behavior_without_accounting() {
+        let root = tempdir().expect("tempdir");
+        let store = std::sync::Arc::new(LocalDirStore::new(root.path()).expect("store"));
+        let shared_store: SharedStore = store;
+        let coordinator = Coordinator::new(shared_store);
+        for index in 0..=HOT_CACHE_CAPACITY {
+            coordinator
+                .upsert(
+                    &format!("ns-{index}"),
+                    vec![Doc {
+                        id: "doc".to_owned(),
+                        vector: Some(vec![1.0, 0.0]),
+                        attributes: BTreeMap::new(),
+                    }],
+                    Vec::new(),
+                    BTreeMap::new(),
+                )
+                .await
+                .expect("upsert");
+        }
+
+        assert_eq!(coordinator.loaded_memory_bytes().await, 0);
+        assert!(coordinator.loaded_namespaces().await.expect("loaded").len() <= HOT_CACHE_CAPACITY);
+        coordinator
+            .query(
+                "ns-0",
+                &Query {
+                    vector: Some(vec![1.0, 0.0]),
+                    text: None,
+                    filter: None,
+                    top_k: 1,
+                    include_attributes: false,
+                },
+            )
+            .await
+            .expect("reload after capacity eviction");
+    }
+
+    #[tokio::test]
+    async fn dropping_coordinator_drops_worker_registry_references() {
+        let root = tempdir().expect("tempdir");
+        let store = std::sync::Arc::new(LocalDirStore::new(root.path()).expect("store"));
+        let shared_store: SharedStore = store;
+        let coordinator = std::sync::Arc::new(Coordinator::new(shared_store));
+        coordinator
+            .upsert(
+                "drop-check",
+                vec![Doc {
+                    id: "doc".to_owned(),
+                    vector: None,
+                    attributes: BTreeMap::new(),
+                }],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("upsert");
+        let weak_registry = std::sync::Arc::downgrade(&coordinator.registry);
+        let entry = coordinator
+            .registry
+            .lock()
+            .await
+            .entries
+            .get("drop-check")
+            .cloned()
+            .expect("entry");
+        let weak_entry = std::sync::Arc::downgrade(&entry);
+        drop(entry);
+
+        drop(coordinator);
+
+        assert!(weak_registry.upgrade().is_none());
+        assert!(weak_entry.upgrade().is_none());
     }
 }

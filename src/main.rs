@@ -14,7 +14,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let bucket = env::var("PUFFERCLONE_S3_BUCKET").map_err(|_| {
                 "PUFFERCLONE_S3_BUCKET must be set when PUFFERCLONE_S3_URL is configured"
             })?;
-            Arc::new(Engine::with_store(Arc::new(S3Store::new(url, bucket)?)))
+            Arc::new(Engine::try_with_store(Arc::new(S3Store::new(
+                url, bucket,
+            )?))?)
         }
         Err(_) => Arc::new(Engine::new(data_dir)?),
     };

@@ -4,18 +4,20 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use serde::Serialize;
 use tokio::sync::Notify;
 
 use crate::index::filter::Filter;
 use crate::index::hnsw::Hnsw;
-use crate::index::text::{TextIndex, TextStats};
+use crate::index::text::TextStats;
 use crate::index::vector::ExactScan;
 use crate::index::{rrf_default, sort_scores};
-use crate::segment::{
-    list_namespace_segment_objects, list_segment_objects, SegmentBuilder, SegmentReader,
+use crate::loaded::{
+    build_text_index, cleanup_orphan_segments, estimate_memory_bytes, LoadedSegment,
 };
+use crate::segment::{list_segment_objects, SegmentBuilder};
 use crate::store::ObjectStore;
-use crate::wal::{wal_key, Manifest, SegmentMeta, WalBatch};
+use crate::wal::{wal_key, Manifest, WalBatch};
 use crate::{AttrValue, Doc, Error, Result};
 
 const DOC_FLUSH_THRESHOLD: usize = 1_000;
@@ -56,20 +58,10 @@ pub struct QueryResult {
     pub attributes: Option<BTreeMap<String, AttrValue>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct MemEntry {
     seq: u64,
     doc: Doc,
-}
-
-struct LoadedSegment {
-    meta: SegmentMeta,
-    docs: Vec<Doc>,
-    vectors: ExactScan,
-    hnsw: Option<Hnsw>,
-    text: TextIndex,
-    indexed_fields: Vec<String>,
-    tombstones: BTreeMap<String, u64>,
 }
 
 pub(crate) struct CompactionPlan {
@@ -144,8 +136,9 @@ impl Namespace {
         let mut segments = Vec::with_capacity(manifest.segments.len());
         let mut tombstones: BTreeMap<String, u64> = BTreeMap::new();
         for meta in &manifest.segments {
-            let segment = load_segment(store.as_ref(), &name, meta, &manifest.full_text_fields)?;
-            for (id, seq) in &segment.tombstones {
+            let segment =
+                LoadedSegment::load(store.as_ref(), &name, meta, &manifest.full_text_fields)?;
+            for (id, seq) in segment.tombstones() {
                 tombstones
                     .entry(id.clone())
                     .and_modify(|current| *current = (*current).max(*seq))
@@ -199,6 +192,15 @@ impl Namespace {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Estimate the memory retained by the loaded namespace.
+    ///
+    /// Segment payloads use their encoded document and index-section sizes;
+    /// the mutable tail uses its deterministic bincode size. This is an
+    /// accounting estimate, not an allocator-level measurement.
+    pub(crate) fn memory_bytes(&self) -> usize {
+        estimate_memory_bytes(&self.segments, &self.memtable, &self.tombstones)
     }
 
     /// Apply a durable upsert/delete batch and return only after the WAL and
@@ -448,7 +450,7 @@ impl Namespace {
             .with_id(segment_id)
             .build_allow_empty(docs, sections)
             .map_err(|error| Error::Store(error.to_string()))?;
-        let loaded = load_segment(
+        let loaded = LoadedSegment::load(
             self.store.as_ref(),
             &self.name,
             &meta,
@@ -518,7 +520,7 @@ impl Namespace {
 
         let input_metas = selected
             .iter()
-            .map(|&index| self.segments[index].meta.clone())
+            .map(|&index| self.segments[index].meta().clone())
             .collect::<Vec<_>>();
         let input_objects = input_metas
             .iter()
@@ -576,7 +578,7 @@ impl Namespace {
         .with_id(segment_id)
         .build_allow_empty(docs, sections)
         .map_err(|error| Error::Store(error.to_string()))?;
-        let output = load_segment(
+        let output = LoadedSegment::load(
             self.store.as_ref(),
             &self.name,
             &output_meta,
@@ -655,7 +657,7 @@ impl Namespace {
         let logical = self.logical_documents();
         let has_stale_segment = self.segments.iter().enumerate().any(|(index, segment)| {
             let dead_docs = segment
-                .docs
+                .docs()
                 .iter()
                 .filter(|doc| {
                     !logical
@@ -663,7 +665,7 @@ impl Namespace {
                         .is_some_and(|(_, source)| *source == Source::Segment(index))
                 })
                 .count();
-            dead_docs > segment.docs.len() / 2
+            dead_docs > segment.docs().len() / 2
         });
         (self.segments.len() >= 4 || has_stale_segment).then(|| (0..self.segments.len()).collect())
     }
@@ -685,11 +687,11 @@ impl Namespace {
     fn logical_documents(&self) -> BTreeMap<String, (Doc, Source)> {
         let mut logical = BTreeMap::new();
         for (segment_index, segment) in self.segments.iter().enumerate() {
-            for doc in &segment.docs {
+            for doc in segment.docs() {
                 if self
                     .tombstones
                     .get(&doc.id)
-                    .is_some_and(|tombstone| *tombstone > segment.meta.last_wal_seq)
+                    .is_some_and(|tombstone| *tombstone > segment.meta().last_wal_seq)
                 {
                     continue;
                 }
@@ -723,10 +725,10 @@ impl Namespace {
         let mut results = Vec::new();
         for (index, segment) in self.segments.iter().enumerate() {
             let ids = source_ids(logical, allowed, Source::Segment(index));
-            if let Some(hnsw) = &segment.hnsw {
+            if let Some(hnsw) = segment.hnsw() {
                 results.extend(hnsw.search_filtered_with_ef(query, top_k, ef_search, Some(&ids)));
             } else {
-                results.extend(segment.vectors.search_filtered(query, top_k, Some(&ids)));
+                results.extend(segment.vectors().search_filtered(query, top_k, Some(&ids)));
             }
         }
         let memtable_index = ExactScan::build(logical.iter().filter_map(|(id, (doc, source))| {
@@ -758,10 +760,10 @@ impl Namespace {
         let mut source_live = Vec::with_capacity(self.segments.len() + 1);
         for (index, segment) in self.segments.iter().enumerate() {
             indexes.push(
-                if segment.indexed_fields == self.manifest.full_text_fields {
-                    segment.text.clone()
+                if segment.indexed_fields() == self.manifest.full_text_fields {
+                    segment.text().clone()
                 } else {
-                    build_text_index(&segment.docs, &self.manifest.full_text_fields)
+                    build_text_index(segment.docs(), &self.manifest.full_text_fields)
                 },
             );
             source_allowed.push(source_ids(logical, allowed, Source::Segment(index)));
@@ -787,99 +789,6 @@ impl Namespace {
         results.truncate(top_k);
         results
     }
-}
-
-fn load_segment(
-    store: &dyn ObjectStore,
-    namespace: &str,
-    meta: &SegmentMeta,
-    fields: &[String],
-) -> Result<LoadedSegment> {
-    let reader = SegmentReader::open(store, namespace, &meta.id)
-        .map_err(|error| Error::Store(error.to_string()))?;
-    let docs = reader.documents().cloned().collect::<Vec<_>>();
-    let vectors = match reader.section_bytes("vectors") {
-        Ok(bytes) => {
-            ExactScan::from_bytes(&bytes).map_err(|error| Error::Store(error.to_string()))?
-        }
-        Err(crate::segment::SegmentError::SectionNotFound(_)) => {
-            ExactScan::build(docs.iter().filter_map(|doc| {
-                doc.vector
-                    .as_ref()
-                    .map(|vector| (doc.id.clone(), vector.clone()))
-            }))
-        }
-        Err(error) => return Err(Error::Store(error.to_string())),
-    };
-    let hnsw = match reader.section_bytes("hnsw") {
-        Ok(bytes) => {
-            Some(Hnsw::from_bytes(&bytes).map_err(|error| Error::Store(error.to_string()))?)
-        }
-        Err(crate::segment::SegmentError::SectionNotFound(_)) => None,
-        Err(error) => return Err(Error::Store(error.to_string())),
-    };
-    let _persisted_text = match reader.section_bytes("text") {
-        Ok(bytes) => {
-            TextIndex::from_bytes(&bytes).map_err(|error| Error::Store(error.to_string()))?
-        }
-        Err(crate::segment::SegmentError::SectionNotFound(_)) => build_text_index(&docs, fields),
-        Err(error) => return Err(Error::Store(error.to_string())),
-    };
-    let tombstones = match reader.section_bytes("tombstones") {
-        Ok(bytes) => {
-            bincode::deserialize(&bytes).map_err(|error| Error::Store(error.to_string()))?
-        }
-        Err(crate::segment::SegmentError::SectionNotFound(_)) => BTreeMap::new(),
-        Err(error) => return Err(Error::Store(error.to_string())),
-    };
-    let text = build_text_index(&docs, fields);
-    Ok(LoadedSegment {
-        meta: meta.clone(),
-        docs,
-        vectors,
-        hnsw,
-        text,
-        indexed_fields: fields.to_vec(),
-        tombstones,
-    })
-}
-
-fn cleanup_orphan_segments(
-    store: &dyn ObjectStore,
-    namespace: &str,
-    manifest: &Manifest,
-) -> Result<()> {
-    let referenced = manifest
-        .segments
-        .iter()
-        .map(|segment| segment.id.as_str())
-        .collect::<HashSet<_>>();
-    let keys = list_namespace_segment_objects(store, namespace)
-        .map_err(|error| Error::Store(error.to_string()))?;
-    let prefix = format!("ns/{namespace}/segments/");
-    for key in keys {
-        let Some(segment_id) = key
-            .strip_prefix(&prefix)
-            .and_then(|suffix| suffix.split('/').next())
-        else {
-            continue;
-        };
-        if !referenced.contains(segment_id) {
-            store.delete(&key)?;
-        }
-    }
-    Ok(())
-}
-
-fn build_text_index(docs: &[Doc], fields: &[String]) -> TextIndex {
-    TextIndex::build(docs.iter().flat_map(|doc| {
-        fields.iter().filter_map(|field| {
-            doc.attributes.get(field).and_then(|value| match value {
-                AttrValue::String(text) => Some((doc.id.clone(), text.clone())),
-                _ => None,
-            })
-        })
-    }))
 }
 
 fn wal_key_seq(key: &str) -> Option<u64> {

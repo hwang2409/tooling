@@ -258,6 +258,7 @@ pub struct SegmentReader<'a> {
     namespace: String,
     meta: SegmentMeta,
     docs: Vec<Doc>,
+    doc_bytes: usize,
 }
 
 impl<'a> SegmentReader<'a> {
@@ -328,6 +329,7 @@ impl<'a> SegmentReader<'a> {
                     .collect(),
             },
             docs,
+            doc_bytes: docs_bytes.len(),
         })
     }
 
@@ -339,6 +341,11 @@ impl<'a> SegmentReader<'a> {
     /// Iterate over all documents in deterministic ID order.
     pub fn documents(&self) -> impl Iterator<Item = &Doc> {
         self.docs.iter()
+    }
+
+    /// Return the encoded size of the document payload loaded from storage.
+    pub fn document_bytes(&self) -> usize {
+        self.doc_bytes
     }
 
     /// Alias for SegmentReader::documents.

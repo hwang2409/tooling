@@ -1,5 +1,15 @@
 # pufferclone
 
+## Memory budget and eviction
+
+Set `PUFFERCLONE_MEMORY_BUDGET_BYTES` to a positive byte budget to bound the
+loaded namespace cache. The default is unset, which preserves the existing
+unlimited behavior. When the budget is exceeded, the coordinator evicts the
+least-recently queried or written loaded namespaces through its normal drain
+and eviction path. A namespace that is larger than the whole budget still
+loads, so one namespace remains available even when the soft budget cannot be
+met. `0` and non-numeric values are startup errors.
+
 ## MinIO end-to-end checks
 
 The repository includes a single-service MinIO fixture. It uses API port

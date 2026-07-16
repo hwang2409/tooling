@@ -4,6 +4,7 @@ pub mod api;
 pub mod engine;
 pub mod index;
 mod lifecycle;
+mod loaded;
 pub mod namespace;
 pub mod segment;
 pub mod store;

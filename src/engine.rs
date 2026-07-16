@@ -17,7 +17,7 @@ impl Engine {
     /// Open an engine backed by a local object-store directory.
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
         let store = Arc::new(LocalDirStore::new(root)?);
-        Ok(Self::with_store(store))
+        Self::try_with_store(store)
     }
 
     /// Construct an engine over a caller-provided object store.
@@ -25,10 +25,19 @@ impl Engine {
     where
         S: ObjectStore + Send + Sync + 'static,
     {
+        Self::try_with_store(store).expect("invalid PUFFERCLONE_MEMORY_BUDGET_BYTES")
+    }
+
+    /// Construct an engine over a caller-provided object store, validating
+    /// the process memory-budget configuration.
+    pub fn try_with_store<S>(store: Arc<S>) -> Result<Self>
+    where
+        S: ObjectStore + Send + Sync + 'static,
+    {
         let store: SharedStore = store;
-        Self {
-            coordinator: Coordinator::new(store),
-        }
+        Ok(Self {
+            coordinator: Coordinator::from_env(store)?,
+        })
     }
 
     pub fn hot_cache_capacity() -> usize {
@@ -95,5 +104,10 @@ impl Engine {
 
     pub async fn loaded_namespaces(&self) -> Result<Vec<String>> {
         self.coordinator.loaded_namespaces().await
+    }
+
+    /// Return the current estimate for all loaded namespaces.
+    pub async fn loaded_memory_bytes(&self) -> usize {
+        self.coordinator.loaded_memory_bytes().await
     }
 }
