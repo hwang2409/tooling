@@ -3,11 +3,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::body::Body;
+use axum::body::to_bytes;
+use axum::http::Request;
 use gauge_server::config::{Config, DurationValue, TargetConfig};
 use gauge_server::scrape::{MAX_SCRAPE_BODY_BYTES, spawn_scrapers};
-use gauge_server::server::{AppState, TargetStatus};
+use gauge_server::server::{AppState, TargetStatus, router};
 use gauge_store::{GaugeStore, Matcher, Sample};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tower::ServiceExt;
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 
@@ -411,5 +415,34 @@ async fn real_loop_rejects_oversized_body_with_bounded_streaming_read() {
                 .is_some_and(|error| error.contains("scrape body exceeds"))
     })
     .await;
+    fixture.stop();
+}
+
+#[tokio::test]
+async fn wired_query_api_returns_scraped_data() {
+    let fixture = Fixture::start().await;
+    let state = make_state(
+        &fixture,
+        &["wired"],
+        Duration::from_millis(25),
+        Duration::from_secs(1),
+    );
+    wait_for_samples(&state, "shared", "wired", |samples| !samples.is_empty()).await;
+    let timestamp = samples(&state, "shared", "wired")[0].timestamp;
+    let response = router(state)
+        .oneshot(
+            Request::get(format!(
+                "/api/query?expr=shared%7Btarget%3D%22wired%22%7D&time={timestamp}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("\"status\":\"success\""));
+    assert!(body.contains("\"value\":1.0"));
     fixture.stop();
 }

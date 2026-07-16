@@ -90,6 +90,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/metrics", get(metrics))
         .route("/api/targets", get(targets))
+        .merge(gauge_query::router(state.store.clone()).with_state(()))
         .with_state(state)
 }
 

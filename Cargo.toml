@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/gauge-cli",
     "crates/gauge-exporters",
     "crates/gauge-query",
     "crates/gauge-server",
