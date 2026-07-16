@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 axum = "0.7"
 bincode = "1"
+clap = { version = "4", features = ["derive"] }
 crc32fast = "1"
 futures-util = "0.3"
 object_store = { version = "0.14.1", default-features = false, features = ["aws"] }
@@ -13,6 +14,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+ureq = { version = "2", default-features = false }
 
 [dev-dependencies]
 criterion = "0.5"
@@ -30,6 +32,10 @@ path = "src/main.rs"
 [[bin]]
 name = "bench_recall"
 path = "src/bin/bench_recall.rs"
+
+[[bin]]
+name = "puf"
+path = "src/bin/puf.rs"
 
 [[bench]]
 name = "benchmarks"
