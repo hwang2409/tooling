@@ -2,6 +2,7 @@ import base64
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -214,6 +215,120 @@ def test_stream_observation_is_incremental_bounded_and_byte_preserving() -> None
     assert base64.b64decode(body["data"]) == b"abcde"
 
 
+def test_body_prefix_seals_after_budget_skip_and_reclamation() -> None:
+    config = CaptureConfig(
+        source_id="source",
+        max_body_prefix_bytes=64,
+        max_in_memory_bytes=4_096,
+    )
+    addon = CaptureAddon(config=config, clock=lambda: "now")
+    flow = fake_flow()
+    addon.requestheaders(flow)
+    addon.responseheaders(flow)
+    metadata_weight = addon._active_metadata_bytes
+    addon.max_in_memory_bytes = metadata_weight + 5
+    assert flow.response.stream(b"FIRST") == b"FIRST"
+    assert flow.response.stream(b"SECOND") == b"SECOND"
+    addon.max_in_memory_bytes = metadata_weight + 1024
+    assert flow.response.stream(b"THIRD") == b"THIRD"
+    addon.response(flow)
+
+    body_end = [
+        message
+        for message in payloads(addon)
+        if message.get("type") == "body.end" and message.get("body_side") == "response"
+    ][-1]
+    body = body_end["body"]
+    assert isinstance(body, Mapping)
+    assert body["captured_bytes"] == "5"
+    assert base64.b64decode(body["data"]) == b"FIRST"
+    assert body_end["total_bytes"] == "16"
+
+
+def test_body_prefix_partial_chunk_is_sealed_as_true_prefix() -> None:
+    config = CaptureConfig(
+        source_id="source",
+        max_body_prefix_bytes=64,
+        max_in_memory_bytes=4_096,
+    )
+    addon = CaptureAddon(config=config, clock=lambda: "now")
+    flow = fake_flow()
+    addon.requestheaders(flow)
+    addon.responseheaders(flow)
+    addon.max_in_memory_bytes = addon._active_metadata_bytes + 6
+    flow.response.stream(b"FIRST")
+    flow.response.stream(b"SECOND")
+    addon.max_in_memory_bytes += 1024
+    addon.response(flow)
+
+    body_end = [
+        message
+        for message in payloads(addon)
+        if message.get("type") == "body.end" and message.get("body_side") == "response"
+    ][-1]
+    body = body_end["body"]
+    assert isinstance(body, Mapping)
+    assert body["captured_bytes"] == "6"
+    assert base64.b64decode(body["data"]) == b"FIRSTS"
+    assert body_end["total_bytes"] == "11"
+
+
+def test_capture_uint64_boundaries_fail_before_body_or_lifecycle_mutation() -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    flow = fake_flow()
+    addon.requestheaders(flow)
+    state = addon._flows[flow.id]
+
+    addon._sequence = MAX_U64
+    with pytest.raises(OverflowError, match="lifecycle sequence exhausted"):
+        addon._lifecycle(state, "synthetic")
+    assert addon._sequence == MAX_U64
+    assert "synthetic" not in state.lifecycle_states
+
+    addon._sequence = 0
+    state.request.total_bytes = MAX_U64
+    with pytest.raises(OverflowError, match="body byte offset exhausted"):
+        addon._observe_chunk(state, "request", b"x")
+    assert state.request.total_bytes == MAX_U64
+    assert not state.request.observed
+
+    state.request.total_bytes = 0
+    state.request.chunk_index = MAX_U64
+    with pytest.raises(OverflowError, match="body chunk index exhausted"):
+        addon._observe_chunk(state, "request", b"")
+    assert state.request.chunk_index == MAX_U64
+    assert not state.request.observed
+
+
+def test_body_end_failure_does_not_tombstone_body_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    flow = fake_flow()
+    addon.requestheaders(flow)
+    state = addon._flows[flow.id]
+    original_send = addon._send
+
+    def fail_body_end(message: dict[str, object]) -> None:
+        if message.get("type") == "body.end":
+            raise ValueError("injected body-end validation failure")
+        original_send(message)
+
+    monkeypatch.setattr(addon, "_send", fail_body_end)
+    with pytest.raises(ValueError, match="body-end validation failure"):
+        addon._finish_body(state, "request", b"body")
+    assert not state.request.ended
+    assert state.request.stream_enabled
+    monkeypatch.undo()
+    addon._finish_body(state, "request", None)
+    assert state.request.ended
+    assert any(
+        message["type"] == "body.end"
+        for message in payloads(addon)
+        if message.get("body_side") == "request"
+    )
+
+
 @pytest.mark.parametrize(
     ("body", "state"),
     [(None, "missing"), (b"", "empty"), (b"abc", "captured"), (b"abcd", "truncated")],
@@ -277,6 +392,38 @@ def test_sink_lock_contention_returns_immediately_and_emits_gap() -> None:
     assert gap.message["dropped_count"] == "1"
 
 
+def test_loss_admission_is_nonblocking_while_position_lock_is_held() -> None:
+    sink = BoundedMessageSink(max_pending=1)
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.first"}))
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_position_lock() -> None:
+        with sink._position_lock:
+            held.set()
+            release.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_position_lock)
+    holder.start()
+    assert held.wait(timeout=1)
+    started = time.perf_counter()
+    assert sink.record_loss()
+    assert not sink.offer(parse_message({"protocol_version": "1", "type": "future.full"}))
+    assert time.perf_counter() - started < 0.05
+    release.set()
+    holder.join(timeout=1)
+    assert not holder.is_alive()
+    assert sink.dropped_count == 2
+    messages = sink.drain()
+    assert [
+        (message.message if isinstance(message, KnownParsedMessage) else message.payload)["type"]
+        for message in messages
+    ] == ["future.first", "stream.gap"]
+    gap = messages[-1]
+    assert isinstance(gap, KnownParsedMessage)
+    assert gap.message["dropped_count"] == "2"
+
+
 def test_sink_queue_and_body_drops_are_in_band_and_delivery_positioned() -> None:
     sink = BoundedMessageSink(max_pending=1, max_body_bytes=1)
     assert sink.offer(parse_message({"protocol_version": "1", "type": "future.first"}))
@@ -328,6 +475,25 @@ def test_callback_cannot_block_stream_forwarding_and_runs_only_on_explicit_drain
     assert delivered == []
     addon.drain()
     assert delivered
+
+
+def test_active_metadata_and_prefix_share_one_memory_budget() -> None:
+    config = CaptureConfig(
+        source_id="source",
+        max_body_prefix_bytes=1_024,
+        max_in_memory_bytes=1_024,
+    )
+    addon = CaptureAddon(config=config, clock=lambda: "now")
+    flow = fake_flow()
+    addon.requestheaders(flow)
+    addon.responseheaders(flow)
+    addon.max_in_memory_bytes = addon._active_metadata_bytes + 6
+    flow.response.stream(b"123456789")
+    counters = addon.counters
+    assert counters["active_metadata_bytes"] + counters["active_prefix_bytes"] <= (
+        addon.max_in_memory_bytes
+    )
+    assert counters["active_prefix_bytes"] == 6
 
 
 def test_hostile_callback_runs_only_on_consumer_thread_after_stream_returns() -> None:
@@ -601,6 +767,49 @@ def test_interrupted_acquire_cleanup_cannot_release_another_lease(
     assert holder.close() is None
     assert original_acquire(False)
     sink._reservation_lock.release()
+
+
+def test_gate_notification_retry_wakes_real_waiting_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    holder = sink_module._ReservationLease(sink._lock)
+    waiter = sink_module._ReservationLease(sink._lock)
+    assert holder.acquire()
+    entered = threading.Event()
+    acquired = threading.Event()
+    waiter_errors: list[BaseException] = []
+
+    def wait_for_gate() -> None:
+        try:
+            entered.set()
+            assert waiter.acquire(blocking=True)
+            acquired.set()
+        except BaseException as error:
+            waiter_errors.append(error)
+
+    waiter_thread = threading.Thread(target=wait_for_gate)
+    waiter_thread.start()
+    assert entered.wait(timeout=1)
+    time.sleep(0.01)
+    original_notify = sink._lock._condition.notify
+    calls = 0
+
+    def notify_once(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KeyboardInterrupt
+        original_notify(*args, **kwargs)
+
+    monkeypatch.setattr(sink._lock._condition, "notify", notify_once)
+    close_error = holder.close()
+    assert isinstance(close_error, KeyboardInterrupt)
+    assert acquired.wait(timeout=1)
+    waiter_thread.join(timeout=1)
+    assert not waiter_thread.is_alive()
+    assert waiter_errors == []
+    assert waiter.close() is None
 
 
 def test_reservation_release_baseexception_before_and_after_clear_is_recoverable(
@@ -1423,6 +1632,24 @@ def test_store_body_budget_and_expiry_counters_are_observable() -> None:
     now[0] = 11.0
     assert list(store.newest_first()) == []
     assert store.counters["expired_flows"] == 1
+
+
+def test_store_expiry_is_incremental_and_append_skips_debug_full_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+    store = MemoryStore(max_messages=2_000, max_age_seconds=10, clock=lambda: now[0])
+
+    def forbidden_full_scan() -> None:
+        raise AssertionError("append must not run exhaustive invariant scans")
+
+    monkeypatch.setattr(store, "_assert_invariants", forbidden_full_scan)
+    for index in range(1_000):
+        store.append(parse_message({"protocol_version": "1", "type": f"future.{index}"}))
+    assert len(store._expiry_heap) == 1_000
+    now[0] = 11.0
+    assert store.counters["retained_messages"] == 0
+    assert not store._expiry_heap
 
 
 def test_store_bounds_incomplete_flows_per_flow_global_and_standalone_messages() -> None:

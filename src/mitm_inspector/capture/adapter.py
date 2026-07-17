@@ -47,6 +47,7 @@ class _BodyCapture:
     lifecycle_emitted: bool = False
     ended: bool = False
     stream_enabled: bool = True
+    prefix_sealed: bool = False
 
 
 @dataclass
@@ -353,18 +354,36 @@ class CaptureAddon:
         if state.completed or state.discarded or body.ended or not body.stream_enabled:
             return
         copied = _safe_bytes(chunk, label="body chunk")
+        if body.total_bytes > MAX_U64 - len(copied):
+            raise OverflowError(f"{side} body byte offset exhausted")
+        if body.chunk_index >= MAX_U64:
+            raise OverflowError(f"{side} body chunk index exhausted")
+        if not body.lifecycle_emitted:
+            self._ensure_lifecycle_capacity()
         offset = body.total_bytes
         body.total_bytes += len(copied)
         body.observed = True
-        remaining = max(0, self.max_body_prefix_bytes - len(body.prefix))
+        remaining = (
+            0
+            if body.prefix_sealed
+            else max(0, self.max_body_prefix_bytes - len(body.prefix))
+        )
         other_prefix_bytes = self._captured_prefix_bytes - len(body.prefix)
-        global_remaining = max(0, self.max_in_memory_bytes - other_prefix_bytes - len(body.prefix))
+        global_remaining = max(
+            0,
+            self.max_in_memory_bytes
+            - self._active_metadata_bytes
+            - other_prefix_bytes
+            - len(body.prefix),
+        )
         captured = copied[: min(remaining, global_remaining)]
         body.prefix.extend(captured)
         self._captured_prefix_bytes += len(captured)
+        if len(captured) < len(copied):
+            body.prefix_sealed = True
         if not body.lifecycle_emitted:
-            body.lifecycle_emitted = True
             self._lifecycle(state, f"{side}_body")
+            body.lifecycle_emitted = True
         if captured:
             self._send(
                 {
@@ -386,10 +405,7 @@ class CaptureAddon:
         if not body.observed and raw_content is not None:
             self._observe_chunk(state, side, raw_content)
         if not body.lifecycle_emitted:
-            body.lifecycle_emitted = True
             self._lifecycle(state, f"{side}_body")
-        body.ended = True
-        body.stream_enabled = False
         descriptor = _body_descriptor(body)
         self._send(
             {
@@ -401,6 +417,9 @@ class CaptureAddon:
                 "body": descriptor,
             }
         )
+        body.lifecycle_emitted = True
+        body.ended = True
+        body.stream_enabled = False
 
     def _metadata(self, state: _FlowCapture) -> None:
         if not state.request_headers_captured:
@@ -437,9 +456,8 @@ class CaptureAddon:
     def _lifecycle(self, state: _FlowCapture, lifecycle_state: str) -> None:
         if lifecycle_state in state.lifecycle_states:
             return
-        state.lifecycle_states.add(lifecycle_state)
+        self._ensure_lifecycle_capacity()
         sequence = self._sequence
-        self._sequence += 1
         self._send(
             {
                 "protocol_version": "1",
@@ -452,6 +470,12 @@ class CaptureAddon:
                 "state": lifecycle_state,
             }
         )
+        state.lifecycle_states.add(lifecycle_state)
+        self._sequence = sequence + 1
+
+    def _ensure_lifecycle_capacity(self) -> None:
+        if self._sequence >= MAX_U64:
+            raise OverflowError("capture lifecycle sequence exhausted")
 
     def _finalize(self, state: _FlowCapture) -> None:
         """Idempotently finish only after request terminal observation exists."""
@@ -493,7 +517,8 @@ class CaptureAddon:
     def _enforce_active_bounds(self) -> None:
         while self._flows and (
             len(self._flows) > self.max_active_flows
-            or self._active_metadata_bytes > self.max_in_memory_bytes
+            or self._active_metadata_bytes + self._captured_prefix_bytes
+            > self.max_in_memory_bytes
         ):
             oldest = min(self._flows.values(), key=lambda item: (item.created_at, item.flow_id))
             self._evict_active(oldest)

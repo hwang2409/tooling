@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import time
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
@@ -39,6 +40,7 @@ class _StoredMessage:
     body_bytes: int
     weight: int
     key: tuple[object, ...] | None = None
+    active: bool = True
 
 
 @dataclass
@@ -98,6 +100,8 @@ class MemoryStore:
         self._clock = clock
         self._flows: dict[str, _FlowRecord] = {}
         self._standalone: deque[_StoredMessage] = deque()
+        self._expiry_heap: list[tuple[float, int, str, object]] = []
+        self._expiry_sequence = 0
         self._order = 0
         self._message_count = 0
         self._body_bytes = 0
@@ -110,6 +114,7 @@ class MemoryStore:
         self._flow_message_evictions = 0
         self._body_budget_drops = 0
         self._memory_budget_drops = 0
+        self._completed_flow_count = 0
 
     def append(self, message: ParsedMessage) -> None:
         """Revalidate and retain a protocol message without retaining aliases."""
@@ -133,18 +138,19 @@ class MemoryStore:
             self._standalone.append(
                 _StoredMessage(self._order, now, retained, body_bytes, weight)
             )
+            self._schedule_expiry(self._standalone[-1])
             self._message_count += 1
             self._body_bytes += body_bytes
             self._memory_bytes += weight
             self._enforce_body_budget()
             self._enforce_memory_budget()
-            self._assert_invariants()
             return
 
         record = self._flows.get(flow_id)
         if record is None:
             record = _FlowRecord(flow_id=flow_id, created_at=now)
             self._flows[flow_id] = record
+            self._schedule_expiry(record)
         key = _coalescing_key(payload, message_type)
         if key is not None and key in record.indexes:
             index = record.indexes[key]
@@ -164,7 +170,6 @@ class MemoryStore:
                 ):
                     self._dropped_messages += 1
                     self._per_flow_drops += 1
-                    self._assert_invariants()
                     return
             else:
                 self._make_room_for_message(protected=record)
@@ -181,10 +186,10 @@ class MemoryStore:
                 record.completed = True
                 record.completed_at = now
                 record.completion_order = self._order
+                self._completed_flow_count += 1
             self._enforce_completed_limit()
         self._enforce_body_budget()
         self._enforce_memory_budget()
-        self._assert_invariants()
 
     def newest_first(self) -> Iterator[ParsedMessageResult]:
         """Yield independent messages in true message-newest-first order."""
@@ -202,7 +207,7 @@ class MemoryStore:
 
         self._purge_expired(self._clock())
         return {
-            "completed_flows": sum(record.completed for record in self._flows.values()),
+            "completed_flows": self._completed_flow_count,
             "retained_flows": len(self._flows),
             "retained_messages": self._message_count,
             "standalone_messages": len(self._standalone),
@@ -222,32 +227,48 @@ class MemoryStore:
         """Drop all retained state while preserving observable counters."""
 
         self._flows.clear()
+        self._expiry_heap.clear()
         self._standalone.clear()
         self._message_count = 0
         self._body_bytes = 0
         self._memory_bytes = 0
-        self._assert_invariants()
+        self._completed_flow_count = 0
 
     def _purge_expired(self, now: float) -> None:
-        expired = [
-            flow_id
-            for flow_id, record in self._flows.items()
-            if now - record.created_at >= self.max_age_seconds
-        ]
-        for flow_id in expired:
-            self._remove_flow(flow_id)
-            self._expired_flows += 1
-        stale_standalone = [
-            index
-            for index, stored in enumerate(self._standalone)
-            if now - stored.created_at >= self.max_age_seconds
-        ]
-        for index in reversed(stale_standalone):
-            self._remove_standalone(index)
-        self._assert_invariants()
+        cutoff = now - self.max_age_seconds
+        while self._expiry_heap and self._expiry_heap[0][0] <= cutoff:
+            _, _, kind, owner = heapq.heappop(self._expiry_heap)
+            if kind == "flow":
+                record = cast_flow(owner)
+                if self._flows.get(record.flow_id) is record:
+                    self._remove_flow(record.flow_id)
+                    self._expired_flows += 1
+            else:
+                stored = cast_stored(owner)
+                if stored.active:
+                    self._remove_standalone_value(stored)
+
+    def _schedule_expiry(self, owner: _FlowRecord | _StoredMessage) -> None:
+        kind = "flow" if isinstance(owner, _FlowRecord) else "standalone"
+        heapq.heappush(
+            self._expiry_heap,
+            (owner.created_at, self._expiry_sequence, kind, owner),
+        )
+        self._expiry_sequence += 1
+        retained = len(self._flows) + len(self._standalone)
+        if len(self._expiry_heap) > 2 * retained + 64:
+            self._expiry_heap = [
+                (record.created_at, index, "flow", record)
+                for index, record in enumerate(self._flows.values())
+            ] + [
+                (stored.created_at, len(self._flows) + index, "standalone", stored)
+                for index, stored in enumerate(self._standalone)
+                if stored.active
+            ]
+            heapq.heapify(self._expiry_heap)
 
     def _enforce_completed_limit(self) -> None:
-        while sum(record.completed for record in self._flows.values()) > self.max_items:
+        while self._completed_flow_count > self.max_items:
             completed = [
                 record
                 for record in self._flows.values()
@@ -397,6 +418,8 @@ class MemoryStore:
 
     def _remove_flow(self, flow_id: str) -> None:
         record = self._flows.pop(flow_id)
+        if record.completed:
+            self._completed_flow_count -= 1
         self._message_count -= len(record.messages)
         self._body_bytes -= sum(stored.body_bytes for stored in record.messages)
         self._memory_bytes -= sum(stored.weight for stored in record.messages)
@@ -415,6 +438,8 @@ class MemoryStore:
         }
         if not record.messages and not keep_empty:
             self._flows.pop(record.flow_id, None)
+            if record.completed:
+                self._completed_flow_count -= 1
 
     def _assert_invariants(self) -> None:
         visible_messages = len(self._standalone) + sum(
@@ -446,6 +471,16 @@ class MemoryStore:
     def _remove_standalone(self, index: int) -> None:
         stored = self._standalone[index]
         del self._standalone[index]
+        stored.active = False
+        self._message_count -= 1
+        self._body_bytes -= stored.body_bytes
+        self._memory_bytes -= stored.weight
+
+    def _remove_standalone_value(self, stored: _StoredMessage) -> None:
+        if not stored.active:
+            return
+        self._standalone.remove(stored)
+        stored.active = False
         self._message_count -= 1
         self._body_bytes -= stored.body_bytes
         self._memory_bytes -= stored.weight
@@ -454,6 +489,12 @@ class MemoryStore:
 def cast_flow(value: object) -> _FlowRecord:
     if not isinstance(value, _FlowRecord):
         raise AssertionError("flow owner must be a flow record")
+    return value
+
+
+def cast_stored(value: object) -> _StoredMessage:
+    if not isinstance(value, _StoredMessage):
+        raise AssertionError("expiry owner must be a stored message")
     return value
 
 
