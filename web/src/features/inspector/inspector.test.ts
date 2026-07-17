@@ -7,7 +7,7 @@ import type { FlowLifecycle } from "../../protocol";
 import * as decoderModule from "./decoders";
 import { bodyFocusTarget, InspectorBodyPanel, isBodySelectionAuthorized, nextBodyTabIndex, PairedInspector } from "./PairedInspector";
 import { bodyMetadata, decodeBase64Bounded, decodeBody, decodeUtf8, gateBodyDecode, hexDump, parseSseEvents } from "./decoders";
-import { lifecyclePhase, orderLifecycle } from "./lifecycle";
+import { inspectorErrorState, lifecyclePhase, orderLifecycle } from "./lifecycle";
 import type { InspectableBody, InspectorFlow } from "./models";
 
 const encoded = (value: string) => Buffer.from(value, "utf8").toString("base64");
@@ -149,6 +149,12 @@ describe("lifecycle ordering", () => {
   it("preserves observed input order for equal sequences", () => {
     const ordered = orderLifecycle([event("response_body", "12", 2), event("request_body", "12", 1)]);
     expect(ordered.map((item) => item.state)).toEqual(["response_body", "request_body"]);
+  });
+
+  it("derives error presence from lifecycle state or a nonempty message", () => {
+    expect(inspectorErrorState({ lifecycle: [event("error", "1", 0)], error: "" })).toEqual({ hasError: true, message: "Error event observed, but no diagnostic message was provided." });
+    expect(inspectorErrorState({ lifecycle: [], error: "diagnostic" })).toEqual({ hasError: true, message: "diagnostic" });
+    expect(inspectorErrorState({ lifecycle: [], error: "   " })).toEqual({ hasError: false, message: undefined });
   });
 });
 

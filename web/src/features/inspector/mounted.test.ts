@@ -470,6 +470,26 @@ describe("mounted PairedInspector DOM behavior", () => {
     expect(container.querySelector("script")).toBeNull();
   });
 
+  it("derives error UI from lifecycle errors and nonempty messages", async () => {
+    const lifecycleOnlyBase = makeFlow("flow-lifecycle-error", Buffer.from("hello", "utf8").toString("base64"), "");
+    const firstEvent = lifecycleOnlyBase.lifecycle?.[0];
+    if (!firstEvent) throw new Error("missing lifecycle fixture");
+    const lifecycleOnlyError = {
+      ...lifecycleOnlyBase,
+      lifecycle: [...(lifecycleOnlyBase.lifecycle ?? []), { ...firstEvent, state: "error" as const, event_id: "flow-lifecycle-error-error", sequence: "11" }],
+    };
+    await act(async () => root.render(createElement(PairedInspector, { flow: lifecycleOnlyError, activePane: "error" })));
+    expect(outerTab(container, "error").textContent).toContain("observed");
+    expect(container.querySelector(".inspector-error-panel")?.className).toContain("has-error");
+    expect(container.querySelector(".inspector-error-copy")?.textContent).toBe("Error event observed, but no diagnostic message was provided.");
+    expect(container.querySelector(".inspector-phase-summary")?.textContent).toContain("ended with error");
+
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-message-error", Buffer.from("hello", "utf8").toString("base64"), "diagnostic message"), activePane: "error" })));
+    expect(outerTab(container, "error").textContent).toContain("observed");
+    expect(container.querySelector(".inspector-error-copy")?.textContent).toBe("diagnostic message");
+    expect(container.querySelector(".inspector-phase-summary")?.textContent).toContain("ended with error");
+  });
+
   it("keeps accessibility IDs unique and locally resolvable for two inspectors", async () => {
     const otherContainer = document.createElement("div");
     document.body.appendChild(otherContainer);
@@ -483,6 +503,14 @@ describe("mounted PairedInspector DOM behavior", () => {
     const instanceIds = (instance: MiniElement) => instance.querySelectorAll("[id]").map((element) => element.id);
     const firstIds = instanceIds(container);
     const secondIds = instanceIds(otherContainer);
+    expect(container.querySelectorAll("main")).toHaveLength(0);
+    expect(otherContainer.querySelectorAll("main")).toHaveLength(0);
+    const firstRegion = find(container, "section.paired-inspector");
+    const firstHeading = firstRegion.querySelector("h1");
+    expect(firstRegion.getAttribute("aria-labelledby")).toBe(firstHeading?.getAttribute("id"));
+    const secondRegion = find(otherContainer, "section.paired-inspector");
+    const secondHeading = secondRegion.querySelector("h1");
+    expect(secondRegion.getAttribute("aria-labelledby")).toBe(secondHeading?.getAttribute("id"));
     expect(new Set(firstIds).size).toBe(firstIds.length);
     expect(new Set(secondIds).size).toBe(secondIds.length);
     expect(firstIds.every((id) => !secondIds.includes(id))).toBe(true);

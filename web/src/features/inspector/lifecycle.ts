@@ -1,5 +1,5 @@
 import type { FlowLifecycle } from "../../protocol";
-import type { LifecycleEntry } from "./models";
+import type { InspectorFlow, LifecycleEntry } from "./models";
 
 const stateLabels: Record<FlowLifecycle["state"], string> = {
   request_started: "request opened",
@@ -41,5 +41,20 @@ export function lifecyclePhase(entries: readonly LifecycleEntry[]): { requestEnd
     responseStarted: entries.some((entry) => entry.state === "response_started"),
     completed: entries.some((entry) => entry.state === "flow_completed"),
     errored: entries.some((entry) => entry.state === "error"),
+  };
+}
+
+export interface InspectorErrorState {
+  hasError: boolean;
+  message?: string;
+}
+
+export function inspectorErrorState(flow: Pick<InspectorFlow, "lifecycle" | "error">): InspectorErrorState {
+  const phase = lifecyclePhase(orderLifecycle(flow.lifecycle));
+  const message = flow.error?.trim();
+  const hasError = phase.errored || Boolean(message);
+  return {
+    hasError,
+    message: message || (phase.errored ? "Error event observed, but no diagnostic message was provided." : undefined),
   };
 }

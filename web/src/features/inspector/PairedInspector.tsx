@@ -3,7 +3,7 @@ import type { KeyboardEvent } from "react";
 
 import type { Header } from "../../protocol";
 import { bodyMetadata, decodeBody, type DecodedBody } from "./decoders";
-import { lifecycleLabel, lifecyclePhase, orderLifecycle } from "./lifecycle";
+import { inspectorErrorState, lifecycleLabel, lifecyclePhase, orderLifecycle, type InspectorErrorState } from "./lifecycle";
 import type { BodyPane, BodySelection, BodyViewMode, InspectableBody, InspectorBodyPanelProps, InspectorFlow, InspectorHeader, InspectorPane, InspectorProps } from "./models";
 import "../../styles/inspector.css";
 
@@ -183,7 +183,7 @@ function BodyOutput({ decoded }: { decoded: DecodedBody }) {
   );
 }
 
-function LifecycleStrip({ flow }: { flow: InspectorFlow }) {
+function LifecycleStrip({ flow, errorState }: { flow: InspectorFlow; errorState: InspectorErrorState }) {
   const lifecycleId = useId().replaceAll(":", "");
   const entries = useMemo(() => orderLifecycle(flow.lifecycle), [flow.lifecycle]);
   const phase = lifecyclePhase(entries);
@@ -199,7 +199,7 @@ function LifecycleStrip({ flow }: { flow: InspectorFlow }) {
       <div className="inspector-phase-summary" aria-label="Lifecycle summary">
         <span className={phase.requestEnded ? "is-seen" : ""}>request end {phase.requestEnded ? "seen" : "pending"}</span>
         <span className={phase.responseStarted ? "is-seen" : ""}>response start {phase.responseStarted ? "seen" : "pending"}</span>
-        <span className={phase.completed ? "is-seen" : ""}>{phase.completed ? "completed" : phase.errored ? "ended with error" : "open"}</span>
+        <span className={errorState.hasError || phase.completed ? "is-seen" : ""}>{errorState.hasError ? "ended with error" : phase.completed ? "completed" : "open"}</span>
       </div>
       {entries.length === 0 ? <p className="inspector-muted inspector-lifecycle-empty">No lifecycle observations attached to this flow.</p> : (
         <ol className="inspector-trace" aria-label="Observed lifecycle events">
@@ -218,13 +218,13 @@ function LifecycleStrip({ flow }: { flow: InspectorFlow }) {
   );
 }
 
-function ErrorPane({ error }: { error?: string }) {
+function ErrorPane({ errorState }: { errorState: InspectorErrorState }) {
   const errorId = useId().replaceAll(":", "");
   return (
-    <section className={`inspector-error-panel ${error ? "has-error" : ""}`} aria-labelledby={`${errorId}-heading`}>
+    <section className={`inspector-error-panel ${errorState.hasError ? "has-error" : ""}`} aria-labelledby={`${errorId}-heading`}>
       <p className="inspector-kicker">FLOW OUTCOME</p>
-      <h3 id={`${errorId}-heading`}>{error ? "Error observed" : "No error recorded"}</h3>
-      {error ? <pre className="inspector-error-copy">{error}</pre> : <p className="inspector-muted">No error event was supplied for this flow.</p>}
+      <h3 id={`${errorId}-heading`}>{errorState.hasError ? "Error observed" : "No error recorded"}</h3>
+      {errorState.hasError ? <pre className="inspector-error-copy">{errorState.message}</pre> : <p className="inspector-muted">No error event was supplied for this flow.</p>}
     </section>
   );
 }
@@ -239,6 +239,7 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
   const previousCommittedPaneRef = useRef<InspectorPane>(activePane ?? internalPane);
   const previousFlowIdRef = useRef(flow.metadata.flow_id);
   const entries = useMemo(() => orderLifecycle(flow.lifecycle), [flow.lifecycle]);
+  const errorState = inspectorErrorState(flow);
 
   const pane = activePane ?? (previousActivePaneRef.current === undefined ? internalPane : lastCommittedPaneRef.current);
 
@@ -283,13 +284,13 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
 
   const responseBody = bodyFor(flow, "response");
   return (
-    <main className={`paired-inspector ${compact ? "is-compact" : ""} ${className}`.trim()}>
+    <section className={`paired-inspector ${compact ? "is-compact" : ""} ${className}`.trim()} aria-labelledby={`${inspectorId}-title`}>
       <header className="inspector-header">
         <div className="inspector-title-lockup">
           <span className="inspector-glyph" aria-hidden="true">↔</span>
           <div>
             <p className="inspector-kicker">PAIRED EXCHANGE / READ ONLY</p>
-            <h1>Request / response inspector</h1>
+            <h1 id={`${inspectorId}-title`}>Request / response inspector</h1>
           </div>
         </div>
         <div className="inspector-flow-identity">
@@ -315,7 +316,7 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
             onKeyDown={(event) => handleTabKeyDown(event, index)}
           >
             <span>{item === "request" ? "Request" : item === "response" ? "Response" : "Error"}</span>
-            <small>{item === "request" ? "outbound" : item === "response" ? "inbound" : flow.error ? "observed" : "clear"}</small>
+            <small>{item === "request" ? "outbound" : item === "response" ? "inbound" : errorState.hasError ? "observed" : "clear"}</small>
           </button>
         ))}
       </div>
@@ -333,7 +334,7 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
             hidden={!isActive}
             aria-hidden={isActive ? undefined : "true"}
           >
-            {isActive && item === "error" && <ErrorPane error={flow.error} />}
+            {isActive && item === "error" && <ErrorPane errorState={errorState} />}
             {isActive && item !== "error" && (
               <div className="inspector-pane-layout">
                 <section className="inspector-column inspector-metadata-column">
@@ -366,8 +367,8 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
         );
       })}
 
-      <LifecycleStrip flow={flow} />
-    </main>
+      <LifecycleStrip flow={flow} errorState={errorState} />
+    </section>
   );
 }
 
