@@ -10,6 +10,7 @@ export interface ConnectionStatus {
   attempt: number;
   error: string | null;
   lastMessageAt: number | null;
+  requestResyncAvailable: boolean;
 }
 
 export interface TransportHandlers {
@@ -19,14 +20,16 @@ export interface TransportHandlers {
   onClose: (reason?: unknown) => void;
 }
 
+export interface ResyncRequest {
+  protocol_version: "1";
+  type: "browser.resync";
+  reason: ResyncReason;
+  requested_cursor: string;
+}
+
 export interface TransportConnection {
   close: () => void;
-  requestResync?: (message: {
-    protocol_version: "1";
-    type: "browser.resync";
-    reason: ResyncReason;
-    requested_cursor: string;
-  }) => void;
+  requestResync?: (message: ResyncRequest) => void;
 }
 
 export type TransportFactory = (handlers: TransportHandlers) => TransportConnection;
@@ -45,7 +48,12 @@ export interface ConnectionClientOptions {
   autoReconnect?: boolean;
 }
 
+export type ResyncRequestResult =
+  | { ok: true }
+  | { ok: false; reason: "not-connected" | "unsupported" | "transport-error"; error?: string };
+
 export type ConnectionEvent =
+  | { type: "attempt"; id: number }
   | { type: "status"; status: ConnectionStatus }
   | { type: "message"; envelope: ParsedMessage }
   | { type: "protocol-error"; error: Error };
@@ -81,13 +89,21 @@ export class ConnectionClient {
   private readonly autoReconnect: boolean;
   private readonly listeners = new Set<(event: ConnectionEvent) => void>();
   private connection: TransportConnection | null = null;
+  private connectionAttemptId: number | null = null;
   private reconnectTimer: unknown = null;
   private staleTimer: unknown = null;
   private generation = 0;
-  private ignoredCloseGeneration: number | null = null;
+  private nextAttemptId = 0;
+  private activeAttemptId: number | null = null;
   private destroyed = false;
   private userDisconnected = true;
-  private status: ConnectionStatus = { state: "disconnected", attempt: 0, error: null, lastMessageAt: null };
+  private status: ConnectionStatus = {
+    state: "disconnected",
+    attempt: 0,
+    error: null,
+    lastMessageAt: null,
+    requestResyncAvailable: false,
+  };
 
   public constructor(options: ConnectionClientOptions) {
     this.transportFactory = options.transportFactory;
@@ -108,7 +124,8 @@ export class ConnectionClient {
   }
 
   public connect(): void {
-    if (this.destroyed || !this.userDisconnected && (this.status.state === "connecting" || this.status.state === "live" || this.status.state === "stale" || this.status.state === "reconnecting")) return;
+    const stateCanOpen = this.status.state === "error" || this.status.state === "disconnected";
+    if (this.destroyed || !this.userDisconnected && !stateCanOpen) return;
     this.userDisconnected = false;
     this.clearReconnectTimer();
     this.open(++this.generation);
@@ -118,10 +135,11 @@ export class ConnectionClient {
     if (this.destroyed) return;
     this.userDisconnected = true;
     this.generation += 1;
+    this.activeAttemptId = null;
     this.clearReconnectTimer();
     this.clearStaleTimer();
-    this.closeConnection();
-    this.updateStatus({ state: "disconnected", attempt: 0, error: null, lastMessageAt: null });
+    this.closeCurrentConnection();
+    this.updateStatus({ state: "disconnected", attempt: 0, error: null, lastMessageAt: null, requestResyncAvailable: false });
   }
 
   public destroy(): void {
@@ -131,66 +149,85 @@ export class ConnectionClient {
     this.listeners.clear();
   }
 
-  public requestResync(cursor: string, reason: ResyncReason = "cursor_gap"): void {
-    this.connection?.requestResync?.({
-      protocol_version: "1",
-      type: "browser.resync",
-      reason,
-      requested_cursor: cursor,
-    });
-  }
-
-  private open(generation: number): void {
-    this.updateStatus({ state: this.status.attempt > 0 ? "reconnecting" : "connecting", error: null });
+  public requestResync(cursor: string, reason: ResyncReason = "cursor_gap"): ResyncRequestResult {
+    if (this.connection === null || this.activeAttemptId === null) return { ok: false, reason: "not-connected" };
+    if (this.connection.requestResync === undefined) return { ok: false, reason: "unsupported" };
     try {
-      this.connection = this.transportFactory({
-        onOpen: () => {
-          if (generation !== this.generation || this.userDisconnected) return;
-          this.updateStatus({ state: "live", attempt: 0, error: null, lastMessageAt: this.now() });
-          this.scheduleStale(generation);
-        },
-        onMessage: (value) => this.receive(value, generation),
-        onError: (error) => this.fail(error, generation),
-        onClose: (reason) => {
-          if (this.ignoredCloseGeneration === generation) {
-            this.ignoredCloseGeneration = null;
-            return;
-          }
-          this.closed(reason, generation);
-        },
-      });
+      this.connection.requestResync({ protocol_version: "1", type: "browser.resync", reason, requested_cursor: cursor });
+      return { ok: true };
     } catch (error) {
-      this.fail(error, generation);
+      return { ok: false, reason: "transport-error", error: errorMessage(error) };
     }
   }
 
-  private receive(value: unknown, generation: number): void {
-    if (generation !== this.generation || this.userDisconnected) return;
+  private open(generation: number): void {
+    const attemptId = ++this.nextAttemptId;
+    this.activeAttemptId = attemptId;
+    this.emit({ type: "attempt", id: attemptId });
+    this.updateStatus({
+      state: this.status.attempt > 0 ? "reconnecting" : "connecting",
+      error: null,
+      requestResyncAvailable: false,
+    });
+
+    let candidate: TransportConnection;
+    try {
+      candidate = this.transportFactory({
+        onOpen: () => this.opened(generation, attemptId),
+        onMessage: (value) => this.receive(value, generation, attemptId),
+        onError: (error) => this.failed(error, generation, attemptId),
+        onClose: (reason) => this.closed(reason, generation, attemptId),
+      });
+    } catch (error) {
+      if (this.isCurrentAttempt(generation, attemptId)) this.failed(error, generation, attemptId);
+      return;
+    }
+
+    if (!this.isCurrentAttempt(generation, attemptId)) {
+      this.safeClose(candidate);
+      return;
+    }
+    this.connection = candidate;
+    this.connectionAttemptId = attemptId;
+    this.updateStatus({ requestResyncAvailable: candidate.requestResync !== undefined });
+  }
+
+  private opened(generation: number, attemptId: number): void {
+    if (!this.isCurrentAttempt(generation, attemptId)) return;
+    this.updateStatus({ state: "live", attempt: 0, error: null, lastMessageAt: this.now() });
+    this.scheduleStale(generation, attemptId);
+  }
+
+  private receive(value: unknown, generation: number, attemptId: number): void {
+    if (!this.isCurrentAttempt(generation, attemptId)) return;
     try {
       const envelope = parseProtocolMessage(value);
       this.updateStatus({ state: "live", error: null, lastMessageAt: this.now() });
-      this.scheduleStale(generation);
+      this.scheduleStale(generation, attemptId);
       this.emit({ type: "message", envelope });
     } catch (error) {
       const normalized = error instanceof Error ? error : new Error(errorMessage(error));
       this.emit({ type: "protocol-error", error: normalized });
-      this.fail(normalized, generation);
+      this.failed(normalized, generation, attemptId);
     }
   }
 
-  private fail(error: unknown, generation: number): void {
-    if (generation !== this.generation || this.userDisconnected) return;
+  private failed(error: unknown, generation: number, attemptId: number): void {
+    if (!this.isCurrentAttempt(generation, attemptId)) return;
+    this.activeAttemptId = null;
     this.clearStaleTimer();
-    this.closeConnection();
-    this.updateStatus({ state: "error", error: errorMessage(error) });
+    this.closeCurrentConnection(attemptId);
+    this.updateStatus({ state: "error", error: errorMessage(error), requestResyncAvailable: false });
     if (this.autoReconnect) this.scheduleReconnect(generation);
   }
 
-  private closed(reason: unknown, generation: number): void {
-    if (generation !== this.generation || this.userDisconnected) return;
+  private closed(reason: unknown, generation: number, attemptId: number): void {
+    if (!this.isCurrentAttempt(generation, attemptId)) return;
+    this.activeAttemptId = null;
     this.connection = null;
+    this.connectionAttemptId = null;
     this.clearStaleTimer();
-    this.updateStatus({ state: "error", error: reason ? errorMessage(reason) : "Source closed the stream" });
+    this.updateStatus({ state: "error", error: reason ? errorMessage(reason) : "Source closed the stream", requestResyncAvailable: false });
     if (this.autoReconnect) this.scheduleReconnect(generation);
   }
 
@@ -204,13 +241,17 @@ export class ConnectionClient {
     }, this.retryDelayMs(attempt));
   }
 
-  private scheduleStale(generation: number): void {
+  private scheduleStale(generation: number, attemptId: number): void {
     this.clearStaleTimer();
     this.staleTimer = this.timer.set(() => {
-      if (generation === this.generation && !this.userDisconnected && this.status.state === "live") {
+      if (this.isCurrentAttempt(generation, attemptId) && this.status.state === "live") {
         this.updateStatus({ state: "stale" });
       }
     }, this.staleAfterMs);
+  }
+
+  private isCurrentAttempt(generation: number, attemptId: number): boolean {
+    return !this.destroyed && !this.userDisconnected && generation === this.generation && attemptId === this.activeAttemptId;
   }
 
   private updateStatus(patch: Partial<ConnectionStatus>): void {
@@ -222,12 +263,19 @@ export class ConnectionClient {
     for (const listener of [...this.listeners]) listener(event);
   }
 
-  private closeConnection(): void {
+  private closeCurrentConnection(attemptId?: number): void {
+    if (attemptId !== undefined && this.connectionAttemptId !== attemptId) return;
     const connection = this.connection;
     this.connection = null;
-    if (connection) {
-      this.ignoredCloseGeneration = this.generation;
+    this.connectionAttemptId = null;
+    if (connection) this.safeClose(connection);
+  }
+
+  private safeClose(connection: TransportConnection): void {
+    try {
       connection.close();
+    } catch {
+      // Teardown must not turn an obsolete transport's close failure into a live error.
     }
   }
 

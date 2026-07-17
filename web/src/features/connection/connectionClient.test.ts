@@ -34,7 +34,7 @@ class TestTimer implements ConnectionTimer {
   }
 }
 
-function factoryHarness() {
+function factoryHarness(withResync = true) {
   const handlers: Array<Parameters<TransportFactory>[0]> = [];
   const closes: Array<() => void> = [];
   const resyncs: Array<(...args: [{ requested_cursor: string }]) => void> = [];
@@ -44,7 +44,7 @@ function factoryHarness() {
     const requestResync = vi.fn();
     closes.push(close);
     resyncs.push(requestResync);
-    return { close, requestResync };
+    return withResync ? { close, requestResync } : { close };
   };
   return { factory, handlers, closes, resyncs };
 }
@@ -64,6 +64,56 @@ describe("connection client", () => {
     timer.runAll();
     expect(harness.handlers).toHaveLength(2);
     expect(client.getSnapshot().state).toBe("reconnecting");
+  });
+
+  it("ignores late error and close callbacks from an obsolete transport", () => {
+    const timer = new TestTimer();
+    const harness = factoryHarness();
+    const client = new ConnectionClient({ transportFactory: harness.factory, timer, retryDelayMs: () => 1 });
+    const attempts: number[] = [];
+    client.subscribe((event) => { if (event.type === "attempt") attempts.push(event.id); });
+    client.connect();
+    harness.handlers[0].onOpen();
+    harness.handlers[0].onClose("retry");
+    timer.runAll();
+    harness.handlers[1].onOpen();
+
+    harness.handlers[0].onError("late error");
+    harness.handlers[0].onClose("late close");
+
+    expect(client.getSnapshot().state).toBe("live");
+    expect(client.getSnapshot().error).toBeNull();
+    expect(timer.size).toBe(1);
+    expect(attempts).toEqual([1, 2]);
+  });
+
+  it("closes a connection returned after synchronous obsolete callbacks", () => {
+    const timer = new TestTimer();
+    const staleClose = vi.fn();
+    const factory: TransportFactory = (handlers) => {
+      handlers.onError("synchronous failure");
+      return { close: staleClose };
+    };
+    const client = new ConnectionClient({ transportFactory: factory, timer, autoReconnect: false });
+    client.connect();
+
+    expect(staleClose).toHaveBeenCalledOnce();
+    expect(client.getSnapshot().state).toBe("error");
+    expect(client.requestResync("1")).toEqual({ ok: false, reason: "not-connected" });
+  });
+
+  it("also closes a connection returned after a synchronous close callback", () => {
+    const timer = new TestTimer();
+    const staleClose = vi.fn();
+    const factory: TransportFactory = (handlers) => {
+      handlers.onClose("synchronous close");
+      return { close: staleClose };
+    };
+    const client = new ConnectionClient({ transportFactory: factory, timer, autoReconnect: false });
+    client.connect();
+
+    expect(staleClose).toHaveBeenCalledOnce();
+    expect(client.getSnapshot().state).toBe("error");
   });
 
   it("marks a quiet live source stale and returns to live on the next event", () => {
@@ -105,7 +155,7 @@ describe("connection client", () => {
     client.connect();
     harness.handlers[1].onOpen();
 
-    expect(listener.mock.calls.filter(([event]) => event.type === "status")).toHaveLength(4);
+    expect(listener.mock.calls.filter(([event]) => event.type === "status")).toHaveLength(6);
     expect(harness.handlers).toHaveLength(2);
     client.destroy();
     expect(timer.size).toBe(0);
@@ -127,16 +177,22 @@ describe("connection client", () => {
     expect(client.getSnapshot().state).toBe("error");
   });
 
-  it("passes a cursor resync request through to the injected transport", () => {
+  it("exposes explicit resync capability and request results", () => {
     const timer = new TestTimer();
-    const harness = factoryHarness();
-    const client = new ConnectionClient({ transportFactory: harness.factory, timer, autoReconnect: false });
+    const supported = factoryHarness(true);
+    const client = new ConnectionClient({ transportFactory: supported.factory, timer, autoReconnect: false });
     client.connect();
-    client.requestResync("41");
-
-    expect(harness.resyncs[0]).toHaveBeenCalledWith({
+    expect(client.getSnapshot().requestResyncAvailable).toBe(true);
+    expect(client.requestResync("41")).toEqual({ ok: true });
+    expect(supported.resyncs[0]).toHaveBeenCalledWith({
       protocol_version: "1", type: "browser.resync", reason: "cursor_gap", requested_cursor: "41",
     });
+
+    const unsupported = factoryHarness(false);
+    const unsupportedClient = new ConnectionClient({ transportFactory: unsupported.factory, timer, autoReconnect: false });
+    unsupportedClient.connect();
+    expect(unsupportedClient.getSnapshot().requestResyncAvailable).toBe(false);
+    expect(unsupportedClient.requestResync("41")).toEqual({ ok: false, reason: "unsupported" });
   });
 
   it("provides bounded jittered exponential delays", () => {

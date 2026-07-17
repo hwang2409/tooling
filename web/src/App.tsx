@@ -26,22 +26,28 @@ function formatCursor(value: string): string {
 }
 
 export function App() {
-  const { browser, status, connect, disconnect, retry, requestResync } = useConnection();
+  const {
+    browser, status, followLive, pauseLive, resumeLive, connect, disconnect, retry, requestResync,
+  } = useConnection();
   const titleId = useId();
-  const [followLive, setFollowLive] = useState(true);
-  const [pausedCursor, setPausedCursor] = useState<string | null>(null);
+  const [resyncMessage, setResyncMessage] = useState<string | null>(null);
   const statusInfo = statusCopy[status.state];
   const isBusy = status.state === "connecting" || status.state === "reconnecting";
   const isConnected = status.state === "live" || status.state === "stale";
   const hasError = status.state === "error";
-  const retainedCount = Object.keys(browser.flows).length;
+  const retainedCount = browser.flows.size;
   const action = isConnected || isBusy ? disconnect : hasError ? retry : connect;
   const memoryBudget = browser.sourceLimits?.max_in_memory_bytes ?? "134217728";
-  const displayedCursor = followLive ? browser.cursor : pausedCursor ?? browser.cursor;
-  const toggleFollowLive = () => {
-    if (followLive) setPausedCursor(browser.cursor);
-    else setPausedCursor(null);
-    setFollowLive((value) => !value);
+  const displayedCursor = browser.cursor;
+  const followLabel = !followLive
+    ? "Live paused"
+    : status.state === "live"
+      ? "Following live"
+      : `Follow when ${statusInfo.label.toLowerCase()}`;
+  const toggleFollowLive = followLive ? pauseLive : resumeLive;
+  const handleResync = () => {
+    const result = requestResync(browser.resyncRequested ?? browser.cursor);
+    setResyncMessage(result.ok ? null : result.reason === "unsupported" ? "This source cannot request snapshots." : "Snapshot request could not be sent.");
   };
 
   return (
@@ -69,7 +75,7 @@ export function App() {
       <section className="workspace-frame" aria-labelledby={titleId}>
         <aside className="rail" aria-label="Workspace navigation">
           <div className="rail-label">WORKSPACE</div>
-          <button className="rail-item is-active" aria-current="page"><span aria-hidden="true">◈</span> Live flows</button>
+          <a className="rail-item is-active" href={`#${titleId}`} aria-current="page"><span aria-hidden="true">◈</span> Live flows</a>
           <button className="rail-item" disabled><span aria-hidden="true">≡</span> Saved views <small>soon</small></button>
           <div className="rail-divider" />
           <div className="rail-label">SOURCE</div>
@@ -90,11 +96,11 @@ export function App() {
           </dl>
         </aside>
 
-        <section className="content-panel" id={titleId}>
+        <section className="content-panel">
           <div className="panel-heading">
             <div>
               <p className="eyebrow">CAPTURE SURFACE / 01</p>
-              <h2>Live flows</h2>
+              <h2 id={titleId} tabIndex={-1}>Live flows</h2>
             </div>
             <div className="heading-meta" aria-label={`${retainedCount} retained flows`}>
               <span className="metric-value">{retainedCount}</span><span>retained</span>
@@ -108,13 +114,13 @@ export function App() {
             <div className="signal-copy">
               <span className="signal-label">SOURCE SIGNAL</span>
               <strong>{statusInfo.label}</strong>
-              <span>{followLive ? `cursor ${browser.cursor}` : `paused at cursor ${displayedCursor}`}</span>
+              <span>{followLive ? `cursor ${displayedCursor}` : `paused at cursor ${displayedCursor}`}</span>
             </div>
             <div className="signal-stat"><span>messages</span><strong>{browser.counters.receivedMessages}</strong></div>
             <div className="signal-stat"><span>changes</span><strong>{browser.counters.appliedChanges}</strong></div>
             <div className="signal-stat"><span>dropped</span><strong>{browser.counters.droppedMessages}</strong></div>
             <button className={`follow-control ${followLive ? "is-following" : "is-paused"}`} aria-pressed={followLive} onClick={toggleFollowLive}>
-              <span aria-hidden="true">{followLive ? "↓" : "Ⅱ"}</span>{followLive ? "Following live" : "Live paused"}
+              <span aria-hidden="true">{followLive && status.state === "live" ? "↓" : "Ⅱ"}</span>{followLabel}
             </button>
           </div>
 
@@ -122,7 +128,12 @@ export function App() {
             <div className="notice notice-warning" role="alert">
               <span className="notice-mark" aria-hidden="true">!</span>
               <div><strong>Stream gap at cursor {browser.gap.received}</strong><p>Waiting for a fresh snapshot from the source. History remains visible until it arrives.</p></div>
-              <button className="notice-action" onClick={() => requestResync(browser.resyncRequested ?? browser.cursor)}>Request snapshot</button>
+              <div className="notice-actions">
+                <button className="notice-action" onClick={handleResync} disabled={!status.requestResyncAvailable}>
+                  {status.requestResyncAvailable ? "Request snapshot" : "Snapshot request unavailable"}
+                </button>
+                {resyncMessage && <span className="notice-result" role="status">{resyncMessage}</span>}
+              </div>
             </div>
           ) : hasError ? (
             <div className="empty-state" role="status">
