@@ -4,8 +4,15 @@ import { describe, expect, it } from "vitest";
 
 const css = readFileSync(resolve(process.cwd(), "src/styles/tokens.css"), "utf8");
 
-function token(name: string): string {
-  const value = css.match(new RegExp(`--${name}:\\s*(#[0-9a-fA-F]{6})`))?.[1];
+function themeBlock(selector: string): string {
+  const escaped = selector.replace(/[[\]"]/g, (character) => `\\${character}`);
+  const match = css.match(new RegExp(`${escaped}\\s*\\{([\\s\\S]*?)\\}`));
+  if (!match) throw new Error(`missing selector ${selector}`);
+  return match[1];
+}
+
+function token(block: string, name: string): string {
+  const value = block.match(new RegExp(`--${name}:\\s*(#[0-9a-fA-F]{6})`))?.[1];
   if (!value) throw new Error(`missing token --${name}`);
   return value;
 }
@@ -22,19 +29,33 @@ function contrast(foreground: string, background: string): number {
   return (light + 0.05) / (dark + 0.05);
 }
 
-describe("console token contrast", () => {
-  it("keeps normal telemetry text WCAG AA on both instrument surfaces", () => {
-    const foregrounds = ["ink", "ink-soft", "muted", "faint", "amber", "teal", "danger"];
-    const backgrounds = ["paper", "paper-deep"];
-    for (const foreground of foregrounds) {
-      for (const background of backgrounds) {
-        expect(contrast(token(foreground), token(background)), `${foreground} on ${background}`).toBeGreaterThanOrEqual(4.5);
-      }
-    }
-  });
+const foregrounds = ["ink", "ink-soft", "muted", "faint", "amber", "teal", "danger"] as const;
+const backgrounds = ["paper", "paper-deep"] as const;
+const themes: Array<{ label: string; selector: string }> = [
+  { label: "light", selector: ":root" },
+  { label: "dark", selector: '[data-theme="dark"]' },
+];
 
-  it("keeps signal colors legible inside their tinted status surfaces", () => {
-    expect(contrast(token("amber"), token("amber-soft"))).toBeGreaterThanOrEqual(4.5);
-    expect(contrast(token("teal"), token("teal-soft"))).toBeGreaterThanOrEqual(4.5);
+describe("console token contrast", () => {
+  for (const theme of themes) {
+    const block = themeBlock(theme.selector);
+    it(`keeps normal telemetry text WCAG AA on both instrument surfaces (${theme.label})`, () => {
+      for (const foreground of foregrounds) {
+        for (const background of backgrounds) {
+          expect(contrast(token(block, foreground), token(block, background)), `${foreground} on ${background} (${theme.label})`).toBeGreaterThanOrEqual(4.5);
+        }
+      }
+    });
+
+    it(`keeps signal colors legible inside their tinted status surfaces (${theme.label})`, () => {
+      expect(contrast(token(block, "amber"), token(block, "amber-soft")), `amber-soft (${theme.label})`).toBeGreaterThanOrEqual(4.5);
+      expect(contrast(token(block, "teal"), token(block, "teal-soft")), `teal-soft (${theme.label})`).toBeGreaterThanOrEqual(4.5);
+    });
+  }
+
+  it("collapses the accent tokens onto the neutral ramp (light theme)", () => {
+    const block = themeBlock(":root");
+    expect(token(block, "teal")).toBe(token(block, "ink"));
+    expect(token(block, "amber")).toBe(token(block, "muted"));
   });
 });

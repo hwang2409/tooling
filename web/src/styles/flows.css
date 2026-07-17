@@ -40,7 +40,7 @@
 .flow-dock-title { color: var(--faint); font-family: var(--font-mono); font-size: 9px; letter-spacing: .1em; }
 .flow-dock-title code { color: var(--ink); letter-spacing: 0; }
 .flow-dock-action { padding: 6px 8px; color: var(--paper); border: 0; border-radius: var(--radius-s); background: var(--ink); cursor: pointer; font-size: 9px; font-weight: 700; white-space: nowrap; transition: background-color 100ms ease-out, transform 100ms ease-out; }
-.flow-dock-action:hover, .flow-dock-action:focus-visible { background: var(--teal); }
+.flow-dock-action:hover, .flow-dock-action:focus-visible { background: var(--ink-soft); }
 .flow-dock-action:active { transform: scale(.97); }
 
 @media (max-width: 760px) {
