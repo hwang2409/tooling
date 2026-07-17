@@ -402,6 +402,7 @@ def test_sink_emits_a_final_gap_without_a_later_retained_message() -> None:
 def test_contended_offer_does_no_payload_work(monkeypatch: pytest.MonkeyPatch) -> None:
     sink = BoundedMessageSink()
     message = parse_message({"protocol_version": "1", "type": "future.contended"})
+    prepared = sink.prepare(message)
 
     def fail(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("payload work ran on the contended producer path")
@@ -411,10 +412,74 @@ def test_contended_offer_does_no_payload_work(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(sink_module, "_message_weight", fail)
     sink._lock.acquire()
     try:
-        assert not sink.offer(message)
+        assert not sink.offer_prepared(prepared)
     finally:
         sink._lock.release()
     assert sink.dropped_count == 1
+
+
+def test_loss_ranges_stay_bounded_for_25000_contiguous_drops() -> None:
+    sink = BoundedMessageSink(max_pending=1)
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.first"}))
+    prepared = sink.prepare(parse_message({"protocol_version": "1", "type": "future.drop"}))
+    for _ in range(25_000):
+        assert not sink.offer_prepared(prepared)
+    assert sink.dropped_count == 25_000
+    assert sink.loss_range_count == 1
+    assert sink.loss_range_collapses == 0
+    messages = sink.drain()
+    gaps = [
+        message
+        for message in messages
+        if isinstance(message, KnownParsedMessage) and message.message["type"] == "stream.gap"
+    ]
+    assert len(gaps) == 1
+    assert gaps[0].message["dropped_count"] == "25000"
+    assert sink.loss_range_count == 0
+
+
+def test_noncontiguous_loss_fragmentation_collapses_to_bounded_resync() -> None:
+    sink = BoundedMessageSink(max_pending=512)
+    prepared = sink.prepare(parse_message({"protocol_version": "1", "type": "future.keep"}))
+    for _ in range(300):
+        assert sink.offer_prepared(prepared)
+        sink.record_loss()
+    assert sink.loss_range_count == 1
+    assert sink.loss_range_collapses > 0
+    messages = sink.drain()
+    gaps = [
+        message
+        for message in messages
+        if isinstance(message, KnownParsedMessage) and message.message["type"] == "stream.gap"
+    ]
+    assert len(gaps) == 1
+    assert gaps[0].message["dropped_count"] == "599"
+    assert sink.dropped_count == 599
+
+
+def test_prepared_offer_has_no_payload_work_when_queue_lock_loses_between_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    prepared = sink.prepare(
+        parse_message({"protocol_version": "1", "type": "future.prepared"})
+    )
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("payload helper ran after prepared admission")
+
+    monkeypatch.setattr(sink_module, "require_parsed_message", fail)
+    monkeypatch.setattr(sink_module, "_message_body_bytes", fail)
+    monkeypatch.setattr(sink_module, "_message_weight", fail)
+    sink._lock.acquire()
+    result: list[bool] = []
+    producer = threading.Thread(
+        target=lambda: result.append(sink.offer_prepared(prepared))
+    )
+    producer.start()
+    producer.join(timeout=1)
+    sink._lock.release()
+    assert not producer.is_alive()
+    assert result == [False]
 
 
 def test_producer_drop_during_drain_is_not_cleared_or_duplicated(

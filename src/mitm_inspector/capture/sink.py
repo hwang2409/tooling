@@ -7,7 +7,6 @@ from collections import deque
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from itertools import count
-from queue import Empty, SimpleQueue
 from threading import Lock
 
 from mitm_inspector.protocol import (
@@ -21,6 +20,52 @@ from mitm_inspector.protocol import (
     require_parsed_message,
 )
 
+MAX_LOSS_RANGES = 256
+_PREPARED_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class _LossRange:
+    start: int
+    end: int
+
+
+class _PreparedEnvelope:
+    """Private immutable message plus metrics trusted by the sink."""
+
+    __slots__ = ("_message", "_body_bytes", "_weight", "_token")
+    _message: ParsedMessageResult
+    _body_bytes: int
+    _weight: int
+    _token: object
+
+    def __init__(
+        self,
+        message: ParsedMessageResult,
+        body_bytes: int,
+        weight: int,
+        *,
+        token: object,
+    ) -> None:
+        if token is not _PREPARED_TOKEN:
+            raise TypeError("prepared envelopes are created by BoundedMessageSink.prepare")
+        object.__setattr__(self, "_message", message)
+        object.__setattr__(self, "_body_bytes", body_bytes)
+        object.__setattr__(self, "_weight", weight)
+        object.__setattr__(self, "_token", token)
+
+    @property
+    def message(self) -> ParsedMessageResult:
+        return self._message
+
+    @property
+    def body_bytes(self) -> int:
+        return self._body_bytes
+
+    @property
+    def weight(self) -> int:
+        return self._weight
+
 
 @dataclass(frozen=True)
 class _QueuedMessage:
@@ -31,13 +76,18 @@ class _QueuedMessage:
 
 
 class BoundedMessageSink:
-    """A bounded queue which never waits for its producer or consumer.
+    """A bounded queue with nonblocking producer admission.
 
-    Producers reserve a delivery position and publish either a retained item or
-    a drop event.  Only the consumer constructs positioned messages and gaps;
-    consequently no parsing, copying, or payload traversal occurs under the
-    queue lock.  The drop event queue is the synchronization boundary for all
-    loss accounting, including lock contention and externally recorded loss.
+    Capture code prepares an immutable envelope before admission.  The single
+    admission lock then serializes position assignment, queue insertion, and
+    loss-range updates without holding the queue lock during any payload work.
+    Raw ``offer`` remains as a compatibility wrapper; the capture hot path uses
+    :meth:`prepare` and :meth:`offer_prepared`.
+
+    Losses are retained as at most ``MAX_LOSS_RANGES`` ranges.  If concurrent
+    reservations fragment that bounded range set, the ranges collapse into a
+    resync interval; queued messages inside that interval are intentionally
+    discarded so the resulting stream.gap covers every position exactly.
     """
 
     def __init__(
@@ -60,58 +110,75 @@ class BoundedMessageSink:
         self._body_bytes = 0
         self._memory_bytes = 0
         self._lock = Lock()
+        self._loss_lock = Lock()
         self._positions = count(1)
-        self._drop_events: SimpleQueue[int] = SimpleQueue()
-        self._pending_drops: list[int] = []
+        self._loss_ranges: deque[_LossRange] = deque()
         self._last_delivered_position = 0
         self._accepted = 0
-        self._observed_drop_count = 0
+        self._dropped_total = 0
+        self._forced_loss_count = 0
         self._body_budget_drops = 0
         self._memory_budget_drops = 0
+        self._loss_range_collapses = 0
+        self._loss_resync_active = False
         self._inflight = 0
 
-    def offer(self, message: ParsedMessage) -> bool:
-        """Queue a message or publish an in-band loss without waiting."""
+    def prepare(self, message: ParsedMessage) -> _PreparedEnvelope:
+        """Canonicalize once and cache bounded metrics before producer admission."""
+
+        _validate_message_numbers(message)
+        retained = require_parsed_message(message)
+        return _PreparedEnvelope(
+            retained,
+            _message_body_bytes(retained),
+            _message_weight(retained),
+            token=_PREPARED_TOKEN,
+        )
+
+    def offer(self, message: ParsedMessage | _PreparedEnvelope) -> bool:
+        """Queue a prepared message or compatibility-wrap a parsed message."""
+
+        if isinstance(message, _PreparedEnvelope):
+            return self.offer_prepared(message)
+        return self.offer_prepared(self.prepare(message))
+
+    def offer_prepared(self, envelope: _PreparedEnvelope) -> bool:
+        """Perform one nonblocking admission using a trusted prepared envelope."""
 
         try:
             self._inflight += 1
-            # Probe the lock before touching the payload.  A stream producer
-            # that loses the race must do only position/drop bookkeeping.
             if not self._lock.acquire(blocking=False):
-                position = next(self._positions)
-                self._record_drop(position)
-                return False
-            self._lock.release()
-            _validate_message_numbers(message)
-            retained = require_parsed_message(message)
-            body_bytes = _message_body_bytes(retained)
-            weight = _message_weight(retained)
-            if not self._lock.acquire(blocking=False):
-                position = next(self._positions)
-                self._record_drop(position)
+                self._record_drop(next(self._positions))
                 return False
             try:
-                position = next(self._positions)
-                if len(self._items) >= self._max_pending:
-                    self._record_drop(position)
-                    return False
-                if self._body_bytes + body_bytes > self._max_body_bytes:
-                    self._body_budget_drops += 1
-                    self._record_drop(position)
-                    return False
-                if self._memory_bytes + weight > self._max_memory_bytes:
-                    self._memory_budget_drops += 1
-                    self._record_drop(position)
-                    return False
-                self._items.append(_QueuedMessage(position, retained, body_bytes, weight))
-                self._body_bytes += body_bytes
-                self._memory_bytes += weight
-                self._accepted += 1
-                return True
+                if envelope._token is not _PREPARED_TOKEN:
+                    raise TypeError("invalid prepared envelope")
+                return self._enqueue(envelope)
             finally:
                 self._lock.release()
         finally:
             self._inflight -= 1
+
+    def _enqueue(self, envelope: _PreparedEnvelope) -> bool:
+        position = next(self._positions)
+        if len(self._items) >= self._max_pending:
+            self._record_drop(position)
+            return False
+        if self._body_bytes + envelope.body_bytes > self._max_body_bytes:
+            self._body_budget_drops += 1
+            self._record_drop(position)
+            return False
+        if self._memory_bytes + envelope.weight > self._max_memory_bytes:
+            self._memory_budget_drops += 1
+            self._record_drop(position)
+            return False
+        self._items.append(
+            _QueuedMessage(position, envelope.message, envelope.body_bytes, envelope.weight)
+        )
+        self._body_bytes += envelope.body_bytes
+        self._memory_bytes += envelope.weight
+        self._accepted += 1
+        return True
 
     def record_loss(self) -> None:
         """Record a bounded-store/addon loss as a synthetic delivery position."""
@@ -125,70 +192,76 @@ class BoundedMessageSink:
     __call__ = offer
 
     def drain(self, limit: int | None = None) -> list[ParsedMessageResult]:
-        """Detach queue entries under lock and build output outside it."""
+        """Detach bounded work under lock, then canonicalize gaps outside it."""
 
         if limit is not None and limit < 1:
             raise ValueError("limit must be positive")
+        # A producer never waits for this consumer lock.  The consumer may
+        # briefly wait for a producer's preparation, but no queue work is held
+        # while messages or gaps are decoded.
         with self._lock:
             if self._inflight:
                 return []
-            count_to_drain = len(self._items) if limit is None else min(limit, len(self._items))
+            count_to_drain = (
+                len(self._items)
+                if limit is None
+                else min(limit, len(self._items))
+            )
             detached = [self._items.popleft() for _ in range(count_to_drain)]
             self._body_bytes -= sum(item.body_bytes for item in detached)
             self._memory_bytes -= sum(item.weight for item in detached)
+        with self._loss_lock:
+            ranges = [*self._loss_ranges]
+            self._loss_ranges.clear()
+            resync_active = self._loss_resync_active
+            self._loss_resync_active = False
+            ranges = _normalize_ranges(ranges)
+        return self._drain_detached(detached, ranges, resync_active=resync_active)
 
-        # A producer may publish a drop while the queue is being detached.  A
-        # second non-blocking drain of the event queue includes all events that
-        # completed before this consumer pass; later events remain for the next
-        # pass and cannot mutate the consumer's local ranges.
-        dropped = self._pending_drops
-        self._pending_drops = []
-        newly_observed = 0
-        while True:
-            try:
-                dropped.append(self._drop_events.get_nowait())
-                newly_observed += 1
-            except Empty:
-                break
-        self._observed_drop_count += newly_observed
-        dropped.sort()
-
+    def _drain_detached(
+        self,
+        detached: list[_QueuedMessage],
+        ranges: list[_LossRange],
+        *,
+        resync_active: bool,
+    ) -> list[ParsedMessageResult]:
         output: list[ParsedMessageResult] = []
         for item in detached:
-            prior = [
-                position
-                for position in dropped
-                if self._last_delivered_position < position < item.position
-            ]
-            if prior:
+            _discard_expired_ranges(ranges, self._last_delivered_position)
+            while ranges and ranges[0].start <= self._last_delivered_position + 1:
+                loss = ranges.pop(0)
+                if loss.end <= self._last_delivered_position:
+                    continue
+                output.append(_gap(self._last_delivered_position, loss.end + 1))
+                self._last_delivered_position = loss.end
+            if item.position <= self._last_delivered_position:
+                self._forced_loss_count += 1
+                continue
+            if ranges and ranges[0].start < item.position:
+                # A range can begin after an already delivered position only
+                # when the producer/consumer overlap leaves an accepted item
+                # in front of it.  Emit that bounded missing interval first.
+                loss = ranges.pop(0)
                 output.append(_gap(self._last_delivered_position, item.position))
                 self._last_delivered_position = item.position - 1
-                dropped = [position for position in dropped if position >= item.position]
+                if loss.end >= item.position:
+                    ranges.insert(0, _LossRange(item.position, loss.end))
+            if ranges and ranges[0].start == item.position:
+                continue
             output.append(_with_delivery_position(item.message, item.position))
             self._last_delivered_position = item.position
-            dropped = [position for position in dropped if position > item.position]
 
-        # A drop must remain visible even if no later retained item exists.  The
-        # next possible delivery position is one beyond the final drop.
-        remaining = sorted(set(dropped))
-        index = 0
-        while index < len(remaining):
-            position = remaining[index]
-            if position <= self._last_delivered_position:
-                index += 1
-                continue
-            if position != self._last_delivered_position + 1:
-                # Positions not yet observed are left for a later pass; this is
-                # the only safe choice during a concurrent producer reservation.
-                self._pending_drops.extend(remaining[index:])
-                break
-            end = position
-            index += 1
-            while index < len(remaining) and remaining[index] == end + 1:
-                end = remaining[index]
-                index += 1
-            output.append(_gap(self._last_delivered_position, end + 1))
-            self._last_delivered_position = end
+        _discard_expired_ranges(ranges, self._last_delivered_position)
+        while ranges and ranges[0].start <= self._last_delivered_position + 1:
+            loss = ranges.pop(0)
+            output.append(_gap(self._last_delivered_position, loss.end + 1))
+            self._last_delivered_position = max(self._last_delivered_position, loss.end)
+        if ranges:
+            with self._loss_lock:
+                self._loss_ranges = deque(
+                    _normalize_ranges([*self._loss_ranges, *ranges])
+                )
+                self._loss_resync_active |= resync_active
         return output
 
     def __iter__(self) -> Iterator[ParsedMessageResult]:
@@ -200,7 +273,7 @@ class BoundedMessageSink:
 
     @property
     def dropped_count(self) -> int:
-        return self._observed_drop_count + self._drop_events.qsize()
+        return self._dropped_total + self._forced_loss_count
 
     @property
     def pending_count(self) -> int:
@@ -215,8 +288,72 @@ class BoundedMessageSink:
     def memory_budget_drops(self) -> int:
         return self._memory_budget_drops
 
+    @property
+    def loss_range_count(self) -> int:
+        with self._loss_lock:
+            return len(self._loss_ranges)
+
+    @property
+    def loss_range_collapses(self) -> int:
+        return self._loss_range_collapses
+
     def _record_drop(self, position: int) -> None:
-        self._drop_events.put(position)
+        with self._loss_lock:
+            if self._loss_resync_active and self._loss_ranges:
+                current = self._loss_ranges[0]
+                self._loss_ranges = deque(
+                    [
+                        _LossRange(
+                            min(current.start, position),
+                            max(current.end, position),
+                        )
+                    ]
+                )
+                collapsed = False
+            else:
+                self._loss_ranges, collapsed = _insert_range(
+                    self._loss_ranges, position, position
+                )
+            self._dropped_total += 1
+            if collapsed:
+                self._loss_range_collapses += 1
+                self._loss_resync_active = True
+
+
+def _insert_range(
+    ranges: deque[_LossRange], start: int, end: int
+) -> tuple[deque[_LossRange], bool]:
+    values = [*ranges, _LossRange(start, end)]
+    values = _merge_ranges(values)
+    if len(values) <= MAX_LOSS_RANGES:
+        return deque(values), False
+    collapsed = _LossRange(values[0].start, values[-1].end)
+    return deque([collapsed]), True
+
+
+def _merge_ranges(ranges: list[_LossRange]) -> list[_LossRange]:
+    if not ranges:
+        return []
+    merged: list[_LossRange] = []
+    for current in sorted(ranges, key=lambda item: (item.start, item.end)):
+        if merged and current.start <= merged[-1].end + 1:
+            previous = merged[-1]
+            merged[-1] = _LossRange(previous.start, max(previous.end, current.end))
+        else:
+            merged.append(current)
+    return merged
+
+
+def _normalize_ranges(ranges: list[_LossRange]) -> list[_LossRange]:
+    merged = _merge_ranges(ranges)
+    if len(merged) > MAX_LOSS_RANGES:
+        return [_LossRange(merged[0].start, merged[-1].end)]
+    return merged
+
+
+def _discard_expired_ranges(ranges: list[_LossRange], last: int) -> None:
+    while ranges and ranges[0].end <= last:
+        ranges.pop(0)
 
 
 def _with_delivery_position(

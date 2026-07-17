@@ -495,7 +495,8 @@ class CaptureAddon:
 
     def _send(self, raw: dict[str, object]) -> None:
         parsed = parse_message(raw)
-        self.sink.offer(parsed)
+        prepared = self.sink.prepare(parsed)
+        self.sink.offer_prepared(prepared)
 
     @property
     def counters(self) -> dict[str, int]:
