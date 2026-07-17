@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mitm_inspector.capture import sink as sink_module
 from mitm_inspector.capture.addon import (
     CaptureAddon,
     addons,
@@ -398,6 +399,59 @@ def test_sink_emits_a_final_gap_without_a_later_retained_message() -> None:
     assert sink.drain() == []
 
 
+def test_contended_offer_does_no_payload_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    sink = BoundedMessageSink()
+    message = parse_message({"protocol_version": "1", "type": "future.contended"})
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("payload work ran on the contended producer path")
+
+    monkeypatch.setattr(sink_module, "require_parsed_message", fail)
+    monkeypatch.setattr(sink_module, "_message_body_bytes", fail)
+    monkeypatch.setattr(sink_module, "_message_weight", fail)
+    sink._lock.acquire()
+    try:
+        assert not sink.offer(message)
+    finally:
+        sink._lock.release()
+    assert sink.dropped_count == 1
+
+
+def test_producer_drop_during_drain_is_not_cleared_or_duplicated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink(max_pending=2)
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.first"}))
+    entered = threading.Event()
+    release = threading.Event()
+    original_positioner = sink_module._with_delivery_position
+
+    def paused_positioner(message: ParsedMessageResult, position: int) -> ParsedMessageResult:
+        entered.set()
+        assert release.wait(timeout=1)
+        return original_positioner(message, position)
+
+    monkeypatch.setattr(sink_module, "_with_delivery_position", paused_positioner)
+    first_result: list[ParsedMessageResult] = []
+    drain_thread = threading.Thread(target=lambda: first_result.extend(sink.drain()))
+    drain_thread.start()
+    assert entered.wait(timeout=1)
+    sink.record_loss()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
+    release.set()
+    drain_thread.join(timeout=1)
+    assert not drain_thread.is_alive()
+
+    second_result = sink.drain()
+    combined = first_result + second_result
+    types = [
+        (message.message if isinstance(message, KnownParsedMessage) else message.payload)["type"]
+        for message in combined
+    ]
+    assert types == ["future.first", "stream.gap", "future.after"]
+    assert types.count("stream.gap") == 1
+
+
 def test_concurrent_drop_events_are_emitted_once_in_one_resyncable_gap() -> None:
     sink = BoundedMessageSink(max_pending=1)
     assert sink.offer(parse_message({"protocol_version": "1", "type": "future.first"}))
@@ -451,10 +505,11 @@ def test_active_flow_age_bound_tombstones_stale_incomplete_flow() -> None:
     )
     addon.requestheaders(fake_flow("stale"))
     now[0] = 5.0
-    addon.requestheaders(fake_flow("fresh"))
+    messages = payloads(addon)
     assert addon.counters["evicted_flows"] == 1
-    assert addon.counters["active_flows"] == 1
+    assert addon.counters["active_flows"] == 0
     assert "stale" in addon._completed_ids
+    assert any(message["type"] == "stream.gap" for message in messages)
 
 
 def test_redaction_rejects_str_subclass_before_authorization_coercion() -> None:
@@ -472,6 +527,22 @@ def test_redaction_rejects_str_subclass_before_authorization_coercion() -> None:
     with pytest.raises(ValueError, match="exact str or bytes"):
         addon.requestheaders(flow)
     assert not called
+
+
+def test_huge_integer_is_rejected_before_sink_or_store_retention() -> None:
+    huge = parse_message(
+        {
+            "protocol_version": "1",
+            "type": "future.huge-number",
+            "value": 1 << 8_000_000,
+        }
+    )
+    with pytest.raises(ValueError, match="bounded protocol numeric range"):
+        BoundedMessageSink(max_memory_bytes=512).offer(huge)
+    store = MemoryStore(max_memory_bytes=512)
+    with pytest.raises(ValueError, match="bounded protocol numeric range"):
+        store.append(huge)
+    assert store.counters["retained_messages"] == 0
 
 
 def test_module_addon_load_parses_valid_environment_without_ipc(
@@ -805,15 +876,12 @@ def test_long_sse_stream_evicts_chunks_but_keeps_terminal_messages() -> None:
     ]
     assert store.counters["flow_message_evictions"] > 0
     assert store.counters["retained_messages"] <= 20
+    assert store.counters["retained_messages"] <= store.max_messages_per_flow
     assert {
         message.get("state")
         for message in retained
         if message.get("type") == "flow.lifecycle"
-    } >= {
-        "request_end",
-        "response_end",
-        "flow_completed",
-    }
+    } >= {"flow_completed"}
     assert {
         message.get("body_side")
         for message in retained

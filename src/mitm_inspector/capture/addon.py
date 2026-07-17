@@ -21,7 +21,7 @@ from mitm_inspector.capture.config import (
 )
 from mitm_inspector.capture.redaction import sanitize_header, sanitize_path
 from mitm_inspector.capture.sink import BoundedMessageSink
-from mitm_inspector.protocol import ParsedMessage, ParsedMessageResult, parse_message
+from mitm_inspector.protocol import MAX_U64, ParsedMessage, ParsedMessageResult, parse_message
 
 MessageEmitter = Callable[[ParsedMessage], None]
 Clock = Callable[[], str]
@@ -262,6 +262,7 @@ class CaptureAddon:
     def drain(self, limit: int | None = None) -> list[ParsedMessageResult]:
         """Drain messages when the addon owns its default bounded sink."""
 
+        self._purge_active()
         messages = self.sink.drain(limit)
         if self._emit_callback is not None:
             for message in messages:
@@ -500,6 +501,7 @@ class CaptureAddon:
     def counters(self) -> dict[str, int]:
         """Expose active-bound and tombstone accounting for health checks."""
 
+        self._purge_active()
         return {
             "active_flows": len(self._flows),
             "active_metadata_bytes": self._active_metadata_bytes,
@@ -569,7 +571,7 @@ def _safe_bytes(value: object, *, label: str) -> bytes:
 
 
 def _safe_uint_text(value: object, *, label: str) -> str:
-    if type(value) is not int or value < 0:
+    if type(value) is not int or value < 0 or value > MAX_U64:
         raise ValueError(f"{label} must be an exact non-negative int")
     return str(value)
 

@@ -9,7 +9,9 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 
 from mitm_inspector.protocol import (
+    MAX_U64,
     KnownParsedMessage,
+    OpaqueParsedMessage,
     ParsedMessage,
     ParsedMessageResult,
     require_parsed_message,
@@ -98,12 +100,14 @@ class MemoryStore:
         self._message_evictions = 0
         self._dropped_messages = 0
         self._per_flow_drops = 0
+        self._flow_message_evictions = 0
         self._body_budget_drops = 0
         self._memory_budget_drops = 0
 
     def append(self, message: ParsedMessage) -> None:
         """Revalidate and retain a protocol message without retaining aliases."""
 
+        _validate_message_numbers(message)
         now = self._clock()
         self._purge_expired(now)
         retained = require_parsed_message(message)
@@ -146,7 +150,11 @@ class MemoryStore:
             self._memory_bytes += weight
         else:
             if len(record.messages) >= self.max_messages_per_flow:
-                if not self._make_room_for_flow(record, incoming_terminal=_is_terminal(retained)):
+                if not self._make_room_for_flow(
+                    record,
+                    incoming_terminal=_is_terminal(retained),
+                    incoming_state=payload.get("state"),
+                ):
                     self._dropped_messages += 1
                     self._per_flow_drops += 1
                     self._assert_invariants()
@@ -197,9 +205,7 @@ class MemoryStore:
             "message_evictions": self._message_evictions,
             "dropped_messages": self._dropped_messages,
             "per_flow_drops": self._per_flow_drops,
-            "flow_message_evictions": sum(
-                record.evicted_messages for record in self._flows.values()
-            ),
+            "flow_message_evictions": self._flow_message_evictions,
             "body_budget_drops": self._body_budget_drops,
             "memory_bytes": self._memory_bytes,
             "memory_budget_drops": self._memory_budget_drops,
@@ -262,7 +268,7 @@ class MemoryStore:
             self._message_evictions += 1
 
     def _make_room_for_flow(
-        self, record: _FlowRecord, *, incoming_terminal: bool
+        self, record: _FlowRecord, *, incoming_terminal: bool, incoming_state: object
     ) -> bool:
         candidates = [
             (stored.order, index)
@@ -272,19 +278,42 @@ class MemoryStore:
         if not candidates:
             if not incoming_terminal:
                 return False
-            # Terminal messages are protected from per-flow chunk eviction, but
-            # the global message cap remains absolute.  If this record is the
-            # only global candidate, replace its oldest terminal atomically;
-            # never leave an empty record and append into an orphan.
-            if self._message_count >= self.max_messages:
-                self._make_room_for_message(protected=record)
-                if self._message_count >= self.max_messages:
-                    return False
-            return True
+            # Terminal messages have priority, but the configured per-flow cap
+            # is absolute.  Prefer dropping a lifecycle terminal over the
+            # essential body-end/completed representation; if a completed flow
+            # arrives at a full cap, replace the oldest body-end as a last
+            # resort.  Every replacement is counted as locatable loss.
+            nonessential = [
+                (stored.order, index)
+                for index, stored in enumerate(record.messages)
+                if not _terminal_is_essential(stored.message)
+            ]
+            if nonessential:
+                _, index = min(nonessential)
+                self._remove_flow_message(record, index, keep_empty=True)
+                self._message_evictions += 1
+                record.evicted_messages += 1
+                self._flow_message_evictions += 1
+                return True
+            if incoming_state == "flow_completed":
+                body_ends = [
+                    (stored.order, index)
+                    for index, stored in enumerate(record.messages)
+                    if _message_type(stored.message) == "body.end"
+                ]
+                if body_ends:
+                    _, index = min(body_ends)
+                    self._remove_flow_message(record, index, keep_empty=True)
+                    self._message_evictions += 1
+                    record.evicted_messages += 1
+                    self._flow_message_evictions += 1
+                    return True
+            return False
         _, index = min(candidates)
         self._remove_flow_message(record, index, keep_empty=True)
         self._message_evictions += 1
         record.evicted_messages += 1
+        self._flow_message_evictions += 1
         return True
 
     def _enforce_body_budget(self) -> None:
@@ -460,6 +489,40 @@ def _is_terminal(message: ParsedMessageResult) -> bool:
     )
 
 
+def _message_type(message: ParsedMessageResult) -> object:
+    payload = message.message if isinstance(message, KnownParsedMessage) else message.payload
+    return payload.get("type")
+
+
+def _terminal_is_essential(message: ParsedMessageResult) -> bool:
+    payload = message.message if isinstance(message, KnownParsedMessage) else message.payload
+    return payload.get("type") == "body.end" or payload.get("state") == "flow_completed"
+
+
+def _validate_message_numbers(message: ParsedMessage) -> None:
+    if isinstance(message, KnownParsedMessage):
+        payload = message.message
+    elif isinstance(message, OpaqueParsedMessage):
+        payload = message.payload
+    else:
+        return
+    _validate_bounded_numbers(payload)
+
+
+def _validate_bounded_numbers(value: object) -> None:
+    if type(value) is int:
+        if value < -(1 << 63) or value > MAX_U64:
+            raise ValueError("integer exceeds the bounded protocol numeric range")
+        return
+    if isinstance(value, Mapping):
+        for item in value.values():
+            _validate_bounded_numbers(item)
+        return
+    if isinstance(value, list | tuple):
+        for item in value:
+            _validate_bounded_numbers(item)
+
+
 def _message_body_bytes(payload: Mapping[str, object]) -> int:
     message_type = payload.get("type")
     if message_type == "body.chunk":
@@ -491,6 +554,8 @@ def _canonical_weight(value: object) -> int:
     if value is None or isinstance(value, bool):
         return 1
     if isinstance(value, int | float):
+        if type(value) is int and (value < -(1 << 63) or value > MAX_U64):
+            raise ValueError("integer exceeds the bounded protocol numeric range")
         return 8
     if isinstance(value, str):
         return len(value)

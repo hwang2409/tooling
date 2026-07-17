@@ -46,7 +46,9 @@ as synchronized delivery events; `drain` coalesces them into valid
 `stream.gap` messages before the next retained message and also flushes a final
 gap when no later retained message exists. Callback delivery, when configured,
 happens only during explicit `CaptureAddon.drain`, never from a mitmproxy
-stream callback.
+stream callback. A contended offer performs only bounded position/drop
+bookkeeping; payload validation, body accounting, and canonicalization happen
+only after the producer has a lock-free admission opportunity.
 
 `MemoryStore` retains project-owned parsed messages grouped by flow. It keeps
 the newest 2,000 completed flows or 30 minutes, whichever evicts first, and
@@ -54,10 +56,13 @@ accounts decoded body-prefix bytes against a 128 MiB global budget, including
 incomplete flows, standalone messages, and body descriptors nested in browser
 snapshot/delta envelopes. A separate canonical-memory counter includes all
 nested and additive fields, so arbitrary envelopes cannot bypass the same
-bound. Global and per-flow message caps prevent lifecycle, zero-byte, or
+bound; integers outside the bounded signed/unsigned 64-bit range are rejected
+before retention. Global and per-flow message caps prevent lifecycle, zero-byte, or
 arbitrary envelope floods from escaping bounds; terminal body/lifecycle
-messages are retained while older SSE chunks are evicted. Active capture flows
-are independently bounded by count, age, and copied metadata weight.
+messages are retained within the hard per-flow cap while older SSE chunks and
+lower-priority terminal observations are evicted with counters. Active capture
+flows are independently bounded by count, age, and copied metadata weight; a
+consumer drain also performs the age sweep when traffic has stopped.
 Metadata and terminal body updates are coalesced. Evictions, expiry, sink
 drops, and body/memory-budget drops are observable through
 `MemoryStore.counters`, `CaptureAddon.counters`, and

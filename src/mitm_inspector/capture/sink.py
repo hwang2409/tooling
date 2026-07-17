@@ -11,7 +11,9 @@ from queue import Empty, SimpleQueue
 from threading import Lock
 
 from mitm_inspector.protocol import (
+    MAX_U64,
     KnownParsedMessage,
+    OpaqueParsedMessage,
     ParsedMessage,
     ParsedMessageResult,
     parse_message,
@@ -73,14 +75,23 @@ class BoundedMessageSink:
 
         try:
             self._inflight += 1
+            # Probe the lock before touching the payload.  A stream producer
+            # that loses the race must do only position/drop bookkeeping.
+            if not self._lock.acquire(blocking=False):
+                position = next(self._positions)
+                self._record_drop(position)
+                return False
+            self._lock.release()
+            _validate_message_numbers(message)
             retained = require_parsed_message(message)
             body_bytes = _message_body_bytes(retained)
             weight = _message_weight(retained)
-            position = next(self._positions)
             if not self._lock.acquire(blocking=False):
+                position = next(self._positions)
                 self._record_drop(position)
                 return False
             try:
+                position = next(self._positions)
                 if len(self._items) >= self._max_pending:
                     self._record_drop(position)
                     return False
@@ -261,10 +272,36 @@ def _message_weight(message: ParsedMessageResult) -> int:
     return _canonical_weight(payload)
 
 
+def _validate_message_numbers(message: ParsedMessage) -> None:
+    if isinstance(message, KnownParsedMessage):
+        payload = message.message
+    elif isinstance(message, OpaqueParsedMessage):
+        payload = message.payload
+    else:
+        return
+    _validate_bounded_numbers(payload)
+
+
+def _validate_bounded_numbers(value: object) -> None:
+    if type(value) is int:
+        if value < -(1 << 63) or value > MAX_U64:
+            raise ValueError("integer exceeds the bounded protocol numeric range")
+        return
+    if isinstance(value, Mapping):
+        for item in value.values():
+            _validate_bounded_numbers(item)
+        return
+    if isinstance(value, list | tuple):
+        for item in value:
+            _validate_bounded_numbers(item)
+
+
 def _canonical_weight(value: object) -> int:
     if value is None or isinstance(value, bool):
         return 1
     if isinstance(value, int | float):
+        if type(value) is int and (value < -(1 << 63) or value > MAX_U64):
+            raise ValueError("integer exceeds the bounded protocol numeric range")
         return 8
     if isinstance(value, str):
         return len(value)
