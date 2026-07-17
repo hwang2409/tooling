@@ -1,7 +1,10 @@
 import base64
+import subprocess
+import sys
 import threading
 from collections import deque
 from collections.abc import Iterator, Mapping
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -348,6 +351,49 @@ def test_hostile_callback_runs_only_on_consumer_thread_after_stream_returns() ->
     assert not drain_thread.is_alive()
 
 
+def test_reentrant_callback_drain_is_single_flight_and_keeps_suffix_order() -> None:
+    observed: list[str] = []
+    reentrant_results: list[list[ParsedMessageResult]] = []
+    addon: CaptureAddon
+
+    def emit(message: ParsedMessageResult) -> None:
+        payload = message.message if isinstance(message, KnownParsedMessage) else message.payload
+        message_type = str(payload["type"])
+        observed.append(message_type)
+        if message_type == "future.one":
+            addon.sink.offer(parse_message({"protocol_version": "1", "type": "future.three"}))
+            reentrant_results.append(addon.drain())
+
+    addon = CaptureAddon(emit=emit, clock=lambda: "now")
+    assert addon.sink.offer(parse_message({"protocol_version": "1", "type": "future.one"}))
+    assert addon.sink.offer(parse_message({"protocol_version": "1", "type": "future.two"}))
+    first = addon.drain()
+    assert len(first) == 2
+    assert reentrant_results == [[]]
+    assert observed == ["future.one", "future.two"]
+    addon.drain()
+    assert observed == ["future.one", "future.two", "future.three"]
+
+
+def test_callback_failure_attempts_entire_batch_without_stranding_suffix() -> None:
+    observed: list[str] = []
+
+    def emit(message: ParsedMessageResult) -> None:
+        payload = message.message if isinstance(message, KnownParsedMessage) else message.payload
+        message_type = str(payload["type"])
+        observed.append(message_type)
+        if message_type == "future.one":
+            raise RuntimeError("injected callback failure")
+
+    addon = CaptureAddon(emit=emit, clock=lambda: "now")
+    assert addon.sink.offer(parse_message({"protocol_version": "1", "type": "future.one"}))
+    assert addon.sink.offer(parse_message({"protocol_version": "1", "type": "future.two"}))
+    with pytest.raises(RuntimeError, match="injected callback failure"):
+        addon.drain()
+    assert observed == ["future.one", "future.two"]
+    assert addon.drain() == []
+
+
 def test_partial_response_error_finishes_response_and_disables_late_stream_chunks() -> None:
     addon = CaptureAddon(clock=lambda: "now")
     flow = fake_flow()
@@ -527,6 +573,39 @@ def test_append_failure_releases_reservation_and_records_exact_gap() -> None:
     ] == ["stream.gap", "future.after"]
 
 
+def test_keyboard_interrupt_during_append_rolls_back_transaction() -> None:
+    class InterruptingDeque(deque[object]):
+        def append(self, _item: object) -> None:
+            raise KeyboardInterrupt
+
+    sink = BoundedMessageSink()
+    sink._items = InterruptingDeque()
+    with pytest.raises(KeyboardInterrupt):
+        sink.offer(parse_message({"protocol_version": "1", "type": "future.interrupt"}))
+    assert sink._reserved_slots == 0
+    assert sink.pending_count == 0
+    assert sink.dropped_count == 1
+    assert sink.loss_range_count == 1
+
+
+def test_keyboard_interrupt_during_drain_restores_detached_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.interrupt"}))
+
+    def interrupt(_message: ParsedMessageResult, _position: int) -> ParsedMessageResult:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink_module, "_with_delivery_position", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        sink.drain()
+    assert sink.pending_count == 1
+    assert sink._last_delivered_position == 0
+    monkeypatch.undo()
+    assert len(sink.drain()) == 1
+
+
 def test_sink_does_not_expose_fabricable_prepared_metric_seam() -> None:
     sink = BoundedMessageSink()
     assert not hasattr(sink, "prepare")
@@ -630,6 +709,48 @@ def test_producer_drop_during_drain_is_not_cleared_or_duplicated(
     ]
     assert types == ["future.first", "stream.gap", "future.after"]
     assert types.count("stream.gap") == 1
+
+
+def test_overlapping_drains_are_single_flight_and_keep_delivery_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink(max_pending=4)
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.one"}))
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.two"}))
+    entered = threading.Event()
+    release = threading.Event()
+    second_done = threading.Event()
+    first_result: list[ParsedMessageResult] = []
+    second_result: list[ParsedMessageResult] = []
+    original_positioner = sink_module._with_delivery_position
+
+    def paused_positioner(message: ParsedMessageResult, position: int) -> ParsedMessageResult:
+        entered.set()
+        assert release.wait(timeout=1)
+        return original_positioner(message, position)
+
+    monkeypatch.setattr(sink_module, "_with_delivery_position", paused_positioner)
+    first = threading.Thread(target=lambda: first_result.extend(sink.drain()))
+
+    def run_second() -> None:
+        second_result.extend(sink.drain())
+        second_done.set()
+
+    second = threading.Thread(target=run_second)
+    first.start()
+    assert entered.wait(timeout=1)
+    second.start()
+    assert not second_done.wait(timeout=0.05)
+    release.set()
+    first.join(timeout=1)
+    second.join(timeout=1)
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert [
+        (item.message if isinstance(item, KnownParsedMessage) else item.payload)["type"]
+        for item in first_result
+    ] == ["future.one", "future.two"]
+    assert second_result == []
 
 
 def test_concurrent_drop_events_are_emitted_once_in_one_resyncable_gap() -> None:
@@ -749,6 +870,47 @@ def test_module_addon_load_parses_valid_environment_without_ipc(
     factory_addon = make_addon_from_environment()
     assert factory_addon.capture_socket == "/tmp/mitm-inspector.sock"
     assert CaptureAddon.from_environment().source_id == "source-from-env"
+
+
+def test_stock_mitmdump_12_2_3_loads_capture_script_without_dataclass_failure() -> None:
+    mitmdump = Path(sys.executable).with_name("mitmdump")
+    if not mitmdump.exists():
+        pytest.skip("mitmdump is not installed beside the test interpreter")
+    repository = Path(__file__).parents[1]
+    script = repository / "src" / "mitm_inspector" / "capture" / "addon.py"
+    version = subprocess.run(
+        [str(mitmdump), "--version"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "12.2.3" in version.stdout
+    process = subprocess.Popen(
+        [
+            str(mitmdump),
+            "-q",
+            "-s",
+            str(script),
+            "--listen-host",
+            "127.0.0.1",
+            "--listen-port",
+            "0",
+        ],
+        cwd=repository,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=1.5)
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        stdout, stderr = process.communicate(timeout=3)
+        assert "error in script" not in stderr
+        assert "Traceback" not in stderr
+    else:
+        pytest.fail(f"mitmdump exited during startup ({process.returncode}): {stdout}{stderr}")
+    assert "dataclass" not in stderr
 
 
 @pytest.mark.parametrize(

@@ -80,6 +80,7 @@ class BoundedMessageSink:
         self._next_position_value = 1
         self._exhausted = False
         self._reservation_lock = Lock()
+        self._consumer_lock = Lock()
         self._reserved_slots = 0
         self._loss_ranges: deque[_LossRange] = deque()
         self._last_delivered_position = 0
@@ -167,7 +168,7 @@ class BoundedMessageSink:
             self._memory_bytes += weight
             self._accepted += 1
             return True
-        except Exception:
+        except BaseException:
             if self._items and self._items[-1] == item:
                 self._items.pop()
             self._body_bytes = before_body
@@ -207,6 +208,12 @@ class BoundedMessageSink:
     __call__ = offer
 
     def drain(self, limit: int | None = None) -> list[ParsedMessageResult]:
+        """Serialize complete consumer transactions, including rollback."""
+
+        with self._consumer_lock:
+            return self._drain_once(limit)
+
+    def _drain_once(self, limit: int | None = None) -> list[ParsedMessageResult]:
         """Detach bounded work, then canonicalize it outside the queue lock.
 
         Detachment is transactional: a canonicalization failure restores the
@@ -250,7 +257,7 @@ class BoundedMessageSink:
             self._reservation_lock.release()
         try:
             return self._drain_detached(detached, ranges, resync_active=resync_active)
-        except Exception:
+        except BaseException:
             with self._lock:
                 self._items.extendleft(reversed(detached))
                 self._body_bytes += sum(item.body_bytes for item in detached)

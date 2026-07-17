@@ -1,11 +1,13 @@
 # Capture and bounded retention
 
-`CaptureAddon` is a small adapter over the documented mitmproxy 12.2.x HTTP
+`capture/adapter.py` contains the canonical `CaptureAddon` implementation over
+the documented mitmproxy 12.2.x HTTP
 hooks: `requestheaders`, `request`, `responseheaders`, `response`, and `error`.
-Its documented `load` hook parses configuration and the module exports
-`addons = [CaptureAddon()]`, so `mitmdump -s` loads a real addon. It imports
-only `mitmproxy.http`; it does not use mitmweb, view, proxy-layer, or
-dynamic-loading APIs.
+The thin `capture/addon.py` shim exports `addons = [CaptureAddon()]`, so stock
+`mitmdump -s` loads a real addon without executing dataclass declarations as a
+script. Its documented `load` hook parses configuration. It imports only
+`mitmproxy.http`; it does not use mitmweb, view, proxy-layer, or dynamic-loading
+APIs.
 
 Configuration is parsed at addon load, not by an import-time connection or
 thread. The supported environment variables are
@@ -56,6 +58,9 @@ is exposed to capture callers.
 Delivery positions are bounded unsigned 64-bit values; exhaustion is a stable
 terminal condition that leaves queued items and loss ranges attached rather
 than emitting an unrepresentable successor position.
+Consumer drains are single-flight, and callback dispatch is single-flight and
+reentrant-safe; callback failures are raised only after the detached batch has
+been fully attempted.
 
 `MemoryStore` retains project-owned parsed messages grouped by flow. It keeps
 the newest 2,000 completed flows or 30 minutes, whichever evicts first, and
