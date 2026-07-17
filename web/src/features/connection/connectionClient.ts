@@ -46,11 +46,12 @@ export interface ConnectionClientOptions {
   retryDelayMs?: (attempt: number) => number;
   staleAfterMs?: number;
   autoReconnect?: boolean;
+  onListenerError?: (error: unknown, event: ConnectionEvent) => void;
 }
 
 export type ResyncRequestResult =
   | { ok: true }
-  | { ok: false; reason: "invalid-cursor" | "not-connected" | "unsupported" | "transport-error"; error?: string };
+  | { ok: false; reason: "invalid-cursor" | "not-connected" | "unsupported" | "transport-error" | "stale-source"; error?: string };
 
 export type ConnectionEvent =
   | { type: "attempt"; id: number }
@@ -96,6 +97,7 @@ export class ConnectionClient {
   private readonly retryDelayMs: (attempt: number) => number;
   private readonly staleAfterMs: number;
   private readonly autoReconnect: boolean;
+  private readonly onListenerError: (error: unknown, event: ConnectionEvent) => void;
   private readonly listeners = new Set<(event: ConnectionEvent) => void>();
   private connection: TransportConnection | null = null;
   private connectionAttemptId: number | null = null;
@@ -121,6 +123,7 @@ export class ConnectionClient {
     this.retryDelayMs = options.retryDelayMs ?? ((attempt) => exponentialBackoff(attempt));
     this.staleAfterMs = options.staleAfterMs ?? 15_000;
     this.autoReconnect = options.autoReconnect ?? true;
+    this.onListenerError = options.onListenerError ?? (() => undefined);
   }
 
   public getSnapshot(): ConnectionStatus {
@@ -218,17 +221,19 @@ export class ConnectionClient {
 
   private receive(value: unknown, generation: number, attemptId: number): void {
     if (!this.isCurrentAttempt(generation, attemptId)) return;
+    let envelope: ParsedMessage;
     try {
-      const envelope = parseProtocolMessage(value);
-      this.updateStatus({ state: "live", error: null, lastMessageAt: this.now() });
-      if (!this.isCurrentAttempt(generation, attemptId)) return;
-      this.scheduleStale(generation, attemptId);
-      this.emit({ type: "message", envelope });
+      envelope = parseProtocolMessage(value);
     } catch (error) {
       const normalized = error instanceof Error ? error : new Error(errorMessage(error));
       this.emit({ type: "protocol-error", error: normalized });
       this.failed(normalized, generation, attemptId);
+      return;
     }
+    this.updateStatus({ state: "live", error: null, lastMessageAt: this.now() });
+    if (!this.isCurrentAttempt(generation, attemptId)) return;
+    this.scheduleStale(generation, attemptId);
+    this.emit({ type: "message", envelope });
   }
 
   private failed(error: unknown, generation: number, attemptId: number): void {
@@ -284,7 +289,17 @@ export class ConnectionClient {
   }
 
   private emit(event: ConnectionEvent): void {
-    for (const listener of [...this.listeners]) listener(event);
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(event);
+      } catch (error) {
+        try {
+          this.onListenerError(error, event);
+        } catch {
+          // Observer diagnostics must not become a transport lifecycle failure.
+        }
+      }
+    }
   }
 
   private closeCurrentConnection(attemptId?: number): void {

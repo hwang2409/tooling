@@ -17,7 +17,7 @@ export interface ConnectionViewModel {
   readonly retry: () => void;
   readonly pauseLive: () => void;
   readonly resumeLive: () => void;
-  readonly requestResync: (...args: [string]) => ResyncRequestResult;
+  readonly requestResync: (...args: [number]) => ResyncRequestResult;
 }
 
 export function useConnection(factory: TransportFactory = unavailableTransportFactory): ConnectionViewModel {
@@ -54,6 +54,10 @@ export function useConnection(factory: TransportFactory = unavailableTransportFa
     retry: () => client.connect(),
     pauseLive: () => dispatch({ type: "pause" }),
     resumeLive: () => dispatch({ type: "resume" }),
-    requestResync: (...args) => client.requestResync(args[0]),
+    requestResync: (...args) => {
+      const current = browserView.latest;
+      if (args[0] !== current.sourceEpoch) return { ok: false, reason: "stale-source" };
+      return client.requestResync(current.resyncRequested ?? current.cursor);
+    },
   };
 }

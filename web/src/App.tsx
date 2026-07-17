@@ -43,7 +43,7 @@ export function App({ transportFactory }: AppProps = {}) {
 
 export function Workbench({ view }: { view: ConnectionViewModel }) {
   const {
-    browser, status, followLive, pauseLive, resumeLive, connect, disconnect, retry, requestResync,
+    browser, latestBrowser, status, followLive, pauseLive, resumeLive, connect, disconnect, retry, requestResync,
   } = view;
   const titleId = useId();
   const [resyncMessage, setResyncMessage] = useState<string | null>(null);
@@ -54,6 +54,8 @@ export function Workbench({ view }: { view: ConnectionViewModel }) {
   const isConnected = status.state === "live" || status.state === "stale";
   const hasError = status.state === "error";
   const retainedCount = browser.flows.size;
+  const currentResyncGap = latestBrowser.gap?.sourceEpoch === latestBrowser.sourceEpoch ? latestBrowser.gap : null;
+  const resyncAvailable = status.requestResyncAvailable && currentResyncGap !== null;
   const action = isConnected || isBusy ? disconnect : hasError ? retry : connect;
   const memoryBudget = browser.sourceLimits?.max_in_memory_bytes ?? "134217728";
   const displayedCursor = browser.cursor;
@@ -64,8 +66,12 @@ export function Workbench({ view }: { view: ConnectionViewModel }) {
       : `Follow when ${statusInfo.label.toLowerCase()}`;
   const toggleFollowLive = followLive ? pauseLive : resumeLive;
   const handleResync = () => {
-    const result = requestResync(browser.resyncRequested ?? browser.cursor);
-    setResyncMessage(result.ok ? null : result.reason === "unsupported" ? "This source cannot request snapshots." : "Snapshot request could not be sent.");
+    if (!resyncAvailable) {
+      setResyncMessage("No current source gap is available.");
+      return;
+    }
+    const result = requestResync(latestBrowser.sourceEpoch);
+    setResyncMessage(result.ok ? null : result.reason === "unsupported" ? "This source cannot request snapshots." : result.reason === "stale-source" ? "The source changed; follow live to resync." : "Snapshot request could not be sent.");
   };
 
   return (
@@ -147,8 +153,8 @@ export function Workbench({ view }: { view: ConnectionViewModel }) {
               <span className="notice-mark" aria-hidden="true">!</span>
               <div><strong>Stream gap at cursor {browser.gap.received}</strong><p>Waiting for a fresh snapshot from the source. History remains visible until it arrives.</p></div>
               <div className="notice-actions">
-                <button className="notice-action" onClick={handleResync} disabled={!status.requestResyncAvailable}>
-                  {status.requestResyncAvailable ? "Request snapshot" : "Snapshot request unavailable"}
+                <button className="notice-action" onClick={handleResync} disabled={!resyncAvailable}>
+                  {resyncAvailable ? "Request snapshot" : "Snapshot request unavailable"}
                 </button>
                 {resyncMessage && <span className="notice-result" role="status">{resyncMessage}</span>}
               </div>

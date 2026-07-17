@@ -12,6 +12,7 @@ import type {
 } from "../protocol";
 
 export interface CursorGap {
+  readonly sourceEpoch: number;
   readonly expected: string;
   readonly received: string;
   readonly requested: string;
@@ -233,6 +234,7 @@ function applyDelta(state: BrowserState, message: BrowserDelta): BrowserState {
     return {
       ...state,
       gap: {
+        sourceEpoch: state.sourceEpoch,
         expected: (currentCursor + 1n).toString(),
         received: message.cursor,
         requested: state.cursor,
@@ -273,6 +275,7 @@ function applyResync(state: BrowserState, message: BrowserResync): BrowserState 
   return {
     ...state,
     gap: state.gap ?? {
+      sourceEpoch: state.sourceEpoch,
       expected: state.cursor,
       received: message.requested_cursor,
       requested: message.requested_cursor,

@@ -191,6 +191,32 @@ describe("connection client", () => {
     expect(client.getSnapshot().state).toBe("error");
   });
 
+  it("isolates an observer that throws while handling a valid message", () => {
+    const timer = new TestTimer();
+    const harness = factoryHarness();
+    const observed: string[] = [];
+    const listenerErrors: unknown[] = [];
+    const client = new ConnectionClient({
+      transportFactory: harness.factory,
+      timer,
+      autoReconnect: false,
+      onListenerError: (error) => listenerErrors.push(error),
+    });
+    client.subscribe((event) => {
+      if (event.type === "message") throw new Error("observer failed");
+    });
+    client.subscribe((event) => observed.push(event.type));
+    client.connect();
+    harness.handlers[0].onOpen();
+    harness.handlers[0].onMessage({ protocol_version: "1", type: "future.message" });
+
+    expect(client.getSnapshot().state).toBe("live");
+    expect(harness.closes[0]).not.toHaveBeenCalled();
+    expect(observed).toContain("message");
+    expect(observed).not.toContain("protocol-error");
+    expect(listenerErrors).toHaveLength(1);
+  });
+
   it("exposes explicit resync capability and request results", () => {
     const timer = new TestTimer();
     const supported = factoryHarness(true);

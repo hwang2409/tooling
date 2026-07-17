@@ -43,7 +43,10 @@ function makeView(overrides: Partial<ConnectionViewModel> = {}): ConnectionViewM
     retry: vi.fn(),
     pauseLive: vi.fn(),
     resumeLive: vi.fn(),
-    requestResync: vi.fn(() => ({ ok: true as const })),
+    requestResync: vi.fn((...args: [number]) => {
+      void args;
+      return { ok: true as const };
+    }),
     ...overrides,
   };
 }
