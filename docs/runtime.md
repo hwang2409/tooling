@@ -38,7 +38,7 @@ include a `preflight` report listing every issue.
 
 ## Shared capture IPC contract
 
-`CaptureIPCConfig` is the durable seam shared by proxy and future app. Every
+`CaptureIPCConfig` is the durable seam shared by proxy and app. Every
 live run allocates a collision-resistant private directory under the system
 temporary directory with mode `0700`; its endpoint is
 `<run-directory>/capture.sock`. Existing directories/endpoints are checked
@@ -56,7 +56,8 @@ MITM_INSPECTOR_MAX_IN_MEMORY_BYTES=134217728
 MITM_INSPECTOR_MAX_PENDING_MESSAGES=4096
 ```
 
-The future app argv additionally has these reserved names for B3:
+The app argv additionally has these reserved names, consumed by
+`mitm_inspector.api.server`:
 
 ```text
 --capture-socket <absolute path>
@@ -71,9 +72,9 @@ project-specific flags cannot be added to its parser before the `-s` addon is
 loaded. B2's addon can consume the exact environment names and remain
 loadable through the ordinary `-s <absolute addon path>` argument.
 
-## Planning before B3
+## Planning and the live run
 
-The safe surface available before the app server exists is:
+The inspection surface is:
 
 ```sh
 mitm-inspector plan \
@@ -81,13 +82,14 @@ mitm-inspector plan \
   --app-port 8000
 ```
 
-It prints the eventual argv vectors, IPC contract, preflight report, and
-lifecycle order. The equivalent dry-run is `mitm-inspector run --dry-run`;
-neither command starts a proxy, app server, listener, browser, or shell. A
-live `run` intentionally exits with an explanation until B3 provides the app
-server.
+It prints the argv vectors, IPC contract, preflight report, and lifecycle
+order. The equivalent dry-run is `mitm-inspector run --dry-run`; neither
+command starts a proxy, app server, listener, browser, or shell. A live
+`mitm-inspector run` starts the B3 app server child first, waits for its
+versioned health endpoint, then starts stock mitmdump and waits for its
+loopback listener to accept a TCP connection.
 
-The planned commands are equivalent to:
+The commands are equivalent to:
 
 ```text
 <sys.executable> -m mitm_inspector.api.server --host 127.0.0.1 --port 8000 --proxy-port 8080 ...
@@ -109,10 +111,13 @@ removed only after cleanup. They map to exit statuses 130 and 143. A
 requires the explicit `SignalPolicy.DISABLED_FOR_TEST` injection; otherwise it
 fails before startup.
 
-Readiness is an injected seam. S0's default probe only detects an immediate
-child exit; B3 can provide a health/readiness probe without changing the
-supervisor or its tests. Process creation is also injected, and production
-creation always receives a `ProcessSpec` with direct argv and `shell=False`.
+Readiness is an injected seam. The supervisor's default probe only detects an
+immediate child exit; the live CLI injects `HttpHealthReadinessProbe`, which
+polls `GET /api/v1/health` on the app and a TCP connect on the proxy, checks
+the child for early exit on every attempt, and raises a bounded
+`ReadinessTimeoutError` otherwise. Process creation is also injected, and
+production creation always receives a `ProcessSpec` with direct argv and
+`shell=False`.
 
 The browser is convenience-only. It is disabled by default; a false return or
 exception from an explicitly enabled opener is nonfatal and sent to the

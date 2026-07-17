@@ -220,7 +220,7 @@ class CaptureIPCConfig:
 
     The proxy receives these values through the explicit environment overlay
     because stock mitmdump cannot accept project-specific command-line
-    options.  The future app receives the identical overlay and may also
+    options.  The app receives the identical overlay and may also
     expose equivalent flags without changing this contract.
     """
 
