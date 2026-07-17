@@ -21,7 +21,7 @@ from mitm_inspector.capture.config import (
 )
 from mitm_inspector.capture.redaction import sanitize_header, sanitize_path
 from mitm_inspector.capture.sink import BoundedMessageSink
-from mitm_inspector.protocol import MAX_U64, ParsedMessage, ParsedMessageResult, parse_message
+from mitm_inspector.protocol import MAX_U64, ParsedMessage, ParsedMessageResult
 
 MessageEmitter = Callable[[ParsedMessage], None]
 Clock = Callable[[], str]
@@ -494,9 +494,7 @@ class CaptureAddon:
         self.sink.record_loss()
 
     def _send(self, raw: dict[str, object]) -> None:
-        parsed = parse_message(raw)
-        prepared = self.sink.prepare(parsed)
-        self.sink.offer_prepared(prepared)
+        self.sink.offer(raw)
 
     @property
     def counters(self) -> dict[str, int]:

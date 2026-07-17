@@ -1,5 +1,6 @@
 import base64
 import threading
+from collections import deque
 from collections.abc import Iterator, Mapping
 from types import SimpleNamespace
 
@@ -13,7 +14,12 @@ from mitm_inspector.capture.addon import (
 )
 from mitm_inspector.capture.config import CaptureConfig
 from mitm_inspector.capture.sink import BoundedMessageSink
-from mitm_inspector.protocol import KnownParsedMessage, ParsedMessageResult, parse_message
+from mitm_inspector.protocol import (
+    MAX_U64,
+    KnownParsedMessage,
+    ParsedMessageResult,
+    parse_message,
+)
 from mitm_inspector.store.memory import MemoryStore
 
 
@@ -401,29 +407,29 @@ def test_sink_emits_a_final_gap_without_a_later_retained_message() -> None:
 
 def test_contended_offer_does_no_payload_work(monkeypatch: pytest.MonkeyPatch) -> None:
     sink = BoundedMessageSink()
-    message = parse_message({"protocol_version": "1", "type": "future.contended"})
-    prepared = sink.prepare(message)
+    message = {"protocol_version": "1", "type": "future.contended"}
 
     def fail(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("payload work ran on the contended producer path")
 
     monkeypatch.setattr(sink_module, "require_parsed_message", fail)
+    monkeypatch.setattr(sink_module, "parse_message", fail)
     monkeypatch.setattr(sink_module, "_message_body_bytes", fail)
     monkeypatch.setattr(sink_module, "_message_weight", fail)
-    sink._lock.acquire()
+    sink._reservation_lock.acquire()
     try:
-        assert not sink.offer_prepared(prepared)
+        assert not sink.offer(message)
     finally:
-        sink._lock.release()
+        sink._reservation_lock.release()
     assert sink.dropped_count == 1
 
 
 def test_loss_ranges_stay_bounded_for_25000_contiguous_drops() -> None:
     sink = BoundedMessageSink(max_pending=1)
     assert sink.offer(parse_message({"protocol_version": "1", "type": "future.first"}))
-    prepared = sink.prepare(parse_message({"protocol_version": "1", "type": "future.drop"}))
+    message = parse_message({"protocol_version": "1", "type": "future.drop"})
     for _ in range(25_000):
-        assert not sink.offer_prepared(prepared)
+        assert not sink.offer(message)
     assert sink.dropped_count == 25_000
     assert sink.loss_range_count == 1
     assert sink.loss_range_collapses == 0
@@ -440,9 +446,9 @@ def test_loss_ranges_stay_bounded_for_25000_contiguous_drops() -> None:
 
 def test_noncontiguous_loss_fragmentation_collapses_to_bounded_resync() -> None:
     sink = BoundedMessageSink(max_pending=512)
-    prepared = sink.prepare(parse_message({"protocol_version": "1", "type": "future.keep"}))
+    message = parse_message({"protocol_version": "1", "type": "future.keep"})
     for _ in range(300):
-        assert sink.offer_prepared(prepared)
+        assert sink.offer(message)
         sink.record_loss()
     assert sink.loss_range_count == 1
     assert sink.loss_range_collapses > 0
@@ -461,9 +467,7 @@ def test_prepared_offer_has_no_payload_work_when_queue_lock_loses_between_stages
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sink = BoundedMessageSink()
-    prepared = sink.prepare(
-        parse_message({"protocol_version": "1", "type": "future.prepared"})
-    )
+    message = parse_message({"protocol_version": "1", "type": "future.prepared"})
     def fail(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("payload helper ran after prepared admission")
 
@@ -473,13 +477,124 @@ def test_prepared_offer_has_no_payload_work_when_queue_lock_loses_between_stages
     sink._lock.acquire()
     result: list[bool] = []
     producer = threading.Thread(
-        target=lambda: result.append(sink.offer_prepared(prepared))
+        target=lambda: result.append(sink.offer(message))
     )
     producer.start()
     producer.join(timeout=1)
     sink._lock.release()
     assert not producer.is_alive()
     assert result == [False]
+
+
+def test_admission_preparation_failure_releases_reservation_without_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    message = parse_message({"protocol_version": "1", "type": "future.failure"})
+
+    def fail(_message: ParsedMessageResult) -> ParsedMessageResult:
+        raise RuntimeError("injected preparation failure")
+
+    monkeypatch.setattr(sink_module, "require_parsed_message", fail)
+    with pytest.raises(RuntimeError, match="injected preparation failure"):
+        sink.offer(message)
+    assert sink._reserved_slots == 0
+    assert sink.pending_count == 0
+    assert sink.dropped_count == 0
+    assert sink._next_position_value == 1
+
+
+def test_append_failure_releases_reservation_and_records_exact_gap() -> None:
+    class FailingDeque(deque[object]):
+        def append(self, _item: object) -> None:
+            raise RuntimeError("injected append failure")
+
+    sink = BoundedMessageSink()
+    sink._items = FailingDeque()
+    message = parse_message({"protocol_version": "1", "type": "future.append"})
+    with pytest.raises(RuntimeError, match="injected append failure"):
+        sink.offer(message)
+    assert sink._reserved_slots == 0
+    assert sink.pending_count == 0
+    assert sink.dropped_count == 1
+    assert sink.loss_range_count == 1
+    sink._items = deque()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
+    drained = sink.drain()
+    assert [
+        (item.message if isinstance(item, KnownParsedMessage) else item.payload)["type"]
+        for item in drained
+    ] == ["stream.gap", "future.after"]
+
+
+def test_sink_does_not_expose_fabricable_prepared_metric_seam() -> None:
+    sink = BoundedMessageSink()
+    assert not hasattr(sink, "prepare")
+    assert not hasattr(sink, "offer_prepared")
+
+
+def test_uint64_exhaustion_is_stable_without_constructing_next_position() -> None:
+    sink = BoundedMessageSink(max_pending=1)
+    sink._next_position_value = MAX_U64 - 1
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.last"}))
+    assert not sink.offer(parse_message({"protocol_version": "1", "type": "future.drop"}))
+    assert sink.exhausted
+    assert sink.dropped_count == 1
+    pending = sink.pending_count
+    ranges = sink.loss_range_count
+    for _ in range(3):
+        assert not sink.offer(parse_message({"protocol_version": "1", "type": "future.repeat"}))
+        assert not sink.record_loss()
+    assert sink.pending_count == pending
+    assert sink.loss_range_count == ranges
+    assert sink.drain() == []
+    assert sink.pending_count == pending
+    assert sink.loss_range_count == ranges
+
+
+def test_drain_failure_restores_detached_queue_and_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    message = parse_message({"protocol_version": "1", "type": "future.rollback"})
+    assert sink.offer(message)
+
+    def fail(_message: ParsedMessageResult, _position: int) -> ParsedMessageResult:
+        raise RuntimeError("injected drain failure")
+
+    monkeypatch.setattr(sink_module, "_with_delivery_position", fail)
+    with pytest.raises(RuntimeError, match="injected drain failure"):
+        sink.drain()
+    assert sink.pending_count == 1
+    assert sink._last_delivered_position == 0
+    monkeypatch.undo()
+    delivered = sink.drain()
+    assert len(delivered) == 1
+    assert sink.pending_count == 0
+
+
+def test_drain_gap_failure_restores_loss_range_and_detached_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink(max_pending=1)
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.keep"}))
+    assert not sink.offer(parse_message({"protocol_version": "1", "type": "future.drop"}))
+
+    def fail(_expected: int, _loss_end: int) -> ParsedMessageResult:
+        raise RuntimeError("injected gap failure")
+
+    monkeypatch.setattr(sink_module, "_gap_after_loss", fail)
+    with pytest.raises(RuntimeError, match="injected gap failure"):
+        sink.drain()
+    assert sink.pending_count == 1
+    assert sink.loss_range_count == 1
+    assert sink._last_delivered_position == 0
+    monkeypatch.undo()
+    drained = sink.drain()
+    assert [
+        (item.message if isinstance(item, KnownParsedMessage) else item.payload)["type"]
+        for item in drained
+    ] == ["future.keep", "stream.gap"]
 
 
 def test_producer_drop_during_drain_is_not_cleared_or_duplicated(

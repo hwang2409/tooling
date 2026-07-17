@@ -47,8 +47,15 @@ as synchronized delivery events; `drain` coalesces them into valid
 gap when no later retained message exists. Callback delivery, when configured,
 happens only during explicit `CaptureAddon.drain`, never from a mitmproxy
 stream callback. A contended offer performs only bounded position/drop
-bookkeeping; capture prepares a private immutable envelope with cached body and
-canonical-memory metrics before the single nonblocking queue admission.
+bookkeeping. The sink owns one admission transaction: it reserves a bounded
+slot nonblockingly, canonicalizes and weighs only after that reservation, and
+commits the queue item and delivery position together. Preparation failures
+release the reservation without consuming a position; commit failures are
+represented by an exact in-band gap. No prepared-message or trusted-metric API
+is exposed to capture callers.
+Delivery positions are bounded unsigned 64-bit values; exhaustion is a stable
+terminal condition that leaves queued items and loss ranges attached rather
+than emitting an unrepresentable successor position.
 
 `MemoryStore` retains project-owned parsed messages grouped by flow. It keeps
 the newest 2,000 completed flows or 30 minutes, whichever evicts first, and

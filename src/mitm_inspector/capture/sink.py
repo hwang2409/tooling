@@ -6,7 +6,6 @@ import base64
 from collections import deque
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from itertools import count
 from threading import Lock
 
 from mitm_inspector.protocol import (
@@ -21,7 +20,6 @@ from mitm_inspector.protocol import (
 )
 
 MAX_LOSS_RANGES = 256
-_PREPARED_TOKEN = object()
 
 
 @dataclass(frozen=True)
@@ -30,41 +28,8 @@ class _LossRange:
     end: int
 
 
-class _PreparedEnvelope:
-    """Private immutable message plus metrics trusted by the sink."""
-
-    __slots__ = ("_message", "_body_bytes", "_weight", "_token")
-    _message: ParsedMessageResult
-    _body_bytes: int
-    _weight: int
-    _token: object
-
-    def __init__(
-        self,
-        message: ParsedMessageResult,
-        body_bytes: int,
-        weight: int,
-        *,
-        token: object,
-    ) -> None:
-        if token is not _PREPARED_TOKEN:
-            raise TypeError("prepared envelopes are created by BoundedMessageSink.prepare")
-        object.__setattr__(self, "_message", message)
-        object.__setattr__(self, "_body_bytes", body_bytes)
-        object.__setattr__(self, "_weight", weight)
-        object.__setattr__(self, "_token", token)
-
-    @property
-    def message(self) -> ParsedMessageResult:
-        return self._message
-
-    @property
-    def body_bytes(self) -> int:
-        return self._body_bytes
-
-    @property
-    def weight(self) -> int:
-        return self._weight
+class _PositionExhausted(RuntimeError):
+    """The bounded uint64 delivery-position namespace is terminal."""
 
 
 @dataclass(frozen=True)
@@ -78,11 +43,11 @@ class _QueuedMessage:
 class BoundedMessageSink:
     """A bounded queue with nonblocking producer admission.
 
-    Capture code prepares an immutable envelope before admission.  The single
-    admission lock then serializes position assignment, queue insertion, and
-    loss-range updates without holding the queue lock during any payload work.
-    Raw ``offer`` remains as a compatibility wrapper; the capture hot path uses
-    :meth:`prepare` and :meth:`offer_prepared`.
+    A producer first reserves an admission slot with a nonblocking,
+    sink-owned lock.  Only that successful path canonicalizes and weighs the
+    message.  Queue insertion and delivery-position assignment are committed
+    after preparation; a preparation failure therefore consumes neither a
+    queue slot nor a delivery position.
 
     Losses are retained as at most ``MAX_LOSS_RANGES`` ranges.  If concurrent
     reservations fragment that bounded range set, the ranges collapse into a
@@ -111,7 +76,11 @@ class BoundedMessageSink:
         self._memory_bytes = 0
         self._lock = Lock()
         self._loss_lock = Lock()
-        self._positions = count(1)
+        self._position_lock = Lock()
+        self._next_position_value = 1
+        self._exhausted = False
+        self._reservation_lock = Lock()
+        self._reserved_slots = 0
         self._loss_ranges: deque[_LossRange] = deque()
         self._last_delivered_position = 0
         self._accepted = 0
@@ -123,100 +92,177 @@ class BoundedMessageSink:
         self._loss_resync_active = False
         self._inflight = 0
 
-    def prepare(self, message: ParsedMessage) -> _PreparedEnvelope:
-        """Canonicalize once and cache bounded metrics before producer admission."""
+    def offer(self, message: ParsedMessage | Mapping[str, object]) -> bool:
+        """Admit one raw or parsed message without exposing trusted metrics."""
 
-        _validate_message_numbers(message)
-        retained = require_parsed_message(message)
-        return _PreparedEnvelope(
-            retained,
-            _message_body_bytes(retained),
-            _message_weight(retained),
-            token=_PREPARED_TOKEN,
-        )
-
-    def offer(self, message: ParsedMessage | _PreparedEnvelope) -> bool:
-        """Queue a prepared message or compatibility-wrap a parsed message."""
-
-        if isinstance(message, _PreparedEnvelope):
-            return self.offer_prepared(message)
-        return self.offer_prepared(self.prepare(message))
-
-    def offer_prepared(self, envelope: _PreparedEnvelope) -> bool:
-        """Perform one nonblocking admission using a trusted prepared envelope."""
-
+        self._inflight += 1
         try:
-            self._inflight += 1
-            if not self._lock.acquire(blocking=False):
-                self._record_drop(next(self._positions))
+            if self._exhausted or not self._reservation_lock.acquire(False):
+                self._record_new_loss()
                 return False
+            reserved = False
             try:
-                if envelope._token is not _PREPARED_TOKEN:
-                    raise TypeError("invalid prepared envelope")
-                return self._enqueue(envelope)
+                if self._exhausted:
+                    return False
+                if not self._lock.acquire(False):
+                    self._record_new_loss()
+                    return False
+                try:
+                    if len(self._items) + self._reserved_slots >= self._max_pending:
+                        self._record_new_loss()
+                        return False
+                    self._reserved_slots += 1
+                    reserved = True
+                finally:
+                    self._lock.release()
+
+                # This is deliberately outside the queue lock.  It is reached
+                # only after the sink-owned reservation succeeded.
+                _validate_message_numbers(message)
+                retained = (
+                    parse_message(message)
+                    if isinstance(message, Mapping)
+                    else require_parsed_message(message)
+                )
+                body_bytes = _message_body_bytes(retained)
+                weight = _message_weight(retained)
+
+                if self._exhausted or not self._lock.acquire(False):
+                    self._record_new_loss()
+                    return False
+                try:
+                    return self._commit(retained, body_bytes, weight)
+                finally:
+                    self._lock.release()
             finally:
-                self._lock.release()
+                if reserved:
+                    with self._lock:
+                        self._reserved_slots -= 1
+                self._reservation_lock.release()
         finally:
             self._inflight -= 1
 
-    def _enqueue(self, envelope: _PreparedEnvelope) -> bool:
-        position = next(self._positions)
-        if len(self._items) >= self._max_pending:
-            self._record_drop(position)
+    def _commit(self, message: ParsedMessageResult, body_bytes: int, weight: int) -> bool:
+        if self._exhausted:
             return False
-        if self._body_bytes + envelope.body_bytes > self._max_body_bytes:
+        try:
+            position = self._allocate_position()
+        except _PositionExhausted:
+            return False
+        if self._body_bytes + body_bytes > self._max_body_bytes:
             self._body_budget_drops += 1
             self._record_drop(position)
             return False
-        if self._memory_bytes + envelope.weight > self._max_memory_bytes:
+        if self._memory_bytes + weight > self._max_memory_bytes:
             self._memory_budget_drops += 1
             self._record_drop(position)
             return False
-        self._items.append(
-            _QueuedMessage(position, envelope.message, envelope.body_bytes, envelope.weight)
-        )
-        self._body_bytes += envelope.body_bytes
-        self._memory_bytes += envelope.weight
-        self._accepted += 1
-        return True
+        item = _QueuedMessage(position, message, body_bytes, weight)
+        before_body = self._body_bytes
+        before_memory = self._memory_bytes
+        before_accepted = self._accepted
+        try:
+            self._items.append(item)
+            self._body_bytes += body_bytes
+            self._memory_bytes += weight
+            self._accepted += 1
+            return True
+        except Exception:
+            if self._items and self._items[-1] == item:
+                self._items.pop()
+            self._body_bytes = before_body
+            self._memory_bytes = before_memory
+            self._accepted = before_accepted
+            self._record_drop(position)
+            raise
 
-    def record_loss(self) -> None:
+    def record_loss(self) -> bool:
         """Record a bounded-store/addon loss as a synthetic delivery position."""
 
+        self._inflight += 1
         try:
-            self._inflight += 1
-            self._record_drop(next(self._positions))
+            return self._record_new_loss()
         finally:
             self._inflight -= 1
+
+    def _record_new_loss(self) -> bool:
+        try:
+            position = self._allocate_position()
+        except _PositionExhausted:
+            return False
+        self._record_drop(position)
+        return True
+
+    def _allocate_position(self) -> int:
+        with self._position_lock:
+            if self._exhausted:
+                raise _PositionExhausted("delivery positions exhausted")
+            position = self._next_position_value
+            if position == MAX_U64:
+                self._exhausted = True
+            else:
+                self._next_position_value = position + 1
+            return position
 
     __call__ = offer
 
     def drain(self, limit: int | None = None) -> list[ParsedMessageResult]:
-        """Detach bounded work under lock, then canonicalize gaps outside it."""
+        """Detach bounded work, then canonicalize it outside the queue lock.
+
+        Detachment is transactional: a canonicalization failure restores the
+        exact queue, counters, loss ranges, and delivery cursor.
+        """
 
         if limit is not None and limit < 1:
             raise ValueError("limit must be positive")
-        # A producer never waits for this consumer lock.  The consumer may
-        # briefly wait for a producer's preparation, but no queue work is held
-        # while messages or gaps are decoded.
-        with self._lock:
-            if self._inflight:
-                return []
-            count_to_drain = (
-                len(self._items)
-                if limit is None
-                else min(limit, len(self._items))
-            )
-            detached = [self._items.popleft() for _ in range(count_to_drain)]
-            self._body_bytes -= sum(item.body_bytes for item in detached)
-            self._memory_bytes -= sum(item.weight for item in detached)
-        with self._loss_lock:
-            ranges = [*self._loss_ranges]
-            self._loss_ranges.clear()
-            resync_active = self._loss_resync_active
-            self._loss_resync_active = False
-            ranges = _normalize_ranges(ranges)
-        return self._drain_detached(detached, ranges, resync_active=resync_active)
+        if not self._reservation_lock.acquire(False):
+            return []
+        # A producer never waits for this consumer lock.  The consumer also
+        # does not detach work while a producer is preparing a message.
+        try:
+            with self._lock:
+                if self._inflight > 0:
+                    return []
+                with self._loss_lock:
+                    if self._exhausted and self._loss_ranges:
+                        # There is no representable sequence after MAX_U64;
+                        # retain the queued/loss state in a stable terminal
+                        # condition rather than constructing MAX_U64 + 1.
+                        return []
+                count_to_drain = (
+                    len(self._items)
+                    if limit is None
+                    else min(limit, len(self._items))
+                )
+                detached = [self._items.popleft() for _ in range(count_to_drain)]
+                self._body_bytes -= sum(item.body_bytes for item in detached)
+                self._memory_bytes -= sum(item.weight for item in detached)
+                old_last = self._last_delivered_position
+                old_forced = self._forced_loss_count
+            with self._loss_lock:
+                ranges = [*self._loss_ranges]
+                self._loss_ranges.clear()
+                resync_active = self._loss_resync_active
+                self._loss_resync_active = False
+                ranges = _normalize_ranges(ranges)
+            original_ranges = [*ranges]
+        finally:
+            self._reservation_lock.release()
+        try:
+            return self._drain_detached(detached, ranges, resync_active=resync_active)
+        except Exception:
+            with self._lock:
+                self._items.extendleft(reversed(detached))
+                self._body_bytes += sum(item.body_bytes for item in detached)
+                self._memory_bytes += sum(item.weight for item in detached)
+                self._last_delivered_position = old_last
+                self._forced_loss_count = old_forced
+            with self._loss_lock:
+                self._loss_ranges = deque(
+                    _normalize_ranges([*self._loss_ranges, *original_ranges])
+                )
+                self._loss_resync_active |= resync_active
+            raise
 
     def _drain_detached(
         self,
@@ -228,11 +274,15 @@ class BoundedMessageSink:
         output: list[ParsedMessageResult] = []
         for item in detached:
             _discard_expired_ranges(ranges, self._last_delivered_position)
-            while ranges and ranges[0].start <= self._last_delivered_position + 1:
+            while (
+                ranges
+                and self._last_delivered_position < MAX_U64
+                and ranges[0].start <= self._last_delivered_position + 1
+            ):
                 loss = ranges.pop(0)
                 if loss.end <= self._last_delivered_position:
                     continue
-                output.append(_gap(self._last_delivered_position, loss.end + 1))
+                output.append(_gap_after_loss(self._last_delivered_position, loss.end))
                 self._last_delivered_position = loss.end
             if item.position <= self._last_delivered_position:
                 self._forced_loss_count += 1
@@ -252,9 +302,13 @@ class BoundedMessageSink:
             self._last_delivered_position = item.position
 
         _discard_expired_ranges(ranges, self._last_delivered_position)
-        while ranges and ranges[0].start <= self._last_delivered_position + 1:
+        while (
+            ranges
+            and self._last_delivered_position < MAX_U64
+            and ranges[0].start <= self._last_delivered_position + 1
+        ):
             loss = ranges.pop(0)
-            output.append(_gap(self._last_delivered_position, loss.end + 1))
+            output.append(_gap_after_loss(self._last_delivered_position, loss.end))
             self._last_delivered_position = max(self._last_delivered_position, loss.end)
         if ranges:
             with self._loss_lock:
@@ -297,6 +351,12 @@ class BoundedMessageSink:
     def loss_range_collapses(self) -> int:
         return self._loss_range_collapses
 
+    @property
+    def exhausted(self) -> bool:
+        """Whether no further uint64 delivery position can be allocated."""
+
+        return self._exhausted
+
     def _record_drop(self, position: int) -> None:
         with self._loss_lock:
             if self._loss_resync_active and self._loss_ranges:
@@ -336,7 +396,13 @@ def _merge_ranges(ranges: list[_LossRange]) -> list[_LossRange]:
         return []
     merged: list[_LossRange] = []
     for current in sorted(ranges, key=lambda item: (item.start, item.end)):
-        if merged and current.start <= merged[-1].end + 1:
+        if merged and (
+            current.start <= merged[-1].end
+            or (
+                merged[-1].end < MAX_U64
+                and current.start == merged[-1].end + 1
+            )
+        ):
             previous = merged[-1]
             merged[-1] = _LossRange(previous.start, max(previous.end, current.end))
         else:
@@ -378,6 +444,14 @@ def _gap(expected: int, actual: int) -> ParsedMessageResult:
     )
 
 
+def _gap_after_loss(expected: int, loss_end: int) -> ParsedMessageResult:
+    """Build the gap following a loss without forming MAX_U64 + 1."""
+
+    if loss_end == MAX_U64:
+        raise _PositionExhausted("loss reaches the end of the uint64 namespace")
+    return _gap(expected, loss_end + 1)
+
+
 def _message_body_bytes(message: ParsedMessageResult) -> int:
     payload = message.message if isinstance(message, KnownParsedMessage) else message.payload
     message_type = payload.get("type")
@@ -409,11 +483,14 @@ def _message_weight(message: ParsedMessageResult) -> int:
     return _canonical_weight(payload)
 
 
-def _validate_message_numbers(message: ParsedMessage) -> None:
+def _validate_message_numbers(message: ParsedMessage | Mapping[str, object]) -> None:
+    payload: object
     if isinstance(message, KnownParsedMessage):
         payload = message.message
     elif isinstance(message, OpaqueParsedMessage):
         payload = message.payload
+    elif isinstance(message, Mapping):
+        payload = message
     else:
         return
     _validate_bounded_numbers(payload)
