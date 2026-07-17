@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import heapq
 import time
+import weakref
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
+from typing import cast
 
 from mitm_inspector.capture.metrics import (
     body_bytes as _message_body_bytes,
@@ -41,7 +43,7 @@ class _StoredMessage:
     weight: int
     key: tuple[object, ...] | None = None
     active: bool = True
-    owner: _FlowRecord | None = None
+    owner: weakref.ReferenceType[_FlowRecord] | None = None
 
 
 @dataclass
@@ -101,11 +103,19 @@ class MemoryStore:
         self._clock = clock
         self._flows: dict[str, _FlowRecord] = {}
         self._standalone: deque[_StoredMessage] = deque()
-        self._expiry_heap: list[tuple[float, int, str, object]] = []
-        self._message_heap: list[tuple[int, int, str, _StoredMessage]] = []
-        self._body_heap: list[tuple[int, int, str, _StoredMessage]] = []
-        self._weight_heap: list[tuple[int, int, str, _StoredMessage]] = []
-        self._completion_heap: list[tuple[int, str, int, _FlowRecord]] = []
+        self._expiry_heap: list[tuple[float, int, str, weakref.ReferenceType[object]]] = []
+        self._message_heap: list[
+            tuple[int, int, str, weakref.ReferenceType[_StoredMessage]]
+        ] = []
+        self._body_heap: list[
+            tuple[int, int, str, weakref.ReferenceType[_StoredMessage]]
+        ] = []
+        self._weight_heap: list[
+            tuple[int, int, str, weakref.ReferenceType[_StoredMessage]]
+        ] = []
+        self._completion_heap: list[
+            tuple[int, str, int, weakref.ReferenceType[_FlowRecord]]
+        ] = []
         self._expiry_sequence = 0
         self._eviction_sequence = 0
         self._order = 0
@@ -171,7 +181,14 @@ class MemoryStore:
             self._body_bytes -= previous.body_bytes
             self._memory_bytes -= previous.weight
             replacement = _StoredMessage(
-                self._order, now, retained, body_bytes, weight, key, True, record
+                self._order,
+                now,
+                retained,
+                body_bytes,
+                weight,
+                key,
+                True,
+                weakref.ref(record),
             )
             record.messages[index] = replacement
             self._index_stored(replacement, "flow")
@@ -192,7 +209,14 @@ class MemoryStore:
             else:
                 self._make_room_for_message(protected=record)
             stored = _StoredMessage(
-                self._order, now, retained, body_bytes, weight, key, True, record
+                self._order,
+                now,
+                retained,
+                body_bytes,
+                weight,
+                key,
+                True,
+                weakref.ref(record),
             )
             if key is not None:
                 record.indexes[key] = len(record.messages)
@@ -214,7 +238,7 @@ class MemoryStore:
                         record.completion_order,
                         record.flow_id,
                         self._eviction_sequence,
-                        record,
+                        weakref.ref(record),
                     ),
                 )
                 self._eviction_sequence += 1
@@ -227,6 +251,7 @@ class MemoryStore:
         """Yield independent messages in true message-newest-first order."""
 
         self._purge_expired(self._clock())
+        self._maybe_rebuild_eviction_indexes()
         entries = [*self._standalone]
         for record in self._flows.values():
             entries.extend(record.messages)
@@ -238,6 +263,7 @@ class MemoryStore:
         """Return observable bounded-retention counters."""
 
         self._purge_expired(self._clock())
+        self._maybe_rebuild_eviction_indexes()
         return {
             "completed_flows": self._completed_flow_count,
             "retained_flows": len(self._flows),
@@ -273,7 +299,10 @@ class MemoryStore:
     def _purge_expired(self, now: float) -> None:
         cutoff = now - self.max_age_seconds
         while self._expiry_heap and self._expiry_heap[0][0] <= cutoff:
-            _, _, kind, owner = heapq.heappop(self._expiry_heap)
+            _, _, kind, owner_ref = heapq.heappop(self._expiry_heap)
+            owner = owner_ref()
+            if owner is None:
+                continue
             if kind == "flow":
                 record = cast_flow(owner)
                 if self._flows.get(record.flow_id) is record:
@@ -286,18 +315,29 @@ class MemoryStore:
 
     def _schedule_expiry(self, owner: _FlowRecord | _StoredMessage) -> None:
         kind = "flow" if isinstance(owner, _FlowRecord) else "standalone"
+        owner_ref = cast(weakref.ReferenceType[object], weakref.ref(owner))
         heapq.heappush(
             self._expiry_heap,
-            (owner.created_at, self._expiry_sequence, kind, owner),
+            (owner.created_at, self._expiry_sequence, kind, owner_ref),
         )
         self._expiry_sequence += 1
         retained = len(self._flows) + len(self._standalone)
         if len(self._expiry_heap) > 2 * retained + 64:
             self._expiry_heap = [
-                (record.created_at, index, "flow", record)
+                (
+                    record.created_at,
+                    index,
+                    "flow",
+                    cast(weakref.ReferenceType[object], weakref.ref(record)),
+                )
                 for index, record in enumerate(self._flows.values())
             ] + [
-                (stored.created_at, len(self._flows) + index, "standalone", stored)
+                (
+                    stored.created_at,
+                    len(self._flows) + index,
+                    "standalone",
+                    cast(weakref.ReferenceType[object], weakref.ref(stored)),
+                )
                 for index, stored in enumerate(self._standalone)
                 if stored.active
             ]
@@ -307,8 +347,11 @@ class MemoryStore:
         while self._completed_flow_count > self.max_items:
             oldest: _FlowRecord | None = None
             while self._completion_heap:
-                _, _, _, candidate = heapq.heappop(self._completion_heap)
+                _, _, _, candidate_ref = heapq.heappop(self._completion_heap)
                 self._completion_candidate_visits += 1
+                candidate = candidate_ref()
+                if candidate is None:
+                    continue
                 if (
                     candidate.completed
                     and candidate.completion_order is not None
@@ -416,18 +459,24 @@ class MemoryStore:
     def _oldest_message(
         self, exclude: _FlowRecord | None = None
     ) -> tuple[str, object, _StoredMessage] | None:
-        skipped: list[tuple[int, int, str, _StoredMessage]] = []
+        skipped: list[
+            tuple[int, int, str, weakref.ReferenceType[_StoredMessage]]
+        ] = []
         result: tuple[str, object, _StoredMessage] | None = None
         while self._message_heap:
             entry = heapq.heappop(self._message_heap)
             self._eviction_candidate_visits += 1
-            _, _, kind, stored = entry
+            _, _, kind, stored_ref = entry
+            stored = stored_ref()
+            if stored is None:
+                continue
             if not self._valid_eviction_entry(kind, stored):
                 continue
-            if kind == "flow" and stored.owner is exclude:
+            owner = self._stored_owner(stored)
+            if kind == "flow" and owner is exclude:
                 skipped.append(entry)
                 continue
-            result = (kind, stored.owner if kind == "flow" else self._standalone, stored)
+            result = (kind, owner if kind == "flow" else self._standalone, stored)
             break
         for entry in skipped:
             heapq.heappush(self._message_heap, entry)
@@ -440,27 +489,35 @@ class MemoryStore:
         return self._pop_eviction_candidate(self._weight_heap)
 
     def _pop_eviction_candidate(
-        self, heap: list[tuple[int, int, str, _StoredMessage]]
+        self, heap: list[tuple[int, int, str, weakref.ReferenceType[_StoredMessage]]]
     ) -> tuple[str, object, _StoredMessage] | None:
         while heap:
-            _, _, kind, stored = heapq.heappop(heap)
+            _, _, kind, stored_ref = heapq.heappop(heap)
             self._eviction_candidate_visits += 1
+            stored = stored_ref()
+            if stored is None:
+                continue
             if self._valid_eviction_entry(kind, stored):
-                return (kind, stored.owner if kind == "flow" else self._standalone, stored)
+                owner = self._stored_owner(stored)
+                return (kind, owner if kind == "flow" else self._standalone, stored)
         return None
 
     def _valid_eviction_entry(self, kind: str, stored: _StoredMessage) -> bool:
         if not stored.active:
             return False
         if kind == "flow":
+            owner = self._stored_owner(stored)
             return (
-                stored.owner is not None
-                and self._flows.get(stored.owner.flow_id) is stored.owner
+                owner is not None and self._flows.get(owner.flow_id) is owner
             )
         return stored.owner is None
 
+    @staticmethod
+    def _stored_owner(stored: _StoredMessage) -> _FlowRecord | None:
+        return None if stored.owner is None else stored.owner()
+
     def _index_stored(self, stored: _StoredMessage, kind: str) -> None:
-        entry = (stored.order, self._eviction_sequence, kind, stored)
+        entry = (stored.order, self._eviction_sequence, kind, weakref.ref(stored))
         self._eviction_sequence += 1
         heapq.heappush(self._message_heap, entry)
         heapq.heappush(self._weight_heap, entry)
@@ -485,7 +542,12 @@ class MemoryStore:
             for stored in record.messages:
                 self._index_stored(stored, "flow")
         self._completion_heap = [
-            (record.completion_order, record.flow_id, self._eviction_sequence, record)
+            (
+                record.completion_order,
+                record.flow_id,
+                self._eviction_sequence,
+                weakref.ref(record),
+            )
             for record in self._flows.values()
             if record.completed and record.completion_order is not None
         ]

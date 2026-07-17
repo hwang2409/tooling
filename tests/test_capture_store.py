@@ -1,8 +1,10 @@
 import base64
+import gc
 import subprocess
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -143,6 +145,20 @@ def test_response_can_start_before_request_end_and_duplicate_hooks_are_idempoten
     assert states.count("request_started") == 1
     assert states.count("response_end") == 1
     assert states.count("flow_completed") == 1
+
+
+def test_successful_completion_does_not_emit_a_capture_loss_gap() -> None:
+    addon = CaptureAddon(source_id="test-source", clock=lambda: "now")
+    flow = fake_flow(request_body=b"request", response_body=b"response")
+
+    addon.requestheaders(flow)
+    addon.responseheaders(flow)
+    addon.response(flow)
+    addon.request(flow)
+
+    messages = payloads(addon)
+    assert not any(message.get("type") == "stream.gap" for message in messages)
+    assert addon.sink.dropped_count == 0
 
 
 def test_response_completion_is_deferred_until_late_missing_request_end() -> None:
@@ -403,6 +419,52 @@ def test_full_sink_is_nonblocking_and_observably_drops() -> None:
     assert not sink.offer(second)
     assert sink.dropped_count == 1
     assert sink.pending_count == 1
+
+
+def test_source_hello_retries_after_full_sink_rejection() -> None:
+    sink = BoundedMessageSink(max_pending=1)
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.blocker"}))
+    addon = CaptureAddon(sink=sink, clock=lambda: "now")
+
+    addon._announce_source()
+    assert not addon._source_announced
+    first = addon.drain()
+    assert not any(
+        (message.message if isinstance(message, KnownParsedMessage) else message.payload)["type"]
+        == "source.hello"
+        for message in first
+    )
+
+    addon._announce_source()
+    assert addon._source_announced
+    second = addon.drain()
+    assert any(
+        (message.message if isinstance(message, KnownParsedMessage) else message.payload)["type"]
+        == "source.hello"
+        for message in second
+    )
+
+
+def test_source_hello_retries_after_injected_send_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    original_send = addon._send
+    failed = True
+
+    def fail_once(message: dict[str, object]) -> bool:
+        nonlocal failed
+        if failed:
+            failed = False
+            raise RuntimeError("injected hello failure")
+        return original_send(message)
+
+    monkeypatch.setattr(addon, "_send", fail_once)
+    with pytest.raises(RuntimeError, match="injected hello failure"):
+        addon._announce_source()
+    assert not addon._source_announced
+    addon._announce_source()
+    assert addon._source_announced
 
 
 def test_sink_lock_contention_returns_immediately_and_emits_gap() -> None:
@@ -1180,10 +1242,85 @@ def test_drain_release_failure_merges_loss_recorded_after_detachment(
         for message in messages
     ]
     assert types == ["future.first", "stream.gap"]
+    assert types.count("stream.gap") == 1
     gap = messages[-1]
     assert isinstance(gap, KnownParsedMessage)
     assert gap.message["expected_sequence"] == "1"
     assert gap.message["actual_sequence"] == "3"
+
+
+def test_admission_rollback_preserves_losses_flushed_during_position_allocation() -> None:
+    sink = BoundedMessageSink()
+    transaction = sink_module._AdmissionTransaction(sink)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_position() -> None:
+        with sink._position_lock:
+            held.set()
+            release.wait(timeout=1)
+
+    holder = threading.Thread(target=hold_position)
+    holder.start()
+    assert held.wait(timeout=1)
+    assert sink.record_loss()
+    release.set()
+    holder.join(timeout=1)
+    assert not holder.is_alive()
+
+    class FailingDeque(deque[object]):
+        def append(self, _item: object) -> None:
+            raise RuntimeError("injected transaction append failure")
+
+    sink._items = FailingDeque()
+    with sink._position_lock:
+        with pytest.raises(RuntimeError, match="transaction append failure"):
+            transaction.allocate_position()
+            transaction.append(
+                sink_module._QueuedMessage(
+                    transaction.position or 0,
+                    parse_message({"protocol_version": "1", "type": "future.failed"}),
+                    0,
+                    1,
+                )
+            )
+        transaction.rollback()
+
+    sink._items = deque()
+    assert sink.dropped_count == 2
+    drained = sink.drain()
+    assert len(drained) == 1
+    gap = drained[0]
+    assert isinstance(gap, KnownParsedMessage)
+    assert gap.message["type"] == "stream.gap"
+    assert gap.message["expected_sequence"] == "0"
+    assert gap.message["actual_sequence"] == "3"
+
+
+def test_drain_rollback_preserves_pending_loss_added_during_detachment() -> None:
+    sink = BoundedMessageSink()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.keep"}))
+    original = sink._items[0]
+
+    class InterruptingDeque(deque[object]):
+        def popleft(self) -> object:
+            assert sink.record_loss()
+            raise KeyboardInterrupt
+
+    sink._items = InterruptingDeque([original])
+    with pytest.raises(KeyboardInterrupt):
+        sink.drain()
+
+    assert sink.dropped_count == 1
+    assert sink._pending_loss_count == 1
+    assert sink._items[0] is original
+    sink._items = deque([original])
+    drained = sink.drain()
+    types = [
+        (item.message if isinstance(item, KnownParsedMessage) else item.payload)["type"]
+        for item in drained
+    ]
+    assert types == ["future.keep", "stream.gap"]
 
 
 def test_pending_count_propagates_lease_close_error_and_releases_gate(
@@ -1756,6 +1893,88 @@ def test_saturated_default_scale_append_uses_incremental_eviction_candidates() -
     store.append(parse_message({"protocol_version": "1", "type": "future.final"}))
     assert store.counters["retained_messages"] <= store.max_messages
     assert store._eviction_candidate_visits <= 2
+
+
+def test_eviction_heaps_do_not_retain_evicted_payloads_or_unbounded_stale_entries() -> None:
+    completed = MemoryStore(max_items=1)
+    completed.append(completed_flow_message("old", "0"))
+    old_record = completed._flows["old"]
+    old_ref = weakref.ref(old_record)
+    completed.append(completed_flow_message("new", "1"))
+    del old_record
+    gc.collect()
+    assert old_ref() is None
+
+    standalone = MemoryStore(max_messages=1)
+    standalone.append(parse_message({"protocol_version": "1", "type": "future.old"}))
+    old_stored = standalone._standalone[0]
+    old_stored_ref = weakref.ref(old_stored)
+    standalone.append(parse_message({"protocol_version": "1", "type": "future.new"}))
+    del old_stored
+    gc.collect()
+    assert old_stored_ref() is None
+
+    body = MemoryStore(max_body_bytes=1)
+    body.append(
+        parse_message(
+            {
+                "protocol_version": "1",
+                "type": "body.end",
+                "flow_id": "body",
+                "body_side": "response",
+                "total_bytes": "1",
+                "body": {
+                    "state": "captured",
+                    "size_bytes": "1",
+                    "encoding": "base64",
+                    "data": base64.b64encode(b"x").decode(),
+                },
+            }
+        )
+    )
+    body_ref = weakref.ref(body._flows["body"].messages[0])
+    body.append(
+        parse_message(
+            {
+                "protocol_version": "1",
+                "type": "body.end",
+                "flow_id": "body-next",
+                "body_side": "response",
+                "total_bytes": "2",
+                "body": {
+                    "state": "captured",
+                    "size_bytes": "2",
+                    "encoding": "base64",
+                    "data": base64.b64encode(b"yy").decode(),
+                },
+            }
+        )
+    )
+    gc.collect()
+    assert body_ref() is None
+
+    memory = MemoryStore(max_memory_bytes=64)
+    memory.append(parse_message({"protocol_version": "1", "type": "future.small", "value": "x"}))
+    small_ref = weakref.ref(memory._standalone[0])
+    memory.append(
+        parse_message(
+            {"protocol_version": "1", "type": "future.large", "value": "x" * 100}
+        )
+    )
+    gc.collect()
+    assert small_ref() is None
+
+    now = [0.0]
+    aged = MemoryStore(max_age_seconds=1, clock=lambda: now[0])
+    aged.append(parse_message({"protocol_version": "1", "type": "future.aged"}))
+    aged_ref = weakref.ref(aged._standalone[0])
+    now[0] = 2.0
+    assert aged.counters["retained_messages"] == 0
+    gc.collect()
+    assert aged_ref() is None
+    assert len(aged._message_heap) <= 64
+    assert len(aged._weight_heap) <= 64
+    assert len(aged._body_heap) <= 64
 
 
 def test_store_bounds_incomplete_flows_per_flow_global_and_standalone_messages() -> None:

@@ -286,23 +286,8 @@ class _AdmissionTransaction:
         self.phase = _AdmissionPhase.LOSS_RECORDED
 
     def rollback(self) -> None:
-        self._restore_snapshot()
-        if self.phase in {
-            _AdmissionPhase.APPEND_PENDING,
-            _AdmissionPhase.QUEUE_APPENDED,
-            _AdmissionPhase.COMMITTED,
-        } and self.position is not None:
-            try:
-                self.sink._record_drop(self.position)
-            except BaseException:
-                self._restore_snapshot()
-            else:
-                assert self.position_after_allocation is not None
-                self.sink._restore_position_state(self.position_after_allocation)
-        self.phase = _AdmissionPhase.ROLLED_BACK
-
-    def _restore_snapshot(self) -> None:
         sink = self.sink
+        current_pending = sink._pending_loss_count
         sink._items.clear()
         sink._items.extend(self.snapshot.items)
         sink._body_bytes = self.snapshot.body_bytes
@@ -310,12 +295,20 @@ class _AdmissionTransaction:
         sink._accepted = self.snapshot.accepted
         sink._body_budget_drops = self.snapshot.body_budget_drops
         sink._memory_budget_drops = self.snapshot.memory_budget_drops
-        sink._restore_position_state(self.snapshot.position)
-        concurrent_pending = max(
-            0, sink._pending_loss_count - self.pending_after_allocation
-        )
-        sink._pending_loss_count = self.snapshot.pending_loss_count + concurrent_pending
-        sink._restore_loss_state(self.snapshot.loss)
+        # Losses flushed while allocating this transaction are already in the
+        # live loss ranges.  Preserve those ranges and keep the consumed
+        # position namespace so every allocated position remains locatable.
+        if self.position is None:
+            sink._restore_position_state(self.snapshot.position)
+            sink._pending_loss_count = current_pending
+        else:
+            assert self.position_after_allocation is not None
+            sink._restore_position_state(self.position_after_allocation)
+            sink._pending_loss_count = current_pending
+            with sink._loss_lock:
+                if not _range_contains(sink._loss_ranges, self.position):
+                    sink._record_drop_range_locked(self.position, self.position, 1)
+        self.phase = _AdmissionPhase.ROLLED_BACK
 
 
 class BoundedMessageSink:
@@ -602,6 +595,7 @@ class BoundedMessageSink:
         old_forced = self._forced_loss_count
         before_body = self._body_bytes
         before_memory = self._memory_bytes
+        before_pending = 0
         phase = _DrainPhase.RESERVATION_ACQUIRED
         primary: BaseException | None = None
         queue = _ReservationLease(self._lock)
@@ -684,7 +678,13 @@ class BoundedMessageSink:
                             self._items.extend(original_items)
                             self._body_bytes = before_body
                             self._memory_bytes = before_memory
-                            self._pending_loss_count = before_pending
+                            # Keep producer losses admitted while the
+                            # position lock was held; they are the pending
+                            # delta after this snapshot.
+                            self._pending_loss_count = max(
+                                before_pending,
+                                self._pending_loss_count,
+                            )
                         self._last_delivered_position = old_last
                         self._forced_loss_count = old_forced
                     finally:
@@ -883,6 +883,10 @@ def _normalize_ranges(ranges: list[_LossRange]) -> list[_LossRange]:
 def _discard_expired_ranges(ranges: list[_LossRange], last: int) -> None:
     while ranges and ranges[0].end <= last:
         ranges.pop(0)
+
+
+def _range_contains(ranges: deque[_LossRange], position: int) -> bool:
+    return any(item.start <= position <= item.end for item in ranges)
 
 
 def _with_delivery_position(

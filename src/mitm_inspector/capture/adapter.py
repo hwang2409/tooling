@@ -305,8 +305,7 @@ class CaptureAddon:
     def _announce_source(self) -> None:
         if self._source_announced:
             return
-        self._source_announced = True
-        self._send(
+        accepted = self._send(
             {
                 "protocol_version": "1",
                 "type": "source.hello",
@@ -319,6 +318,8 @@ class CaptureAddon:
                 },
             }
         )
+        if accepted:
+            self._source_announced = True
 
     def _ensure_flow(self, flow: http.HTTPFlow) -> _FlowCapture:
         self._purge_active()
@@ -540,7 +541,7 @@ class CaptureAddon:
             return
         state.completed = True
         state.completion_pending = False
-        self._discard_active(state, count_eviction=False)
+        self._complete_active(state)
 
     def _disable_streams(self, state: _FlowCapture) -> None:
         state.request.stream_enabled = False
@@ -569,7 +570,16 @@ class CaptureAddon:
     def _evict_active(self, state: _FlowCapture) -> None:
         self._discard_active(state, count_eviction=True)
 
+    def _complete_active(self, state: _FlowCapture) -> None:
+        self._release_active(state, count_eviction=False)
+
     def _discard_active(self, state: _FlowCapture, *, count_eviction: bool) -> None:
+        if state.discarded:
+            return
+        self._release_active(state, count_eviction=count_eviction)
+        self.sink.record_loss()
+
+    def _release_active(self, state: _FlowCapture, *, count_eviction: bool) -> None:
         if state.discarded:
             return
         self._disable_streams(state)
@@ -584,10 +594,9 @@ class CaptureAddon:
         state.tombstone = True
         if count_eviction:
             self._capture_evicted_flows += 1
-        self.sink.record_loss()
 
-    def _send(self, raw: dict[str, object]) -> None:
-        self.sink.offer(raw)
+    def _send(self, raw: dict[str, object]) -> bool:
+        return self.sink.offer(raw)
 
     @property
     def counters(self) -> dict[str, int]:
