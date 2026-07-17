@@ -269,6 +269,19 @@ function applyDelta(state: BrowserState, message: BrowserDelta): BrowserState {
 }
 
 function applyResync(state: BrowserState, message: BrowserResync): BrowserState {
+  const requestedCursor = cursor(message.requested_cursor);
+  const currentCursor = cursor(state.cursor);
+
+  const hasCurrentPendingRequest = state.gap !== null
+    && state.gap.sourceEpoch === state.sourceEpoch
+    && state.resyncRequested !== null;
+  if (hasCurrentPendingRequest) {
+    if (message.requested_cursor !== state.resyncRequested) return stale(state);
+    return { ...state, resyncRequested: state.resyncRequested };
+  }
+
+  if (requestedCursor < currentCursor) return stale(state);
+  if (state.cursor !== "0") return stale(state);
   if (message.reason === "initial_connect") {
     return { ...state, resyncRequested: message.requested_cursor };
   }

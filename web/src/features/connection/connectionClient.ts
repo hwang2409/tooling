@@ -81,6 +81,20 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error || "Unknown connection error");
 }
 
+function immutableError(error: Error): Error {
+  const copy = new Error(error.message);
+  copy.name = error.name;
+  if (error.stack !== undefined) copy.stack = error.stack;
+  return Object.freeze(copy);
+}
+
+function immutableEvent(event: ConnectionEvent): ConnectionEvent {
+  if (event.type === "protocol-error") {
+    return Object.freeze({ ...event, error: immutableError(event.error) });
+  }
+  return Object.freeze({ ...event });
+}
+
 function isCanonicalCursor(value: unknown): value is string {
   if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) return false;
   try {
@@ -289,12 +303,13 @@ export class ConnectionClient {
   }
 
   private emit(event: ConnectionEvent): void {
+    const published = immutableEvent(event);
     for (const listener of [...this.listeners]) {
       try {
-        listener(event);
+        listener(published);
       } catch (error) {
         try {
-          this.onListenerError(error, event);
+          this.onListenerError(error, published);
         } catch {
           // Observer diagnostics must not become a transport lifecycle failure.
         }

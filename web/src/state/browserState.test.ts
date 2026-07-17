@@ -261,4 +261,35 @@ describe("browser state reducer", () => {
     expect(unknown.lastUnknownType).toBe("future.message");
     expect(unknown.counters.unknownMessages).toBe(1);
   });
+
+  it("ignores stale resync acknowledgements without regressing a current gap", () => {
+    const current = reduce(initialBrowserState, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "current", cursor: "12", flows: [],
+    });
+    const staleAck = reduce(current, {
+      protocol_version: "1", type: "browser.resync", reason: "history_evicted", requested_cursor: "5",
+    });
+    const staleSnapshot = reduce(staleAck, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "old", cursor: "5", flows: [flow("old")],
+    });
+    const pending = reduce(current, {
+      protocol_version: "1", type: "browser.delta", cursor: "14", changes: [],
+    });
+    const stalePendingAck = reduce(pending, {
+      protocol_version: "1", type: "browser.resync", reason: "cursor_gap", requested_cursor: "5",
+    });
+    const validAck = reduce(pending, {
+      protocol_version: "1", type: "browser.resync", reason: "cursor_gap", requested_cursor: "12",
+    });
+
+    expect(staleAck.cursor).toBe("12");
+    expect(staleAck.resyncRequested).toBeNull();
+    expect(staleAck.gap).toBeNull();
+    expect(staleSnapshot.cursor).toBe("12");
+    expect(staleSnapshot.resyncRequested).toBeNull();
+    expect(stalePendingAck.resyncRequested).toBe("12");
+    expect(stalePendingAck.gap).toEqual(pending.gap);
+    expect(validAck.resyncRequested).toBe("12");
+    expect(validAck.gap).toEqual(pending.gap);
+  });
 });

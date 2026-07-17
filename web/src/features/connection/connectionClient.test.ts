@@ -217,6 +217,41 @@ describe("connection client", () => {
     expect(listenerErrors).toHaveLength(1);
   });
 
+  it("publishes frozen status, message, and protocol-error events to hostile observers", () => {
+    const timer = new TestTimer();
+    const harness = factoryHarness();
+    const seen: string[] = [];
+    const client = new ConnectionClient({ transportFactory: harness.factory, timer, autoReconnect: false });
+    client.subscribe((event) => {
+      try { (event as { type: string }).type = "corrupted"; } catch { /* frozen publication */ }
+      if (event.type === "status") {
+        try { (event.status as { state: string }).state = "corrupted"; } catch { /* frozen publication */ }
+      }
+      if (event.type === "message") {
+        try { (event.envelope as { kind: string }).kind = "corrupted"; } catch { /* frozen publication */ }
+      }
+      if (event.type === "protocol-error") {
+        try { event.error.message = "corrupted"; } catch { /* frozen publication */ }
+      }
+    });
+    client.subscribe((event) => {
+      if (event.type === "status") seen.push(`status:${event.status.state}`);
+      if (event.type === "message") seen.push(`message:${event.envelope.kind}`);
+      if (event.type === "protocol-error") seen.push(`error:${event.error.message}`);
+    });
+
+    client.connect();
+    harness.handlers[0].onOpen();
+    harness.handlers[0].onMessage({ protocol_version: "1", type: "future.message" });
+    harness.handlers[0].onMessage({ protocol_version: "1", type: "browser.delta", cursor: "bad", changes: [] });
+
+    expect(seen).toContain("status:connecting");
+    expect(seen).toContain("status:live");
+    expect(seen).toContain("message:unknown");
+    expect(seen.some((event) => event.startsWith("error:") && event !== "error:corrupted")).toBe(true);
+    expect(client.getSnapshot().state).toBe("error");
+  });
+
   it("exposes explicit resync capability and request results", () => {
     const timer = new TestTimer();
     const supported = factoryHarness(true);
