@@ -11,6 +11,13 @@ from typing import cast
 
 from mitmproxy import http
 
+from mitm_inspector.capture.config import (
+    DEFAULT_MAX_BODY_PREFIX_BYTES,
+    DEFAULT_MAX_IN_MEMORY_BYTES,
+    DEFAULT_MAX_PENDING_MESSAGES,
+    DEFAULT_SOURCE_ID,
+    CaptureConfig,
+)
 from mitm_inspector.capture.redaction import sanitize_header, sanitize_path
 from mitm_inspector.capture.sink import BoundedMessageSink
 from mitm_inspector.protocol import ParsedMessage, ParsedMessageResult, parse_message
@@ -18,8 +25,8 @@ from mitm_inspector.protocol import ParsedMessage, ParsedMessageResult, parse_me
 MessageEmitter = Callable[[ParsedMessage], None]
 Clock = Callable[[], str]
 
-MAX_BODY_PREFIX_BYTES = 1 * 1024 * 1024
-MAX_IN_MEMORY_BYTES = 128 * 1024 * 1024
+MAX_BODY_PREFIX_BYTES = DEFAULT_MAX_BODY_PREFIX_BYTES
+MAX_IN_MEMORY_BYTES = DEFAULT_MAX_IN_MEMORY_BYTES
 
 
 def _utc_now() -> str:
@@ -42,11 +49,14 @@ class _FlowCapture:
     flow_id: str
     identity: dict[str, str] = field(default_factory=dict)
     request_headers: list[dict[str, str]] = field(default_factory=list)
+    request_headers_captured: bool = False
     response_headers: list[dict[str, str]] | None = None
+    response_headers_captured: bool = False
     request: _BodyCapture = field(default_factory=_BodyCapture)
     response: _BodyCapture = field(default_factory=_BodyCapture)
     lifecycle_states: set[str] = field(default_factory=set)
     completed: bool = False
+    completion_pending: bool = False
     tombstone: bool = False
 
 
@@ -66,34 +76,73 @@ class CaptureAddon:
             "responseheaders",
             "response",
             "error",
+            "load",
         }
     )
+
+    @classmethod
+    def from_environment(cls) -> CaptureAddon:
+        """Build a configured addon without opening the configured endpoint."""
+
+        return cls(config=CaptureConfig.from_environment())
 
     def __init__(
         self,
         emit: MessageEmitter | None = None,
         *,
         sink: BoundedMessageSink | None = None,
-        source_id: str = "mitm-inspector",
-        max_body_prefix_bytes: int = MAX_BODY_PREFIX_BYTES,
+        config: CaptureConfig | None = None,
+        source_id: str = DEFAULT_SOURCE_ID,
+        max_body_prefix_bytes: int = DEFAULT_MAX_BODY_PREFIX_BYTES,
         clock: Clock = _utc_now,
-        max_pending_messages: int = 4_096,
+        max_pending_messages: int = DEFAULT_MAX_PENDING_MESSAGES,
     ) -> None:
         if emit is not None and sink is not None:
             raise ValueError("pass either emit or sink, not both")
-        if not source_id:
-            raise ValueError("source_id must be non-empty")
-        if max_body_prefix_bytes < 0:
-            raise ValueError("max_body_prefix_bytes must not be negative")
-        self.source_id = source_id
-        self.max_body_prefix_bytes = max_body_prefix_bytes
+        if config is None:
+            config = CaptureConfig(
+                source_id=source_id,
+                max_body_prefix_bytes=max_body_prefix_bytes,
+                max_pending_messages=max_pending_messages,
+            )
+        self.config = config
+        self.source_id = config.source_id
+        self.capture_socket = config.capture_socket
+        self.max_body_prefix_bytes = config.max_body_prefix_bytes
+        self.max_in_memory_bytes = config.max_in_memory_bytes
         self._clock = clock
         self._emit_callback = emit
-        self.sink = sink if sink is not None else BoundedMessageSink(max_pending_messages)
+        self._sink_injected = sink is not None
+        self.sink = (
+            sink
+            if sink is not None
+            else BoundedMessageSink(config.max_pending_messages, config.max_in_memory_bytes)
+        )
         self._flows: dict[str, _FlowCapture] = {}
         self._completed_ids: deque[str] = deque(maxlen=2_000)
+        self._captured_prefix_bytes = 0
         self._sequence = 0
         self._source_announced = False
+
+    def load(self, _loader: object) -> None:
+        """Parse B1's environment at addon load without opening IPC."""
+
+        self.configure(CaptureConfig.from_environment())
+
+    def configure(self, config: CaptureConfig) -> None:
+        """Apply parsed configuration before the first captured flow."""
+
+        if self._source_announced or self._flows:
+            raise RuntimeError("capture configuration cannot change after capture starts")
+        self.config = config
+        self.source_id = config.source_id
+        self.capture_socket = config.capture_socket
+        self.max_body_prefix_bytes = config.max_body_prefix_bytes
+        self.max_in_memory_bytes = config.max_in_memory_bytes
+        if not self._sink_injected:
+            self.sink = BoundedMessageSink(
+                config.max_pending_messages, config.max_in_memory_bytes
+            )
 
     def requestheaders(self, flow: http.HTTPFlow) -> None:
         """Observe request start/headers and install the public body callback."""
@@ -105,6 +154,7 @@ class CaptureAddon:
         self._lifecycle(state, "request_started")
         if "request_headers" not in state.lifecycle_states:
             state.request_headers = _headers(flow.request.headers)
+            state.request_headers_captured = True
             state.request.content_type = _content_type(flow.request.headers)
             self._set_identity(state, flow)
             self._install_stream(flow.request, state, "request")
@@ -121,6 +171,8 @@ class CaptureAddon:
         if "request_end" not in state.lifecycle_states:
             self._lifecycle(state, "request_end")
             self._metadata(state)
+        if state.completion_pending:
+            self._complete(state)
         self._discard_if_complete(state)
 
     def responseheaders(self, flow: http.HTTPFlow) -> None:
@@ -132,6 +184,7 @@ class CaptureAddon:
         self._lifecycle(state, "response_started")
         if "response_headers" not in state.lifecycle_states:
             state.response_headers = _headers(flow.response.headers) if flow.response else []
+            state.response_headers_captured = True
             if flow.response:
                 state.response.content_type = _content_type(flow.response.headers)
                 self._install_stream(flow.response, state, "response")
@@ -149,7 +202,7 @@ class CaptureAddon:
         if "response_end" not in state.lifecycle_states:
             self._lifecycle(state, "response_end")
             self._metadata(state)
-        self._complete(state, wait_for_request=True)
+        self._complete(state)
 
     def error(self, flow: http.HTTPFlow) -> None:
         """Observe an HTTP error and complete the flow without exposing its text."""
@@ -157,19 +210,22 @@ class CaptureAddon:
         state = self._ensure_request(flow)
         if state.tombstone:
             return
-        if flow.request.raw_content is not None and "request_end" not in state.lifecycle_states:
+        if "request_end" not in state.lifecycle_states:
             self._finish_body(state, "request", flow.request.raw_content)
             self._lifecycle(state, "request_end")
             self._metadata(state)
         self._lifecycle(state, "error")
-        self._complete(state, wait_for_request=False)
+        self._complete(state)
+        self._discard_if_complete(state)
 
     def drain(self, limit: int | None = None) -> list[ParsedMessageResult]:
         """Drain messages when the addon owns its default bounded sink."""
 
+        messages = self.sink.drain(limit)
         if self._emit_callback is not None:
-            raise RuntimeError("drain is unavailable when using a callback emitter")
-        return self.sink.drain(limit)
+            for message in messages:
+                self._emit_callback(message)
+        return messages
 
     def _announce_source(self) -> None:
         if self._source_announced:
@@ -184,7 +240,7 @@ class CaptureAddon:
                 "capabilities": {"body_chunks": True, "redaction": "headers-and-query"},
                 "limits": {
                     "max_body_prefix_bytes": str(self.max_body_prefix_bytes),
-                    "max_in_memory_bytes": str(MAX_IN_MEMORY_BYTES),
+                    "max_in_memory_bytes": str(self.max_in_memory_bytes),
                 },
             }
         )
@@ -229,8 +285,11 @@ class CaptureAddon:
         body.total_bytes += len(copied)
         body.observed = True
         remaining = max(0, self.max_body_prefix_bytes - len(body.prefix))
-        captured = copied[:remaining]
+        other_prefix_bytes = self._captured_prefix_bytes - len(body.prefix)
+        global_remaining = max(0, self.max_in_memory_bytes - other_prefix_bytes - len(body.prefix))
+        captured = copied[: min(remaining, global_remaining)]
         body.prefix.extend(captured)
+        self._captured_prefix_bytes += len(captured)
         if not body.lifecycle_emitted:
             body.lifecycle_emitted = True
             self._lifecycle(state, f"{side}_body")
@@ -271,7 +330,7 @@ class CaptureAddon:
         )
 
     def _metadata(self, state: _FlowCapture) -> None:
-        if not state.request_headers:
+        if not state.request_headers_captured:
             return
         metadata: dict[str, object] = {
             "flow_id": state.flow_id,
@@ -286,7 +345,7 @@ class CaptureAddon:
         # Identity fields are copied on the first hook.  No Flow or Message
         # object crosses out of this adapter.
         metadata.update(state.identity)
-        if state.response_headers is not None:
+        if state.response_headers_captured:
             metadata["response_headers"] = state.response_headers
             metadata["response_body"] = _body_descriptor(state.response)
         self._send({"protocol_version": "1", "type": "flow.metadata", "metadata": metadata})
@@ -321,25 +380,26 @@ class CaptureAddon:
             }
         )
 
-    def _complete(self, state: _FlowCapture, *, wait_for_request: bool) -> None:
+    def _complete(self, state: _FlowCapture) -> None:
         if state.completed:
             return
+        if not state.request.ended:
+            state.completion_pending = True
+            return
         state.completed = True
+        state.completion_pending = False
         self._lifecycle(state, "flow_completed")
-        if not wait_for_request or state.request.ended:
-            self._discard_if_complete(state)
+        self._discard_if_complete(state)
 
     def _discard_if_complete(self, state: _FlowCapture) -> None:
         if state.completed and state.request.ended:
             self._flows.pop(state.flow_id, None)
             self._completed_ids.append(state.flow_id)
+            self._captured_prefix_bytes -= len(state.request.prefix) + len(state.response.prefix)
 
     def _send(self, raw: dict[str, object]) -> None:
         parsed = parse_message(raw)
-        if self._emit_callback is not None:
-            self._emit_callback(parsed)
-        else:
-            self.sink.offer(parsed)
+        self.sink.offer(parsed)
 
 
 def _headers(headers: Mapping[str, str]) -> list[dict[str, str]]:
@@ -377,3 +437,14 @@ def _body_descriptor(body: _BodyCapture) -> dict[str, str]:
     if body.content_type is not None:
         descriptor["content_type"] = body.content_type
     return descriptor
+
+
+def make_addon_from_environment() -> CaptureAddon:
+    """Construct a configured addon without connecting to the IPC endpoint."""
+
+    return CaptureAddon.from_environment()
+
+
+# mitmdump -s imports this module and discovers the documented addon list.
+# Construction is intentionally local-only; CaptureConfig performs no I/O.
+addons = [CaptureAddon()]
