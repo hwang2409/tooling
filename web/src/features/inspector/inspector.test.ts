@@ -116,6 +116,16 @@ describe("SSE framing", () => {
     expect(parseSseEvents("\uFEFFdata: hello\n\n")).toEqual([expect.objectContaining({ data: "hello" })]);
     expect(parseSseEvents("\uFEFF\uFEFFdata: hello\n\n")).toEqual([]);
   });
+
+  it("keeps the byte decoder BOM for the parser and strips only one in decodeBody", () => {
+    expect(decodeUtf8(new Uint8Array([0xef, 0xbb, 0xbf, 0x78]), true).text).toBe("\uFEFFx");
+    const oneBom = decodeBody({ state: "captured", size_bytes: "12", encoding: "base64", data: encoded("\uFEFFdata: hello\n\n") }, "sse");
+    expect(oneBom.events?.map((event) => event.data)).toEqual(["hello"]);
+
+    const twoBoms = decodeBody({ state: "captured", size_bytes: "13", encoding: "base64", data: encoded("\uFEFF\uFEFFdata: hello\n\n") }, "sse");
+    expect(twoBoms.events).toEqual([]);
+    expect(twoBoms.text).toBe("No complete SSE event frames found.");
+  });
 });
 
 describe("lifecycle ordering", () => {

@@ -236,13 +236,10 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
 
   const pane = activePane ?? internalPane;
 
-  useEffect(() => {
-    onPaneChange?.(pane);
-  }, [onPaneChange, pane]);
-
   const selectPane = (nextPane: InspectorPane) => {
     if (activePane === undefined) setInternalPane(nextPane);
     if (bodySelection === undefined) setInternalSelectedBody(null);
+    onPaneChange?.(nextPane);
   };
 
   const selectBody = (bodyPane: BodyPane) => {
@@ -301,34 +298,51 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
         ))}
       </div>
 
-      {pane === "error" ? <div id={`${tablistId}-error-pane`} role="tabpanel" tabIndex={0} aria-labelledby={`${tablistId}-error`}><ErrorPane error={flow.error} /></div> : (
-        <div className="inspector-pane-layout" id={`${tablistId}-${pane}-pane`} role="tabpanel" tabIndex={0} aria-labelledby={`${tablistId}-${pane}`}>
-          <section className="inspector-column inspector-metadata-column">
-            <div className="inspector-section-heading">
-              <div>
-                <p className="inspector-kicker">{pane === "request" ? "OUTBOUND METADATA" : "INBOUND METADATA"}</p>
-                <h2>{pane === "request" ? "Request" : "Response"}</h2>
+      {paneOrder.map((item) => {
+        const isActive = pane === item;
+        return (
+          <div
+            key={item}
+            className="inspector-exchange-tabpanel"
+            id={`${tablistId}-${item}-pane`}
+            role="tabpanel"
+            tabIndex={isActive ? 0 : -1}
+            aria-labelledby={`${tablistId}-${item}`}
+            hidden={!isActive}
+            aria-hidden={isActive ? undefined : "true"}
+          >
+            {isActive && item === "error" && <ErrorPane error={flow.error} />}
+            {isActive && item !== "error" && (
+              <div className="inspector-pane-layout">
+                <section className="inspector-column inspector-metadata-column">
+                  <div className="inspector-section-heading">
+                    <div>
+                      <p className="inspector-kicker">{item === "request" ? "OUTBOUND METADATA" : "INBOUND METADATA"}</p>
+                      <h2>{item === "request" ? "Request" : "Response"}</h2>
+                    </div>
+                    <span className="inspector-sequence-count">{entries.length} observations</span>
+                  </div>
+                  <dl className="inspector-facts">
+                    <div><dt>host</dt><dd>{flow.metadata.host}</dd></div>
+                    <div><dt>path</dt><dd>{flow.metadata.path}</dd></div>
+                    <div><dt>port</dt><dd>{flow.metadata.port}</dd></div>
+                    <div><dt>scheme</dt><dd>{flow.metadata.scheme}</dd></div>
+                  </dl>
+                  <div className="inspector-subsection">
+                    <div className="inspector-subheading"><span>Headers</span><span>{headersFor(flow, item).length} ordered</span></div>
+                    <HeaderList headers={headersFor(flow, item)} />
+                  </div>
+                </section>
+                <section className="inspector-column inspector-body-column">
+                  <InspectorBodyPanel body={bodyFor(flow, item)} pane={item} selected={isBodySelected(item)} onSelect={() => selectBody(item)} />
+                  {item === "response" && bodyFor(flow, "request").state !== "missing" && <p className="inspector-cross-note">Request body is available in the Request pane.</p>}
+                  {item === "request" && responseBody.state !== "missing" && <p className="inspector-cross-note">Response body is available in the Response pane.</p>}
+                </section>
               </div>
-              <span className="inspector-sequence-count">{entries.length} observations</span>
-            </div>
-            <dl className="inspector-facts">
-              <div><dt>host</dt><dd>{flow.metadata.host}</dd></div>
-              <div><dt>path</dt><dd>{flow.metadata.path}</dd></div>
-              <div><dt>port</dt><dd>{flow.metadata.port}</dd></div>
-              <div><dt>scheme</dt><dd>{flow.metadata.scheme}</dd></div>
-            </dl>
-            <div className="inspector-subsection">
-              <div className="inspector-subheading"><span>Headers</span><span>{headersFor(flow, pane).length} ordered</span></div>
-              <HeaderList headers={headersFor(flow, pane)} />
-            </div>
-          </section>
-          <section className="inspector-column inspector-body-column">
-            <InspectorBodyPanel body={bodyFor(flow, pane)} pane={pane} selected={isBodySelected(pane)} onSelect={() => selectBody(pane)} />
-            {pane === "response" && bodyFor(flow, "request").state !== "missing" && <p className="inspector-cross-note">Request body is available in the Request pane.</p>}
-            {pane === "request" && responseBody.state !== "missing" && <p className="inspector-cross-note">Response body is available in the Response pane.</p>}
-          </section>
-        </div>
-      )}
+            )}
+          </div>
+        );
+      })}
 
       <LifecycleStrip flow={flow} />
     </main>

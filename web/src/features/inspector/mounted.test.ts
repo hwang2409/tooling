@@ -1,9 +1,9 @@
 import { Buffer } from "node:buffer";
-import { act, createElement } from "react";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { act, createElement, useState } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { FlowLifecycle } from "../../protocol";
-import type { InspectorFlow } from "./models";
+import type { InspectorFlow, InspectorPane } from "./models";
 
 // eslint-disable-next-line no-unused-vars
 type Listener = (event: MiniEvent) => void;
@@ -298,6 +298,11 @@ const { document } = installMiniDom();
 const { PairedInspector } = await import("./PairedInspector");
 const { createRoot } = await import("react-dom/client");
 
+function ControlledInspector({ flow }: { flow: InspectorFlow }) {
+  const [activePane, setActivePane] = useState<InspectorPane>("request");
+  return createElement(PairedInspector, { flow, activePane, onPaneChange: setActivePane });
+}
+
 function makeFlow(flowId: string, bodyData = Buffer.from("hello", "utf8").toString("base64"), error = "<img src=x onerror=alert(1)>"): InspectorFlow {
   const lifecycle = (state: FlowLifecycle["state"], sequence: string): FlowLifecycle => ({ protocol_version: "1", type: "flow.lifecycle", source_id: "source", flow_id: flowId, event_id: `${flowId}-${sequence}`, occurred_at: "2026-07-17T12:00:00.000Z", sequence, state });
   return {
@@ -329,23 +334,17 @@ function dispatchKey(element: MiniElement, key: string) {
 describe("mounted PairedInspector DOM behavior", () => {
   let container: MiniElement;
   let root: ReturnType<typeof createRoot>;
-  let errorContainer: MiniElement;
-  let errorRoot: ReturnType<typeof createRoot>;
 
-  beforeAll(() => {
+  beforeEach(() => {
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container as unknown as Element);
-    errorContainer = document.createElement("div");
-    document.body.appendChild(errorContainer);
-    errorRoot = createRoot(errorContainer as unknown as Element);
   });
 
-  afterAll(async () => {
+  afterEach(async () => {
     await act(async () => root.unmount());
-    await act(async () => errorRoot.unmount());
     document.body.removeChild(container);
-    document.body.removeChild(errorContainer);
+    document.activeElement = document.body;
   });
 
   it("runs mounted clicks and renders the gated-to-decoded transition", async () => {
@@ -360,6 +359,8 @@ describe("mounted PairedInspector DOM behavior", () => {
   });
 
   it("runs body keyboard navigation with horizontal-only arrows and roving tabindex", async () => {
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-body") })));
+    await act(async () => find(container, ".inspector-action").click());
     const bodyTablist = find(container, '[aria-label="request body view mode"]');
     const tabs = bodyTablist.querySelectorAll('[role="tab"]');
     expect(tabs[0].getAttribute("tabindex")).toBe("-1");
@@ -375,7 +376,20 @@ describe("mounted PairedInspector DOM behavior", () => {
     expect(container.querySelectorAll('[role="tabpanel"]').some((panel) => panel.getAttribute("id") === bodyPanelId)).toBe(true);
   });
 
+  it("updates uncontrolled pane state and reports click and keyboard requests", async () => {
+    const onPaneChange = vi.fn();
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-uncontrolled"), onPaneChange })));
+    const tabs = find(container, '[aria-label="Exchange panes"]').querySelectorAll('[role="tab"]');
+    await act(async () => tabs[1].click());
+    expect(onPaneChange).toHaveBeenLastCalledWith("response");
+    expect(tabs[1].getAttribute("aria-selected")).toBe("true");
+    await act(async () => dispatchKey(tabs[1], "ArrowRight"));
+    expect(onPaneChange).toHaveBeenLastCalledWith("error");
+    expect(tabs[2].getAttribute("aria-selected")).toBe("true");
+  });
+
   it("does not steal focus from outer tabs, but recovers when the body control owns focus", async () => {
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-a") })));
     const outerTabs = find(container, '[aria-label="Exchange panes"]').querySelectorAll('[role="tab"]');
     outerTabs[0].focus();
     await act(async () => dispatchKey(outerTabs[0], "ArrowDown"));
@@ -393,29 +407,45 @@ describe("mounted PairedInspector DOM behavior", () => {
     expect(document.activeElement?.className).toContain("inspector-action");
   });
 
-  it("rerenders panes without stealing the new outer tab and labels the error panel safely", async () => {
-    await act(async () => errorRoot.render(createElement(PairedInspector, { flow: makeFlow("flow-error"), activePane: "error" })));
-    const errorTabs = find(errorContainer, '[aria-label="Exchange panes"]').querySelectorAll('[role="tab"]');
-    const errorTab = errorTabs[2];
-    const errorPanel = find(errorContainer, '[role="tabpanel"]');
-    expect(errorPanel.getAttribute("aria-labelledby")).toBe(errorTab.getAttribute("id"));
-    expect(errorPanel.textContent).toContain("<img src=x onerror=alert(1)>");
-    expect(errorContainer.querySelector("script")).toBeNull();
+  it("rerenders controlled panes through click and keyboard, preserves focus, and resolves every tab panel", async () => {
+    await act(async () => root.render(createElement(ControlledInspector, { flow: makeFlow("flow-error") })));
+    const tablist = find(container, '[aria-label="Exchange panes"]');
+    const tabs = tablist.querySelectorAll('[role="tab"]');
+    const panels = container.querySelectorAll('[role="tabpanel"]');
+    expect(panels).toHaveLength(3);
+    for (const tab of tabs) {
+      const controls = tab.getAttribute("aria-controls");
+      expect(controls).not.toBeNull();
+      expect(panels.some((panel) => panel.getAttribute("id") === controls)).toBe(true);
+    }
+
+    await act(async () => tabs[1].click());
+    expect(tabs[1].getAttribute("aria-selected")).toBe("true");
+    expect(tabs[0].getAttribute("aria-selected")).toBe("false");
+    const responsePanel = panels.find((panel) => panel.getAttribute("id") === tabs[1].getAttribute("aria-controls"));
+    expect(responsePanel?.hasAttribute("hidden")).toBe(false);
+    const requestPanel = panels.find((panel) => panel.getAttribute("id") === tabs[0].getAttribute("aria-controls"));
+    expect(requestPanel?.hasAttribute("hidden")).toBe(true);
+    expect(requestPanel?.querySelector(".inspector-body-panel")).toBeNull();
+    expect(requestPanel?.querySelector(".inspector-output")).toBeNull();
+
+    tabs[1].focus();
+    await act(async () => dispatchKey(tabs[1], "ArrowRight"));
+    expect(tabs[2].getAttribute("aria-selected")).toBe("true");
+    await act(async () => dispatchKey(tabs[2], "ArrowDown"));
+    expect(tabs[2].getAttribute("aria-selected")).toBe("true");
+    const errorPanel = panels.find((panel) => panel.getAttribute("id") === tabs[2].getAttribute("aria-controls"));
+    expect(errorPanel?.getAttribute("aria-labelledby")).toBe(tabs[2].getAttribute("id"));
+    expect(errorPanel?.textContent).toContain("<img src=x onerror=alert(1)>");
+    expect(container.querySelector("script")).toBeNull();
   });
 
   it("renders lifecycle observations in sequence and bounds a large invalid base64 payload", async () => {
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-sequence") })));
     const trace = container.querySelectorAll(".inspector-trace-label");
     expect(trace.map((item) => item.textContent)).toEqual(["response opened", "request ended", "response ended"]);
-    await act(async () => outerTab(container, "request").click());
     await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-invalid", `!${"A".repeat(16 * 1024 * 1024)}`) })));
     await act(async () => find(container, ".inspector-action").click());
     expect(find(container, ".inspector-output").textContent).toContain("Invalid base64 payload");
   });
 });
-
-function outerTab(container: MiniElement, name: "request" | "response" | "error"): MiniElement {
-  const tabs = find(container, `[aria-label="Exchange panes"]`).querySelectorAll('[role="tab"]');
-  const tab = tabs[name === "request" ? 0 : name === "response" ? 1 : 2];
-  if (!tab) throw new Error(`missing ${name} exchange tab`);
-  return tab;
-}

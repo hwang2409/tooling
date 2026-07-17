@@ -79,9 +79,11 @@ export function decodeBase64Bounded(value: string, limit = DEFAULT_BODY_LIMIT): 
   return { bytes: output, invalid: false, truncated: inputWasTruncated || decodedLength > boundedLimit };
 }
 
-export function decodeUtf8(bytes: Uint8Array): TextDecodeResult {
+export function decodeUtf8(bytes: Uint8Array, preserveBom = false): TextDecodeResult {
   try {
-    return { text: new TextDecoder("utf-8", { fatal: true }).decode(bytes), invalid: false };
+    // Only the SSE path keeps U+FEFF; its parser owns the protocol's
+    // one-leading-BOM rule. Other text modes retain TextDecoder defaults.
+    return { text: new TextDecoder("utf-8", { fatal: true, ignoreBOM: preserveBom }).decode(bytes), invalid: false };
   } catch {
     return { text: toHex(bytes), invalid: true };
   }
@@ -173,7 +175,7 @@ export function decodeBody(body: InspectableBody, mode: BodyViewMode, limit = DE
   const decodeLimit = mode === "hex" ? Math.min(limit, DEFAULT_HEX_LIMIT) : limit;
   const base64 = decodeBase64Bounded(bodyData(body), decodeLimit);
   if (base64.invalid) return { mode, text: "Invalid base64 payload; no bytes were decoded.", copyText: "", byteLength: 0, invalidEncoding: true, truncated: false, fallback: "hex" };
-  const utf8 = decodeUtf8(base64.bytes);
+  const utf8 = decodeUtf8(base64.bytes, mode === "sse");
   const truncated = base64.truncated || body.state === "truncated";
   if (mode === "hex" || utf8.invalid) {
     const text = toHex(base64.bytes);
