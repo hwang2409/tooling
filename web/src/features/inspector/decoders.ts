@@ -55,24 +55,28 @@ function toHex(bytes: Uint8Array): string {
 
 export function decodeBase64Bounded(value: string, limit = DEFAULT_BODY_LIMIT): Base64DecodeResult {
   if (!Number.isSafeInteger(limit) || limit < 0) throw new RangeError("limit must be a non-negative safe integer");
-  if (value.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+  const boundedLimit = Math.min(limit, DEFAULT_BODY_LIMIT);
+  const inputLimit = Math.ceil(boundedLimit / 3) * 4;
+  const inputWasTruncated = value.length > inputLimit;
+  const boundedValue = inputWasTruncated ? value.slice(0, inputLimit) : value;
+  if (boundedValue.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(boundedValue)) {
     return { bytes: new Uint8Array(), invalid: true, truncated: false };
   }
 
-  const decodedLength = value.length / 4 * 3 - (value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0);
-  const output = new Uint8Array(Math.min(decodedLength, limit));
+  const decodedLength = boundedValue.length / 4 * 3 - (boundedValue.endsWith("==") ? 2 : boundedValue.endsWith("=") ? 1 : 0);
+  const output = new Uint8Array(Math.min(decodedLength, boundedLimit));
   let write = 0;
-  for (let index = 0; index < value.length; index += 4) {
-    const a = BASE64_ALPHABET.indexOf(value[index]);
-    const b = BASE64_ALPHABET.indexOf(value[index + 1]);
-    const c = value[index + 2] === "=" ? 0 : BASE64_ALPHABET.indexOf(value[index + 2]);
-    const d = value[index + 3] === "=" ? 0 : BASE64_ALPHABET.indexOf(value[index + 3]);
+  for (let index = 0; index < boundedValue.length; index += 4) {
+    const a = BASE64_ALPHABET.indexOf(boundedValue[index]);
+    const b = BASE64_ALPHABET.indexOf(boundedValue[index + 1]);
+    const c = boundedValue[index + 2] === "=" ? 0 : BASE64_ALPHABET.indexOf(boundedValue[index + 2]);
+    const d = boundedValue[index + 3] === "=" ? 0 : BASE64_ALPHABET.indexOf(boundedValue[index + 3]);
     const block = (a << 18) | (b << 12) | (c << 6) | d;
     if (write < output.length) output[write++] = (block >> 16) & 0xff;
-    if (value[index + 2] !== "=" && write < output.length) output[write++] = (block >> 8) & 0xff;
-    if (value[index + 3] !== "=" && write < output.length) output[write++] = block & 0xff;
+    if (boundedValue[index + 2] !== "=" && write < output.length) output[write++] = (block >> 8) & 0xff;
+    if (boundedValue[index + 3] !== "=" && write < output.length) output[write++] = block & 0xff;
   }
-  return { bytes: output, invalid: false, truncated: decodedLength > limit };
+  return { bytes: output, invalid: false, truncated: inputWasTruncated || decodedLength > boundedLimit };
 }
 
 export function decodeUtf8(bytes: Uint8Array): TextDecodeResult {
@@ -87,23 +91,23 @@ export function parseSseEvents(text: string): SseEvent[] {
   const events: SseEvent[] = [];
   let data: string[] = [];
   let event: string | undefined;
-  let id: string | undefined;
-  let retry: number | undefined;
+  let lastEventId: string | undefined;
+  let lastRetry: number | undefined;
   let comments: string[] = [];
   let fields: Array<{ name: string; value: string }> = [];
 
   const dispatch = () => {
-    if (data.length === 0 && event === undefined && id === undefined && retry === undefined && comments.length === 0 && fields.length === 0) return;
-    events.push({ data: data.join("\n"), event, id, retry, comments, fields });
+    if (data.length > 0) events.push({ data: data.join("\n"), event, id: lastEventId, retry: lastRetry, comments, fields });
     data = [];
     event = undefined;
-    id = undefined;
-    retry = undefined;
     comments = [];
     fields = [];
   };
 
-  for (const line of text.replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n")) {
+  const normalized = text.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+  const lines = normalized.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  for (const line of lines) {
     if (line === "") {
       dispatch();
       continue;
@@ -118,10 +122,12 @@ export function parseSseEvents(text: string): SseEvent[] {
     fields.push({ name, value });
     if (name === "data") data.push(value);
     else if (name === "event") event = value;
-    else if (name === "id" && !value.includes("\0")) id = value;
-    else if (name === "retry" && /^[0-9]+$/.test(value)) retry = Number(value);
+    else if (name === "id" && !value.includes("\0")) lastEventId = value;
+    else if (name === "retry" && /^[0-9]+$/.test(value)) {
+      const parsedRetry = Number(value);
+      if (Number.isSafeInteger(parsedRetry)) lastRetry = parsedRetry;
+    }
   }
-  dispatch();
   return events;
 }
 

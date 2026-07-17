@@ -19,17 +19,20 @@ export function lifecycleLabel(state: FlowLifecycle["state"]): string {
 }
 
 export function orderLifecycle(events: readonly FlowLifecycle[] = []): LifecycleEntry[] {
-  return events.map((event, index) => ({
-    state: event.state,
-    sequence: event.sequence,
-    occurredAt: event.occurred_at,
-    eventId: `${event.event_id}:${index}`,
+  return events.map((event, observedIndex) => ({
+    entry: {
+      state: event.state,
+      sequence: event.sequence,
+      occurredAt: event.occurred_at,
+      eventId: `${event.event_id}:${observedIndex}`,
+    },
+    observedIndex,
   })).sort((left, right) => {
-    const sequenceOrder = BigInt(left.sequence) - BigInt(right.sequence);
+    const sequenceOrder = BigInt(left.entry.sequence) - BigInt(right.entry.sequence);
     if (sequenceOrder < 0n) return -1;
     if (sequenceOrder > 0n) return 1;
-    return left.eventId.localeCompare(right.eventId);
-  });
+    return left.observedIndex - right.observedIndex;
+  }).map(({ entry }) => entry);
 }
 
 export function lifecyclePhase(entries: readonly LifecycleEntry[]): { requestEnded: boolean; responseStarted: boolean; completed: boolean; errored: boolean } {

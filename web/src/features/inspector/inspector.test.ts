@@ -1,9 +1,14 @@
 import { Buffer } from "node:buffer";
-import { describe, expect, it } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it, vi } from "vitest";
 
 import type { FlowLifecycle } from "../../protocol";
+import * as decoderModule from "./decoders";
+import { bodyFocusTarget, InspectorBodyPanel, isBodySelectionAuthorized, nextBodyTabIndex, PairedInspector } from "./PairedInspector";
 import { bodyMetadata, decodeBase64Bounded, decodeBody, decodeUtf8, gateBodyDecode, hexDump, parseSseEvents } from "./decoders";
 import { lifecyclePhase, orderLifecycle } from "./lifecycle";
+import type { InspectableBody, InspectorFlow } from "./models";
 
 const encoded = (value: string) => Buffer.from(value, "utf8").toString("base64");
 
@@ -13,6 +18,14 @@ describe("bounded body decoding", () => {
     expect(Array.from(result.bytes)).toEqual([48, 49, 50, 51]);
     expect(result.truncated).toBe(true);
     expect(result.invalid).toBe(false);
+  });
+
+  it("bounds multi-megabyte valid base64 before validation and decoding", () => {
+    const multiMegabyte = Buffer.alloc(8 * 1024 * 1024, 0x78).toString("base64");
+    expect(() => decodeBase64Bounded(multiMegabyte)).not.toThrow();
+    const result = decodeBase64Bounded(multiMegabyte);
+    expect(result.bytes.byteLength).toBe(64 * 1024);
+    expect(result.truncated).toBe(true);
   });
 
   it("rejects malformed base64 and falls back for invalid UTF-8", () => {
@@ -92,6 +105,12 @@ describe("SSE framing", () => {
     expect(events[0]?.id).toBeUndefined();
     expect(events[0]?.fields).toEqual([{ name: "id", value: "bad\0id" }, { name: "data", value: "" }]);
   });
+
+  it("does not dispatch comment/id/retry-only blocks, persists ID and retry, and drops EOF data", () => {
+    expect(parseSseEvents(": heartbeat\n\n")).toEqual([]);
+    expect(parseSseEvents("id: 7\n\nretry: 1500\n\ndata: complete\n\n")).toEqual([expect.objectContaining({ data: "complete", id: "7", retry: 1500 })]);
+    expect(parseSseEvents("id: 7\ndata: incomplete")).toEqual([]);
+  });
 });
 
 describe("lifecycle ordering", () => {
@@ -110,5 +129,92 @@ describe("lifecycle ordering", () => {
     const ordered = orderLifecycle([event("request_end", "9", 2), event("response_started", "8", 1), event("response_end", "10", 3)]);
     expect(ordered.map((item) => item.state)).toEqual(["response_started", "request_end", "response_end"]);
     expect(lifecyclePhase(ordered)).toEqual({ requestEnded: true, responseStarted: true, completed: false, errored: false });
+  });
+
+  it("preserves observed input order for equal sequences", () => {
+    const ordered = orderLifecycle([event("response_body", "12", 2), event("request_body", "12", 1)]);
+    expect(ordered.map((item) => item.state)).toEqual(["response_body", "request_body"]);
+  });
+});
+
+describe("PairedInspector rendering and interaction contracts", () => {
+  const capturedBody: InspectableBody = { state: "captured", size_bytes: "5", encoding: "base64", data: encoded("hello") };
+  const flow: InspectorFlow = {
+    metadata: {
+      flow_id: "flow-a",
+      method: "POST",
+      scheme: "https",
+      host: "api.example.test",
+      port: "443",
+      path: "/trace/<script>alert(1)</script>",
+      request_headers: [
+        { name: "x-trace", value: "first" },
+        { name: "x-trace", value: "[REDACTED]" },
+        { name: "x-empty", value: "" },
+      ],
+      request_body: capturedBody,
+    },
+    response_body: { state: "redacted", reason: "policy" },
+    error: "<img src=x onerror=alert(1)>",
+  };
+
+  it("renders the initial flow with metadata and gated body content", () => {
+    const markup = renderToStaticMarkup(createElement(PairedInspector, { flow }));
+    expect(markup).toContain("Body decoding is paused");
+    expect(markup).not.toContain(">hello<");
+    expect(markup).toContain("x-trace");
+    expect(markup).toContain("[REDACTED]");
+    expect(markup).toContain("empty value");
+    expect(markup).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+    expect(markup).not.toContain("<script>alert(1)</script>");
+  });
+
+  it("renders selected body output through the component and exposes complete body tabs", () => {
+    const decodeSpy = vi.spyOn(decoderModule, "decodeBody");
+    const markup = renderToStaticMarkup(createElement(PairedInspector, { flow, bodySelection: { flowId: "flow-a", pane: "request" } }));
+    expect(decodeSpy).toHaveBeenCalledWith(capturedBody, "text");
+    expect(markup).toContain(">hello</pre>");
+    expect(markup).toContain('role="tablist"');
+    expect(markup).toContain('aria-orientation="horizontal"');
+    expect(markup).toContain('role="tabpanel"');
+    expect(markup).toContain('aria-controls=');
+    expect(markup).toContain('tabindex="0"');
+    expect(markup).toContain('tabindex="-1"');
+    decodeSpy.mockRestore();
+  });
+
+  it("gates synchronously when the flow ID changes under a stale selection", () => {
+    const nextFlow: InspectorFlow = { ...flow, metadata: { ...flow.metadata, flow_id: "flow-b" } };
+    const markup = renderToStaticMarkup(createElement(PairedInspector, { flow: nextFlow, bodySelection: { flowId: "flow-a", pane: "request" } }));
+    expect(markup).toContain("Body decoding is paused");
+    expect(markup).not.toContain(">hello</pre>");
+  });
+
+  it("keeps redacted, empty, and missing states explicit in rendered body panels", () => {
+    for (const body of [{ state: "redacted" as const }, { state: "empty" as const, size_bytes: "0" as const }, { state: "missing" as const }]) {
+      const markup = renderToStaticMarkup(createElement(InspectorBodyPanel, { body, pane: "response", selected: false, onSelect: () => undefined }));
+      expect(markup).toMatch(/is-(redacted|empty|missing)/);
+    }
+  });
+
+  it("authorizes selection by both current flow ID and body pane", () => {
+    const selection = { flowId: "flow-a", pane: "request" as const };
+    expect(isBodySelectionAuthorized(selection, "flow-a", "request")).toBe(true);
+    expect(isBodySelectionAuthorized(selection, "flow-b", "request")).toBe(false);
+    expect(isBodySelectionAuthorized(selection, "flow-a", "response")).toBe(false);
+    expect(isBodySelectionAuthorized(null, "flow-a", "request")).toBe(false);
+  });
+
+  it("uses horizontal roving-tab keyboard behavior and deterministic focus recovery", () => {
+    expect(nextBodyTabIndex(0, "ArrowRight", 4)).toBe(1);
+    expect(nextBodyTabIndex(0, "ArrowLeft", 4)).toBe(3);
+    expect(nextBodyTabIndex(0, "ArrowDown", 4)).toBeUndefined();
+    expect(nextBodyTabIndex(1, "Home", 4)).toBe(0);
+    expect(nextBodyTabIndex(1, "End", 4)).toBe(3);
+    expect(nextBodyTabIndex(0, "ArrowDown", 4, "vertical")).toBe(1);
+    expect(nextBodyTabIndex(0, "ArrowRight", 4, "vertical")).toBeUndefined();
+    expect(bodyFocusTarget(false, true)).toBe("active-tab");
+    expect(bodyFocusTarget(true, false)).toBe("inspect-control");
+    expect(bodyFocusTarget(false, false)).toBeUndefined();
   });
 });

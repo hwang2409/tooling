@@ -1,12 +1,13 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 
 import type { Header } from "../../protocol";
 import { bodyMetadata, decodeBody, type DecodedBody } from "./decoders";
 import { lifecycleLabel, lifecyclePhase, orderLifecycle } from "./lifecycle";
-import type { BodyViewMode, InspectableBody, InspectorFlow, InspectorHeader, InspectorPane, InspectorProps } from "./models";
+import type { BodyPane, BodySelection, BodyViewMode, InspectableBody, InspectorBodyPanelProps, InspectorFlow, InspectorHeader, InspectorPane, InspectorProps } from "./models";
 import "../../styles/inspector.css";
 
+const useInspectorLayoutEffect = typeof document === "undefined" ? useEffect : useLayoutEffect;
 const paneOrder: InspectorPane[] = ["request", "response", "error"];
 const bodyModes: Array<{ value: BodyViewMode; label: string }> = [
   { value: "json", label: "JSON" },
@@ -14,6 +15,27 @@ const bodyModes: Array<{ value: BodyViewMode; label: string }> = [
   { value: "sse", label: "SSE" },
   { value: "hex", label: "Hex" },
 ];
+
+export function nextBodyTabIndex(current: number, key: string, count: number, orientation: "horizontal" | "vertical" = "horizontal"): number | undefined {
+  if (count < 1) return undefined;
+  if (key === "Home") return 0;
+  if (key === "End") return count - 1;
+  const forward = orientation === "horizontal" ? "ArrowRight" : "ArrowDown";
+  const backward = orientation === "horizontal" ? "ArrowLeft" : "ArrowUp";
+  if (key === forward) return (current + 1) % count;
+  if (key === backward) return (current - 1 + count) % count;
+  return undefined;
+}
+
+export function isBodySelectionAuthorized(selection: BodySelection | null, flowId: string, pane: BodyPane): boolean {
+  return selection?.flowId === flowId && selection.pane === pane;
+}
+
+export function bodyFocusTarget(wasSelected: boolean, selected: boolean): "active-tab" | "inspect-control" | undefined {
+  if (selected) return "active-tab";
+  if (wasSelected) return "inspect-control";
+  return undefined;
+}
 
 function bodyFor(flow: InspectorFlow, pane: "request" | "response"): InspectableBody {
   if (pane === "request") return flow.request_body ?? flow.metadata.request_body;
@@ -57,15 +79,37 @@ function HeaderList({ headers }: { headers: readonly (Header | InspectorHeader)[
   );
 }
 
-function BodyPanel({ body, pane, selected, onSelect }: { body: InspectableBody; pane: "request" | "response"; selected: boolean; onSelect: () => void }) {
+export function InspectorBodyPanel({ body, pane, selected, onSelect }: InspectorBodyPanelProps) {
   const [mode, setMode] = useState<BodyViewMode>("text");
   const metadata = bodyMetadata(body);
   const decoded = selected ? decodeBody(body, mode) : undefined;
   const bodyId = `${pane}-body-panel`;
+  const tablistId = useId();
+  const panelId = `${tablistId}-panel`;
+  const sectionRef = useRef<HTMLElement | null>(null);
+  const inspectRef = useRef<HTMLButtonElement | null>(null);
+  const tabRefs = useRef<Partial<Record<BodyViewMode, HTMLButtonElement | null>>>({});
+  const wasSelected = useRef(selected);
   const canInspect = body.state !== "missing" && body.state !== "redacted";
 
+  useInspectorLayoutEffect(() => {
+    const target = bodyFocusTarget(wasSelected.current, selected);
+    if (target === "active-tab") tabRefs.current[mode]?.focus();
+    else if (target === "inspect-control") (inspectRef.current ?? sectionRef.current)?.focus();
+    wasSelected.current = selected;
+  }, [mode, selected]);
+
+  const handleModeKeyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
+    const nextIndex = nextBodyTabIndex(index, event.key, bodyModes.length);
+    if (nextIndex === undefined) return;
+    event.preventDefault();
+    const nextMode = bodyModes[nextIndex].value;
+    setMode(nextMode);
+    tabRefs.current[nextMode]?.focus();
+  };
+
   return (
-    <section className={`inspector-body-panel ${selected ? "is-selected" : ""}`} aria-labelledby={bodyId}>
+    <section ref={sectionRef} className={`inspector-body-panel ${selected ? "is-selected" : ""}`} aria-labelledby={bodyId} tabIndex={-1}>
       <div className="inspector-section-heading">
         <div>
           <p className="inspector-kicker">{pane === "request" ? "REQUEST BODY" : "RESPONSE BODY"}</p>
@@ -84,17 +128,31 @@ function BodyPanel({ body, pane, selected, onSelect }: { body: InspectableBody; 
             <strong>{canInspect ? "Body decoding is paused" : metadata.state === "redacted" ? "Body withheld by redaction" : "No body bytes retained"}</strong>
             <p>{canInspect ? "Select this pane to decode the bounded prefix." : metadata.state === "redacted" ? "The source marked this content as unavailable." : "Metadata remains available without a body payload."}</p>
           </div>
-          {canInspect && <button className="inspector-action" type="button" onClick={onSelect}>Inspect body <span aria-hidden="true">↗</span></button>}
+          {canInspect && <button ref={inspectRef} className="inspector-action" type="button" onClick={onSelect}>Inspect body <span aria-hidden="true">↗</span></button>}
         </div>
       ) : (
         <div className="inspector-body-view">
-          <div className="inspector-mode-row" role="tablist" aria-label={`${pane} body view mode`}>
-            {bodyModes.map((bodyMode) => (
-              <button key={bodyMode.value} className={`inspector-mode-tab ${mode === bodyMode.value ? "is-active" : ""}`} type="button" role="tab" aria-selected={mode === bodyMode.value} onClick={() => setMode(bodyMode.value)}>{bodyMode.label}</button>
+          <div className="inspector-mode-row" role="tablist" aria-label={`${pane} body view mode`} aria-orientation="horizontal">
+            {bodyModes.map((bodyMode, index) => (
+              <button
+                key={bodyMode.value}
+                ref={(element) => { tabRefs.current[bodyMode.value] = element; }}
+                id={`${tablistId}-${bodyMode.value}`}
+                className={`inspector-mode-tab ${mode === bodyMode.value ? "is-active" : ""}`}
+                type="button"
+                role="tab"
+                aria-selected={mode === bodyMode.value}
+                aria-controls={panelId}
+                tabIndex={mode === bodyMode.value ? 0 : -1}
+                onClick={() => setMode(bodyMode.value)}
+                onKeyDown={(event) => handleModeKeyDown(event, index)}
+              >{bodyMode.label}</button>
             ))}
             <span className="inspector-view-limit">bounded / 64 KiB</span>
           </div>
-          <BodyOutput decoded={decoded!} />
+          <div id={panelId} role="tabpanel" aria-labelledby={`${tablistId}-${mode}`} tabIndex={0}>
+            <BodyOutput decoded={decoded!} />
+          </div>
         </div>
       )}
     </section>
@@ -160,9 +218,9 @@ function ErrorPane({ error }: { error?: string }) {
   );
 }
 
-export function PairedInspector({ flow, className = "", compact = false, onPaneChange }: InspectorProps) {
+export function PairedInspector({ flow, className = "", compact = false, bodySelection, onBodySelect, onPaneChange }: InspectorProps) {
   const [pane, setPane] = useState<InspectorPane>("request");
-  const [selectedBody, setSelectedBody] = useState<"request" | "response" | null>(null);
+  const [internalSelectedBody, setInternalSelectedBody] = useState<BodySelection | null>(null);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const tablistId = useId();
   const entries = useMemo(() => orderLifecycle(flow.lifecycle), [flow.lifecycle]);
@@ -173,8 +231,17 @@ export function PairedInspector({ flow, className = "", compact = false, onPaneC
 
   const selectPane = (nextPane: InspectorPane) => {
     setPane(nextPane);
-    setSelectedBody(null);
+    if (bodySelection === undefined) setInternalSelectedBody(null);
   };
+
+  const selectBody = (bodyPane: BodyPane) => {
+    const selection = { flowId: flow.metadata.flow_id, pane: bodyPane };
+    if (bodySelection === undefined) setInternalSelectedBody(selection);
+    onBodySelect?.(selection);
+  };
+
+  const selectedBody = bodySelection === undefined ? internalSelectedBody : bodySelection;
+  const isBodySelected = (bodyPane: BodyPane) => isBodySelectionAuthorized(selectedBody, flow.metadata.flow_id, bodyPane);
 
   const handleTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     let nextIndex: number | undefined;
@@ -249,8 +316,8 @@ export function PairedInspector({ flow, className = "", compact = false, onPaneC
             </div>
           </section>
           <section className="inspector-column inspector-body-column">
-            <BodyPanel body={bodyFor(flow, pane)} pane={pane} selected={selectedBody === pane} onSelect={() => setSelectedBody(pane)} />
-            {pane === "response" && flow.metadata.request_body.state !== "missing" && <p className="inspector-cross-note">Request body is available in the Request pane.</p>}
+            <InspectorBodyPanel body={bodyFor(flow, pane)} pane={pane} selected={isBodySelected(pane)} onSelect={() => selectBody(pane)} />
+            {pane === "response" && bodyFor(flow, "request").state !== "missing" && <p className="inspector-cross-note">Request body is available in the Request pane.</p>}
             {pane === "request" && responseBody.state !== "missing" && <p className="inspector-cross-note">Response body is available in the Response pane.</p>}
           </section>
         </div>
@@ -261,4 +328,4 @@ export function PairedInspector({ flow, className = "", compact = false, onPaneC
   );
 }
 
-export type { BodyViewMode, InspectableBody, InspectorFlow, InspectorPane } from "./models";
+export type { BodyPane, BodySelection, BodyViewMode, InspectableBody, InspectorFlow, InspectorPane } from "./models";
