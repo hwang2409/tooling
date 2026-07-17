@@ -202,6 +202,24 @@ describe("mounted FlowWorkspace", () => {
     expect(mounted.container.textContent).toContain("Select a flow row");
   });
 
+  it("marks retained rows as unseen until the user selects them", async () => {
+    const browser = reduceAll([
+      hello(),
+      snapshot("1", [flow("alpha"), flow("bravo"), flow("charlie")]),
+    ]);
+    const mounted = await mountWorkspace(browser, { followLive: false });
+    const beforeAlpha = rowByText(mounted.container, "/v1/alpha");
+    const beforeBravo = rowByText(mounted.container, "/v1/bravo");
+    expect(beforeAlpha.classList.contains("is-unseen")).toBe(true);
+    expect(beforeBravo.classList.contains("is-unseen")).toBe(true);
+
+    await act(async () => beforeAlpha.click());
+    const afterAlpha = rowByText(mounted.container, "/v1/alpha");
+    const afterBravo = rowByText(mounted.container, "/v1/bravo");
+    expect(afterAlpha.classList.contains("is-unseen")).toBe(false);
+    expect(afterBravo.classList.contains("is-unseen")).toBe(true);
+  });
+
   it("reports when the selected flow leaves bounded retention", async () => {
     const messages = [hello(), snapshot("1", [flow("alpha"), flow("bravo")])];
     const browser = reduceAll(messages);

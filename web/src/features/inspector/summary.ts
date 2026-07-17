@@ -1,7 +1,8 @@
 import { formatBytesCompact, formatDurationMs } from "../../format";
 import { decodeBody } from "./decoders";
 import { durationMsFromLifecycle } from "../flows/gridModel";
-import type { InspectableBody, InspectorFlow } from "./models";
+import type { InspectableBody } from "./models";
+import type { InspectorFlow } from "./models";
 
 /** Best-guess one-line summary of a captured HTTP flow. */
 export function flowSummary(flow: InspectorFlow): string {
@@ -15,7 +16,7 @@ export function flowSummary(flow: InspectorFlow): string {
   const requestSize = formatBytesCompact(sizeOf(requestBody));
   const responseSize = formatBytesCompact(sizeOf(responseBody));
 
-  const anthropicSummary = anthropicMessagesSummary(flow, requestBody, path, method);
+  const anthropicSummary = anthropicMessagesSummary(requestBody, path, method);
   const base = anthropicSummary ?? genericSummary(method, host, path);
   const tail: string[] = [];
   if (anthropicSummary === null) {
@@ -57,7 +58,6 @@ interface AnthropicMessages {
  * a shape we recognise so the caller can render a generic summary instead.
  */
 export function anthropicMessagesSummary(
-  flow: InspectorFlow,
   requestBody: InspectableBody | undefined,
   path: string,
   method: string,

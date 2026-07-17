@@ -50,8 +50,11 @@ function JsonScalar({ value }: { value: JsonValue }) {
   return <span className="json-string">&quot;{escapeJsonString(value as string)}&quot;</span>;
 }
 
+// eslint-disable-next-line no-control-regex -- JSON string escaping intentionally targets the ASCII control range.
+const JSON_ESCAPE_PATTERN = /[\\"\b\f\n\r\t\x00-\x1f]/g;
+
 function escapeJsonString(value: string): string {
-  return value.replace(/[\\"\b\f\n\r\t\x00-\x1f]/g, (character) => {
+  return value.replace(JSON_ESCAPE_PATTERN, (character) => {
     switch (character) {
       case "\\": return "\\\\";
       case '"': return '\\"';

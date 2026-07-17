@@ -4,7 +4,15 @@ import type { InspectorFlow } from "./models";
 import { flowSummary } from "./summary";
 
 function toBase64(text: string): string {
-  return Buffer.from(text, "utf8").toString("base64");
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(text);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function byteLength(text: string): number {
+  return new TextEncoder().encode(text).length;
 }
 
 function flow(overrides: Partial<InspectorFlow> = {}): InspectorFlow {
@@ -47,10 +55,10 @@ describe("flowSummary", () => {
   it("recognises Anthropic /v1/messages, extracts model, message count, and stream flag", () => {
     const requestJson = JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "hi" }, { role: "user", content: "again" }], stream: true });
     const requestBase64 = toBase64(requestJson);
-    const requestSize = String(Buffer.byteLength(requestJson, "utf8"));
+    const requestSize = String(byteLength(requestJson));
     const responseJson = "data: {\"type\":\"message_start\"}\n\n";
     const responseBase64 = toBase64(responseJson);
-    const responseSize = String(Buffer.byteLength(responseJson, "utf8"));
+    const responseSize = String(byteLength(responseJson));
 
     const summary = flowSummary(flow({
       metadata: {

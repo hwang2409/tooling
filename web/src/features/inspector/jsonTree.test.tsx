@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { act } from "react";
+import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -10,7 +11,7 @@ import { JsonTree, collapsedSummary, safeParseJson, shouldStartCollapsed } from 
 
 const mounts: Array<{ root: ReturnType<typeof createRoot>; container: HTMLDivElement }> = [];
 
-async function mount(node: React.ReactNode): Promise<HTMLDivElement> {
+async function mount(node: ReactNode): Promise<HTMLDivElement> {
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
