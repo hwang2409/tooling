@@ -171,6 +171,21 @@ class PopenChild:
             except ProcessLookupError:
                 if self.poll() is not None:
                     return
+            except PermissionError as exc:
+                # The group can disappear between group_alive() and this
+                # signal.  macOS may report EPERM for that stale cached PGID;
+                # reap the leader and probe the cached group again.  Only a
+                # gone group is benign; a surviving/permission-denied group
+                # must remain a cleanup failure.
+                if self.poll() is not None:
+                    try:
+                        os.killpg(self._process_group_id, 0)
+                    except ProcessLookupError:
+                        return
+                    except PermissionError:
+                        raise exc from None
+                    raise exc from None
+                raise
         fallback()
 
     def terminate(self) -> None:

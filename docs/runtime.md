@@ -19,6 +19,10 @@ from the checkout working directory:
 - body budget: 128 MiB globally, with a 1 MiB captured prefix per side
 - pending-message budget: 4,096 queued capture messages
 
+All uint64 limits are positive except `max_body_prefix_bytes`, which may be
+zero. This matches B2's environment parser: emitted body memory and pending
+message values are never zero.
+
 Both app and proxy hosts must be loopback addresses. Ports must be distinct
 and in the TCP range 1–65535. The reverse target accepts the pinned
 mitmdump 12.2.3 authority grammar only: lowercase `http`/`https` (uppercase

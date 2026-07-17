@@ -43,7 +43,7 @@ CAPTURE_MAX_MEMORY_ENV = "MITM_INSPECTOR_MAX_IN_MEMORY_BYTES"
 CAPTURE_MAX_PENDING_ENV = "MITM_INSPECTOR_MAX_PENDING_MESSAGES"
 
 
-def _uint64(value: int, name: str, *, allow_zero: bool = True) -> int:
+def _uint64(value: int, name: str, *, allow_zero: bool = False) -> int:
     minimum = 0 if allow_zero else 1
     if type(value) is not int or not minimum <= value <= MAX_UINT64:
         range_text = "0" if allow_zero else "1"
@@ -256,17 +256,29 @@ class CaptureIPCConfig:
         object.__setattr__(
             self,
             "max_body_prefix_bytes",
-            _uint64(self.max_body_prefix_bytes, "capture max_body_prefix_bytes"),
+            _uint64(
+                self.max_body_prefix_bytes,
+                "capture max_body_prefix_bytes",
+                allow_zero=True,
+            ),
         )
         object.__setattr__(
             self,
             "max_in_memory_bytes",
-            _uint64(self.max_in_memory_bytes, "capture max_in_memory_bytes"),
+            _uint64(
+                self.max_in_memory_bytes,
+                "capture max_in_memory_bytes",
+                allow_zero=False,
+            ),
         )
         object.__setattr__(
             self,
             "max_pending_messages",
-            _uint64(self.max_pending_messages, "capture max_pending_messages"),
+            _uint64(
+                self.max_pending_messages,
+                "capture max_pending_messages",
+                allow_zero=False,
+            ),
         )
         if self.max_body_prefix_bytes > self.max_in_memory_bytes:
             raise RuntimeConfigError(
@@ -356,27 +368,31 @@ class RuntimeConfig:
         object.__setattr__(
             self,
             "retention_max_flows",
-            _uint64(self.retention_max_flows, "retention_max_flows"),
+            _uint64(self.retention_max_flows, "retention_max_flows", allow_zero=False),
         )
         object.__setattr__(
             self,
             "retention_max_age_seconds",
-            _uint64(self.retention_max_age_seconds, "retention_max_age_seconds"),
+            _uint64(
+                self.retention_max_age_seconds,
+                "retention_max_age_seconds",
+                allow_zero=False,
+            ),
         )
         object.__setattr__(
             self,
             "max_body_bytes",
-            _uint64(self.max_body_bytes, "max_body_bytes"),
+            _uint64(self.max_body_bytes, "max_body_bytes", allow_zero=False),
         )
         object.__setattr__(
             self,
             "max_body_prefix_bytes",
-            _uint64(self.max_body_prefix_bytes, "max_body_prefix_bytes"),
+            _uint64(self.max_body_prefix_bytes, "max_body_prefix_bytes", allow_zero=True),
         )
         object.__setattr__(
             self,
             "max_pending_messages",
-            _uint64(self.max_pending_messages, "max_pending_messages"),
+            _uint64(self.max_pending_messages, "max_pending_messages", allow_zero=False),
         )
         if self.max_body_prefix_bytes > self.max_body_bytes:
             raise RuntimeConfigError("max_body_prefix_bytes cannot exceed max_body_bytes")

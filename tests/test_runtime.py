@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -299,9 +300,54 @@ def test_integer_caps_are_uint64_bounded(tmp_path: Path, field: str) -> None:
 
 
 def test_zero_body_prefix_is_supported_by_shared_contract(tmp_path: Path) -> None:
-    config = runtime_config(tmp_path, max_body_prefix_bytes=0, max_body_bytes=0)
+    config = runtime_config(tmp_path, max_body_prefix_bytes=0, max_body_bytes=1)
     assert config.capture.max_body_prefix_bytes == 0
     assert config.capture.environment()[CAPTURE_MAX_BODY_PREFIX_ENV] == "0"
+    for spec in (build_proxy_spec(config), build_app_spec(config)):
+        assert _parse_b2_capture_environment(dict(spec.env))[2:] == (0, 1, 4096)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "retention_max_flows",
+        "retention_max_age_seconds",
+        "max_body_bytes",
+        "max_pending_messages",
+    ],
+)
+def test_b2_nonzero_uint_ranges_reject_zero(tmp_path: Path, field: str) -> None:
+    with pytest.raises(RuntimeConfigError, match="unsigned 64-bit"):
+        runtime_config(tmp_path, **{field: 0})
+
+
+@pytest.mark.parametrize("field", ["max_in_memory_bytes", "max_pending_messages"])
+def test_b2_capture_environment_nonzero_ranges_reject_zero(field: str) -> None:
+    with pytest.raises(RuntimeConfigError, match="unsigned 64-bit"):
+        CaptureIPCConfig(**{field: 0})
+
+
+def _parse_b2_capture_environment(env: dict[str, str]) -> tuple[str, str, int, int, int]:
+    """Test-only copy of B2 CaptureConfig.from_environment's five-field seam."""
+
+    socket_path = env[CAPTURE_SOCKET_ENV]
+    source_id = env[CAPTURE_SOURCE_ID_ENV]
+    assert socket_path.startswith("/") and "\x00" not in socket_path
+    assert source_id and "\x00" not in source_id
+    parsed: list[int] = []
+    for name, allow_zero in (
+        (CAPTURE_MAX_BODY_PREFIX_ENV, True),
+        (CAPTURE_MAX_MEMORY_ENV, False),
+        (CAPTURE_MAX_PENDING_ENV, False),
+    ):
+        value = env[name]
+        assert re.fullmatch(r"(?:0|[1-9][0-9]*)", value)
+        number = int(value)
+        assert number <= MAX_UINT64
+        assert allow_zero or number >= 1
+        parsed.append(number)
+    assert parsed[0] <= parsed[1]
+    return socket_path, source_id, *parsed
 
 
 def test_lowercase_authority_matches_pinned_mitmproxy_parser() -> None:
@@ -370,6 +416,13 @@ def test_process_specs_share_exact_ipc_environment_and_packaged_addon(tmp_path: 
         CAPTURE_MAX_MEMORY_ENV: "4096",
         CAPTURE_MAX_PENDING_ENV: "4096",
     }
+    assert _parse_b2_capture_environment(dict(proxy.env)) == (
+        "/tmp/mitm-inspector-test.sock",
+        "synthetic-source",
+        1024,
+        4096,
+        4096,
+    )
     assert proxy.argv[-2:] == ("-s", str(config.addon_path))
     assert Path(proxy.argv[-1]).is_absolute()
     assert str(config.capture.socket_path) in app.argv
@@ -908,3 +961,74 @@ def test_real_process_shutdown_reaps_leaders_without_false_kill() -> None:
     assert events == ["terminate:proxy", "terminate:app"]
     assert supervisor.state is RuntimeState.STOPPED
     assert specs[0].env[CAPTURE_SOCKET_ENV] == specs[1].env[CAPTURE_SOCKET_ENV]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group semantics are POSIX-specific")
+def test_real_process_exit_between_group_check_and_signal_is_benign() -> None:
+    class RaceChild:
+        def __init__(self, child: PopenChild) -> None:
+            self.child = child
+            self.raced = False
+
+        @property
+        def pid(self) -> int:
+            return self.child.pid
+
+        @property
+        def process_group_id(self) -> int | None:
+            return self.child.process_group_id
+
+        def poll(self) -> int | None:
+            return self.child.poll()
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self.child.wait(timeout)
+
+        def group_alive(self) -> bool:
+            alive = self.child.group_alive()
+            if alive and not self.raced:
+                self.raced = True
+                os.kill(self.child.pid, signal.SIGTERM)
+                self.child.wait(timeout=1.0)
+                return True
+            return alive
+
+        def terminate(self) -> None:
+            self.child.terminate()
+
+        def kill(self) -> None:
+            self.child.kill()
+
+    class RaceFactory:
+        def spawn(self, spec: ProcessSpec) -> ChildProcess:
+            code = "import time; time.sleep(60)"
+            child = SubprocessFactory().spawn(
+                ProcessSpec(spec.name, (sys.executable, "-c", code), spec.env)
+            )
+            assert isinstance(child, PopenChild)
+            return RaceChild(child)
+
+    supervisor = RuntimeSupervisor(
+        RuntimeConfig(
+            readiness_timeout_seconds=1.0,
+            graceful_shutdown_seconds=0.1,
+            kill_wait_seconds=0.1,
+            poll_interval_seconds=0.01,
+        ),
+        process_factory=RaceFactory(),
+        readiness_probe=ImmediateReadinessProbe(),
+        preflight_checker=lambda _config: None,
+        signal_policy=SignalPolicy.DISABLED_FOR_TEST,
+    )
+    try:
+        supervisor.start()
+        supervisor.stop()
+    finally:
+        if supervisor.state is not RuntimeState.STOPPED:
+            try:
+                supervisor.stop()
+            except CleanupError:
+                pass
+
+    assert supervisor.state is RuntimeState.STOPPED
+    assert supervisor.cleanup_failures == ()
