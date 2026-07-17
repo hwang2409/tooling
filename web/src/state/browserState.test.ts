@@ -251,7 +251,7 @@ describe("browser state reducer", () => {
 
   it("records server resync signals and unknown messages without failing", () => {
     const resync = reduce(initialBrowserState, {
-      protocol_version: "1", type: "browser.resync", reason: "history_evicted", requested_cursor: "9",
+      protocol_version: "1", type: "browser.resync", reason: "initial_connect", requested_cursor: "9",
     });
     const unknown = reduce(resync, {
       protocol_version: "1", type: "future.message", sequence: "18446744073709551615", safe: true,
@@ -291,5 +291,55 @@ describe("browser state reducer", () => {
     expect(stalePendingAck.gap).toEqual(pending.gap);
     expect(validAck.resyncRequested).toBe("12");
     expect(validAck.gap).toEqual(pending.gap);
+  });
+
+  it("accepts only current-epoch initial and explicitly pending resync acknowledgements", () => {
+    const sourceA = reduce(initialBrowserState, hello("source-a"));
+    const initial = reduce(sourceA, {
+      protocol_version: "1", type: "browser.resync", reason: "initial_connect", requested_cursor: "0",
+    });
+    const initialAck = reduce(initial, {
+      protocol_version: "1", type: "browser.resync", reason: "history_evicted", requested_cursor: "0",
+    });
+    const withGap = reduce(sourceA, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "a", cursor: "10", flows: [],
+    });
+    const pending = reduce(withGap, {
+      protocol_version: "1", type: "browser.delta", cursor: "12", changes: [],
+    });
+    const sourceB = reduce(pending, hello("source-b"));
+    const lateSourceAAck = reduce(sourceB, {
+      protocol_version: "1", type: "browser.resync", reason: "cursor_gap", requested_cursor: "10",
+    });
+
+    expect(initial.initialConnectPending).toBe(false);
+    expect(initial.resyncEpoch).toBe(initial.sourceEpoch);
+    expect(initialAck.resyncRequested).toBe("0");
+    expect(lateSourceAAck.sourceId).toBe("source-b");
+    expect(lateSourceAAck.resyncRequested).toBeNull();
+    expect(lateSourceAAck.gap).toBeNull();
+    expect(lateSourceAAck.counters.staleMessages).toBe(1);
+  });
+
+  it("ignores a late cursor-zero acknowledgement after a snapshot resolves the gap", () => {
+    const snapshot = reduce(initialBrowserState, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "one", cursor: "1", flows: [],
+    });
+    const pending = reduce(snapshot, {
+      protocol_version: "1", type: "browser.delta", cursor: "3", changes: [],
+    });
+    const resolved = reduce(pending, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "two", cursor: "12", flows: [],
+    });
+    const late = reduce(resolved, {
+      protocol_version: "1", type: "browser.resync", reason: "history_evicted", requested_cursor: "0",
+    });
+
+    expect(resolved.gap).toBeNull();
+    expect(resolved.resyncRequested).toBeNull();
+    expect(late.cursor).toBe("12");
+    expect(late.gap).toBeNull();
+    expect(late.resyncRequested).toBeNull();
+    expect(late.counters.staleMessages).toBe(1);
   });
 });

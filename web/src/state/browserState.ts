@@ -53,6 +53,7 @@ export interface BrowserState {
   readonly cursor: string;
   readonly streamSequence: string | null;
   readonly sourceEpoch: number;
+  readonly initialConnectPending: boolean;
   readonly sourceId: string | null;
   readonly sourceLimits: DeepReadonly<SourceHello["limits"]> | null;
   readonly sourceCapabilities: DeepReadonly<SourceHello["capabilities"]> | null;
@@ -60,6 +61,7 @@ export interface BrowserState {
   readonly gap: CursorGap | null;
   readonly streamGap: StreamGapState | null;
   readonly resyncRequested: string | null;
+  readonly resyncEpoch: number | null;
   readonly lastUnknownType: string | null;
   readonly counters: BrowserCounters;
 }
@@ -77,6 +79,7 @@ const initialBrowserStateValue: BrowserState = {
   cursor: "0",
   streamSequence: null,
   sourceEpoch: 0,
+  initialConnectPending: true,
   sourceId: null,
   sourceLimits: null,
   sourceCapabilities: null,
@@ -84,6 +87,7 @@ const initialBrowserStateValue: BrowserState = {
   gap: null,
   streamGap: null,
   resyncRequested: null,
+  resyncEpoch: null,
   lastUnknownType: null,
   counters: {
     receivedMessages: 0,
@@ -185,6 +189,7 @@ function resetForSource(state: BrowserState, message: SourceHello): BrowserState
     cursor: "0",
     streamSequence: null,
     sourceEpoch: state.sourceEpoch + 1,
+    initialConnectPending: true,
     sourceId: message.source_id,
     sourceLimits: message.limits,
     sourceCapabilities: message.capabilities,
@@ -192,6 +197,7 @@ function resetForSource(state: BrowserState, message: SourceHello): BrowserState
     gap: null,
     streamGap: null,
     resyncRequested: null,
+    resyncEpoch: null,
     counters: {
       receivedMessages: state.counters.receivedMessages,
       appliedChanges: 0,
@@ -206,6 +212,7 @@ function resetForTransport(state: BrowserState): BrowserState {
   return {
     ...initialBrowserState,
     sourceEpoch: state.sourceEpoch + 1,
+    initialConnectPending: false,
   };
 }
 
@@ -218,6 +225,8 @@ function applySnapshot(state: BrowserState, message: BrowserSnapshot): BrowserSt
     snapshotId: message.snapshot_id,
     gap: null,
     resyncRequested: null,
+    initialConnectPending: false,
+    resyncEpoch: null,
     counters: {
       ...state.counters,
       appliedChanges: state.counters.appliedChanges + message.flows.length,
@@ -241,6 +250,8 @@ function applyDelta(state: BrowserState, message: BrowserDelta): BrowserState {
         reason: "cursor_gap",
       },
       resyncRequested: state.cursor,
+      initialConnectPending: false,
+      resyncEpoch: state.sourceEpoch,
     };
   }
 
@@ -261,6 +272,8 @@ function applyDelta(state: BrowserState, message: BrowserDelta): BrowserState {
     cursor: message.cursor,
     gap: null,
     resyncRequested: null,
+    initialConnectPending: false,
+    resyncEpoch: null,
     counters: {
       ...state.counters,
       appliedChanges: state.counters.appliedChanges + message.changes.length,
@@ -269,33 +282,20 @@ function applyDelta(state: BrowserState, message: BrowserDelta): BrowserState {
 }
 
 function applyResync(state: BrowserState, message: BrowserResync): BrowserState {
-  const requestedCursor = cursor(message.requested_cursor);
-  const currentCursor = cursor(state.cursor);
-
-  const hasCurrentPendingRequest = state.gap !== null
-    && state.gap.sourceEpoch === state.sourceEpoch
-    && state.resyncRequested !== null;
-  if (hasCurrentPendingRequest) {
-    if (message.requested_cursor !== state.resyncRequested) return stale(state);
-    return { ...state, resyncRequested: state.resyncRequested };
-  }
-
-  if (requestedCursor < currentCursor) return stale(state);
-  if (state.cursor !== "0") return stale(state);
   if (message.reason === "initial_connect") {
-    return { ...state, resyncRequested: message.requested_cursor };
+    if (!state.initialConnectPending || state.resyncRequested !== null) return stale(state);
+    return {
+      ...state,
+      initialConnectPending: false,
+      resyncRequested: message.requested_cursor,
+      resyncEpoch: state.sourceEpoch,
+    };
   }
-  return {
-    ...state,
-    gap: state.gap ?? {
-      sourceEpoch: state.sourceEpoch,
-      expected: state.cursor,
-      received: message.requested_cursor,
-      requested: message.requested_cursor,
-      reason: message.reason,
-    },
-    resyncRequested: message.requested_cursor,
-  };
+  const hasCurrentPendingRequest = state.resyncRequested !== null
+    && state.resyncEpoch === state.sourceEpoch
+    && (state.gap === null || state.gap.sourceEpoch === state.sourceEpoch);
+  if (!hasCurrentPendingRequest || message.requested_cursor !== state.resyncRequested) return stale(state);
+  return state;
 }
 
 function applyStreamGap(state: BrowserState, message: StreamGap): BrowserState {
