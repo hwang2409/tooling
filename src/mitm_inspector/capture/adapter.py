@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import math
 import time
 from collections import deque
@@ -23,6 +22,7 @@ from mitm_inspector.capture.config import (
     CaptureConfig,
 )
 from mitm_inspector.capture.redaction import sanitize_header, sanitize_path
+from mitm_inspector.capture.sequencer import DrainBatch
 from mitm_inspector.capture.sink import BoundedMessageSink
 from mitm_inspector.protocol import MAX_U64, ParsedMessageResult
 
@@ -58,8 +58,7 @@ class _PendingChunk:
     chunk_index: int
     captured_start: int
     captured_length: int
-    source_length: int
-    source_digest: bytes
+    source_identity: int
 
 
 @dataclass
@@ -74,8 +73,7 @@ class _BodyCapture:
     stream_enabled: bool = True
     prefix_sealed: bool = False
     pending_chunk: _PendingChunk | None = None
-    replay_length: int | None = None
-    replay_digest: bytes | None = None
+    retry_chunk: _PendingChunk | None = None
 
 
 @dataclass
@@ -158,7 +156,6 @@ class CaptureAddon:
         self._clock = clock
         self._emit_callback = emit
         self._dispatch_lock = Lock()
-        self._callback_progress: dict[int, int] = {}
         self._sink_injected = sink is not None
         self.sink = (
             sink
@@ -317,24 +314,44 @@ class CaptureAddon:
             batch = self.sink.drain(limit)
             messages = batch.messages
             callback_failure: BaseException | None = None
-            start = self._callback_progress.get(batch.token, 0)
+            start = batch._progress.next_index
             if self._emit_callback is not None:
                 for index in range(start, len(messages)):
                     message = messages[index]
                     try:
                         self._emit_callback(message)
-                        self._callback_progress[batch.token] = index + 1
                     except BaseException as error:
                         if callback_failure is None:
                             callback_failure = error
                         break
+                    try:
+                        self._publish_callback_progress(batch, index + 1)
+                    except BaseException:
+                        # The callback has already returned successfully.
+                        # Keep its receipt in the handed-off batch even when
+                        # the progress publication itself is interrupted.
+                        batch._progress.next_index = index + 1
+                        raise
             if callback_failure is not None:
                 raise callback_failure
-            self.sink.acknowledge(batch)
-            self._callback_progress.pop(batch.token, None)
-            return list(messages)
+            result = list(messages)
+            try:
+                self.sink.acknowledge(batch)
+            except BaseException:
+                # A post-ack cleanup/return fault cannot make an already
+                # acknowledged batch disappear from this consumer.
+                if not self.sink._sequencer.has_committed_batch():
+                    return result
+                raise
+            return result
         finally:
             self._dispatch_lock.release()
+
+    @staticmethod
+    def _publish_callback_progress(batch: DrainBatch, next_index: int) -> None:
+        """Publish the accepted index in the durable handed-off receipt."""
+
+        batch._progress.next_index = next_index
 
     def _announce_source(self) -> None:
         if self._source_announced:
@@ -407,36 +424,18 @@ class CaptureAddon:
         if state.completed or state.discarded or body.ended or not body.stream_enabled:
             return
         copied = _safe_bytes(chunk, label="body chunk")
-        source_digest = hashlib.blake2s(copied, digest_size=16).digest()
-        if body.replay_digest is not None:
-            is_replay = (
-                body.replay_length == len(copied)
-                and body.replay_digest == source_digest
-            )
-            body.replay_length = None
-            body.replay_digest = None
-            if is_replay:
+        if body.retry_chunk is not None:
+            retry = body.retry_chunk
+            body.retry_chunk = None
+            if retry.source_identity == id(copied):
                 return
         if body.pending_chunk is not None:
             pending = body.pending_chunk
-            if not body.lifecycle_emitted:
-                try:
-                    self._lifecycle(state, f"{side}_body")
-                except OverflowError:
-                    self._discard_active(state, count_eviction=False)
-                    return
-                except BaseException as error:
-                    if getattr(error, "capture_committed", False):
-                        body.lifecycle_emitted = True
-                    raise
-                body.lifecycle_emitted = True
-            if (
-                pending.source_length == len(copied)
-                and pending.source_digest == source_digest
-            ):
-                self._emit_pending_chunk(state, side, body, pending)
-                return
+            is_retry = pending.source_identity == id(copied)
+            self._emit_body_lifecycle(state, side, body)
             self._emit_pending_chunk(state, side, body, pending)
+            if is_retry:
+                return
         if body.total_bytes > MAX_U64 - len(copied):
             raise OverflowError(f"{side} body byte offset exhausted")
         if body.chunk_index >= MAX_U64:
@@ -468,23 +467,36 @@ class CaptureAddon:
             body.chunk_index,
             captured_start,
             len(captured),
-            len(copied),
-            source_digest,
+            id(copied),
         )
         if len(captured) < len(copied):
             body.prefix_sealed = True
-        if not body.lifecycle_emitted:
-            try:
-                self._lifecycle(state, f"{side}_body")
-            except OverflowError:
-                self._discard_active(state, count_eviction=False)
-                return
-            except BaseException as error:
-                if getattr(error, "capture_committed", False):
-                    body.lifecycle_emitted = True
-                raise
-            body.lifecycle_emitted = True
+        self._emit_body_lifecycle(state, side, body)
         self._emit_pending_chunk(state, side, body, body.pending_chunk)
+
+    def _emit_body_lifecycle(
+        self, state: _FlowCapture, side: str, body: _BodyCapture
+    ) -> None:
+        if body.lifecycle_emitted:
+            return
+        try:
+            self._lifecycle(state, f"{side}_body")
+        except OverflowError:
+            self._discard_active(state, count_eviction=False)
+            raise
+        except BaseException as error:
+            if getattr(error, "capture_committed", False):
+                body.lifecycle_emitted = True
+            raise
+        try:
+            self._publish_body_lifecycle(body)
+        except BaseException:
+            body.lifecycle_emitted = True
+            raise
+
+    @staticmethod
+    def _publish_body_lifecycle(body: _BodyCapture) -> None:
+        body.lifecycle_emitted = True
 
     def _emit_pending_chunk(
         self,
@@ -518,12 +530,27 @@ class CaptureAddon:
             if not getattr(error, "capture_committed", False):
                 raise
             committed_error = error
-        body.chunk_index = pending.chunk_index + 1
-        body.pending_chunk = None
-        body.replay_length = pending.source_length
-        body.replay_digest = pending.source_digest
+        try:
+            self._publish_body_chunk(body, pending, committed_error is not None)
+        except BaseException:
+            self._force_body_chunk_receipt(body, pending)
+            raise
         if committed_error is not None:
             raise committed_error
+
+    @staticmethod
+    def _publish_body_chunk(
+        body: _BodyCapture, pending: _PendingChunk, retryable: bool
+    ) -> None:
+        body.chunk_index = pending.chunk_index + 1
+        body.pending_chunk = None
+        body.retry_chunk = pending if retryable else None
+
+    @staticmethod
+    def _force_body_chunk_receipt(body: _BodyCapture, pending: _PendingChunk) -> None:
+        body.chunk_index = pending.chunk_index + 1
+        body.pending_chunk = None
+        body.retry_chunk = pending
 
     def _finish_body(
         self, state: _FlowCapture, side: str, raw_content: bytes | None
@@ -539,9 +566,11 @@ class CaptureAddon:
                 return False
             if state.discarded:
                 return False
+        if body.retry_chunk is not None:
+            body.retry_chunk = None
         if not body.lifecycle_emitted:
             try:
-                self._lifecycle(state, f"{side}_body")
+                self._emit_body_lifecycle(state, side, body)
             except OverflowError:
                 self._discard_active(state, count_eviction=False)
                 return False
@@ -558,17 +587,31 @@ class CaptureAddon:
                     "total_bytes": str(body.total_bytes),
                     "body": descriptor,
                 }
-            )
+        )
         except BaseException as error:
             if getattr(error, "capture_committed", False):
                 body.lifecycle_emitted = True
                 body.ended = True
                 body.stream_enabled = False
             raise
+        try:
+            self._publish_body_end(body)
+        except BaseException:
+            self._force_body_end_receipt(body)
+            raise
+        return True
+
+    @staticmethod
+    def _publish_body_end(body: _BodyCapture) -> None:
         body.lifecycle_emitted = True
         body.ended = True
         body.stream_enabled = False
-        return True
+
+    @staticmethod
+    def _force_body_end_receipt(body: _BodyCapture) -> None:
+        body.lifecycle_emitted = True
+        body.ended = True
+        body.stream_enabled = False
 
     def _metadata(self, state: _FlowCapture) -> None:
         if not state.request_headers_captured:

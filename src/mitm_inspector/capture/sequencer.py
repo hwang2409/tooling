@@ -1,14 +1,16 @@
 """Single-owner delivery sequencing for the capture sink.
 
 The sequencer is the only authority that turns observations into protocol
-delivery positions.  Producers that cannot acquire it do not touch its state:
-they reserve one ticket from the CPython atomic ``itertools.count`` and leave
-the ticket stream for the owner to fold into one loss run later.
+delivery positions. Producers that cannot acquire it only advance a CPython
+3.12 atomic ``itertools.count`` watermark; the owner snapshots that watermark
+without consuming a reader ticket and folds the delta into sequencer state.
 """
 
 from __future__ import annotations
 
 import itertools
+import sys
+import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from threading import RLock
@@ -36,6 +38,11 @@ class QueuedMessage:
     loss_before: tuple[LossRun, ...] = ()
 
 
+@dataclass
+class _BatchProgress:
+    next_index: int = 0
+
+
 @dataclass(frozen=True)
 class DrainBatch:
     """Stable drain handoff retained until the consumer explicitly acks it."""
@@ -43,6 +50,7 @@ class DrainBatch:
     token: int
     messages: tuple[ParsedMessageResult, ...]
     _owner: object = field(repr=False, compare=False)
+    _progress: _BatchProgress = field(default_factory=_BatchProgress, repr=False, compare=False)
 
     def __iter__(self) -> Iterator[ParsedMessageResult]:
         return iter(self.messages)
@@ -58,9 +66,12 @@ class DrainBatch:
 class SequencerState:
     next_position: int = 1
     exhausted: bool = False
-    pending_marker: int = -1
+    pending_marker: int = 0
     pending_losses: int = 0
     committed_batch: DrainBatch | None = None
+    next_batch_generation: int = 1
+    last_acknowledged_generation: int | None = None
+    sequencer_identity: object | None = field(default=None, repr=False, compare=False)
     trailing_losses: tuple[LossRun, ...] = ()
     items: tuple[QueuedMessage, ...] = ()
     body_bytes: int = 0
@@ -73,13 +84,6 @@ class SequencerState:
     memory_budget_drops: int = 0
 
 
-@dataclass
-class _PendingLossSnapshot:
-    marker: int = -1
-    count: int = 0
-    folded: SequencerState | None = None
-
-
 class PositionExhausted(RuntimeError):
     """The bounded uint64 delivery-position namespace is terminal."""
 
@@ -89,12 +93,9 @@ class DeliverySequencer:
 
     def __init__(self) -> None:
         self.lock = RLock()
-        self.state = SequencerState()
-        self._pending_tickets = itertools.count()
-        self._batch_owner = object()
-        self._next_batch_token = 1
-        self._last_acknowledged_batch: int | None = None
-        self._pending_snapshot = _PendingLossSnapshot()
+        identity = object()
+        self.state = replace(SequencerState(), sequencer_identity=identity)
+        self._loss_watermark = itertools.count()
 
     def note_loss_without_lock(self) -> bool:
         """Record an acknowledged loss without waiting for the owner.
@@ -104,31 +105,42 @@ class DeliverySequencer:
         payload traversal, allocation snapshot, or queue copy is performed.
         """
 
-        next(self._pending_tickets)
+        next(self._loss_watermark)
         return True
 
+    def _producer_watermark(self) -> int:
+        """Read the producer counter without consuming a reader ticket.
+
+        CPython 3.12 is the deliberately constrained runtime for this
+        nonblocking fallback.  ``count.__reduce__`` is the supported way to
+        inspect its current value without advancing it; later runtimes must
+        provide a replacement before this implementation is broadened.
+        """
+
+        if sys.version_info[:2] != (3, 12):
+            raise RuntimeError("capture loss watermark requires CPython 3.12")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            return int(self._loss_watermark.__reduce__()[1][0])
+
     def _take_pending(self, state: SequencerState) -> SequencerState:
-        marker = next(self._pending_tickets)
-        snapshot = self._pending_snapshot
-        newly_pending = max(0, marker - snapshot.marker - 1)
-        snapshot.marker = marker
-        snapshot.count += newly_pending
-        if snapshot.folded is None:
-            if snapshot.count:
-                snapshot.folded = self._append_loss_count(state, snapshot.count)
-            else:
-                snapshot.folded = state
-        # The mutable accumulator is the durable publication point.  If any
-        # replace below is interrupted, the consumed reader ticket and the
-        # already-folded result remain available for the retry.
-        candidate = replace(
-            snapshot.folded,
-            pending_marker=marker,
-            pending_losses=0,
+        watermark = self._producer_watermark()
+        newly_pending = max(0, watermark - state.pending_marker)
+        pending = state.pending_losses + newly_pending
+        # Publish watermark and accumulated count together before any
+        # fallible folding.  A retry sees the same durable count; no reader
+        # operation advances the producer counter or fabricates a loss.
+        snapshot = replace(
+            state,
+            pending_marker=watermark,
+            pending_losses=pending,
         )
+        self.state = snapshot
+        if pending <= 0:
+            return snapshot
+        folded = self._append_loss_count(snapshot, pending)
+        candidate = replace(folded, pending_losses=0)
         self.state = candidate
-        snapshot.count = 0
-        snapshot.folded = None
         return candidate
 
     def _append_loss_count(self, state: SequencerState, count: int) -> SequencerState:
@@ -279,17 +291,21 @@ class DeliverySequencer:
         """Acknowledge a batch only after the consumer accepts all messages."""
 
         with self.lock:
-            if batch._owner is not self._batch_owner:
+            state = self.state
+            if batch._owner is not state.sequencer_identity:
                 raise ValueError("batch belongs to another sequencer")
-            current = self.state.committed_batch
+            current = state.committed_batch
             if current is None:
-                if self._last_acknowledged_batch == batch.token:
+                if state.last_acknowledged_generation == batch.token:
                     return
                 raise ValueError("batch is no longer pending")
-            if current.token != batch.token:
+            if current is not batch or current.token != batch.token:
                 raise ValueError("batch token is not current")
-            self._last_acknowledged_batch = batch.token
-            self.state = replace(self.state, committed_batch=None)
+            self.state = replace(
+                state,
+                committed_batch=None,
+                last_acknowledged_generation=batch.token,
+            )
 
     def has_committed_batch(self) -> bool:
         with self.lock:
@@ -362,13 +378,16 @@ class DeliverySequencer:
                 last_delivered=cursor,
             )
             batch = DrainBatch(
-                self._next_batch_token,
+                committed.next_batch_generation,
                 tuple(output),
-                self._batch_owner,
+                committed.sequencer_identity,
             )
-            committed = replace(committed, committed_batch=batch)
+            committed = replace(
+                committed,
+                committed_batch=batch,
+                next_batch_generation=batch.token + 1,
+            )
             self.state = committed
-            self._next_batch_token += 1
             return batch
 
     def flush_for_read(self) -> None:

@@ -63,8 +63,12 @@ available until `BoundedMessageSink.acknowledge(batch)` succeeds. A retry
 returns the same token, so queue removal, handoff, gate cleanup, and callback
 acceptance cannot lose a batch. `CaptureAddon.drain` acknowledges only after
 all configured callbacks accept their messages and resumes a failed callback
-from the first unaccepted message. Consumer drains and callback dispatch are
-single-flight and reentrant-safe.
+from the first unaccepted message. Callback progress is a receipt attached to
+the handed-off batch, and no-callback results are materialized before ack, so
+post-ack return faults cannot lose the accepted batch. Consumer drains and
+callback dispatch are single-flight and reentrant-safe. The capture runtime
+uses a CPython 3.12-only producer watermark snapshot for lock-free loss
+admission; it does not consume a reader ticket while folding losses.
 
 `MemoryStore` retains project-owned parsed messages grouped by flow. It keeps
 the newest 2,000 completed flows or 30 minutes, whichever evicts first, and
