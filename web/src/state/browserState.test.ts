@@ -126,7 +126,8 @@ describe("browser state reducer", () => {
   });
 
   it("tracks lifecycle delivery sequence independently from browser cursor", () => {
-    const snapshot = reduce(initialBrowserState, {
+    const source = reduce(initialBrowserState, hello("source-a"));
+    const snapshot = reduce(source, {
       protocol_version: "1", type: "browser.snapshot", snapshot_id: "one", cursor: "100", flows: [],
     });
     const lifecycle = reduce(snapshot, {
@@ -140,6 +141,27 @@ describe("browser state reducer", () => {
     expect(next.streamSequence).toBe("2");
     expect(next.cursor).toBe("101");
     expect(next.streamGap).toBeNull();
+  });
+
+  it("keys lifecycle sequence by source epoch and ignores late A after switching to B", () => {
+    const sourceA = reduce(initialBrowserState, hello("source-a"));
+    const sequenceA = reduce(sourceA, {
+      protocol_version: "1", type: "flow.lifecycle", source_id: "source-a", flow_id: "f", event_id: "a100",
+      occurred_at: "2026-01-01T00:00:00Z", sequence: "100", state: "response_started",
+    });
+    const sourceB = reduce(sequenceA, hello("source-b"));
+    const lateA = reduce(sourceB, {
+      protocol_version: "1", type: "flow.lifecycle", source_id: "source-a", flow_id: "f", event_id: "late",
+      occurred_at: "2026-01-01T00:00:01Z", sequence: "100", state: "response_end",
+    });
+    const sequenceB = reduce(lateA, {
+      protocol_version: "1", type: "flow.lifecycle", source_id: "source-b", flow_id: "g", event_id: "b1",
+      occurred_at: "2026-01-01T00:00:02Z", sequence: "1", state: "request_started",
+    });
+
+    expect(lateA.streamSequence).toBeNull();
+    expect(sequenceB.streamSequence).toBe("1");
+    expect(sequenceB.sourceId).toBe("source-b");
   });
 
   it("resets flows and both cursor domains at a new source epoch", () => {
@@ -179,6 +201,52 @@ describe("browser state reducer", () => {
     expect(resumed.followLive).toBe(true);
     expect(resumed.displayed).toBe(resumed.latest);
     expect(resumed.displayed.cursor).toBe("2");
+  });
+
+  it("keeps the paused display through a reconnect source reset until resume", () => {
+    const sourceA = viewReduce(initialBrowserViewState, hello("source-a"));
+    const withSnapshot = viewReduce(sourceA, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "a", cursor: "1", flows: [flow("old")],
+    });
+    const paused = browserViewReducer(withSnapshot, { type: "pause" });
+    const reset = browserViewReducer(paused, { type: "source-reset" });
+    const sourceB = viewReduce(reset, hello("source-b"));
+    const resumed = browserViewReducer(sourceB, { type: "resume" });
+
+    expect(reset.followLive).toBe(false);
+    expect(reset.latest.cursor).toBe("0");
+    expect(reset.latest.sourceEpoch).toBeGreaterThan(sourceA.latest.sourceEpoch);
+    expect(reset.latest.flows.ids).toEqual([]);
+    expect(reset.displayed).toBe(paused.displayed);
+    expect(reset.displayed.cursor).toBe("1");
+    expect(reset.displayed.flows.ids).toEqual(["old"]);
+    expect(sourceB.displayed).toBe(paused.displayed);
+    expect(sourceB.latest.sourceEpoch).toBeGreaterThan(sourceA.latest.sourceEpoch);
+    expect(resumed.displayed).toBe(resumed.latest);
+    expect(resumed.displayed.sourceId).toBe("source-b");
+    expect(resumed.displayed.cursor).toBe("0");
+  });
+
+  it("deep-freezes public state, nested flow data, counters, and gap metadata", () => {
+    const source = reduce(initialBrowserState, hello("source-a"));
+    const state = reduce(source, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "one", cursor: "1", flows: [flow("f")],
+    });
+    const gap = reduce(state, {
+      protocol_version: "1", type: "stream.gap", expected_sequence: "2", actual_sequence: "4", dropped_count: "1",
+    });
+    const retained = gap.flows.get("f");
+
+    expect(Object.isFrozen(gap)).toBe(true);
+    expect(Object.isFrozen(gap.counters)).toBe(true);
+    expect(Object.isFrozen(gap.streamGap)).toBe(true);
+    expect(Object.isFrozen(gap.sourceLimits)).toBe(true);
+    expect(Object.isFrozen(retained)).toBe(true);
+    expect(Object.isFrozen(retained?.request_headers)).toBe(true);
+    expect(() => { (gap.counters as { receivedMessages: number }).receivedMessages = 0; }).toThrow(TypeError);
+    expect(() => { (retained as { host: string }).host = "mutated"; }).toThrow(TypeError);
+    expect(gap.counters.receivedMessages).toBe(3);
+    expect(retained?.host).toBe("f.example.test");
   });
 
   it("records server resync signals and unknown messages without failing", () => {

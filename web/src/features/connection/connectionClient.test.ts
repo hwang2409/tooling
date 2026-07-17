@@ -50,6 +50,20 @@ function factoryHarness(withResync = true) {
 }
 
 describe("connection client", () => {
+  it("revalidates after an attempt listener disconnects before factory invocation", () => {
+    const timer = new TestTimer();
+    const harness = factoryHarness();
+    const client = new ConnectionClient({ transportFactory: harness.factory, timer, autoReconnect: false });
+    client.subscribe((event) => { if (event.type === "attempt") client.disconnect(); });
+
+    client.connect();
+
+    expect(client.getSnapshot().state).toBe("disconnected");
+    expect(client.getSnapshot().requestResyncAvailable).toBe(false);
+    expect(harness.handlers).toHaveLength(0);
+    expect(timer.size).toBe(0);
+  });
+
   it("reconnects with an injected backoff seam after an unexpected close", () => {
     const timer = new TestTimer();
     const harness = factoryHarness();
@@ -183,6 +197,11 @@ describe("connection client", () => {
     const client = new ConnectionClient({ transportFactory: supported.factory, timer, autoReconnect: false });
     client.connect();
     expect(client.getSnapshot().requestResyncAvailable).toBe(true);
+    const publicSnapshot = client.getSnapshot();
+    expect(Object.isFrozen(publicSnapshot)).toBe(true);
+    expect(() => { (publicSnapshot as { attempt: number }).attempt = 99; }).toThrow(TypeError);
+    expect(client.requestResync("01")).toEqual({ ok: false, reason: "invalid-cursor" });
+    expect(client.requestResync("18446744073709551616")).toEqual({ ok: false, reason: "invalid-cursor" });
     expect(client.requestResync("41")).toEqual({ ok: true });
     expect(supported.resyncs[0]).toHaveBeenCalledWith({
       protocol_version: "1", type: "browser.resync", reason: "cursor_gap", requested_cursor: "41",

@@ -12,58 +12,66 @@ import type {
 } from "../protocol";
 
 export interface CursorGap {
-  expected: string;
-  received: string;
-  requested: string;
-  reason: "cursor_gap" | "history_evicted";
+  readonly expected: string;
+  readonly received: string;
+  readonly requested: string;
+  readonly reason: "cursor_gap" | "history_evicted";
 }
 
 export interface StreamGapState {
-  expected: string;
-  actual: string;
-  droppedCount: string | null;
+  readonly expected: string;
+  readonly actual: string;
+  readonly droppedCount: string | null;
 }
 
 export interface BrowserCounters {
-  receivedMessages: number;
-  appliedChanges: number;
-  staleMessages: number;
-  unknownMessages: number;
-  droppedMessages: string;
+  readonly receivedMessages: number;
+  readonly appliedChanges: number;
+  readonly staleMessages: number;
+  readonly unknownMessages: number;
+  readonly droppedMessages: string;
 }
+
+type DeepReadonly<T> = T extends ReadonlyArray<infer Item>
+  ? ReadonlyArray<DeepReadonly<Item>>
+  : T extends object
+    ? { readonly [Key in keyof T]: DeepReadonly<T[Key]> }
+    : T;
+
+export type ImmutableFlowMetadata = DeepReadonly<FlowMetadata>;
 
 export interface ImmutableFlowCollection {
   readonly ids: readonly string[];
-  readonly entries: readonly FlowMetadata[];
+  readonly entries: readonly ImmutableFlowMetadata[];
   readonly size: number;
-  get: (flowId: string) => FlowMetadata | undefined;
+  readonly get: (flowId: string) => ImmutableFlowMetadata | undefined;
 }
 
 export interface BrowserState {
-  flows: ImmutableFlowCollection;
-  cursor: string;
-  streamSequence: string | null;
-  sourceEpoch: number;
-  sourceId: string | null;
-  sourceLimits: SourceHello["limits"] | null;
-  sourceCapabilities: SourceHello["capabilities"] | null;
-  snapshotId: string | null;
-  gap: CursorGap | null;
-  streamGap: StreamGapState | null;
-  resyncRequested: string | null;
-  lastUnknownType: string | null;
-  counters: BrowserCounters;
+  readonly flows: ImmutableFlowCollection;
+  readonly cursor: string;
+  readonly streamSequence: string | null;
+  readonly sourceEpoch: number;
+  readonly sourceId: string | null;
+  readonly sourceLimits: DeepReadonly<SourceHello["limits"]> | null;
+  readonly sourceCapabilities: DeepReadonly<SourceHello["capabilities"]> | null;
+  readonly snapshotId: string | null;
+  readonly gap: CursorGap | null;
+  readonly streamGap: StreamGapState | null;
+  readonly resyncRequested: string | null;
+  readonly lastUnknownType: string | null;
+  readonly counters: BrowserCounters;
 }
 
 export interface BrowserViewState {
-  latest: BrowserState;
-  displayed: BrowserState;
-  followLive: boolean;
+  readonly latest: BrowserState;
+  readonly displayed: BrowserState;
+  readonly followLive: boolean;
 }
 
 export const emptyFlowCollection = createFlowCollection([]);
 
-export const initialBrowserState: BrowserState = {
+const initialBrowserStateValue: BrowserState = {
   flows: emptyFlowCollection,
   cursor: "0",
   streamSequence: null,
@@ -85,11 +93,13 @@ export const initialBrowserState: BrowserState = {
   },
 };
 
-export const initialBrowserViewState: BrowserViewState = {
+export const initialBrowserState = freezeBrowserState(initialBrowserStateValue);
+
+export const initialBrowserViewState = freezeBrowserViewState({
   latest: initialBrowserState,
   displayed: initialBrowserState,
   followLive: true,
-};
+});
 
 export type BrowserAction =
   | { type: "protocol"; envelope: ParsedMessage }
@@ -97,6 +107,7 @@ export type BrowserAction =
 
 export type BrowserViewAction =
   | { type: "protocol"; envelope: ParsedMessage }
+  | { type: "source-reset" }
   | { type: "pause" }
   | { type: "resume" }
   | { type: "reset" };
@@ -105,12 +116,35 @@ function cursor(value: string): bigint {
   return BigInt(value);
 }
 
-function createFlowCollection(entries: readonly FlowMetadata[]): ImmutableFlowCollection {
-  const byId = new Map<string, FlowMetadata>();
+function freezeCopy<T>(value: T): T {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return Object.freeze(value.map((item) => freezeCopy(item))) as T;
+  const copy = Object.create(null) as Record<string, unknown>;
+  for (const [key, item] of Object.entries(value)) copy[key] = freezeCopy(item);
+  return Object.freeze(copy) as T;
+}
+
+function freezeBrowserState(state: BrowserState): BrowserState {
+  return Object.freeze({
+    ...state,
+    sourceLimits: state.sourceLimits === null ? null : freezeCopy(state.sourceLimits),
+    sourceCapabilities: state.sourceCapabilities === null ? null : freezeCopy(state.sourceCapabilities),
+    gap: state.gap === null ? null : Object.freeze({ ...state.gap }),
+    streamGap: state.streamGap === null ? null : Object.freeze({ ...state.streamGap }),
+    counters: Object.freeze({ ...state.counters }),
+  });
+}
+
+function freezeBrowserViewState(state: BrowserViewState): BrowserViewState {
+  return Object.freeze({ ...state });
+}
+
+function createFlowCollection(entries: readonly ImmutableFlowMetadata[]): ImmutableFlowCollection {
+  const byId = new Map<string, ImmutableFlowMetadata>();
   const ids: string[] = [];
   for (const flow of entries) {
     if (!byId.has(flow.flow_id)) ids.push(flow.flow_id);
-    byId.set(flow.flow_id, flow);
+    byId.set(flow.flow_id, freezeCopy(flow));
   }
   const frozenIds = Object.freeze(ids);
   const frozenEntries = Object.freeze(frozenIds.map((flowId) => byId.get(flowId)!));
@@ -164,6 +198,13 @@ function resetForSource(state: BrowserState, message: SourceHello): BrowserState
       unknownMessages: 0,
       droppedMessages: "0",
     },
+  };
+}
+
+function resetForTransport(state: BrowserState): BrowserState {
+  return {
+    ...initialBrowserState,
+    sourceEpoch: state.sourceEpoch + 1,
   };
 }
 
@@ -254,6 +295,7 @@ function applyStreamGap(state: BrowserState, message: StreamGap): BrowserState {
 }
 
 function applyLifecycle(state: BrowserState, message: FlowLifecycle): BrowserState {
+  if (state.sourceId === null || message.source_id !== state.sourceId) return stale(state);
   if (state.streamSequence !== null && cursor(message.sequence) <= cursor(state.streamSequence)) return stale(state);
   return { ...state, streamSequence: message.sequence };
 }
@@ -264,41 +306,54 @@ export function browserReducer(state: BrowserState, action: BrowserAction): Brow
   const { envelope } = action;
 
   if (envelope.kind === "unknown") {
-    return {
+    return freezeBrowserState({
       ...withCounter(counted, "unknownMessages"),
       lastUnknownType: envelope.original_type,
-    };
+    });
   }
 
   const message = envelope.message;
+  let next: BrowserState;
   switch (message.type) {
     case "source.hello":
-      return resetForSource(counted, message as unknown as SourceHello);
+      next = resetForSource(counted, message as unknown as SourceHello);
+      break;
     case "browser.snapshot":
-      return applySnapshot(counted, message as unknown as BrowserSnapshot);
+      next = applySnapshot(counted, message as unknown as BrowserSnapshot);
+      break;
     case "browser.delta":
-      return applyDelta(counted, message as unknown as BrowserDelta);
+      next = applyDelta(counted, message as unknown as BrowserDelta);
+      break;
     case "browser.resync":
-      return applyResync(counted, message as unknown as BrowserResync);
+      next = applyResync(counted, message as unknown as BrowserResync);
+      break;
     case "stream.gap":
-      return applyStreamGap(counted, message as unknown as StreamGap);
+      next = applyStreamGap(counted, message as unknown as StreamGap);
+      break;
     case "flow.lifecycle":
-      return applyLifecycle(counted, message as unknown as FlowLifecycle);
+      next = applyLifecycle(counted, message as unknown as FlowLifecycle);
+      break;
     default:
-      return counted;
+      next = counted;
+      break;
   }
+  return freezeBrowserState(next);
 }
 
 export function browserViewReducer(state: BrowserViewState, action: BrowserViewAction): BrowserViewState {
+  if (action.type === "source-reset") {
+    const latest = freezeBrowserState(resetForTransport(state.latest));
+    return freezeBrowserViewState({ latest, displayed: state.followLive ? latest : state.displayed, followLive: state.followLive });
+  }
   if (action.type === "pause") {
     if (!state.followLive) return state;
-    return { latest: state.latest, displayed: state.latest, followLive: false };
+    return freezeBrowserViewState({ latest: state.latest, displayed: state.latest, followLive: false });
   }
   if (action.type === "resume") {
-    return { latest: state.latest, displayed: state.latest, followLive: true };
+    return freezeBrowserViewState({ latest: state.latest, displayed: state.latest, followLive: true });
   }
   if (action.type === "reset") return initialBrowserViewState;
 
   const latest = browserReducer(state.latest, { type: "protocol", envelope: action.envelope });
-  return { latest, displayed: state.followLive ? latest : state.displayed, followLive: state.followLive };
+  return freezeBrowserViewState({ latest, displayed: state.followLive ? latest : state.displayed, followLive: state.followLive });
 }

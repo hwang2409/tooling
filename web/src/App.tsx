@@ -1,7 +1,8 @@
 import { useId, useState } from "react";
 
 import { useConnection } from "./features/connection/useConnection";
-import type { ConnectionStatusName } from "./features/connection/connectionClient";
+import type { ConnectionStatusName, TransportFactory } from "./features/connection/connectionClient";
+import type { ConnectionViewModel } from "./features/connection/useConnection";
 import "./styles/shell.css";
 
 const statusCopy: Record<ConnectionStatusName, { label: string; detail: string }> = {
@@ -13,11 +14,18 @@ const statusCopy: Record<ConnectionStatusName, { label: string; detail: string }
   error: { label: "Source error", detail: "The source needs attention" },
 };
 
-function formatBytes(value: string | undefined): string {
+export function formatBytes(value: string | undefined): string {
   if (!value) return "—";
-  const bytes = Number(value);
-  if (bytes >= 1024 * 1024) return `${Math.round(bytes / (1024 * 1024))} MiB`;
-  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KiB`;
+  let bytes: bigint;
+  try {
+    bytes = BigInt(value);
+  } catch {
+    return "—";
+  }
+  const mib = 1024n * 1024n;
+  const kib = 1024n;
+  if (bytes >= mib) return `${bytes / mib} MiB`;
+  if (bytes >= kib) return `${bytes / kib} KiB`;
   return `${bytes} B`;
 }
 
@@ -25,14 +33,24 @@ function formatCursor(value: string): string {
   return value.length > 9 ? `${value.slice(0, 3)}…${value.slice(-4)}` : value;
 }
 
-export function App() {
+export interface AppProps {
+  transportFactory?: TransportFactory;
+}
+
+export function App({ transportFactory }: AppProps = {}) {
+  return <Workbench view={useConnection(transportFactory)} />;
+}
+
+export function Workbench({ view }: { view: ConnectionViewModel }) {
   const {
     browser, status, followLive, pauseLive, resumeLive, connect, disconnect, retry, requestResync,
-  } = useConnection();
+  } = view;
   const titleId = useId();
   const [resyncMessage, setResyncMessage] = useState<string | null>(null);
   const statusInfo = statusCopy[status.state];
   const isBusy = status.state === "connecting" || status.state === "reconnecting";
+  const isRetrying = status.state === "reconnecting";
+  const isConnecting = status.state === "connecting";
   const isConnected = status.state === "live" || status.state === "stale";
   const hasError = status.state === "error";
   const retainedCount = browser.flows.size;
@@ -67,7 +85,7 @@ export function App() {
             <span>{statusInfo.label}</span>
           </div>
           <button className="connect-button" onClick={action}>
-            {isBusy ? "Cancel" : isConnected ? "Disconnect" : hasError ? "Try again" : "Connect source"}
+            {isRetrying ? "Stop reconnecting" : isConnecting ? "Cancel connection" : isConnected ? "Disconnect" : hasError ? "Try again" : "Connect source"}
           </button>
         </div>
       </header>
@@ -86,7 +104,7 @@ export function App() {
               <small>{statusInfo.detail}</small>
             </div>
           </div>
-          {hasError && <p className="source-error">{status.error}</p>}
+          {(hasError || isRetrying) && status.error && <p className="source-error">Last failure: {status.error}</p>}
           <div className="rail-divider" />
           <div className="rail-label">RETENTION</div>
           <dl className="rail-metrics">
@@ -134,6 +152,22 @@ export function App() {
                 </button>
                 {resyncMessage && <span className="notice-result" role="status">{resyncMessage}</span>}
               </div>
+            </div>
+          ) : isRetrying ? (
+            <div className="empty-state" role="status">
+              <div className="empty-glyph" aria-hidden="true">↻</div>
+              <p className="eyebrow">RETRYING SOURCE / ATTEMPT {status.attempt}</p>
+              <h3>Reconnecting to local capture source</h3>
+              <p>{status.error ? `Last failure: ${status.error}` : "The source closed. Retrying with backoff."}</p>
+              <button className="empty-action" onClick={disconnect}>Stop reconnecting</button>
+            </div>
+          ) : isConnecting ? (
+            <div className="empty-state" role="status">
+              <div className="empty-glyph" aria-hidden="true">…</div>
+              <p className="eyebrow">OPENING SOURCE</p>
+              <h3>Connecting to local capture source</h3>
+              <p>{status.error ? `Last failure: ${status.error}` : "Opening the read-only event stream."}</p>
+              <button className="empty-action" onClick={disconnect}>Cancel connection</button>
             </div>
           ) : hasError ? (
             <div className="empty-state" role="status">

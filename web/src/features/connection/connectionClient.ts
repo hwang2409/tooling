@@ -1,16 +1,16 @@
 /* eslint-disable no-unused-vars */
 
-import { parseProtocolMessage } from "../../protocol";
+import { MAX_U64, parseProtocolMessage } from "../../protocol";
 import type { ParsedMessage, ResyncReason } from "../../protocol";
 
 export type ConnectionStatusName = "disconnected" | "connecting" | "live" | "reconnecting" | "stale" | "error";
 
 export interface ConnectionStatus {
-  state: ConnectionStatusName;
-  attempt: number;
-  error: string | null;
-  lastMessageAt: number | null;
-  requestResyncAvailable: boolean;
+  readonly state: ConnectionStatusName;
+  readonly attempt: number;
+  readonly error: string | null;
+  readonly lastMessageAt: number | null;
+  readonly requestResyncAvailable: boolean;
 }
 
 export interface TransportHandlers {
@@ -50,7 +50,7 @@ export interface ConnectionClientOptions {
 
 export type ResyncRequestResult =
   | { ok: true }
-  | { ok: false; reason: "not-connected" | "unsupported" | "transport-error"; error?: string };
+  | { ok: false; reason: "invalid-cursor" | "not-connected" | "unsupported" | "transport-error"; error?: string };
 
 export type ConnectionEvent =
   | { type: "attempt"; id: number }
@@ -80,6 +80,15 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error || "Unknown connection error");
 }
 
+function isCanonicalCursor(value: unknown): value is string {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) return false;
+  try {
+    return BigInt(value) <= MAX_U64;
+  } catch {
+    return false;
+  }
+}
+
 export class ConnectionClient {
   private readonly transportFactory: TransportFactory;
   private readonly timer: ConnectionTimer;
@@ -97,13 +106,13 @@ export class ConnectionClient {
   private activeAttemptId: number | null = null;
   private destroyed = false;
   private userDisconnected = true;
-  private status: ConnectionStatus = {
+  private status: ConnectionStatus = Object.freeze({
     state: "disconnected",
     attempt: 0,
     error: null,
     lastMessageAt: null,
     requestResyncAvailable: false,
-  };
+  });
 
   public constructor(options: ConnectionClientOptions) {
     this.transportFactory = options.transportFactory;
@@ -144,12 +153,19 @@ export class ConnectionClient {
 
   public destroy(): void {
     if (this.destroyed) return;
-    this.disconnect();
     this.destroyed = true;
+    this.userDisconnected = true;
+    this.generation += 1;
+    this.activeAttemptId = null;
+    this.clearReconnectTimer();
+    this.clearStaleTimer();
+    this.closeCurrentConnection();
+    this.updateStatus({ state: "disconnected", attempt: 0, error: null, lastMessageAt: null, requestResyncAvailable: false });
     this.listeners.clear();
   }
 
   public requestResync(cursor: string, reason: ResyncReason = "cursor_gap"): ResyncRequestResult {
+    if (!isCanonicalCursor(cursor)) return { ok: false, reason: "invalid-cursor" };
     if (this.connection === null || this.activeAttemptId === null) return { ok: false, reason: "not-connected" };
     if (this.connection.requestResync === undefined) return { ok: false, reason: "unsupported" };
     try {
@@ -164,11 +180,12 @@ export class ConnectionClient {
     const attemptId = ++this.nextAttemptId;
     this.activeAttemptId = attemptId;
     this.emit({ type: "attempt", id: attemptId });
+    if (!this.isCurrentAttempt(generation, attemptId)) return;
     this.updateStatus({
       state: this.status.attempt > 0 ? "reconnecting" : "connecting",
-      error: null,
       requestResyncAvailable: false,
     });
+    if (!this.isCurrentAttempt(generation, attemptId)) return;
 
     let candidate: TransportConnection;
     try {
@@ -195,6 +212,7 @@ export class ConnectionClient {
   private opened(generation: number, attemptId: number): void {
     if (!this.isCurrentAttempt(generation, attemptId)) return;
     this.updateStatus({ state: "live", attempt: 0, error: null, lastMessageAt: this.now() });
+    if (!this.isCurrentAttempt(generation, attemptId)) return;
     this.scheduleStale(generation, attemptId);
   }
 
@@ -203,6 +221,7 @@ export class ConnectionClient {
     try {
       const envelope = parseProtocolMessage(value);
       this.updateStatus({ state: "live", error: null, lastMessageAt: this.now() });
+      if (!this.isCurrentAttempt(generation, attemptId)) return;
       this.scheduleStale(generation, attemptId);
       this.emit({ type: "message", envelope });
     } catch (error) {
@@ -218,7 +237,7 @@ export class ConnectionClient {
     this.clearStaleTimer();
     this.closeCurrentConnection(attemptId);
     this.updateStatus({ state: "error", error: errorMessage(error), requestResyncAvailable: false });
-    if (this.autoReconnect) this.scheduleReconnect(generation);
+    if (this.canContinueAfterBoundary(generation) && this.autoReconnect) this.scheduleReconnect(generation);
   }
 
   private closed(reason: unknown, generation: number, attemptId: number): void {
@@ -228,13 +247,14 @@ export class ConnectionClient {
     this.connectionAttemptId = null;
     this.clearStaleTimer();
     this.updateStatus({ state: "error", error: reason ? errorMessage(reason) : "Source closed the stream", requestResyncAvailable: false });
-    if (this.autoReconnect) this.scheduleReconnect(generation);
+    if (this.canContinueAfterBoundary(generation) && this.autoReconnect) this.scheduleReconnect(generation);
   }
 
   private scheduleReconnect(generation: number): void {
     this.clearReconnectTimer();
     const attempt = this.status.attempt + 1;
     this.updateStatus({ state: "reconnecting", attempt });
+    if (!this.canContinueAfterBoundary(generation)) return;
     this.reconnectTimer = this.timer.set(() => {
       this.reconnectTimer = null;
       if (generation === this.generation && !this.userDisconnected) this.open(generation);
@@ -254,8 +274,12 @@ export class ConnectionClient {
     return !this.destroyed && !this.userDisconnected && generation === this.generation && attemptId === this.activeAttemptId;
   }
 
+  private canContinueAfterBoundary(generation: number): boolean {
+    return !this.destroyed && !this.userDisconnected && generation === this.generation && this.activeAttemptId === null;
+  }
+
   private updateStatus(patch: Partial<ConnectionStatus>): void {
-    this.status = { ...this.status, ...patch };
+    this.status = Object.freeze({ ...this.status, ...patch });
     this.emit({ type: "status", status: this.status });
   }
 

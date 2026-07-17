@@ -8,16 +8,16 @@ import { ConnectionClient, unavailableTransportFactory } from "./connectionClien
 import type { ConnectionStatus, ResyncRequestResult, TransportFactory } from "./connectionClient";
 
 export interface ConnectionViewModel {
-  browser: BrowserState;
-  status: ConnectionStatus;
-  latestBrowser: BrowserState;
-  followLive: boolean;
-  connect: () => void;
-  disconnect: () => void;
-  retry: () => void;
-  pauseLive: () => void;
-  resumeLive: () => void;
-  requestResync: (...args: [string]) => ResyncRequestResult;
+  readonly browser: BrowserState;
+  readonly status: ConnectionStatus;
+  readonly latestBrowser: BrowserState;
+  readonly followLive: boolean;
+  readonly connect: () => void;
+  readonly disconnect: () => void;
+  readonly retry: () => void;
+  readonly pauseLive: () => void;
+  readonly resumeLive: () => void;
+  readonly requestResync: (...args: [string]) => ResyncRequestResult;
 }
 
 export function useConnection(factory: TransportFactory = unavailableTransportFactory): ConnectionViewModel {
@@ -33,7 +33,7 @@ export function useConnection(factory: TransportFactory = unavailableTransportFa
 
   useEffect(() => {
     const unsubscribe = client.subscribe((event) => {
-      if (event.type === "attempt") dispatch({ type: "reset" });
+      if (event.type === "attempt") dispatch({ type: "source-reset" });
       if (event.type === "message") dispatch({ type: "protocol", envelope: event.envelope });
       refresh((value) => value + 1);
     });
