@@ -174,7 +174,7 @@ describe("mounted App connection behavior", () => {
     await act(async () => rows[0].click());
 
     expect(document.body.textContent).toContain("Live paused");
-    expect(document.body.textContent).toContain("Request / response inspector");
+    expect(document.querySelector('[data-testid="paired-inspector"]')).not.toBeNull();
     expect(document.body.textContent).toContain("response opened");
 
     await act(async () => harness.handlers[0].onMessage(gap("2")));

@@ -353,24 +353,22 @@ describe("mounted PairedInspector DOM behavior", () => {
     document.activeElement = document.body;
   });
 
-  it("runs mounted clicks and renders the gated-to-decoded transition", async () => {
+  it("renders the body inline without a gate — F6 prioritises reading the payload", async () => {
     await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-a") })));
-    expect(container.querySelector(".inspector-action")).not.toBeNull();
-    expect(container.querySelector(".inspector-output")).toBeNull();
-    const inspect = find(container, ".inspector-action");
-    inspect.focus();
-    await act(async () => inspect.click());
-    expect(container.querySelector(".inspector-output")?.textContent).toContain("hello");
-    expect(document.activeElement?.getAttribute("role")).toBe("tab");
+    expect(container.querySelector(".inspector-action")).toBeNull();
+    const output = container.querySelector(".inspector-output");
+    expect(output?.textContent).toContain("hello");
+    expect(container.querySelectorAll('[role="tab"]').some((tab) => tab.textContent === "JSON")).toBe(true);
   });
 
   it("runs body keyboard navigation with horizontal-only arrows and roving tabindex", async () => {
     await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-body") })));
-    await act(async () => find(container, ".inspector-action").click());
     const bodyTablist = find(container, '[aria-label="request body view mode"]');
     const tabs = bodyTablist.querySelectorAll('[role="tab"]');
-    expect(tabs[0].getAttribute("tabindex")).toBe("-1");
+    // Default mode for a body with no content_type is "text", so tabs[1] is
+    // active. Arrow keys advance roving focus/selection through the strip.
     expect(tabs[1].getAttribute("tabindex")).toBe("0");
+    expect(tabs[0].getAttribute("tabindex")).toBe("-1");
     tabs[1].focus();
     await act(async () => dispatchKey(tabs[1], "ArrowRight"));
     expect(tabs[2].getAttribute("aria-selected")).toBe("true");
@@ -394,31 +392,30 @@ describe("mounted PairedInspector DOM behavior", () => {
     expect(tabs[2].getAttribute("aria-selected")).toBe("true");
   });
 
-  it("preserves body selection for same-pane requests and preserves committed panes across handoffs", async () => {
+  it("keeps the same body output visible across a same-pane rerender", async () => {
     await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection") })));
-    await act(async () => find(container, ".inspector-action").click());
     expect(container.querySelector(".inspector-output")?.textContent).toContain("hello");
     await act(async () => outerTab(container, "request").click());
     expect(container.querySelector(".inspector-output")?.textContent).toContain("hello");
 
     await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection"), activePane: "request" })));
     expect(container.querySelector(".inspector-output")?.textContent).toContain("hello");
-    await act(async () => outerTab(container, "request").click());
-    expect(container.querySelector(".inspector-output")?.textContent).toContain("hello");
+  });
 
-    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection"), activePane: "response" })));
-    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection"), activePane: "error" })));
-    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection") })));
+  it("preserves committed panes across controlled → uncontrolled handoffs", async () => {
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-handoff"), activePane: "response" })));
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-handoff"), activePane: "error" })));
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-handoff") })));
     expect(outerTab(container, "error").getAttribute("aria-selected")).toBe("true");
 
-    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection") })));
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-handoff") })));
     await act(async () => outerTab(container, "response").click());
-    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection"), activePane: "response" })));
-    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection") })));
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-handoff"), activePane: "response" })));
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-handoff") })));
     expect(outerTab(container, "response").getAttribute("aria-selected")).toBe("true");
   });
 
-  it("does not steal focus from outer tabs, but recovers when the body control owns focus", async () => {
+  it("does not steal focus from outer tabs on flow swap", async () => {
     await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-a") })));
     const outerTabs = find(container, '[aria-label="Exchange panes"]').querySelectorAll('[role="tab"]');
     outerTabs[0].focus();
@@ -427,35 +424,29 @@ describe("mounted PairedInspector DOM behavior", () => {
     expect(outerTabs[0].getAttribute("aria-selected")).toBe("true");
     await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-b") })));
     expect(document.activeElement).toBe(outerTabs[0]);
-
-    const inspect = find(container, ".inspector-action");
-    await act(async () => inspect.click());
-    const bodyTab = find(container, '[aria-label="request body view mode"]').querySelector('[role="tab"]');
-    if (!bodyTab) throw new Error("missing body tab");
-    bodyTab.focus();
-    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-c") })));
-    expect(document.activeElement?.className).toContain("inspector-action");
   });
 
   it("rerenders controlled panes through click and keyboard, preserves focus, and resolves every tab panel", async () => {
     await act(async () => root.render(createElement(ControlledInspector, { flow: makeFlow("flow-error") })));
     const tablist = find(container, '[aria-label="Exchange panes"]');
     const tabs = tablist.querySelectorAll('[role="tab"]');
-    const panels = container.querySelectorAll('[role="tabpanel"]');
-    expect(panels).toHaveLength(3);
+    const exchangePanels = container.querySelectorAll('.inspector-exchange-tabpanel');
+    expect(exchangePanels).toHaveLength(3);
     for (const tab of tabs) {
       const controls = tab.getAttribute("aria-controls");
       expect(controls).not.toBeNull();
-      expect(panels.some((panel) => panel.getAttribute("id") === controls)).toBe(true);
+      expect(exchangePanels.some((panel) => panel.getAttribute("id") === controls)).toBe(true);
     }
 
     await act(async () => tabs[1].click());
     expect(tabs[1].getAttribute("aria-selected")).toBe("true");
     expect(tabs[0].getAttribute("aria-selected")).toBe("false");
-    const responsePanel = panels.find((panel) => panel.getAttribute("id") === tabs[1].getAttribute("aria-controls"));
+    const responsePanel = exchangePanels.find((panel) => panel.getAttribute("id") === tabs[1].getAttribute("aria-controls"));
     expect(responsePanel?.hasAttribute("hidden")).toBe(false);
-    const requestPanel = panels.find((panel) => panel.getAttribute("id") === tabs[0].getAttribute("aria-controls"));
+    const requestPanel = exchangePanels.find((panel) => panel.getAttribute("id") === tabs[0].getAttribute("aria-controls"));
     expect(requestPanel?.hasAttribute("hidden")).toBe(true);
+    // Hidden panes must not mount body machinery — F6 auto-renders bodies
+    // for the active pane only.
     expect(requestPanel?.querySelector(".inspector-body-panel")).toBeNull();
     expect(requestPanel?.querySelector(".inspector-output")).toBeNull();
 
@@ -464,7 +455,7 @@ describe("mounted PairedInspector DOM behavior", () => {
     expect(tabs[2].getAttribute("aria-selected")).toBe("true");
     await act(async () => dispatchKey(tabs[2], "ArrowDown"));
     expect(tabs[2].getAttribute("aria-selected")).toBe("true");
-    const errorPanel = panels.find((panel) => panel.getAttribute("id") === tabs[2].getAttribute("aria-controls"));
+    const errorPanel = exchangePanels.find((panel) => panel.getAttribute("id") === tabs[2].getAttribute("aria-controls"));
     expect(errorPanel?.getAttribute("aria-labelledby")).toBe(tabs[2].getAttribute("id"));
     expect(errorPanel?.textContent).toContain("<img src=x onerror=alert(1)>");
     expect(container.querySelector("script")).toBeNull();
@@ -521,12 +512,11 @@ describe("mounted PairedInspector DOM behavior", () => {
     }
   });
 
-  it("renders lifecycle observations in sequence and bounds a large invalid base64 payload", async () => {
+  it("renders lifecycle observations in sequence and surfaces invalid base64 payloads", async () => {
     await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-sequence") })));
     const trace = container.querySelectorAll(".inspector-trace-label");
     expect(trace.map((item) => item.textContent)).toEqual(["response opened", "request ended", "response ended"]);
-    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-invalid", `!${"A".repeat(16 * 1024 * 1024)}`) })));
-    await act(async () => find(container, ".inspector-action").click());
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-invalid", "!!!!not-base64!!!!") })));
     expect(find(container, ".inspector-output").textContent).toContain("Invalid base64 payload");
   });
 });

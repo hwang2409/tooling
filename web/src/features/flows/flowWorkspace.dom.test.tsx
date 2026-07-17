@@ -172,7 +172,7 @@ describe("mounted FlowWorkspace", () => {
     expect(mounted.container.textContent).toContain("Select a flow row");
     await act(async () => rowByText(mounted.container, "/v1/alpha").click());
     expect(pauseLive).toHaveBeenCalledOnce();
-    expect(mounted.container.textContent).toContain("Request / response inspector");
+    expect(mounted.container.querySelector('[data-testid="paired-inspector"]')).not.toBeNull();
     expect(mounted.container.textContent).toContain("response opened");
     expect(mounted.container.textContent).toContain("request ended");
   });
@@ -183,23 +183,51 @@ describe("mounted FlowWorkspace", () => {
     const mounted = await mountWorkspace(browser, { pauseLive, followLive: false });
     await act(async () => rowByText(mounted.container, "/v1/alpha").click());
     expect(pauseLive).not.toHaveBeenCalled();
-    expect(mounted.container.textContent).toContain("Request / response inspector");
+    expect(mounted.container.querySelector('[data-testid="paired-inspector"]')).not.toBeNull();
   });
 
   it("closes the inspector with the close control and with Escape", async () => {
     const browser = reduceAll([hello(), snapshot("1", [flow("alpha")])]);
     const mounted = await mountWorkspace(browser, { followLive: false });
     await act(async () => rowByText(mounted.container, "/v1/alpha").click());
-    const close = Array.from(mounted.container.querySelectorAll("button")).find((button) => button.textContent === "Close inspector");
+    const close = mounted.container.querySelector<HTMLButtonElement>('button[aria-label="Close inspector"]');
     await act(async () => close?.click());
     expect(mounted.container.textContent).toContain("Select a flow row");
 
     await act(async () => rowByText(mounted.container, "/v1/alpha").click());
-    expect(mounted.container.textContent).toContain("Request / response inspector");
+    expect(mounted.container.querySelector('[data-testid="paired-inspector"]')).not.toBeNull();
     await act(async () => {
       rowByText(mounted.container, "/v1/alpha").dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
     });
     expect(mounted.container.textContent).toContain("Select a flow row");
+  });
+
+  it("docks the inspector on the right side of the flow grid on selection", async () => {
+    const browser = reduceAll([hello(), snapshot("1", [flow("alpha")])]);
+    const mounted = await mountWorkspace(browser, { followLive: false });
+    await act(async () => rowByText(mounted.container, "/v1/alpha").click());
+    const flowMain = mounted.container.querySelector(".flow-main");
+    const inspectorSide = mounted.container.querySelector(".flow-inspector-side");
+    expect(flowMain).not.toBeNull();
+    expect(inspectorSide).not.toBeNull();
+    expect(flowMain?.classList.contains("has-inspector")).toBe(true);
+    // Right-side dock order: grid comes first, inspector sits after so the
+    // horizontal flexbox row places the inspector on the right.
+    const children = Array.from(flowMain?.children ?? []);
+    const gridIndex = children.findIndex((child) => child.classList.contains("flow-main-grid"));
+    const inspectorIndex = children.findIndex((child) => child.classList.contains("flow-inspector-side"));
+    expect(gridIndex).toBeGreaterThanOrEqual(0);
+    expect(inspectorIndex).toBeGreaterThan(gridIndex);
+  });
+
+  it("renders JSON bodies as the tree view by default", async () => {
+    const jsonBody = { state: "captured", size_bytes: "7", encoding: "base64", data: btoa('{"n":1}'), content_type: "application/json" };
+    const browser = reduceAll([hello(), snapshot("1", [flow("json", { request_body: jsonBody })])]);
+    const mounted = await mountWorkspace(browser, { followLive: false });
+    await act(async () => rowByText(mounted.container, "/v1/json").click());
+    expect(mounted.container.querySelector(".json-tree")).not.toBeNull();
+    // The raw pre for JSON mode should not mount when the tree wins.
+    expect(mounted.container.querySelector('pre[aria-label="json body output"]')).toBeNull();
   });
 
   it("marks retained rows as unseen until the user selects them", async () => {
@@ -225,7 +253,7 @@ describe("mounted FlowWorkspace", () => {
     const browser = reduceAll(messages);
     const mounted = await mountWorkspace(browser, { followLive: false });
     await act(async () => rowByText(mounted.container, "/v1/alpha").click());
-    expect(mounted.container.textContent).toContain("Request / response inspector");
+    expect(mounted.container.querySelector('[data-testid="paired-inspector"]')).not.toBeNull();
 
     const evicted = reduceAll([...messages, {
       protocol_version: "1", type: "browser.delta", cursor: "2",

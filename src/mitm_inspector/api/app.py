@@ -13,6 +13,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from mitm_inspector.api.limits import MAX_INGEST_BODY_PREFIX_BYTES
 from mitm_inspector.api.projection import collect_grid_flows, diff_grid_changes, grid_flow
 from mitm_inspector.json_boundary import PlainJsonObject
 from mitm_inspector.protocol import (
@@ -95,7 +96,7 @@ class ApiApplication:
         store: MemoryStore,
         *,
         source_id: str = "mitm-inspector",
-        max_body_prefix_bytes: int = 1024 * 1024,
+        max_body_prefix_bytes: int = MAX_INGEST_BODY_PREFIX_BYTES,
         max_in_memory_bytes: int = 128 * 1024 * 1024,
         wall_clock: Callable[[], str] = _utc_now_iso,
         cursor_start: int = 0,

@@ -63,6 +63,8 @@ export interface InspectorProps {
 export interface InspectorBodyPanelProps {
   body: InspectableBody;
   pane: BodyPane;
-  selected: boolean;
-  onSelect: () => void;
+  /** F5 gating hook; F6 auto-renders the body so this is now advisory. */
+  selected?: boolean;
+  /** F5 gating hook; F6 auto-renders the body so this is now advisory. */
+  onSelect?: () => void;
 }

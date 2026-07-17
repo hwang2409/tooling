@@ -103,7 +103,10 @@ class ApiServerConfig:
     max_retained_flows: int = 2_000
     retention_seconds: int = 1_800
     max_body_bytes: int = 128 * 1024 * 1024
-    max_body_prefix_bytes: int = 1024 * 1024
+    # Default to the full wire ceiling so bodies are not truncated in the UI
+    # unless the operator explicitly asks for a smaller cap. F5 shipped a 1
+    # MiB default that was quietly clipping typical Anthropic responses.
+    max_body_prefix_bytes: int = MAX_INGEST_BODY_PREFIX_BYTES
     max_pending_messages: int = 4096
     capture_socket: Path | None = None
     sweep_interval_seconds: float = DEFAULT_SWEEP_INTERVAL_SECONDS
@@ -621,7 +624,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-retained-flows", type=int, default=2_000)
     parser.add_argument("--retention-seconds", type=int, default=1_800)
     parser.add_argument("--max-body-bytes", type=int, default=128 * 1024 * 1024)
-    parser.add_argument("--max-body-prefix-bytes", type=int, default=1024 * 1024)
+    parser.add_argument(
+        "--max-body-prefix-bytes",
+        type=int,
+        default=MAX_INGEST_BODY_PREFIX_BYTES,
+        help="body prefix retained per side; defaults to the wire ceiling",
+    )
     parser.add_argument("--capture-socket", type=Path, default=None)
     parser.add_argument("--capture-source-id", default="mitm-inspector")
     parser.add_argument("--capture-max-body-prefix-bytes", type=int, default=None)

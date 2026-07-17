@@ -106,31 +106,35 @@ export function FlowWorkspace({ browser, followLive, pauseLive, gridViewportHeig
         </p>
       )}
 
-      <FlowGrid
-        rows={filteredRows}
-        selectedFlowId={selectedFlowId}
-        onSelectFlow={selectFlow}
-        followLive={followLive}
-        viewportHeight={gridViewportHeight}
-        seenFlowIds={effectiveSeenFlowIds}
-      />
+      <div className={`flow-main${selectedFlowId === null ? "" : " has-inspector"}`}>
+        <div className="flow-main-grid">
+          <FlowGrid
+            rows={filteredRows}
+            selectedFlowId={selectedFlowId}
+            onSelectFlow={selectFlow}
+            followLive={followLive}
+            viewportHeight={gridViewportHeight}
+            seenFlowIds={effectiveSeenFlowIds}
+          />
+          {selectedFlowId === null && (
+            <p className="flow-inspector-hint">Select a flow row to open the paired request/response inspector. Selection pauses follow-live.</p>
+          )}
+        </div>
 
-      {selectedFlowId === null ? (
-        <p className="flow-inspector-hint">Select a flow row to open the paired request/response inspector. Selection pauses follow-live.</p>
-      ) : selectedFlow === null ? (
-        <div className="flow-inspector-dock is-evicted" role="status">
-          <p>The selected flow left the bounded retention window and can no longer be inspected.</p>
-          <button className="flow-dock-action" type="button" onClick={closeInspector}>Dismiss</button>
-        </div>
-      ) : (
-        <div className="flow-inspector-dock">
-          <div className="flow-dock-bar">
-            <span className="flow-dock-title">INSPECTING <code>{selectedFlow.metadata.flow_id}</code></span>
-            <button className="flow-dock-action" type="button" onClick={closeInspector}>Close inspector</button>
-          </div>
-          <PairedInspector flow={selectedFlow} compact />
-        </div>
-      )}
+        {selectedFlowId !== null && (
+          selectedFlow === null ? (
+            <aside className="flow-inspector-side is-evicted" role="status">
+              <p>The selected flow left the bounded retention window and can no longer be inspected.</p>
+              <button className="flow-dock-action" type="button" onClick={closeInspector}>Dismiss</button>
+            </aside>
+          ) : (
+            <aside className="flow-inspector-side" aria-label={`Inspector for ${selectedFlow.metadata.flow_id}`}>
+              <PairedInspector flow={selectedFlow} compact />
+              <button className="flow-inspector-close" type="button" onClick={closeInspector} aria-label="Close inspector" title="Close inspector">×</button>
+            </aside>
+          )
+        )}
+      </div>
     </div>
   );
 }

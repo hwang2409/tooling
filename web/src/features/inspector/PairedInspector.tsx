@@ -4,7 +4,7 @@ import type { KeyboardEvent } from "react";
 import type { Header } from "../../protocol";
 import { LIFECYCLE_EVENTS_PER_FLOW } from "../../state/browserState";
 import { bodyMetadata, decodeBody, defaultBodyMode, type DecodedBody, type SseEvent } from "./decoders";
-import { JsonTree, safeParseJson } from "./jsonTree";
+import { JsonTree, LARGE_TREE_COLLAPSE_THRESHOLD, safeParseJson } from "./jsonTree";
 import { inspectorErrorState, lifecycleLabel, lifecyclePhase, orderLifecycle, type InspectorErrorState } from "./lifecycle";
 import type { BodyPane, BodySelection, BodyViewMode, InspectableBody, InspectorBodyPanelProps, InspectorFlow, InspectorHeader, InspectorPane, InspectorProps } from "./models";
 import { flowSummary } from "./summary";
@@ -34,6 +34,11 @@ export function isBodySelectionAuthorized(selection: BodySelection | null, flowI
   return selection?.flowId === flowId && selection.pane === pane;
 }
 
+/**
+ * Deprecated F5 helper preserved so external tooling that still imports it
+ * keeps type-checking; the F6 inspector auto-renders bodies and no longer
+ * manages focus recovery through this helper.
+ */
 export function bodyFocusTarget(wasSelected: boolean, selected: boolean): "active-tab" | "inspect-control" | undefined {
   if (selected) return "active-tab";
   if (wasSelected) return "inspect-control";
@@ -60,11 +65,6 @@ function formatTime(value: string): string {
   return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", fractionalSecondDigits: 3 }).format(date);
 }
 
-function BodyBadge({ body }: { body: InspectableBody }) {
-  const metadata = bodyMetadata(body);
-  return <span className={`inspector-body-badge is-${metadata.state}`}>{metadata.state}</span>;
-}
-
 function HeaderList({ headers }: { headers: readonly (Header | InspectorHeader)[] }) {
   if (headers.length === 0) return <p className="inspector-muted">No headers observed.</p>;
   return (
@@ -75,39 +75,27 @@ function HeaderList({ headers }: { headers: readonly (Header | InspectorHeader)[
           <span className={isRedactedHeader(header) ? "inspector-header-value is-redacted" : "inspector-header-value"} role="cell">
             {header.value || <span className="inspector-empty-value">empty value</span>}
           </span>
-          <span className="inspector-header-index" aria-label={`header ${index + 1}`}>{String(index + 1).padStart(2, "0")}</span>
         </div>
       ))}
     </div>
   );
 }
 
-export function InspectorBodyPanel({ body, pane, selected, onSelect }: InspectorBodyPanelProps) {
+export function InspectorBodyPanel({ body, pane }: InspectorBodyPanelProps) {
   const [mode, setMode] = useState<BodyViewMode>(() => defaultBodyMode(body));
   const metadata = bodyMetadata(body);
-  const decoded = selected ? decodeBody(body, mode) : undefined;
-  const bodyId = `${useId().replaceAll(":", "")}-body-heading`;
+  const canDecode = body.state !== "missing" && body.state !== "redacted";
+  // Memoize the decoded payload — decodeBody now runs on the full wire
+  // ceiling (~3 MiB) so a re-decode on every keystroke or hover would burn
+  // real wall-clock time on large captures.
+  const decoded = useMemo<DecodedBody | undefined>(
+    () => (canDecode ? decodeBody(body, mode) : undefined),
+    [body, canDecode, mode],
+  );
   const tablistId = `${useId().replaceAll(":", "")}-body-tabs`;
   const panelId = `${tablistId}-panel`;
   const sectionRef = useRef<HTMLElement | null>(null);
-  const bodyControlRootRef = useRef<HTMLDivElement | null>(null);
-  const inspectRef = useRef<HTMLButtonElement | null>(null);
   const tabRefs = useRef<Partial<Record<BodyViewMode, HTMLButtonElement | null>>>({});
-  const wasSelected = useRef(selected);
-  const focusWasInBodyControls = useRef(false);
-  const canInspect = body.state !== "missing" && body.state !== "redacted";
-
-  if (typeof document !== "undefined") {
-    focusWasInBodyControls.current = Boolean(bodyControlRootRef.current?.contains(document.activeElement));
-  }
-
-  useInspectorLayoutEffect(() => {
-    const target = bodyFocusTarget(wasSelected.current, selected);
-    if (focusWasInBodyControls.current && target === "active-tab") tabRefs.current[mode]?.focus();
-    else if (focusWasInBodyControls.current && target === "inspect-control") (inspectRef.current ?? sectionRef.current)?.focus();
-    wasSelected.current = selected;
-    focusWasInBodyControls.current = false;
-  }, [mode, selected]);
 
   const handleModeKeyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     const nextIndex = nextBodyTabIndex(index, event.key, bodyModes.length);
@@ -119,30 +107,9 @@ export function InspectorBodyPanel({ body, pane, selected, onSelect }: Inspector
   };
 
   return (
-    <section ref={sectionRef} className={`inspector-body-panel ${selected ? "is-selected" : ""}`} aria-labelledby={bodyId} tabIndex={-1}>
-      <div className="inspector-section-heading">
-        <div>
-          <p className="inspector-kicker">{pane === "request" ? "REQUEST BODY" : "RESPONSE BODY"}</p>
-          <h3 id={bodyId}>Bounded capture</h3>
-        </div>
-        <BodyBadge body={body} />
-      </div>
-      <dl className="inspector-body-meta">
-        <div><dt>total</dt><dd>{metadata.size}</dd></div>
-        <div><dt>captured</dt><dd>{metadata.captured}</dd></div>
-        <div><dt>type</dt><dd>{metadata.contentType}</dd></div>
-      </dl>
-      <div ref={bodyControlRootRef} className="inspector-body-control">
-        {!selected ? (
-          <div className="inspector-body-gate">
-          <div>
-            <strong>{canInspect ? "Body decoding is paused" : metadata.state === "redacted" ? "Body withheld by redaction" : "No body bytes retained"}</strong>
-            <p>{canInspect ? "Select this pane to decode the bounded prefix." : metadata.state === "redacted" ? "The source marked this content as unavailable." : "Metadata remains available without a body payload."}</p>
-          </div>
-          {canInspect && <button ref={inspectRef} className="inspector-action" type="button" onClick={onSelect}>Inspect body <span aria-hidden="true">↗</span></button>}
-          </div>
-        ) : (
-          <div className="inspector-body-view">
+    <section ref={sectionRef} className={`inspector-body-panel is-${metadata.state}`} aria-label={`${pane === "request" ? "Request" : "Response"} body`} tabIndex={-1}>
+      {canDecode ? (
+        <>
           <div className="inspector-mode-row" role="tablist" aria-label={`${pane} body view mode`} aria-orientation="horizontal">
             {bodyModes.map((bodyMode, index) => (
               <button
@@ -159,31 +126,47 @@ export function InspectorBodyPanel({ body, pane, selected, onSelect }: Inspector
                 onKeyDown={(event) => handleModeKeyDown(event, index)}
               >{bodyMode.label}</button>
             ))}
-            <span className="inspector-view-limit">bounded / 64 KiB</span>
+            <span className="inspector-body-hint" title={metadata.contentType}>{metadata.contentType} · {metadata.size}</span>
           </div>
-          <div id={panelId} role="tabpanel" aria-labelledby={`${tablistId}-${mode}`} tabIndex={0}>
-            <BodyOutput decoded={decoded!} />
+          <div id={panelId} className="inspector-body-panelbody" role="tabpanel" aria-labelledby={`${tablistId}-${mode}`} tabIndex={0}>
+            {decoded && <BodyOutput decoded={decoded} />}
           </div>
-          </div>
-        )}
-      </div>
+        </>
+      ) : (
+        <div className={`inspector-body-empty is-${metadata.state}`} role="status">
+          <strong>{metadata.state === "redacted" ? "Withheld by redaction" : "No body bytes retained"}</strong>
+          <p>{metadata.state === "redacted" ? "Source marked this content as unavailable." : "Metadata remains, but no payload was captured."}</p>
+        </div>
+      )}
     </section>
   );
 }
 
 function BodyOutput({ decoded }: { decoded: DecodedBody }) {
-  const parsed = decoded.mode === "json" && decoded.fallback === "none" ? safeParseJson(decoded.text) : null;
+  const parsed = useMemo(
+    () => (decoded.mode === "json" && decoded.fallback === "none" ? safeParseJson(decoded.text) : null),
+    [decoded.fallback, decoded.mode, decoded.text],
+  );
+  const startCollapsed = decoded.byteLength > LARGE_TREE_COLLAPSE_THRESHOLD;
+  const warnings = [
+    // Only surface the truncated chip when the backend flagged the capture
+    // itself as truncated. Decoder-side clamping is gone in F6, so raw
+    // "prefix truncated" is only ever true for bodies larger than the wire
+    // ceiling — the rare case worth showing a chip for.
+    decoded.truncated ? "capture truncated at wire ceiling" : null,
+    decoded.invalidEncoding ? "invalid UTF-8" : null,
+    decoded.fallback !== "none" ? `fallback: ${decoded.fallback}` : null,
+  ].filter(Boolean) as string[];
   return (
     <div className="inspector-output-wrap">
-      <div className="inspector-output-meta">
-        <span>{decoded.byteLength.toLocaleString()} decoded bytes</span>
-        {decoded.truncated && <span className="inspector-output-warning">prefix truncated</span>}
-        {decoded.invalidEncoding && <span className="inspector-output-warning">invalid UTF-8</span>}
-        {decoded.fallback !== "none" && <span className="inspector-output-warning">fallback: {decoded.fallback}</span>}
-      </div>
+      {warnings.length > 0 && (
+        <div className="inspector-output-meta" role="note">
+          {warnings.map((warning) => <span key={warning} className="inspector-output-warning">{warning}</span>)}
+        </div>
+      )}
       {parsed && parsed.ok ? (
         <div className={`inspector-output is-${decoded.mode}`} tabIndex={0} aria-label={`${decoded.mode} body output`}>
-          <JsonTree value={parsed.value} />
+          <JsonTree value={parsed.value} startCollapsed={startCollapsed} />
         </div>
       ) : decoded.mode === "sse" && decoded.events !== undefined && decoded.events.length > 0 ? (
         <div className={`inspector-output is-${decoded.mode}`} tabIndex={0} aria-label={`${decoded.mode} body output`}>
@@ -192,7 +175,6 @@ function BodyOutput({ decoded }: { decoded: DecodedBody }) {
       ) : (
         <pre className={`inspector-output is-${decoded.mode}`} tabIndex={0} aria-label={`${decoded.mode} body output`}>{decoded.text}</pre>
       )}
-      <p className="inspector-copy-note">Derived text is copy-ready from the focused output; raw bytes are never exported automatically.</p>
     </div>
   );
 }
@@ -254,13 +236,7 @@ function LifecycleStrip({ flow, errorState }: { flow: InspectorFlow; errorState:
   const phase = lifecyclePhase(entries);
   return (
     <section className="inspector-lifecycle" aria-labelledby={`${lifecycleId}-heading`}>
-      <div className="inspector-section-heading">
-        <div>
-          <p className="inspector-kicker">OBSERVED ORDER</p>
-          <h3 id={`${lifecycleId}-heading`}>Lifecycle trace</h3>
-        </div>
-        <span className="inspector-lifecycle-note">sequence is authoritative</span>
-      </div>
+      <h3 id={`${lifecycleId}-heading`} className="inspector-lifecycle-heading">Lifecycle</h3>
       <div className="inspector-phase-summary" aria-label="Lifecycle summary">
         <span className={phase.requestEnded ? "is-seen" : ""}>request end {phase.requestEnded ? "seen" : "pending"}</span>
         <span className={phase.responseStarted ? "is-seen" : ""}>response start {phase.responseStarted ? "seen" : "pending"}</span>
@@ -279,7 +255,6 @@ function LifecycleStrip({ flow, errorState }: { flow: InspectorFlow; errorState:
               <span className="inspector-trace-index">{String(index + 1).padStart(2, "0")}</span>
               <span className="inspector-trace-label">{lifecycleLabel(entry.state)}</span>
               <span className="inspector-trace-time">{formatTime(entry.occurredAt)}</span>
-              <span className="inspector-trace-sequence">#{entry.sequence}</span>
             </li>
           ))}
         </ol>
@@ -292,57 +267,40 @@ function ErrorPane({ errorState }: { errorState: InspectorErrorState }) {
   const errorId = useId().replaceAll(":", "");
   return (
     <section className={`inspector-error-panel ${errorState.hasError ? "has-error" : ""}`} aria-labelledby={`${errorId}-heading`}>
-      <p className="inspector-kicker">FLOW OUTCOME</p>
       <h3 id={`${errorId}-heading`}>{errorState.hasError ? "Error observed" : "No error recorded"}</h3>
       {errorState.hasError ? <pre className="inspector-error-copy">{errorState.message}</pre> : <p className="inspector-muted">No error event was supplied for this flow.</p>}
     </section>
   );
 }
 
-export function PairedInspector({ flow, className = "", compact = false, activePane, bodySelection, onBodySelect, onPaneChange }: InspectorProps) {
+export function PairedInspector({ flow, className = "", compact = false, activePane, onPaneChange }: InspectorProps) {
   const [internalPane, setInternalPane] = useState<InspectorPane>("request");
-  const [internalSelectedBody, setInternalSelectedBody] = useState<BodySelection | null>(null);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const inspectorId = useId().replaceAll(":", "");
   const previousActivePaneRef = useRef<InspectorPane | undefined>(activePane);
   const lastCommittedPaneRef = useRef<InspectorPane>(activePane ?? internalPane);
   const previousCommittedPaneRef = useRef<InspectorPane>(activePane ?? internalPane);
   const previousFlowIdRef = useRef(flow.metadata.flow_id);
-  const entries = useMemo(() => orderLifecycle(flow.lifecycle), [flow.lifecycle]);
   const errorState = inspectorErrorState(flow);
 
   const pane = activePane ?? (previousActivePaneRef.current === undefined ? internalPane : lastCommittedPaneRef.current);
 
   useInspectorLayoutEffect(() => {
-    const paneChanged = previousCommittedPaneRef.current !== pane;
-    const flowChanged = previousFlowIdRef.current !== flow.metadata.flow_id;
-
     if (activePane === undefined) {
       if (previousActivePaneRef.current !== undefined) setInternalPane(lastCommittedPaneRef.current);
       lastCommittedPaneRef.current = pane;
     } else {
       lastCommittedPaneRef.current = activePane;
     }
-    if ((paneChanged || flowChanged) && bodySelection === undefined) setInternalSelectedBody(null);
-
     previousCommittedPaneRef.current = pane;
     previousFlowIdRef.current = flow.metadata.flow_id;
     previousActivePaneRef.current = activePane;
-  }, [activePane, bodySelection, flow.metadata.flow_id, pane]);
+  }, [activePane, flow.metadata.flow_id, pane]);
 
   const selectPane = (nextPane: InspectorPane) => {
     if (activePane === undefined) setInternalPane(nextPane);
     onPaneChange?.(nextPane);
   };
-
-  const selectBody = (bodyPane: BodyPane) => {
-    const selection = { flowId: flow.metadata.flow_id, pane: bodyPane };
-    if (bodySelection === undefined) setInternalSelectedBody(selection);
-    onBodySelect?.(selection);
-  };
-
-  const selectedBody = bodySelection === undefined ? internalSelectedBody : bodySelection;
-  const isBodySelected = (bodyPane: BodyPane) => isBodySelectionAuthorized(selectedBody, flow.metadata.flow_id, bodyPane);
 
   const handleTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     const nextIndex = nextBodyTabIndex(index, event.key, paneOrder.length, "horizontal");
@@ -352,23 +310,15 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
     selectPane(paneOrder[nextIndex]);
   };
 
-  const responseBody = bodyFor(flow, "response");
   const summaryLine = useMemo(() => flowSummary(flow), [flow]);
   return (
     <section data-testid="paired-inspector" className={`paired-inspector ${compact ? "is-compact" : ""} ${className}`.trim()} aria-labelledby={`${inspectorId}-title`}>
       <header className="inspector-header">
-        <div className="inspector-title-lockup">
-          <span className="inspector-glyph" aria-hidden="true">↔</span>
-          <div>
-            <p className="inspector-kicker">PAIRED EXCHANGE / READ ONLY</p>
-            <h1 id={`${inspectorId}-title`}>Request / response inspector</h1>
-          </div>
-        </div>
-        <div className="inspector-flow-identity">
+        <h1 id={`${inspectorId}-title`} className="inspector-flow-line">
           <span className="inspector-method">{flow.metadata.method}</span>
-          <span className="inspector-route">{flow.metadata.scheme}://{flow.metadata.host}:{flow.metadata.port}{flow.metadata.path}</span>
-          <code>{flow.metadata.flow_id}</code>
-        </div>
+          <span className="inspector-route">{flow.metadata.host}{flow.metadata.path}</span>
+        </h1>
+        <code className="inspector-flow-id">{flow.metadata.flow_id}</code>
       </header>
       <p className="inspector-summary" aria-label="Flow summary">{summaryLine}</p>
 
@@ -388,7 +338,7 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
             onKeyDown={(event) => handleTabKeyDown(event, index)}
           >
             <span>{item === "request" ? "Request" : item === "response" ? "Response" : "Error"}</span>
-            <small>{item === "request" ? "outbound" : item === "response" ? "inbound" : errorState.hasError ? "observed" : "clear"}</small>
+            {item === "error" && <small>{errorState.hasError ? "observed" : "clear"}</small>}
           </button>
         ))}
       </div>
@@ -409,13 +359,13 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
             {isActive && item === "error" && <ErrorPane errorState={errorState} />}
             {isActive && item !== "error" && (
               <div className="inspector-pane-layout">
+                <section className="inspector-column inspector-body-column">
+                  <InspectorBodyPanel body={bodyFor(flow, item)} pane={item} />
+                </section>
                 <section className="inspector-column inspector-metadata-column">
-                  <div className="inspector-section-heading">
-                    <div>
-                      <p className="inspector-kicker">{item === "request" ? "OUTBOUND METADATA" : "INBOUND METADATA"}</p>
-                      <h2>{item === "request" ? "Request" : "Response"}</h2>
-                    </div>
-                    <span className="inspector-sequence-count">{entries.length} observations</span>
+                  <div className="inspector-subsection">
+                    <div className="inspector-subheading"><span>Headers</span><span>{headersFor(flow, item).length}</span></div>
+                    <HeaderList headers={headersFor(flow, item)} />
                   </div>
                   <dl className="inspector-facts">
                     <div><dt>host</dt><dd>{flow.metadata.host}</dd></div>
@@ -423,15 +373,6 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
                     <div><dt>port</dt><dd>{flow.metadata.port}</dd></div>
                     <div><dt>scheme</dt><dd>{flow.metadata.scheme}</dd></div>
                   </dl>
-                  <div className="inspector-subsection">
-                    <div className="inspector-subheading"><span>Headers</span><span>{headersFor(flow, item).length} ordered</span></div>
-                    <HeaderList headers={headersFor(flow, item)} />
-                  </div>
-                </section>
-                <section className="inspector-column inspector-body-column">
-                  <InspectorBodyPanel body={bodyFor(flow, item)} pane={item} selected={isBodySelected(item)} onSelect={() => selectBody(item)} />
-                  {item === "response" && bodyFor(flow, "request").state !== "missing" && <p className="inspector-cross-note">Request body is available in the Request pane.</p>}
-                  {item === "request" && responseBody.state !== "missing" && <p className="inspector-cross-note">Response body is available in the Response pane.</p>}
                 </section>
               </div>
             )}

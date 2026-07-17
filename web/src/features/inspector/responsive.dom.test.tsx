@@ -25,7 +25,7 @@ const flow: InspectorFlow = {
   lifecycle: [],
 };
 
-describe("paired inspector responsive DOM contract", () => {
+describe("F6 layout contracts pinned in CSS", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot>;
 
@@ -34,7 +34,7 @@ describe("paired inspector responsive DOM contract", () => {
     container.remove();
   });
 
-  it("fits the 800px viewport by stacking the exchange columns", async () => {
+  it("pane layout stacks below 900px and inspector dock switches to a single column", async () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -45,6 +45,20 @@ describe("paired inspector responsive DOM contract", () => {
     expect(inspector).not.toBeNull();
 
     const inspectorCss = readFileSync(resolve(process.cwd(), "src/styles/inspector.css"), "utf8");
+    // Narrow viewport: two-column body/metadata splits into a stack so the
+    // body reader stays the full width.
     expect(inspectorCss).toMatch(/@media \(max-width: 900px\) \{[\s\S]*?\.inspector-pane-layout \{ display: block; \}/);
+  });
+
+  it("workspace docks the inspector on the right by default and stacks below 1024px", () => {
+    const flowsCss = readFileSync(resolve(process.cwd(), "src/styles/flows.css"), "utf8");
+    // Default layout: flow-main is a flexbox row that keeps the grid on the
+    // left and the inspector docked on the right.
+    expect(flowsCss).toMatch(/\.flow-main \{[^}]*display:\s*flex[^}]*\}/);
+    expect(flowsCss).toMatch(/\.flow-inspector-side \{[^}]*flex:\s*0 0 clamp\(/);
+    // Stacking breakpoint: below 1024px the flexbox row flips to a column
+    // and the inspector loses its sticky pin.
+    expect(flowsCss).toMatch(/@media \(max-width: 1023px\) \{[\s\S]*?\.flow-main \{[^}]*flex-direction:\s*column/);
+    expect(flowsCss).toMatch(/@media \(max-width: 1023px\) \{[\s\S]*?\.flow-inspector-side \{[^}]*position:\s*static/);
   });
 });

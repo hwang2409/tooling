@@ -1356,6 +1356,19 @@ def test_server_config_bounds_prefix_to_the_ingest_line_capacity() -> None:
         ApiServerConfig(max_body_prefix_bytes=MAX_INGEST_BODY_PREFIX_BYTES + 1)
 
 
+def test_server_config_defaults_body_prefix_to_the_wire_ceiling() -> None:
+    # F6: uncapped defaults let real API responses render whole in the UI. F5
+    # shipped a 1 MiB default that quietly truncated typical Anthropic
+    # responses. `--max-body-prefix-bytes` is still an explicit override.
+    default = ApiServerConfig()
+    assert default.max_body_prefix_bytes == MAX_INGEST_BODY_PREFIX_BYTES
+
+
+def test_config_from_argv_defaults_body_prefix_to_the_wire_ceiling() -> None:
+    config = config_from_argv([])
+    assert config.max_body_prefix_bytes == MAX_INGEST_BODY_PREFIX_BYTES
+
+
 def test_two_max_prefix_bodies_fit_one_bounded_ingest_line() -> None:
     prefix = b"x" * MAX_INGEST_BODY_PREFIX_BYTES
     descriptor = captured_body(prefix)
