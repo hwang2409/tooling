@@ -6,6 +6,8 @@ import {
   browserViewReducer,
   initialBrowserState,
   initialBrowserViewState,
+  LIFECYCLE_EVENTS_PER_FLOW,
+  LIFECYCLE_FLOW_LIMIT,
 } from "./browserState";
 import type { BrowserState, BrowserViewState } from "./browserState";
 
@@ -341,5 +343,96 @@ describe("browser state reducer", () => {
     expect(late.gap).toBeNull();
     expect(late.resyncRequested).toBeNull();
     expect(late.counters.staleMessages).toBe(1);
+  });
+});
+
+describe("per-flow lifecycle retention", () => {
+  function lifecycleMessage(flowId: string, sequence: string, state = "request_started", sourceId = "source-a") {
+    return {
+      protocol_version: "1", type: "flow.lifecycle", source_id: sourceId, flow_id: flowId,
+      event_id: `${flowId}-${sequence}`, occurred_at: "2026-01-01T00:00:00Z", sequence, state,
+    };
+  }
+
+  it("retains accepted lifecycle events per flow in arrival order without assuming state order", () => {
+    const source = reduce(initialBrowserState, hello("source-a"));
+    const first = reduce(source, lifecycleMessage("f", "5", "response_started"));
+    const second = reduce(first, lifecycleMessage("f", "6", "request_end"));
+    const other = reduce(second, lifecycleMessage("g", "7", "request_started"));
+
+    expect(other.lifecycles.get("f")?.map((event) => event.state)).toEqual(["response_started", "request_end"]);
+    expect(other.lifecycles.get("g")?.map((event) => event.sequence)).toEqual(["7"]);
+    expect(other.lifecycles.flowIds).toEqual(["f", "g"]);
+  });
+
+  it("does not retain events rejected as stale or from a foreign source", () => {
+    const source = reduce(initialBrowserState, hello("source-a"));
+    const accepted = reduce(source, lifecycleMessage("f", "5"));
+    const duplicate = reduce(accepted, lifecycleMessage("f", "5", "response_started"));
+    const foreign = reduce(duplicate, lifecycleMessage("f", "6", "response_started", "source-x"));
+
+    expect(foreign.lifecycles.get("f")).toHaveLength(1);
+    expect(foreign.counters.staleMessages).toBe(2);
+  });
+
+  it("caps retained events per flow, keeping the newest observations", () => {
+    let state = reduce(initialBrowserState, hello("source-a"));
+    for (let sequence = 1; sequence <= LIFECYCLE_EVENTS_PER_FLOW + 8; sequence += 1) {
+      state = reduce(state, lifecycleMessage("f", String(sequence)));
+    }
+
+    const events = state.lifecycles.get("f");
+    expect(events).toHaveLength(LIFECYCLE_EVENTS_PER_FLOW);
+    expect(events?.[0].sequence).toBe("9");
+    expect(events?.[events.length - 1].sequence).toBe(String(LIFECYCLE_EVENTS_PER_FLOW + 8));
+  });
+
+  it("caps the number of tracked flows by evicting the oldest tracked flow", () => {
+    let state = reduce(initialBrowserState, hello("source-a"));
+    for (let index = 0; index < LIFECYCLE_FLOW_LIMIT + 2; index += 1) {
+      state = reduce(state, lifecycleMessage(`flow-${index}`, String(index + 1)));
+    }
+
+    expect(state.lifecycles.size).toBe(LIFECYCLE_FLOW_LIMIT);
+    expect(state.lifecycles.get("flow-0")).toBeUndefined();
+    expect(state.lifecycles.get("flow-1")).toBeUndefined();
+    expect(state.lifecycles.get("flow-2")).toHaveLength(1);
+    expect(state.lifecycles.get(`flow-${LIFECYCLE_FLOW_LIMIT + 1}`)).toHaveLength(1);
+  });
+
+  it("clears lifecycle retention at a new source epoch", () => {
+    const source = reduce(initialBrowserState, hello("source-a"));
+    const tracked = reduce(source, lifecycleMessage("f", "5"));
+    const sourceB = reduce(tracked, hello("source-b"));
+
+    expect(tracked.lifecycles.get("f")).toHaveLength(1);
+    expect(sourceB.lifecycles.size).toBe(0);
+  });
+
+  it("prunes lifecycle retention when a delta removes the flow", () => {
+    const source = reduce(initialBrowserState, hello("source-a"));
+    const snapshot = reduce(source, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "one", cursor: "1", flows: [flow("f"), flow("g")],
+    });
+    const tracked = reduce(reduce(snapshot, lifecycleMessage("f", "1")), lifecycleMessage("g", "2"));
+    const removed = reduce(tracked, {
+      protocol_version: "1", type: "browser.delta", cursor: "2", changes: [{ op: "remove", flow_id: "f" }],
+    });
+
+    expect(removed.lifecycles.get("f")).toBeUndefined();
+    expect(removed.lifecycles.get("g")).toHaveLength(1);
+    expect(removed.lifecycles.flowIds).toEqual(["g"]);
+  });
+
+  it("freezes retained lifecycle events and their containers", () => {
+    const source = reduce(initialBrowserState, hello("source-a"));
+    const tracked = reduce(source, lifecycleMessage("f", "5"));
+    const events = tracked.lifecycles.get("f");
+
+    expect(Object.isFrozen(tracked.lifecycles)).toBe(true);
+    expect(Object.isFrozen(tracked.lifecycles.flowIds)).toBe(true);
+    expect(Object.isFrozen(events)).toBe(true);
+    expect(Object.isFrozen(events?.[0])).toBe(true);
+    expect(() => { (events?.[0] as { state: string }).state = "error"; }).toThrow(TypeError);
   });
 });

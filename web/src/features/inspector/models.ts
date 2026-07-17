@@ -1,3 +1,4 @@
+import type { DeepReadonly } from "../../immutable";
 import type {
   BodyDescriptor,
   FlowLifecycle,
@@ -27,9 +28,11 @@ export interface InspectorHeader extends Header {
   redacted?: boolean;
 }
 
+export type InspectorLifecycleEvent = DeepReadonly<FlowLifecycle>;
+
 export interface InspectorFlow {
-  metadata: FlowMetadata;
-  lifecycle?: readonly FlowLifecycle[];
+  metadata: DeepReadonly<FlowMetadata>;
+  lifecycle?: readonly InspectorLifecycleEvent[];
   error?: string;
   request_headers?: readonly InspectorHeader[];
   response_headers?: readonly InspectorHeader[];

@@ -1,5 +1,5 @@
 import type { FlowLifecycle } from "../../protocol";
-import type { InspectorFlow, LifecycleEntry } from "./models";
+import type { InspectorFlow, InspectorLifecycleEvent, LifecycleEntry } from "./models";
 
 const stateLabels: Record<FlowLifecycle["state"], string> = {
   request_started: "request opened",
@@ -18,7 +18,7 @@ export function lifecycleLabel(state: FlowLifecycle["state"]): string {
   return stateLabels[state];
 }
 
-export function orderLifecycle(events: readonly FlowLifecycle[] = []): LifecycleEntry[] {
+export function orderLifecycle(events: readonly InspectorLifecycleEvent[] = []): LifecycleEntry[] {
   return events.map((event, observedIndex) => ({
     entry: {
       state: event.state,

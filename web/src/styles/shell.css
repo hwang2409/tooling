@@ -4,7 +4,7 @@
 .skip-link { position: absolute; z-index: 2; top: 8px; left: 12px; padding: 8px 10px; color: var(--paper); background: var(--ink); transform: translateY(-150%); transition: transform 120ms ease; }
 .skip-link:focus { transform: translateY(0); }
 .topbar { height: 64px; display: flex; align-items: center; justify-content: space-between; padding: 0 28px; border-bottom: 1px solid var(--line-dark); background: var(--paper); }
-.brand-lockup, .topbar-actions, .heading-meta, .status-pill, .source-card, .empty-hint, .ready-stamp { display: flex; align-items: center; }
+.brand-lockup, .topbar-actions, .heading-meta, .status-pill, .source-card, .empty-hint { display: flex; align-items: center; }
 .brand-lockup { gap: 12px; }
 .brand-mark { display: grid; place-items: center; width: 30px; height: 30px; color: var(--teal); border: 1px solid var(--teal); border-radius: 4px; font-family: inherit; font-size: 18px; line-height: 1; }
 .eyebrow, .rail-label, .signal-label { color: var(--muted); font-family: "SFMono-Regular", "Cascadia Code", "Roboto Mono", monospace; font-size: 9px; font-weight: 700; letter-spacing: .15em; }
@@ -80,10 +80,6 @@ h2 { font-family: inherit; font-size: 26px; font-weight: 500; letter-spacing: -.
 kbd { padding: 3px 6px; color: var(--ink-soft); border: 1px solid var(--line-dark); font-family: monospace; }
 .empty-action { margin-top: 21px; padding: 9px 12px; color: var(--paper); background: var(--teal); font-size: 10px; font-weight: 700; }
 .empty-action:hover, .notice-action:hover { background: var(--ink); }
-.ready-state { display: grid; place-items: center; min-height: 330px; color: var(--ink-soft); text-align: center; }
-.ready-stamp { gap: 12px; padding: 14px 17px; border: 1px solid var(--teal); color: var(--teal); font-family: monospace; font-size: 10px; }
-.ready-count { font-family: inherit; font-size: 22px; }
-.ready-state > p { margin-top: 18px; font-size: 11px; }
 .notice { display: flex; align-items: flex-start; gap: 12px; margin-top: 23px; padding: 13px 14px; border: 1px solid var(--amber); background: var(--amber-soft); }
 .notice-mark { display: grid; place-items: center; width: 19px; height: 19px; flex: 0 0 auto; border: 1px solid var(--amber); border-radius: 50%; color: var(--amber); font-family: monospace; font-size: 11px; }
 .notice strong { font-size: 11px; }

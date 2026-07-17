@@ -3,6 +3,8 @@ import { useId, useState } from "react";
 import { useConnection } from "./features/connection/useConnection";
 import type { ConnectionStatusName, TransportFactory } from "./features/connection/connectionClient";
 import type { ConnectionViewModel } from "./features/connection/useConnection";
+import { FlowWorkspace } from "./features/flows/FlowWorkspace";
+import { formatBytes } from "./format";
 import "./styles/shell.css";
 
 const statusCopy: Record<ConnectionStatusName, { label: string; detail: string }> = {
@@ -14,20 +16,7 @@ const statusCopy: Record<ConnectionStatusName, { label: string; detail: string }
   error: { label: "Source error", detail: "The source needs attention" },
 };
 
-export function formatBytes(value: string | undefined): string {
-  if (!value) return "—";
-  let bytes: bigint;
-  try {
-    bytes = BigInt(value);
-  } catch {
-    return "—";
-  }
-  const mib = 1024n * 1024n;
-  const kib = 1024n;
-  if (bytes >= mib) return `${bytes / mib} MiB`;
-  if (bytes >= kib) return `${bytes / kib} KiB`;
-  return `${bytes} B`;
-}
+export { formatBytes } from "./format";
 
 function formatCursor(value: string): string {
   return value.length > 9 ? `${value.slice(0, 3)}…${value.slice(-4)}` : value;
@@ -192,10 +181,7 @@ export function Workbench({ view }: { view: ConnectionViewModel }) {
               <div className="empty-hint"><kbd>⌘</kbd><span>Flow search and inspection arrive with the workspace.</span></div>
             </div>
           ) : (
-            <div className="ready-state" role="status">
-              <div className="ready-stamp"><span className="ready-count">{retainedCount}</span><span>flows held in the bounded browser view</span></div>
-              <p>Flow rows and paired request/response inspection are the next workspace layer.</p>
-            </div>
+            <FlowWorkspace browser={browser} followLive={followLive} pauseLive={pauseLive} />
           )}
         </section>
       </section>
