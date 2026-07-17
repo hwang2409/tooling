@@ -6,11 +6,13 @@ has `protocol_version: "1"` and a string `type`. The JSON Schema,
 known-message vocabulary and invariants. Unknown types use the base schema
 branch; additive fields on known or unknown messages are retained.
 
-Parsing returns a discriminated envelope: `{kind:"known", message:<KnownMessage>}`
-for known types, or `{kind:"unknown", original_type, payload}` for an unknown
-type. A type name in the known vocabulary always takes strict validation and
-cannot fall through to the opaque branch. Store and transport boundaries accept
-only these parsed envelopes; raw dictionaries are accepted only by the parser.
+Parsing deep-copies protocol input into nominal, recursively immutable values:
+`{kind:"known", message:<KnownMessage>}` for known types, or
+`{kind:"unknown", original_type, payload}` for an opaque unknown type. Known and
+opaque values are non-overlapping, `original_type` always equals `payload.type`,
+and a known vocabulary name cannot enter the opaque branch. Store and transport
+boundaries verify the nominal parsed value at runtime; raw structural lookalikes
+are accepted only by the parser and cannot mutate retained content by alias.
 
 ## Numeric and ordering rules
 

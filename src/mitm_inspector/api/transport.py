@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from mitm_inspector.protocol import ParsedMessage
+from mitm_inspector.protocol import ParsedMessage, ParsedMessageResult, require_parsed_message
 
 
-def encode_for_browser(message: ParsedMessage) -> ParsedMessage:
+def encode_for_browser(message: ParsedMessage) -> ParsedMessageResult:
     """Return a protocol-owned message for a future API/WebSocket adapter."""
 
-    return message
+    return require_parsed_message(message)

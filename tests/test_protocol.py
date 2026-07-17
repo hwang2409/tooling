@@ -1,12 +1,23 @@
 import base64
 import json
+from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 
 import pytest
 from jsonschema import Draft202012Validator
 
+from mitm_inspector.api.transport import encode_for_browser
 from mitm_inspector.capture.redaction import REDACTED, sanitize_header, sanitize_path
-from mitm_inspector.protocol import ProtocolError, parse_message
+from mitm_inspector.protocol import (
+    FrozenJsonObject,
+    KnownParsedMessage,
+    OpaqueParsedMessage,
+    ParsedMessage,
+    ProtocolError,
+    parse_message,
+)
+from mitm_inspector.store.memory import MemoryStore
 
 ROOT = Path(__file__).parents[1]
 STREAM_PATH = ROOT / "contracts" / "fixtures" / "stream.json"
@@ -28,21 +39,21 @@ def schema_validator() -> Draft202012Validator:
     return Draft202012Validator(schema)
 
 
-def known(message: object) -> dict[str, object]:
+def known(message: object) -> FrozenJsonObject:
     parsed = parse_message(message)
-    assert parsed["kind"] == "known"
-    return parsed["message"]
+    assert isinstance(parsed, KnownParsedMessage)
+    return parsed.message
 
 
 def known_fixture_messages() -> list[object]:
     return [message for message in fixture_messages() if message["type"] != "future.message"]
 
 
-def body_descriptors(message: dict[str, object]) -> list[dict[str, object]]:
+def body_descriptors(message: Mapping[str, object]) -> list[Mapping[str, object]]:
     message_type = message.get("type")
     if message_type == "flow.metadata":
         metadata = message["metadata"]
-        assert isinstance(metadata, dict)
+        assert isinstance(metadata, Mapping)
         result = [metadata["request_body"]]
         if "response_body" in metadata:
             result.append(metadata["response_body"])
@@ -81,10 +92,10 @@ def test_python_accepts_positive_and_rejects_every_negative_case() -> None:
 def test_shared_fixture_preserves_ordered_duplicates_and_lifecycle_order() -> None:
     messages = [known(message) for message in known_fixture_messages()]
     metadata = messages[1]["metadata"]
-    assert metadata["request_headers"][1:3] == [
+    assert metadata["request_headers"][1:3] == (
         {"name": "x-trace", "value": "first"},
         {"name": "x-trace", "value": "second"},
-    ]
+    )
     conformance_metadata = known(conformance()["valid"][1])["metadata"]
     assert conformance_metadata["request_headers"][2]["value"] == ""
     assert conformance_metadata["request_body"]["content_type"] == ""
@@ -149,13 +160,96 @@ def test_gap_order_and_dropped_count_are_authoritative_runtime_invariants() -> N
 
 def test_unknown_types_and_additive_fields_are_tolerated_without_numeric_coercion() -> None:
     message = parse_message(fixture_messages()[-1])
-    assert message["kind"] == "unknown"
-    assert message["original_type"] == "future.message"
-    assert message["payload"]["sequence"] == "9007199254740993"
+    assert isinstance(message, OpaqueParsedMessage)
+    assert message.original_type == "future.message"
+    assert message.original_type == message.payload["type"]
+    assert message.payload["sequence"] == "9007199254740993"
     future = parse_message(conformance()["valid"][-1])
-    assert future["kind"] == "unknown"
-    assert future["original_type"] == "future.additive"
-    assert future["payload"]["sequence"] == "18446744073709551616"
+    assert isinstance(future, OpaqueParsedMessage)
+    assert future.original_type == "future.additive"
+    assert future.original_type == future.payload["type"]
+    assert future.payload["sequence"] == "18446744073709551616"
+
+
+def test_parsed_messages_are_nominal_non_overlapping_and_recursively_immutable() -> None:
+    raw_known = {
+        "protocol_version": "1",
+        "type": "body.chunk",
+        "flow_id": "f",
+        "body_side": "request",
+        "chunk_index": "0",
+        "offset_bytes": "0",
+        "data_base64": "",
+        "extension": {"nested": [{"value": "before"}]},
+    }
+    known_message = parse_message(raw_known)
+    assert isinstance(known_message, KnownParsedMessage)
+    assert not hasattr(known_message, "payload")
+
+    raw_known["flow_id"] = "mutated"
+    raw_known["extension"]["nested"][0]["value"] = "after"
+    assert known_message.message["flow_id"] == "f"
+    extension = known_message.message["extension"]
+    assert isinstance(extension, Mapping)
+    nested = extension["nested"]
+    assert isinstance(nested, tuple)
+    nested_value = nested[0]
+    assert isinstance(nested_value, Mapping)
+    assert nested_value["value"] == "before"
+    with pytest.raises(TypeError):
+        known_message.message["flow_id"] = "forged"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        nested_value["value"] = "forged"  # type: ignore[index]
+
+    raw_opaque = {
+        "protocol_version": "1",
+        "type": "future.message",
+        "extension": {"values": ["before"]},
+    }
+    opaque_message = parse_message(raw_opaque)
+    assert isinstance(opaque_message, OpaqueParsedMessage)
+    assert not hasattr(opaque_message, "message")
+    raw_opaque["type"] = "body.chunk"
+    raw_opaque["extension"]["values"][0] = "after"
+    assert opaque_message.original_type == opaque_message.payload["type"] == "future.message"
+    opaque_extension = opaque_message.payload["extension"]
+    assert isinstance(opaque_extension, Mapping)
+    assert opaque_extension["values"] == ("before",)
+
+
+def test_opaque_messages_reject_non_json_cycles() -> None:
+    extension: dict[str, object] = {}
+    extension["self"] = extension
+    with pytest.raises(ProtocolError, match="cycles"):
+        parse_message(
+            {"protocol_version": "1", "type": "future.message", "extension": extension}
+        )
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [
+        {"kind": "known", "message": {"protocol_version": "1", "type": "source.hello"}},
+        {
+            "kind": "unknown",
+            "original_type": "future.message",
+            "payload": {"protocol_version": "1", "type": "different.future"},
+        },
+        {
+            "kind": "unknown",
+            "original_type": "future.message",
+            "payload": {"protocol_version": "1", "type": "body.chunk"},
+        },
+    ],
+)
+def test_store_and_transport_reject_forged_or_spoofed_envelopes(
+    forged: dict[str, object],
+) -> None:
+    structural_lookalike = cast(ParsedMessage, forged)
+    with pytest.raises(ProtocolError, match="returned by parse_message"):
+        MemoryStore().append(structural_lookalike)
+    with pytest.raises(ProtocolError, match="returned by parse_message"):
+        encode_for_browser(structural_lookalike)
 
 
 def test_fixtures_have_no_secret_canaries() -> None:
@@ -186,6 +280,10 @@ def test_fixtures_have_no_secret_canaries() -> None:
         "XToken",
         "X-ApiKey",
         "XApiKey",
+        "X.Token",
+        "X.Access.Token",
+        "X.Api.Key",
+        "X+Api+Key",
         "XAuthToken",
         "X_Credential",
         "X-Custom_Secret",
@@ -194,7 +292,13 @@ def test_fixtures_have_no_secret_canaries() -> None:
     ],
 )
 def test_redaction_covers_credential_shape_variants(name: str) -> None:
-    assert sanitize_header(name, "credential-canary")[1] == REDACTED
+    assert sanitize_header(name, "credential-canary") == (name, REDACTED)
+
+
+@pytest.mark.parametrize("punctuation", list("!#$%&'*+-.^_`|~"))
+def test_redaction_tokenizes_every_rfc_field_name_punctuation(punctuation: str) -> None:
+    name = f"X{punctuation}Api{punctuation}Key"
+    assert sanitize_header(name, "credential-canary") == (name, REDACTED)
 
 
 @pytest.mark.parametrize(
@@ -210,14 +314,18 @@ def test_redaction_covers_credential_shape_variants(name: str) -> None:
         "X-Signature-Version",
         "X-Cookie-State",
         "X-Auth-Mode",
+        "X.Token.Count",
+        "X+Key+ID",
+        "X.Secret.Version",
+        "X.Api.Key.Version",
     ],
 )
 def test_redaction_does_not_redact_harmless_shaped_headers(name: str) -> None:
-    assert sanitize_header(name, "safe-value")[1] == "safe-value"
+    assert sanitize_header(name, "safe-value") == (name, "safe-value")
 
 
 def test_redaction_is_case_and_separator_insensitive_for_credential_names() -> None:
     for name in ("Authorization", "X_Api_Key", "X-Auth_Token", "X-Amz-Security_Token"):
         assert sanitize_header(name, "credential-canary")[1] == REDACTED
-    assert sanitize_header("X-Trace", "safe-value") == ("x-trace", "safe-value")
+    assert sanitize_header("X-Trace", "safe-value") == ("X-Trace", "safe-value")
     assert sanitize_path("/v1/messages?query-secret-canary") == "/v1/messages"

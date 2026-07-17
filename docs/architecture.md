@@ -37,4 +37,5 @@ sockets, persist traffic, or capture real flows.
 `tests/test_architecture.py` parses every source Python module and rejects
 imports from `mitmproxy.tools.web`, `mitmproxy.addons.view`,
 `mitmproxy.proxy.layers`, and the private `mitmweb` namespace generally. Public
-hooks are the only allowed mitmproxy integration surface.
+hooks are the only allowed mitmproxy integration surface. Dynamic loader calls
+fail closed unless their module is an approved public literal.

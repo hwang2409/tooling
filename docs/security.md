@@ -9,9 +9,10 @@ header policy is deliberately fail-closed for credential-shaped names:
 - `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `api-key`,
   `x-api-key`, `x-auth-token`, `x-amz-security-token`, access/refresh/id
   tokens, and client secrets become `[REDACTED]`.
-- Names are case-insensitive, camel-case aware, and collapse underscore/hyphen
-  runs. Credential-shaped terminal terms (`token`, `key`, `secret`,
-  `credential`, `cookie`, `signature`) and auth/bearer segments are redacted;
+- Classification is case-insensitive and camel-case aware, and tokenizes every
+  punctuation character allowed in an HTTP field name. Header names themselves
+  are preserved unchanged. Credential-shaped terminal terms (`token`, `key`,
+  `secret`, `credential`, `cookie`, `signature`) and auth/bearer segments are redacted;
   explicit harmless shape exceptions such as `x-token-count`, `x-key-id`,
   `x-secret-version`, and `x-signature-version` remain visible. This catches
   variants such as `X_Api_Key`, `XApiKey`, and `X-Auth_Token` without treating

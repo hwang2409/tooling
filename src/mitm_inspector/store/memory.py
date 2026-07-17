@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Iterator
 
-from mitm_inspector.protocol import ParsedMessage
+from mitm_inspector.protocol import ParsedMessage, require_parsed_message
 
 
 class MemoryStore:
@@ -17,7 +17,7 @@ class MemoryStore:
         self._items: deque[ParsedMessage] = deque(maxlen=max_items)
 
     def append(self, message: ParsedMessage) -> None:
-        self._items.append(message)
+        self._items.append(require_parsed_message(message))
 
     def newest_first(self) -> Iterator[ParsedMessage]:
         return reversed(self._items)

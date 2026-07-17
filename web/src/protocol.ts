@@ -157,18 +157,43 @@ export type KnownMessage =
   | BrowserDelta
   | BrowserResync;
 
+type DeepReadonly<T> = T extends ReadonlyArray<infer Item>
+  ? ReadonlyArray<DeepReadonly<Item>>
+  : T extends object
+    ? { readonly [Key in keyof T]: DeepReadonly<T[Key]> }
+    : T;
+
+export type ImmutableKnownMessage = DeepReadonly<KnownMessage>;
+export type FrozenJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | ReadonlyArray<FrozenJsonValue>
+  | FrozenJsonObject;
+export interface FrozenJsonObject {
+  readonly [key: string]: FrozenJsonValue;
+}
+
+declare const parsedMessageBrand: unique symbol;
+
 export interface KnownEnvelope {
-  kind: "known";
-  message: KnownMessage;
+  readonly kind: "known";
+  readonly message: ImmutableKnownMessage;
+  readonly original_type?: never;
+  readonly payload?: never;
+  readonly [parsedMessageBrand]: true;
 }
 
-export interface UnknownEnvelope {
-  kind: "unknown";
-  original_type: string;
-  payload: Record<string, unknown>;
+export interface OpaqueEnvelope {
+  readonly kind: "unknown";
+  readonly original_type: string;
+  readonly payload: FrozenJsonObject;
+  readonly message?: never;
+  readonly [parsedMessageBrand]: true;
 }
 
-export type ParsedMessage = KnownEnvelope | UnknownEnvelope;
+export type ParsedMessage = KnownEnvelope | OpaqueEnvelope;
 
 export class ProtocolError extends Error {}
 
@@ -185,12 +210,89 @@ const knownTypes = new Set([
   "source.hello", "flow.metadata", "flow.lifecycle", "body.chunk", "body.end",
   "stream.gap", "browser.snapshot", "browser.delta", "browser.resync",
 ]);
+const parsedMessages = new WeakSet<object>();
 
 function record(value: unknown, label: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new ProtocolError(`${label} must be an object`);
   }
   return value as Record<string, unknown>;
+}
+
+function freezeJson(
+  value: unknown,
+  label: string,
+  ancestors: WeakSet<object> = new WeakSet(),
+): FrozenJsonValue {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new ProtocolError(`${label} must contain finite JSON numbers`);
+    return value;
+  }
+  if (typeof value !== "object") throw new ProtocolError(`${label} must contain only JSON values`);
+  if (ancestors.has(value)) throw new ProtocolError(`${label} must not contain cycles`);
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return Object.freeze(value.map((item, index) => freezeJson(item, `${label}[${index}]`, ancestors)));
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new ProtocolError(`${label} must contain only plain JSON objects`);
+    }
+    const ownKeys = Reflect.ownKeys(value);
+    if (ownKeys.some((key) => typeof key !== "string" || !Object.prototype.propertyIsEnumerable.call(value, key))) {
+      throw new ProtocolError(`${label} must contain only enumerable string keys`);
+    }
+    const frozen: Record<string, FrozenJsonValue> = Object.create(null) as Record<string, FrozenJsonValue>;
+    for (const [key, item] of Object.entries(value)) {
+      frozen[key] = freezeJson(item, `${label}.${key}`, ancestors);
+    }
+    return Object.freeze(frozen);
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function freezeJsonObject(value: Record<string, unknown>): FrozenJsonObject {
+  const frozen = freezeJson(value, "message");
+  if (Array.isArray(frozen) || frozen === null || typeof frozen !== "object") {
+    throw new ProtocolError("message must be an object");
+  }
+  return frozen as FrozenJsonObject;
+}
+
+function knownEnvelope(message: FrozenJsonObject): KnownEnvelope {
+  const type = message.type;
+  if (typeof type !== "string" || !knownTypes.has(type)) {
+    throw new ProtocolError("known parsed message must use a known type");
+  }
+  const envelope = Object.freeze({ kind: "known", message });
+  parsedMessages.add(envelope);
+  return envelope as KnownEnvelope;
+}
+
+function opaqueEnvelope(originalType: string, payload: FrozenJsonObject): OpaqueEnvelope {
+  if (knownTypes.has(originalType)) {
+    throw new ProtocolError("opaque parsed message cannot use a known type");
+  }
+  if (payload.type !== originalType) {
+    throw new ProtocolError("opaque original_type must equal payload.type");
+  }
+  const envelope = Object.freeze({ kind: "unknown", original_type: originalType, payload });
+  parsedMessages.add(envelope);
+  return envelope as OpaqueEnvelope;
+}
+
+export function isParsedProtocolMessage(value: unknown): value is ParsedMessage {
+  return typeof value === "object" && value !== null && parsedMessages.has(value);
+}
+
+export function requireParsedProtocolMessage(value: unknown): ParsedMessage {
+  if (!isParsedProtocolMessage(value)) {
+    throw new ProtocolError("message must be an immutable value returned by parseProtocolMessage");
+  }
+  return value;
 }
 
 function stringValue(value: unknown, label: string): string {
@@ -315,7 +417,7 @@ function streamGap(message: Record<string, unknown>): void {
   }
 }
 
-/** Validate a protocol-v1 message without discarding unknown fields or types. */
+/** Validate, deep-copy, and recursively freeze a protocol-v1 message. */
 export function parseProtocolMessage(value: unknown): ParsedMessage {
   const message = record(value, "message");
   if (message.protocol_version !== "1") throw new ProtocolError("protocol_version must be '1'");
@@ -358,8 +460,7 @@ export function parseProtocolMessage(value: unknown): ParsedMessage {
     decimalValue(message.requested_cursor, "requested_cursor");
   }
 
-  if (knownTypes.has(type)) {
-    return { kind: "known", message: message as unknown as KnownMessage };
-  }
-  return { kind: "unknown", original_type: type, payload: message };
+  const frozenMessage = freezeJsonObject(message);
+  if (knownTypes.has(type)) return knownEnvelope(frozenMessage);
+  return opaqueEnvelope(type, frozenMessage);
 }

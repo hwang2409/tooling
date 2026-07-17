@@ -4,8 +4,13 @@ import Ajv2020 from "ajv/dist/2020";
 import { describe, expect, it } from "vitest";
 
 import schema from "../../contracts/protocol-v1.schema.json";
-import { parseProtocolMessage, ProtocolError } from "./protocol";
-import type { KnownMessage } from "./protocol";
+import {
+  isParsedProtocolMessage,
+  parseProtocolMessage,
+  ProtocolError,
+  requireParsedProtocolMessage,
+} from "./protocol";
+import type { ImmutableKnownMessage, ParsedMessage } from "./protocol";
 
 const streamPath = resolve(process.cwd(), "../contracts/fixtures/stream.json");
 const conformancePath = resolve(process.cwd(), "../contracts/fixtures/conformance.json");
@@ -16,7 +21,7 @@ const conformance = JSON.parse(readFileSync(conformancePath, "utf8")) as {
 };
 const validateSchema = new Ajv2020({ strict: false }).compile(schema);
 
-function known(message: unknown): KnownMessage {
+function known(message: unknown): ImmutableKnownMessage {
   const parsed = parseProtocolMessage(message);
   expect(parsed.kind).toBe("known");
   if (parsed.kind !== "known") throw new Error("expected known message");
@@ -61,8 +66,73 @@ describe("shared protocol-v1 conformance", () => {
     expect(future.kind).toBe("unknown");
     if (future.kind !== "unknown") throw new Error("expected unknown message");
     expect(future.original_type).toBe("future.additive");
+    expect(future.original_type).toBe(future.payload.type);
     expect(future.payload.sequence).toBe("18446744073709551616");
     expect(future.payload.new_field).toEqual({ safe: true });
+  });
+
+  it("returns nominal, non-overlapping, recursively immutable values", () => {
+    const rawKnown = {
+      protocol_version: "1",
+      type: "body.chunk",
+      flow_id: "f",
+      body_side: "request",
+      chunk_index: "0",
+      offset_bytes: "0",
+      data_base64: "",
+      extension: { nested: [{ value: "before" }] },
+    };
+    const parsedKnown = parseProtocolMessage(rawKnown);
+    expect(parsedKnown.kind).toBe("known");
+    if (parsedKnown.kind !== "known") throw new Error("expected known message");
+    expect("payload" in parsedKnown).toBe(false);
+
+    rawKnown.flow_id = "mutated";
+    rawKnown.extension.nested[0].value = "after";
+    expect(parsedKnown.message.flow_id).toBe("f");
+    expect(parsedKnown.message.extension).toEqual({ nested: [{ value: "before" }] });
+    expect(Object.isFrozen(parsedKnown)).toBe(true);
+    expect(Object.isFrozen(parsedKnown.message)).toBe(true);
+    const mutableKnown = parsedKnown.message as unknown as {
+      flow_id: string;
+      extension: { nested: Array<{ value: string }> };
+    };
+    expect(() => { mutableKnown.flow_id = "forged"; }).toThrow(TypeError);
+    expect(() => { mutableKnown.extension.nested[0].value = "forged"; }).toThrow(TypeError);
+
+    const rawOpaque = {
+      protocol_version: "1",
+      type: "future.message",
+      extension: { values: ["before"] },
+    };
+    const parsedOpaque = parseProtocolMessage(rawOpaque);
+    expect(parsedOpaque.kind).toBe("unknown");
+    if (parsedOpaque.kind !== "unknown") throw new Error("expected opaque message");
+    expect("message" in parsedOpaque).toBe(false);
+    rawOpaque.type = "body.chunk";
+    rawOpaque.extension.values[0] = "after";
+    expect(parsedOpaque.original_type).toBe(parsedOpaque.payload.type);
+    expect(parsedOpaque.original_type).toBe("future.message");
+    expect(parsedOpaque.payload.extension).toEqual({ values: ["before"] });
+    expect(requireParsedProtocolMessage(parsedOpaque)).toBe(parsedOpaque);
+  });
+
+  it.each([
+    { kind: "known", message: { protocol_version: "1", type: "source.hello" } },
+    {
+      kind: "unknown",
+      original_type: "future.message",
+      payload: { protocol_version: "1", type: "different.future" },
+    },
+    {
+      kind: "unknown",
+      original_type: "future.message",
+      payload: { protocol_version: "1", type: "body.chunk" },
+    },
+  ])("rejects forged or spoofed structural envelope %#", (candidate) => {
+    const forged = candidate as unknown as ParsedMessage;
+    expect(isParsedProtocolMessage(forged)).toBe(false);
+    expect(() => requireParsedProtocolMessage(forged)).toThrow(ProtocolError);
   });
 
   it("rejects a truncated prefix whose count exceeds the total", () => {

@@ -20,8 +20,10 @@ SENSITIVE_HEADER_NAMES = frozenset(
         "client-secret",
     }
 )
-_SEPARATOR_RUN = re.compile(r"[-_]+")
-_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_TCHAR_PUNCTUATION = "!#$%&'*+-.^_`|~"
+_SEPARATOR_RUN = re.compile(f"[{re.escape(_TCHAR_PUNCTUATION)}]+")
+_LOWER_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_ACRONYM_CAMEL_BOUNDARY = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
 REDACTED = "[REDACTED]"
 _EXPLICIT_SENSITIVE_NAMES = frozenset(
     {
@@ -61,10 +63,45 @@ _HARMLESS_SHAPED_NAMES = frozenset(
         "x-token-count",
     }
 )
+_EXPLICIT_SENSITIVE_COMPACT_NAMES = frozenset(
+    name.replace("-", "") for name in _EXPLICIT_SENSITIVE_NAMES
+)
+_COMPACT_SENSITIVE_SUFFIXES = (
+    "authorization",
+    "authtoken",
+    "bearertoken",
+    "accesstoken",
+    "refreshtoken",
+    "idtoken",
+    "securitytoken",
+    "apikey",
+    "clientsecret",
+    "credentials",
+    "credential",
+    "signature",
+    "cookie",
+    "secret",
+    "token",
+)
+_CREDENTIAL_SEGMENTS = frozenset(
+    {
+        "auth",
+        "authorization",
+        "bearer",
+        "cookie",
+        "credential",
+        "credentials",
+        "secret",
+        "signature",
+    }
+)
 
 
 def sanitize_header_name(name: str) -> str:
-    camel_separated = _CAMEL_BOUNDARY.sub("-", name.strip())
+    """Return a comparison-only token form without changing the emitted name."""
+
+    camel_separated = _ACRONYM_CAMEL_BOUNDARY.sub("-", name.strip())
+    camel_separated = _LOWER_CAMEL_BOUNDARY.sub("-", camel_separated)
     return _SEPARATOR_RUN.sub("-", camel_separated.lower())
 
 
@@ -75,27 +112,18 @@ def is_sensitive_header_name(name: str) -> bool:
     compact_name = normalized_name.replace("-", "")
     if normalized_name in SENSITIVE_HEADER_NAMES or normalized_name in _EXPLICIT_SENSITIVE_NAMES:
         return True
-    if compact_name in {name.replace("-", "") for name in _EXPLICIT_SENSITIVE_NAMES}:
+    if compact_name in _EXPLICIT_SENSITIVE_COMPACT_NAMES:
+        return True
+    if any(compact_name.endswith(suffix) for suffix in _COMPACT_SENSITIVE_SUFFIXES):
         return True
     parts = normalized_name.split("-")
-    credential_terms = {
-        "auth",
-        "authorization",
-        "bearer",
-        "cookie",
-        "credential",
-        "credentials",
-        "secret",
-        "signature",
-    }
-    if any(part in credential_terms for part in parts):
+    if any(part in _CREDENTIAL_SEGMENTS for part in parts):
         return True
     return parts[-1] in {"token", "key"}
 
 
 def sanitize_header(name: str, value: str) -> tuple[str, str]:
-    normalized_name = sanitize_header_name(name)
-    return normalized_name, REDACTED if is_sensitive_header_name(normalized_name) else value
+    return name, REDACTED if is_sensitive_header_name(name) else value
 
 
 def sanitize_path(path: str) -> str:
