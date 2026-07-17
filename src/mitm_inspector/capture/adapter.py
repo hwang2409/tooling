@@ -596,7 +596,15 @@ class CaptureAddon:
             self._capture_evicted_flows += 1
 
     def _send(self, raw: dict[str, object]) -> bool:
-        return self.sink.offer(raw)
+        try:
+            return self.sink.offer(raw)
+        except BaseException as error:
+            if (
+                raw.get("type") == "source.hello"
+                and getattr(error, "capture_committed", False)
+            ):
+                self._source_announced = True
+            raise
 
     @property
     def counters(self) -> dict[str, int]:

@@ -467,6 +467,61 @@ def test_source_hello_retries_after_injected_send_failure(
     assert addon._source_announced
 
 
+def test_source_hello_postcommit_cleanup_failure_does_not_duplicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    addon = CaptureAddon(sink=sink, clock=lambda: "now")
+    original_release = sink._lock.release_if_owned
+    releases = 0
+
+    def release_then_interrupt(owner: object | None = None) -> bool:
+        nonlocal releases
+        releases += 1
+        released = original_release(owner)
+        if releases == 2:
+            raise KeyboardInterrupt
+        return released
+
+    monkeypatch.setattr(sink._lock, "release_if_owned", release_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        addon._announce_source()
+    assert addon._source_announced
+    monkeypatch.undo()
+
+    messages = addon.drain()
+    assert [
+        (message.message if isinstance(message, KnownParsedMessage) else message.payload)["type"]
+        for message in messages
+    ] == ["source.hello"]
+
+
+def test_source_hello_precommit_cleanup_failure_remains_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    addon = CaptureAddon(sink=sink, clock=lambda: "now")
+    original_release = sink._lock.release_if_owned
+
+    def release_then_interrupt(owner: object | None = None) -> bool:
+        original_release(owner)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink._lock, "release_if_owned", release_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        addon._announce_source()
+    assert not addon._source_announced
+    monkeypatch.undo()
+    assert sink.pending_count == 0
+
+    addon._announce_source()
+    assert addon._source_announced
+    messages = addon.drain()
+    assert len(messages) == 1
+    assert isinstance(messages[0], KnownParsedMessage)
+    assert messages[0].message["type"] == "source.hello"
+
+
 def test_sink_lock_contention_returns_immediately_and_emits_gap() -> None:
     sink = BoundedMessageSink(max_pending=4)
     sink._lock.acquire()
@@ -1064,20 +1119,47 @@ def test_keyboard_interrupt_after_enqueue_position_allocation_restores_position(
     monkeypatch.setattr(sink, "_allocate_position", interrupt_after_allocate)
     with pytest.raises(KeyboardInterrupt):
         sink.offer(parse_message({"protocol_version": "1", "type": "future.allocate"}))
-    assert sink._next_position_value == 1
+    assert sink._next_position_value == 2
     assert not sink.exhausted
     assert sink.pending_count == 0
+    assert sink.dropped_count == 1
+    monkeypatch.undo()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
+    delivered = sink.drain()
+    assert len(delivered) == 2
+    assert isinstance(delivered[0], KnownParsedMessage)
+    assert delivered[0].message["type"] == "stream.gap"
+    delivered_payload = (
+        delivered[1].message
+        if isinstance(delivered[1], KnownParsedMessage)
+        else delivered[1].payload
+    )
+    assert delivered_payload["delivery_position"] == "2"
+
+
+def test_keyboard_interrupt_before_position_mutation_does_not_create_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+
+    def interrupt_before_allocate() -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink, "_allocate_position", interrupt_before_allocate)
+    with pytest.raises(KeyboardInterrupt):
+        sink.offer(parse_message({"protocol_version": "1", "type": "future.allocate"}))
+    assert sink._next_position_value == 1
     assert sink.dropped_count == 0
     monkeypatch.undo()
     assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
     delivered = sink.drain()
     assert len(delivered) == 1
-    delivered_payload = (
+    payload = (
         delivered[0].message
         if isinstance(delivered[0], KnownParsedMessage)
         else delivered[0].payload
     )
-    assert delivered_payload["delivery_position"] == "1"
+    assert payload["delivery_position"] == "1"
 
 
 def test_keyboard_interrupt_after_loss_position_allocation_restores_position(
@@ -1093,14 +1175,91 @@ def test_keyboard_interrupt_after_loss_position_allocation_restores_position(
     monkeypatch.setattr(sink, "_allocate_position", interrupt_after_allocate)
     with pytest.raises(KeyboardInterrupt):
         sink.record_loss()
-    assert sink._next_position_value == 1
+    assert sink._next_position_value == 2
     assert not sink.exhausted
-    assert sink.dropped_count == 0
-    assert sink.loss_range_count == 0
+    assert sink.dropped_count == 1
+    assert sink.loss_range_count == 1
     monkeypatch.undo()
     assert sink.record_loss()
-    assert sink.dropped_count == 1
+    assert sink.dropped_count == 2
     assert sink.drain()[0].message["type"] == "stream.gap"  # type: ignore[union-attr]
+
+
+def test_pending_loss_flush_exception_preserves_acknowledged_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    sink._pending_loss_count = 1
+    original_flush = sink._flush_pending_losses_locked
+
+    def flush_then_interrupt(*, loss_lock_held: bool = False) -> None:
+        original_flush(loss_lock_held=loss_lock_held)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink, "_flush_pending_losses_locked", flush_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        sink.record_loss()
+    monkeypatch.undo()
+
+    assert sink._next_position_value == 2
+    assert sink.dropped_count == 1
+    assert sink.loss_range_count == 1
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after-flush"}))
+    drained = sink.drain()
+    assert [
+        (item.message if isinstance(item, KnownParsedMessage) else item.payload)["type"]
+        for item in drained
+    ] == ["stream.gap", "future.after-flush"]
+
+
+def test_reentrant_loss_during_allocation_is_not_erased(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    original_allocate = sink._allocate_position
+    reentered = False
+
+    def allocate_with_reentrant_loss() -> int:
+        nonlocal reentered
+        if not reentered:
+            reentered = True
+            assert sink.record_loss()
+        return original_allocate()
+
+    monkeypatch.setattr(sink, "_allocate_position", allocate_with_reentrant_loss)
+    assert sink.record_loss()
+    monkeypatch.undo()
+
+    assert sink.dropped_count == 2
+    assert sink._next_position_value == 3
+    assert sink.loss_range_count == 1
+    assert len(sink.drain()) == 1
+
+
+def test_concurrent_loss_admissions_cover_every_reserved_position() -> None:
+    sink = BoundedMessageSink(max_pending=1)
+    barrier = threading.Barrier(8)
+    results: list[bool] = []
+    results_lock = threading.Lock()
+
+    def record() -> None:
+        barrier.wait()
+        result = sink.record_loss()
+        with results_lock:
+            results.append(result)
+
+    workers = [threading.Thread(target=record) for _ in range(8)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=1)
+    assert all(not worker.is_alive() for worker in workers)
+    assert results == [True] * 8
+    assert sink.dropped_count == 8
+    gaps = sink.drain()
+    assert len(gaps) == 1
+    assert isinstance(gaps[0], KnownParsedMessage)
+    assert gaps[0].message["dropped_count"] == "8"
 
 
 def test_keyboard_interrupt_on_second_popleft_restores_queue_and_counters() -> None:
@@ -1798,6 +1957,52 @@ def test_direct_capture_config_rejects_non_exact_or_out_of_range_uint64(
 def test_invalid_direct_config_cannot_leave_addon_source_or_flow_state() -> None:
     with pytest.raises(ValueError, match="exact uint64"):
         CaptureAddon(config=CaptureConfig(max_in_memory_bytes=MAX_U64 + 1))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_pending": 1.0},
+        {"max_pending": True},
+        {"max_pending": float("nan")},
+        {"max_body_bytes": MAX_U64 + 1},
+        {"max_memory_bytes": MAX_U64 + 1},
+    ],
+)
+def test_sink_rejects_non_integral_or_unbounded_limits(
+    kwargs: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="exact bounded integer"):
+        BoundedMessageSink(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_items": 1.0},
+        {"max_items": True},
+        {"max_items": float("nan")},
+        {"max_messages": MAX_U64 + 1},
+        {"max_body_bytes": MAX_U64 + 1},
+        {"max_memory_bytes": MAX_U64 + 1},
+        {"max_messages_per_flow": MAX_U64 + 1},
+        {"max_standalone_messages": MAX_U64 + 1},
+        {"max_age_seconds": float("nan")},
+        {"max_age_seconds": float("inf")},
+        {"max_age_seconds": -1},
+        {"max_age_seconds": True},
+    ],
+)
+def test_store_rejects_non_integral_or_unbounded_limits(
+    kwargs: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        MemoryStore(**kwargs)  # type: ignore[arg-type]
+
+
+def test_store_accepts_large_exact_integer_age_without_float_coercion() -> None:
+    store = MemoryStore(max_age_seconds=10**400)
+    assert store.max_age_seconds == 10**400
 
 
 def completed_flow_message(flow_id: str, sequence: str) -> ParsedMessageResult:

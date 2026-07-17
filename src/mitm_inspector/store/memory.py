@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import heapq
+import math
 import time
 import weakref
 from collections import deque
@@ -20,6 +21,7 @@ from mitm_inspector.capture.metrics import (
     validate_bounded_numbers as _validate_bounded_numbers,
 )
 from mitm_inspector.protocol import (
+    MAX_U64,
     KnownParsedMessage,
     OpaqueParsedMessage,
     ParsedMessage,
@@ -79,20 +81,21 @@ class MemoryStore:
         max_standalone_messages: int | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if max_items < 1:
-            raise ValueError("max_items must be positive")
-        if max_age_seconds < 0:
-            raise ValueError("max_age_seconds must not be negative")
-        if max_body_bytes < 0:
-            raise ValueError("max_body_bytes must not be negative")
-        if max_memory_bytes < 0:
-            raise ValueError("max_memory_bytes must not be negative")
-        if max_messages < 1:
-            raise ValueError("max_messages must be positive")
-        if max_messages_per_flow < 1:
-            raise ValueError("max_messages_per_flow must be positive")
-        if max_standalone_messages is not None and max_standalone_messages < 1:
-            raise ValueError("max_standalone_messages must be positive")
+        _validate_store_limit(max_items, "max_items", minimum=1)
+        _validate_store_limit(max_body_bytes, "max_body_bytes", minimum=0)
+        _validate_store_limit(max_memory_bytes, "max_memory_bytes", minimum=0)
+        _validate_store_limit(max_messages, "max_messages", minimum=1)
+        _validate_store_limit(max_messages_per_flow, "max_messages_per_flow", minimum=1)
+        if max_standalone_messages is not None:
+            _validate_store_limit(max_standalone_messages, "max_standalone_messages", minimum=1)
+        if type(max_age_seconds) is int:
+            valid_age = max_age_seconds >= 0
+        elif type(max_age_seconds) is float:
+            valid_age = math.isfinite(max_age_seconds) and max_age_seconds >= 0
+        else:
+            valid_age = False
+        if not valid_age:
+            raise ValueError("max_age_seconds must be finite and nonnegative")
         self.max_items = max_items
         self.max_age_seconds = max_age_seconds
         self.max_body_bytes = max_body_bytes
@@ -647,6 +650,11 @@ def cast_stored(value: object) -> _StoredMessage:
     if not isinstance(value, _StoredMessage):
         raise AssertionError("expiry owner must be a stored message")
     return value
+
+
+def _validate_store_limit(value: object, name: str, *, minimum: int) -> None:
+    if type(value) is not int or value < minimum or value > MAX_U64:
+        raise ValueError(f"{name} must be an exact bounded integer")
 
 
 def _flow_id_for(payload: Mapping[str, object]) -> str | None:
