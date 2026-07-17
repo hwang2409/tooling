@@ -104,7 +104,8 @@ export function parseSseEvents(text: string): SseEvent[] {
     fields = [];
   };
 
-  const normalized = text.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+  const withoutBom = text.startsWith("\uFEFF") ? text.slice(1) : text;
+  const normalized = withoutBom.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
   const lines = normalized.split("\n");
   if (lines.at(-1) === "") lines.pop();
   for (const line of lines) {

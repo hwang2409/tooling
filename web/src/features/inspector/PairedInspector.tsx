@@ -87,16 +87,23 @@ export function InspectorBodyPanel({ body, pane, selected, onSelect }: Inspector
   const tablistId = useId();
   const panelId = `${tablistId}-panel`;
   const sectionRef = useRef<HTMLElement | null>(null);
+  const bodyControlRootRef = useRef<HTMLDivElement | null>(null);
   const inspectRef = useRef<HTMLButtonElement | null>(null);
   const tabRefs = useRef<Partial<Record<BodyViewMode, HTMLButtonElement | null>>>({});
   const wasSelected = useRef(selected);
+  const focusWasInBodyControls = useRef(false);
   const canInspect = body.state !== "missing" && body.state !== "redacted";
+
+  if (typeof document !== "undefined") {
+    focusWasInBodyControls.current = Boolean(bodyControlRootRef.current?.contains(document.activeElement));
+  }
 
   useInspectorLayoutEffect(() => {
     const target = bodyFocusTarget(wasSelected.current, selected);
-    if (target === "active-tab") tabRefs.current[mode]?.focus();
-    else if (target === "inspect-control") (inspectRef.current ?? sectionRef.current)?.focus();
+    if (focusWasInBodyControls.current && target === "active-tab") tabRefs.current[mode]?.focus();
+    else if (focusWasInBodyControls.current && target === "inspect-control") (inspectRef.current ?? sectionRef.current)?.focus();
     wasSelected.current = selected;
+    focusWasInBodyControls.current = false;
   }, [mode, selected]);
 
   const handleModeKeyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
@@ -122,16 +129,17 @@ export function InspectorBodyPanel({ body, pane, selected, onSelect }: Inspector
         <div><dt>captured</dt><dd>{metadata.captured}</dd></div>
         <div><dt>type</dt><dd>{metadata.contentType}</dd></div>
       </dl>
-      {!selected ? (
-        <div className="inspector-body-gate">
+      <div ref={bodyControlRootRef} className="inspector-body-control">
+        {!selected ? (
+          <div className="inspector-body-gate">
           <div>
             <strong>{canInspect ? "Body decoding is paused" : metadata.state === "redacted" ? "Body withheld by redaction" : "No body bytes retained"}</strong>
             <p>{canInspect ? "Select this pane to decode the bounded prefix." : metadata.state === "redacted" ? "The source marked this content as unavailable." : "Metadata remains available without a body payload."}</p>
           </div>
           {canInspect && <button ref={inspectRef} className="inspector-action" type="button" onClick={onSelect}>Inspect body <span aria-hidden="true">↗</span></button>}
-        </div>
-      ) : (
-        <div className="inspector-body-view">
+          </div>
+        ) : (
+          <div className="inspector-body-view">
           <div className="inspector-mode-row" role="tablist" aria-label={`${pane} body view mode`} aria-orientation="horizontal">
             {bodyModes.map((bodyMode, index) => (
               <button
@@ -153,8 +161,9 @@ export function InspectorBodyPanel({ body, pane, selected, onSelect }: Inspector
           <div id={panelId} role="tabpanel" aria-labelledby={`${tablistId}-${mode}`} tabIndex={0}>
             <BodyOutput decoded={decoded!} />
           </div>
-        </div>
-      )}
+          </div>
+        )}
+      </div>
     </section>
   );
 }
@@ -218,19 +227,21 @@ function ErrorPane({ error }: { error?: string }) {
   );
 }
 
-export function PairedInspector({ flow, className = "", compact = false, bodySelection, onBodySelect, onPaneChange }: InspectorProps) {
-  const [pane, setPane] = useState<InspectorPane>("request");
+export function PairedInspector({ flow, className = "", compact = false, activePane, bodySelection, onBodySelect, onPaneChange }: InspectorProps) {
+  const [internalPane, setInternalPane] = useState<InspectorPane>("request");
   const [internalSelectedBody, setInternalSelectedBody] = useState<BodySelection | null>(null);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const tablistId = useId();
   const entries = useMemo(() => orderLifecycle(flow.lifecycle), [flow.lifecycle]);
+
+  const pane = activePane ?? internalPane;
 
   useEffect(() => {
     onPaneChange?.(pane);
   }, [onPaneChange, pane]);
 
   const selectPane = (nextPane: InspectorPane) => {
-    setPane(nextPane);
+    if (activePane === undefined) setInternalPane(nextPane);
     if (bodySelection === undefined) setInternalSelectedBody(null);
   };
 
@@ -244,11 +255,7 @@ export function PairedInspector({ flow, className = "", compact = false, bodySel
   const isBodySelected = (bodyPane: BodyPane) => isBodySelectionAuthorized(selectedBody, flow.metadata.flow_id, bodyPane);
 
   const handleTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
-    let nextIndex: number | undefined;
-    if (event.key === "ArrowRight" || event.key === "ArrowDown") nextIndex = (index + 1) % paneOrder.length;
-    if (event.key === "ArrowLeft" || event.key === "ArrowUp") nextIndex = (index - 1 + paneOrder.length) % paneOrder.length;
-    if (event.key === "Home") nextIndex = 0;
-    if (event.key === "End") nextIndex = paneOrder.length - 1;
+    const nextIndex = nextBodyTabIndex(index, event.key, paneOrder.length, "horizontal");
     if (nextIndex === undefined) return;
     event.preventDefault();
     tabRefs.current[nextIndex]?.focus();
@@ -273,7 +280,7 @@ export function PairedInspector({ flow, className = "", compact = false, bodySel
         </div>
       </header>
 
-      <div className="inspector-tabbar" role="tablist" aria-label="Exchange panes" id={tablistId}>
+      <div className="inspector-tabbar" role="tablist" aria-label="Exchange panes" aria-orientation="horizontal" id={tablistId}>
         {paneOrder.map((item, index) => (
           <button
             key={item}
@@ -283,7 +290,7 @@ export function PairedInspector({ flow, className = "", compact = false, bodySel
             type="button"
             role="tab"
             aria-selected={pane === item}
-            aria-controls={`${item}-pane`}
+            aria-controls={`${tablistId}-${item}-pane`}
             tabIndex={pane === item ? 0 : -1}
             onClick={() => selectPane(item)}
             onKeyDown={(event) => handleTabKeyDown(event, index)}
@@ -294,8 +301,8 @@ export function PairedInspector({ flow, className = "", compact = false, bodySel
         ))}
       </div>
 
-      {pane === "error" ? <div id="error-pane" role="tabpanel" tabIndex={0}><ErrorPane error={flow.error} /></div> : (
-        <div className="inspector-pane-layout" id={`${pane}-pane`} role="tabpanel" tabIndex={0} aria-labelledby={`${tablistId}-${pane}`}>
+      {pane === "error" ? <div id={`${tablistId}-error-pane`} role="tabpanel" tabIndex={0} aria-labelledby={`${tablistId}-error`}><ErrorPane error={flow.error} /></div> : (
+        <div className="inspector-pane-layout" id={`${tablistId}-${pane}-pane`} role="tabpanel" tabIndex={0} aria-labelledby={`${tablistId}-${pane}`}>
           <section className="inspector-column inspector-metadata-column">
             <div className="inspector-section-heading">
               <div>

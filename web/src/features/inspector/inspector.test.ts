@@ -111,6 +111,11 @@ describe("SSE framing", () => {
     expect(parseSseEvents("id: 7\n\nretry: 1500\n\ndata: complete\n\n")).toEqual([expect.objectContaining({ data: "complete", id: "7", retry: 1500 })]);
     expect(parseSseEvents("id: 7\ndata: incomplete")).toEqual([]);
   });
+
+  it("strips exactly one leading BOM in the SSE parser", () => {
+    expect(parseSseEvents("\uFEFFdata: hello\n\n")).toEqual([expect.objectContaining({ data: "hello" })]);
+    expect(parseSseEvents("\uFEFF\uFEFFdata: hello\n\n")).toEqual([]);
+  });
 });
 
 describe("lifecycle ordering", () => {

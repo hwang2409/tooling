@@ -48,6 +48,7 @@ export interface InspectorProps {
   flow: InspectorFlow;
   className?: string;
   compact?: boolean;
+  activePane?: InspectorPane;
   bodySelection?: BodySelection | null;
   // eslint-disable-next-line no-unused-vars
   onBodySelect?: (selection: BodySelection) => void;
