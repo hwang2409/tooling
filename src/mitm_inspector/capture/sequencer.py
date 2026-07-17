@@ -80,9 +80,17 @@ class DeliverySequencer:
         marker = next(self._pending_tickets)
         pending = marker - state.pending_marker - 1
         if pending <= 0:
-            return replace(state, pending_marker=marker)
+            state = replace(state, pending_marker=marker)
+            # The marker is a producer-side commit point.  Publish it before
+            # returning to callers that may subsequently hit an injected
+            # allocation/canonicalization failure; otherwise the consumed
+            # ticket is counted again on the retry.
+            self.state = state
+            return state
         state = replace(state, pending_marker=marker)
-        return self._append_loss_count(state, pending)
+        state = self._append_loss_count(state, pending)
+        self.state = state
+        return state
 
     def _append_loss_count(self, state: SequencerState, count: int) -> SequencerState:
         if count <= 0:
@@ -222,6 +230,12 @@ class DeliverySequencer:
         )
         return True
 
+    def can_accept_locked(self, max_pending: int) -> bool:
+        """Check admission before a caller touches an offered payload."""
+
+        state = self.state
+        return not state.exhausted and len(state.items) < max_pending
+
     def drain(
         self,
         limit: int | None,
@@ -236,16 +250,10 @@ class DeliverySequencer:
             count = len(state.items) if limit is None else min(limit, len(state.items))
             detached = state.items[:count]
             trailing = state.trailing_losses if count == len(state.items) else ()
-            if state.exhausted and any(
-                loss.end == MAX_U64
-                for item in detached
-                for loss in item.loss_before
-            ) or state.exhausted and any(loss.end == MAX_U64 for loss in trailing):
-                self.state = state
-                return []
             output: list[ParsedMessageResult] = []
             cursor = state.last_delivered
             forced = state.forced
+            terminal_trailing: tuple[LossRun, ...] = ()
             try:
                 for item in detached:
                     for loss in item.loss_before:
@@ -256,7 +264,14 @@ class DeliverySequencer:
                         continue
                     output.append(with_position(item.message, item.position))
                     cursor = item.position
-                for loss in trailing:
+                for index, loss in enumerate(trailing):
+                    if loss.end == MAX_U64:
+                        # MAX_U64 is a real terminal loss, but it has no
+                        # representable successor for stream.gap.  Emit the
+                        # representable prefix and retain the terminal run so
+                        # it is neither fabricated nor silently forgotten.
+                        terminal_trailing = trailing[index:]
+                        break
                     output.append(gap_after_loss(cursor, loss.end))
                     cursor = loss.end
             except BaseException:
@@ -272,9 +287,11 @@ class DeliverySequencer:
             committed = replace(
                 state,
                 items=remaining,
-                trailing_losses=()
-                if count == len(state.items)
-                else state.trailing_losses,
+                trailing_losses=(
+                    terminal_trailing
+                    if count == len(state.items)
+                    else state.trailing_losses
+                ),
                 body_bytes=state.body_bytes - body,
                 memory_bytes=state.memory_bytes - memory,
                 forced=forced,

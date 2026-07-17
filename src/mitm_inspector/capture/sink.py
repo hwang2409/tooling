@@ -129,6 +129,13 @@ class BoundedMessageSink:
             if close_error is not None:
                 raise close_error
             return False
+        if not self._sequencer.can_accept_locked(self._max_pending):
+            self._sequencer.lock.release()
+            close_error = reservation.close()
+            self._sequencer.record_loss()
+            if close_error is not None:
+                raise close_error
+            return False
         committed = False
         primary: BaseException | None = None
         before_state = self._sequencer.state
@@ -172,18 +179,17 @@ class BoundedMessageSink:
         return self._sequencer.record_loss()
 
     def drain(self, limit: int | None = None) -> list[ParsedMessageResult]:
-        if limit is not None and limit < 1:
-            raise ValueError("limit must be positive")
+        limit = _validate_drain_limit(limit)
         with self._consumer_lock:
             reservation = _ReservationLease(self._reservation_lock)
             if not reservation.acquire(True):
                 return []
             committed = False
             primary: BaseException | None = None
+            result: list[ParsedMessageResult] | None = None
             try:
                 result = self._sequencer.drain(limit, _with_delivery_position, _gap_after_loss)
                 committed = True
-                return result
             except BaseException as error:
                 primary = error
                 raise
@@ -191,9 +197,15 @@ class BoundedMessageSink:
                 close_error = reservation.close()
                 if close_error is not None:
                     if committed:
+                        # Sequencer commit is already authoritative.  Do not
+                        # turn a cleanup-only fault into a lost committed
+                        # batch; the caller receives it exactly once.
                         _mark_committed_exception(close_error)
-                    if primary is None:
+                    elif primary is None:
                         raise close_error
+            if result is None:
+                raise RuntimeError("drain committed without a result")
+            return result
 
     def __iter__(self) -> Iterator[ParsedMessageResult]:
         return iter(self.drain())
@@ -241,6 +253,14 @@ def _message_weight(message: ParsedMessageResult) -> int:
 def _validate_sink_limit(value: object, name: str, *, minimum: int) -> None:
     if type(value) is not int or value < minimum or value > MAX_U64:
         raise ValueError(f"{name} must be an exact bounded integer")
+
+
+def _validate_drain_limit(limit: object) -> int | None:
+    if limit is None:
+        return None
+    if type(limit) is not int or limit < 1 or limit > MAX_U64:
+        raise ValueError("limit must be an exact bounded positive integer")
+    return limit
 
 
 def _mark_committed_exception(error: BaseException) -> None:

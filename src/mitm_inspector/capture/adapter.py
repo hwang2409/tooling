@@ -294,6 +294,7 @@ class CaptureAddon:
         been attempted, so a suffix cannot be stranded.
         """
 
+        _validate_drain_limit(limit)
         if not self._dispatch_lock.acquire(False):
             return []
         try:
@@ -722,3 +723,10 @@ def make_addon_from_environment() -> CaptureAddon:
 # mitmdump -s imports this module and discovers the documented addon list.
 # Construction is intentionally local-only; CaptureConfig performs no I/O.
 addons = [CaptureAddon()]
+
+
+def _validate_drain_limit(limit: object) -> None:
+    if limit is not None and (
+        type(limit) is not int or limit < 1 or limit > MAX_U64
+    ):
+        raise ValueError("limit must be an exact bounded positive integer")

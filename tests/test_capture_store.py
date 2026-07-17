@@ -663,8 +663,7 @@ def test_drain_cleanup_fault_keeps_committed_snapshot_visible_once(
         raise KeyboardInterrupt
 
     monkeypatch.setattr(sink._lock, "release_if_owned", release_then_interrupt)
-    with pytest.raises(KeyboardInterrupt):
-        sink.drain()
+    assert len(sink.drain()) == 1
     monkeypatch.undo()
     assert sink.pending_count == 0
     assert sink.drain() == []
@@ -908,6 +907,19 @@ def test_contended_offer_does_no_payload_work(monkeypatch: pytest.MonkeyPatch) -
     assert sink.dropped_count == 1
 
 
+def test_full_offer_rejects_hostile_mapping_before_payload_traversal() -> None:
+    sink = BoundedMessageSink(max_pending=1)
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.full"}))
+
+    class HostileMapping(dict[str, object]):
+        def items(self) -> Iterator[tuple[str, object]]:
+            raise AssertionError("full queue must not inspect the payload")
+
+    assert not sink.offer(HostileMapping())
+    assert sink.pending_count == 1
+    assert sink.dropped_count == 1
+
+
 def test_loss_ranges_stay_bounded_for_25000_contiguous_drops() -> None:
     sink = BoundedMessageSink(max_pending=1)
     assert sink.offer(parse_message({"protocol_version": "1", "type": "future.first"}))
@@ -990,6 +1002,32 @@ def test_admission_preparation_failure_releases_reservation_without_position(
     assert sink.pending_count == 0
     assert sink.dropped_count == 0
     assert sink._next_position_value == 1
+
+
+def test_pending_marker_commit_survives_allocate_fault_without_phantom_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    original = sink._sequencer._allocate_position
+
+    def fail(_state: object) -> tuple[object, int]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink._sequencer, "_allocate_position", fail)
+    with pytest.raises(KeyboardInterrupt):
+        sink.offer(parse_message({"protocol_version": "1", "type": "future.fault"}))
+    monkeypatch.setattr(sink._sequencer, "_allocate_position", original)
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.retry"}))
+    drained = sink.drain()
+    assert len(drained) == 1
+    payload = (
+        drained[0].payload
+        if not isinstance(drained[0], KnownParsedMessage)
+        else drained[0].message
+    )
+    assert payload["type"] == "future.retry"
+    assert payload["delivery_position"] == "1"
+    assert sink.dropped_count == 0
 
 
 def test_reservation_acquire_baseexception_after_ownership_is_recoverable(
@@ -1119,6 +1157,33 @@ def test_reservation_release_baseexception_before_and_after_clear_is_recoverable
     assert len(sink.drain()) == 2
 
 
+def test_reservation_close_keeps_uncleared_owner_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    lease = sink_module._ReservationLease(sink._lock)
+    assert lease.acquire()
+    original = sink._lock.release_if_owned
+    attempts = 0
+
+    def fail_before_clear(owner: object | None = None) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise KeyboardInterrupt
+        return original(owner)
+
+    monkeypatch.setattr(sink._lock, "release_if_owned", fail_before_clear)
+    error = lease.close()
+    assert isinstance(error, KeyboardInterrupt)
+    assert lease.phase.name == "RELEASING"
+    assert sink._lock.is_owned(lease)
+    monkeypatch.undo()
+    assert lease.close() is None
+    assert not sink._lock.is_owned(lease)
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after-release"}))
+
+
 def test_queue_lock_ownership_boundaries_do_not_strand_slot_or_drain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1219,8 +1284,18 @@ def test_uint64_exhaustion_is_stable_without_constructing_next_position() -> Non
         assert not sink.record_loss()
     assert sink.pending_count == pending
     assert sink.loss_range_count == ranges
+    drained = sink.drain()
+    assert len(drained) == 1
+    drained_payload = (
+        drained[0].message
+        if isinstance(drained[0], KnownParsedMessage)
+        else drained[0].payload
+    )
+    assert drained_payload["type"] == "future.last"
+    assert drained_payload["delivery_position"] == str(MAX_U64 - 1)
+    assert sink.pending_count == 0
+    assert sink.loss_range_count == ranges
     assert sink.drain() == []
-    assert sink.pending_count == pending
     assert sink.loss_range_count == ranges
 
 
@@ -1606,6 +1681,30 @@ def test_sink_rejects_non_integral_or_unbounded_limits(
         BoundedMessageSink(**kwargs)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("limit", [True, 0, 1.5, float("nan"), float("inf"), MAX_U64 + 1])
+def test_sink_drain_rejects_invalid_limit_before_sequencing(limit: object) -> None:
+    sink = BoundedMessageSink()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.limit"}))
+    with pytest.raises(ValueError):
+        sink.drain(limit)  # type: ignore[arg-type]
+    assert sink.pending_count == 1
+
+
+@pytest.mark.parametrize("limit", [True, 0, 1.5, float("nan"), float("inf"), MAX_U64 + 1])
+def test_addon_drain_rejects_invalid_limit_before_active_purge(limit: object) -> None:
+    now = [0.0]
+    addon = CaptureAddon(
+        active_clock=lambda: now[0],
+        max_active_age_seconds=1,
+        clock=lambda: "now",
+    )
+    addon.requestheaders(fake_flow("limit-flow"))
+    now[0] = 2.0
+    with pytest.raises(ValueError):
+        addon.drain(limit)  # type: ignore[arg-type]
+    assert "limit-flow" in addon._flows
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -1630,9 +1729,9 @@ def test_store_rejects_non_integral_or_unbounded_limits(
         MemoryStore(**kwargs)  # type: ignore[arg-type]
 
 
-def test_store_accepts_large_exact_integer_age_without_float_coercion() -> None:
-    store = MemoryStore(max_age_seconds=10**400)
-    assert store.max_age_seconds == 10**400
+def test_store_rejects_overflowing_exact_integer_age_before_append() -> None:
+    with pytest.raises(ValueError, match="bounded"):
+        MemoryStore(max_age_seconds=10**400)
 
 
 @pytest.mark.parametrize(

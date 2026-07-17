@@ -34,6 +34,7 @@ DEFAULT_MAX_AGE_SECONDS = 30 * 60
 DEFAULT_MAX_BODY_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_MESSAGES_PER_FLOW = 256
 DEFAULT_MAX_MESSAGES = DEFAULT_MAX_COMPLETED_FLOWS * 16
+MAX_SAFE_AGE_SECONDS = 1 << 53
 
 
 @dataclass
@@ -89,13 +90,16 @@ class MemoryStore:
         if max_standalone_messages is not None:
             _validate_store_limit(max_standalone_messages, "max_standalone_messages", minimum=1)
         if type(max_age_seconds) is int:
-            valid_age = max_age_seconds >= 0
+            valid_age = 0 <= max_age_seconds <= MAX_SAFE_AGE_SECONDS
         elif type(max_age_seconds) is float:
-            valid_age = math.isfinite(max_age_seconds) and max_age_seconds >= 0
+            valid_age = (
+                math.isfinite(max_age_seconds)
+                and 0 <= max_age_seconds <= MAX_SAFE_AGE_SECONDS
+            )
         else:
             valid_age = False
         if not valid_age:
-            raise ValueError("max_age_seconds must be finite and nonnegative")
+            raise ValueError("max_age_seconds must be finite, nonnegative, and bounded")
         self.max_items = max_items
         self.max_age_seconds = max_age_seconds
         self.max_body_bytes = max_body_bytes
