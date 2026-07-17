@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mitm_inspector.capture import metrics as metrics_module
 from mitm_inspector.capture import sink as sink_module
 from mitm_inspector.capture.addon import (
     CaptureAddon,
@@ -23,6 +24,7 @@ from mitm_inspector.protocol import (
     ParsedMessageResult,
     parse_message,
 )
+from mitm_inspector.store import memory as memory_module
 from mitm_inspector.store.memory import MemoryStore
 
 
@@ -550,6 +552,102 @@ def test_admission_preparation_failure_releases_reservation_without_position(
     assert sink._next_position_value == 1
 
 
+def test_reservation_acquire_baseexception_after_ownership_is_recoverable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    original_acquire = sink._reservation_lock.acquire
+
+    def interrupt_after_acquire(blocking: bool = True) -> bool:
+        acquired = original_acquire(blocking)
+        if acquired:
+            raise KeyboardInterrupt
+        return acquired
+
+    monkeypatch.setattr(sink._reservation_lock, "acquire", interrupt_after_acquire)
+    with pytest.raises(KeyboardInterrupt):
+        sink.offer(parse_message({"protocol_version": "1", "type": "future.acquire"}))
+    monkeypatch.undo()
+
+    assert sink._reserved_slots == 0
+    assert sink.pending_count == 0
+    assert sink.dropped_count == 0
+    assert sink._reservation_lock.acquire(False)
+    sink._reservation_lock.release()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
+
+
+def test_reservation_release_baseexception_before_and_after_clear_is_recoverable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink(max_pending=2)
+    original_release = sink._reservation_lock.release_if_owned
+    calls = 0
+
+    def interrupt_once() -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KeyboardInterrupt
+        return original_release()
+
+    monkeypatch.setattr(sink._reservation_lock, "release_if_owned", interrupt_once)
+    with pytest.raises(KeyboardInterrupt):
+        sink.offer(parse_message({"protocol_version": "1", "type": "future.before"}))
+    monkeypatch.undo()
+    assert sink._reserved_slots == 0
+    assert sink.pending_count == 1
+
+    original_release = sink._reservation_lock.release_if_owned
+
+    def release_then_interrupt() -> bool:
+        original_release()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink._reservation_lock, "release_if_owned", release_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
+    monkeypatch.undo()
+    assert sink._reserved_slots == 0
+    assert sink.pending_count == 2
+    assert len(sink.drain()) == 2
+
+
+def test_queue_lock_ownership_boundaries_do_not_strand_slot_or_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink(max_pending=2)
+    original_acquire = sink._lock.acquire
+
+    def interrupt_after_queue_acquire(blocking: bool = True) -> bool:
+        acquired = original_acquire(blocking)
+        if acquired:
+            raise KeyboardInterrupt
+        return acquired
+
+    monkeypatch.setattr(sink._lock, "acquire", interrupt_after_queue_acquire)
+    with pytest.raises(KeyboardInterrupt):
+        sink.offer(parse_message({"protocol_version": "1", "type": "future.queue"}))
+    monkeypatch.undo()
+    assert sink._reserved_slots == 0
+    assert sink.pending_count == 0
+
+    original_release = sink._lock.release_if_owned
+
+    def release_queue_then_interrupt() -> bool:
+        original_release()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink._lock, "release_if_owned", release_queue_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        sink.offer(parse_message({"protocol_version": "1", "type": "future.release"}))
+    monkeypatch.undo()
+    assert sink._reserved_slots == 0
+    assert sink.pending_count == 0
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
+    assert len(sink.drain()) == 1
+
+
 def test_append_failure_releases_reservation_and_records_exact_gap() -> None:
     class FailingDeque(deque[object]):
         def append(self, _item: object) -> None:
@@ -680,6 +778,72 @@ def test_keyboard_interrupt_on_second_popleft_restores_queue_and_counters() -> N
     ) == before
     assert [item.position for item in sink._items] == [1, 2]
     assert sink._last_delivered_position == 0
+
+
+def test_keyboard_interrupt_during_drain_snapshot_preserves_queue_exactly() -> None:
+    class SnapshotInterruptingDeque(deque[object]):
+        def __iter__(self) -> Iterator[object]:
+            raise KeyboardInterrupt
+
+    sink = BoundedMessageSink(max_pending=2)
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.snapshot"}))
+    original_item = sink._items[0]
+    sink._items = SnapshotInterruptingDeque([original_item])
+    with pytest.raises(KeyboardInterrupt):
+        sink.drain()
+    assert sink.pending_count == 1
+    assert sink._items[0] is original_item
+    assert sink._body_bytes == 0
+    assert sink._memory_bytes > 0
+    assert sink._last_delivered_position == 0
+    sink._items = deque([original_item])
+    assert len(sink.drain()) == 1
+
+
+@pytest.mark.parametrize("after_clear", [False, True])
+def test_keyboard_interrupt_during_drain_reservation_release_restores_transaction(
+    monkeypatch: pytest.MonkeyPatch, after_clear: bool
+) -> None:
+    sink = BoundedMessageSink()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.release"}))
+    before = (
+        sink.pending_count,
+        sink._body_bytes,
+        sink._memory_bytes,
+        sink.accepted_count,
+        sink.dropped_count,
+        sink.loss_range_count,
+        sink._next_position_value,
+        sink._last_delivered_position,
+    )
+    original_release = sink._reservation_lock.release_if_owned
+    calls = 0
+
+    def release_then_interrupt() -> bool:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return original_release()
+        if after_clear:
+            original_release()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink._reservation_lock, "release_if_owned", release_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        sink.drain()
+    monkeypatch.undo()
+
+    assert (
+        sink.pending_count,
+        sink._body_bytes,
+        sink._memory_bytes,
+        sink.accepted_count,
+        sink.dropped_count,
+        sink.loss_range_count,
+        sink._next_position_value,
+        sink._last_delivered_position,
+    ) == before
+    assert len(sink.drain()) == 1
 
 
 def test_keyboard_interrupt_during_loss_detachment_restores_all_ranges() -> None:
@@ -980,6 +1144,47 @@ def test_huge_integer_is_rejected_before_sink_or_store_retention() -> None:
     with pytest.raises(ValueError, match="bounded protocol numeric range"):
         store.append(huge)
     assert store.counters["retained_messages"] == 0
+
+
+@pytest.mark.parametrize(
+    ("value", "accepted"),
+    [
+        (-(1 << 63), True),
+        (-(1 << 63) - 1, False),
+        (MAX_U64, True),
+        (MAX_U64 + 1, False),
+    ],
+)
+def test_shared_metric_boundary_corpus_matches_sink_and_store(
+    value: int, accepted: bool
+) -> None:
+    parsed = parse_message(
+        {
+            "protocol_version": "1",
+            "type": "future.metric-boundary",
+            "nested": {"value": value},
+        }
+    )
+    sink = BoundedMessageSink(max_memory_bytes=512)
+    store = MemoryStore(max_memory_bytes=512)
+    payload = parsed.payload if not isinstance(parsed, KnownParsedMessage) else parsed.message
+    if accepted:
+        assert metrics_module.canonical_weight(payload) == memory_module._message_weight(payload)
+        assert sink.offer(parsed)
+        store.append(parsed)
+        assert sink.pending_count == 1
+        assert store.counters["retained_messages"] == 1
+    else:
+        with pytest.raises(ValueError, match="bounded protocol numeric range"):
+            metrics_module.canonical_weight(payload)
+        with pytest.raises(ValueError, match="bounded protocol numeric range"):
+            memory_module._message_weight(payload)
+        with pytest.raises(ValueError, match="bounded protocol numeric range"):
+            sink.offer(parsed)
+        with pytest.raises(ValueError, match="bounded protocol numeric range"):
+            store.append(parsed)
+        assert sink.pending_count == 0
+        assert store.counters["retained_messages"] == 0
 
 
 def test_module_addon_load_parses_valid_environment_without_ipc(

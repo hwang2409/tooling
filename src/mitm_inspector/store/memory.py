@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
-import base64
 import time
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 
+from mitm_inspector.capture.metrics import (
+    body_bytes as _message_body_bytes,
+)
+from mitm_inspector.capture.metrics import (
+    canonical_weight as _message_weight,
+)
+from mitm_inspector.capture.metrics import (
+    validate_bounded_numbers as _validate_bounded_numbers,
+)
 from mitm_inspector.protocol import (
-    MAX_U64,
     KnownParsedMessage,
     OpaqueParsedMessage,
     ParsedMessage,
@@ -507,86 +514,3 @@ def _validate_message_numbers(message: ParsedMessage) -> None:
     else:
         return
     _validate_bounded_numbers(payload)
-
-
-def _validate_bounded_numbers(value: object) -> None:
-    if type(value) is int:
-        if value < -(1 << 63) or value > MAX_U64:
-            raise ValueError("integer exceeds the bounded protocol numeric range")
-        return
-    if isinstance(value, Mapping):
-        for item in value.values():
-            _validate_bounded_numbers(item)
-        return
-    if isinstance(value, list | tuple):
-        for item in value:
-            _validate_bounded_numbers(item)
-
-
-def _message_body_bytes(payload: Mapping[str, object]) -> int:
-    message_type = payload.get("type")
-    if message_type == "body.chunk":
-        return _decoded_length(payload.get("data_base64"))
-    if message_type == "body.end":
-        return _descriptor_bytes(payload.get("body"))
-    if message_type == "flow.metadata":
-        return _flow_metadata_body_bytes(payload.get("metadata"))
-    if message_type == "browser.snapshot":
-        flows = payload.get("flows")
-        return sum(_flow_metadata_body_bytes(flow) for flow in _mappings(flows))
-    if message_type == "browser.delta":
-        changes = payload.get("changes")
-        return sum(
-            _flow_metadata_body_bytes(change.get("flow"))
-            for change in _mappings(changes)
-            if change.get("op") == "upsert"
-        )
-    return 0
-
-
-def _message_weight(payload: Mapping[str, object]) -> int:
-    """Count all canonical retained data, including unknown nested fields."""
-
-    return _canonical_weight(payload)
-
-
-def _canonical_weight(value: object) -> int:
-    if value is None or isinstance(value, bool):
-        return 1
-    if isinstance(value, int | float):
-        if type(value) is int and (value < -(1 << 63) or value > MAX_U64):
-            raise ValueError("integer exceeds the bounded protocol numeric range")
-        return 8
-    if isinstance(value, str):
-        return len(value)
-    if isinstance(value, Mapping):
-        return 8 + sum(len(key) + _canonical_weight(item) for key, item in value.items())
-    if isinstance(value, list | tuple):
-        return 8 + sum(_canonical_weight(item) for item in value)
-    return 0
-
-
-def _flow_metadata_body_bytes(value: object) -> int:
-    if not isinstance(value, Mapping):
-        return 0
-    return _descriptor_bytes(value.get("request_body")) + _descriptor_bytes(
-        value.get("response_body")
-    )
-
-
-def _mappings(value: object) -> list[Mapping[str, object]]:
-    if not isinstance(value, list | tuple):
-        return []
-    return [item for item in value if isinstance(item, Mapping)]
-
-
-def _descriptor_bytes(value: object) -> int:
-    if not isinstance(value, Mapping):
-        return 0
-    return _decoded_length(value.get("data"))
-
-
-def _decoded_length(value: object) -> int:
-    if not isinstance(value, str):
-        return 0
-    return len(base64.b64decode(value, validate=True))
