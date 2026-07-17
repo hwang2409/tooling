@@ -25,15 +25,27 @@ FLOW = {
 }
 
 
-def wait_for_server() -> None:
+def wait_for_server(server: subprocess.Popen[str]) -> None:
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
+        if server.poll() is not None:
+            output, _ = server.communicate()
+            raise RuntimeError(f"preview server exited before ready:\n{output.strip()}")
         try:
             with socket.create_connection(("127.0.0.1", PORT), timeout=0.5):
                 return
         except OSError:
             time.sleep(0.1)
     raise RuntimeError(f"preview server did not start on port {PORT}")
+
+
+def ensure_port_available() -> None:
+    try:
+        with socket.create_connection(("127.0.0.1", PORT), timeout=0.5):
+            pass
+    except OSError:
+        return
+    raise RuntimeError(f"preview port {PORT} is already in use")
 
 
 def install_fake_stream(page: Page) -> None:
@@ -133,15 +145,16 @@ def check_width(page: Page, width: int) -> None:
 
 
 def main() -> None:
+    ensure_port_available()
     server = subprocess.Popen(
-        ["npm", "run", "preview", "--", "--host", "127.0.0.1", "--port", str(PORT)],
+        ["npm", "run", "preview", "--", "--host", "127.0.0.1", "--port", str(PORT), "--strictPort"],
         cwd=ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
     try:
-        wait_for_server()
+        wait_for_server(server)
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
             page = browser.new_page()
