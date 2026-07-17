@@ -2,6 +2,7 @@ import { useId, useState } from "react";
 
 import { useConnection } from "./features/connection/useConnection";
 import type { ConnectionStatusName, TransportFactory } from "./features/connection/connectionClient";
+import { webSocketTransportFactory } from "./features/connection/wsTransport";
 import type { ConnectionViewModel } from "./features/connection/useConnection";
 import { FlowWorkspace } from "./features/flows/FlowWorkspace";
 import { formatBytes } from "./format";
@@ -27,7 +28,9 @@ export interface AppProps {
 }
 
 export function App({ transportFactory }: AppProps = {}) {
-  return <Workbench view={useConnection(transportFactory)} />;
+  // The production default speaks to the local B3 API over its WebSocket
+  // stream; tests and previews inject their own transports.
+  return <Workbench view={useConnection(transportFactory ?? webSocketTransportFactory())} />;
 }
 
 export function Workbench({ view }: { view: ConnectionViewModel }) {

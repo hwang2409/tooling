@@ -131,6 +131,11 @@ function cursor(value: string): bigint {
 
 function freezeCopy<T>(value: T): T {
   if (value === null || typeof value !== "object") return value;
+  // Every frozen object reaching this module is deep-frozen: protocol.ts
+  // recursively freezes parsed messages and this module only freezes values
+  // it deep-copied.  Reusing them keeps retention incremental instead of
+  // re-copying all retained state on every message.
+  if (Object.isFrozen(value)) return value;
   if (Array.isArray(value)) return Object.freeze(value.map((item) => freezeCopy(item))) as T;
   const copy = Object.create(null) as Record<string, unknown>;
   for (const [key, item] of Object.entries(value)) copy[key] = freezeCopy(item);
@@ -174,7 +179,8 @@ type LifecycleEntries = readonly (readonly [string, readonly ImmutableFlowLifecy
 function createLifecycleCollection(entries: LifecycleEntries): ImmutableLifecycleCollection {
   const byId = new Map<string, readonly ImmutableFlowLifecycle[]>();
   for (const [flowId, events] of entries) {
-    byId.set(flowId, Object.freeze(events.map((event) => freezeCopy(event))));
+    // Retained event lists are already frozen; only new lists pay a copy.
+    byId.set(flowId, Object.isFrozen(events) ? events : Object.freeze(events.map((event) => freezeCopy(event))));
   }
   const flowIds = Object.freeze([...byId.keys()]);
   return Object.freeze({
@@ -186,7 +192,9 @@ function createLifecycleCollection(entries: LifecycleEntries): ImmutableLifecycl
 
 function recordLifecycle(collection: ImmutableLifecycleCollection, message: FlowLifecycle): ImmutableLifecycleCollection {
   const existing = collection.get(message.flow_id);
-  const events = [...(existing ?? []), message as ImmutableFlowLifecycle].slice(-LIFECYCLE_EVENTS_PER_FLOW);
+  const events = Object.freeze(
+    [...(existing ?? []), freezeCopy(message) as ImmutableFlowLifecycle].slice(-LIFECYCLE_EVENTS_PER_FLOW),
+  );
   let flowIds = collection.flowIds;
   if (existing === undefined && flowIds.length >= LIFECYCLE_FLOW_LIMIT) {
     flowIds = flowIds.slice(flowIds.length - LIFECYCLE_FLOW_LIMIT + 1);

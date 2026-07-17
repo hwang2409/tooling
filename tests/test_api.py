@@ -1414,3 +1414,57 @@ def test_close_terminates_connected_websocket_and_ingest_peers(
             pass
 
     run_async(scenario)
+
+
+def test_incremental_metadata_projection_matches_full_rescan() -> None:
+    """The single-flow fast path must stay equivalent to a full projection."""
+
+    application = make_application(max_items=64)
+    scripted = [
+        metadata_message("flow-a"),
+        metadata_message("flow-b"),
+        metadata_message("flow-a", path="/v1/messages/updated"),
+        metadata_message("flow-c"),
+        metadata_message("flow-b", request_body=captured_body()),
+        metadata_message("flow-a", path="/v1/messages/updated"),
+    ]
+    for message in scripted:
+        application.ingest(message)
+        expected = collect_grid_flows(application.store)
+        assert application._state.published == expected
+        assert list(application._state.published) == list(expected)
+
+
+def test_incremental_metadata_projection_emits_single_upsert_delta() -> None:
+    application = make_application(max_items=64)
+    application.ingest(metadata_message("flow-a"))
+    application.ingest(metadata_message("flow-b"))
+    frames: list[str] = []
+    application.subscribe(lambda text: frames.append(text) or True)
+    frames.clear()
+    application.ingest(metadata_message("flow-a", path="/v1/updated"))
+    deltas = [json.loads(frame) for frame in frames if '"browser.delta"' in frame]
+    assert len(deltas) == 1
+    changes = deltas[0]["changes"]
+    assert len(changes) == 1
+    assert changes[0]["op"] == "upsert"
+    assert changes[0]["flow"]["flow_id"] == "flow-a"
+    assert changes[0]["flow"]["path"] == "/v1/updated"
+
+
+def test_duplicate_metadata_ingest_emits_no_delta() -> None:
+    application = make_application(max_items=64)
+    application.ingest(metadata_message("flow-a"))
+    before = application.cursor
+    result = application.ingest(metadata_message("flow-a"))
+    assert result.delta_emitted is False
+    assert application.cursor == before
+
+
+def test_eviction_during_metadata_ingest_falls_back_to_full_projection() -> None:
+    application = make_application(max_items=4)
+    for index in range(8):
+        application.ingest(metadata_message(f"flow-{index}"))
+        expected = collect_grid_flows(application.store)
+        assert application._state.published == expected
+        assert list(application._state.published) == list(expected)
