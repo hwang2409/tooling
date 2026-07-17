@@ -28,7 +28,7 @@ Git 2.54.0
 uv sync --python /opt/homebrew/bin/python3.12       # pass; local .venv
 uv run ruff check .                                 # pass
 uv run mypy                                          # pass, 11 source files
-uv run pytest                                        # pass, 81 tests
+uv run pytest                                        # pass, 138 tests
 
 npm install --prefix web                             # pass; generated lockfile
 npm ci --prefix web                                  # pass; 221 packages
@@ -44,5 +44,6 @@ The Python and TypeScript suites both parse shared positive and negative
 fixtures in `contracts/fixtures/`. They cover ordered duplicate headers,
 missing/empty/truncated body states and decoded byte counts,
 response-before-request-end ordering, bounded decimal-string values including
-u64 overflow, unknown additive fields/types, redaction canaries, gap/body
-arithmetic invariants, and private-mitmweb import bypasses.
+u64 overflow, unknown additive fields/types, fail-closed header values,
+revalidated immutable ingress, plain-JSON transport, gap/body arithmetic
+invariants, and the wholesale dynamic-import/private-mitmweb ban.

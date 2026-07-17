@@ -34,8 +34,11 @@ sockets, persist traffic, or capture real flows.
 
 ## Compatibility guard
 
-`tests/test_architecture.py` parses every source Python module and rejects
-imports from `mitmproxy.tools.web`, `mitmproxy.addons.view`,
+`tests/test_architecture.py` parses every project source Python module and
+rejects imports from `mitmproxy.tools.web`, `mitmproxy.addons.view`,
 `mitmproxy.proxy.layers`, and the private `mitmweb` namespace generally. Public
-hooks are the only allowed mitmproxy integration surface. Dynamic loader calls
-fail closed unless their module is an approved public literal.
+hooks are the only allowed mitmproxy integration surface. Dynamic imports are
+forbidden wholesale: project source cannot import or reference `importlib`,
+`builtins` import machinery, `__import__`, `import_module`, loader aliases, or
+private-module literals. Approved public mitmproxy access uses ordinary static
+imports only.

@@ -10,9 +10,12 @@ Parsing deep-copies protocol input into nominal, recursively immutable values:
 `{kind:"known", message:<KnownMessage>}` for known types, or
 `{kind:"unknown", original_type, payload}` for an opaque unknown type. Known and
 opaque values are non-overlapping, `original_type` always equals `payload.type`,
-and a known vocabulary name cannot enter the opaque branch. Store and transport
-boundaries verify the nominal parsed value at runtime; raw structural lookalikes
-are accepted only by the parser and cannot mutate retained content by alias.
+and a known vocabulary name cannot enter the opaque branch. Class or token
+identity is not a trust boundary: store and transport ingress deep-copy the
+supplied wrapper to plain JSON, verify opaque discrimination, run full protocol
+validation again, and create a new recursively frozen canonical wrapper. The
+API then emits another independent deep plain-JSON message, so no mapping proxy,
+tuple, or mutable alias crosses onto the wire.
 
 ## Numeric and ordering rules
 

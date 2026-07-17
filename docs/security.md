@@ -3,20 +3,20 @@
 The app is designed for loopback-only use and read-only inspection. S0 does
 not start a listener, authenticate a browser, proxy traffic, or persist data.
 
-Sensitive values are removed before crossing the capture-to-app boundary. The
-header policy is deliberately fail-closed for credential-shaped names:
+Sensitive values are removed before crossing the capture-to-app boundary. S0
+uses a deliberately fail-closed safe-header value allowlist:
 
-- `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `api-key`,
-  `x-api-key`, `x-auth-token`, `x-amz-security-token`, access/refresh/id
-  tokens, and client secrets become `[REDACTED]`.
-- Classification is case-insensitive and camel-case aware, and tokenizes every
-  punctuation character allowed in an HTTP field name. Header names themselves
-  are preserved unchanged. Credential-shaped terminal terms (`token`, `key`,
-  `secret`, `credential`, `cookie`, `signature`) and auth/bearer segments are redacted;
-  explicit harmless shape exceptions such as `x-token-count`, `x-key-id`,
-  `x-secret-version`, and `x-signature-version` remain visible. This catches
-  variants such as `X_Api_Key`, `XApiKey`, and `X-Auth_Token` without treating
-  ordinary metadata headers as credentials.
+- Header names and duplicate ordering are preserved unchanged, but every value
+  is `[REDACTED]` unless its case-insensitive name is explicitly allowlisted.
+- The reviewed MVP allowlist covers content type/length/encoding, the accept
+  family, cache metadata, date/etag/last-modified, host, user-agent, server,
+  range, transfer/connection metadata, and explicit request/trace ID headers.
+- Unknown, custom, credential-shaped, suffixed, malformed, Unicode, and control
+  character names always retain their name but lose their value.
+- S0 has no configuration or escape hatch for revealing another header value.
+
+This intentionally favors privacy over visibility. Expanding the allowlist
+requires a code and test change that judges the specific header value safe.
 - Query material is dropped from paths until a query-aware allow-list exists.
 - Raw mitmproxy `Flow` objects never enter the store, API, or browser contract.
 - Body bytes are bounded prefixes in the future store; body data is not shown
@@ -25,7 +25,7 @@ header policy is deliberately fail-closed for credential-shaped names:
 The shared fixtures deliberately contain no authorization, API-key, cookie, or
 query-secret canary values. `tests/test_protocol.py` enforces that property.
 The architecture guard in `tests/test_architecture.py` protects against
-accidental adoption of private mitmweb APIs.
+accidental adoption of private mitmweb APIs or dynamic import machinery.
 
 Future integration work must add loopback binding, browser authentication, and
 explicit tests for redaction-before-transport before enabling live traffic.

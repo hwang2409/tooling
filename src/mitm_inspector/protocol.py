@@ -236,6 +236,10 @@ type FrozenJsonValue = (
     | Mapping[str, FrozenJsonValue]
 )
 type FrozenJsonObject = Mapping[str, FrozenJsonValue]
+type PlainJsonValue = (
+    None | bool | int | float | str | list[PlainJsonValue] | dict[str, PlainJsonValue]
+)
+type PlainJsonObject = dict[str, PlainJsonValue]
 _PARSE_TOKEN = object()
 
 
@@ -315,11 +319,103 @@ type ParsedMessageResult = KnownParsedMessage | OpaqueParsedMessage
 
 
 def require_parsed_message(value: object) -> ParsedMessageResult:
-    """Reject structural lookalikes at store and transport ingress."""
+    """Copy and fully revalidate an untrusted parsed wrapper at ingress."""
 
-    if type(value) not in (KnownParsedMessage, OpaqueParsedMessage):
-        raise ProtocolError("message must be an immutable value returned by parse_message")
-    return cast(ParsedMessageResult, value)
+    if isinstance(value, KnownParsedMessage):
+        try:
+            supplied_payload = object.__getattribute__(value, "_message")
+        except AttributeError as error:
+            raise ProtocolError("known parsed wrapper has no message payload") from error
+        payload = _copy_plain_object(supplied_payload, label="message")
+        reparsed = parse_message(payload)
+        if not isinstance(reparsed, KnownParsedMessage):
+            raise ProtocolError("known parsed wrapper must contain a known message type")
+        return reparsed
+
+    if isinstance(value, OpaqueParsedMessage):
+        try:
+            original_type = object.__getattribute__(value, "_original_type")
+            supplied_payload = object.__getattribute__(value, "_payload")
+        except AttributeError as error:
+            raise ProtocolError("opaque parsed wrapper is incomplete") from error
+        if not isinstance(original_type, str) or not original_type:
+            raise ProtocolError("opaque original_type must be a non-empty string")
+        payload = _copy_plain_object(supplied_payload, label="payload")
+        if original_type in KNOWN_MESSAGE_TYPES:
+            raise ProtocolError("opaque parsed wrapper cannot use a known type")
+        if payload.get("type") != original_type:
+            raise ProtocolError("opaque original_type must equal payload.type")
+        reparsed = parse_message(payload)
+        if not isinstance(reparsed, OpaqueParsedMessage):
+            raise ProtocolError("opaque parsed wrapper must contain an unknown message type")
+        return reparsed
+
+    raise ProtocolError("message must be a parsed wrapper")
+
+
+def parsed_message_to_plain_json(value: object) -> PlainJsonObject:
+    """Revalidate a wrapper and return an independent JSON wire message."""
+
+    canonical = require_parsed_message(value)
+    if isinstance(canonical, KnownParsedMessage):
+        return _copy_plain_object(canonical.message, label="message")
+    return _copy_plain_object(canonical.payload, label="payload")
+
+
+def _copy_plain_json(
+    value: object,
+    *,
+    label: str,
+    ancestors: set[int] | None = None,
+) -> PlainJsonValue:
+    """Copy JSON-shaped containers to plain mutable dict/list wire values."""
+
+    if value is None or isinstance(value, str | bool | int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ProtocolError(f"{label} must contain finite JSON numbers")
+        return value
+    if ancestors is None:
+        ancestors = set()
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in ancestors:
+            raise ProtocolError(f"{label} must not contain cycles")
+        ancestors.add(identity)
+        try:
+            copied: dict[str, PlainJsonValue] = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ProtocolError(f"{label} object keys must be strings")
+                copied[key] = _copy_plain_json(
+                    item,
+                    label=f"{label}.{key}",
+                    ancestors=ancestors,
+                )
+            return copied
+        finally:
+            ancestors.remove(identity)
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        identity = id(value)
+        if identity in ancestors:
+            raise ProtocolError(f"{label} must not contain cycles")
+        ancestors.add(identity)
+        try:
+            return [
+                _copy_plain_json(item, label=f"{label}[{index}]", ancestors=ancestors)
+                for index, item in enumerate(value)
+            ]
+        finally:
+            ancestors.remove(identity)
+    raise ProtocolError(f"{label} must contain only JSON values")
+
+
+def _copy_plain_object(value: object, *, label: str) -> PlainJsonObject:
+    copied = _copy_plain_json(value, label=label)
+    if not isinstance(copied, dict):
+        raise ProtocolError(f"{label} must be an object")
+    return copied
 
 
 def _freeze_json(

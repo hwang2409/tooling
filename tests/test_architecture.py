@@ -4,113 +4,105 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).parents[1]
+SOURCE_ROOT = ROOT / "src"
 APPROVED_PUBLIC_IMPORTS = frozenset({"mitmproxy.http"})
-EXCLUDED_PARTS = frozenset({".git", ".venv", "node_modules", "dist", "__pycache__"})
+FORBIDDEN_DYNAMIC_ROOTS = frozenset({"builtins", "importlib"})
+FORBIDDEN_DYNAMIC_NAMES = frozenset(
+    {"__builtins__", "__import__", "builtins", "import_module", "importlib"}
+)
+FORBIDDEN_DYNAMIC_ATTRIBUTES = frozenset({"__import__", "import_module"})
+FORBIDDEN_DYNAMIC_LITERAL_MARKERS = frozenset(
+    {"__builtins__", "__import__", "builtins", "import_module", "importlib"}
+)
+SUSPICIOUS_LOADER_CALL_NAMES = frozenset(
+    {"dynamic_import", "dynamic_loader", "importer", "load", "loader"}
+)
+PRIVATE_MODULE_PREFIXES = (
+    "mitmproxy.addons.view",
+    "mitmproxy.proxy.layers",
+    "mitmproxy.tools.web",
+    "mitmweb",
+)
 
 
 def project_python_files() -> list[Path]:
     return sorted(
         path
-        for path in ROOT.rglob("*")
+        for path in SOURCE_ROOT.rglob("*")
         if path.suffix in {".py", ".pyi", ".pyw"}
-        and not EXCLUDED_PARTS.intersection(path.parts)
     )
 
 
-def _loader_aliases(tree: ast.AST) -> set[str]:
-    aliases = {"__import__", "import_module"}
-    changed = True
-    while changed:
-        changed = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module == "importlib":
-                for alias in node.names:
-                    if alias.name == "import_module":
-                        name = alias.asname or alias.name
-                        if name not in aliases:
-                            aliases.add(name)
-                            changed = True
-            if isinstance(node, ast.ImportFrom) and node.module == "builtins":
-                for alias in node.names:
-                    if alias.name == "__import__":
-                        name = alias.asname or alias.name
-                        if name not in aliases:
-                            aliases.add(name)
-                            changed = True
-            if isinstance(node, ast.Assign | ast.AnnAssign):
-                value = node.value
-                is_loader = isinstance(value, ast.Name) and value.id in aliases
-                is_loader = is_loader or (
-                    isinstance(value, ast.Attribute)
-                    and value.attr in {"import_module", "__import__"}
-                )
-                if is_loader:
-                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                    for target in targets:
-                        if isinstance(target, ast.Name) and target.id not in aliases:
-                            aliases.add(target.id)
-                            changed = True
-    return aliases
-
-
-def _dynamic_import_name(node: ast.Call, loader_aliases: set[str]) -> tuple[bool, str | None]:
-    if isinstance(node.func, ast.Name) and node.func.id in loader_aliases:
-        pass
-    elif (
-        isinstance(node.func, ast.Attribute)
-        and node.func.attr in {"import_module", "__import__"}
-    ):
-        pass
-    else:
-        return False, None
-    argument = node.args[0] if node.args else next(
-        (keyword.value for keyword in node.keywords if keyword.arg == "name"),
-        None,
+def _is_approved_public_import(imported_name: str) -> bool:
+    return any(
+        imported_name == approved or imported_name.startswith(f"{approved}.")
+        for approved in APPROVED_PUBLIC_IMPORTS
     )
-    if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
-        return True, argument.value
-    return True, None
 
 
-def find_private_mitm_imports(source: str, filename: str = "<source>") -> list[str]:
+def _is_private_module_literal(value: str) -> bool:
+    return any(prefix in value for prefix in PRIVATE_MODULE_PREFIXES)
+
+
+def _is_dynamic_import_literal(value: str) -> bool:
+    return any(marker in value for marker in FORBIDDEN_DYNAMIC_LITERAL_MARKERS)
+
+
+def find_import_boundary_violations(
+    source: str,
+    filename: str = "<source>",
+) -> list[str]:
     tree = ast.parse(source, filename=filename)
-    loader_aliases = _loader_aliases(tree)
     violations: list[str] = []
+
+    def reject(node: ast.AST, detail: str) -> None:
+        violations.append(f"{filename}:{getattr(node, 'lineno', 0)}: {detail}")
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            imported_names = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom) and node.module and node.module == "mitmproxy":
-            imported_names = [f"{node.module}.{alias.name}" for alias in node.names]
+            for alias in node.names:
+                imported_name = alias.name
+                if imported_name.split(".", 1)[0] in FORBIDDEN_DYNAMIC_ROOTS:
+                    reject(node, f"dynamic import machinery is forbidden: {imported_name}")
+                elif imported_name.startswith("mitmproxy"):
+                    if not _is_approved_public_import(imported_name):
+                        reject(node, f"unapproved mitmproxy import: {imported_name}")
+                elif imported_name == "mitmweb" or imported_name.startswith("mitmweb."):
+                    reject(node, f"private mitmweb import: {imported_name}")
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            module = node.module
+            if module.split(".", 1)[0] in FORBIDDEN_DYNAMIC_ROOTS:
+                reject(node, f"dynamic import machinery is forbidden: {module}")
+            elif module == "mitmproxy" or module.startswith("mitmproxy."):
+                for alias in node.names:
+                    imported_name = f"{module}.{alias.name}"
+                    if not _is_approved_public_import(imported_name):
+                        reject(node, f"unapproved mitmproxy import: {imported_name}")
+            elif module == "mitmweb" or module.startswith("mitmweb."):
+                reject(node, f"private mitmweb import: {module}")
+        elif isinstance(node, ast.Name) and node.id in FORBIDDEN_DYNAMIC_NAMES:
+            reject(node, f"dynamic import name is forbidden: {node.id}")
+        elif isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_DYNAMIC_ATTRIBUTES:
+            reject(node, f"dynamic import attribute is forbidden: {node.attr}")
         elif (
-            isinstance(node, ast.ImportFrom)
-            and node.module
-            and node.module.startswith("mitmproxy.")
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in SUSPICIOUS_LOADER_CALL_NAMES
         ):
-            imported_names = [f"{node.module}.{alias.name}" for alias in node.names]
-        elif isinstance(node, ast.Call):
-            is_loader, dynamic_name = _dynamic_import_name(node, loader_aliases)
-            imported_names = []
-            if is_loader:
-                if dynamic_name is None:
-                    violations.append(f"{filename}:{node.lineno}: unresolved dynamic import")
-                elif dynamic_name not in APPROVED_PUBLIC_IMPORTS:
-                    violations.append(f"{filename}:{node.lineno}: {dynamic_name}")
-        else:
-            imported_names = []
-        for imported_name in imported_names:
-            if (
-                imported_name.startswith("mitmproxy")
-                and imported_name not in APPROVED_PUBLIC_IMPORTS
-            ):
-                violations.append(f"{filename}:{node.lineno}: {imported_name}")
+            reject(node, f"unresolved dynamic loader call is forbidden: {node.func.id}")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if _is_dynamic_import_literal(node.value):
+                reject(node, f"dynamic import literal is forbidden: {node.value}")
+            elif _is_private_module_literal(node.value):
+                reject(node, f"private module literal is forbidden: {node.value}")
     return violations
 
 
-def test_project_uses_only_approved_public_mitmproxy_imports() -> None:
+def test_project_uses_only_static_approved_public_mitmproxy_imports() -> None:
     violations = [
         violation
         for path in project_python_files()
-        for violation in find_private_mitm_imports(path.read_text(), str(path))
+        for violation in find_import_boundary_violations(path.read_text(), str(path))
     ]
     assert violations == []
 
@@ -121,41 +113,51 @@ def test_project_uses_only_approved_public_mitmproxy_imports() -> None:
         "from mitmproxy.tools import web",
         "from mitmproxy.tools import web as public_web",
         "import mitmproxy.proxy.layers as layers",
-        "import importlib; importlib.import_module('mitmproxy.tools.web')",
-        "from importlib import import_module; import_module('mitmproxy.addons.view')",
-        "__import__('mitmproxy.proxy.layers')",
-        "from importlib import import_module as load; load('mitmproxy.tools.web')",
-        "loader = __import__; loader('mitmproxy.addons.view')",
+        "import mitmweb.master",
+        "PRIVATE_MODULE = 'mitmproxy.tools.web'",
+        "PRIVATE_MODULE = 'mitmweb.state'",
     ],
 )
-def test_private_api_bypass_forms_are_rejected(source: str) -> None:
-    assert find_private_mitm_imports(source)
+def test_private_api_imports_and_literals_are_rejected(source: str) -> None:
+    assert find_import_boundary_violations(source)
 
 
 @pytest.mark.parametrize(
     "source",
     [
-        "from importlib import import_module as load; load(name)",
-        "import builtins; loader = builtins.__import__; loader(module_name)",
+        "import importlib",
+        "from importlib import import_module",
+        "import importlib; importlib.import_module('mitmproxy.http')",
+        "from importlib import import_module as load; load('mitmproxy.http')",
+        "__import__('mitmproxy.http')",
+        "import_module(module_name)",
+        "load(module_name)",
+        "loader(module_name)",
+        "import builtins; loader = builtins.__import__; loader('mitmproxy.http')",
         "from builtins import __import__ as loader; loader(name=module_name)",
+        "(loader := __import__)('mitmproxy.http')",
+        "loader, other = __import__, print; loader('mitmproxy.http')",
+        "import builtins; getattr(builtins, '__import__')('mitmproxy.http')",
+        "__builtins__['__import__']('mitmproxy.http')",
+        "import importlib; importlib.__dict__['import_module']('mitmproxy.http')",
+        "module = 'importlib'",
+        "module = 'builtins'",
+        "eval(\"__import__('mitmproxy.http')\")",
+        "eval(\"importlib.import_module('mitmproxy.http')\")",
     ],
 )
-def test_unresolved_dynamic_loader_calls_fail_closed(source: str) -> None:
-    assert "unresolved dynamic import" in find_private_mitm_imports(source)[0]
-
-
-def test_dynamic_loader_rejects_literals_outside_the_public_allow_list() -> None:
-    source = "from importlib import import_module as load; load('json')"
-    assert find_private_mitm_imports(source)
+def test_all_dynamic_import_machinery_is_rejected(source: str) -> None:
+    assert find_import_boundary_violations(source)
 
 
 @pytest.mark.parametrize(
     "source",
     [
         "from mitmproxy import http",
-        "from importlib import import_module as load; load('mitmproxy.http')",
-        "import builtins; loader = builtins.__import__; loader('mitmproxy.http')",
+        "import mitmproxy.http",
+        "from mitmproxy.http import HTTPFlow",
+        "import json",
     ],
 )
-def test_documented_public_import_remains_allowed(source: str) -> None:
-    assert find_private_mitm_imports(source) == []
+def test_ordinary_static_public_imports_remain_allowed(source: str) -> None:
+    assert find_import_boundary_violations(source) == []

@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 from jsonschema import Draft202012Validator
 
+from mitm_inspector import protocol as protocol_module
 from mitm_inspector.api.transport import encode_for_browser
 from mitm_inspector.capture.redaction import REDACTED, sanitize_header, sanitize_path
 from mitm_inspector.protocol import (
@@ -47,6 +48,31 @@ def known(message: object) -> FrozenJsonObject:
 
 def known_fixture_messages() -> list[object]:
     return [message for message in fixture_messages() if message["type"] != "future.message"]
+
+
+def body_chunk_message() -> dict[str, object]:
+    return {
+        "protocol_version": "1",
+        "type": "body.chunk",
+        "flow_id": "f",
+        "body_side": "request",
+        "chunk_index": "0",
+        "offset_bytes": "0",
+        "data_base64": "",
+        "extension": {"nested": [{"value": "before"}]},
+    }
+
+
+def assert_deep_plain_json(value: object) -> None:
+    if isinstance(value, dict):
+        assert all(type(key) is str for key in value)
+        for item in value.values():
+            assert_deep_plain_json(item)
+    elif isinstance(value, list):
+        for item in value:
+            assert_deep_plain_json(item)
+    else:
+        assert value is None or type(value) in {bool, float, int, str}
 
 
 def body_descriptors(message: Mapping[str, object]) -> list[Mapping[str, object]]:
@@ -172,16 +198,7 @@ def test_unknown_types_and_additive_fields_are_tolerated_without_numeric_coercio
 
 
 def test_parsed_messages_are_nominal_non_overlapping_and_recursively_immutable() -> None:
-    raw_known = {
-        "protocol_version": "1",
-        "type": "body.chunk",
-        "flow_id": "f",
-        "body_side": "request",
-        "chunk_index": "0",
-        "offset_bytes": "0",
-        "data_base64": "",
-        "extension": {"nested": [{"value": "before"}]},
-    }
+    raw_known = body_chunk_message()
     known_message = parse_message(raw_known)
     assert isinstance(known_message, KnownParsedMessage)
     assert not hasattr(known_message, "payload")
@@ -226,6 +243,139 @@ def test_opaque_messages_reject_non_json_cycles() -> None:
         )
 
 
+def test_ingress_rejects_token_constructed_invalid_known_wrapper() -> None:
+    invalid_payload = body_chunk_message()
+    invalid_payload["flow_id"] = ""
+    constructed = KnownParsedMessage(
+        cast(FrozenJsonObject, invalid_payload),
+        _token=protocol_module._PARSE_TOKEN,
+    )
+    with pytest.raises(ProtocolError, match="flow_id"):
+        MemoryStore().append(constructed)
+    with pytest.raises(ProtocolError, match="flow_id"):
+        encode_for_browser(constructed)
+
+
+def test_ingress_canonicalizes_object_new_wrapper_and_breaks_nested_aliases() -> None:
+    mutable_payload = body_chunk_message()
+    forged = object.__new__(KnownParsedMessage)
+    object.__setattr__(forged, "_message", mutable_payload)
+
+    store = MemoryStore()
+    store.append(forged)
+    stored = next(store.newest_first())
+    assert isinstance(stored, KnownParsedMessage)
+    assert stored is not forged
+
+    mutable_payload["flow_id"] = "mutated"
+    mutable_payload["extension"]["nested"][0]["value"] = "after"
+    assert stored.message["flow_id"] == "f"
+    extension = stored.message["extension"]
+    assert isinstance(extension, Mapping)
+    assert extension["nested"][0]["value"] == "before"
+
+
+def test_ingress_revalidates_payload_replaced_after_parse() -> None:
+    parsed = parse_message(body_chunk_message())
+    assert isinstance(parsed, KnownParsedMessage)
+    tampered_payload = body_chunk_message()
+    object.__setattr__(parsed, "_message", tampered_payload)
+
+    store = MemoryStore()
+    store.append(parsed)
+    stored = next(store.newest_first())
+    assert stored is not parsed
+    tampered_payload["extension"]["nested"][0]["value"] = "after"
+    assert isinstance(stored, KnownParsedMessage)
+    extension = stored.message["extension"]
+    assert isinstance(extension, Mapping)
+    assert extension["nested"][0]["value"] == "before"
+
+
+def test_ingress_canonicalizes_valid_opaque_wrapper() -> None:
+    mutable_payload = {
+        "protocol_version": "1",
+        "type": "future.message",
+        "extension": {"values": ["before"]},
+    }
+    forged = object.__new__(OpaqueParsedMessage)
+    object.__setattr__(forged, "_original_type", "future.message")
+    object.__setattr__(forged, "_payload", mutable_payload)
+
+    store = MemoryStore()
+    store.append(forged)
+    stored = next(store.newest_first())
+    assert isinstance(stored, OpaqueParsedMessage)
+    assert stored is not forged
+    mutable_payload["extension"]["values"][0] = "after"
+    extension = stored.payload["extension"]
+    assert isinstance(extension, Mapping)
+    assert extension["values"] == ("before",)
+    assert encode_for_browser(stored) == {
+        "protocol_version": "1",
+        "type": "future.message",
+        "extension": {"values": ["before"]},
+    }
+
+
+@pytest.mark.parametrize(
+    ("original_type", "payload_type"),
+    [
+        ("future.message", "different.future"),
+        ("future.message", "body.chunk"),
+        ("body.chunk", "body.chunk"),
+    ],
+)
+def test_ingress_rejects_object_new_spoofed_opaque_wrappers(
+    original_type: str,
+    payload_type: str,
+) -> None:
+    spoofed = object.__new__(OpaqueParsedMessage)
+    object.__setattr__(spoofed, "_original_type", original_type)
+    object.__setattr__(
+        spoofed,
+        "_payload",
+        {"protocol_version": "1", "type": payload_type},
+    )
+    with pytest.raises(ProtocolError):
+        MemoryStore().append(spoofed)
+    with pytest.raises(ProtocolError):
+        encode_for_browser(spoofed)
+
+
+def test_transport_returns_independent_deep_plain_json() -> None:
+    raw = body_chunk_message()
+    parsed = parse_message(raw)
+    assert isinstance(parsed, KnownParsedMessage)
+
+    wire = encode_for_browser(parsed)
+    assert_deep_plain_json(wire)
+    assert wire == raw
+    assert json.loads(json.dumps(wire)) == wire
+
+    wire["flow_id"] = "wire-mutated"
+    wire["extension"]["nested"][0]["value"] = "wire-mutated"
+    assert parsed.message["flow_id"] == "f"
+    parsed_extension = parsed.message["extension"]
+    assert isinstance(parsed_extension, Mapping)
+    assert parsed_extension["nested"][0]["value"] == "before"
+
+    store = MemoryStore()
+    store.append(parsed)
+    stored = next(store.newest_first())
+    assert stored is not parsed
+    stored_wire = encode_for_browser(stored)
+    stored_wire["extension"]["nested"][0]["value"] = "after"
+    assert encode_for_browser(stored)["extension"]["nested"][0]["value"] == "before"
+
+
+def test_transport_json_roundtrips_every_valid_known_and_opaque_message() -> None:
+    for raw in [*fixture_messages(), *conformance()["valid"]]:
+        wire = encode_for_browser(parse_message(raw))
+        assert_deep_plain_json(wire)
+        assert json.loads(json.dumps(wire)) == raw
+
+
 @pytest.mark.parametrize(
     "forged",
     [
@@ -246,9 +396,9 @@ def test_store_and_transport_reject_forged_or_spoofed_envelopes(
     forged: dict[str, object],
 ) -> None:
     structural_lookalike = cast(ParsedMessage, forged)
-    with pytest.raises(ProtocolError, match="returned by parse_message"):
+    with pytest.raises(ProtocolError, match="parsed wrapper"):
         MemoryStore().append(structural_lookalike)
-    with pytest.raises(ProtocolError, match="returned by parse_message"):
+    with pytest.raises(ProtocolError, match="parsed wrapper"):
         encode_for_browser(structural_lookalike)
 
 
@@ -262,6 +412,37 @@ def test_fixtures_have_no_secret_canaries() -> None:
         "contract-secret",
     ):
         assert canary not in serialized
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Accept",
+        "ACCEPT-ENCODING",
+        "accept-language",
+        "Cache-Control",
+        "Content-Encoding",
+        "Content-Length",
+        "Content-Range",
+        "Content-Type",
+        "Date",
+        "ETag",
+        "Expires",
+        "Host",
+        "Last-Modified",
+        "Range",
+        "Server",
+        "Traceparent",
+        "Transfer-Encoding",
+        "User-Agent",
+        "X-B3-TraceId",
+        "X-Correlation-ID",
+        "X-Request-ID",
+        "X-Trace-ID",
+    ],
+)
+def test_redaction_exposes_only_explicit_safe_header_values(name: str) -> None:
+    assert sanitize_header(name, "safe-value") == (name, "safe-value")
 
 
 @pytest.mark.parametrize(
@@ -289,22 +470,6 @@ def test_fixtures_have_no_secret_canaries() -> None:
         "X-Custom_Secret",
         "X-Signature",
         "Cookie",
-    ],
-)
-def test_redaction_covers_credential_shape_variants(name: str) -> None:
-    assert sanitize_header(name, "credential-canary") == (name, REDACTED)
-
-
-@pytest.mark.parametrize("punctuation", list("!#$%&'*+-.^_`|~"))
-def test_redaction_tokenizes_every_rfc_field_name_punctuation(punctuation: str) -> None:
-    name = f"X{punctuation}Api{punctuation}Key"
-    assert sanitize_header(name, "credential-canary") == (name, REDACTED)
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "Content-Type",
         "Content-Key",
         "X-Trace",
         "X-Token-Count",
@@ -318,14 +483,51 @@ def test_redaction_tokenizes_every_rfc_field_name_punctuation(punctuation: str) 
         "X+Key+ID",
         "X.Secret.Version",
         "X.Api.Key.Version",
+        "X-Api-Key-Suffix",
+        "XApiKeySuffix",
+        "X-Request-ID-Suffix",
+        "Unknown-Custom-Header",
     ],
 )
-def test_redaction_does_not_redact_harmless_shaped_headers(name: str) -> None:
-    assert sanitize_header(name, "safe-value") == (name, "safe-value")
+def test_redaction_redacts_all_unlisted_prior_and_suffix_variants(name: str) -> None:
+    assert sanitize_header(name, "credential-canary") == (name, REDACTED)
 
 
-def test_redaction_is_case_and_separator_insensitive_for_credential_names() -> None:
-    for name in ("Authorization", "X_Api_Key", "X-Auth_Token", "X-Amz-Security_Token"):
-        assert sanitize_header(name, "credential-canary")[1] == REDACTED
-    assert sanitize_header("X-Trace", "safe-value") == ("X-Trace", "safe-value")
+@pytest.mark.parametrize("punctuation", list("!#$%&'*+-.^_`|~"))
+def test_redaction_redacts_every_punctuation_variant(punctuation: str) -> None:
+    name = f"X{punctuation}Api{punctuation}Key"
+    assert sanitize_header(name, "credential-canary") == (name, REDACTED)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        " Content-Type",
+        "Content-Type ",
+        "Content\x00Type",
+        "Content\nType",
+        "Contént-Type",
+        "Ｃontent-Type",
+        "🔥",
+    ],
+)
+def test_redaction_preserves_but_never_exposes_invalid_header_names(name: str) -> None:
+    assert sanitize_header(name, "credential-canary") == (name, REDACTED)
+
+
+def test_redaction_preserves_header_name_order() -> None:
+    headers = [
+        ("X-Custom", "secret"),
+        ("Content-Type", "application/json"),
+        ("X-Custom", "second-secret"),
+    ]
+    assert [sanitize_header(name, value) for name, value in headers] == [
+        ("X-Custom", REDACTED),
+        ("Content-Type", "application/json"),
+        ("X-Custom", REDACTED),
+    ]
+
+
+def test_query_material_is_dropped() -> None:
     assert sanitize_path("/v1/messages?query-secret-canary") == "/v1/messages"
