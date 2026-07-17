@@ -86,18 +86,23 @@ describe("flowSummary", () => {
         { protocol_version: "1", type: "flow.lifecycle", source_id: "s", flow_id: "flow-1", event_id: "e1", occurred_at: "2026-01-01T00:00:00Z", sequence: "1", state: "error" },
       ],
     }));
-    expect(summary).toContain("err");
+    expect(summary).toBe("GET /things · err · —");
     expect(summary).not.toContain("api.example.test");
   });
 
-  it("omits the status segment entirely from the generic shape when unknown and no error observed", () => {
-    const summary = flowSummary(flow({
+  it("locks both status and duration slots for the generic shape", () => {
+    const unknown = flowSummary(flow({
       metadata: { flow_id: "flow-1", method: "GET", scheme: "https", host: "api.example.test", port: "443", path: "/things", request_headers: [], request_body: { state: "missing" } },
       lifecycle: [
         { protocol_version: "1", type: "flow.lifecycle", source_id: "s", flow_id: "flow-1", event_id: "e1", occurred_at: "2026-01-01T00:00:00Z", sequence: "1", state: "request_started" },
       ],
     }));
-    expect(summary).toBe("GET /things · —");
+    expect(unknown).toBe("GET /things · — · —");
+
+    const statusOnly = flowSummary(flow({
+      metadata: { flow_id: "flow-1", method: "GET", scheme: "https", host: "api.example.test", port: "443", path: "/things", request_headers: [], request_body: { state: "missing" }, response_status: "200" },
+    }));
+    expect(statusOnly).toBe("GET /things · 200 · —");
   });
 
   it("falls back to the generic shape when the request body is missing", () => {

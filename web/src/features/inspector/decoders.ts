@@ -33,6 +33,12 @@ export interface DecodedBody {
   truncated: boolean;
   fallback: "none" | "text" | "hex";
   events?: SseEvent[];
+  /**
+   * SSE payload bytes that arrived after the last complete `\n\n`-terminated
+   * frame. Preserved verbatim so a truncated trailing frame can still be
+   * rendered and copied — the parser itself never returns partial events.
+   */
+  pendingSseSuffix?: string;
 }
 
 const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -87,6 +93,28 @@ export function decodeUtf8(bytes: Uint8Array, preserveBom = false): TextDecodeRe
   } catch {
     return { text: toHex(bytes), invalid: true };
   }
+}
+
+export interface SseStreamParseResult {
+  readonly events: SseEvent[];
+  readonly pendingSuffix: string;
+}
+
+/**
+ * Parse SSE text and also return the unconsumed suffix — the bytes after
+ * the last complete `\n\n`-terminated frame. The suffix is preserved
+ * verbatim so a truncated trailing frame can still be surfaced instead of
+ * silently dropped.
+ */
+export function parseSseStream(text: string): SseStreamParseResult {
+  const events = parseSseEvents(text);
+  const withoutBom = text.startsWith("﻿") ? text.slice(1) : text;
+  const normalized = withoutBom.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+  // The parser terminates a frame on the first blank line, so any text after
+  // the last "\n\n" (or the whole payload when none exists) is unconsumed.
+  const lastBoundary = normalized.lastIndexOf("\n\n");
+  const suffix = lastBoundary === -1 ? normalized : normalized.slice(lastBoundary + 2);
+  return { events, pendingSuffix: suffix.length === 0 ? "" : suffix };
 }
 
 export function parseSseEvents(text: string): SseEvent[] {
@@ -191,15 +219,16 @@ export function decodeBody(body: InspectableBody, mode: BodyViewMode, limit = DE
     }
   }
   if (mode === "sse") {
-    const events = parseSseEvents(utf8.text);
+    const parseResult = parseSseStream(utf8.text);
+    const { events, pendingSuffix } = parseResult;
     if (events.length === 0) {
       // Preserve the raw payload verbatim so garbage or partial frames stay
       // inspectable; the caller renders this via the plain-text fallback.
       const text = utf8.text || "(empty text)";
-      return { mode, text, copyText: utf8.text, byteLength: base64.bytes.length, invalidEncoding: false, truncated, fallback: "text", events: [] };
+      return { mode, text, copyText: utf8.text, byteLength: base64.bytes.length, invalidEncoding: false, truncated, fallback: "text", events: [], pendingSseSuffix: pendingSuffix };
     }
-    const text = formatSse(events);
-    return { mode, text, copyText: text, byteLength: base64.bytes.length, invalidEncoding: false, truncated, fallback: "none", events };
+    const text = pendingSuffix.length > 0 ? `${formatSse(events)}\n\ntruncated frame\n${pendingSuffix}` : formatSse(events);
+    return { mode, text, copyText: text, byteLength: base64.bytes.length, invalidEncoding: false, truncated, fallback: "none", events, pendingSseSuffix: pendingSuffix };
   }
   return { mode, text: utf8.text || "(empty text)", copyText: utf8.text, byteLength: base64.bytes.length, invalidEncoding: false, truncated, fallback: "none" };
 }

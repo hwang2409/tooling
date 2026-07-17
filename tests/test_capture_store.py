@@ -158,6 +158,26 @@ def test_response_can_start_before_request_end_and_duplicate_hooks_are_idempoten
     assert states.count("flow_completed") == 1
 
 
+def test_error_flow_metadata_never_carries_a_synthetic_response_status() -> None:
+    addon = CaptureAddon(source_id="test-source", clock=lambda: "now")
+    flow = fake_flow(flow_id="errored")
+    # No responseheaders / response hook fires — this is the failed-connect
+    # shape where the proxy observed only the outbound request before the
+    # error. Every metadata emission from here must omit response_status.
+    flow.response = None
+    addon.requestheaders(flow)
+    addon.error(flow)
+    messages = payloads(addon)
+    metadata_messages = [
+        message for message in messages if message["type"] == "flow.metadata"
+    ]
+    assert metadata_messages, "expected at least one flow.metadata payload"
+    for message in metadata_messages:
+        metadata = message["metadata"]
+        assert isinstance(metadata, Mapping)
+        assert "response_status" not in metadata, message
+
+
 def test_response_status_is_emitted_only_for_real_http_status_codes() -> None:
     addon = CaptureAddon(source_id="test-source", clock=lambda: "now")
     good = fake_flow()

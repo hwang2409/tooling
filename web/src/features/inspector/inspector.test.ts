@@ -130,6 +130,17 @@ describe("SSE framing", () => {
     expect(twoBoms.text).toBe("\uFEFF\uFEFFdata: hello\n\n");
   });
 
+  it("preserves the truncated trailing frame in text, copyText, and the parsed suffix", () => {
+    const raw = "data: complete\n\ndata: truncated";
+    const decoded = decodeBody({ state: "captured", size_bytes: String(raw.length), encoding: "base64", data: encoded(raw) }, "sse");
+    expect(decoded.events?.map((event) => event.data)).toEqual(["complete"]);
+    expect(decoded.pendingSseSuffix).toBe("data: truncated");
+    expect(decoded.text).toContain("data: complete");
+    expect(decoded.text).toContain("truncated frame");
+    expect(decoded.text).toContain("data: truncated");
+    expect(decoded.copyText).toBe(decoded.text);
+  });
+
   it("falls back to raw text when the SSE parser finds no frames", () => {
     const raw = "not sse at all";
     const decoded = decodeBody({ state: "captured", size_bytes: String(raw.length), encoding: "base64", data: encoded(raw) }, "sse");

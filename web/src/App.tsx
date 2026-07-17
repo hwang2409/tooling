@@ -5,6 +5,8 @@ import type { ConnectionStatusName, TransportFactory } from "./features/connecti
 import { webSocketTransportFactory } from "./features/connection/wsTransport";
 import type { ConnectionViewModel } from "./features/connection/useConnection";
 import { FlowWorkspace } from "./features/flows/FlowWorkspace";
+import { useSeenFlows } from "./features/flows/useSeenFlows";
+export { SEEN_FLOW_LIMIT } from "./features/flows/useSeenFlows";
 import { formatBytes } from "./format";
 import "./styles/shell.css";
 
@@ -22,9 +24,6 @@ export { formatBytes } from "./format";
 function formatCursor(value: string): string {
   return value.length > 9 ? `${value.slice(0, 3)}…${value.slice(-4)}` : value;
 }
-
-/** Upper bound on remembered seen flow ids. Older entries evict FIFO. */
-export const SEEN_FLOW_LIMIT = 1024;
 
 export interface AppProps {
   transportFactory?: TransportFactory;
@@ -45,23 +44,9 @@ export function Workbench({ view }: { view: ConnectionViewModel }) {
   // seenFlowIds lives on the workbench so a reconnect — which unmounts
   // FlowWorkspace via the empty-state branch when displayed flows drop
   // to zero in follow-live mode — does not throw away the record of
-  // which rows the user has already opened. Bounded by SEEN_FLOW_LIMIT
-  // with FIFO eviction on the insertion-ordered Set so the working set
-  // stays bounded without discarding entries on transient reconnects.
-  const [seenFlowIds, setSeenFlowIds] = useState<ReadonlySet<string>>(() => new Set());
-  const markFlowSeen = (flowId: string) => {
-    setSeenFlowIds((previous) => {
-      if (previous.has(flowId)) return previous;
-      const next = new Set(previous);
-      next.add(flowId);
-      while (next.size > SEEN_FLOW_LIMIT) {
-        const oldest = next.values().next().value;
-        if (oldest === undefined) break;
-        next.delete(oldest);
-      }
-      return next;
-    });
-  };
+  // which rows the user has already opened. Implementation and rollover
+  // discipline live in useSeenFlows.
+  const { seen: seenFlowIds, mark: markFlowSeen } = useSeenFlows(browser.flows.ids);
   const statusInfo = statusCopy[status.state];
   const isBusy = status.state === "connecting" || status.state === "reconnecting";
   const isRetrying = status.state === "reconnecting";

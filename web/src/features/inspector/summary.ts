@@ -15,21 +15,23 @@ import type { InspectorFlow } from "./models";
 export function flowSummary(flow: InspectorFlow): string {
   const method = flow.metadata.method;
   const path = flow.metadata.path;
-  const status = normalizedStatus(flow);
+  const status = normalizedStatus(flow) ?? "—";
   const duration = formatDurationMs(durationMsFromLifecycle(flow.lifecycle ?? []));
   const requestBody = flow.request_body ?? flow.metadata.request_body;
   const responseBody = flow.response_body ?? flow.metadata.response_body;
 
   const anthropic = anthropicMessagesSummary(requestBody, path, method);
   if (anthropic !== null) {
-    const parts = [anthropic, `${formatBytesCompact(sizeOf(requestBody))} in / ${formatBytesCompact(sizeOf(responseBody))} out`, duration];
-    if (status !== null) parts.push(status);
-    return parts.join(" · ");
+    return [
+      anthropic,
+      `${formatBytesCompact(sizeOf(requestBody))} in / ${formatBytesCompact(sizeOf(responseBody))} out`,
+      duration,
+      status,
+    ].join(" · ");
   }
-  const parts = [`${method} ${path}`];
-  if (status !== null) parts.push(status);
-  parts.push(duration);
-  return parts.join(" · ");
+  // Generic shape locks both slots so `<method> <path> · <status> · <duration>`
+  // is always three segments; unknown values render as an em dash placeholder.
+  return `${method} ${path} · ${status} · ${duration}`;
 }
 
 function sizeOf(body: InspectableBody | undefined): string | undefined {

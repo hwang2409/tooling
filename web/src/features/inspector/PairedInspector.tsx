@@ -187,7 +187,7 @@ function BodyOutput({ decoded }: { decoded: DecodedBody }) {
         </div>
       ) : decoded.mode === "sse" && decoded.events !== undefined && decoded.events.length > 0 ? (
         <div className={`inspector-output is-${decoded.mode}`} tabIndex={0} aria-label={`${decoded.mode} body output`}>
-          <SseBlocks events={decoded.events} />
+          <SseBlocks events={decoded.events} pendingSuffix={decoded.pendingSseSuffix} />
         </div>
       ) : (
         <pre className={`inspector-output is-${decoded.mode}`} tabIndex={0} aria-label={`${decoded.mode} body output`}>{decoded.text}</pre>
@@ -197,12 +197,24 @@ function BodyOutput({ decoded }: { decoded: DecodedBody }) {
   );
 }
 
-function SseBlocks({ events }: { events: readonly SseEvent[] }) {
+function SseBlocks({ events, pendingSuffix }: { events: readonly SseEvent[]; pendingSuffix?: string }) {
   return (
     <ol className="inspector-sse-list">
       {events.map((event, index) => (
         <SseBlock key={index} event={event} index={index} />
       ))}
+      {pendingSuffix !== undefined && pendingSuffix.length > 0 && (
+        <li className="inspector-sse-item is-truncated" data-testid="sse-truncated-frame">
+          <div className="inspector-sse-toggle" aria-label="truncated frame">
+            <span aria-hidden="true">…</span>
+            <span className="inspector-sse-label">truncated frame</span>
+            <span className="inspector-sse-meta">no terminator observed</span>
+          </div>
+          <div className="inspector-sse-body">
+            <pre className="inspector-sse-raw">{pendingSuffix}</pre>
+          </div>
+        </li>
+      )}
     </ol>
   );
 }
