@@ -127,23 +127,19 @@ class BoundedMessageSink:
         if not reservation.acquire(False):
             self._sequencer.record_loss()
             return False
-        if not self._sequencer.lock.acquire(False):
-            close_error = self._finish_reservation_safely(reservation)
-            self._sequencer.record_loss()
-            if close_error is not None:
-                raise close_error
-            return False
-        if not self._sequencer.can_accept_locked(self._max_pending):
-            self._sequencer.lock.release()
-            close_error = self._finish_reservation_safely(reservation)
-            self._sequencer.record_loss()
-            if close_error is not None:
-                raise close_error
-            return False
+        sequencer_locked = False
         committed = False
         primary: BaseException | None = None
-        before_state = self._sequencer.state
+        before_state: SequencerState | None = None
         try:
+            if not self._sequencer.lock.acquire(False):
+                self._sequencer.record_loss()
+                return False
+            sequencer_locked = True
+            if not self._sequencer.can_accept_locked(self._max_pending):
+                self._sequencer.record_loss()
+                return False
+            before_state = self._sequencer.state
             _validate_message_numbers(message)
             retained = (
                 parse_message(message)
@@ -165,14 +161,29 @@ class BoundedMessageSink:
             # A fault injected immediately after the sequencer's atomic
             # state replacement has a committed outcome even though the
             # caller did not receive ``True``.
-            if self._sequencer.state.accepted > before_state.accepted:
+            if before_state is not None and self._sequencer.state.accepted > before_state.accepted:
                 committed = True
                 _mark_committed_exception(error)
             primary = error
             raise
         finally:
-            self._sequencer.lock.release()
-            close_error = self._finish_reservation_safely(reservation)
+            close_error: BaseException | None = None
+            try:
+                # Arm the gate before the sequencer unlock.  If the unlock
+                # itself is interrupted, the next producer can retry this
+                # generation instead of inheriting an owned gate forever.
+                reservation.prepare_close()
+            except BaseException as error:
+                close_error = error
+            try:
+                if sequencer_locked:
+                    self._sequencer.lock.release()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+            finish_error = self._finish_reservation_safely(reservation)
+            if close_error is None:
+                close_error = finish_error
             if close_error is not None:
                 if committed:
                     _mark_committed_exception(close_error)
@@ -195,6 +206,10 @@ class BoundedMessageSink:
             primary: BaseException | None = None
             result: DrainBatch | None = None
             try:
+                # Publish the generation's cleanup obligation before the
+                # sequencer can release its internal lock or hand off a
+                # committed batch.
+                reservation.prepare_close()
                 result = self._sequencer.drain(
                     limit, _with_delivery_position, _gap_after_loss
                 )
@@ -227,7 +242,10 @@ class BoundedMessageSink:
     ) -> BaseException | None:
         """Publish cleanup ownership before invoking the fallible helper."""
 
-        reservation.prepare_close()
+        try:
+            reservation.prepare_close()
+        except BaseException as error:
+            return error
         try:
             return self._finish_reservation(reservation)
         except BaseException as error:

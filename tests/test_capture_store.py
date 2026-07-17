@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mitm_inspector.capture import adapter as adapter_module
 from mitm_inspector.capture import gate as gate_module
 from mitm_inspector.capture import metrics as metrics_module
 from mitm_inspector.capture import sequencer as sequencer_module
@@ -169,6 +170,84 @@ def test_successful_completion_does_not_emit_a_capture_loss_gap() -> None:
     messages = payloads(addon)
     assert not any(message.get("type") == "stream.gap" for message in messages)
     assert addon.sink.dropped_count == 0
+
+
+def test_offer_post_sequencer_unlock_fault_does_not_wedge_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    original_lock = sink._sequencer.lock
+
+    class ReleaseFaultLock:
+        def __init__(self) -> None:
+            self.failed = True
+
+        def acquire(self, blocking: bool = True) -> bool:
+            return original_lock.acquire(blocking)
+
+        def release(self) -> None:
+            original_lock.release()
+            if self.failed:
+                self.failed = False
+                raise KeyboardInterrupt("post-unlock")
+
+        def __enter__(self) -> object:
+            self.acquire()
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.release()
+
+    monkeypatch.setattr(sink._sequencer, "lock", ReleaseFaultLock())
+    with pytest.raises(KeyboardInterrupt, match="post-unlock"):
+        sink.offer(parse_message({"protocol_version": "1", "type": "future.unlock"}))
+    monkeypatch.undo()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after-unlock"}))
+    batch = sink.drain()
+    assert [
+        message.message["type"]
+        if isinstance(message, KnownParsedMessage)
+        else message.payload["type"]
+        for message in batch
+    ] == ["future.unlock", "future.after-unlock"]
+    sink.acknowledge(batch)
+
+
+def test_drain_post_sequencer_unlock_fault_recovers_committed_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.drain-unlock"}))
+    original_lock = sink._sequencer.lock
+
+    class ReleaseFaultLock:
+        def __init__(self) -> None:
+            self.failed = True
+
+        def acquire(self, blocking: bool = True) -> bool:
+            return original_lock.acquire(blocking)
+
+        def release(self) -> None:
+            original_lock.release()
+            if self.failed:
+                self.failed = False
+                raise KeyboardInterrupt("post-drain-unlock")
+
+        def __enter__(self) -> object:
+            self.acquire()
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.release()
+
+    monkeypatch.setattr(sink._sequencer, "lock", ReleaseFaultLock())
+    with pytest.raises(KeyboardInterrupt, match="post-drain-unlock") as raised:
+        sink.drain()
+    assert getattr(raised.value, "capture_committed", False)
+    monkeypatch.undo()
+    batch = sink.drain()
+    assert len(batch) == 1
+    sink.acknowledge(batch)
 
 
 def test_post_commit_lifecycle_fault_reconciles_sequence_before_retry(
@@ -401,6 +480,90 @@ def test_equal_adjacent_body_chunks_are_distinct_without_retry_receipt(side: str
     ]
     assert [message.message["chunk_index"] for message in chunks] == ["0", "1"]
     assert [message.message["offset_bytes"] for message in chunks] == ["0", "5"]
+
+
+@pytest.mark.parametrize("side", ["request", "response"])
+def test_pending_chunk_constructor_fault_precedes_all_body_accounting(
+    monkeypatch: pytest.MonkeyPatch, side: str
+) -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    state = addon._ensure_flow(fake_flow())
+    body = state.request if side == "request" else state.response
+
+    def fail_constructor(*args: object, **kwargs: object) -> object:
+        raise MemoryError("pending receipt construction")
+
+    monkeypatch.setattr(adapter_module, "_PendingChunk", fail_constructor)
+    with pytest.raises(MemoryError, match="pending receipt construction"):
+        addon._observe_chunk(state, side, b"abc")
+    assert body.total_bytes == 0
+    assert body.chunk_index == 0
+    assert body.prefix == bytearray()
+    assert body.pending_chunk is None
+    assert addon._captured_prefix_bytes == 0
+    monkeypatch.undo()
+
+    addon._observe_chunk(state, side, b"abc")
+    assert body.total_bytes == 3
+    assert body.chunk_index == 1
+    assert bytes(body.prefix) == b"abc"
+
+
+@pytest.mark.parametrize("side", ["request", "response"])
+def test_equal_retry_chunk_uses_bytes_identity_not_reusable_address(
+    monkeypatch: pytest.MonkeyPatch, side: str
+) -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    state = addon._ensure_flow(fake_flow())
+    body = state.request if side == "request" else state.response
+    first = bytes(bytearray(b"equal"))
+    second = bytes(bytearray(b"equal"))
+    original_publish = addon._publish_body_chunk
+    failed = True
+
+    def fail_receipt(body_arg: object, pending: object, retryable: bool) -> None:
+        nonlocal failed
+        if failed:
+            failed = False
+            raise KeyboardInterrupt("retry receipt")
+        original_publish(body_arg, pending, retryable)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(addon, "_publish_body_chunk", fail_receipt)
+    with pytest.raises(KeyboardInterrupt, match="retry receipt"):
+        addon._observe_chunk(state, side, first)
+    monkeypatch.undo()
+    assert body.retry_chunk is not None
+    addon._observe_chunk(state, side, second)
+    addon._finish_body(state, side, None)
+    chunks = [
+        message
+        for message in addon.drain()
+        if isinstance(message, KnownParsedMessage)
+        and message.message.get("type") == "body.chunk"
+        and message.message.get("body_side") == side
+    ]
+    assert [message.message["chunk_index"] for message in chunks] == ["0", "1"]
+    assert [message.message["offset_bytes"] for message in chunks] == ["0", "5"]
+
+
+def test_retained_flow_does_not_retain_released_capture_state() -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    flow = fake_flow()
+    addon.requestheaders(flow)
+    flow.request.stream(b"secret-prefix")
+    state = addon._flows[flow.id]
+    state_ref = weakref.ref(state)
+    callback = flow.request.stream
+    assert bytes(state.request.prefix) == b"secret-prefix"
+
+    addon._complete_active(state)
+    assert addon.counters["active_prefix_bytes"] == 0
+    assert state.request.prefix == bytearray()
+    assert state.identity == {}
+    del state
+    gc.collect()
+    assert state_ref() is None
+    assert callback(b"still-forwarded") == b"still-forwarded"
 
 
 @pytest.mark.parametrize("side", ["request", "response"])
@@ -1118,8 +1281,47 @@ def test_drain_baseexception_restores_one_atomic_snapshot(
         sink._memory_bytes,
     ) == before
     monkeypatch.undo()
-    assert len(sink.drain()) == 1
+    batch = sink.drain()
+    assert len(batch) == 1
+    sink.acknowledge(batch)
     assert sink._memory_bytes == 0
+
+
+def test_unacknowledged_drain_batch_remains_inside_admission_budgets() -> None:
+    sink = BoundedMessageSink(max_pending=2, max_body_bytes=8, max_memory_bytes=4_096)
+    message = parse_message(
+        {
+            "protocol_version": "1",
+            "type": "body.end",
+            "flow_id": "budget",
+            "body_side": "response",
+            "total_bytes": "8",
+            "body": {
+                "state": "captured",
+                "size_bytes": "8",
+                "encoding": "base64",
+                "data": base64.b64encode(b"12345678").decode(),
+            },
+        }
+    )
+    assert sink.offer(message)
+    retained_memory = sink._memory_bytes
+    batch = sink.drain()
+    assert len(batch) == 1
+    assert sink._memory_bytes == retained_memory
+    assert sink._body_bytes == 8
+    assert not sink.offer(message)
+    assert sink.pending_count == 0
+    sink.acknowledge(batch)
+    assert sink._memory_bytes == 0
+    assert sink._body_bytes == 0
+    assert sink.offer(message)
+
+    count_sink = BoundedMessageSink(max_pending=1, max_body_bytes=8, max_memory_bytes=4_096)
+    assert count_sink.offer(message)
+    count_batch = count_sink.drain()
+    assert not count_sink.offer(message)
+    count_sink.acknowledge(count_batch)
 
 
 def test_sink_queue_and_body_drops_are_in_band_and_delivery_positioned() -> None:

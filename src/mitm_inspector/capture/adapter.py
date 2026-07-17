@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import math
 import time
+import weakref
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -52,13 +53,13 @@ def _validate_active_limits(max_flows: object, max_age: object) -> None:
         raise ValueError("max_active_age_seconds must be finite and nonnegative")
 
 
-@dataclass
+@dataclass(frozen=True)
 class _PendingChunk:
     offset: int
     chunk_index: int
     captured_start: int
     captured_length: int
-    source_identity: int
+    source_object: bytes
 
 
 @dataclass
@@ -403,16 +404,21 @@ class CaptureAddon:
         state: _FlowCapture,
         side: str,
     ) -> None:
+        state_ref = weakref.ref(state)
+
         def observe(chunk: bytes) -> bytes:
-            body = state.request if side == "request" else state.response
-            if state.completed or state.discarded or not body.stream_enabled:
+            current = state_ref()
+            if current is None:
+                return chunk
+            body = current.request if side == "request" else current.response
+            if current.completed or current.discarded or not body.stream_enabled:
                 return chunk
             try:
-                self._observe_chunk(state, side, chunk)
+                self._observe_chunk(current, side, chunk)
             except OverflowError:
                 # Forwarding owns the return value.  Exhaustion is a capture
                 # terminal state, never a reason to interrupt mitmproxy.
-                self._discard_active(state, count_eviction=False)
+                self._discard_active(current, count_eviction=False)
             return chunk
 
         message.stream = observe
@@ -427,11 +433,11 @@ class CaptureAddon:
         if body.retry_chunk is not None:
             retry = body.retry_chunk
             body.retry_chunk = None
-            if retry.source_identity == id(copied):
+            if retry.source_object is copied:
                 return
         if body.pending_chunk is not None:
             pending = body.pending_chunk
-            is_retry = pending.source_identity == id(copied)
+            is_retry = pending.source_object is copied
             self._emit_body_lifecycle(state, side, body)
             self._emit_pending_chunk(state, side, body, pending)
             if is_retry:
@@ -443,8 +449,6 @@ class CaptureAddon:
         if not body.lifecycle_emitted:
             self._ensure_lifecycle_capacity()
         offset = body.total_bytes
-        body.total_bytes += len(copied)
-        body.observed = True
         remaining = (
             0
             if body.prefix_sealed
@@ -460,17 +464,25 @@ class CaptureAddon:
         )
         captured = copied[: min(remaining, global_remaining)]
         captured_start = len(body.prefix)
-        body.prefix.extend(captured)
-        self._captured_prefix_bytes += len(captured)
-        body.pending_chunk = _PendingChunk(
+        pending = _PendingChunk(
             offset,
             body.chunk_index,
             captured_start,
             len(captured),
-            id(copied),
+            copied,
         )
-        if len(captured) < len(copied):
-            body.prefix_sealed = True
+        # Build every allocation that can fail before publishing any body or
+        # global accounting.  A constructor/allocation fault is then a clean
+        # retry of the same caller observation, not a half-accounted chunk.
+        next_prefix = body.prefix + captured
+        next_total = body.total_bytes + len(copied)
+        next_sealed = body.prefix_sealed or len(captured) < len(copied)
+        body.prefix = next_prefix
+        body.total_bytes = next_total
+        body.observed = True
+        self._captured_prefix_bytes += len(captured)
+        body.pending_chunk = pending
+        body.prefix_sealed = next_sealed
         self._emit_body_lifecycle(state, side, body)
         self._emit_pending_chunk(state, side, body, body.pending_chunk)
 
@@ -752,10 +764,33 @@ class CaptureAddon:
         self._active_metadata_bytes -= state.retained_weight
         assert self._captured_prefix_bytes >= 0
         assert self._active_metadata_bytes >= 0
+        self._scrub_released_state(state)
         state.discarded = True
         state.tombstone = True
         if count_eviction:
             self._capture_evicted_flows += 1
+
+    @staticmethod
+    def _scrub_released_state(state: _FlowCapture) -> None:
+        """Drop secret-bearing state even if a caller retains the Flow."""
+
+        state.identity.clear()
+        state.request_headers.clear()
+        state.response_headers = None
+        state.lifecycle_states.clear()
+        for body in (state.request, state.response):
+            body.content_type = None
+            body.total_bytes = 0
+            body.prefix.clear()
+            body.chunk_index = 0
+            body.observed = False
+            body.lifecycle_emitted = False
+            body.ended = True
+            body.stream_enabled = False
+            body.prefix_sealed = True
+            body.pending_chunk = None
+            body.retry_chunk = None
+        state.retained_weight = 0
 
     def _send(self, raw: dict[str, object]) -> bool:
         try:

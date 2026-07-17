@@ -76,6 +76,11 @@ class SequencerState:
     items: tuple[QueuedMessage, ...] = ()
     body_bytes: int = 0
     memory_bytes: int = 0
+    # Detached messages remain budget-charged while their batch is handed to
+    # the consumer.  They are released only by the matching acknowledgement.
+    committed_message_count: int = 0
+    committed_body_bytes: int = 0
+    committed_memory_bytes: int = 0
     accepted: int = 0
     dropped: int = 0
     forced: int = 0
@@ -244,7 +249,9 @@ class DeliverySequencer:
         """Append while the caller owns ``lock``."""
 
         state = self._take_pending(self.state)
-        if state.exhausted or len(state.items) >= max_pending:
+        if state.exhausted or (
+            len(state.items) + state.committed_message_count >= max_pending
+        ):
             if not state.exhausted:
                 state = self._append_loss_count(state, 1)
             self.state = state
@@ -285,7 +292,9 @@ class DeliverySequencer:
         """Check admission before a caller touches an offered payload."""
 
         state = self.state
-        return not state.exhausted and len(state.items) < max_pending
+        return not state.exhausted and (
+            len(state.items) + state.committed_message_count < max_pending
+        )
 
     def acknowledge(self, batch: DrainBatch) -> None:
         """Acknowledge a batch only after the consumer accepts all messages."""
@@ -304,6 +313,11 @@ class DeliverySequencer:
             self.state = replace(
                 state,
                 committed_batch=None,
+                body_bytes=state.body_bytes - state.committed_body_bytes,
+                memory_bytes=state.memory_bytes - state.committed_memory_bytes,
+                committed_message_count=0,
+                committed_body_bytes=0,
+                committed_memory_bytes=0,
                 last_acknowledged_generation=batch.token,
             )
 
@@ -372,8 +386,11 @@ class DeliverySequencer:
                     if count == len(state.items)
                     else state.trailing_losses
                 ),
-                body_bytes=state.body_bytes - body,
-                memory_bytes=state.memory_bytes - memory,
+                # Keep detached messages charged until explicit acknowledgement;
+                # the committed batch still retains their payloads.
+                committed_message_count=len(detached),
+                committed_body_bytes=body,
+                committed_memory_bytes=memory,
                 forced=forced,
                 last_delivered=cursor,
             )
