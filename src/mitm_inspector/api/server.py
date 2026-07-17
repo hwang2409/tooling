@@ -190,6 +190,7 @@ class ApiServer:
         self._ingest_server: asyncio.Server | None = None
         self._sweep_task: asyncio.Task[None] | None = None
         self._connections: set[asyncio.StreamWriter] = set()
+        self._closing = False
         self._rejected_ingest_lines = 0
         self._ingest_connections = 0
         self._http_requests = 0
@@ -216,6 +217,7 @@ class ApiServer:
         return port
 
     async def start(self) -> None:
+        self._closing = False
         if self._http_server is not None:
             raise ApiServerError("the API server is already started")
         self._http_server = await asyncio.start_server(
@@ -256,6 +258,7 @@ class ApiServer:
         await self._http_server.serve_forever()
 
     async def close(self) -> None:
+        self._closing = True
         if self._sweep_task is not None:
             self._sweep_task.cancel()
             try:
@@ -272,17 +275,28 @@ class ApiServer:
             server.close()
         # Server.wait_closed() waits for every active connection handler on
         # Python 3.12.1+, so a connected WebSocket client or ingest producer
-        # would stall shutdown forever.  Abort live transports first; their
-        # handlers observe the reset and finish promptly.
+        # would stall shutdown forever.  Abort live transports and re-check:
+        # a connection accepted in the same tick may have a handler that has
+        # not run yet, so it is not in the snapshot; handlers observe
+        # ``_closing`` on entry, and this loop aborts late registrations
+        # until every handler has finished.
+        for server in servers:
+            while True:
+                self._abort_connections()
+                try:
+                    await asyncio.wait_for(server.wait_closed(), 0.25)
+                    break
+                except TimeoutError:
+                    continue
+        self._ingest_server = None
+        self._http_server = None
+
+    def _abort_connections(self) -> None:
         for writer in list(self._connections):
             try:
                 writer.transport.abort()
             except (ConnectionError, RuntimeError):
                 pass
-        for server in servers:
-            await server.wait_closed()
-        self._ingest_server = None
-        self._http_server = None
 
     async def _close_http(self) -> None:
         if self._http_server is not None:
@@ -308,6 +322,10 @@ class ApiServer:
         self._connections.add(writer)
         self._ingest_connections += 1
         try:
+            if self._closing:
+                # This handler can start one tick after close() snapshotted
+                # the connection set; never outlive an announced shutdown.
+                return
             while True:
                 try:
                     line = await reader.readline()
@@ -340,6 +358,10 @@ class ApiServer:
         self._connections.add(writer)
         self._http_requests += 1
         try:
+            if self._closing:
+                # See the ingest handler: an accept can race close() by one
+                # event-loop tick.
+                return
             try:
                 raw_head = await asyncio.wait_for(
                     reader.readuntil(b"\r\n\r\n"), timeout=HEAD_READ_TIMEOUT_SECONDS

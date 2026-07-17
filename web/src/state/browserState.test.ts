@@ -385,6 +385,52 @@ describe("per-flow lifecycle retention", () => {
     expect(events).toHaveLength(LIFECYCLE_EVENTS_PER_FLOW);
     expect(events?.[0].sequence).toBe("9");
     expect(events?.[events.length - 1].sequence).toBe(String(LIFECYCLE_EVENTS_PER_FLOW + 8));
+    expect(state.lifecycles.isTruncated("f")).toBe(true);
+  });
+
+  it("marks lifecycle overflow only after the 33rd event", () => {
+    let state = reduce(initialBrowserState, hello("source-a"));
+    for (let sequence = 1; sequence <= 31; sequence += 1) {
+      state = reduce(state, lifecycleMessage("f", String(sequence)));
+    }
+    expect(state.lifecycles.isTruncated("f")).toBe(false);
+
+    state = reduce(state, lifecycleMessage("f", "32"));
+    expect(state.lifecycles.get("f")).toHaveLength(32);
+    expect(state.lifecycles.isTruncated("f")).toBe(false);
+
+    state = reduce(state, lifecycleMessage("f", "33"));
+    expect(state.lifecycles.get("f")).toHaveLength(32);
+    expect(state.lifecycles.isTruncated("f")).toBe(true);
+  });
+
+  it("evicts exactly one oldest flow at the flow-limit boundary", () => {
+    // Pins the `>=` limit comparison: with a `>` mutant the collection
+    // would hold LIFECYCLE_FLOW_LIMIT + 1 flows after one insert past the cap.
+    let state = reduce(initialBrowserState, hello("source-a"));
+    for (let index = 0; index < LIFECYCLE_FLOW_LIMIT; index += 1) {
+      state = reduce(state, lifecycleMessage(`flow-${index}`, String(index + 1)));
+    }
+    expect(state.lifecycles.size).toBe(LIFECYCLE_FLOW_LIMIT);
+    expect(state.lifecycles.get("flow-0")).toHaveLength(1);
+
+    const overflowed = reduce(state, lifecycleMessage("flow-overflow", String(LIFECYCLE_FLOW_LIMIT + 1)));
+    expect(overflowed.lifecycles.size).toBe(LIFECYCLE_FLOW_LIMIT);
+    expect(overflowed.lifecycles.get("flow-0")).toBeUndefined();
+    expect(overflowed.lifecycles.get("flow-1")).toHaveLength(1);
+    expect(overflowed.lifecycles.get("flow-overflow")).toHaveLength(1);
+  });
+
+  it("reuses untouched per-flow event lists instead of re-copying retained state", () => {
+    const source = reduce(initialBrowserState, hello("source-a"));
+    const first = reduce(source, lifecycleMessage("f", "1"));
+    const second = reduce(first, lifecycleMessage("g", "2"));
+    // Recording flow g must not rebuild flow f's retained (frozen) events.
+    expect(second.lifecycles.get("f")).toBe(first.lifecycles.get("f"));
+    const third = reduce(second, lifecycleMessage("f", "3"));
+    expect(third.lifecycles.get("g")).toBe(second.lifecycles.get("g"));
+    expect(third.lifecycles.get("f")).not.toBe(second.lifecycles.get("f"));
+    expect(third.lifecycles.get("f")).toHaveLength(2);
   });
 
   it("caps the number of tracked flows by evicting the oldest tracked flow", () => {
@@ -422,6 +468,27 @@ describe("per-flow lifecycle retention", () => {
     expect(removed.lifecycles.get("f")).toBeUndefined();
     expect(removed.lifecycles.get("g")).toHaveLength(1);
     expect(removed.lifecycles.flowIds).toEqual(["g"]);
+  });
+
+  it("preserves surviving truncation markers when pruning another flow", () => {
+    const source = reduce(initialBrowserState, hello("source-a"));
+    const snapshot = reduce(source, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "one", cursor: "1", flows: [flow("f"), flow("g")],
+    });
+    let tracked = snapshot;
+    for (let sequence = 1; sequence <= LIFECYCLE_EVENTS_PER_FLOW + 1; sequence += 1) {
+      tracked = reduce(tracked, lifecycleMessage("f", String(sequence)));
+    }
+    tracked = reduce(tracked, lifecycleMessage("g", String(LIFECYCLE_EVENTS_PER_FLOW + 2)));
+    expect(tracked.lifecycles.isTruncated("f")).toBe(true);
+
+    const removed = reduce(tracked, {
+      protocol_version: "1", type: "browser.delta", cursor: "2", changes: [{ op: "remove", flow_id: "g" }],
+    });
+
+    expect(removed.lifecycles.isTruncated("f")).toBe(true);
+    expect(removed.lifecycles.isTruncated("g")).toBe(false);
+    expect(removed.lifecycles.get("f")).toHaveLength(LIFECYCLE_EVENTS_PER_FLOW);
   });
 
   it("freezes retained lifecycle events and their containers", () => {

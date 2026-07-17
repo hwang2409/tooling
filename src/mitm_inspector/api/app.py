@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from mitm_inspector.api.projection import collect_grid_flows, diff_grid_changes
+from mitm_inspector.api.projection import collect_grid_flows, diff_grid_changes, grid_flow
 from mitm_inspector.json_boundary import PlainJsonObject
 from mitm_inspector.protocol import (
     MAX_U64,
@@ -161,7 +161,12 @@ class ApiApplication:
         if relayed:
             self._broadcast(self._wire_text(parsed_message_to_plain_json(parsed)))
             self._counters.relayed_messages += 1
-        delta_emitted = self._reconcile(force=payload.get("type") == "flow.metadata")
+        metadata: Mapping[str, object] | None = None
+        if payload.get("type") == "flow.metadata":
+            candidate = payload.get("metadata")
+            if isinstance(candidate, Mapping):
+                metadata = candidate
+        delta_emitted = self._reconcile(force=metadata is not None, metadata=metadata)
         return IngestResult(parsed=parsed, relayed=relayed, delta_emitted=delta_emitted)
 
     def sweep(self) -> bool:
@@ -243,11 +248,19 @@ class ApiApplication:
         }
         return json.dumps(detail, separators=(",", ":"))
 
-    def _reconcile(self, *, force: bool) -> bool:
+    def _reconcile(
+        self, *, force: bool, metadata: Mapping[str, object] | None = None
+    ) -> bool:
         counters = self._store.counters
         marks = tuple(counters[name] for name in _EVICTION_COUNTER_NAMES)
-        if not force and marks == self._state.eviction_marks:
-            return False
+        if marks == self._state.eviction_marks:
+            if not force:
+                return False
+            if metadata is not None:
+                # Nothing was evicted, so this newest metadata message is the
+                # only possible change; project just its flow instead of
+                # re-scanning and re-copying the entire retained store.
+                return self._reconcile_single_flow(metadata)
         self._state.eviction_marks = marks
         current = collect_grid_flows(self._store)
         changes = diff_grid_changes(self._state.published, current)
@@ -255,6 +268,24 @@ class ApiApplication:
         if not changes:
             return False
         return self._emit_delta(changes)
+
+    def _reconcile_single_flow(self, metadata: Mapping[str, object]) -> bool:
+        flow_id = metadata.get("flow_id")
+        if not isinstance(flow_id, str) or not flow_id:
+            return False
+        flow = grid_flow(metadata)
+        published = self._state.published
+        unchanged = published.get(flow_id) == flow
+        # The just-ingested metadata is now the flow's newest message, which
+        # moves the flow to the end of the oldest-first projection order even
+        # when its content is identical, exactly like a full re-projection.
+        current = dict(published)
+        current.pop(flow_id, None)
+        current[flow_id] = flow
+        self._state.published = current
+        if unchanged:
+            return False
+        return self._emit_delta([{"op": "upsert", "flow": flow}])
 
     def _emit_delta(self, changes: list[PlainJsonObject]) -> bool:
         if self._state.cursor >= MAX_U64:

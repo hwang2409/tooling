@@ -91,12 +91,14 @@ describe("buildFlowRow", () => {
       response_body: { state: "empty", size_bytes: "0", content_type: "text/event-stream" },
     }));
     expect(fromBodies.contentType).toBe("text/event-stream");
-    expect(fromBodies.filterable.requestContentType).toBe("application/json");
+    // mitmproxy's ~t matches the full header value, parameters included.
+    expect(fromBodies.filterable.requestContentType).toBe("application/json; charset=utf-8");
 
     const fromHeaders = buildFlowRow(metadata({
       request_headers: [{ name: "Content-Type", value: "application/xml; charset=utf-8" }],
     }));
     expect(fromHeaders.contentType).toBe("application/xml");
+    expect(fromHeaders.filterable.requestContentType).toBe("application/xml; charset=utf-8");
 
     const none = buildFlowRow(metadata());
     expect(none.contentType).toBe("—");

@@ -50,6 +50,8 @@ export const LIFECYCLE_EVENTS_PER_FLOW = 32;
 export interface ImmutableLifecycleCollection {
   readonly flowIds: readonly string[];
   readonly size: number;
+  readonly truncatedFlowIds: readonly string[];
+  readonly isTruncated: (flowId: string) => boolean;
   readonly get: (flowId: string) => readonly ImmutableFlowLifecycle[] | undefined;
 }
 
@@ -131,6 +133,11 @@ function cursor(value: string): bigint {
 
 function freezeCopy<T>(value: T): T {
   if (value === null || typeof value !== "object") return value;
+  // Every frozen object reaching this module is deep-frozen: protocol.ts
+  // recursively freezes parsed messages and this module only freezes values
+  // it deep-copied.  Reusing them keeps retention incremental instead of
+  // re-copying all retained state on every message.
+  if (Object.isFrozen(value)) return value;
   if (Array.isArray(value)) return Object.freeze(value.map((item) => freezeCopy(item))) as T;
   const copy = Object.create(null) as Record<string, unknown>;
   for (const [key, item] of Object.entries(value)) copy[key] = freezeCopy(item);
@@ -171,24 +178,40 @@ function createFlowCollection(entries: readonly ImmutableFlowMetadata[]): Immuta
 
 type LifecycleEntries = readonly (readonly [string, readonly ImmutableFlowLifecycle[]])[];
 
-function createLifecycleCollection(entries: LifecycleEntries): ImmutableLifecycleCollection {
+function createLifecycleCollection(
+  entries: LifecycleEntries,
+  truncatedFlowIds: readonly string[] = [],
+): ImmutableLifecycleCollection {
   const byId = new Map<string, readonly ImmutableFlowLifecycle[]>();
   for (const [flowId, events] of entries) {
-    byId.set(flowId, Object.freeze(events.map((event) => freezeCopy(event))));
+    // Retained event lists are already frozen; only new lists pay a copy.
+    byId.set(flowId, Object.isFrozen(events) ? events : Object.freeze(events.map((event) => freezeCopy(event))));
   }
   const flowIds = Object.freeze([...byId.keys()]);
+  const retained = new Set(flowIds);
+  const truncated = Object.freeze([...new Set(truncatedFlowIds)].filter((flowId) => retained.has(flowId)));
+  const truncatedSet = new Set(truncated);
   return Object.freeze({
     flowIds,
     size: flowIds.length,
+    truncatedFlowIds: truncated,
+    isTruncated: (flowId: string) => truncatedSet.has(flowId),
     get: (flowId: string) => byId.get(flowId),
   });
 }
 
 function recordLifecycle(collection: ImmutableLifecycleCollection, message: FlowLifecycle): ImmutableLifecycleCollection {
   const existing = collection.get(message.flow_id);
-  const events = [...(existing ?? []), message as ImmutableFlowLifecycle].slice(-LIFECYCLE_EVENTS_PER_FLOW);
+  const events = Object.freeze(
+    [...(existing ?? []), freezeCopy(message) as ImmutableFlowLifecycle].slice(-LIFECYCLE_EVENTS_PER_FLOW),
+  );
+  const truncated = new Set(collection.truncatedFlowIds);
+  if (existing !== undefined && existing.length >= LIFECYCLE_EVENTS_PER_FLOW) {
+    truncated.add(message.flow_id);
+  }
   let flowIds = collection.flowIds;
   if (existing === undefined && flowIds.length >= LIFECYCLE_FLOW_LIMIT) {
+    truncated.delete(flowIds[0]);
     flowIds = flowIds.slice(flowIds.length - LIFECYCLE_FLOW_LIMIT + 1);
   }
   const entries: Array<readonly [string, readonly ImmutableFlowLifecycle[]]> = [];
@@ -197,7 +220,7 @@ function recordLifecycle(collection: ImmutableLifecycleCollection, message: Flow
     entries.push([flowId, collection.get(flowId) ?? []]);
   }
   entries.push([message.flow_id, events]);
-  return createLifecycleCollection(entries);
+  return createLifecycleCollection(entries, [...truncated]);
 }
 
 function pruneLifecycle(collection: ImmutableLifecycleCollection, removedFlowIds: readonly string[]): ImmutableLifecycleCollection {
@@ -207,7 +230,7 @@ function pruneLifecycle(collection: ImmutableLifecycleCollection, removedFlowIds
   for (const flowId of collection.flowIds) {
     if (!removed.has(flowId)) entries.push([flowId, collection.get(flowId) ?? []]);
   }
-  return createLifecycleCollection(entries);
+  return createLifecycleCollection(entries, collection.truncatedFlowIds);
 }
 
 function withCounter(state: BrowserState, key: keyof Omit<BrowserCounters, "droppedMessages">, amount = 1): BrowserState {

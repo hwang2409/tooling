@@ -3,6 +3,8 @@ import type { KeyboardEvent } from "react";
 
 import type { BrowserState } from "../../state/browserState";
 import { PairedInspector } from "../inspector/PairedInspector";
+import { useFlowDetail } from "../inspector/flowDetail";
+import type { FlowDetailLoader } from "../inspector/flowDetail";
 import type { InspectorFlow } from "../inspector/models";
 import { FlowGrid } from "./FlowGrid";
 import { parseFilter } from "./filter";
@@ -15,9 +17,10 @@ export interface FlowWorkspaceProps {
   followLive: boolean;
   pauseLive: () => void;
   gridViewportHeight?: number;
+  loadFlowDetail?: FlowDetailLoader;
 }
 
-export function FlowWorkspace({ browser, followLive, pauseLive, gridViewportHeight }: FlowWorkspaceProps) {
+export function FlowWorkspace({ browser, followLive, pauseLive, gridViewportHeight, loadFlowDetail }: FlowWorkspaceProps) {
   const workspaceId = useId().replaceAll(":", "");
   const [query, setQuery] = useState("");
   const [selectedFlowId, setSelectedFlowId] = useState<string | null>(null);
@@ -47,9 +50,15 @@ export function FlowWorkspace({ browser, followLive, pauseLive, gridViewportHeig
   };
 
   const selectedMetadata = selectedFlowId === null ? undefined : browser.flows.get(selectedFlowId);
+  const detail = useFlowDetail(selectedMetadata === undefined ? null : selectedMetadata.flow_id, loadFlowDetail);
   const selectedFlow: InspectorFlow | null = selectedMetadata === undefined
     ? null
-    : { metadata: selectedMetadata, lifecycle: browser.lifecycles.get(selectedMetadata.flow_id) };
+    : {
+        metadata: selectedMetadata,
+        lifecycle: browser.lifecycles.get(selectedMetadata.flow_id),
+        lifecycleTruncated: browser.lifecycles.isTruncated(selectedMetadata.flow_id),
+        ...(detail?.status === "loaded" ? detail.overrides : {}),
+      };
 
   return (
     <div className="flow-workspace" onKeyDown={handleWorkspaceKeyDown}>

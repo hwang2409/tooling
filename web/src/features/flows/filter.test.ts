@@ -88,6 +88,13 @@ describe("filter parsing", () => {
     expect(matches("~t json", flow({ requestContentType: null, responseContentType: null }))).toBe(false);
   });
 
+  it("matches ~t against the full header value including parameters, like mitmproxy", () => {
+    const parameterized = flow({ requestContentType: "application/json; charset=utf-8" });
+    expect(matches("~t charset=utf-8", parameterized)).toBe(true);
+    expect(matches("~tq charset", parameterized)).toBe(true);
+    expect(matches("~ts charset", parameterized)).toBe(false);
+  });
+
   it("evaluates ~q, ~s, and ~e presence filters", () => {
     expect(matches("~q", flow({ hasResponse: false }))).toBe(true);
     expect(matches("~q", flow())).toBe(false);

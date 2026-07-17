@@ -2,6 +2,7 @@ import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "re
 import type { KeyboardEvent } from "react";
 
 import type { Header } from "../../protocol";
+import { LIFECYCLE_EVENTS_PER_FLOW } from "../../state/browserState";
 import { bodyMetadata, decodeBody, type DecodedBody } from "./decoders";
 import { inspectorErrorState, lifecycleLabel, lifecyclePhase, orderLifecycle, type InspectorErrorState } from "./lifecycle";
 import type { BodyPane, BodySelection, BodyViewMode, InspectableBody, InspectorBodyPanelProps, InspectorFlow, InspectorHeader, InspectorPane, InspectorProps } from "./models";
@@ -201,6 +202,11 @@ function LifecycleStrip({ flow, errorState }: { flow: InspectorFlow; errorState:
         <span className={phase.responseStarted ? "is-seen" : ""}>response start {phase.responseStarted ? "seen" : "pending"}</span>
         <span className={errorState.hasError || phase.completed ? "is-seen" : ""}>{errorState.hasError ? "ended with error" : phase.completed ? "completed" : "open"}</span>
       </div>
+      {flow.lifecycleTruncated === true && (
+        <p className="inspector-muted inspector-lifecycle-truncated" role="note">
+          Showing the newest {LIFECYCLE_EVENTS_PER_FLOW} events; older observations were dropped from the bounded window.
+        </p>
+      )}
       {entries.length === 0 ? <p className="inspector-muted inspector-lifecycle-empty">No lifecycle observations attached to this flow.</p> : (
         <ol className="inspector-trace" aria-label="Observed lifecycle events">
           {entries.map((entry, index) => (
