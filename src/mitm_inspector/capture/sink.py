@@ -1,13 +1,13 @@
-"""Bounded, non-blocking message sink used at the capture boundary."""
+"""Bounded, non-blocking capture sink backed by one delivery sequencer."""
 
 from __future__ import annotations
 
-from collections import deque
-from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, replace
-from enum import Enum, auto
-from threading import Condition, Lock, RLock
+from collections.abc import Iterator, Mapping
+from dataclasses import replace
+from threading import Lock
 
+from mitm_inspector.capture.gate import ReservationGate as _ReservationGate
+from mitm_inspector.capture.gate import ReservationLease as _ReservationLease
 from mitm_inspector.capture.metrics import (
     body_bytes as _shared_body_bytes,
 )
@@ -17,6 +17,16 @@ from mitm_inspector.capture.metrics import (
 from mitm_inspector.capture.metrics import (
     validate_bounded_numbers as _validate_bounded_numbers,
 )
+from mitm_inspector.capture.sequencer import (
+    DeliverySequencer,
+    SequencerState,
+)
+from mitm_inspector.capture.sequencer import (
+    gap_after_loss as _gap_after_loss,
+)
+from mitm_inspector.capture.sequencer import (
+    with_delivery_position as _with_delivery_position,
+)
 from mitm_inspector.protocol import (
     MAX_U64,
     KnownParsedMessage,
@@ -24,386 +34,12 @@ from mitm_inspector.protocol import (
     ParsedMessage,
     ParsedMessageResult,
     parse_message,
-    parsed_message_to_plain_json,
     require_parsed_message,
 )
 
-MAX_LOSS_RANGES = 256
-_UNSCOPED_OWNER = object()
-
-
-@dataclass(frozen=True)
-class _LossRange:
-    start: int
-    end: int
-
-
-@dataclass(frozen=True)
-class _LossState:
-    ranges: tuple[_LossRange, ...]
-    resync_active: bool
-    dropped_total: int
-    range_collapses: int
-
-
-@dataclass(frozen=True)
-class _PositionLossState:
-    """Single replaceable value for all delivery-position/loss bookkeeping."""
-
-    next_position: int = 1
-    exhausted: bool = False
-    pending_loss_count: int = 0
-    ranges: tuple[_LossRange, ...] = ()
-    resync_active: bool = False
-    dropped_total: int = 0
-    range_collapses: int = 0
-
-
-class _PositionExhausted(RuntimeError):
-    """The bounded uint64 delivery-position namespace is terminal."""
-
-
-@dataclass(frozen=True)
-class _QueuedMessage:
-    position: int
-    message: ParsedMessageResult
-    body_bytes: int
-    weight: int
-
-
-class _OwnershipPhase(Enum):
-    UNOWNED = auto()
-    OWNED = auto()
-    RELEASING = auto()
-    RELEASED = auto()
-
-
-class _ReservationGate:
-    """Nonblocking reservation state with an explicit ownership bit."""
-
-    def __init__(self) -> None:
-        self._condition = Condition(Lock())
-        self._owner: object | None = None
-        self._notification_pending = False
-
-    def acquire(self, blocking: bool = True, owner: object | None = None) -> bool:
-        if blocking:
-            with self._condition:
-                while self._owner is not None:
-                    self._condition.wait()
-                self._owner = _UNSCOPED_OWNER if owner is None else owner
-                return True
-        if not self._condition.acquire(False):
-            return False
-        try:
-            if self._owner is not None:
-                return False
-            self._owner = _UNSCOPED_OWNER if owner is None else owner
-            return True
-        finally:
-            self._condition.release()
-
-    def release(self) -> None:
-        if not self.release_if_owned():
-            raise RuntimeError("reservation gate is not owned")
-
-    def release_if_owned(self, owner: object | None = None) -> bool:
-        with self._condition:
-            if self._owner is None:
-                if self._notification_pending:
-                    self._notify_waiter()
-                return False
-            if owner is not None and self._owner is not owner:
-                return False
-            self._owner = None
-            self._notify_waiter()
-            return True
-
-    def _notify_waiter(self) -> None:
-        try:
-            self._condition.notify()
-        except BaseException:
-            self._notification_pending = True
-            raise
-        self._notification_pending = False
-
-
-class _ReservationLease:
-    """Own a reservation gate and make release idempotent and observable."""
-
-    def __init__(self, gate: _ReservationGate) -> None:
-        self._gate = gate
-        self.phase = _OwnershipPhase.UNOWNED
-
-    def acquire(self, blocking: bool = False) -> bool:
-        try:
-            acquired = self._gate.acquire(blocking, self)
-        except BaseException:
-            for _ in range(2):
-                try:
-                    if not self._gate.release_if_owned(self):
-                        break
-                except BaseException:
-                    continue
-            raise
-        if acquired:
-            self.phase = _OwnershipPhase.OWNED
-        return acquired
-
-    def close(self) -> BaseException | None:
-        if self.phase is not _OwnershipPhase.OWNED:
-            return None
-        self.phase = _OwnershipPhase.RELEASING
-        try:
-            if not self._gate.release_if_owned(self):
-                raise RuntimeError("owned reservation was already released")
-        except BaseException as error:
-            # The gate clears ownership before notification, so a release
-            # exception cannot strand the gate.  One bounded retry handles an
-            # exception injected immediately before or after the clear.
-            try:
-                self._gate.release_if_owned(self)
-            except BaseException:
-                pass
-            self.phase = _OwnershipPhase.RELEASED
-            return error
-        self.phase = _OwnershipPhase.RELEASED
-        return None
-
-
-class _SlotLease:
-    """Own the one bounded pending-slot reservation for an offer."""
-
-    def __init__(self, sink: BoundedMessageSink) -> None:
-        self._sink = sink
-        self.phase = _OwnershipPhase.UNOWNED
-        self._before = 0
-
-    def reserve(self) -> bool:
-        queue = _ReservationLease(self._sink._lock)
-        if not queue.acquire():
-            return False
-        primary: BaseException | None = None
-        try:
-            if (
-                len(self._sink._items) + self._sink._reserved_slots
-                >= self._sink._max_pending
-            ):
-                return False
-            self._before = self._sink._reserved_slots
-            self._sink._reserved_slots += 1
-            self.phase = _OwnershipPhase.OWNED
-            return True
-        except BaseException as error:
-            primary = error
-            self._sink._reserved_slots = self._before
-            raise
-        finally:
-            queue_error = queue.close()
-            if primary is None and queue_error is not None:
-                raise queue_error
-
-    def close(self) -> BaseException | None:
-        if self.phase is not _OwnershipPhase.OWNED:
-            return None
-        self.phase = _OwnershipPhase.RELEASING
-        try:
-            self._sink._reserved_slots -= 1
-        except BaseException as error:
-            self._sink._reserved_slots = self._before
-            self.phase = _OwnershipPhase.RELEASED
-            return error
-        self.phase = _OwnershipPhase.RELEASED
-        return None
-
-
-class _AdmissionPhase(Enum):
-    SNAPSHOTTED = auto()
-    POSITION_ALLOCATED = auto()
-    APPEND_PENDING = auto()
-    QUEUE_APPENDED = auto()
-    LOSS_RECORDED = auto()
-    COMMITTED = auto()
-    ROLLED_BACK = auto()
-
-
-class _DrainPhase(Enum):
-    RESERVATION_ACQUIRED = auto()
-    SNAPSHOTTED = auto()
-    ITEMS_DETACHED = auto()
-    RANGES_DETACHED = auto()
-    DETACH_LOCKS_RELEASED = auto()
-    RESERVATION_RELEASED = auto()
-    MATERIALIZED = auto()
-    ROLLED_BACK = auto()
-
-
-@dataclass(frozen=True)
-class _AdmissionSnapshot:
-    items: tuple[_QueuedMessage, ...]
-    body_bytes: int
-    memory_bytes: int
-    accepted: int
-    body_budget_drops: int
-    memory_budget_drops: int
-    position_loss: _PositionLossState
-
-
-class _AdmissionTransaction:
-    """Complete sink-owned commit snapshot and phase machine."""
-
-    def __init__(self, sink: BoundedMessageSink) -> None:
-        self.sink = sink
-        self.snapshot = _AdmissionSnapshot(
-            tuple(sink._items),
-            sink._body_bytes,
-            sink._memory_bytes,
-            sink._accepted,
-            sink._body_budget_drops,
-            sink._memory_budget_drops,
-            sink._position_loss,
-        )
-        self.phase = _AdmissionPhase.SNAPSHOTTED
-        self.position: int | None = None
-        self.position_after_allocation: _PositionLossState | None = None
-        self.item: _QueuedMessage | None = None
-
-    def allocate_position(self) -> None:
-        self.sink._flush_pending_losses_locked()
-        state = self.sink._position_loss
-        if state.exhausted:
-            raise _PositionExhausted("delivery positions exhausted")
-        # Record ownership before calling the allocation helper.  If an
-        # injected BaseException lands after the helper's state replacement,
-        # rollback can preserve this already-represented position.
-        self.position = state.next_position
-        self.phase = _AdmissionPhase.POSITION_ALLOCATED
-        try:
-            self.sink._allocate_position()
-        finally:
-            self.position_after_allocation = self.sink._position_loss
-
-    def append(self, item: _QueuedMessage) -> None:
-        self.item = item
-        self.phase = _AdmissionPhase.APPEND_PENDING
-        self.sink._items.append(item)
-        self.phase = _AdmissionPhase.QUEUE_APPENDED
-
-    def commit_counters(self, body_bytes: int, weight: int) -> None:
-        self.sink._body_bytes += body_bytes
-        self.sink._memory_bytes += weight
-        self.sink._accepted += 1
-        self.phase = _AdmissionPhase.COMMITTED
-
-    def record_loss(self, position: int) -> None:
-        self.sink._record_drop(position)
-        self.phase = _AdmissionPhase.LOSS_RECORDED
-
-    def rollback(self) -> None:
-        sink = self.sink
-        current_state = sink._position_loss
-        sink._items.clear()
-        sink._items.extend(self.snapshot.items)
-        sink._body_bytes = self.snapshot.body_bytes
-        sink._memory_bytes = self.snapshot.memory_bytes
-        sink._accepted = self.snapshot.accepted
-        sink._body_budget_drops = self.snapshot.body_budget_drops
-        sink._memory_budget_drops = self.snapshot.memory_budget_drops
-        # Never rewind the state value: it may contain flushed losses or a
-        # reentrant producer's pending admission.  Add this transaction's
-        # marked position if allocation happened before the failure.
-        allocation_changed = (
-            current_state.next_position != self.snapshot.position_loss.next_position
-            or current_state.exhausted != self.snapshot.position_loss.exhausted
-        )
-        if self.position is not None and allocation_changed:
-            if not _range_contains(current_state.ranges, self.position):
-                sink._record_drop_range_locked(self.position, self.position, 1)
-        elif self.position is None and current_state == self.snapshot.position_loss:
-            sink._position_loss = self.snapshot.position_loss
-        self.phase = _AdmissionPhase.ROLLED_BACK
-
 
 class BoundedMessageSink:
-    """A bounded queue with nonblocking producer admission.
-
-    A producer first reserves an admission slot with a nonblocking,
-    sink-owned lock.  Only that successful path canonicalizes and weighs the
-    message.  Queue insertion and delivery-position assignment are committed
-    after preparation; a preparation failure therefore consumes neither a
-    queue slot nor a delivery position.
-
-    Losses are retained as at most ``MAX_LOSS_RANGES`` ranges.  If concurrent
-    reservations fragment that bounded range set, the ranges collapse into a
-    resync interval; queued messages inside that interval are intentionally
-    discarded so the resulting stream.gap covers every position exactly.
-    """
-
-    _position_loss: _PositionLossState
-    _loss_ranges_override: deque[_LossRange] | None
-    _reserved_slots: int
-    _accepted: int
-    _body_budget_drops: int
-    _memory_budget_drops: int
-
-    @property
-    def _next_position_value(self) -> int:
-        return self._position_loss.next_position
-
-    @_next_position_value.setter
-    def _next_position_value(self, value: int) -> None:
-        self._position_loss = replace(self._position_loss, next_position=value)
-
-    @property
-    def _exhausted(self) -> bool:
-        return self._position_loss.exhausted
-
-    @_exhausted.setter
-    def _exhausted(self, value: bool) -> None:
-        self._position_loss = replace(self._position_loss, exhausted=value)
-
-    @property
-    def _pending_loss_count(self) -> int:
-        return self._position_loss.pending_loss_count
-
-    @_pending_loss_count.setter
-    def _pending_loss_count(self, value: int) -> None:
-        self._position_loss = replace(self._position_loss, pending_loss_count=value)
-
-    @property
-    def _loss_ranges(self) -> deque[_LossRange]:
-        if self._loss_ranges_override is not None:
-            return self._loss_ranges_override
-        return deque(self._position_loss.ranges)
-
-    @_loss_ranges.setter
-    def _loss_ranges(self, value: deque[_LossRange]) -> None:
-        self._loss_ranges_override = value
-        self._position_loss = replace(self._position_loss, ranges=tuple(value))
-
-    @property
-    def _loss_resync_active(self) -> bool:
-        return self._position_loss.resync_active
-
-    @_loss_resync_active.setter
-    def _loss_resync_active(self, value: bool) -> None:
-        self._position_loss = replace(self._position_loss, resync_active=value)
-
-    @property
-    def _dropped_total(self) -> int:
-        return self._position_loss.dropped_total
-
-    @_dropped_total.setter
-    def _dropped_total(self, value: int) -> None:
-        self._position_loss = replace(self._position_loss, dropped_total=value)
-
-    @property
-    def _loss_range_collapses(self) -> int:
-        return self._position_loss.range_collapses
-
-    @_loss_range_collapses.setter
-    def _loss_range_collapses(self, value: int) -> None:
-        self._position_loss = replace(self._position_loss, range_collapses=value)
+    """Bounded capture sink with one state owner for every delivery mutation."""
 
     def __init__(
         self,
@@ -415,52 +51,88 @@ class BoundedMessageSink:
         _validate_sink_limit(max_pending, "max_pending", minimum=1)
         _validate_sink_limit(max_body_bytes, "max_body_bytes", minimum=0)
         _validate_sink_limit(max_memory_bytes, "max_memory_bytes", minimum=0)
-        self._items: deque[_QueuedMessage] = deque()
         self._max_pending = max_pending
         self._max_body_bytes = max_body_bytes
         self._max_memory_bytes = max_memory_bytes
-        self._body_bytes = 0
-        self._memory_bytes = 0
+        self._sequencer = DeliverySequencer()
+        # Both names intentionally point at the one admission gate.  There
+        # is no second queue/position lock domain to create stale snapshots.
         self._lock = _ReservationGate()
-        self._loss_lock = Lock()
-        # Rejected producers use this short, independent critical section to
-        # atomically replace the pending-loss state.  It is never held by a
-        # consumer or by the position/loss bookkeeping path.
-        self._pending_loss_lock = Lock()
-        self._position_lock = RLock()
-        self._position_loss = _PositionLossState()
-        self._loss_ranges_override = None
-        self._reservation_lock = _ReservationGate()
+        self._reservation_lock = self._lock
         self._consumer_lock = Lock()
-        self._reserved_slots = 0
-        self._last_delivered_position = 0
-        self._accepted = 0
-        self._forced_loss_count = 0
-        self._body_budget_drops = 0
-        self._memory_budget_drops = 0
-        self._pending_loss_count = 0
-        self._loss_lock_fast_path_held = False
+
+    @property
+    def _state(self) -> SequencerState:
+        return self._sequencer.state
+
+    @_state.setter
+    def _state(self, value: SequencerState) -> None:
+        self._sequencer.state = value
+
+    # Read-only compatibility views expose the sequencer value; they do not
+    # maintain a second copy of delivery state.
+    @property
+    def _next_position_value(self) -> int:
+        return self._state.next_position
+
+    @_next_position_value.setter
+    def _next_position_value(self, value: int) -> None:
+        with self._sequencer.lock:
+            self._state = replace(self._state, next_position=value)
+
+    @property
+    def _exhausted(self) -> bool:
+        return self._state.exhausted
+
+    @_exhausted.setter
+    def _exhausted(self, value: bool) -> None:
+        with self._sequencer.lock:
+            self._state = replace(self._state, exhausted=value)
+
+    @property
+    def _body_bytes(self) -> int:
+        return self._state.body_bytes
+
+    @_body_bytes.setter
+    def _body_bytes(self, value: int) -> None:
+        with self._sequencer.lock:
+            self._state = replace(self._state, body_bytes=value)
+
+    @property
+    def _memory_bytes(self) -> int:
+        return self._state.memory_bytes
+
+    @_memory_bytes.setter
+    def _memory_bytes(self, value: int) -> None:
+        with self._sequencer.lock:
+            self._state = replace(self._state, memory_bytes=value)
+
+    @property
+    def _last_delivered_position(self) -> int:
+        return self._state.last_delivered
+
+    @_last_delivered_position.setter
+    def _last_delivered_position(self, value: int) -> None:
+        with self._sequencer.lock:
+            self._state = replace(self._state, last_delivered=value)
 
     def offer(self, message: ParsedMessage | Mapping[str, object]) -> bool:
-        """Admit one raw or parsed message without exposing trusted metrics."""
+        """Prepare only after immediate gate admission; never waits for drain."""
 
-        if self._exhausted:
-            self._record_new_loss()
-            return False
         reservation = _ReservationLease(self._reservation_lock)
-        if not reservation.acquire():
-            self._record_new_loss()
+        if not reservation.acquire(False):
+            self._sequencer.record_loss()
             return False
-        slot = _SlotLease(self)
-        primary: BaseException | None = None
+        if not self._sequencer.lock.acquire(False):
+            close_error = reservation.close()
+            self._sequencer.record_loss()
+            if close_error is not None:
+                raise close_error
+            return False
         committed = False
+        primary: BaseException | None = None
+        before_state = self._sequencer.state
         try:
-            if self._exhausted or not slot.reserve():
-                self._record_new_loss()
-                return False
-
-            # This is deliberately outside the queue lock.  It is reached
-            # only after the sink-owned reservation succeeded.
             _validate_message_numbers(message)
             retained = (
                 parse_message(message)
@@ -469,617 +141,91 @@ class BoundedMessageSink:
             )
             body_bytes = _message_body_bytes(retained)
             weight = _message_weight(retained)
-
-            queue = _ReservationLease(self._lock)
-            if self._exhausted or not queue.acquire():
-                self._record_new_loss()
-                return False
-            queue_primary: BaseException | None = None
-            try:
-                try:
-                    with self._position_lock:
-                        transaction = _AdmissionTransaction(self)
-                        try:
-                            committed = self._commit(
-                                transaction, retained, body_bytes, weight
-                            )
-                            return committed
-                        except BaseException:
-                            transaction.rollback()
-                            raise
-                except BaseException as error:
-                    queue_primary = error
-                    raise
-            finally:
-                queue_error = queue.close()
-                if queue_primary is None and queue_error is not None:
-                    if committed:
-                        _mark_committed_exception(queue_error)
-                    raise queue_error
+            committed = self._sequencer.append_locked(
+                retained,
+                body_bytes,
+                weight,
+                self._max_pending,
+                self._max_body_bytes,
+                self._max_memory_bytes,
+            )
+            return committed
         except BaseException as error:
+            # A fault injected immediately after the sequencer's atomic
+            # state replacement has a committed outcome even though the
+            # caller did not receive ``True``.
+            if self._sequencer.state.accepted > before_state.accepted:
+                committed = True
+                _mark_committed_exception(error)
             primary = error
             raise
         finally:
-            slot_error = slot.close()
-            reservation_error = reservation.close()
-            if primary is None:
-                if slot_error is not None:
-                    if committed:
-                        _mark_committed_exception(slot_error)
-                    raise slot_error
-                if reservation_error is not None:
-                    if committed:
-                        _mark_committed_exception(reservation_error)
-                    raise reservation_error
-
-    def _commit(
-        self,
-        transaction: _AdmissionTransaction,
-        message: ParsedMessageResult,
-        body_bytes: int,
-        weight: int,
-    ) -> bool:
-        if self._exhausted:
-            return False
-        try:
-            transaction.allocate_position()
-        except _PositionExhausted:
-            return False
-        assert transaction.position is not None
-        if self._body_bytes + body_bytes > self._max_body_bytes:
-            self._body_budget_drops += 1
-            transaction.record_loss(transaction.position)
-            return False
-        if self._memory_bytes + weight > self._max_memory_bytes:
-            self._memory_budget_drops += 1
-            transaction.record_loss(transaction.position)
-            return False
-        item = _QueuedMessage(transaction.position, message, body_bytes, weight)
-        transaction.append(item)
-        transaction.commit_counters(body_bytes, weight)
-        return True
+            self._sequencer.lock.release()
+            close_error = reservation.close()
+            if close_error is not None:
+                if committed:
+                    _mark_committed_exception(close_error)
+                if primary is None:
+                    raise close_error
 
     def record_loss(self) -> bool:
-        """Record a bounded-store/addon loss as a synthetic delivery position."""
-
-        return self._record_new_loss()
-
-    def _record_new_loss(self) -> bool:
-        if self._exhausted:
-            return False
-        if not self._position_lock.acquire(False):
-            # Coalesce rejected admissions as one scalar until a producer or
-            # consumer owns the position lock.  This keeps the hot path
-            # strictly nonblocking and avoids one node per rejection.
-            self._increment_pending_loss()
-            return True
-        try:
-            # Loss admission has its own constant-work fast path.  Testing
-            # the bookkeeping lock before constructing a transaction is
-            # important: a rejected producer must never copy the queue or
-            # wait behind a consumer's loss bookkeeping.
-            if not self._loss_lock.acquire(False):
-                self._increment_pending_loss()
-                return True
-            try:
-                self._loss_lock_fast_path_held = True
-                try:
-                    self._flush_pending_losses_locked(loss_lock_held=True)
-                    if self._exhausted:
-                        return False
-                    before_allocation = self._position_loss
-                    marked_position = before_allocation.next_position
-                    # Keep the position token before the helper call.  If a
-                    # fault lands after the helper replaces state, the token
-                    # is converted into a loss rather than rewinding state.
-                    try:
-                        position = self._allocate_position()
-                    except BaseException:
-                        allocation_changed = (
-                            self._position_loss.next_position
-                            != before_allocation.next_position
-                            or self._position_loss.exhausted
-                            != before_allocation.exhausted
-                        )
-                        if allocation_changed:
-                            if not _range_contains(
-                                self._position_loss.ranges, marked_position
-                            ):
-                                self._record_drop_range_locked(
-                                    marked_position, marked_position, 1
-                                )
-                        raise
-                    self._record_drop_range_locked(position, position, 1)
-                    return True
-                except BaseException:
-                    # The authoritative state is never rewound here.  Any
-                    # allocation already represented remains a loss/gap.
-                    raise
-                finally:
-                    self._loss_lock_fast_path_held = False
-            finally:
-                self._loss_lock.release()
-        finally:
-            self._position_lock.release()
-
-    def _allocate_position(self) -> int:
-        with self._position_lock:
-            self._flush_pending_losses_locked(
-                loss_lock_held=self._loss_lock_fast_path_held
-            )
-            return self._allocate_position_locked()
-
-    def _allocate_position_locked(self) -> int:
-        state = self._position_loss
-        if state.exhausted:
-            raise _PositionExhausted("delivery positions exhausted")
-        position = state.next_position
-        if position == MAX_U64:
-            self._position_loss = replace(state, exhausted=True)
-        else:
-            self._position_loss = replace(state, next_position=position + 1)
-        return position
-
-    def _flush_pending_losses_locked(self, *, loss_lock_held: bool = False) -> None:
-        # Rejected producers replace the same state value under this short
-        # lock.  Holding it while flushing prevents a pending increment from
-        # being lost between the state read and replacement.
-        with self._pending_loss_lock:
-            state = self._position_loss
-            pending = state.pending_loss_count
-            if pending == 0 or state.exhausted:
-                return
-            available = MAX_U64 - state.next_position + 1
-            count = min(pending, available)
-            start = state.next_position
-            end = start + count - 1
-            ranges, collapsed, resync_active = _loss_range_update(
-                state.ranges,
-                state.resync_active,
-                start,
-                end,
-            )
-            next_position = state.next_position
-            exhausted: bool = state.exhausted
-            if end == MAX_U64:
-                exhausted = True
-            else:
-                next_position = end + 1
-            pending_after = pending - count
-            dropped_total = state.dropped_total + count
-            if count < pending:
-                # No position exists for the excess after uint64 exhaustion.
-                dropped_total += pending_after
-                pending_after = 0
-            self._position_loss = replace(
-                state,
-                next_position=next_position,
-                exhausted=exhausted,
-                pending_loss_count=pending_after,
-                ranges=ranges,
-                resync_active=resync_active,
-                dropped_total=dropped_total,
-                range_collapses=state.range_collapses + (1 if collapsed else 0),
-            )
-
-    def _increment_pending_loss(self) -> None:
-        with self._pending_loss_lock:
-            state = self._position_loss
-            self._position_loss = replace(
-                state,
-                pending_loss_count=state.pending_loss_count + 1,
-            )
-
-    def _loss_state(self) -> _LossState:
-        with self._loss_lock:
-            state = self._position_loss
-            return _LossState(
-                state.ranges,
-                state.resync_active,
-                state.dropped_total,
-                state.range_collapses,
-            )
-
-    def _restore_loss_state(self, state: _LossState) -> None:
-        self._position_loss = replace(
-            self._position_loss,
-            ranges=state.ranges,
-            resync_active=state.resync_active,
-            dropped_total=state.dropped_total,
-            range_collapses=state.range_collapses,
-        )
-
-    def _restore_position_state(self, state: tuple[int, bool]) -> None:
-        self._position_loss = replace(
-            self._position_loss,
-            next_position=state[0],
-            exhausted=state[1],
-        )
-
-    __call__ = offer
+        return self._sequencer.record_loss()
 
     def drain(self, limit: int | None = None) -> list[ParsedMessageResult]:
-        """Serialize complete consumer transactions, including rollback."""
-
-        with self._consumer_lock:
-            return self._drain_once(limit)
-
-    def _drain_once(self, limit: int | None = None) -> list[ParsedMessageResult]:
-        """Detach bounded work, then canonicalize it outside the queue lock.
-
-        Detachment is transactional: a canonicalization failure restores the
-        exact queue, counters, loss ranges, and delivery cursor.
-        """
-
         if limit is not None and limit < 1:
             raise ValueError("limit must be positive")
-        reservation = _ReservationLease(self._reservation_lock)
-        if not reservation.acquire():
-            return []
-        detached: list[_QueuedMessage] = []
-        ranges: list[_LossRange] = []
-        original_items: tuple[_QueuedMessage, ...] = ()
-        original_ranges: tuple[_LossRange, ...] = ()
-        original_resync = False
-        old_last = self._last_delivered_position
-        old_forced = self._forced_loss_count
-        before_body = self._body_bytes
-        before_memory = self._memory_bytes
-        phase = _DrainPhase.RESERVATION_ACQUIRED
-        primary: BaseException | None = None
-        queue = _ReservationLease(self._lock)
-        try:
-            if not queue.acquire(blocking=True):
+        with self._consumer_lock:
+            reservation = _ReservationLease(self._reservation_lock)
+            if not reservation.acquire(True):
                 return []
-            queue_primary: BaseException | None = None
+            committed = False
+            primary: BaseException | None = None
             try:
-                # Position, queue, and loss snapshots are taken before the
-                # first mutation.  The position lock also excludes a loss
-                # producer for this short detachment transaction.
-                with self._position_lock:
-                    self._flush_pending_losses_locked()
-                    with self._loss_lock:
-                        state = self._position_loss
-                        if state.exhausted and state.ranges:
-                            # There is no representable sequence after MAX_U64;
-                            # retain the queued/loss state in a stable terminal
-                            # condition rather than constructing MAX_U64 + 1.
-                            return []
-                        original_items = tuple(self._items)
-                        original_ranges = state.ranges
-                        original_resync = state.resync_active
-                        old_last = self._last_delivered_position
-                        old_forced = self._forced_loss_count
-                        before_body = self._body_bytes
-                        before_memory = self._memory_bytes
-                        phase = _DrainPhase.SNAPSHOTTED
-                        count_to_drain = (
-                            len(self._items)
-                            if limit is None
-                            else min(limit, len(self._items))
-                        )
-                        for _ in range(count_to_drain):
-                            detached.append(self._items.popleft())
-                        phase = _DrainPhase.ITEMS_DETACHED
-                        self._body_bytes -= sum(item.body_bytes for item in detached)
-                        self._memory_bytes -= sum(item.weight for item in detached)
-                        removed_ranges: list[_LossRange] = []
-                        if self._loss_ranges_override is not None:
-                            while self._loss_ranges_override:
-                                removed_ranges.append(self._loss_ranges_override.popleft())
-                        else:
-                            removed_ranges.extend(state.ranges)
-                        phase = _DrainPhase.RANGES_DETACHED
-                        self._position_loss = replace(
-                            state,
-                            ranges=(),
-                            resync_active=False,
-                        )
-                        self._loss_ranges_override = None
-                        ranges = _normalize_ranges(removed_ranges)
-                phase = _DrainPhase.DETACH_LOCKS_RELEASED
+                result = self._sequencer.drain(limit, _with_delivery_position, _gap_after_loss)
+                committed = True
+                return result
             except BaseException as error:
-                queue_primary = error
+                primary = error
                 raise
             finally:
-                queue_error = queue.close()
-                if queue_primary is None and queue_error is not None:
-                    raise queue_error
-            release_error = reservation.close()
-            phase = _DrainPhase.RESERVATION_RELEASED
-            if release_error is not None:
-                raise release_error
-            result = self._drain_detached(detached, ranges, resync_active=original_resync)
-            phase = _DrainPhase.MATERIALIZED
-            return result
-        except BaseException as error:
-            primary = error
-            rollback_queue = _ReservationLease(self._lock)
-            try:
-                if rollback_queue.acquire(blocking=True):
-                    try:
-                        if phase in {
-                            _DrainPhase.DETACH_LOCKS_RELEASED,
-                            _DrainPhase.RESERVATION_RELEASED,
-                            _DrainPhase.MATERIALIZED,
-                        }:
-                            self._items.extendleft(reversed(detached))
-                            self._body_bytes += sum(item.body_bytes for item in detached)
-                            self._memory_bytes += sum(item.weight for item in detached)
-                        elif phase in {
-                            _DrainPhase.SNAPSHOTTED,
-                            _DrainPhase.ITEMS_DETACHED,
-                            _DrainPhase.RANGES_DETACHED,
-                        }:
-                            self._items.clear()
-                            self._items.extend(original_items)
-                            self._body_bytes = before_body
-                            self._memory_bytes = before_memory
-                            # Keep producer losses admitted while the
-                            # position lock was held; they are the pending
-                            # delta after this snapshot.
-                        self._last_delivered_position = old_last
-                        self._forced_loss_count = old_forced
-                    finally:
-                        rollback_queue.close()
-                    with self._position_lock, self._loss_lock:
-                        state = self._position_loss
-                        if phase in {
-                            _DrainPhase.DETACH_LOCKS_RELEASED,
-                            _DrainPhase.RESERVATION_RELEASED,
-                            _DrainPhase.MATERIALIZED,
-                        }:
-                            self._position_loss = replace(
-                                state,
-                                ranges=tuple(
-                                    _normalize_ranges(
-                                        [*state.ranges, *original_ranges]
-                                    )
-                                ),
-                                resync_active=state.resync_active or original_resync,
-                            )
-                        elif phase in {
-                            _DrainPhase.SNAPSHOTTED,
-                            _DrainPhase.ITEMS_DETACHED,
-                            _DrainPhase.RANGES_DETACHED,
-                        }:
-                            self._position_loss = replace(
-                                state,
-                                ranges=original_ranges,
-                                resync_active=original_resync,
-                            )
-                        self._loss_ranges_override = None
-            except BaseException:
-                # The injected failure belongs to the drain operation.  A
-                # rollback cleanup failure must not mask it or trigger a
-                # second release attempt.
-                pass
-            phase = _DrainPhase.ROLLED_BACK
-            raise
-        finally:
-            release_error = reservation.close()
-            if release_error is not None and primary is None:
-                raise release_error
-
-    def _drain_detached(
-        self,
-        detached: list[_QueuedMessage],
-        ranges: list[_LossRange],
-        *,
-        resync_active: bool,
-    ) -> list[ParsedMessageResult]:
-        output: list[ParsedMessageResult] = []
-        for item in detached:
-            _discard_expired_ranges(ranges, self._last_delivered_position)
-            while (
-                ranges
-                and self._last_delivered_position < MAX_U64
-                and ranges[0].start <= self._last_delivered_position + 1
-            ):
-                loss = ranges.pop(0)
-                if loss.end <= self._last_delivered_position:
-                    continue
-                output.append(_gap_after_loss(self._last_delivered_position, loss.end))
-                self._last_delivered_position = loss.end
-            if item.position <= self._last_delivered_position:
-                self._forced_loss_count += 1
-                continue
-            if ranges and ranges[0].start < item.position:
-                # A range can begin after an already delivered position only
-                # when the producer/consumer overlap leaves an accepted item
-                # in front of it.  Emit that bounded missing interval first.
-                loss = ranges.pop(0)
-                output.append(_gap(self._last_delivered_position, item.position))
-                self._last_delivered_position = item.position - 1
-                if loss.end >= item.position:
-                    ranges.insert(0, _LossRange(item.position, loss.end))
-            if ranges and ranges[0].start == item.position:
-                continue
-            output.append(_with_delivery_position(item.message, item.position))
-            self._last_delivered_position = item.position
-
-        _discard_expired_ranges(ranges, self._last_delivered_position)
-        while (
-            ranges
-            and self._last_delivered_position < MAX_U64
-            and ranges[0].start <= self._last_delivered_position + 1
-        ):
-            loss = ranges.pop(0)
-            output.append(_gap_after_loss(self._last_delivered_position, loss.end))
-            self._last_delivered_position = max(self._last_delivered_position, loss.end)
-        if ranges:
-            with self._position_lock, self._loss_lock:
-                state = self._position_loss
-                self._position_loss = replace(
-                    state,
-                    ranges=tuple(_normalize_ranges([*state.ranges, *ranges])),
-                    resync_active=state.resync_active or resync_active,
-                )
-        return output
+                close_error = reservation.close()
+                if close_error is not None:
+                    if committed:
+                        _mark_committed_exception(close_error)
+                    if primary is None:
+                        raise close_error
 
     def __iter__(self) -> Iterator[ParsedMessageResult]:
         return iter(self.drain())
 
     @property
     def accepted_count(self) -> int:
-        return self._accepted
+        return self._state.accepted
 
     @property
     def dropped_count(self) -> int:
-        return self._dropped_total + self._forced_loss_count + self._pending_loss_count
+        self._sequencer.flush_for_read()
+        return self._state.dropped + self._state.forced
 
     @property
     def pending_count(self) -> int:
-        lease = _ReservationLease(self._lock)
-        if not lease.acquire(blocking=True):
-            return 0
-        primary: BaseException | None = None
-        try:
-            return len(self._items)
-        except BaseException as error:
-            primary = error
-            raise
-        finally:
-            close_error = lease.close()
-            if primary is None and close_error is not None:
-                raise close_error
+        return len(self._state.items)
 
     @property
     def body_budget_drops(self) -> int:
-        return self._body_budget_drops
+        return self._state.body_budget_drops
 
     @property
     def memory_budget_drops(self) -> int:
-        return self._memory_budget_drops
+        return self._state.memory_budget_drops
 
     @property
     def loss_range_count(self) -> int:
-        with self._loss_lock:
-            return len(self._position_loss.ranges)
-
-    @property
-    def loss_range_collapses(self) -> int:
-        return self._loss_range_collapses
+        return len(self._sequencer.loss_runs())
 
     @property
     def exhausted(self) -> bool:
-        """Whether no further uint64 delivery position can be allocated."""
-
-        return self._exhausted
-
-    def _record_drop(self, position: int) -> None:
-        with self._loss_lock:
-            self._record_drop_range_locked(position, position, 1)
-
-    def _record_drop_range_locked(self, start: int, end: int, count: int) -> None:
-        state = self._position_loss
-        ranges, collapsed, resync_active = _loss_range_update(
-            state.ranges,
-            state.resync_active,
-            start,
-            end,
-        )
-        self._position_loss = replace(
-            state,
-            ranges=ranges,
-            resync_active=resync_active,
-            dropped_total=state.dropped_total + count,
-            range_collapses=state.range_collapses + (1 if collapsed else 0),
-        )
-
-
-def _insert_range(
-    ranges: deque[_LossRange], start: int, end: int
-) -> tuple[deque[_LossRange], bool]:
-    values = [*ranges, _LossRange(start, end)]
-    values = _merge_ranges(values)
-    if len(values) <= MAX_LOSS_RANGES:
-        return deque(values), False
-    collapsed = _LossRange(values[0].start, values[-1].end)
-    return deque([collapsed]), True
-
-
-def _loss_range_update(
-    ranges: Iterable[_LossRange],
-    resync_active: bool,
-    start: int,
-    end: int,
-) -> tuple[tuple[_LossRange, ...], bool, bool]:
-    existing = tuple(ranges)
-    if resync_active and existing:
-        current = existing[0]
-        return (
-            (_LossRange(min(current.start, start), max(current.end, end)),),
-            False,
-            True,
-        )
-    updated, collapsed = _insert_range(deque(existing), start, end)
-    return tuple(updated), collapsed, resync_active or collapsed
-
-
-def _merge_ranges(ranges: list[_LossRange]) -> list[_LossRange]:
-    if not ranges:
-        return []
-    merged: list[_LossRange] = []
-    for current in sorted(ranges, key=lambda item: (item.start, item.end)):
-        if merged and (
-            current.start <= merged[-1].end
-            or (
-                merged[-1].end < MAX_U64
-                and current.start == merged[-1].end + 1
-            )
-        ):
-            previous = merged[-1]
-            merged[-1] = _LossRange(previous.start, max(previous.end, current.end))
-        else:
-            merged.append(current)
-    return merged
-
-
-def _normalize_ranges(ranges: list[_LossRange]) -> list[_LossRange]:
-    merged = _merge_ranges(ranges)
-    if len(merged) > MAX_LOSS_RANGES:
-        return [_LossRange(merged[0].start, merged[-1].end)]
-    return merged
-
-
-def _discard_expired_ranges(ranges: list[_LossRange], last: int) -> None:
-    while ranges and ranges[0].end <= last:
-        ranges.pop(0)
-
-
-def _range_contains(ranges: Iterable[_LossRange], position: int) -> bool:
-    return any(item.start <= position <= item.end for item in ranges)
-
-
-def _with_delivery_position(
-    message: ParsedMessageResult, position: int
-) -> ParsedMessageResult:
-    payload = parsed_message_to_plain_json(message)
-    payload["delivery_position"] = str(position)
-    return parse_message(payload)
-
-
-def _gap(expected: int, actual: int) -> ParsedMessageResult:
-    if actual <= expected:
-        raise AssertionError("delivery positions must increase")
-    return parse_message(
-        {
-            "protocol_version": "1",
-            "type": "stream.gap",
-            "expected_sequence": str(expected),
-            "actual_sequence": str(actual),
-            "dropped_count": str(actual - expected - 1),
-        }
-    )
-
-
-def _gap_after_loss(expected: int, loss_end: int) -> ParsedMessageResult:
-    """Build the gap following a loss without forming MAX_U64 + 1."""
-
-    if loss_end == MAX_U64:
-        raise _PositionExhausted("loss reaches the end of the uint64 namespace")
-    return _gap(expected, loss_end + 1)
+        return self._state.exhausted
 
 
 def _message_body_bytes(message: ParsedMessageResult) -> int:
@@ -1088,8 +234,6 @@ def _message_body_bytes(message: ParsedMessageResult) -> int:
 
 
 def _message_weight(message: ParsedMessageResult) -> int:
-    """Count canonical retained data, including additive/nested fields."""
-
     payload = message.message if isinstance(message, KnownParsedMessage) else message.payload
     return _shared_canonical_weight(payload)
 
@@ -1107,9 +251,8 @@ def _mark_committed_exception(error: BaseException) -> None:
 
 
 def _validate_message_numbers(message: ParsedMessage | Mapping[str, object]) -> None:
-    payload: object
     if isinstance(message, KnownParsedMessage):
-        payload = message.message
+        payload: object = message.message
     elif isinstance(message, OpaqueParsedMessage):
         payload = message.payload
     elif isinstance(message, Mapping):

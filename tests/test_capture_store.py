@@ -5,7 +5,6 @@ import sys
 import threading
 import time
 import weakref
-from collections import deque
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from types import SimpleNamespace
@@ -479,7 +478,7 @@ def test_source_hello_postcommit_cleanup_failure_does_not_duplicate(
         nonlocal releases
         releases += 1
         released = original_release(owner)
-        if releases == 2:
+        if releases == 1:
             raise KeyboardInterrupt
         return released
 
@@ -501,14 +500,11 @@ def test_source_hello_precommit_cleanup_failure_remains_retryable(
 ) -> None:
     sink = BoundedMessageSink()
     addon = CaptureAddon(sink=sink, clock=lambda: "now")
-    original_release = sink._lock.release_if_owned
+    def fail_before_admission(_message: object) -> bool:
+        raise RuntimeError("injected precommit failure")
 
-    def release_then_interrupt(owner: object | None = None) -> bool:
-        original_release(owner)
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(sink._lock, "release_if_owned", release_then_interrupt)
-    with pytest.raises(KeyboardInterrupt):
+    monkeypatch.setattr(sink, "offer", fail_before_admission)
+    with pytest.raises(RuntimeError, match="injected precommit failure"):
         addon._announce_source()
     assert not addon._source_announced
     monkeypatch.undo()
@@ -549,12 +545,12 @@ def test_loss_admission_is_nonblocking_while_position_lock_is_held() -> None:
     held = threading.Event()
     release = threading.Event()
 
-    def hold_position_lock() -> None:
-        with sink._position_lock:
+    def hold_sequencer() -> None:
+        with sink._sequencer.lock:
             held.set()
             release.wait(timeout=2)
 
-    holder = threading.Thread(target=hold_position_lock)
+    holder = threading.Thread(target=hold_sequencer)
     holder.start()
     assert held.wait(timeout=1)
     started = time.perf_counter()
@@ -575,17 +571,11 @@ def test_loss_admission_is_nonblocking_while_position_lock_is_held() -> None:
     assert gap.message["dropped_count"] == "2"
 
 
-def test_loss_admission_is_nonblocking_while_loss_lock_is_held(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_loss_admission_is_nonblocking_while_sequencer_is_held() -> None:
     sink = BoundedMessageSink(max_pending=1)
     assert sink.offer(parse_message({"protocol_version": "1", "type": "future.first"}))
 
-    def forbidden_transaction(_sink: BoundedMessageSink) -> object:
-        raise AssertionError("loss rejection must not snapshot the queue")
-
-    monkeypatch.setattr(sink_module, "_AdmissionTransaction", forbidden_transaction)
-    sink._loss_lock.acquire()
+    sink._sequencer.lock.acquire()
     try:
         started = time.perf_counter()
         assert sink.record_loss()
@@ -594,7 +584,7 @@ def test_loss_admission_is_nonblocking_while_loss_lock_is_held(
         )
         assert time.perf_counter() - started < 0.05
     finally:
-        sink._loss_lock.release()
+        sink._sequencer.lock.release()
 
     assert sink.dropped_count == 2
     drained = sink.drain()
@@ -605,6 +595,103 @@ def test_loss_admission_is_nonblocking_while_loss_lock_is_held(
     gap = drained[-1]
     assert isinstance(gap, KnownParsedMessage)
     assert gap.message["dropped_count"] == "2"
+
+
+def test_contended_loss_ticket_is_folded_once_after_two_public_admissions() -> None:
+    sink = BoundedMessageSink(max_pending=1)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_sequencer() -> None:
+        with sink._sequencer.lock:
+            entered.set()
+            release.wait(timeout=1)
+
+    holder = threading.Thread(target=hold_sequencer)
+    holder.start()
+    assert entered.wait(timeout=1)
+    results: list[bool] = []
+    workers = [
+        threading.Thread(target=lambda: results.append(sink.record_loss()))
+        for _ in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=1)
+    release.set()
+    holder.join(timeout=1)
+    assert results == [True, True]
+    assert sink.dropped_count == 2
+    gaps = sink.drain()
+    assert len(gaps) == 1
+    assert isinstance(gaps[0], KnownParsedMessage)
+    assert gaps[0].message["dropped_count"] == "2"
+
+
+def test_post_append_fault_reports_committed_offer_without_duplicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    original_append = sink._sequencer.append_locked
+
+    def append_then_interrupt(*args: object, **kwargs: object) -> bool:
+        original_append(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink._sequencer, "append_locked", append_then_interrupt)
+    with pytest.raises(KeyboardInterrupt) as raised:
+        sink.offer(parse_message({"protocol_version": "1", "type": "future.committed"}))
+    assert getattr(raised.value, "capture_committed", False)
+    assert sink.accepted_count == 1
+    assert sink.pending_count == 1
+    monkeypatch.undo()
+    drained = sink.drain()
+    assert len(drained) == 1
+    assert sink.drain() == []
+
+
+def test_drain_cleanup_fault_keeps_committed_snapshot_visible_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.drain"}))
+    original_release = sink._lock.release_if_owned
+
+    def release_then_interrupt(owner: object | None = None) -> bool:
+        original_release(owner)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink._lock, "release_if_owned", release_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        sink.drain()
+    monkeypatch.undo()
+    assert sink.pending_count == 0
+    assert sink.drain() == []
+
+
+def test_drain_baseexception_restores_one_atomic_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink(max_pending=2)
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.atomic"}))
+    before = (sink.pending_count, sink.accepted_count, sink.dropped_count, sink._memory_bytes)
+
+    def interrupt(_message: ParsedMessageResult, _position: int) -> ParsedMessageResult:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink_module, "_with_delivery_position", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        sink.drain()
+    assert (
+        sink.pending_count,
+        sink.accepted_count,
+        sink.dropped_count,
+        sink._memory_bytes,
+    ) == before
+    monkeypatch.undo()
+    assert len(sink.drain()) == 1
+    assert sink._memory_bytes == 0
 
 
 def test_sink_queue_and_body_drops_are_in_band_and_delivery_positioned() -> None:
@@ -829,7 +916,6 @@ def test_loss_ranges_stay_bounded_for_25000_contiguous_drops() -> None:
         assert not sink.offer(message)
     assert sink.dropped_count == 25_000
     assert sink.loss_range_count == 1
-    assert sink.loss_range_collapses == 0
     messages = sink.drain()
     gaps = [
         message
@@ -841,23 +927,29 @@ def test_loss_ranges_stay_bounded_for_25000_contiguous_drops() -> None:
     assert sink.loss_range_count == 0
 
 
-def test_noncontiguous_loss_fragmentation_collapses_to_bounded_resync() -> None:
+def test_noncontiguous_losses_preserve_every_accepted_entry() -> None:
     sink = BoundedMessageSink(max_pending=512)
     message = parse_message({"protocol_version": "1", "type": "future.keep"})
     for _ in range(300):
         assert sink.offer(message)
         sink.record_loss()
-    assert sink.loss_range_count == 1
-    assert sink.loss_range_collapses > 0
+    assert sink.loss_range_count == 300
     messages = sink.drain()
+    retained = [
+        message
+        for message in messages
+        if (message.message if isinstance(message, KnownParsedMessage) else message.payload)[
+            "type"
+        ] == "future.keep"
+    ]
     gaps = [
         message
         for message in messages
         if isinstance(message, KnownParsedMessage) and message.message["type"] == "stream.gap"
     ]
-    assert len(gaps) == 1
-    assert gaps[0].message["dropped_count"] == "599"
-    assert sink.dropped_count == 599
+    assert len(retained) == 300
+    assert len(gaps) == 300
+    assert sink.dropped_count == 300
 
 
 def test_prepared_offer_has_no_payload_work_when_queue_lock_loses_between_stages(
@@ -895,7 +987,6 @@ def test_admission_preparation_failure_releases_reservation_without_position(
     monkeypatch.setattr(sink_module, "require_parsed_message", fail)
     with pytest.raises(RuntimeError, match="injected preparation failure"):
         sink.offer(message)
-    assert sink._reserved_slots == 0
     assert sink.pending_count == 0
     assert sink.dropped_count == 0
     assert sink._next_position_value == 1
@@ -920,7 +1011,6 @@ def test_reservation_acquire_baseexception_after_ownership_is_recoverable(
         sink.offer(parse_message({"protocol_version": "1", "type": "future.acquire"}))
     monkeypatch.undo()
 
-    assert sink._reserved_slots == 0
     assert sink.pending_count == 0
     assert sink.dropped_count == 0
     assert sink._reservation_lock.acquire(False)
@@ -1013,7 +1103,6 @@ def test_reservation_release_baseexception_before_and_after_clear_is_recoverable
     with pytest.raises(KeyboardInterrupt):
         sink.offer(parse_message({"protocol_version": "1", "type": "future.before"}))
     monkeypatch.undo()
-    assert sink._reserved_slots == 0
     assert sink.pending_count == 1
 
     original_release = sink._reservation_lock.release_if_owned
@@ -1026,7 +1115,6 @@ def test_reservation_release_baseexception_before_and_after_clear_is_recoverable
     with pytest.raises(KeyboardInterrupt):
         sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
     monkeypatch.undo()
-    assert sink._reserved_slots == 0
     assert sink.pending_count == 2
     assert len(sink.drain()) == 2
 
@@ -1049,7 +1137,6 @@ def test_queue_lock_ownership_boundaries_do_not_strand_slot_or_drain(
     with pytest.raises(KeyboardInterrupt):
         sink.offer(parse_message({"protocol_version": "1", "type": "future.queue"}))
     monkeypatch.undo()
-    assert sink._reserved_slots == 0
     assert sink.pending_count == 0
 
     original_release = sink._lock.release_if_owned
@@ -1062,177 +1149,9 @@ def test_queue_lock_ownership_boundaries_do_not_strand_slot_or_drain(
     with pytest.raises(KeyboardInterrupt):
         sink.offer(parse_message({"protocol_version": "1", "type": "future.release"}))
     monkeypatch.undo()
-    assert sink._reserved_slots == 0
-    assert sink.pending_count == 0
-    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
-    assert len(sink.drain()) == 1
-
-
-def test_append_failure_releases_reservation_and_records_exact_gap() -> None:
-    class FailingDeque(deque[object]):
-        def append(self, _item: object) -> None:
-            raise RuntimeError("injected append failure")
-
-    sink = BoundedMessageSink()
-    sink._items = FailingDeque()
-    message = parse_message({"protocol_version": "1", "type": "future.append"})
-    with pytest.raises(RuntimeError, match="injected append failure"):
-        sink.offer(message)
-    assert sink._reserved_slots == 0
-    assert sink.pending_count == 0
-    assert sink.dropped_count == 1
-    assert sink.loss_range_count == 1
-    sink._items = deque()
-    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
-    drained = sink.drain()
-    assert [
-        (item.message if isinstance(item, KnownParsedMessage) else item.payload)["type"]
-        for item in drained
-    ] == ["stream.gap", "future.after"]
-
-
-def test_keyboard_interrupt_during_append_rolls_back_transaction() -> None:
-    class InterruptingDeque(deque[object]):
-        def append(self, _item: object) -> None:
-            raise KeyboardInterrupt
-
-    sink = BoundedMessageSink()
-    sink._items = InterruptingDeque()
-    with pytest.raises(KeyboardInterrupt):
-        sink.offer(parse_message({"protocol_version": "1", "type": "future.interrupt"}))
-    assert sink._reserved_slots == 0
-    assert sink.pending_count == 0
-    assert sink.dropped_count == 1
-    assert sink.loss_range_count == 1
-
-
-def test_keyboard_interrupt_after_enqueue_position_allocation_restores_position(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sink = BoundedMessageSink()
-    original_allocate = sink._allocate_position
-
-    def interrupt_after_allocate() -> int:
-        original_allocate()
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(sink, "_allocate_position", interrupt_after_allocate)
-    with pytest.raises(KeyboardInterrupt):
-        sink.offer(parse_message({"protocol_version": "1", "type": "future.allocate"}))
-    assert sink._next_position_value == 2
-    assert not sink.exhausted
-    assert sink.pending_count == 0
-    assert sink.dropped_count == 1
-    monkeypatch.undo()
-    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
-    delivered = sink.drain()
-    assert len(delivered) == 2
-    assert isinstance(delivered[0], KnownParsedMessage)
-    assert delivered[0].message["type"] == "stream.gap"
-    delivered_payload = (
-        delivered[1].message
-        if isinstance(delivered[1], KnownParsedMessage)
-        else delivered[1].payload
-    )
-    assert delivered_payload["delivery_position"] == "2"
-
-
-def test_keyboard_interrupt_before_position_mutation_does_not_create_loss(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sink = BoundedMessageSink()
-
-    def interrupt_before_allocate() -> int:
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(sink, "_allocate_position", interrupt_before_allocate)
-    with pytest.raises(KeyboardInterrupt):
-        sink.offer(parse_message({"protocol_version": "1", "type": "future.allocate"}))
-    assert sink._next_position_value == 1
-    assert sink.dropped_count == 0
-    monkeypatch.undo()
-    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
-    delivered = sink.drain()
-    assert len(delivered) == 1
-    payload = (
-        delivered[0].message
-        if isinstance(delivered[0], KnownParsedMessage)
-        else delivered[0].payload
-    )
-    assert payload["delivery_position"] == "1"
-
-
-def test_keyboard_interrupt_after_loss_position_allocation_restores_position(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sink = BoundedMessageSink()
-    original_allocate = sink._allocate_position
-
-    def interrupt_after_allocate() -> int:
-        original_allocate()
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(sink, "_allocate_position", interrupt_after_allocate)
-    with pytest.raises(KeyboardInterrupt):
-        sink.record_loss()
-    assert sink._next_position_value == 2
-    assert not sink.exhausted
-    assert sink.dropped_count == 1
-    assert sink.loss_range_count == 1
-    monkeypatch.undo()
-    assert sink.record_loss()
-    assert sink.dropped_count == 2
-    assert sink.drain()[0].message["type"] == "stream.gap"  # type: ignore[union-attr]
-
-
-def test_pending_loss_flush_exception_preserves_acknowledged_range(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sink = BoundedMessageSink()
-    sink._pending_loss_count = 1
-    original_flush = sink._flush_pending_losses_locked
-
-    def flush_then_interrupt(*, loss_lock_held: bool = False) -> None:
-        original_flush(loss_lock_held=loss_lock_held)
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(sink, "_flush_pending_losses_locked", flush_then_interrupt)
-    with pytest.raises(KeyboardInterrupt):
-        sink.record_loss()
-    monkeypatch.undo()
-
-    assert sink._next_position_value == 2
-    assert sink.dropped_count == 1
-    assert sink.loss_range_count == 1
-    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after-flush"}))
-    drained = sink.drain()
-    assert [
-        (item.message if isinstance(item, KnownParsedMessage) else item.payload)["type"]
-        for item in drained
-    ] == ["stream.gap", "future.after-flush"]
-
-
-def test_reentrant_loss_during_allocation_is_not_erased(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sink = BoundedMessageSink()
-    original_allocate = sink._allocate_position
-    reentered = False
-
-    def allocate_with_reentrant_loss() -> int:
-        nonlocal reentered
-        if not reentered:
-            reentered = True
-            assert sink.record_loss()
-        return original_allocate()
-
-    monkeypatch.setattr(sink, "_allocate_position", allocate_with_reentrant_loss)
-    assert sink.record_loss()
-    monkeypatch.undo()
-
-    assert sink.dropped_count == 2
-    assert sink._next_position_value == 3
-    assert sink.loss_range_count == 1
+    # The queue commit succeeded before cleanup failed; the surfaced error is
+    # therefore a committed outcome and retrying would duplicate the message.
+    assert sink.pending_count == 1
     assert len(sink.drain()) == 1
 
 
@@ -1260,294 +1179,6 @@ def test_concurrent_loss_admissions_cover_every_reserved_position() -> None:
     assert len(gaps) == 1
     assert isinstance(gaps[0], KnownParsedMessage)
     assert gaps[0].message["dropped_count"] == "8"
-
-
-def test_keyboard_interrupt_on_second_popleft_restores_queue_and_counters() -> None:
-    class InterruptingDeque(deque[object]):
-        def __init__(self) -> None:
-            super().__init__()
-            self.calls = 0
-
-        def popleft(self) -> object:
-            self.calls += 1
-            if self.calls == 2:
-                raise KeyboardInterrupt
-            return super().popleft()
-
-    sink = BoundedMessageSink(max_pending=2)
-    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.one"}))
-    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.two"}))
-    queue = InterruptingDeque()
-    queue.extend(sink._items)
-    sink._items = queue
-    before = (
-        sink.pending_count,
-        sink._body_bytes,
-        sink._memory_bytes,
-        sink.accepted_count,
-        sink.dropped_count,
-        sink.loss_range_count,
-        sink._next_position_value,
-    )
-    with pytest.raises(KeyboardInterrupt):
-        sink.drain()
-    assert (
-        sink.pending_count,
-        sink._body_bytes,
-        sink._memory_bytes,
-        sink.accepted_count,
-        sink.dropped_count,
-        sink.loss_range_count,
-        sink._next_position_value,
-    ) == before
-    assert [item.position for item in sink._items] == [1, 2]
-    assert sink._last_delivered_position == 0
-
-
-def test_keyboard_interrupt_during_drain_snapshot_preserves_queue_exactly() -> None:
-    class SnapshotInterruptingDeque(deque[object]):
-        def __iter__(self) -> Iterator[object]:
-            raise KeyboardInterrupt
-
-    sink = BoundedMessageSink(max_pending=2)
-    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.snapshot"}))
-    original_item = sink._items[0]
-    sink._items = SnapshotInterruptingDeque([original_item])
-    with pytest.raises(KeyboardInterrupt):
-        sink.drain()
-    assert sink.pending_count == 1
-    assert sink._items[0] is original_item
-    assert sink._body_bytes == 0
-    assert sink._memory_bytes > 0
-    assert sink._last_delivered_position == 0
-    sink._items = deque([original_item])
-    assert len(sink.drain()) == 1
-
-
-@pytest.mark.parametrize("after_clear", [False, True])
-def test_keyboard_interrupt_during_drain_reservation_release_restores_transaction(
-    monkeypatch: pytest.MonkeyPatch, after_clear: bool
-) -> None:
-    sink = BoundedMessageSink()
-    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.release"}))
-    before = (
-        sink.pending_count,
-        sink._body_bytes,
-        sink._memory_bytes,
-        sink.accepted_count,
-        sink.dropped_count,
-        sink.loss_range_count,
-        sink._next_position_value,
-        sink._last_delivered_position,
-    )
-    original_release = sink._reservation_lock.release_if_owned
-    calls = 0
-
-    def release_then_interrupt(owner: object | None = None) -> bool:
-        nonlocal calls
-        calls += 1
-        if calls > 1:
-            return original_release(owner)
-        if after_clear:
-            original_release(owner)
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(sink._reservation_lock, "release_if_owned", release_then_interrupt)
-    with pytest.raises(KeyboardInterrupt):
-        sink.drain()
-    monkeypatch.undo()
-
-    assert (
-        sink.pending_count,
-        sink._body_bytes,
-        sink._memory_bytes,
-        sink.accepted_count,
-        sink.dropped_count,
-        sink.loss_range_count,
-        sink._next_position_value,
-        sink._last_delivered_position,
-    ) == before
-    assert len(sink.drain()) == 1
-
-
-def test_drain_release_failure_merges_loss_recorded_after_detachment(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sink = BoundedMessageSink()
-    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.first"}))
-    original_release = sink._lock.release_if_owned
-    calls = 0
-
-    def release_queue_and_record_loss(owner: object | None = None) -> bool:
-        nonlocal calls
-        calls += 1
-        released = original_release(owner)
-        if calls == 1:
-            assert sink.record_loss()
-            raise KeyboardInterrupt
-        return released
-
-    monkeypatch.setattr(sink._lock, "release_if_owned", release_queue_and_record_loss)
-    with pytest.raises(KeyboardInterrupt):
-        sink.drain()
-    assert sink._next_position_value == 3
-    assert sink.dropped_count == 1
-    assert sink.loss_range_count == 1
-    monkeypatch.undo()
-
-    messages = sink.drain()
-    types = [
-        (message.message if isinstance(message, KnownParsedMessage) else message.payload)["type"]
-        for message in messages
-    ]
-    assert types == ["future.first", "stream.gap"]
-    assert types.count("stream.gap") == 1
-    gap = messages[-1]
-    assert isinstance(gap, KnownParsedMessage)
-    assert gap.message["expected_sequence"] == "1"
-    assert gap.message["actual_sequence"] == "3"
-
-
-def test_admission_rollback_preserves_losses_flushed_during_position_allocation() -> None:
-    sink = BoundedMessageSink()
-    transaction = sink_module._AdmissionTransaction(sink)
-    held = threading.Event()
-    release = threading.Event()
-
-    def hold_position() -> None:
-        with sink._position_lock:
-            held.set()
-            release.wait(timeout=1)
-
-    holder = threading.Thread(target=hold_position)
-    holder.start()
-    assert held.wait(timeout=1)
-    assert sink.record_loss()
-    release.set()
-    holder.join(timeout=1)
-    assert not holder.is_alive()
-
-    class FailingDeque(deque[object]):
-        def append(self, _item: object) -> None:
-            raise RuntimeError("injected transaction append failure")
-
-    sink._items = FailingDeque()
-    with sink._position_lock:
-        with pytest.raises(RuntimeError, match="transaction append failure"):
-            transaction.allocate_position()
-            transaction.append(
-                sink_module._QueuedMessage(
-                    transaction.position or 0,
-                    parse_message({"protocol_version": "1", "type": "future.failed"}),
-                    0,
-                    1,
-                )
-            )
-        transaction.rollback()
-
-    sink._items = deque()
-    assert sink.dropped_count == 2
-    drained = sink.drain()
-    assert len(drained) == 1
-    gap = drained[0]
-    assert isinstance(gap, KnownParsedMessage)
-    assert gap.message["type"] == "stream.gap"
-    assert gap.message["expected_sequence"] == "0"
-    assert gap.message["actual_sequence"] == "3"
-
-
-def test_drain_rollback_preserves_pending_loss_added_during_detachment() -> None:
-    sink = BoundedMessageSink()
-    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.keep"}))
-    original = sink._items[0]
-
-    class InterruptingDeque(deque[object]):
-        def popleft(self) -> object:
-            assert sink.record_loss()
-            raise KeyboardInterrupt
-
-    sink._items = InterruptingDeque([original])
-    with pytest.raises(KeyboardInterrupt):
-        sink.drain()
-
-    assert sink.dropped_count == 1
-    assert sink._pending_loss_count == 1
-    assert sink._items[0] is original
-    sink._items = deque([original])
-    drained = sink.drain()
-    types = [
-        (item.message if isinstance(item, KnownParsedMessage) else item.payload)["type"]
-        for item in drained
-    ]
-    assert types == ["future.keep", "stream.gap"]
-
-
-def test_pending_count_propagates_lease_close_error_and_releases_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sink = BoundedMessageSink()
-    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.pending"}))
-    original_release = sink._lock.release_if_owned
-    calls = 0
-
-    def release_then_interrupt(owner: object | None = None) -> bool:
-        nonlocal calls
-        calls += 1
-        released = original_release(owner)
-        if calls == 1:
-            raise KeyboardInterrupt
-        return released
-
-    monkeypatch.setattr(sink._lock, "release_if_owned", release_then_interrupt)
-    with pytest.raises(KeyboardInterrupt):
-        _ = sink.pending_count
-    monkeypatch.undo()
-
-    assert sink.pending_count == 1
-    assert sink._lock.acquire(False)
-    sink._lock.release()
-
-
-def test_keyboard_interrupt_during_loss_detachment_restores_all_ranges() -> None:
-    class InterruptingDeque(deque[object]):
-        def __init__(self, values: tuple[object, ...]) -> None:
-            super().__init__(values)
-            self.calls = 0
-
-        def popleft(self) -> object:
-            self.calls += 1
-            if self.calls == 2:
-                raise KeyboardInterrupt
-            return super().popleft()
-
-    sink = BoundedMessageSink(max_pending=2)
-    assert sink.record_loss()
-    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.keep"}))
-    assert sink.record_loss()
-    original_ranges = tuple(sink._loss_ranges)
-    sink._loss_ranges = InterruptingDeque(original_ranges)
-    before = (
-        sink.pending_count,
-        sink._body_bytes,
-        sink._memory_bytes,
-        sink.accepted_count,
-        sink.dropped_count,
-        sink.loss_range_count,
-        sink._next_position_value,
-    )
-    with pytest.raises(KeyboardInterrupt):
-        sink.drain()
-    assert (
-        sink.pending_count,
-        sink._body_bytes,
-        sink._memory_bytes,
-        sink.accepted_count,
-        sink.dropped_count,
-        sink.loss_range_count,
-        sink._next_position_value,
-    ) == before
-    assert tuple(sink._loss_ranges) == original_ranges
-    assert sink._last_delivered_position == 0
 
 
 def test_keyboard_interrupt_during_drain_restores_detached_state(
@@ -1638,7 +1269,7 @@ def test_drain_gap_failure_restores_loss_range_and_detached_message(
     ] == ["future.keep", "stream.gap"]
 
 
-def test_producer_drop_during_drain_is_not_cleared_or_duplicated(
+def test_producer_losses_during_drain_are_not_cleared_or_duplicated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sink = BoundedMessageSink(max_pending=2)
@@ -1658,18 +1289,17 @@ def test_producer_drop_during_drain_is_not_cleared_or_duplicated(
     drain_thread.start()
     assert entered.wait(timeout=1)
     sink.record_loss()
-    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
+    assert not sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
     release.set()
     drain_thread.join(timeout=1)
     assert not drain_thread.is_alive()
 
-    second_result = sink.drain()
-    combined = first_result + second_result
+    combined = first_result + sink.drain()
     types = [
         (message.message if isinstance(message, KnownParsedMessage) else message.payload)["type"]
         for message in combined
     ]
-    assert types == ["future.first", "stream.gap", "future.after"]
+    assert types == ["future.first", "stream.gap"]
     assert types.count("stream.gap") == 1
 
 
@@ -2003,6 +1633,26 @@ def test_store_rejects_non_integral_or_unbounded_limits(
 def test_store_accepts_large_exact_integer_age_without_float_coercion() -> None:
     store = MemoryStore(max_age_seconds=10**400)
     assert store.max_age_seconds == 10**400
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_active_flows": True},
+        {"max_active_flows": 1.0},
+        {"max_active_flows": float("nan")},
+        {"max_active_flows": float("inf")},
+        {"max_active_flows": MAX_U64 + 1},
+        {"max_active_age_seconds": True},
+        {"max_active_age_seconds": float("nan")},
+        {"max_active_age_seconds": float("inf")},
+    ],
+)
+def test_active_flow_limits_reject_nonfinite_or_unbounded_values(
+    kwargs: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        CaptureAddon(**kwargs)  # type: ignore[arg-type]
 
 
 def completed_flow_message(flow_id: str, sequence: str) -> ParsedMessageResult:

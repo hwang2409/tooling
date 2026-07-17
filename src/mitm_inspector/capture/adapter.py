@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import math
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
@@ -35,6 +36,19 @@ MAX_ACTIVE_AGE_SECONDS = 30 * 60
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _validate_active_limits(max_flows: object, max_age: object) -> None:
+    if type(max_flows) is not int or max_flows < 1 or max_flows > MAX_U64:
+        raise ValueError("max_active_flows must be an exact bounded integer")
+    if type(max_age) is int:
+        valid_age = max_age >= 0
+    elif type(max_age) is float:
+        valid_age = math.isfinite(max_age) and max_age >= 0
+    else:
+        valid_age = False
+    if not valid_age:
+        raise ValueError("max_active_age_seconds must be finite and nonnegative")
 
 
 @dataclass
@@ -118,15 +132,12 @@ class CaptureAddon:
                 max_body_prefix_bytes=max_body_prefix_bytes,
                 max_pending_messages=max_pending_messages,
             )
+        _validate_active_limits(max_active_flows, max_active_age_seconds)
         self.config = config
         self.source_id = config.source_id
         self.capture_socket = config.capture_socket
         self.max_body_prefix_bytes = config.max_body_prefix_bytes
         self.max_in_memory_bytes = config.max_in_memory_bytes
-        if max_active_flows < 1:
-            raise ValueError("max_active_flows must be positive")
-        if max_active_age_seconds < 0:
-            raise ValueError("max_active_age_seconds must not be negative")
         self.max_active_flows = max_active_flows
         self.max_active_age_seconds = max_active_age_seconds
         self._active_clock = active_clock
