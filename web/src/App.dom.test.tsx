@@ -149,6 +149,40 @@ describe("mounted App connection behavior", () => {
     expect(connectionB.close).toHaveBeenCalledOnce();
   });
 
+  it("renders the flow grid for retained flows and pauses follow-live when a row opens the inspector", async () => {
+    const harness = mountedHarness();
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => root?.render(<App transportFactory={harness.factory} />));
+    await act(async () => {
+      harness.handlers[0].onOpen();
+      harness.handlers[0].onMessage(hello("source-a"));
+      harness.handlers[0].onMessage(snapshot("1", "a", [flow("flow-one"), flow("flow-two")]));
+      harness.handlers[0].onMessage({
+        protocol_version: "1", type: "flow.lifecycle", source_id: "source-a", flow_id: "flow-one",
+        event_id: "e1", occurred_at: "2026-01-01T00:00:01Z", sequence: "1", state: "response_started",
+      });
+    });
+
+    const grid = document.querySelector('[role="grid"]');
+    expect(grid?.getAttribute("aria-rowcount")).toBe("3");
+    expect(document.body.textContent).toContain("Following live");
+
+    const rows = Array.from(document.querySelectorAll<HTMLElement>(".flow-grid-row"));
+    expect(rows).toHaveLength(2);
+    await act(async () => rows[0].click());
+
+    expect(document.body.textContent).toContain("Live paused");
+    expect(document.body.textContent).toContain("Request / response inspector");
+    expect(document.body.textContent).toContain("response opened");
+
+    await act(async () => harness.handlers[0].onMessage(gap("2")));
+    expect(document.body.textContent).toContain("paused at cursor 1");
+    await act(async () => root?.unmount());
+    root = null;
+  });
+
   it("mounts an unsupported transport as an explicit unavailable resync action", async () => {
     const harness = mountedHarness(false);
     const container = document.createElement("div");

@@ -1,5 +1,6 @@
 /* eslint-disable no-unused-vars */
 
+import type { DeepReadonly } from "../immutable";
 import type {
   BrowserDelta,
   BrowserResync,
@@ -33,13 +34,8 @@ export interface BrowserCounters {
   readonly droppedMessages: string;
 }
 
-type DeepReadonly<T> = T extends ReadonlyArray<infer Item>
-  ? ReadonlyArray<DeepReadonly<Item>>
-  : T extends object
-    ? { readonly [Key in keyof T]: DeepReadonly<T[Key]> }
-    : T;
-
 export type ImmutableFlowMetadata = DeepReadonly<FlowMetadata>;
+export type ImmutableFlowLifecycle = DeepReadonly<FlowLifecycle>;
 
 export interface ImmutableFlowCollection {
   readonly ids: readonly string[];
@@ -48,8 +44,18 @@ export interface ImmutableFlowCollection {
   readonly get: (flowId: string) => ImmutableFlowMetadata | undefined;
 }
 
+export const LIFECYCLE_FLOW_LIMIT = 512;
+export const LIFECYCLE_EVENTS_PER_FLOW = 32;
+
+export interface ImmutableLifecycleCollection {
+  readonly flowIds: readonly string[];
+  readonly size: number;
+  readonly get: (flowId: string) => readonly ImmutableFlowLifecycle[] | undefined;
+}
+
 export interface BrowserState {
   readonly flows: ImmutableFlowCollection;
+  readonly lifecycles: ImmutableLifecycleCollection;
   readonly cursor: string;
   readonly streamSequence: string | null;
   readonly sourceEpoch: number;
@@ -73,9 +79,11 @@ export interface BrowserViewState {
 }
 
 export const emptyFlowCollection = createFlowCollection([]);
+export const emptyLifecycleCollection = createLifecycleCollection([]);
 
 const initialBrowserStateValue: BrowserState = {
   flows: emptyFlowCollection,
+  lifecycles: emptyLifecycleCollection,
   cursor: "0",
   streamSequence: null,
   sourceEpoch: 0,
@@ -161,6 +169,47 @@ function createFlowCollection(entries: readonly ImmutableFlowMetadata[]): Immuta
   });
 }
 
+type LifecycleEntries = readonly (readonly [string, readonly ImmutableFlowLifecycle[]])[];
+
+function createLifecycleCollection(entries: LifecycleEntries): ImmutableLifecycleCollection {
+  const byId = new Map<string, readonly ImmutableFlowLifecycle[]>();
+  for (const [flowId, events] of entries) {
+    byId.set(flowId, Object.freeze(events.map((event) => freezeCopy(event))));
+  }
+  const flowIds = Object.freeze([...byId.keys()]);
+  return Object.freeze({
+    flowIds,
+    size: flowIds.length,
+    get: (flowId: string) => byId.get(flowId),
+  });
+}
+
+function recordLifecycle(collection: ImmutableLifecycleCollection, message: FlowLifecycle): ImmutableLifecycleCollection {
+  const existing = collection.get(message.flow_id);
+  const events = [...(existing ?? []), message as ImmutableFlowLifecycle].slice(-LIFECYCLE_EVENTS_PER_FLOW);
+  let flowIds = collection.flowIds;
+  if (existing === undefined && flowIds.length >= LIFECYCLE_FLOW_LIMIT) {
+    flowIds = flowIds.slice(flowIds.length - LIFECYCLE_FLOW_LIMIT + 1);
+  }
+  const entries: Array<readonly [string, readonly ImmutableFlowLifecycle[]]> = [];
+  for (const flowId of flowIds) {
+    if (flowId === message.flow_id) continue;
+    entries.push([flowId, collection.get(flowId) ?? []]);
+  }
+  entries.push([message.flow_id, events]);
+  return createLifecycleCollection(entries);
+}
+
+function pruneLifecycle(collection: ImmutableLifecycleCollection, removedFlowIds: readonly string[]): ImmutableLifecycleCollection {
+  const removed = new Set(removedFlowIds);
+  if (!collection.flowIds.some((flowId) => removed.has(flowId))) return collection;
+  const entries: Array<readonly [string, readonly ImmutableFlowLifecycle[]]> = [];
+  for (const flowId of collection.flowIds) {
+    if (!removed.has(flowId)) entries.push([flowId, collection.get(flowId) ?? []]);
+  }
+  return createLifecycleCollection(entries);
+}
+
 function withCounter(state: BrowserState, key: keyof Omit<BrowserCounters, "droppedMessages">, amount = 1): BrowserState {
   return {
     ...state,
@@ -186,6 +235,7 @@ function resetForSource(state: BrowserState, message: SourceHello): BrowserState
   return {
     ...state,
     flows: emptyFlowCollection,
+    lifecycles: emptyLifecycleCollection,
     cursor: "0",
     streamSequence: null,
     sourceEpoch: state.sourceEpoch + 1,
@@ -256,6 +306,7 @@ function applyDelta(state: BrowserState, message: BrowserDelta): BrowserState {
   }
 
   const entries = [...state.flows.entries];
+  const removedFlowIds: string[] = [];
   for (const change of message.changes) {
     const flowId = change.op === "upsert" ? change.flow.flow_id : change.flow_id;
     const index = entries.findIndex((flow) => flow.flow_id === flowId);
@@ -264,11 +315,13 @@ function applyDelta(state: BrowserState, message: BrowserDelta): BrowserState {
       else entries[index] = change.flow;
     } else if (index !== -1) {
       entries.splice(index, 1);
+      removedFlowIds.push(flowId);
     }
   }
   return {
     ...state,
     flows: createFlowCollection(entries),
+    lifecycles: pruneLifecycle(state.lifecycles, removedFlowIds),
     cursor: message.cursor,
     gap: null,
     resyncRequested: null,
@@ -313,7 +366,11 @@ function applyStreamGap(state: BrowserState, message: StreamGap): BrowserState {
 function applyLifecycle(state: BrowserState, message: FlowLifecycle): BrowserState {
   if (state.sourceId === null || message.source_id !== state.sourceId) return stale(state);
   if (state.streamSequence !== null && cursor(message.sequence) <= cursor(state.streamSequence)) return stale(state);
-  return { ...state, streamSequence: message.sequence };
+  return {
+    ...state,
+    streamSequence: message.sequence,
+    lifecycles: recordLifecycle(state.lifecycles, message),
+  };
 }
 
 export function browserReducer(state: BrowserState, action: BrowserAction): BrowserState {
