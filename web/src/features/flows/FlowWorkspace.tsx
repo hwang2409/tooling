@@ -56,6 +56,7 @@ export function FlowWorkspace({ browser, followLive, pauseLive, gridViewportHeig
     : {
         metadata: selectedMetadata,
         lifecycle: browser.lifecycles.get(selectedMetadata.flow_id),
+        lifecycleTruncated: browser.lifecycles.isTruncated(selectedMetadata.flow_id),
         ...(detail?.status === "loaded" ? detail.overrides : {}),
       };
 

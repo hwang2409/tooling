@@ -22,6 +22,7 @@ from mitm_inspector.json_boundary import (
 
 PROTOCOL_VERSION = "1"
 MAX_U64 = 18_446_744_073_709_551_615
+MAX_METADATA_HEADER_BYTES = 64 * 1024
 _U64_PATTERN = re.compile(r"^(0|[1-9][0-9]*)$")
 _BASE64_PATTERN = re.compile(r"^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$")
 BODY_SIDES = ("request", "response")
@@ -462,12 +463,18 @@ def _headers(value: object, *, label: str) -> list[Header]:
     if not isinstance(value, Sequence) or isinstance(value, str | bytes | bytearray):
         raise ProtocolError(f"{label} must be an ordered list")
     result: list[Header] = []
+    total_bytes = 0
     for index, item in enumerate(value):
         header = _object(item, label=f"{label}[{index}]")
+        name = _string(header.get("name"), label=f"{label}[{index}].name")
+        header_value = _text(header.get("value"), label=f"{label}[{index}].value")
+        total_bytes += len(name.encode("utf-8")) + len(header_value.encode("utf-8"))
+        if total_bytes > MAX_METADATA_HEADER_BYTES:
+            raise ProtocolError(f"{label} exceeds {MAX_METADATA_HEADER_BYTES} bytes")
         result.append(
             Header(
-                name=_string(header.get("name"), label=f"{label}[{index}].name"),
-                value=_text(header.get("value"), label=f"{label}[{index}].value"),
+                name=name,
+                value=header_value,
             )
         )
     return result

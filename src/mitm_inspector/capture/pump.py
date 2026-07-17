@@ -144,7 +144,10 @@ class CaptureSocketPump:
                         self._addon.sink.record_loss()
                         continue
                     writer.write(line)
-                await writer.drain()
+                    # Drain each message so a full sink batch cannot accumulate
+                    # unbounded bytes in the transport before backpressure is
+                    # observed.
+                    await writer.drain()
             except (OSError, RuntimeError) as error:
                 # The batch was already acknowledged by drain(); whatever the
                 # reader did not receive is a real loss, so record it and let

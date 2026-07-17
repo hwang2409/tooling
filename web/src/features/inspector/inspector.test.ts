@@ -179,7 +179,7 @@ describe("PairedInspector rendering and interaction contracts", () => {
     error: "<img src=x onerror=alert(1)>",
   };
 
-  it("marks the lifecycle trace as truncated once the bounded window fills", () => {
+  it("marks the lifecycle trace only when overflow explicitly evicts an event", () => {
     const events = Array.from({ length: 32 }, (_, index) => ({
       protocol_version: "1",
       type: "flow.lifecycle",
@@ -190,12 +190,20 @@ describe("PairedInspector rendering and interaction contracts", () => {
       sequence: String(index + 1),
       state: "request_started",
     })) as unknown as InspectorFlow["lifecycle"];
-    const full = renderToStaticMarkup(createElement(PairedInspector, { flow: { ...flow, lifecycle: events } }));
-    expect(full).toContain("Showing the newest 32 events");
-    const partial = renderToStaticMarkup(
-      createElement(PairedInspector, { flow: { ...flow, lifecycle: events!.slice(0, 5) } }),
+    const thirtyOne = renderToStaticMarkup(
+      createElement(PairedInspector, { flow: { ...flow, lifecycle: events!.slice(0, 31), lifecycleTruncated: false } }),
     );
-    expect(partial).not.toContain("Showing the newest");
+    expect(thirtyOne).not.toContain("Showing the newest");
+
+    const thirtyTwo = renderToStaticMarkup(
+      createElement(PairedInspector, { flow: { ...flow, lifecycle: events, lifecycleTruncated: false } }),
+    );
+    expect(thirtyTwo).not.toContain("Showing the newest");
+
+    const thirtyThree = renderToStaticMarkup(
+      createElement(PairedInspector, { flow: { ...flow, lifecycle: events!.slice(1), lifecycleTruncated: true } }),
+    );
+    expect(thirtyThree).toContain("Showing the newest 32 events");
   });
 
   it("renders the initial flow with metadata and gated body content", () => {

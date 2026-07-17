@@ -75,6 +75,51 @@ class _LineCollector:
         await asyncio.gather(*(writer.wait_closed() for writer in writers), return_exceptions=True)
 
 
+class _FailFirstWriteCollector(_LineCollector):
+    """Abort the first live transport after its hello has been received."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hello_received = asyncio.Event()
+        self.transport_aborted = asyncio.Event()
+
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.connections += 1
+        self.writers.append(writer)
+        try:
+            line = await reader.readline()
+            if not line:
+                return
+            self.lines.append(json.loads(line))
+            if self.connections == 1:
+                self.hello_received.set()
+                writer.transport.abort()
+                self.transport_aborted.set()
+                return
+            while True:
+                line = await reader.readline()
+                if not line:
+                    return
+                self.lines.append(json.loads(line))
+        finally:
+            writer.close()
+
+
+class _BackpressureWriter:
+    def __init__(self) -> None:
+        self.pending_bytes = 0
+        self.max_pending_bytes = 0
+        self.drain_calls = 0
+
+    def write(self, data: bytes) -> None:
+        self.pending_bytes += len(data)
+        self.max_pending_bytes = max(self.max_pending_bytes, self.pending_bytes)
+
+    async def drain(self) -> None:
+        self.drain_calls += 1
+        self.pending_bytes = 0
+
+
 async def _wait_for(predicate, timeout: float = 5.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():
@@ -151,7 +196,7 @@ def test_pump_delivers_messages_and_flushes_on_done(socket_dir: Path) -> None:
 def test_pump_reconnects_and_reports_gap_after_listener_restart(socket_dir: Path) -> None:
     async def scenario() -> None:
         socket_path = str(socket_dir / "capture.sock")
-        collector = _LineCollector()
+        collector = _FailFirstWriteCollector()
         server = await asyncio.start_unix_server(collector.handle, path=socket_path)
         addon = CaptureAddon()
         addon.capture_socket = socket_path
@@ -163,31 +208,28 @@ def test_pump_reconnects_and_reports_gap_after_listener_restart(socket_dir: Path
         )
         assert addon.sink.offer(_hello())
         pump.running()
-        await _wait_for(lambda: len(collector.lines) >= 1)
+        await asyncio.wait_for(collector.hello_received.wait(), timeout=5.0)
+        await asyncio.wait_for(collector.transport_aborted.wait(), timeout=5.0)
 
-        # Drop the listener entirely, lose one batch, then restart it.
-        server.close()
-        await collector.close_connections()
-        await server.wait_closed()
-        Path(socket_path).unlink()
+        # The peer reset is a real write failure, not a mocked drain error.
+        # The queued lifecycle must be recorded as lost before reconnecting.
         assert addon.sink.offer(_lifecycle(0))
-        await _wait_for(lambda: addon.sink.dropped_count >= 1 or pump.active)
-        # Force the pending message out against the dead endpoint.
-        await asyncio.sleep(0.1)
-
-        server = await asyncio.start_unix_server(collector.handle, path=socket_path)
-        assert addon.sink.offer(_lifecycle(1))
-        await _wait_for(lambda: any(line["type"] == "flow.lifecycle" for line in collector.lines))
+        await _wait_for(lambda: addon.sink.dropped_count >= 1)
+        assert addon.sink.dropped_count >= 1
+        assert addon.sink.offer(_lifecycle(1, flow_id="flow-2"))
+        await _wait_for(
+            lambda: "stream.gap" in [line["type"] for line in collector.lines]
+            and any(line.get("flow_id") == "flow-2" for line in collector.lines)
+        )
         await pump.done()
         server.close()
         await server.wait_closed()
 
         types = [line["type"] for line in collector.lines]
         assert types[0] == "source.hello"
-        assert "flow.lifecycle" in types
-        # The lost write surfaced as a stream.gap before the next delivery.
-        if addon.sink.dropped_count:
-            assert "stream.gap" in types
+        assert collector.connections >= 2
+        assert "stream.gap" in types
+        assert any(line.get("flow_id") == "flow-2" for line in collector.lines)
 
     asyncio.run(scenario())
 
@@ -225,5 +267,27 @@ def test_pump_drops_oversized_lines_instead_of_desyncing(
         assert [line["flow_id"] for line in lifecycles] == ["small"]
         assert all(len(json.dumps(line)) <= 512 for line in collector.lines)
         assert addon.sink.dropped_count >= 1
+
+    asyncio.run(scenario())
+
+
+def test_pump_applies_backpressure_per_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A full drain batch never accumulates more than one serialized message."""
+
+    import mitm_inspector.capture.pump as pump_module
+
+    message_size = 32 * 1024
+    monkeypatch.setattr(pump_module, "serialize_message", lambda _message: b"x" * message_size)
+
+    async def scenario() -> None:
+        addon = CaptureAddon()
+        for sequence in range(256):
+            assert addon.sink.offer(_lifecycle(sequence, flow_id=f"flow-{sequence}"))
+        pump = CaptureSocketPump(addon, drain_limit=256)
+        pump._stopping = True
+        writer = _BackpressureWriter()
+        assert await pump._run_connected(writer) is True
+        assert writer.drain_calls == 256
+        assert writer.max_pending_bytes <= message_size
 
     asyncio.run(scenario())

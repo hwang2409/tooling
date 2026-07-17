@@ -32,6 +32,7 @@ from mitm_inspector.api.httpwire import (
 from mitm_inspector.api.limits import (
     MAX_INGEST_BODY_PREFIX_BYTES,
     MAX_INGEST_LINE_BYTES,
+    MAX_METADATA_HEADER_BYTES,
 )
 from mitm_inspector.api.projection import (
     collect_grid_flows,
@@ -1371,6 +1372,30 @@ def test_two_max_prefix_bodies_fit_one_bounded_ingest_line() -> None:
     assert parse_ingest_line(line) == message
 
 
+def test_max_prefix_and_header_boundary_is_accepted_and_one_byte_over_rejected() -> None:
+    prefix = b"x" * MAX_INGEST_BODY_PREFIX_BYTES
+    ApiServerConfig(max_body_prefix_bytes=MAX_INGEST_BODY_PREFIX_BYTES)
+
+    def line_for_header_bytes(header_bytes: int) -> bytes:
+        message = metadata_message(request_body=captured_body(prefix))
+        metadata = message["metadata"]
+        assert isinstance(metadata, dict)
+        header = {"name": "x", "value": "v" * (header_bytes - 1)}
+        metadata["request_headers"] = [header]
+        metadata["response_body"] = captured_body(prefix)
+        metadata["response_headers"] = [header]
+        return json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n"
+
+    accepted_line = line_for_header_bytes(MAX_METADATA_HEADER_BYTES)
+    assert len(accepted_line) <= MAX_INGEST_LINE_BYTES
+    accepted = parse_ingest_line(accepted_line)
+    parse_message(accepted)
+
+    rejected_line = line_for_header_bytes(MAX_METADATA_HEADER_BYTES + 1)
+    with pytest.raises(ProtocolError, match="exceeds"):
+        parse_message(parse_ingest_line(rejected_line))
+
+
 async def _peer_saw_close(reader: asyncio.StreamReader) -> bool:
     try:
         return await reader.read(1024) == b""
@@ -1416,9 +1441,22 @@ def test_close_terminates_connected_websocket_and_ingest_peers(
     run_async(scenario)
 
 
-def test_incremental_metadata_projection_matches_full_rescan() -> None:
+def test_incremental_metadata_projection_matches_full_rescan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The single-flow fast path must stay equivalent to a full projection."""
 
+    import mitm_inspector.api.app as app_module
+
+    projection_calls = 0
+    original_projection = app_module.collect_grid_flows
+
+    def spy_projection(store: MemoryStore):
+        nonlocal projection_calls
+        projection_calls += 1
+        return original_projection(store)
+
+    monkeypatch.setattr(app_module, "collect_grid_flows", spy_projection)
     application = make_application(max_items=64)
     scripted = [
         metadata_message("flow-a"),
@@ -1428,17 +1466,34 @@ def test_incremental_metadata_projection_matches_full_rescan() -> None:
         metadata_message("flow-b", request_body=captured_body()),
         metadata_message("flow-a", path="/v1/messages/updated"),
     ]
-    for message in scripted:
+    application.ingest(scripted[0])
+    projection_calls = 0
+    for message in scripted[1:]:
         application.ingest(message)
         expected = collect_grid_flows(application.store)
         assert application._state.published == expected
         assert list(application._state.published) == list(expected)
+    assert projection_calls == 0
 
 
-def test_incremental_metadata_projection_emits_single_upsert_delta() -> None:
+def test_incremental_metadata_projection_emits_single_upsert_delta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mitm_inspector.api.app as app_module
+
+    projection_calls = 0
+    original_projection = app_module.collect_grid_flows
+
+    def spy_projection(store: MemoryStore):
+        nonlocal projection_calls
+        projection_calls += 1
+        return original_projection(store)
+
+    monkeypatch.setattr(app_module, "collect_grid_flows", spy_projection)
     application = make_application(max_items=64)
     application.ingest(metadata_message("flow-a"))
     application.ingest(metadata_message("flow-b"))
+    projection_calls = 0
     frames: list[str] = []
     application.subscribe(lambda text: frames.append(text) or True)
     frames.clear()
@@ -1450,15 +1505,29 @@ def test_incremental_metadata_projection_emits_single_upsert_delta() -> None:
     assert changes[0]["op"] == "upsert"
     assert changes[0]["flow"]["flow_id"] == "flow-a"
     assert changes[0]["flow"]["path"] == "/v1/updated"
+    assert projection_calls == 0
 
 
-def test_duplicate_metadata_ingest_emits_no_delta() -> None:
+def test_duplicate_metadata_ingest_emits_no_delta(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mitm_inspector.api.app as app_module
+
+    projection_calls = 0
+    original_projection = app_module.collect_grid_flows
+
+    def spy_projection(store: MemoryStore):
+        nonlocal projection_calls
+        projection_calls += 1
+        return original_projection(store)
+
+    monkeypatch.setattr(app_module, "collect_grid_flows", spy_projection)
     application = make_application(max_items=64)
     application.ingest(metadata_message("flow-a"))
+    projection_calls = 0
     before = application.cursor
     result = application.ingest(metadata_message("flow-a"))
     assert result.delta_emitted is False
     assert application.cursor == before
+    assert projection_calls == 0
 
 
 def test_eviction_during_metadata_ingest_falls_back_to_full_projection() -> None:
@@ -1473,34 +1542,82 @@ def test_eviction_during_metadata_ingest_falls_back_to_full_projection() -> None
 def test_close_converges_when_connections_race_the_close_snapshot(
     socket_dir: Path,
 ) -> None:
-    """A connection accepted in the same tick as close() must not stall it."""
+    """A handler registered after the close snapshot must not make it stall."""
 
     async def scenario() -> None:
-        server = make_server(socket_dir)
+        server = make_server(socket_dir, with_ingest=False)
         await server.start()
-        port = server.bound_port
-        writers: list[asyncio.StreamWriter] = []
+        http_server = server._http_server
+        assert http_server is not None
 
-        async def open_and_hold() -> None:
-            try:
-                _reader, writer = await asyncio.open_connection("127.0.0.1", port)
-            except OSError:
+        handler_registered = asyncio.Event()
+        handler_started = asyncio.Event()
+        release_handler = asyncio.Event()
+        snapshot_taken = asyncio.Event()
+        wait_closed_gate = asyncio.Event()
+        read_forever = asyncio.Event()
+        original_handler = server._handle_http_connection
+
+        class FakeTransport:
+            def abort(self) -> None:
                 return
-            writers.append(writer)
 
-        # Launch a burst of connects and start closing before their handlers
-        # have necessarily run; each interleaving must still converge well
-        # inside the 10-second head-read timeout the old code waited on.
-        tasks = [asyncio.create_task(open_and_hold()) for _ in range(20)]
-        await asyncio.sleep(0)
-        await asyncio.wait_for(server.close(), timeout=5.0)
-        await asyncio.gather(*tasks, return_exceptions=True)
-        for writer in writers:
-            writer.close()
-        for writer in writers:
-            try:
-                await writer.wait_closed()
-            except (ConnectionError, OSError):
-                pass
+        class FakeWriter:
+            transport = FakeTransport()
+
+            def close(self) -> None:
+                handler_registered.set()
+                wait_closed_gate.set()
+
+            async def wait_closed(self) -> None:
+                return
+
+        class FakeReader:
+            async def readuntil(self, _separator: bytes) -> bytes:
+                await read_forever.wait()
+                return b""
+
+        fake_writer = FakeWriter()
+        fake_reader = FakeReader()
+
+        async def gated_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            handler_started.set()
+            await release_handler.wait()
+            await original_handler(reader, writer)
+
+        scheduled_after_snapshot = False
+
+        class LateConnectionSet(set[object]):
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                nonlocal scheduled_after_snapshot
+                if not scheduled_after_snapshot:
+                    scheduled_after_snapshot = True
+                    snapshot_taken.set()
+                    asyncio.create_task(gated_handler(fake_reader, fake_writer))
+                return super().__iter__()
+
+            def add(self, item: object) -> None:
+                handler_registered.set()
+                super().add(item)
+
+        server._connections = LateConnectionSet()  # type: ignore[assignment]
+        real_wait_closed = http_server.wait_closed
+
+        async def gated_wait_closed() -> None:
+            await wait_closed_gate.wait()
+            await real_wait_closed()
+
+        http_server.wait_closed = gated_wait_closed  # type: ignore[method-assign]
+
+        # The set's iterator schedules an accepted handler after close() has
+        # taken its snapshot.  The handler then blocks before its read loop;
+        # the fixed implementation rechecks and sees its closing flag.
+        close_task = asyncio.create_task(server.close())
+        await asyncio.wait_for(snapshot_taken.wait(), timeout=5.0)
+        await asyncio.wait_for(handler_started.wait(), timeout=5.0)
+        assert not handler_registered.is_set()
+        release_handler.set()
+        await asyncio.wait_for(close_task, timeout=5.0)
+        assert handler_registered.is_set()
 
     run_async(scenario)

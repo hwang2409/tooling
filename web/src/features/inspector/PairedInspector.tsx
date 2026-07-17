@@ -202,7 +202,7 @@ function LifecycleStrip({ flow, errorState }: { flow: InspectorFlow; errorState:
         <span className={phase.responseStarted ? "is-seen" : ""}>response start {phase.responseStarted ? "seen" : "pending"}</span>
         <span className={errorState.hasError || phase.completed ? "is-seen" : ""}>{errorState.hasError ? "ended with error" : phase.completed ? "completed" : "open"}</span>
       </div>
-      {entries.length >= LIFECYCLE_EVENTS_PER_FLOW && (
+      {flow.lifecycleTruncated === true && (
         <p className="inspector-muted inspector-lifecycle-truncated" role="note">
           Showing the newest {LIFECYCLE_EVENTS_PER_FLOW} events; older observations were dropped from the bounded window.
         </p>

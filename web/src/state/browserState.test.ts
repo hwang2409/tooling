@@ -385,6 +385,23 @@ describe("per-flow lifecycle retention", () => {
     expect(events).toHaveLength(LIFECYCLE_EVENTS_PER_FLOW);
     expect(events?.[0].sequence).toBe("9");
     expect(events?.[events.length - 1].sequence).toBe(String(LIFECYCLE_EVENTS_PER_FLOW + 8));
+    expect(state.lifecycles.isTruncated("f")).toBe(true);
+  });
+
+  it("marks lifecycle overflow only after the 33rd event", () => {
+    let state = reduce(initialBrowserState, hello("source-a"));
+    for (let sequence = 1; sequence <= 31; sequence += 1) {
+      state = reduce(state, lifecycleMessage("f", String(sequence)));
+    }
+    expect(state.lifecycles.isTruncated("f")).toBe(false);
+
+    state = reduce(state, lifecycleMessage("f", "32"));
+    expect(state.lifecycles.get("f")).toHaveLength(32);
+    expect(state.lifecycles.isTruncated("f")).toBe(false);
+
+    state = reduce(state, lifecycleMessage("f", "33"));
+    expect(state.lifecycles.get("f")).toHaveLength(32);
+    expect(state.lifecycles.isTruncated("f")).toBe(true);
   });
 
   it("evicts exactly one oldest flow at the flow-limit boundary", () => {

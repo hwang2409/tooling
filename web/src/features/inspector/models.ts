@@ -33,6 +33,7 @@ export type InspectorLifecycleEvent = DeepReadonly<FlowLifecycle>;
 export interface InspectorFlow {
   metadata: DeepReadonly<FlowMetadata>;
   lifecycle?: readonly InspectorLifecycleEvent[];
+  lifecycleTruncated?: boolean;
   error?: string;
   request_headers?: readonly InspectorHeader[];
   response_headers?: readonly InspectorHeader[];
