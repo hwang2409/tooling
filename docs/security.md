@@ -8,6 +8,9 @@ uses a deliberately fail-closed safe-header value allowlist:
 
 - Header names and duplicate ordering are preserved unchanged, but every value
   is `[REDACTED]` unless its case-insensitive name is explicitly allowlisted.
+- Header names and values are first copied to exact built-in strings without
+  calling subclass overrides; allowlist comparison never runs attacker-defined
+  equality, hashing, or case-conversion methods.
 - The reviewed MVP allowlist covers content type/length/encoding, the accept
   family, cache metadata, date/etag/last-modified, host, user-agent, server,
   range, transfer/connection metadata, and explicit request/trace ID headers.

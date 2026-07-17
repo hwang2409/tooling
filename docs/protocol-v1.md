@@ -17,6 +17,13 @@ validation again, and create a new recursively frozen canonical wrapper. The
 API then emits another independent deep plain-JSON message, so no mapping proxy,
 tuple, or mutable alias crosses onto the wire.
 
+Before validation or type discrimination, every accepted mapping key and JSON
+string is copied to an exact built-in `str`; numeric subclasses are rejected.
+Containers are copied to exact built-in `dict`/`list` values, normalized-key
+collisions are rejected, and only then is the message validated and frozen.
+Store reads create another fully revalidated wrapper, so a caller can never
+mutate retained state through an object returned by `newest_first()`.
+
 ## Numeric and ordering rules
 
 All unsigned 64-bit values are decimal strings in the inclusive range

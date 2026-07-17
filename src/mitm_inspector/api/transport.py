@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-from mitm_inspector.protocol import (
-    ParsedMessage,
-    PlainJsonObject,
-    parsed_message_to_plain_json,
-)
+from mitm_inspector.json_boundary import PlainJsonObject
+from mitm_inspector.protocol import ParsedMessage, parsed_message_to_plain_json
 
 
 def encode_for_browser(message: ParsedMessage) -> PlainJsonObject:

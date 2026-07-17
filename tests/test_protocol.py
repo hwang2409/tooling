@@ -63,6 +63,40 @@ def body_chunk_message() -> dict[str, object]:
     }
 
 
+class HostileString(str):
+    """A string whose Python-level behavior disagrees with its stored text."""
+
+    def __eq__(self, other: object) -> bool:
+        return other == "body.chunk"
+
+    def __hash__(self) -> int:
+        return hash("body.chunk")
+
+    def __str__(self) -> str:
+        return "spoofed-text"
+
+    def lower(self) -> str:
+        return "content-type"
+
+
+class DuplicateTextKey(str):
+    def __eq__(self, _other: object) -> bool:
+        return False
+
+    def __hash__(self) -> int:
+        return hash("different-key")
+
+
+class HostileInt(int):
+    def __int__(self) -> int:
+        return 999
+
+
+class HostileFloat(float):
+    def __float__(self) -> float:
+        return 999.0
+
+
 def assert_deep_plain_json(value: object) -> None:
     if isinstance(value, dict):
         assert all(type(key) is str for key in value)
@@ -195,6 +229,62 @@ def test_unknown_types_and_additive_fields_are_tolerated_without_numeric_coercio
     assert future.original_type == "future.additive"
     assert future.original_type == future.payload["type"]
     assert future.payload["sequence"] == "18446744073709551616"
+
+
+def test_string_subclasses_are_normalized_before_type_discrimination_and_emission() -> None:
+    raw = body_chunk_message()
+    raw["type"] = HostileString("future.evil")
+
+    parsed = parse_message(raw)
+    assert isinstance(parsed, OpaqueParsedMessage)
+    assert type(parsed.original_type) is str
+    assert parsed.original_type == "future.evil"
+    assert type(parsed.payload["type"]) is str
+
+    store = MemoryStore()
+    store.append(parsed)
+    wire = encode_for_browser(next(store.newest_first()))
+    assert_deep_plain_json(wire)
+    assert wire["type"] == "future.evil"
+    assert json.loads(json.dumps(wire)) == wire
+
+
+def test_string_mapping_keys_and_values_are_exact_builtins_before_validation() -> None:
+    raw = body_chunk_message()
+    del raw["type"]
+    raw[HostileString("type")] = "body.chunk"
+    raw["flow_id"] = HostileString("f")
+
+    parsed = parse_message(raw)
+    assert isinstance(parsed, KnownParsedMessage)
+    wire = encode_for_browser(parsed)
+    assert_deep_plain_json(wire)
+    assert wire["type"] == "body.chunk"
+    assert wire["flow_id"] == "f"
+    assert json.loads(json.dumps(wire)) == wire
+
+
+def test_keys_that_collide_after_string_normalization_are_rejected() -> None:
+    raw: dict[str, object] = {
+        "protocol_version": "1",
+        "type": "future.message",
+    }
+    raw[DuplicateTextKey("type")] = "future.evil"
+
+    with pytest.raises(ProtocolError, match="duplicate keys"):
+        parse_message(raw)
+
+
+@pytest.mark.parametrize("scalar", [HostileInt(1), HostileFloat(1.5)])
+def test_numeric_scalar_subclasses_are_rejected(scalar: object) -> None:
+    with pytest.raises(ProtocolError, match="scalar subclasses"):
+        parse_message(
+            {
+                "protocol_version": "1",
+                "type": "future.message",
+                "extension": scalar,
+            }
+        )
 
 
 def test_parsed_messages_are_nominal_non_overlapping_and_recursively_immutable() -> None:
@@ -369,6 +459,26 @@ def test_transport_returns_independent_deep_plain_json() -> None:
     assert encode_for_browser(stored)["extension"]["nested"][0]["value"] == "before"
 
 
+def test_store_reads_never_expose_retained_wrappers() -> None:
+    store = MemoryStore()
+    store.append(parse_message(body_chunk_message()))
+
+    first_read = next(store.newest_first())
+    replacement_raw = body_chunk_message()
+    replacement_raw["flow_id"] = "valid-replacement"
+    replacement = parse_message(replacement_raw)
+    assert isinstance(first_read, KnownParsedMessage)
+    assert isinstance(replacement, KnownParsedMessage)
+    object.__setattr__(first_read, "_message", replacement.message)
+    assert encode_for_browser(first_read)["flow_id"] == "valid-replacement"
+
+    second_read = next(store.newest_first())
+    assert second_read is not first_read
+    assert encode_for_browser(second_read)["flow_id"] == "f"
+    object.__setattr__(second_read, "_message", replacement.message)
+    assert encode_for_browser(next(store.newest_first()))["flow_id"] == "f"
+
+
 def test_transport_json_roundtrips_every_valid_known_and_opaque_message() -> None:
     for raw in [*fixture_messages(), *conformance()["valid"]]:
         wire = encode_for_browser(parse_message(raw))
@@ -527,6 +637,22 @@ def test_redaction_preserves_header_name_order() -> None:
         ("Content-Type", "application/json"),
         ("X-Custom", REDACTED),
     ]
+
+
+def test_redaction_normalizes_hostile_string_subclasses_before_allowlist_comparison() -> None:
+    name, value = sanitize_header(
+        HostileString("Authorization"),
+        HostileString("credential-canary"),
+    )
+    assert type(name) is type(value) is str
+    assert (name, value) == ("Authorization", REDACTED)
+
+    safe_name, safe_value = sanitize_header(
+        HostileString("Content-Type"),
+        HostileString("application/json"),
+    )
+    assert type(safe_name) is type(safe_value) is str
+    assert (safe_name, safe_value) == ("Content-Type", "application/json")
 
 
 def test_query_material_is_dropped() -> None:

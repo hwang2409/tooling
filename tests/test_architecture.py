@@ -6,13 +6,40 @@ import pytest
 ROOT = Path(__file__).parents[1]
 SOURCE_ROOT = ROOT / "src"
 APPROVED_PUBLIC_IMPORTS = frozenset({"mitmproxy.http"})
-FORBIDDEN_DYNAMIC_ROOTS = frozenset({"builtins", "importlib"})
+FORBIDDEN_DYNAMIC_ROOTS = frozenset({"builtins", "importlib", "pkgutil", "pydoc", "runpy"})
 FORBIDDEN_DYNAMIC_NAMES = frozenset(
-    {"__builtins__", "__import__", "builtins", "import_module", "importlib"}
+    {
+        "__builtins__",
+        "__import__",
+        "__loader__",
+        "builtins",
+        "import_module",
+        "importlib",
+        "load_module",
+        "locate",
+        "pkgutil",
+        "pydoc",
+        "resolve_name",
+        "run_module",
+        "runpy",
+    }
 )
-FORBIDDEN_DYNAMIC_ATTRIBUTES = frozenset({"__import__", "import_module"})
+FORBIDDEN_DYNAMIC_ATTRIBUTES = frozenset(
+    {"__import__", "import_module", "load_module", "locate", "resolve_name", "run_module"}
+)
 FORBIDDEN_DYNAMIC_LITERAL_MARKERS = frozenset(
-    {"__builtins__", "__import__", "builtins", "import_module", "importlib"}
+    {
+        "__builtins__",
+        "__import__",
+        "__loader__",
+        "builtins",
+        "import_module",
+        "importlib",
+        "load_module",
+        "pkgutil",
+        "pydoc",
+        "runpy",
+    }
 )
 SUSPICIOUS_LOADER_CALL_NAMES = frozenset(
     {"dynamic_import", "dynamic_loader", "importer", "load", "loader"}
@@ -144,6 +171,14 @@ def test_private_api_imports_and_literals_are_rejected(source: str) -> None:
         "module = 'builtins'",
         "eval(\"__import__('mitmproxy.http')\")",
         "eval(\"importlib.import_module('mitmproxy.http')\")",
+        "import pkgutil; pkgutil.resolve_name(module_name)",
+        "from pkgutil import resolve_name; resolve_name(module_name)",
+        "import pydoc; pydoc.locate(module_name)",
+        "from pydoc import locate; locate(module_name)",
+        "import runpy; runpy.run_module(module_name)",
+        "from runpy import run_module; run_module(module_name)",
+        "__loader__.load_module(module_name)",
+        "loader = __loader__; loader.load_module(module_name)",
     ],
 )
 def test_all_dynamic_import_machinery_is_rejected(source: str) -> None:

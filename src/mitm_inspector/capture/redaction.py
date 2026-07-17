@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from mitm_inspector.json_boundary import JsonBoundaryError, canonicalize_json
+
 REDACTED = "[REDACTED]"
 
 # S0 deliberately exposes values only for a small, reviewed set of metadata
@@ -42,11 +44,25 @@ SAFE_HEADER_VALUE_NAMES = frozenset(
 def sanitize_header(name: str, value: str) -> tuple[str, str]:
     """Preserve the name and expose the value only for an explicitly safe header."""
 
-    exposed_value = value if name.lower() in SAFE_HEADER_VALUE_NAMES else REDACTED
-    return name, exposed_value
+    canonical_name = _canonical_text(name, label="header name")
+    canonical_value = _canonical_text(value, label="header value")
+    exposed_value = (
+        canonical_value if canonical_name.lower() in SAFE_HEADER_VALUE_NAMES else REDACTED
+    )
+    return canonical_name, exposed_value
 
 
 def sanitize_path(path: str) -> str:
     """Drop query material until a query-aware allow-list exists."""
 
-    return path.split("?", 1)[0]
+    return _canonical_text(path, label="path").split("?", 1)[0]
+
+
+def _canonical_text(value: object, *, label: str) -> str:
+    try:
+        canonical = canonicalize_json(value, label=label)
+    except JsonBoundaryError as error:
+        raise ValueError(str(error)) from error
+    if type(canonical) is not str:
+        raise ValueError(f"{label} must be a string")
+    return canonical

@@ -40,5 +40,7 @@ rejects imports from `mitmproxy.tools.web`, `mitmproxy.addons.view`,
 hooks are the only allowed mitmproxy integration surface. Dynamic imports are
 forbidden wholesale: project source cannot import or reference `importlib`,
 `builtins` import machinery, `__import__`, `import_module`, loader aliases, or
-private-module literals. Approved public mitmproxy access uses ordinary static
-imports only.
+private-module literals. The standard dynamic resolvers `pkgutil.resolve_name`,
+`pydoc.locate`, `runpy.run_module`, and loader `load_module` are also forbidden,
+including unresolved aliases. Approved public mitmproxy access uses ordinary
+static imports only.

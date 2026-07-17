@@ -20,4 +20,5 @@ class MemoryStore:
         self._items.append(require_parsed_message(message))
 
     def newest_first(self) -> Iterator[ParsedMessageResult]:
-        return reversed(self._items)
+        for retained in reversed(self._items):
+            yield require_parsed_message(retained)

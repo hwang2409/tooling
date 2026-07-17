@@ -27,8 +27,8 @@ Git 2.54.0
 ```sh
 uv sync --python /opt/homebrew/bin/python3.12       # pass; local .venv
 uv run ruff check .                                 # pass
-uv run mypy                                          # pass, 11 source files
-uv run pytest                                        # pass, 138 tests
+uv run mypy                                          # pass, 12 source files
+uv run pytest                                        # pass, 153 tests
 
 npm install --prefix web                             # pass; generated lockfile
 npm ci --prefix web                                  # pass; 221 packages
@@ -46,4 +46,5 @@ missing/empty/truncated body states and decoded byte counts,
 response-before-request-end ordering, bounded decimal-string values including
 u64 overflow, unknown additive fields/types, fail-closed header values,
 revalidated immutable ingress, plain-JSON transport, gap/body arithmetic
-invariants, and the wholesale dynamic-import/private-mitmweb ban.
+invariants, exact built-in scalar/key canonicalization, isolated store reads,
+and the wholesale dynamic-import/private-mitmweb ban.
