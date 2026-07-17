@@ -179,6 +179,25 @@ describe("PairedInspector rendering and interaction contracts", () => {
     error: "<img src=x onerror=alert(1)>",
   };
 
+  it("marks the lifecycle trace as truncated once the bounded window fills", () => {
+    const events = Array.from({ length: 32 }, (_, index) => ({
+      protocol_version: "1",
+      type: "flow.lifecycle",
+      source_id: "source-a",
+      flow_id: "flow-a",
+      event_id: `flow-a-${index}`,
+      occurred_at: "2026-01-01T00:00:00Z",
+      sequence: String(index + 1),
+      state: "request_started",
+    })) as unknown as InspectorFlow["lifecycle"];
+    const full = renderToStaticMarkup(createElement(PairedInspector, { flow: { ...flow, lifecycle: events } }));
+    expect(full).toContain("Showing the newest 32 events");
+    const partial = renderToStaticMarkup(
+      createElement(PairedInspector, { flow: { ...flow, lifecycle: events!.slice(0, 5) } }),
+    );
+    expect(partial).not.toContain("Showing the newest");
+  });
+
   it("renders the initial flow with metadata and gated body content", () => {
     const markup = renderToStaticMarkup(createElement(PairedInspector, { flow }));
     expect(markup).toContain("Body decoding is paused");

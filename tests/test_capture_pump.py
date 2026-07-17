@@ -54,9 +54,11 @@ class _LineCollector:
     def __init__(self) -> None:
         self.lines: list[dict[str, object]] = []
         self.connections = 0
+        self.writers: list[asyncio.StreamWriter] = []
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.connections += 1
+        self.writers.append(writer)
         try:
             while True:
                 line = await reader.readline()
@@ -65,6 +67,12 @@ class _LineCollector:
                 self.lines.append(json.loads(line))
         finally:
             writer.close()
+
+    async def close_connections(self) -> None:
+        writers = tuple(self.writers)
+        for writer in writers:
+            writer.close()
+        await asyncio.gather(*(writer.wait_closed() for writer in writers), return_exceptions=True)
 
 
 async def _wait_for(predicate, timeout: float = 5.0) -> None:
@@ -159,6 +167,7 @@ def test_pump_reconnects_and_reports_gap_after_listener_restart(socket_dir: Path
 
         # Drop the listener entirely, lose one batch, then restart it.
         server.close()
+        await collector.close_connections()
         await server.wait_closed()
         Path(socket_path).unlink()
         assert addon.sink.offer(_lifecycle(0))
@@ -179,5 +188,42 @@ def test_pump_reconnects_and_reports_gap_after_listener_restart(socket_dir: Path
         # The lost write surfaced as a stream.gap before the next delivery.
         if addon.sink.dropped_count:
             assert "stream.gap" in types
+
+    asyncio.run(scenario())
+
+
+def test_pump_drops_oversized_lines_instead_of_desyncing(
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A line the ingest listener would reject is counted as a loss, not sent."""
+
+    import mitm_inspector.capture.pump as pump_module
+
+    monkeypatch.setattr(pump_module, "MAX_INGEST_LINE_BYTES", 256)
+
+    async def scenario() -> None:
+        socket_path = str(socket_dir / "capture.sock")
+        collector = _LineCollector()
+        server = await asyncio.start_unix_server(collector.handle, path=socket_path)
+        addon = CaptureAddon()
+        addon.capture_socket = socket_path
+        pump = CaptureSocketPump(addon, poll_interval_seconds=0.01)
+        oversized = _lifecycle(0)
+        oversized["flow_id"] = "f" * 400
+        oversized["event_id"] = f"{oversized['flow_id']}:0"
+        assert addon.sink.offer(oversized)
+        assert addon.sink.offer(_lifecycle(1, flow_id="small"))
+        pump.running()
+        await _wait_for(
+            lambda: any(line["type"] == "flow.lifecycle" for line in collector.lines)
+        )
+        await pump.done()
+        server.close()
+        await server.wait_closed()
+
+        lifecycles = [line for line in collector.lines if line["type"] == "flow.lifecycle"]
+        assert [line["flow_id"] for line in lifecycles] == ["small"]
+        assert all(len(json.dumps(line)) <= 512 for line in collector.lines)
+        assert addon.sink.dropped_count >= 1
 
     asyncio.run(scenario())

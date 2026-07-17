@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+from mitm_inspector.api.limits import MAX_INGEST_LINE_BYTES
 from mitm_inspector.capture.adapter import CaptureAddon
 from mitm_inspector.protocol import ParsedMessageResult, parsed_message_to_plain_json
 
@@ -24,6 +25,7 @@ DEFAULT_POLL_INTERVAL_SECONDS = 0.05
 DEFAULT_RECONNECT_MIN_SECONDS = 0.1
 DEFAULT_RECONNECT_MAX_SECONDS = 2.0
 SHUTDOWN_FLUSH_TIMEOUT_SECONDS = 2.0
+WRITER_CLOSE_TIMEOUT_SECONDS = 0.25
 
 
 def serialize_message(message: ParsedMessageResult) -> bytes:
@@ -132,7 +134,16 @@ class CaptureSocketPump:
                 continue
             try:
                 for message in messages:
-                    writer.write(serialize_message(message))
+                    line = serialize_message(message)
+                    if len(line) > MAX_INGEST_LINE_BYTES:
+                        # A line the ingest listener would reject must never
+                        # reach the wire: it would desync and drop the whole
+                        # producer connection.  Configured body prefixes are
+                        # provably bounded, so only pathological header/URL
+                        # envelopes can get here; count the message as lost.
+                        self._addon.sink.record_loss()
+                        continue
+                    writer.write(line)
                 await writer.drain()
             except (OSError, RuntimeError) as error:
                 # The batch was already acknowledged by drain(); whatever the
@@ -148,9 +159,12 @@ class CaptureSocketPump:
 async def _close_writer(writer: asyncio.StreamWriter) -> None:
     try:
         writer.close()
-        await writer.wait_closed()
-    except (OSError, RuntimeError):
-        pass
+        await asyncio.wait_for(writer.wait_closed(), WRITER_CLOSE_TIMEOUT_SECONDS)
+    except (OSError, RuntimeError, TimeoutError):
+        writer.transport.abort()
+    except asyncio.CancelledError:
+        writer.transport.abort()
+        raise
 
 
 __all__ = ["CaptureSocketPump", "serialize_message"]

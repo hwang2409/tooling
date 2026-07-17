@@ -1468,3 +1468,39 @@ def test_eviction_during_metadata_ingest_falls_back_to_full_projection() -> None
         expected = collect_grid_flows(application.store)
         assert application._state.published == expected
         assert list(application._state.published) == list(expected)
+
+
+def test_close_converges_when_connections_race_the_close_snapshot(
+    socket_dir: Path,
+) -> None:
+    """A connection accepted in the same tick as close() must not stall it."""
+
+    async def scenario() -> None:
+        server = make_server(socket_dir)
+        await server.start()
+        port = server.bound_port
+        writers: list[asyncio.StreamWriter] = []
+
+        async def open_and_hold() -> None:
+            try:
+                _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            except OSError:
+                return
+            writers.append(writer)
+
+        # Launch a burst of connects and start closing before their handlers
+        # have necessarily run; each interleaving must still converge well
+        # inside the 10-second head-read timeout the old code waited on.
+        tasks = [asyncio.create_task(open_and_hold()) for _ in range(20)]
+        await asyncio.sleep(0)
+        await asyncio.wait_for(server.close(), timeout=5.0)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for writer in writers:
+            writer.close()
+        for writer in writers:
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
+    run_async(scenario)

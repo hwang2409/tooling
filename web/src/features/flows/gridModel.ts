@@ -43,15 +43,20 @@ function bodyCell(body: ImmutableBody | undefined): BodyCell {
 function contentTypeOf(body: ImmutableBody | undefined): string | null {
   if (body === undefined) return null;
   const value = body.content_type;
-  if (value === undefined || value === "") return null;
-  const bare = value.split(";", 1)[0].trim();
-  return bare === "" ? value : bare;
+  return value === undefined || value === "" ? null : value;
 }
 
 function headerValue(headers: readonly { readonly name: string; readonly value: string }[] | undefined, name: string): string | null {
   if (headers === undefined) return null;
   const match = headers.find((header) => header.name.toLowerCase() === name);
-  return match === undefined || match.value === "" ? null : match.value.split(";", 1)[0].trim() || null;
+  return match === undefined || match.value === "" ? null : match.value;
+}
+
+/** Reduce a full content-type header value to its bare type for display. */
+function bareContentType(value: string | null): string | null {
+  if (value === null) return null;
+  const bare = value.split(";", 1)[0].trim();
+  return bare === "" ? value : bare;
 }
 
 export function buildFlowRow(
@@ -81,7 +86,7 @@ export function buildFlowRow(
     phaseLabel: phaseLabels[phase],
     requestBody: bodyCell(metadata.request_body),
     responseBody: bodyCell(metadata.response_body),
-    contentType: responseContentType ?? requestContentType ?? "—",
+    contentType: bareContentType(responseContentType) ?? bareContentType(requestContentType) ?? "—",
     filterable: {
       method: metadata.method,
       scheme: metadata.scheme,
