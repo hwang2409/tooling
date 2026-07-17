@@ -291,7 +291,6 @@ def test_capture_uint64_boundaries_fail_before_body_or_lifecycle_mutation() -> N
         addon._observe_chunk(state, "request", b"x")
     assert state.request.total_bytes == MAX_U64
     assert not state.request.observed
-
     state.request.total_bytes = 0
     state.request.chunk_index = MAX_U64
     with pytest.raises(OverflowError, match="body chunk index exhausted"):
@@ -299,6 +298,41 @@ def test_capture_uint64_boundaries_fail_before_body_or_lifecycle_mutation() -> N
     assert state.request.chunk_index == MAX_U64
     assert not state.request.observed
 
+
+def test_stream_body_exhaustion_returns_original_chunk_and_discards_flow() -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    flow = fake_flow()
+    addon.requestheaders(flow)
+    state = addon._flows[flow.id]
+    state.request.total_bytes = MAX_U64
+    chunk = b"forwarded-without-capture"
+
+    assert flow.request.stream(chunk) is chunk
+    assert state.discarded
+    assert state.tombstone
+    assert flow.id not in addon._flows
+    assert addon.counters["active_flows"] == 0
+    assert addon.sink.dropped_count == 1
+    assert flow.request.stream(chunk) is chunk
+    assert addon.sink.dropped_count == 1
+
+
+def test_flow_completion_exhaustion_discards_before_sticky_completion() -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    flow = fake_flow()
+    addon.requestheaders(flow)
+    state = addon._flows[flow.id]
+    state.request.ended = True
+    state.terminal_observed = True
+    addon._sequence = MAX_U64
+
+    addon._finalize(state)
+
+    assert not state.completed
+    assert state.discarded
+    assert state.tombstone
+    assert flow.id not in addon._flows
+    assert addon.sink.dropped_count == 1
 
 def test_body_end_failure_does_not_tombstone_body_before_retry(
     monkeypatch: pytest.MonkeyPatch,
@@ -420,6 +454,38 @@ def test_loss_admission_is_nonblocking_while_position_lock_is_held() -> None:
         for message in messages
     ] == ["future.first", "stream.gap"]
     gap = messages[-1]
+    assert isinstance(gap, KnownParsedMessage)
+    assert gap.message["dropped_count"] == "2"
+
+
+def test_loss_admission_is_nonblocking_while_loss_lock_is_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink(max_pending=1)
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.first"}))
+
+    def forbidden_transaction(_sink: BoundedMessageSink) -> object:
+        raise AssertionError("loss rejection must not snapshot the queue")
+
+    monkeypatch.setattr(sink_module, "_AdmissionTransaction", forbidden_transaction)
+    sink._loss_lock.acquire()
+    try:
+        started = time.perf_counter()
+        assert sink.record_loss()
+        assert not sink.offer(
+            parse_message({"protocol_version": "1", "type": "future.full"})
+        )
+        assert time.perf_counter() - started < 0.05
+    finally:
+        sink._loss_lock.release()
+
+    assert sink.dropped_count == 2
+    drained = sink.drain()
+    assert [
+        (item.message if isinstance(item, KnownParsedMessage) else item.payload)["type"]
+        for item in drained
+    ] == ["future.first", "stream.gap"]
+    gap = drained[-1]
     assert isinstance(gap, KnownParsedMessage)
     assert gap.message["dropped_count"] == "2"
 
@@ -1575,6 +1641,28 @@ def test_invalid_environment_is_rejected_clearly(
         CaptureAddon().load(object())
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_in_memory_bytes": 1.5},
+        {"max_pending_messages": True},
+        {"max_body_prefix_bytes": MAX_U64 + 1},
+        {"max_in_memory_bytes": MAX_U64 + 1},
+        {"max_pending_messages": MAX_U64 + 1},
+    ],
+)
+def test_direct_capture_config_rejects_non_exact_or_out_of_range_uint64(
+    kwargs: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="exact uint64"):
+        CaptureConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_invalid_direct_config_cannot_leave_addon_source_or_flow_state() -> None:
+    with pytest.raises(ValueError, match="exact uint64"):
+        CaptureAddon(config=CaptureConfig(max_in_memory_bytes=MAX_U64 + 1))
+
+
 def completed_flow_message(flow_id: str, sequence: str) -> ParsedMessageResult:
     return parse_message(
         {
@@ -1650,6 +1738,24 @@ def test_store_expiry_is_incremental_and_append_skips_debug_full_scan(
     now[0] = 11.0
     assert store.counters["retained_messages"] == 0
     assert not store._expiry_heap
+
+
+def test_saturated_default_scale_append_uses_incremental_eviction_candidates() -> None:
+    store = MemoryStore(max_items=2_000, max_messages=32_000)
+    for index in range(2_001):
+        store.append(completed_flow_message(f"completed-{index}", str(index)))
+    completion_visits = store._completion_candidate_visits
+    store._completion_candidate_visits = 0
+    store.append(completed_flow_message("completed-final", "9000"))
+    assert store._completion_candidate_visits <= 2
+    assert store._completion_candidate_visits + completion_visits < 2_100
+
+    for index in range(31_999):
+        store.append(parse_message({"protocol_version": "1", "type": f"future.{index}"}))
+    store._eviction_candidate_visits = 0
+    store.append(parse_message({"protocol_version": "1", "type": "future.final"}))
+    assert store.counters["retained_messages"] <= store.max_messages
+    assert store._eviction_candidate_visits <= 2
 
 
 def test_store_bounds_incomplete_flows_per_flow_global_and_standalone_messages() -> None:

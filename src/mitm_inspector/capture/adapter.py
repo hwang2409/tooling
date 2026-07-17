@@ -180,14 +180,16 @@ class CaptureAddon:
         if state.tombstone:
             return
         self._announce_source()
-        self._lifecycle(state, "request_started")
+        if not self._try_lifecycle(state, "request_started"):
+            return
         if "request_headers" not in state.lifecycle_states:
             state.request_headers = _headers(flow.request.headers)
             state.request_headers_captured = True
             state.request.content_type = _content_type(flow.request.headers)
             self._set_identity(state, flow)
             self._install_stream(flow.request, state, "request")
-            self._lifecycle(state, "request_headers")
+            if not self._try_lifecycle(state, "request_headers"):
+                return
             self._metadata(state)
         self._refresh_state_weight(state)
         self._enforce_active_bounds()
@@ -198,9 +200,11 @@ class CaptureAddon:
         state = self._ensure_request(flow)
         if state.tombstone:
             return
-        self._finish_body(state, "request", flow.request.raw_content)
+        if not self._finish_body(state, "request", flow.request.raw_content):
+            return
         if "request_end" not in state.lifecycle_states:
-            self._lifecycle(state, "request_end")
+            if not self._try_lifecycle(state, "request_end"):
+                return
             self._metadata(state)
         self._finalize(state)
         self._refresh_state_weight(state)
@@ -212,14 +216,16 @@ class CaptureAddon:
         state = self._ensure_request(flow)
         if state.tombstone:
             return
-        self._lifecycle(state, "response_started")
+        if not self._try_lifecycle(state, "response_started"):
+            return
         if "response_headers" not in state.lifecycle_states:
             state.response_headers = _headers(flow.response.headers) if flow.response else []
             state.response_headers_captured = True
             if flow.response:
                 state.response.content_type = _content_type(flow.response.headers)
                 self._install_stream(flow.response, state, "response")
-            self._lifecycle(state, "response_headers")
+            if not self._try_lifecycle(state, "response_headers"):
+                return
             self._metadata(state)
         self._refresh_state_weight(state)
         self._enforce_active_bounds()
@@ -231,9 +237,11 @@ class CaptureAddon:
         if state.tombstone:
             return
         response_content = flow.response.raw_content if flow.response else None
-        self._finish_body(state, "response", response_content)
+        if not self._finish_body(state, "response", response_content):
+            return
         if "response_end" not in state.lifecycle_states:
-            self._lifecycle(state, "response_end")
+            if not self._try_lifecycle(state, "response_end"):
+                return
             self._metadata(state)
         state.terminal_observed = True
         self._finalize(state)
@@ -247,16 +255,21 @@ class CaptureAddon:
         if state.tombstone:
             return
         if "request_end" not in state.lifecycle_states:
-            self._finish_body(state, "request", flow.request.raw_content)
-            self._lifecycle(state, "request_end")
+            if not self._finish_body(state, "request", flow.request.raw_content):
+                return
+            if not self._try_lifecycle(state, "request_end"):
+                return
             self._metadata(state)
         if state.response_headers_captured and not state.response.ended:
             response_content = flow.response.raw_content if flow.response else None
-            self._finish_body(state, "response", response_content)
+            if not self._finish_body(state, "response", response_content):
+                return
             if "response_end" not in state.lifecycle_states:
-                self._lifecycle(state, "response_end")
+                if not self._try_lifecycle(state, "response_end"):
+                    return
                 self._metadata(state)
-        self._lifecycle(state, "error")
+        if not self._try_lifecycle(state, "error"):
+            return
         state.terminal_observed = True
         self._finalize(state)
         self._refresh_state_weight(state)
@@ -342,7 +355,12 @@ class CaptureAddon:
             body = state.request if side == "request" else state.response
             if state.completed or state.discarded or not body.stream_enabled:
                 return chunk
-            self._observe_chunk(state, side, chunk)
+            try:
+                self._observe_chunk(state, side, chunk)
+            except OverflowError:
+                # Forwarding owns the return value.  Exhaustion is a capture
+                # terminal state, never a reason to interrupt mitmproxy.
+                self._discard_active(state, count_eviction=False)
             return chunk
 
         message.stream = observe
@@ -382,7 +400,11 @@ class CaptureAddon:
         if len(captured) < len(copied):
             body.prefix_sealed = True
         if not body.lifecycle_emitted:
-            self._lifecycle(state, f"{side}_body")
+            try:
+                self._lifecycle(state, f"{side}_body")
+            except OverflowError:
+                self._discard_active(state, count_eviction=False)
+                return
             body.lifecycle_emitted = True
         if captured:
             self._send(
@@ -398,14 +420,26 @@ class CaptureAddon:
             )
         body.chunk_index += 1
 
-    def _finish_body(self, state: _FlowCapture, side: str, raw_content: bytes | None) -> None:
+    def _finish_body(
+        self, state: _FlowCapture, side: str, raw_content: bytes | None
+    ) -> bool:
         body = state.request if side == "request" else state.response
         if body.ended:
-            return
+            return True
         if not body.observed and raw_content is not None:
-            self._observe_chunk(state, side, raw_content)
+            try:
+                self._observe_chunk(state, side, raw_content)
+            except OverflowError:
+                self._discard_active(state, count_eviction=False)
+                return False
+            if state.discarded:
+                return False
         if not body.lifecycle_emitted:
-            self._lifecycle(state, f"{side}_body")
+            try:
+                self._lifecycle(state, f"{side}_body")
+            except OverflowError:
+                self._discard_active(state, count_eviction=False)
+                return False
         descriptor = _body_descriptor(body)
         self._send(
             {
@@ -420,6 +454,7 @@ class CaptureAddon:
         body.lifecycle_emitted = True
         body.ended = True
         body.stream_enabled = False
+        return True
 
     def _metadata(self, state: _FlowCapture) -> None:
         if not state.request_headers_captured:
@@ -477,6 +512,14 @@ class CaptureAddon:
         if self._sequence >= MAX_U64:
             raise OverflowError("capture lifecycle sequence exhausted")
 
+    def _try_lifecycle(self, state: _FlowCapture, lifecycle_state: str) -> bool:
+        try:
+            self._lifecycle(state, lifecycle_state)
+        except OverflowError:
+            self._discard_active(state, count_eviction=False)
+            return False
+        return True
+
     def _finalize(self, state: _FlowCapture) -> None:
         """Idempotently finish only after request terminal observation exists."""
 
@@ -487,17 +530,17 @@ class CaptureAddon:
         if not state.request.ended:
             state.completion_pending = True
             return
+        # Emit the terminal lifecycle before setting sticky completion state.
+        # If its uint64 sequence is exhausted, discard coherently so a later
+        # hook cannot observe a completed-but-live flow.
+        try:
+            self._lifecycle(state, "flow_completed")
+        except OverflowError:
+            self._discard_active(state, count_eviction=False)
+            return
         state.completed = True
         state.completion_pending = False
-        self._disable_streams(state)
-        self._lifecycle(state, "flow_completed")
-        self._flows.pop(state.flow_id, None)
-        self._completed_ids.append(state.flow_id)
-        self._captured_prefix_bytes -= len(state.request.prefix) + len(state.response.prefix)
-        self._active_metadata_bytes -= state.retained_weight
-        assert self._captured_prefix_bytes >= 0
-        assert self._active_metadata_bytes >= 0
-        state.discarded = True
+        self._discard_active(state, count_eviction=False)
 
     def _disable_streams(self, state: _FlowCapture) -> None:
         state.request.stream_enabled = False
@@ -524,17 +567,23 @@ class CaptureAddon:
             self._evict_active(oldest)
 
     def _evict_active(self, state: _FlowCapture) -> None:
+        self._discard_active(state, count_eviction=True)
+
+    def _discard_active(self, state: _FlowCapture, *, count_eviction: bool) -> None:
         if state.discarded:
             return
         self._disable_streams(state)
-        self._flows.pop(state.flow_id, None)
+        if self._flows.get(state.flow_id) is state:
+            self._flows.pop(state.flow_id, None)
         self._completed_ids.append(state.flow_id)
         self._captured_prefix_bytes -= len(state.request.prefix) + len(state.response.prefix)
         self._active_metadata_bytes -= state.retained_weight
         assert self._captured_prefix_bytes >= 0
         assert self._active_metadata_bytes >= 0
         state.discarded = True
-        self._capture_evicted_flows += 1
+        state.tombstone = True
+        if count_eviction:
+            self._capture_evicted_flows += 1
         self.sink.record_loss()
 
     def _send(self, raw: dict[str, object]) -> None:

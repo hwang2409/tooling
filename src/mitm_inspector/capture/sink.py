@@ -370,6 +370,7 @@ class BoundedMessageSink:
         self._loss_range_collapses = 0
         self._loss_resync_active = False
         self._pending_loss_count = 0
+        self._loss_lock_fast_path_held = False
 
     def offer(self, message: ParsedMessage | Mapping[str, object]) -> bool:
         """Admit one raw or parsed message without exposing trusted metrics."""
@@ -474,34 +475,63 @@ class BoundedMessageSink:
             self._pending_loss_count += 1
             return True
         try:
-            transaction = _AdmissionTransaction(self)
-            try:
-                try:
-                    transaction.allocate_position()
-                except _PositionExhausted:
-                    return False
-                assert transaction.position is not None
-                transaction.record_loss(transaction.position)
+            # Loss admission has its own constant-work fast path.  Testing
+            # the bookkeeping lock before constructing a transaction is
+            # important: a rejected producer must never copy the queue or
+            # wait behind a consumer's loss bookkeeping.
+            if not self._loss_lock.acquire(False):
+                self._pending_loss_count += 1
                 return True
-            except BaseException:
-                transaction.rollback()
-                raise
+            position_before = (self._next_position_value, self._exhausted)
+            pending_before = self._pending_loss_count
+            loss_before = (
+                tuple(self._loss_ranges),
+                self._loss_resync_active,
+                self._dropped_total,
+                self._loss_range_collapses,
+            )
+            try:
+                self._loss_lock_fast_path_held = True
+                try:
+                    self._flush_pending_losses_locked(loss_lock_held=True)
+                    if self._exhausted:
+                        return False
+                    position = self._allocate_position()
+                    self._record_drop_range_locked(position, position, 1)
+                    return True
+                except BaseException:
+                    self._next_position_value, self._exhausted = position_before
+                    self._pending_loss_count = pending_before
+                    self._loss_ranges = deque(loss_before[0])
+                    self._loss_resync_active = loss_before[1]
+                    self._dropped_total = loss_before[2]
+                    self._loss_range_collapses = loss_before[3]
+                    raise
+                finally:
+                    self._loss_lock_fast_path_held = False
+            finally:
+                self._loss_lock.release()
         finally:
             self._position_lock.release()
 
     def _allocate_position(self) -> int:
         with self._position_lock:
-            self._flush_pending_losses_locked()
-            if self._exhausted:
-                raise _PositionExhausted("delivery positions exhausted")
-            position = self._next_position_value
-            if position == MAX_U64:
-                self._exhausted = True
-            else:
-                self._next_position_value = position + 1
-            return position
+            self._flush_pending_losses_locked(
+                loss_lock_held=self._loss_lock_fast_path_held
+            )
+            return self._allocate_position_locked()
 
-    def _flush_pending_losses_locked(self) -> None:
+    def _allocate_position_locked(self) -> int:
+        if self._exhausted:
+            raise _PositionExhausted("delivery positions exhausted")
+        position = self._next_position_value
+        if position == MAX_U64:
+            self._exhausted = True
+        else:
+            self._next_position_value = position + 1
+        return position
+
+    def _flush_pending_losses_locked(self, *, loss_lock_held: bool = False) -> None:
         pending = self._pending_loss_count
         if pending == 0 or self._exhausted:
             return
@@ -509,11 +539,16 @@ class BoundedMessageSink:
         count = min(pending, available)
         start = self._next_position_value
         end = start + count - 1
-        with self._loss_lock:
+        if loss_lock_held:
             self._record_drop_range_locked(start, end, count)
+        else:
+            with self._loss_lock:
+                self._record_drop_range_locked(start, end, count)
         self._pending_loss_count -= count
         if end == MAX_U64:
             self._exhausted = True
+        else:
+            self._next_position_value = end + 1
         if count < pending:
             # No position exists for the excess after uint64 exhaustion.
             self._dropped_total += self._pending_loss_count

@@ -41,6 +41,7 @@ class _StoredMessage:
     weight: int
     key: tuple[object, ...] | None = None
     active: bool = True
+    owner: _FlowRecord | None = None
 
 
 @dataclass
@@ -101,7 +102,12 @@ class MemoryStore:
         self._flows: dict[str, _FlowRecord] = {}
         self._standalone: deque[_StoredMessage] = deque()
         self._expiry_heap: list[tuple[float, int, str, object]] = []
+        self._message_heap: list[tuple[int, int, str, _StoredMessage]] = []
+        self._body_heap: list[tuple[int, int, str, _StoredMessage]] = []
+        self._weight_heap: list[tuple[int, int, str, _StoredMessage]] = []
+        self._completion_heap: list[tuple[int, str, int, _FlowRecord]] = []
         self._expiry_sequence = 0
+        self._eviction_sequence = 0
         self._order = 0
         self._message_count = 0
         self._body_bytes = 0
@@ -115,6 +121,8 @@ class MemoryStore:
         self._body_budget_drops = 0
         self._memory_budget_drops = 0
         self._completed_flow_count = 0
+        self._eviction_candidate_visits = 0
+        self._completion_candidate_visits = 0
 
     def append(self, message: ParsedMessage) -> None:
         """Revalidate and retain a protocol message without retaining aliases."""
@@ -138,12 +146,15 @@ class MemoryStore:
             self._standalone.append(
                 _StoredMessage(self._order, now, retained, body_bytes, weight)
             )
-            self._schedule_expiry(self._standalone[-1])
+            stored = self._standalone[-1]
+            self._schedule_expiry(stored)
+            self._index_stored(stored, "standalone")
             self._message_count += 1
             self._body_bytes += body_bytes
             self._memory_bytes += weight
             self._enforce_body_budget()
             self._enforce_memory_budget()
+            self._maybe_rebuild_eviction_indexes()
             return
 
         record = self._flows.get(flow_id)
@@ -155,10 +166,15 @@ class MemoryStore:
         if key is not None and key in record.indexes:
             index = record.indexes[key]
             previous = record.messages[index]
+            previous.active = False
+            previous.owner = None
             self._body_bytes -= previous.body_bytes
             self._memory_bytes -= previous.weight
-            replacement = _StoredMessage(self._order, now, retained, body_bytes, weight, key)
+            replacement = _StoredMessage(
+                self._order, now, retained, body_bytes, weight, key, True, record
+            )
             record.messages[index] = replacement
+            self._index_stored(replacement, "flow")
             self._body_bytes += body_bytes
             self._memory_bytes += weight
         else:
@@ -168,15 +184,20 @@ class MemoryStore:
                     incoming_terminal=_is_terminal(retained),
                     incoming_state=payload.get("state"),
                 ):
+                    if not record.messages:
+                        self._flows.pop(record.flow_id, None)
                     self._dropped_messages += 1
                     self._per_flow_drops += 1
                     return
             else:
                 self._make_room_for_message(protected=record)
-            stored = _StoredMessage(self._order, now, retained, body_bytes, weight, key)
+            stored = _StoredMessage(
+                self._order, now, retained, body_bytes, weight, key, True, record
+            )
             if key is not None:
                 record.indexes[key] = len(record.messages)
             record.messages.append(stored)
+            self._index_stored(stored, "flow")
             self._message_count += 1
             self._body_bytes += body_bytes
             self._memory_bytes += weight
@@ -187,9 +208,20 @@ class MemoryStore:
                 record.completed_at = now
                 record.completion_order = self._order
                 self._completed_flow_count += 1
+                heapq.heappush(
+                    self._completion_heap,
+                    (
+                        record.completion_order,
+                        record.flow_id,
+                        self._eviction_sequence,
+                        record,
+                    ),
+                )
+                self._eviction_sequence += 1
             self._enforce_completed_limit()
         self._enforce_body_budget()
         self._enforce_memory_budget()
+        self._maybe_rebuild_eviction_indexes()
 
     def newest_first(self) -> Iterator[ParsedMessageResult]:
         """Yield independent messages in true message-newest-first order."""
@@ -228,6 +260,10 @@ class MemoryStore:
 
         self._flows.clear()
         self._expiry_heap.clear()
+        self._message_heap.clear()
+        self._body_heap.clear()
+        self._weight_heap.clear()
+        self._completion_heap.clear()
         self._standalone.clear()
         self._message_count = 0
         self._body_bytes = 0
@@ -269,14 +305,19 @@ class MemoryStore:
 
     def _enforce_completed_limit(self) -> None:
         while self._completed_flow_count > self.max_items:
-            completed = [
-                record
-                for record in self._flows.values()
-                if record.completed and record.completion_order is not None
-            ]
-            if not completed:
+            oldest: _FlowRecord | None = None
+            while self._completion_heap:
+                _, _, _, candidate = heapq.heappop(self._completion_heap)
+                self._completion_candidate_visits += 1
+                if (
+                    candidate.completed
+                    and candidate.completion_order is not None
+                    and self._flows.get(candidate.flow_id) is candidate
+                ):
+                    oldest = candidate
+                    break
+            if oldest is None:
                 return
-            oldest = min(completed, key=lambda record: (record.completion_order, record.flow_id))
             self._remove_flow(oldest.flow_id)
             self._evicted_flows += 1
 
@@ -287,12 +328,14 @@ class MemoryStore:
                 oldest = self._oldest_message()
             if oldest is None:
                 return
-            kind, owner, index = oldest
+            kind, owner, stored = oldest
             if kind == "flow":
                 flow_owner = cast_flow(owner)
-                self._remove_flow_message(flow_owner, index, keep_empty=flow_owner is protected)
+                self._remove_flow_stored(
+                    flow_owner, stored, keep_empty=flow_owner is protected
+                )
             else:
-                self._remove_standalone(index)
+                self._remove_standalone_value(stored)
             self._message_evictions += 1
 
     def _make_room_for_flow(
@@ -349,11 +392,11 @@ class MemoryStore:
             oldest = self._oldest_body_message()
             if oldest is None:
                 return
-            kind, owner, index = oldest
+            kind, owner, stored = oldest
             if kind == "flow":
-                self._remove_flow_message(cast_flow(owner), index)
+                self._remove_flow_stored(cast_flow(owner), stored)
             else:
-                self._remove_standalone(index)
+                self._remove_standalone_value(stored)
             self._body_budget_drops += 1
             self._message_evictions += 1
 
@@ -362,59 +405,92 @@ class MemoryStore:
             oldest = self._oldest_weighted_message()
             if oldest is None:
                 return
-            kind, owner, index = oldest
+            kind, owner, stored = oldest
             if kind == "flow":
-                self._remove_flow_message(cast_flow(owner), index)
+                self._remove_flow_stored(cast_flow(owner), stored)
             else:
-                self._remove_standalone(index)
+                self._remove_standalone_value(stored)
             self._memory_budget_drops += 1
             self._message_evictions += 1
 
-    def _oldest_message(self, exclude: _FlowRecord | None = None) -> tuple[str, object, int] | None:
-        candidates: list[tuple[int, str, object, int]] = []
-        for record in self._flows.values():
-            if record is exclude:
+    def _oldest_message(
+        self, exclude: _FlowRecord | None = None
+    ) -> tuple[str, object, _StoredMessage] | None:
+        skipped: list[tuple[int, int, str, _StoredMessage]] = []
+        result: tuple[str, object, _StoredMessage] | None = None
+        while self._message_heap:
+            entry = heapq.heappop(self._message_heap)
+            self._eviction_candidate_visits += 1
+            _, _, kind, stored = entry
+            if not self._valid_eviction_entry(kind, stored):
                 continue
-            for index, stored in enumerate(record.messages):
-                candidates.append((stored.order, "flow", record, index))
-        candidates.extend(
-            (stored.order, "standalone", self._standalone, index)
-            for index, stored in enumerate(self._standalone)
-        )
-        if not candidates:
-            return None
-        _, kind, owner, index = min(candidates, key=lambda item: (item[0], item[1]))
-        return kind, owner, index
+            if kind == "flow" and stored.owner is exclude:
+                skipped.append(entry)
+                continue
+            result = (kind, stored.owner if kind == "flow" else self._standalone, stored)
+            break
+        for entry in skipped:
+            heapq.heappush(self._message_heap, entry)
+        return result
 
-    def _oldest_body_message(self) -> tuple[str, object, int] | None:
-        candidates: list[tuple[int, str, object, int]] = []
-        for record in self._flows.values():
-            for index, stored in enumerate(record.messages):
-                if stored.body_bytes:
-                    candidates.append((stored.order, "flow", record, index))
-        candidates.extend(
-            (stored.order, "standalone", self._standalone, index)
-            for index, stored in enumerate(self._standalone)
-            if stored.body_bytes
-        )
-        if not candidates:
-            return None
-        _, kind, owner, index = min(candidates, key=lambda item: (item[0], item[1]))
-        return kind, owner, index
+    def _oldest_body_message(self) -> tuple[str, object, _StoredMessage] | None:
+        return self._pop_eviction_candidate(self._body_heap)
 
-    def _oldest_weighted_message(self) -> tuple[str, object, int] | None:
-        candidates: list[tuple[int, str, object, int]] = []
+    def _oldest_weighted_message(self) -> tuple[str, object, _StoredMessage] | None:
+        return self._pop_eviction_candidate(self._weight_heap)
+
+    def _pop_eviction_candidate(
+        self, heap: list[tuple[int, int, str, _StoredMessage]]
+    ) -> tuple[str, object, _StoredMessage] | None:
+        while heap:
+            _, _, kind, stored = heapq.heappop(heap)
+            self._eviction_candidate_visits += 1
+            if self._valid_eviction_entry(kind, stored):
+                return (kind, stored.owner if kind == "flow" else self._standalone, stored)
+        return None
+
+    def _valid_eviction_entry(self, kind: str, stored: _StoredMessage) -> bool:
+        if not stored.active:
+            return False
+        if kind == "flow":
+            return (
+                stored.owner is not None
+                and self._flows.get(stored.owner.flow_id) is stored.owner
+            )
+        return stored.owner is None
+
+    def _index_stored(self, stored: _StoredMessage, kind: str) -> None:
+        entry = (stored.order, self._eviction_sequence, kind, stored)
+        self._eviction_sequence += 1
+        heapq.heappush(self._message_heap, entry)
+        heapq.heappush(self._weight_heap, entry)
+        if stored.body_bytes:
+            heapq.heappush(self._body_heap, entry)
+
+    def _maybe_rebuild_eviction_indexes(self) -> None:
+        retained = self._message_count
+        if (
+            len(self._message_heap) <= 2 * retained + 64
+            and len(self._body_heap) <= 2 * retained + 64
+            and len(self._weight_heap) <= 2 * retained + 64
+            and len(self._completion_heap) <= 2 * self._completed_flow_count + 64
+        ):
+            return
+        self._message_heap.clear()
+        self._body_heap.clear()
+        self._weight_heap.clear()
+        for stored in self._standalone:
+            self._index_stored(stored, "standalone")
         for record in self._flows.values():
-            for index, stored in enumerate(record.messages):
-                candidates.append((stored.order, "flow", record, index))
-        candidates.extend(
-            (stored.order, "standalone", self._standalone, index)
-            for index, stored in enumerate(self._standalone)
-        )
-        if not candidates:
-            return None
-        _, kind, owner, index = min(candidates, key=lambda item: (item[0], item[1]))
-        return kind, owner, index
+            for stored in record.messages:
+                self._index_stored(stored, "flow")
+        self._completion_heap = [
+            (record.completion_order, record.flow_id, self._eviction_sequence, record)
+            for record in self._flows.values()
+            if record.completed and record.completion_order is not None
+        ]
+        heapq.heapify(self._completion_heap)
+        self._eviction_sequence += len(self._completion_heap)
 
     def _remove_flow(self, flow_id: str) -> None:
         record = self._flows.pop(flow_id)
@@ -423,11 +499,16 @@ class MemoryStore:
         self._message_count -= len(record.messages)
         self._body_bytes -= sum(stored.body_bytes for stored in record.messages)
         self._memory_bytes -= sum(stored.weight for stored in record.messages)
+        for stored in record.messages:
+            stored.active = False
+            stored.owner = None
 
     def _remove_flow_message(
         self, record: _FlowRecord, index: int, *, keep_empty: bool = False
     ) -> None:
         stored = record.messages.pop(index)
+        stored.active = False
+        stored.owner = None
         self._message_count -= 1
         self._body_bytes -= stored.body_bytes
         self._memory_bytes -= stored.weight
@@ -440,6 +521,12 @@ class MemoryStore:
             self._flows.pop(record.flow_id, None)
             if record.completed:
                 self._completed_flow_count -= 1
+
+    def _remove_flow_stored(
+        self, record: _FlowRecord, stored: _StoredMessage, *, keep_empty: bool = False
+    ) -> None:
+        index = next(index for index, item in enumerate(record.messages) if item is stored)
+        self._remove_flow_message(record, index, keep_empty=keep_empty)
 
     def _assert_invariants(self) -> None:
         visible_messages = len(self._standalone) + sum(
@@ -472,6 +559,7 @@ class MemoryStore:
         stored = self._standalone[index]
         del self._standalone[index]
         stored.active = False
+        stored.owner = None
         self._message_count -= 1
         self._body_bytes -= stored.body_bytes
         self._memory_bytes -= stored.weight
@@ -481,6 +569,7 @@ class MemoryStore:
             return
         self._standalone.remove(stored)
         stored.active = False
+        stored.owner = None
         self._message_count -= 1
         self._body_bytes -= stored.body_bytes
         self._memory_bytes -= stored.weight
