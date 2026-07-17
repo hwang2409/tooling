@@ -722,6 +722,10 @@ class CaptureAddon:
         state.response.stream_enabled = False
 
     def _refresh_state_weight(self, state: _FlowCapture) -> None:
+        # A released flow already surrendered its accounting; recomputing a
+        # weight for it would recharge unreclaimable bytes forever.
+        if state.discarded:
+            return
         weight = _state_weight(state)
         self._active_metadata_bytes += weight - state.retained_weight
         state.retained_weight = weight

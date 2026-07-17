@@ -2444,6 +2444,103 @@ def test_active_flow_age_bound_tombstones_stale_incomplete_flow() -> None:
     assert any(message["type"] == "stream.gap" for message in messages)
 
 
+def test_repeated_completed_flows_release_all_active_accounting() -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    for index in range(5):
+        flow = fake_flow(f"fake-{index}", request_body=b"req", response_body=b"resp")
+        addon.requestheaders(flow)
+        addon.request(flow)
+        addon.responseheaders(flow)
+        addon.response(flow)
+        assert addon.counters["active_flows"] == 0
+        assert addon.counters["active_metadata_bytes"] == 0
+        assert addon.counters["active_prefix_bytes"] == 0
+
+
+def test_repeated_error_completions_release_all_active_accounting() -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    for index in range(5):
+        flow = fake_flow(f"err-{index}", request_body=b"req")
+        flow.error = SimpleNamespace(msg="synthetic failure")
+        addon.requestheaders(flow)
+        addon.error(flow)
+        assert addon.counters["active_flows"] == 0
+        assert addon.counters["active_metadata_bytes"] == 0
+        assert addon.counters["active_prefix_bytes"] == 0
+
+
+def test_repeated_deferred_completions_release_all_active_accounting() -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    for index in range(5):
+        flow = fake_flow(f"late-{index}", request_body=None, response_body=b"resp")
+        addon.requestheaders(flow)
+        addon.responseheaders(flow)
+        addon.response(flow)
+        assert addon.counters["active_flows"] == 1
+        addon.request(flow)
+        assert addon.counters["active_flows"] == 0
+        assert addon.counters["active_metadata_bytes"] == 0
+        assert addon.counters["active_prefix_bytes"] == 0
+
+
+def test_repeated_real_httpflow_completions_release_all_active_accounting() -> None:
+    from mitmproxy.test import tflow
+
+    addon = CaptureAddon(clock=lambda: "now")
+    for _ in range(5):
+        flow = tflow.tflow(resp=True)
+        addon.requestheaders(flow)
+        addon.request(flow)
+        addon.responseheaders(flow)
+        addon.response(flow)
+        assert addon.counters["active_flows"] == 0
+        assert addon.counters["active_metadata_bytes"] == 0
+        assert addon.counters["active_prefix_bytes"] == 0
+
+
+def test_tight_budget_flow_still_captures_after_many_completions() -> None:
+    config = CaptureConfig(
+        source_id="source",
+        max_body_prefix_bytes=64,
+        max_in_memory_bytes=4_096,
+    )
+    addon = CaptureAddon(config=config, clock=lambda: "now")
+    probe = fake_flow("probe", request_body=None, response_body=b"data")
+    addon.requestheaders(probe)
+    addon.request(probe)
+    addon.responseheaders(probe)
+    single_flow_weight = addon._active_metadata_bytes
+    addon.response(probe)
+
+    for index in range(50):
+        flow = fake_flow(f"churn-{index}", request_body=None, response_body=b"data")
+        addon.requestheaders(flow)
+        addon.request(flow)
+        addon.responseheaders(flow)
+        addon.response(flow)
+        payloads(addon)
+    assert addon.counters["active_metadata_bytes"] == 0
+
+    addon.max_in_memory_bytes = single_flow_weight + 8
+    late = fake_flow("tight", request_body=None, response_body=b"data")
+    addon.requestheaders(late)
+    addon.request(late)
+    addon.responseheaders(late)
+    addon.response(late)
+    assert addon.counters["evicted_flows"] == 0
+    body_end = [
+        message
+        for message in payloads(addon)
+        if message.get("type") == "body.end"
+        and message.get("body_side") == "response"
+        and message.get("flow_id") == "tight"
+    ][-1]
+    body = body_end["body"]
+    assert isinstance(body, Mapping)
+    assert body["state"] == "captured"
+    assert base64.b64decode(body["data"]) == b"data"
+
+
 def test_redaction_rejects_str_subclass_before_authorization_coercion() -> None:
     called = False
 
