@@ -41,6 +41,7 @@ class SequencerState:
     next_position: int = 1
     exhausted: bool = False
     pending_marker: int = -1
+    pending_losses: int = 0
     trailing_losses: tuple[LossRun, ...] = ()
     items: tuple[QueuedMessage, ...] = ()
     body_bytes: int = 0
@@ -64,6 +65,7 @@ class DeliverySequencer:
         self.lock = RLock()
         self.state = SequencerState()
         self._pending_tickets = itertools.count()
+        self._committed_batch: tuple[ParsedMessageResult, ...] | None = None
 
     def note_loss_without_lock(self) -> bool:
         """Record an acknowledged loss without waiting for the owner.
@@ -78,19 +80,28 @@ class DeliverySequencer:
 
     def _take_pending(self, state: SequencerState) -> SequencerState:
         marker = next(self._pending_tickets)
-        pending = marker - state.pending_marker - 1
+        newly_pending = max(0, marker - state.pending_marker - 1)
+        pending = state.pending_losses + newly_pending
+        # Publish both the consumed marker and the retryable fold snapshot
+        # before calling the fallible loss-folding operation.  A retry then
+        # carries ``pending_losses`` forward instead of deriving it from a
+        # marker that has already been consumed.
+        snapshot = replace(
+            state,
+            pending_marker=marker,
+            pending_losses=pending,
+        )
+        self.state = snapshot
         if pending <= 0:
-            state = replace(state, pending_marker=marker)
-            # The marker is a producer-side commit point.  Publish it before
-            # returning to callers that may subsequently hit an injected
-            # allocation/canonicalization failure; otherwise the consumed
-            # ticket is counted again on the retry.
-            self.state = state
-            return state
-        state = replace(state, pending_marker=marker)
-        state = self._append_loss_count(state, pending)
-        self.state = state
-        return state
+            return snapshot
+        try:
+            folded = self._append_loss_count(snapshot, pending)
+        except BaseException:
+            self.state = snapshot
+            raise
+        folded = replace(folded, pending_losses=0)
+        self.state = folded
+        return folded
 
     def _append_loss_count(self, state: SequencerState, count: int) -> SequencerState:
         if count <= 0:
@@ -236,6 +247,26 @@ class DeliverySequencer:
         state = self.state
         return not state.exhausted and len(state.items) < max_pending
 
+    def take_committed_batch(self) -> list[ParsedMessageResult] | None:
+        """Recover a committed drain whose caller faulted before acknowledgement."""
+
+        with self.lock:
+            if self._committed_batch is None:
+                return None
+            batch = list(self._committed_batch)
+            self._committed_batch = None
+            return batch
+
+    def acknowledge_committed_batch(self) -> None:
+        """Acknowledge the normal sink handoff of the committed batch."""
+
+        with self.lock:
+            self._committed_batch = None
+
+    def has_committed_batch(self) -> bool:
+        with self.lock:
+            return self._committed_batch is not None
+
     def drain(
         self,
         limit: int | None,
@@ -264,13 +295,16 @@ class DeliverySequencer:
                         continue
                     output.append(with_position(item.message, item.position))
                     cursor = item.position
-                for index, loss in enumerate(trailing):
+                for loss in trailing:
                     if loss.end == MAX_U64:
                         # MAX_U64 is a real terminal loss, but it has no
                         # representable successor for stream.gap.  Emit the
-                        # representable prefix and retain the terminal run so
-                        # it is neither fabricated nor silently forgotten.
-                        terminal_trailing = trailing[index:]
+                        # representable prefix and retain only the terminal
+                        # run so the preceding loss is not hidden.
+                        if loss.start < MAX_U64:
+                            output.append(gap_after_loss(cursor, MAX_U64 - 1))
+                            cursor = MAX_U64 - 1
+                        terminal_trailing = (LossRun(MAX_U64, MAX_U64),)
                         break
                     output.append(gap_after_loss(cursor, loss.end))
                     cursor = loss.end
@@ -298,6 +332,7 @@ class DeliverySequencer:
                 last_delivered=cursor,
             )
             self.state = committed
+            self._committed_batch = tuple(output)
             return output
 
     def flush_for_read(self) -> None:

@@ -420,17 +420,23 @@ class CaptureAddon:
                 return
             body.lifecycle_emitted = True
         if captured:
-            self._send(
-                {
-                    "protocol_version": "1",
-                    "type": "body.chunk",
-                    "flow_id": state.flow_id,
-                    "body_side": side,
-                    "chunk_index": str(body.chunk_index),
-                    "offset_bytes": str(offset),
-                    "data_base64": base64.b64encode(captured).decode("ascii"),
-                }
-            )
+            chunk_index = body.chunk_index
+            try:
+                self._send(
+                    {
+                        "protocol_version": "1",
+                        "type": "body.chunk",
+                        "flow_id": state.flow_id,
+                        "body_side": side,
+                        "chunk_index": str(chunk_index),
+                        "offset_bytes": str(offset),
+                        "data_base64": base64.b64encode(captured).decode("ascii"),
+                    }
+                )
+            except BaseException as error:
+                if getattr(error, "capture_committed", False):
+                    body.chunk_index = chunk_index + 1
+                raise
         body.chunk_index += 1
 
     def _finish_body(
@@ -454,16 +460,23 @@ class CaptureAddon:
                 self._discard_active(state, count_eviction=False)
                 return False
         descriptor = _body_descriptor(body)
-        self._send(
-            {
-                "protocol_version": "1",
-                "type": "body.end",
-                "flow_id": state.flow_id,
-                "body_side": side,
-                "total_bytes": str(body.total_bytes),
-                "body": descriptor,
-            }
-        )
+        try:
+            self._send(
+                {
+                    "protocol_version": "1",
+                    "type": "body.end",
+                    "flow_id": state.flow_id,
+                    "body_side": side,
+                    "total_bytes": str(body.total_bytes),
+                    "body": descriptor,
+                }
+            )
+        except BaseException as error:
+            if getattr(error, "capture_committed", False):
+                body.lifecycle_emitted = True
+                body.ended = True
+                body.stream_enabled = False
+            raise
         body.lifecycle_emitted = True
         body.ended = True
         body.stream_enabled = False
@@ -506,18 +519,24 @@ class CaptureAddon:
             return
         self._ensure_lifecycle_capacity()
         sequence = self._sequence
-        self._send(
-            {
-                "protocol_version": "1",
-                "type": "flow.lifecycle",
-                "source_id": self.source_id,
-                "flow_id": state.flow_id,
-                "event_id": f"{self.source_id}:{sequence}",
-                "occurred_at": self._clock(),
-                "sequence": str(sequence),
-                "state": lifecycle_state,
-            }
-        )
+        try:
+            self._send(
+                {
+                    "protocol_version": "1",
+                    "type": "flow.lifecycle",
+                    "source_id": self.source_id,
+                    "flow_id": state.flow_id,
+                    "event_id": f"{self.source_id}:{sequence}",
+                    "occurred_at": self._clock(),
+                    "sequence": str(sequence),
+                    "state": lifecycle_state,
+                }
+            )
+        except BaseException as error:
+            if getattr(error, "capture_committed", False):
+                state.lifecycle_states.add(lifecycle_state)
+                self._sequence = sequence + 1
+            raise
         state.lifecycle_states.add(lifecycle_state)
         self._sequence = sequence + 1
 

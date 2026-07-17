@@ -62,6 +62,12 @@ class ReservationGate:
         with self._condition:
             return self._owner is owner
 
+    def obligations_clear(self, owner: object) -> bool:
+        """Return whether ownership and the pending notification are clear."""
+
+        with self._condition:
+            return self._owner is not owner and not self._notification_pending
+
     def _notify_waiter(self) -> None:
         try:
             self._condition.notify()
@@ -94,6 +100,7 @@ class ReservationLease:
     def close(self) -> BaseException | None:
         if self.phase not in (OwnershipPhase.OWNED, OwnershipPhase.RELEASING):
             return None
+        was_releasing = self.phase is OwnershipPhase.RELEASING
         self.phase = OwnershipPhase.RELEASING
         first_error: BaseException | None = None
         for _ in range(2):
@@ -103,13 +110,15 @@ class ReservationLease:
                 if first_error is None:
                     first_error = error
                 released = False
-            if released:
+            if released and self._gate.obligations_clear(self):
                 self.phase = OwnershipPhase.RELEASED
                 return first_error
-            if not self._gate.is_owned(self) and first_error is None:
+            if self._gate.obligations_clear(self) and first_error is None:
                 self.phase = OwnershipPhase.RELEASED
+                if was_releasing:
+                    return None
                 return RuntimeError("owned reservation was already released")
-            if not self._gate.is_owned(self) and first_error is not None and _ == 1:
+            if self._gate.obligations_clear(self) and first_error is not None:
                 self.phase = OwnershipPhase.RELEASED
                 return first_error
         # A failed notification must not make an uncleared owner look

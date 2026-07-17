@@ -6,6 +6,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from threading import Lock
 
+from mitm_inspector.capture.gate import OwnershipPhase as _OwnershipPhase
 from mitm_inspector.capture.gate import ReservationGate as _ReservationGate
 from mitm_inspector.capture.gate import ReservationLease as _ReservationLease
 from mitm_inspector.capture.metrics import (
@@ -60,6 +61,8 @@ class BoundedMessageSink:
         self._lock = _ReservationGate()
         self._reservation_lock = self._lock
         self._consumer_lock = Lock()
+        self._lease_state_lock = Lock()
+        self._pending_lease: _ReservationLease | None = None
 
     @property
     def _state(self) -> SequencerState:
@@ -119,19 +122,22 @@ class BoundedMessageSink:
     def offer(self, message: ParsedMessage | Mapping[str, object]) -> bool:
         """Prepare only after immediate gate admission; never waits for drain."""
 
+        pending_error = self._retry_pending_lease()
+        if pending_error is not None:
+            raise pending_error
         reservation = _ReservationLease(self._reservation_lock)
         if not reservation.acquire(False):
             self._sequencer.record_loss()
             return False
         if not self._sequencer.lock.acquire(False):
-            close_error = reservation.close()
+            close_error = self._finish_reservation(reservation)
             self._sequencer.record_loss()
             if close_error is not None:
                 raise close_error
             return False
         if not self._sequencer.can_accept_locked(self._max_pending):
             self._sequencer.lock.release()
-            close_error = reservation.close()
+            close_error = self._finish_reservation(reservation)
             self._sequencer.record_loss()
             if close_error is not None:
                 raise close_error
@@ -168,7 +174,7 @@ class BoundedMessageSink:
             raise
         finally:
             self._sequencer.lock.release()
-            close_error = reservation.close()
+            close_error = self._finish_reservation(reservation)
             if close_error is not None:
                 if committed:
                     _mark_committed_exception(close_error)
@@ -181,6 +187,9 @@ class BoundedMessageSink:
     def drain(self, limit: int | None = None) -> list[ParsedMessageResult]:
         limit = _validate_drain_limit(limit)
         with self._consumer_lock:
+            pending_error = self._retry_pending_lease()
+            if pending_error is not None:
+                raise pending_error
             reservation = _ReservationLease(self._reservation_lock)
             if not reservation.acquire(True):
                 return []
@@ -188,13 +197,22 @@ class BoundedMessageSink:
             primary: BaseException | None = None
             result: list[ParsedMessageResult] | None = None
             try:
-                result = self._sequencer.drain(limit, _with_delivery_position, _gap_after_loss)
+                recovered = self._sequencer.take_committed_batch()
+                if recovered is not None:
+                    result = recovered
+                else:
+                    result = self._sequencer.drain(
+                        limit, _with_delivery_position, _gap_after_loss
+                    )
+                    self._sequencer.acknowledge_committed_batch()
                 committed = True
             except BaseException as error:
                 primary = error
+                if self._sequencer.has_committed_batch():
+                    _mark_committed_exception(error)
                 raise
             finally:
-                close_error = reservation.close()
+                close_error = self._finish_reservation(reservation)
                 if close_error is not None:
                     if committed:
                         # Sequencer commit is already authoritative.  Do not
@@ -206,6 +224,23 @@ class BoundedMessageSink:
             if result is None:
                 raise RuntimeError("drain committed without a result")
             return result
+
+    def _finish_reservation(self, reservation: _ReservationLease) -> BaseException | None:
+        with self._lease_state_lock:
+            error = reservation.close()
+            if reservation.phase is _OwnershipPhase.RELEASING:
+                self._pending_lease = reservation
+            elif self._pending_lease is reservation:
+                self._pending_lease = None
+        return error
+
+    def _retry_pending_lease(self) -> BaseException | None:
+        with self._lease_state_lock:
+            reservation = self._pending_lease
+        if reservation is None:
+            return None
+        error = self._finish_reservation(reservation)
+        return error
 
     def __iter__(self) -> Iterator[ParsedMessageResult]:
         return iter(self.drain())

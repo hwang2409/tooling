@@ -160,6 +160,108 @@ def test_successful_completion_does_not_emit_a_capture_loss_gap() -> None:
     assert addon.sink.dropped_count == 0
 
 
+def test_post_commit_lifecycle_fault_reconciles_sequence_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    state = addon._ensure_flow(fake_flow())
+    original_release = addon.sink._lock.release_if_owned
+
+    def release_then_interrupt(owner: object | None = None) -> bool:
+        original_release(owner)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(addon.sink._lock, "release_if_owned", release_then_interrupt)
+    with pytest.raises(KeyboardInterrupt) as raised:
+        addon._lifecycle(state, "request_started")
+    assert getattr(raised.value, "capture_committed", False)
+    assert "request_started" in state.lifecycle_states
+    assert addon._sequence == 1
+    monkeypatch.undo()
+    addon._lifecycle(state, "request_started")
+    messages = addon.drain()
+    lifecycle = [
+        message
+        for message in messages
+        if isinstance(message, KnownParsedMessage)
+        and message.message.get("type") == "flow.lifecycle"
+    ]
+    assert len(lifecycle) == 1
+    assert lifecycle[0].message["sequence"] == "0"
+
+
+def test_post_commit_body_end_fault_reconciles_terminal_state_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    state = addon._ensure_flow(fake_flow())
+    original_release = addon.sink._lock.release_if_owned
+    releases = 0
+
+    def release_body_end_then_interrupt(owner: object | None = None) -> bool:
+        nonlocal releases
+        releases += 1
+        released = original_release(owner)
+        if releases == 2:
+            raise KeyboardInterrupt
+        return released
+
+    monkeypatch.setattr(
+        addon.sink._lock,
+        "release_if_owned",
+        release_body_end_then_interrupt,
+    )
+    with pytest.raises(KeyboardInterrupt) as raised:
+        addon._finish_body(state, "request", b"")
+    assert getattr(raised.value, "capture_committed", False)
+    assert state.request.ended
+    assert not state.request.stream_enabled
+    monkeypatch.undo()
+    assert addon._finish_body(state, "request", b"")
+    messages = addon.drain()
+    assert sum(
+        isinstance(message, KnownParsedMessage)
+        and message.message.get("type") == "body.end"
+        for message in messages
+    ) == 1
+
+
+def test_post_commit_body_chunk_fault_reconciles_offset_before_next_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    state = addon._ensure_flow(fake_flow())
+    original_release = addon.sink._lock.release_if_owned
+    releases = 0
+
+    def release_body_chunk_then_interrupt(owner: object | None = None) -> bool:
+        nonlocal releases
+        releases += 1
+        released = original_release(owner)
+        if releases == 2:
+            raise KeyboardInterrupt
+        return released
+
+    monkeypatch.setattr(
+        addon.sink._lock,
+        "release_if_owned",
+        release_body_chunk_then_interrupt,
+    )
+    with pytest.raises(KeyboardInterrupt) as raised:
+        addon._observe_chunk(state, "request", b"abc")
+    assert getattr(raised.value, "capture_committed", False)
+    assert state.request.chunk_index == 1
+    monkeypatch.undo()
+    addon._observe_chunk(state, "request", b"def")
+    chunks = [
+        message
+        for message in addon.drain()
+        if isinstance(message, KnownParsedMessage)
+        and message.message.get("type") == "body.chunk"
+    ]
+    assert [message.message["chunk_index"] for message in chunks] == ["0", "1"]
+
+
 def test_response_completion_is_deferred_until_late_missing_request_end() -> None:
     addon = CaptureAddon(clock=lambda: "now")
     flow = fake_flow(request_body=None)
@@ -669,6 +771,28 @@ def test_drain_cleanup_fault_keeps_committed_snapshot_visible_once(
     assert sink.drain() == []
 
 
+def test_drain_post_commit_fault_keeps_durable_batch_for_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.drain-fault"}))
+    original_drain = sink._sequencer.drain
+
+    def drain_then_interrupt(*args: object, **kwargs: object) -> list[ParsedMessageResult]:
+        original_drain(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink._sequencer, "drain", drain_then_interrupt)
+    with pytest.raises(KeyboardInterrupt) as raised:
+        sink.drain()
+    assert getattr(raised.value, "capture_committed", False)
+    assert sink.pending_count == 0
+    monkeypatch.undo()
+    recovered = sink.drain()
+    assert len(recovered) == 1
+    assert sink.drain() == []
+
+
 def test_drain_baseexception_restores_one_atomic_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1030,6 +1154,40 @@ def test_pending_marker_commit_survives_allocate_fault_without_phantom_gap(
     assert sink.dropped_count == 0
 
 
+def test_pending_loss_fold_fault_retries_snapshot_without_double_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    assert sink._sequencer.note_loss_without_lock()
+    original = sink._sequencer._append_loss_count
+    failed = True
+
+    def fail_once(state: object, count: int) -> object:
+        nonlocal failed
+        if failed:
+            failed = False
+            raise MemoryError("injected loss fold failure")
+        return original(state, count)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sink._sequencer, "_append_loss_count", fail_once)
+    with pytest.raises(MemoryError, match="injected loss fold failure"):
+        sink.offer(parse_message({"protocol_version": "1", "type": "future.fold-fault"}))
+    monkeypatch.undo()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after-fold"}))
+    drained = sink.drain()
+    assert [
+        (
+            message.message
+            if isinstance(message, KnownParsedMessage)
+            else message.payload
+        )["type"]
+        for message in drained
+    ] == ["stream.gap", "future.after-fold"]
+    gap = drained[0]
+    assert isinstance(gap, KnownParsedMessage)
+    assert gap.message["dropped_count"] == "1"
+
+
 def test_reservation_acquire_baseexception_after_ownership_is_recoverable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1184,6 +1342,81 @@ def test_reservation_close_keeps_uncleared_owner_retryable(
     assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after-release"}))
 
 
+def test_public_drain_retains_lease_after_two_preclear_cleanup_faults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.lease"}))
+    original = sink._lock.release_if_owned
+    attempts = 0
+
+    def fail_twice(owner: object | None = None) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise KeyboardInterrupt
+        return original(owner)
+
+    monkeypatch.setattr(sink._lock, "release_if_owned", fail_twice)
+    assert len(sink.drain()) == 1
+    pending_lease = sink._pending_lease
+    assert pending_lease is not None
+    assert sink._lock.is_owned(pending_lease)
+    monkeypatch.undo()
+    assert sink.drain() == []
+    assert sink._pending_lease is None
+
+
+def test_gate_retries_two_failed_notifications_for_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    holder = sink_module._ReservationLease(sink._lock)
+    assert holder.acquire()
+    waiter = sink_module._ReservationLease(sink._lock)
+    entered = threading.Event()
+    waiting = threading.Event()
+    acquired = threading.Event()
+
+    def wait_for_gate() -> None:
+        entered.set()
+        assert waiter.acquire(blocking=True)
+        acquired.set()
+        assert waiter.close() is None
+
+    original_wait = sink._lock._condition.wait
+
+    def mark_waiting(*args: object, **kwargs: object) -> bool:
+        waiting.set()
+        return original_wait(*args, **kwargs)
+
+    monkeypatch.setattr(sink._lock._condition, "wait", mark_waiting)
+    waiter_thread = threading.Thread(target=wait_for_gate)
+    waiter_thread.start()
+    assert entered.wait(timeout=1)
+    assert waiting.wait(timeout=1)
+    original = sink._lock._condition.notify
+    calls = 0
+
+    def fail_twice(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            raise KeyboardInterrupt
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(sink._lock._condition, "notify", fail_twice)
+    close_error = holder.close()
+    assert isinstance(close_error, KeyboardInterrupt)
+    assert holder.phase.name == "RELEASING"
+    assert not acquired.wait(timeout=0.05)
+    monkeypatch.undo()
+    assert holder.close() is None
+    assert acquired.wait(timeout=1)
+    waiter_thread.join(timeout=1)
+    assert not waiter_thread.is_alive()
+
+
 def test_queue_lock_ownership_boundaries_do_not_strand_slot_or_drain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1297,6 +1530,21 @@ def test_uint64_exhaustion_is_stable_without_constructing_next_position() -> Non
     assert sink.loss_range_count == ranges
     assert sink.drain() == []
     assert sink.loss_range_count == ranges
+
+
+def test_terminal_loss_splits_representable_prefix_from_terminal_position() -> None:
+    sink = BoundedMessageSink(max_pending=2)
+    sink._next_position_value = MAX_U64 - 2
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.edge"}))
+    assert sink.record_loss()
+    assert sink.record_loss()
+    drained = sink.drain()
+    assert len(drained) == 2
+    assert isinstance(drained[1], KnownParsedMessage)
+    assert drained[1].message["type"] == "stream.gap"
+    assert drained[1].message["actual_sequence"] == str(MAX_U64)
+    assert sink.loss_range_count == 1
+    assert sink.drain() == []
 
 
 def test_drain_failure_restores_detached_queue_and_cursor(
