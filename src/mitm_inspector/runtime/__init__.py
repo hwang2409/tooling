@@ -14,6 +14,8 @@ from mitm_inspector.runtime.config import (
     RuntimeConfig,
     RuntimeConfigError,
     RuntimePreflightError,
+    cleanup_private_runtime_dir,
+    validate_private_runtime_dir,
 )
 from mitm_inspector.runtime.supervisor import (
     BrowserOpener,
@@ -49,6 +51,8 @@ __all__ = [
     "RuntimeConfig",
     "RuntimeConfigError",
     "RuntimePreflightError",
+    "cleanup_private_runtime_dir",
+    "validate_private_runtime_dir",
     "RuntimeState",
     "RuntimeSupervisor",
     "RuntimeSupervisorError",

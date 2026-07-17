@@ -11,12 +11,17 @@ import warnings
 import webbrowser
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from enum import StrEnum
 from types import FrameType
 from typing import Any, Protocol
 
 from mitm_inspector.runtime.commands import ProcessSpec, build_app_spec, build_proxy_spec
-from mitm_inspector.runtime.config import RuntimeConfig, validate_preflight
+from mitm_inspector.runtime.config import (
+    RuntimeConfig,
+    cleanup_private_runtime_dir,
+    validate_preflight,
+)
 
 
 class RuntimeState(StrEnum):
@@ -141,12 +146,21 @@ class PopenChild:
     def group_alive(self) -> bool:
         if os.name != "posix" or self._process_group_id is None:
             return self.poll() is None
+        # Popen.poll() also reaps the group leader.  On macOS, probing a
+        # cached group after that can report EPERM for a stale leader.  Only a
+        # successful probe is evidence of a live descendant in this case.
+        if self.poll() is not None:
+            try:
+                os.killpg(self._process_group_id, 0)
+            except (ProcessLookupError, PermissionError):
+                return False
+            return True
         try:
             os.killpg(self._process_group_id, 0)
         except ProcessLookupError:
             return False
         except PermissionError:
-            return True
+            return False
         return True
 
     def _signal_group(self, signum: int, fallback: Callable[[], None]) -> None:
@@ -238,6 +252,7 @@ class RuntimeSupervisor:
         self._stop_status_code = 0
         self._last_error: BaseException | None = None
         self._cleanup_failures: tuple[ChildCleanupFailure, ...] = ()
+        self._active_config: RuntimeConfig | None = None
         self._state = RuntimeState.NEW
         self._state_history: list[RuntimeState] = [self._state]
         self._lock = threading.RLock()
@@ -289,30 +304,51 @@ class RuntimeSupervisor:
                 self._preflight_checker(self.config)
                 if self._stop_requested:
                     return
+                allocated_capture = self.config.capture.allocate()
+                try:
+                    self._active_config = replace(
+                        self.config,
+                        capture_ipc=allocated_capture,
+                    )
+                except BaseException:
+                    cleanup_private_runtime_dir(allocated_capture)
+                    raise
+                active_config = self._active_config
+                if active_config is None:  # pragma: no cover - defensive invariant.
+                    raise RuntimeSupervisorError("runtime configuration was not allocated")
                 self._set_state(RuntimeState.STARTING_APP)
-                self._children["app"] = self._process_factory.spawn(build_app_spec(self.config))
+                self._children["app"] = self._process_factory.spawn(build_app_spec(active_config))
                 self._readiness_probe.wait_until_ready(
-                    "app", self._children["app"], self.config.readiness_timeout_seconds
+                    "app", self._children["app"], active_config.readiness_timeout_seconds
                 )
                 if self._stop_requested:
                     return
                 self._set_state(RuntimeState.APP_READY)
                 self._set_state(RuntimeState.STARTING_PROXY)
-                self._children["proxy"] = self._process_factory.spawn(build_proxy_spec(self.config))
+                self._children["proxy"] = self._process_factory.spawn(
+                    build_proxy_spec(active_config)
+                )
                 self._readiness_probe.wait_until_ready(
-                    "proxy", self._children["proxy"], self.config.readiness_timeout_seconds
+                    "proxy", self._children["proxy"], active_config.readiness_timeout_seconds
                 )
                 if self._stop_requested:
                     return
                 self._set_state(RuntimeState.RUNNING)
                 self._open_browser_if_requested()
-            except KeyboardInterrupt:
+            except KeyboardInterrupt as exc:
                 self.request_stop("keyboard interrupt", 130)
+                failures = self._cleanup_runtime()
+                if failures:
+                    self._cleanup_failures = failures
+                    raise CleanupError(failures) from exc
                 raise
             except Exception as exc:
                 self._last_error = exc
                 self._set_state(RuntimeState.FAILED)
-                self._shutdown_children()
+                failures = self._cleanup_runtime()
+                if failures:
+                    self._cleanup_failures = failures
+                    raise CleanupError(failures) from exc
                 raise
 
     def run(self) -> int:
@@ -355,13 +391,13 @@ class RuntimeSupervisor:
                 return
             if self._state is not RuntimeState.FAILED:
                 self._set_state(RuntimeState.STOPPING)
-            try:
-                self._shutdown_children()
-            except CleanupError as exc:
-                self._cleanup_failures = exc.failures
-                self._last_error = exc
+            failures = self._cleanup_runtime()
+            self._cleanup_failures = failures
+            if failures:
+                error = CleanupError(failures)
+                self._last_error = error
                 self._set_state(RuntimeState.FAILED)
-                raise
+                raise error
             if self._state is RuntimeState.STOPPING:
                 self._set_state(RuntimeState.STOPPED)
 
@@ -393,7 +429,23 @@ class RuntimeSupervisor:
     def _default_warning_sink(message: str) -> None:
         warnings.warn(message, RuntimeWarning, stacklevel=3)
 
-    def _shutdown_children(self) -> None:
+    def _cleanup_runtime(self) -> tuple[ChildCleanupFailure, ...]:
+        failures = list(self._shutdown_children())
+        active_config = self._active_config
+        if active_config is not None and active_config.capture.runtime_dir is not None:
+            try:
+                resource_errors = cleanup_private_runtime_dir(active_config.capture)
+            except BaseException as exc:
+                resource_errors = (f"runtime directory cleanup raised: {exc}",)
+            if resource_errors:
+                failures.append(ChildCleanupFailure("ipc", resource_errors, True))
+            else:
+                self._active_config = None
+        else:
+            self._active_config = None
+        return tuple(failures)
+
+    def _shutdown_children(self) -> tuple[ChildCleanupFailure, ...]:
         failures: list[ChildCleanupFailure] = []
         for component in ("proxy", "app"):
             child = self._children.get(component)
@@ -407,8 +459,7 @@ class RuntimeSupervisor:
                 failures.append(
                     ChildCleanupFailure(component, (f"unexpected cleanup exception: {exc}",), True)
                 )
-        if failures:
-            raise CleanupError(tuple(failures))
+        return tuple(failures)
 
     def _shutdown_child(self, component: str, child: ChildProcess) -> None:
         errors: list[str] = []
@@ -465,13 +516,16 @@ class RuntimeSupervisor:
 
     @contextmanager
     def _signal_handlers(self) -> Iterator[None]:
-        if threading.current_thread() is not threading.main_thread():
-            if self._signal_policy is not SignalPolicy.DISABLED_FOR_TEST:
-                raise SignalHandlingError(
-                    "runtime signals require the main thread; use DISABLED_FOR_TEST only in tests"
-                )
+        if self._signal_policy is SignalPolicy.DISABLED_FOR_TEST:
+            # A true no-op, including on the main thread.  This policy is
+            # intentionally explicit so tests never perturb process-global
+            # handlers while exercising startup and cleanup.
             yield
             return
+        if threading.current_thread() is not threading.main_thread():
+            raise SignalHandlingError(
+                "runtime signals require the main thread; use DISABLED_FOR_TEST only in tests"
+            )
         previous: dict[signal.Signals, Any] = {}
 
         def handle(signum: int, _frame: FrameType | None) -> None:
@@ -481,9 +535,34 @@ class RuntimeSupervisor:
             for signum in (signal.SIGINT, signal.SIGTERM):
                 previous[signum] = signal.getsignal(signum)
                 signal.signal(signum, handle)
-            yield
         except (OSError, ValueError) as exc:
-            raise SignalHandlingError(f"could not install runtime signal handlers: {exc}") from exc
-        finally:
+            install_restore_errors: list[str] = []
             for signum, handler in previous.items():
-                signal.signal(signum, handler)
+                try:
+                    signal.signal(signum, handler)
+                except (OSError, ValueError) as restore_exc:
+                    install_restore_errors.append(str(restore_exc))
+            detail = str(exc)
+            if install_restore_errors:
+                detail += "; partial restore failed: " + "; ".join(install_restore_errors)
+            raise SignalHandlingError(
+                f"could not install runtime signal handlers: {detail}"
+            ) from exc
+
+        body_error: BaseException | None = None
+        try:
+            yield
+        except BaseException as exc:
+            body_error = exc
+            raise
+        finally:
+            restore_errors: list[str] = []
+            for signum, handler in previous.items():
+                try:
+                    signal.signal(signum, handler)
+                except (OSError, ValueError) as exc:
+                    restore_errors.append(str(exc))
+            if restore_errors and body_error is None:
+                raise SignalHandlingError(
+                    "could not restore runtime signal handlers: " + "; ".join(restore_errors)
+                )

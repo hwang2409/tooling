@@ -16,6 +16,7 @@ CAPTURE_SOCKET_ARG: Final = "--capture-socket"
 CAPTURE_SOURCE_ID_ARG: Final = "--capture-source-id"
 CAPTURE_MAX_BODY_PREFIX_ARG: Final = "--capture-max-body-prefix-bytes"
 CAPTURE_MAX_MEMORY_ARG: Final = "--capture-max-in-memory-bytes"
+CAPTURE_MAX_PENDING_ARG: Final = "--capture-max-pending-messages"
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +112,8 @@ def build_app_argv(
         str(ipc.max_body_prefix_bytes),
         CAPTURE_MAX_MEMORY_ARG,
         str(ipc.max_in_memory_bytes),
+        CAPTURE_MAX_PENDING_ARG,
+        str(ipc.max_pending_messages),
     )
 
 

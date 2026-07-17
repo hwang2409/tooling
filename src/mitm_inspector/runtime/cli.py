@@ -31,6 +31,7 @@ def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--retention-max-age-seconds", type=int, default=1_800)
     parser.add_argument("--max-body-bytes", type=int, default=128 * 1024 * 1024)
     parser.add_argument("--max-body-prefix-bytes", type=int, default=1024 * 1024)
+    parser.add_argument("--max-pending-messages", type=int, default=4096)
     parser.add_argument("--mitmdump-executable", type=Path, default=DEFAULT_MITMDUMP_EXECUTABLE)
     parser.add_argument("--app-executable", type=Path, default=DEFAULT_APP_EXECUTABLE)
     parser.add_argument(
@@ -59,6 +60,7 @@ def _config_from_args(args: argparse.Namespace) -> RuntimeConfig:
         retention_max_age_seconds=args.retention_max_age_seconds,
         max_body_bytes=args.max_body_bytes,
         max_body_prefix_bytes=args.max_body_prefix_bytes,
+        max_pending_messages=args.max_pending_messages,
         mitmdump_executable=args.mitmdump_executable,
         app_executable=args.app_executable,
         addon_path=args.addon_path,
@@ -67,6 +69,7 @@ def _config_from_args(args: argparse.Namespace) -> RuntimeConfig:
             source_id=args.source_id,
             max_body_prefix_bytes=args.max_body_prefix_bytes,
             max_in_memory_bytes=args.max_body_bytes,
+            max_pending_messages=args.max_pending_messages,
         ),
         open_browser=args.open_browser,
     )

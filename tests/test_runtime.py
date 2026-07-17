@@ -3,9 +3,12 @@ from __future__ import annotations
 import math
 import os
 import signal
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -22,26 +25,33 @@ from mitm_inspector.runtime.commands import (
 from mitm_inspector.runtime.config import (
     CAPTURE_MAX_BODY_PREFIX_ENV,
     CAPTURE_MAX_MEMORY_ENV,
+    CAPTURE_MAX_PENDING_ENV,
     CAPTURE_SOCKET_ENV,
     CAPTURE_SOURCE_ID_ENV,
     DEFAULT_ADDON_PATH,
     DEFAULT_APP_EXECUTABLE,
     DEFAULT_MITMDUMP_EXECUTABLE,
+    MAX_UINT64,
     CaptureIPCConfig,
     RuntimeConfig,
     RuntimeConfigError,
     RuntimePreflightError,
+    cleanup_private_runtime_dir,
     preflight_issues,
+    validate_private_runtime_dir,
 )
 from mitm_inspector.runtime.supervisor import (
     BrowserOpener,
     ChildExitedError,
     ChildProcess,
     CleanupError,
+    ImmediateReadinessProbe,
+    PopenChild,
     RuntimeState,
     RuntimeSupervisor,
     SignalHandlingError,
     SignalPolicy,
+    SubprocessFactory,
 )
 
 
@@ -264,19 +274,58 @@ def test_config_rejects_nonfinite_or_nonpositive_timeouts(
         runtime_config(tmp_path, **{field: value})
 
 
-def test_uppercase_scheme_is_normalized_and_matches_pinned_mitmproxy_parser() -> None:
+def test_oversized_timeout_is_a_runtime_config_error(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeConfigError, match="finite positive"):
+        runtime_config(tmp_path, readiness_timeout_seconds=10**1000)
+
+
+@pytest.mark.parametrize("field", [
+    "retention_max_flows",
+    "retention_max_age_seconds",
+    "max_body_bytes",
+    "max_body_prefix_bytes",
+    "max_pending_messages",
+])
+def test_integer_caps_are_uint64_bounded(tmp_path: Path, field: str) -> None:
+    accepted: dict[str, object] = {field: MAX_UINT64}
+    if field == "max_body_prefix_bytes":
+        accepted["max_body_bytes"] = MAX_UINT64
+    config = runtime_config(tmp_path, **accepted)
+    assert getattr(config, field) == MAX_UINT64
+    rejected = dict(accepted)
+    rejected[field] = MAX_UINT64 + 1
+    with pytest.raises(RuntimeConfigError, match="unsigned 64-bit"):
+        runtime_config(tmp_path, **rejected)
+
+
+def test_zero_body_prefix_is_supported_by_shared_contract(tmp_path: Path) -> None:
+    config = runtime_config(tmp_path, max_body_prefix_bytes=0, max_body_bytes=0)
+    assert config.capture.max_body_prefix_bytes == 0
+    assert config.capture.environment()[CAPTURE_MAX_BODY_PREFIX_ENV] == "0"
+
+
+def test_lowercase_authority_matches_pinned_mitmproxy_parser() -> None:
     from mitmproxy.proxy.mode_specs import ProxyMode
 
     for target in (
-        "HTTPS://api.anthropic.com",
         "http://Example.com:8080",
         "https://127.0.0.1",
         "https://[::1]:8443",
     ):
         config = RuntimeConfig(reverse_upstream=target)
-        assert config.reverse_upstream.startswith(("http://", "https://"))
+        assert config.reverse_upstream == target
         parsed = ProxyMode.parse(f"reverse:{config.reverse_upstream}")
         assert parsed.data == config.reverse_upstream
+
+
+def test_uppercase_scheme_is_rejected_without_repair() -> None:
+    from mitmproxy.proxy.mode_specs import ProxyMode
+
+    target = "HTTPS://api.anthropic.com"
+    with pytest.raises(RuntimeConfigError, match="lowercase"):
+        RuntimeConfig(reverse_upstream=target)
+    with pytest.raises(ValueError):
+        ProxyMode.parse(f"reverse:{target}")
 
 
 @pytest.mark.parametrize(
@@ -285,6 +334,8 @@ def test_uppercase_scheme_is_normalized_and_matches_pinned_mitmproxy_parser() ->
         "https://user@example.com",
         "https://example.com/path",
         "https://example.com?query",
+        "https://example.com?",
+        "https://example.com#",
         "https://example.com:",
     ],
 )
@@ -317,11 +368,13 @@ def test_process_specs_share_exact_ipc_environment_and_packaged_addon(tmp_path: 
         CAPTURE_SOURCE_ID_ENV: "synthetic-source",
         CAPTURE_MAX_BODY_PREFIX_ENV: "1024",
         CAPTURE_MAX_MEMORY_ENV: "4096",
+        CAPTURE_MAX_PENDING_ENV: "4096",
     }
     assert proxy.argv[-2:] == ("-s", str(config.addon_path))
     assert Path(proxy.argv[-1]).is_absolute()
     assert str(config.capture.socket_path) in app.argv
     assert "--capture-source-id" in app.argv
+    assert "--capture-max-pending-messages" in app.argv
     with pytest.raises(TypeError):
         proxy.env[CAPTURE_SOURCE_ID_ENV] = "changed"  # type: ignore[index]
 
@@ -331,6 +384,111 @@ def test_argv_builders_are_direct_vectors(tmp_path: Path) -> None:
     assert build_proxy_argv(config) == config_spec(config, "proxy").argv
     assert build_app_argv(config) == config_spec(config, "app").argv
     assert all(isinstance(argument, str) for argument in build_proxy_argv(config))
+
+
+def test_capture_allocations_are_unique_private_and_cleanable() -> None:
+    capture = CaptureIPCConfig()
+    first = capture.allocate()
+    second = capture.allocate()
+    try:
+        assert first.runtime_dir is not None
+        assert second.runtime_dir is not None
+        assert first.runtime_dir != second.runtime_dir
+        assert first.socket_path.parent == first.runtime_dir
+        assert second.socket_path.parent == second.runtime_dir
+        assert first.runtime_dir.stat().st_mode & 0o777 == 0o700
+        assert second.runtime_dir.stat().st_mode & 0o777 == 0o700
+        validate_private_runtime_dir(first.runtime_dir)
+        validate_private_runtime_dir(second.runtime_dir)
+    finally:
+        assert cleanup_private_runtime_dir(first) == ()
+        assert cleanup_private_runtime_dir(second) == ()
+    assert not first.runtime_dir.exists()
+    assert not second.runtime_dir.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private Unix socket adversary test")
+def test_capture_cleanup_rejects_symlink_and_wrong_mode(tmp_path: Path) -> None:
+    # Keep the Unix socket path below macOS's sockaddr_un limit; the adversary
+    # files themselves can still live under pytest's longer temporary path.
+    capture = CaptureIPCConfig(runtime_base_dir=Path(tempfile.gettempdir()).resolve()).allocate()
+    assert capture.runtime_dir is not None
+    endpoint = capture.socket_path
+    outside = tmp_path / "outside"
+    outside.write_text("must survive")
+    try:
+        endpoint.symlink_to(outside)
+        issues = cleanup_private_runtime_dir(capture)
+        assert issues and "symlink" in issues[0]
+        assert outside.exists()
+        endpoint.unlink()
+        endpoint.write_text("not a socket")
+        issues = cleanup_private_runtime_dir(capture)
+        assert issues and "non-socket" in issues[0]
+        endpoint.unlink()
+        os.chmod(capture.runtime_dir, 0o755)
+        issues = cleanup_private_runtime_dir(capture)
+        assert issues and "mode 0700" in issues[0]
+        os.chmod(capture.runtime_dir, 0o700)
+    finally:
+        if endpoint.is_symlink() or endpoint.exists():
+            endpoint.unlink()
+        assert cleanup_private_runtime_dir(capture) == ()
+
+
+def test_capture_cleanup_removes_a_real_socket_and_refuses_non_socket(tmp_path: Path) -> None:
+    capture = CaptureIPCConfig(runtime_base_dir=Path(tempfile.gettempdir()).resolve()).allocate()
+    assert capture.runtime_dir is not None
+    endpoint = capture.socket_path
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listener.bind(str(endpoint))
+        listener.close()
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.close()
+        assert cleanup_private_runtime_dir(capture) == ()
+    finally:
+        listener.close()
+        if capture.runtime_dir.exists():
+            endpoint.unlink(missing_ok=True)
+            capture.runtime_dir.rmdir()
+
+
+def test_supervisor_uses_one_ephemeral_ipc_endpoint_and_cleans_it(tmp_path: Path) -> None:
+    events: list[str] = []
+    factory = FakeFactory(events, lambda pid, seen: FakeChild(pid, seen, terminate_exits=True))
+    supervisor = fake_supervisor(tmp_path, factory)
+
+    supervisor.start()
+    assert len(factory.specs) == 2
+    proxy_socket = factory.specs[1].env[CAPTURE_SOCKET_ENV]
+    app_socket = factory.specs[0].env[CAPTURE_SOCKET_ENV]
+    runtime_dir = Path(proxy_socket).parent
+    assert proxy_socket == app_socket
+    assert runtime_dir.stat().st_mode & 0o777 == 0o700
+    supervisor.stop()
+    assert not runtime_dir.exists()
+
+
+def test_supervisor_cleans_ephemeral_ipc_after_start_failure(tmp_path: Path) -> None:
+    events: list[str] = []
+
+    class FailsOnProxy(FakeFactory):
+        def spawn(self, spec: ProcessSpec) -> ChildProcess:
+            if len(self.specs) == 1:
+                self.specs.append(spec)
+                raise OSError("synthetic proxy spawn failure")
+            return super().spawn(spec)
+
+    factory = FailsOnProxy(
+        events,
+        lambda pid, seen: FakeChild(pid, seen, terminate_exits=True),
+    )
+    supervisor = fake_supervisor(tmp_path, factory)
+    with pytest.raises(OSError, match="synthetic proxy spawn failure"):
+        supervisor.start()
+    app_socket = factory.specs[0].env[CAPTURE_SOCKET_ENV]
+    assert not Path(app_socket).parent.exists()
 
 
 def config_spec(config: RuntimeConfig, name: str) -> ProcessSpec:
@@ -538,6 +696,71 @@ def test_non_main_thread_requires_explicit_disabled_policy(tmp_path: Path) -> No
     assert supervisor.state is RuntimeState.STOPPED
 
 
+def test_disabled_signal_policy_is_a_true_noop_on_main_thread(tmp_path: Path) -> None:
+    before = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+    factory = FakeFactory([])
+    supervisor = fake_supervisor(
+        tmp_path,
+        factory,
+        signal_policy=SignalPolicy.DISABLED_FOR_TEST,
+    )
+    supervisor.request_stop("test", 0)
+    assert supervisor.run() == 0
+    assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before
+
+
+def test_spawn_oserror_is_not_translated_by_signal_context(tmp_path: Path) -> None:
+    class FailsToSpawn:
+        def spawn(self, spec: ProcessSpec) -> ChildProcess:
+            raise OSError(f"cannot spawn {spec.name}")
+
+    supervisor = RuntimeSupervisor(
+        runtime_config(tmp_path),
+        process_factory=FailsToSpawn(),
+        preflight_checker=lambda _config: None,
+    )
+    with pytest.raises(OSError, match="cannot spawn app"):
+        supervisor.run()
+    assert supervisor.state is RuntimeState.FAILED
+
+
+def test_keyboard_interrupt_during_direct_start_cleans_runtime_lease(tmp_path: Path) -> None:
+    class InterruptFactory:
+        spec: ProcessSpec | None = None
+
+        def spawn(self, spec: ProcessSpec) -> ChildProcess:
+            self.spec = spec
+            raise KeyboardInterrupt
+
+    factory = InterruptFactory()
+    supervisor = RuntimeSupervisor(
+        runtime_config(tmp_path),
+        process_factory=factory,
+        preflight_checker=lambda _config: None,
+        signal_policy=SignalPolicy.DISABLED_FOR_TEST,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        supervisor.start()
+    assert factory.spec is not None
+    assert not Path(factory.spec.env[CAPTURE_SOCKET_ENV]).parent.exists()
+
+
+def test_body_exception_is_not_translated_by_signal_context(tmp_path: Path) -> None:
+    supervisor = fake_supervisor(tmp_path, FakeFactory([]))
+    with pytest.raises(RuntimeError, match="body failure"):
+        with supervisor._signal_handlers():  # type: ignore[attr-defined]
+            raise RuntimeError("body failure")
+
+
+def test_signal_handlers_are_restored_after_shutdown_exception(tmp_path: Path) -> None:
+    before = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+    supervisor = fake_supervisor(tmp_path, FakeFactory([]))
+    with pytest.raises(RuntimeError, match="shutdown body failure"):
+        with supervisor._signal_handlers():  # type: ignore[attr-defined]
+            raise RuntimeError("shutdown body failure")
+    assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before
+
+
 @pytest.mark.parametrize("opener", [browser_returns_false, browser_raises])
 def test_browser_failure_is_nonfatal_but_warning_is_observable(
     tmp_path: Path,
@@ -613,3 +836,75 @@ def test_cli_plan_reports_preflight_and_never_launches(capsys: pytest.CaptureFix
 
     assert main(["run", "--dry-run"]) == 0
     assert "start order: app -> proxy" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group semantics are POSIX-specific")
+def test_real_process_shutdown_reaps_leaders_without_false_kill() -> None:
+    events: list[str] = []
+    specs: list[ProcessSpec] = []
+
+    class RecordingChild:
+        def __init__(self, name: str, child: PopenChild) -> None:
+            self.name = name
+            self.child = child
+
+        @property
+        def pid(self) -> int:
+            return self.child.pid
+
+        @property
+        def process_group_id(self) -> int | None:
+            return self.child.process_group_id
+
+        def poll(self) -> int | None:
+            return self.child.poll()
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self.child.wait(timeout)
+
+        def group_alive(self) -> bool:
+            return self.child.group_alive()
+
+        def terminate(self) -> None:
+            events.append(f"terminate:{self.name}")
+            self.child.terminate()
+
+        def kill(self) -> None:
+            events.append(f"kill:{self.name}")
+            self.child.kill()
+
+    class RealFactory:
+        def spawn(self, spec: ProcessSpec) -> ChildProcess:
+            specs.append(spec)
+            code = (
+                "import signal, time\n"
+                "signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit(0)))\n"
+                "while True: time.sleep(1)\n"
+            )
+            process_spec = ProcessSpec(spec.name, (sys.executable, "-c", code), spec.env)
+            child = SubprocessFactory().spawn(process_spec)
+            assert isinstance(child, PopenChild)
+            return RecordingChild(spec.name, child)
+
+    config = RuntimeConfig(
+        readiness_timeout_seconds=1.0,
+        graceful_shutdown_seconds=0.1,
+        kill_wait_seconds=0.1,
+        poll_interval_seconds=0.01,
+    )
+    supervisor = RuntimeSupervisor(
+        config,
+        process_factory=RealFactory(),
+        readiness_probe=ImmediateReadinessProbe(),
+        preflight_checker=lambda _config: None,
+        signal_policy=SignalPolicy.DISABLED_FOR_TEST,
+    )
+    started = time.monotonic()
+    supervisor.start()
+    supervisor.stop()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0
+    assert events == ["terminate:proxy", "terminate:app"]
+    assert supervisor.state is RuntimeState.STOPPED
+    assert specs[0].env[CAPTURE_SOCKET_ENV] == specs[1].env[CAPTURE_SOCKET_ENV]

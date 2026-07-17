@@ -17,30 +17,39 @@ from the checkout working directory:
 - reverse upstream: `https://api.anthropic.com`
 - retention: 2,000 completed flows or 30 minutes
 - body budget: 128 MiB globally, with a 1 MiB captured prefix per side
+- pending-message budget: 4,096 queued capture messages
 
 Both app and proxy hosts must be loopback addresses. Ports must be distinct
 and in the TCP range 1–65535. The reverse target accepts the pinned
-mitmdump 12.2.3 authority grammar only: lowercase-normalized `http`/`https`,
-hostname or IP, optional port 1–65535, no credentials, path, query, fragment,
-or empty port.
+mitmdump 12.2.3 authority grammar only: lowercase `http`/`https` (uppercase
+schemes are rejected, never repaired), hostname or IP, optional port 1–65535,
+no credentials, path, query, fragment, or empty port.
 
 Live startup preflights both executable files, executable permissions, the
-addon file, and the capture socket's parent directory before spawning a child.
+addon file, and the writable runtime base directory before spawning a child;
+the private per-run directory is then allocated and validated before the first
+child starts.
 `plan` and `run --dry-run` do not fail just because a path is absent; they
 include a `preflight` report listing every issue.
 
 ## Shared capture IPC contract
 
-`CaptureIPCConfig` is the durable seam shared by proxy and future app. On
-POSIX its default is an absolute Unix-socket path under the system temporary
-directory. The same explicit environment overlay is attached to both
+`CaptureIPCConfig` is the durable seam shared by proxy and future app. Every
+live run allocates a collision-resistant private directory under the system
+temporary directory with mode `0700`; its endpoint is
+`<run-directory>/capture.sock`. Existing directories/endpoints are checked
+with `lstat` (including ownership, mode, type, and symlink rejection) before
+use. The socket and directory are removed after both children stop, including
+failure paths; unexpected files or adversarial replacements fail closed.
+The same explicit five-variable environment overlay is attached to both
 `ProcessSpec` values:
 
 ```text
-MITM_INSPECTOR_CAPTURE_SOCKET=/absolute/path/to/mitm-inspector.sock
+MITM_INSPECTOR_CAPTURE_SOCKET=/absolute/path/to/<run-directory>/capture.sock
 MITM_INSPECTOR_SOURCE_ID=mitm-inspector
 MITM_INSPECTOR_MAX_BODY_PREFIX_BYTES=1048576
 MITM_INSPECTOR_MAX_IN_MEMORY_BYTES=134217728
+MITM_INSPECTOR_MAX_PENDING_MESSAGES=4096
 ```
 
 The future app argv additionally has these reserved names for B3:
@@ -50,6 +59,7 @@ The future app argv additionally has these reserved names for B3:
 --capture-source-id <source id>
 --capture-max-body-prefix-bytes <bytes>
 --capture-max-in-memory-bytes <bytes>
+--capture-max-pending-messages <count>
 ```
 
 Stock mitmdump receives the shared values through the environment because
