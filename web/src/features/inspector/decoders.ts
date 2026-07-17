@@ -1,7 +1,20 @@
+import { MAX_INGEST_BODY_PREFIX_BYTES } from "../../contracts/limits";
 import type { BodyDescriptor } from "../../protocol";
 import type { BodyViewMode, InspectableBody } from "./models";
 
-export const DEFAULT_BODY_LIMIT = 64 * 1024;
+/**
+ * Decode ceiling equals the backend wire ceiling — the biggest body the
+ * ingest listener will ever accept. Bodies smaller than this are surfaced
+ * whole; larger ones cannot exist on the wire, so no additional client-side
+ * clamp is meaningful. F5 shipped a 64 KiB cap that quietly truncated most
+ * captured API responses; F6 uncaps it (Henry: "let's not cap anything").
+ */
+export const DEFAULT_BODY_LIMIT = MAX_INGEST_BODY_PREFIX_BYTES;
+/**
+ * Hex mode still shows a bounded prefix by default because the raw hex+ascii
+ * grid is a scan surface, not a stream reader. Callers can pass a larger
+ * limit up to DEFAULT_BODY_LIMIT for a deeper dump.
+ */
 export const DEFAULT_HEX_LIMIT = 4 * 1024;
 
 export interface Base64DecodeResult {
@@ -61,7 +74,7 @@ function toHex(bytes: Uint8Array): string {
 
 export function decodeBase64Bounded(value: string, limit = DEFAULT_BODY_LIMIT): Base64DecodeResult {
   if (!Number.isSafeInteger(limit) || limit < 0) throw new RangeError("limit must be a non-negative safe integer");
-  const boundedLimit = Math.min(limit, DEFAULT_BODY_LIMIT);
+  const boundedLimit = limit;
   const inputLimit = Math.ceil(boundedLimit / 3) * 4;
   const inputWasTruncated = value.length > inputLimit;
   const boundedValue = inputWasTruncated ? value.slice(0, inputLimit) : value;

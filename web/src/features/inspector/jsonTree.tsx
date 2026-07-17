@@ -41,7 +41,17 @@ interface JsonNodeProps {
   depth: number;
   keyLabel?: string;
   trailingComma?: boolean;
+  forceCollapsed?: boolean;
 }
+
+/**
+ * Threshold above which the tree root defaults to collapsed regardless of
+ * shape. Uncapped body prefixes (see decoders.DEFAULT_BODY_LIMIT) can be
+ * multi-megabyte; mounting every node up-front on a 2 MiB payload freezes
+ * the DOM for hundreds of ms. Collapse-first keeps the initial render cheap
+ * — the user opens the branches they care about.
+ */
+export const LARGE_TREE_COLLAPSE_THRESHOLD = 256 * 1024;
 
 function JsonScalar({ value }: { value: JsonValue }) {
   if (value === null) return <span className="json-null">null</span>;
@@ -68,10 +78,10 @@ function escapeJsonString(value: string): string {
   });
 }
 
-function JsonNode({ value, depth, keyLabel, trailingComma }: JsonNodeProps) {
+function JsonNode({ value, depth, keyLabel, trailingComma, forceCollapsed }: JsonNodeProps) {
   const isObject = value !== null && typeof value === "object";
   const isArray = Array.isArray(value);
-  const [collapsed, setCollapsed] = useState<boolean>(() => isObject ? shouldStartCollapsed(value, depth) : false);
+  const [collapsed, setCollapsed] = useState<boolean>(() => isObject ? (forceCollapsed === true ? true : shouldStartCollapsed(value, depth)) : false);
 
   const prefix = keyLabel !== undefined
     ? <span className="json-key">&quot;{escapeJsonString(keyLabel)}&quot;</span>
@@ -146,10 +156,10 @@ function JsonNode({ value, depth, keyLabel, trailingComma }: JsonNodeProps) {
   );
 }
 
-export function JsonTree({ value }: { value: JsonValue }) {
+export function JsonTree({ value, startCollapsed = false }: { value: JsonValue; startCollapsed?: boolean }) {
   return (
     <div className="json-tree" role="tree" aria-label="JSON body">
-      <JsonNode value={value} depth={0} />
+      <JsonNode value={value} depth={0} forceCollapsed={startCollapsed} />
     </div>
   );
 }

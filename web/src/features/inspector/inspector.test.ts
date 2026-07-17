@@ -4,6 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
 import type { FlowLifecycle } from "../../protocol";
+import { MAX_INGEST_BODY_PREFIX_BYTES } from "../../contracts/limits";
 import * as decoderModule from "./decoders";
 import { bodyFocusTarget, InspectorBodyPanel, isBodySelectionAuthorized, nextBodyTabIndex, PairedInspector } from "./PairedInspector";
 import { bodyMetadata, decodeBase64Bounded, decodeBody, decodeUtf8, gateBodyDecode, hexDump, parseSseEvents } from "./decoders";
@@ -20,12 +21,29 @@ describe("bounded body decoding", () => {
     expect(result.invalid).toBe(false);
   });
 
-  it("bounds multi-megabyte valid base64 before validation and decoding", () => {
-    const multiMegabyte = Buffer.alloc(8 * 1024 * 1024, 0x78).toString("base64");
-    expect(() => decodeBase64Bounded(multiMegabyte)).not.toThrow();
-    const result = decodeBase64Bounded(multiMegabyte);
-    expect(result.bytes.byteLength).toBe(64 * 1024);
-    expect(result.truncated).toBe(true);
+  it("decodes multi-megabyte valid base64 up to the wire ceiling", () => {
+    // F5 clamped output to 64 KiB unconditionally; F6 raises the cap to the
+    // full wire ceiling (~3 MiB) so real captures render whole.
+    const halfMegabyte = Buffer.alloc(512 * 1024, 0x78).toString("base64");
+    const result = decodeBase64Bounded(halfMegabyte);
+    expect(result.bytes.byteLength).toBe(512 * 1024);
+    expect(result.truncated).toBe(false);
+    expect(result.invalid).toBe(false);
+    // Two-megabyte payload still fits under the ceiling.
+    const twoMegabytes = Buffer.alloc(2 * 1024 * 1024, 0x78).toString("base64");
+    const bigger = decodeBase64Bounded(twoMegabytes);
+    expect(bigger.bytes.byteLength).toBe(2 * 1024 * 1024);
+    expect(bigger.truncated).toBe(false);
+  });
+
+  it("truncates only when the input exceeds the wire ceiling itself", () => {
+    // The wire ceiling is ~3 MiB. A caller can pass a small explicit limit
+    // and observe the truncation flag; passing the default limit means
+    // anything smaller than the ceiling comes back untouched.
+    const bounded = decodeBase64Bounded(Buffer.alloc(4096, 0x41).toString("base64"), 64);
+    expect(bounded.bytes.byteLength).toBe(64);
+    expect(bounded.truncated).toBe(true);
+    expect(decoderModule.DEFAULT_BODY_LIMIT).toBe(MAX_INGEST_BODY_PREFIX_BYTES);
   });
 
   it("rejects malformed base64 and falls back for invalid UTF-8", () => {
@@ -69,7 +87,9 @@ describe("bounded body decoding", () => {
     expect(bounded.truncated).toBe(true);
   });
 
-  it("does not decode a body until the pane is explicitly selected", () => {
+  it("keeps the F5 gate helper callable for callers that opt into gating", () => {
+    // The gate is dormant inside the F6 inspector but the helper is still
+    // exported so external callers (fixtures, tools) can consume it.
     const body = { state: "captured" as const, size_bytes: "5", encoding: "base64" as const, data: encoded("hello") };
     const gated = gateBodyDecode(body, false, "text");
     expect(gated.selected).toBe(false);
@@ -113,21 +133,21 @@ describe("SSE framing", () => {
   });
 
   it("strips exactly one leading BOM in the SSE parser", () => {
-    expect(parseSseEvents("\uFEFFdata: hello\n\n")).toEqual([expect.objectContaining({ data: "hello" })]);
-    expect(parseSseEvents("\uFEFF\uFEFFdata: hello\n\n")).toEqual([]);
+    expect(parseSseEvents("﻿data: hello\n\n")).toEqual([expect.objectContaining({ data: "hello" })]);
+    expect(parseSseEvents("﻿﻿data: hello\n\n")).toEqual([]);
   });
 
   it("keeps the byte decoder BOM for the parser and strips only one in decodeBody", () => {
-    expect(decodeUtf8(new Uint8Array([0xef, 0xbb, 0xbf, 0x78]), true).text).toBe("\uFEFFx");
-    const oneBom = decodeBody({ state: "captured", size_bytes: "12", encoding: "base64", data: encoded("\uFEFFdata: hello\n\n") }, "sse");
+    expect(decodeUtf8(new Uint8Array([0xef, 0xbb, 0xbf, 0x78]), true).text).toBe("﻿x");
+    const oneBom = decodeBody({ state: "captured", size_bytes: "12", encoding: "base64", data: encoded("﻿data: hello\n\n") }, "sse");
     expect(oneBom.events?.map((event) => event.data)).toEqual(["hello"]);
 
-    const twoBoms = decodeBody({ state: "captured", size_bytes: "13", encoding: "base64", data: encoded("\uFEFF\uFEFFdata: hello\n\n") }, "sse");
+    const twoBoms = decodeBody({ state: "captured", size_bytes: "13", encoding: "base64", data: encoded("﻿﻿data: hello\n\n") }, "sse");
     expect(twoBoms.events).toEqual([]);
     // Rejects hint at raw text so garbage frames stay legible; the caller
     // routes through the plain-text fallback rather than a stub message.
     expect(twoBoms.fallback).toBe("text");
-    expect(twoBoms.text).toBe("\uFEFF\uFEFFdata: hello\n\n");
+    expect(twoBoms.text).toBe("﻿﻿data: hello\n\n");
   });
 
   it("preserves the truncated trailing frame in text, copyText, and the parsed suffix", () => {
@@ -229,21 +249,26 @@ describe("PairedInspector rendering and interaction contracts", () => {
     expect(thirtyThree).toContain("Showing the newest 32 events");
   });
 
-  it("renders the initial flow with metadata and gated body content", () => {
+  it("renders the body inline (no gate) with metadata and safely escaped content", () => {
+    const decodeSpy = vi.spyOn(decoderModule, "decodeBody");
     const markup = renderToStaticMarkup(createElement(PairedInspector, { flow }));
-    expect(markup).toContain("Body decoding is paused");
-    expect(markup).not.toContain(">hello<");
+    // F6 removes the "Body decoding is paused" gate. The body decodes and
+    // renders on the initial mount so the reader sees the payload without
+    // an extra click.
+    expect(markup).not.toContain("Body decoding is paused");
+    expect(markup).toContain(">hello</pre>");
+    expect(decodeSpy).toHaveBeenCalledWith(capturedBody, "text");
     expect(markup).toContain("x-trace");
     expect(markup).toContain("[REDACTED]");
     expect(markup).toContain("empty value");
+    // Route metadata still round-trips through React escaping.
     expect(markup).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
     expect(markup).not.toContain("<script>alert(1)</script>");
+    decodeSpy.mockRestore();
   });
 
   it("renders selected body output through the component and exposes complete body tabs", () => {
-    const decodeSpy = vi.spyOn(decoderModule, "decodeBody");
-    const markup = renderToStaticMarkup(createElement(PairedInspector, { flow, bodySelection: { flowId: "flow-a", pane: "request" } }));
-    expect(decodeSpy).toHaveBeenCalledWith(capturedBody, "text");
+    const markup = renderToStaticMarkup(createElement(PairedInspector, { flow }));
     expect(markup).toContain(">hello</pre>");
     expect(markup).toContain('role="tablist"');
     expect(markup).toContain('aria-orientation="horizontal"');
@@ -251,32 +276,56 @@ describe("PairedInspector rendering and interaction contracts", () => {
     expect(markup).toContain('aria-controls=');
     expect(markup).toContain('tabindex="0"');
     expect(markup).toContain('tabindex="-1"');
-    decodeSpy.mockRestore();
   });
 
-  it("gates synchronously when the flow ID changes under a stale selection", () => {
-    const nextFlow: InspectorFlow = { ...flow, metadata: { ...flow.metadata, flow_id: "flow-b" } };
-    const markup = renderToStaticMarkup(createElement(PairedInspector, { flow: nextFlow, bodySelection: { flowId: "flow-a", pane: "request" } }));
-    expect(markup).toContain("Body decoding is paused");
-    expect(markup).not.toContain(">hello</pre>");
+  it("renders the JSON tree by default when the response is JSON", () => {
+    const jsonFlow: InspectorFlow = {
+      metadata: {
+        flow_id: "json-flow",
+        method: "POST",
+        scheme: "https",
+        host: "api.example.test",
+        port: "443",
+        path: "/v1/echo",
+        request_headers: [],
+        request_body: {
+          state: "captured",
+          size_bytes: String(encoded('{"n":1}').length),
+          encoding: "base64",
+          data: encoded('{"n":1}'),
+          content_type: "application/json",
+        },
+      },
+    };
+    const markup = renderToStaticMarkup(createElement(PairedInspector, { flow: jsonFlow }));
+    // Default view for a JSON body is the tree, not the raw pre. The tree
+    // wrapper announces itself with role=tree; the raw pre never mounts.
+    expect(markup).toContain('class="json-tree"');
+    expect(markup).toContain('role="tree"');
+    expect(markup).not.toMatch(/<pre[^>]*aria-label="json body output"/i);
   });
 
   it("keeps redacted, empty, and missing states explicit in rendered body panels", () => {
     for (const body of [{ state: "redacted" as const }, { state: "empty" as const, size_bytes: "0" as const }, { state: "missing" as const }]) {
-      const markup = renderToStaticMarkup(createElement(InspectorBodyPanel, { body, pane: "response", selected: false, onSelect: () => undefined }));
+      const markup = renderToStaticMarkup(createElement(InspectorBodyPanel, { body, pane: "response" }));
       expect(markup).toMatch(/is-(redacted|empty|missing)/);
     }
   });
 
-  it("authorizes selection by both current flow ID and body pane", () => {
+  it("keeps the F5 helper exports around for external callers", () => {
+    // The gating helpers are dormant inside the F6 inspector but stay
+    // exported so external tooling that reused them keeps compiling.
     const selection = { flowId: "flow-a", pane: "request" as const };
     expect(isBodySelectionAuthorized(selection, "flow-a", "request")).toBe(true);
     expect(isBodySelectionAuthorized(selection, "flow-b", "request")).toBe(false);
     expect(isBodySelectionAuthorized(selection, "flow-a", "response")).toBe(false);
     expect(isBodySelectionAuthorized(null, "flow-a", "request")).toBe(false);
+    expect(bodyFocusTarget(false, true)).toBe("active-tab");
+    expect(bodyFocusTarget(true, false)).toBe("inspect-control");
+    expect(bodyFocusTarget(false, false)).toBeUndefined();
   });
 
-  it("uses horizontal roving-tab keyboard behavior and deterministic focus recovery", () => {
+  it("uses horizontal roving-tab keyboard behavior", () => {
     expect(nextBodyTabIndex(0, "ArrowRight", 4)).toBe(1);
     expect(nextBodyTabIndex(0, "ArrowLeft", 4)).toBe(3);
     expect(nextBodyTabIndex(0, "ArrowDown", 4)).toBeUndefined();
@@ -284,8 +333,5 @@ describe("PairedInspector rendering and interaction contracts", () => {
     expect(nextBodyTabIndex(1, "End", 4)).toBe(3);
     expect(nextBodyTabIndex(0, "ArrowDown", 4, "vertical")).toBe(1);
     expect(nextBodyTabIndex(0, "ArrowRight", 4, "vertical")).toBeUndefined();
-    expect(bodyFocusTarget(false, true)).toBe("active-tab");
-    expect(bodyFocusTarget(true, false)).toBe("inspect-control");
-    expect(bodyFocusTarget(false, false)).toBeUndefined();
   });
 });

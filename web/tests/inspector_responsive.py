@@ -121,26 +121,41 @@ def check_width(page: Page, width: int) -> None:
         """
         () => {
           const inspector = document.querySelector('[data-testid="paired-inspector"]');
-          const layout = inspector?.querySelector('.inspector-pane-layout');
+          const inspectorSide = document.querySelector('.flow-inspector-side');
+          const grid = document.querySelector('.flow-grid');
+          const flowMain = document.querySelector('.flow-main');
           const row = document.querySelector('.flow-grid-row');
-          if (!inspector || !layout || !row) throw new Error('responsive fixture did not mount');
+          if (!inspector || !inspectorSide || !grid || !flowMain || !row) {
+            throw new Error('responsive fixture did not mount');
+          }
+          const rect = (el) => el.getBoundingClientRect();
           return {
-            inspectorLeft: inspector.getBoundingClientRect().left,
-            inspectorWidth: inspector.getBoundingClientRect().width,
-            inspectorRight: inspector.getBoundingClientRect().right,
+            inspectorLeft: rect(inspector).left,
+            inspectorRight: rect(inspector).right,
+            inspectorTop: rect(inspector).top,
             inspectorScrollWidth: inspector.scrollWidth,
-            inspectorScrollRight: inspector.getBoundingClientRect().left + inspector.scrollWidth,
-            layoutRight: layout.getBoundingClientRect().right,
+            inspectorScrollRight: rect(inspector).left + inspector.scrollWidth,
+            inspectorSideLeft: rect(inspectorSide).left,
+            gridRight: rect(grid).right,
+            gridBottom: rect(grid).bottom,
+            flowMainDirection: getComputedStyle(flowMain).flexDirection,
             viewportWidth: window.innerWidth,
-            rowHeight: row.getBoundingClientRect().height,
+            rowHeight: rect(row).height,
           };
         }
         """
     )
     assert result["inspectorRight"] <= result["viewportWidth"], result
-    assert result["layoutRight"] <= result["viewportWidth"], result
     assert result["inspectorScrollRight"] <= result["viewportWidth"], result
     assert result["rowHeight"] == 28, result
+    if width >= 1024:
+        # Wide: inspector docks to the RIGHT of the grid, flow-main is a row.
+        assert result["flowMainDirection"] == "row", result
+        assert result["inspectorSideLeft"] >= result["gridRight"] - 1, result
+    else:
+        # Narrow: layout stacks, inspector sits below the grid.
+        assert result["flowMainDirection"] == "column", result
+        assert result["inspectorTop"] >= result["gridBottom"] - 1, result
     print(width, result)
 
 
