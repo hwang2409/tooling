@@ -1,16 +1,26 @@
 """Runtime configuration, command composition, and process lifecycle boundary."""
 
 from mitm_inspector.runtime.commands import (
+    ProcessSpec,
     build_app_argv,
     build_app_server_argv,
+    build_app_spec,
     build_mitmdump_argv,
     build_proxy_argv,
+    build_proxy_spec,
 )
-from mitm_inspector.runtime.config import RuntimeConfig, RuntimeConfigError
+from mitm_inspector.runtime.config import (
+    CaptureIPCConfig,
+    RuntimeConfig,
+    RuntimeConfigError,
+    RuntimePreflightError,
+)
 from mitm_inspector.runtime.supervisor import (
     BrowserOpener,
+    ChildCleanupFailure,
     ChildExitedError,
     ChildProcess,
+    CleanupError,
     ImmediateReadinessProbe,
     PopenChild,
     ProcessFactory,
@@ -18,25 +28,38 @@ from mitm_inspector.runtime.supervisor import (
     RuntimeState,
     RuntimeSupervisor,
     RuntimeSupervisorError,
+    SignalHandlingError,
+    SignalPolicy,
     SubprocessFactory,
+    WarningSink,
 )
 
 __all__ = [
     "BrowserOpener",
+    "CaptureIPCConfig",
+    "ChildCleanupFailure",
     "ChildExitedError",
     "ChildProcess",
+    "CleanupError",
     "ImmediateReadinessProbe",
     "PopenChild",
+    "ProcessSpec",
     "ProcessFactory",
     "ReadinessProbe",
     "RuntimeConfig",
     "RuntimeConfigError",
+    "RuntimePreflightError",
     "RuntimeState",
     "RuntimeSupervisor",
     "RuntimeSupervisorError",
+    "SignalHandlingError",
+    "SignalPolicy",
     "SubprocessFactory",
+    "WarningSink",
     "build_app_argv",
     "build_app_server_argv",
+    "build_app_spec",
     "build_mitmdump_argv",
     "build_proxy_argv",
+    "build_proxy_spec",
 ]

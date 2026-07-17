@@ -10,7 +10,15 @@ from typing import cast
 
 from mitm_inspector import __version__
 from mitm_inspector.runtime.commands import build_app_argv, build_proxy_argv
-from mitm_inspector.runtime.config import RuntimeConfig, RuntimeConfigError
+from mitm_inspector.runtime.config import (
+    DEFAULT_ADDON_PATH,
+    DEFAULT_APP_EXECUTABLE,
+    DEFAULT_MITMDUMP_EXECUTABLE,
+    CaptureIPCConfig,
+    RuntimeConfig,
+    RuntimeConfigError,
+    preflight_issues,
+)
 
 
 def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
@@ -23,13 +31,15 @@ def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--retention-max-age-seconds", type=int, default=1_800)
     parser.add_argument("--max-body-bytes", type=int, default=128 * 1024 * 1024)
     parser.add_argument("--max-body-prefix-bytes", type=int, default=1024 * 1024)
-    parser.add_argument("--mitmdump-executable", type=Path, default=Path("mitmdump"))
-    parser.add_argument("--app-executable", type=Path, default=Path("python"))
+    parser.add_argument("--mitmdump-executable", type=Path, default=DEFAULT_MITMDUMP_EXECUTABLE)
+    parser.add_argument("--app-executable", type=Path, default=DEFAULT_APP_EXECUTABLE)
     parser.add_argument(
         "--addon-path",
         type=Path,
-        default=Path("src/mitm_inspector/capture/addon.py"),
+        default=DEFAULT_ADDON_PATH,
     )
+    parser.add_argument("--capture-socket", type=Path, default=None)
+    parser.add_argument("--source-id", default="mitm-inspector")
     parser.add_argument(
         "--open-browser",
         action=argparse.BooleanOptionalAction,
@@ -51,19 +61,32 @@ def _config_from_args(args: argparse.Namespace) -> RuntimeConfig:
         max_body_prefix_bytes=args.max_body_prefix_bytes,
         mitmdump_executable=args.mitmdump_executable,
         app_executable=args.app_executable,
+        addon_path=args.addon_path,
+        capture_ipc=CaptureIPCConfig(
+            socket_path=args.capture_socket or CaptureIPCConfig().socket_path,
+            source_id=args.source_id,
+            max_body_prefix_bytes=args.max_body_prefix_bytes,
+            max_in_memory_bytes=args.max_body_bytes,
+        ),
         open_browser=args.open_browser,
     )
 
 
 def _plan(config: RuntimeConfig, addon_path: Path) -> dict[str, object]:
     host = f"[{config.app_host}]" if ":" in config.app_host else config.app_host
+    issues = preflight_issues(config)
     return {
         "app": list(build_app_argv(config)),
         "proxy": list(build_proxy_argv(config, addon_path)),
+        "shared_env": config.capture.environment(),
         "app_url": f"http://{host}:{config.app_port}/",
         "open_browser": config.open_browser,
         "start_order": ["app", "proxy"],
         "stop_order": ["proxy", "app"],
+        "preflight": {
+            "ok": not issues,
+            "issues": list(issues),
+        },
     }
 
 
@@ -75,12 +98,17 @@ def _print_plan(plan: dict[str, object], as_json: bool) -> None:
     proxy_argv = cast(list[str], plan["proxy"])
     start_order = cast(list[str], plan["start_order"])
     stop_order = cast(list[str], plan["stop_order"])
+    shared_env = cast(dict[str, str], plan["shared_env"])
     print("app:", " ".join(app_argv))
     print("proxy:", " ".join(proxy_argv))
     print("app URL:", plan["app_url"])
     print("start order:", " -> ".join(start_order))
     print("stop order:", " -> ".join(stop_order))
+    print("shared env:", "; ".join(f"{key}={value}" for key, value in shared_env.items()))
     print("browser:", "enabled" if plan["open_browser"] else "disabled")
+    preflight = cast(dict[str, object], plan["preflight"])
+    issues = cast(list[str], preflight["issues"])
+    print("preflight:", "ok" if preflight["ok"] else "; ".join(issues))
 
 
 def _parser() -> argparse.ArgumentParser:

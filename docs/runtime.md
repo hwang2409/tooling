@@ -4,22 +4,58 @@ The runtime owns local process topology and command composition. It does not
 import mitmproxy internals, retain `Flow` objects, open a listener itself, or
 make the future API server part of S0.
 
-## Configuration
+## Configuration and preflight
 
-`RuntimeConfig` is frozen and validates its values at construction time. The
-defaults are intentionally local and bounded:
+`RuntimeConfig` and `CaptureIPCConfig` are frozen. Defaults are relocatable
+from the checkout working directory:
 
+- app executable: `sys.executable`
+- proxy executable: the sibling `mitmdump` beside that interpreter
+- addon: the absolute package-relative `src/mitm_inspector/capture/addon.py`
 - app: `127.0.0.1:8000`
 - proxy: `127.0.0.1:8080`
 - reverse upstream: `https://api.anthropic.com`
 - retention: 2,000 completed flows or 30 minutes
 - body budget: 128 MiB globally, with a 1 MiB captured prefix per side
 
-Both app and proxy hosts must be loopback addresses (`localhost`, `127.0.0.1`,
-or `::1`/another literal loopback address). Ports must be distinct and in the
-TCP range 1–65535. Reverse upstreams must be absolute HTTP(S) URLs without
-credentials, queries, or fragments. These checks fail closed before any child
-can be spawned.
+Both app and proxy hosts must be loopback addresses. Ports must be distinct
+and in the TCP range 1–65535. The reverse target accepts the pinned
+mitmdump 12.2.3 authority grammar only: lowercase-normalized `http`/`https`,
+hostname or IP, optional port 1–65535, no credentials, path, query, fragment,
+or empty port.
+
+Live startup preflights both executable files, executable permissions, the
+addon file, and the capture socket's parent directory before spawning a child.
+`plan` and `run --dry-run` do not fail just because a path is absent; they
+include a `preflight` report listing every issue.
+
+## Shared capture IPC contract
+
+`CaptureIPCConfig` is the durable seam shared by proxy and future app. On
+POSIX its default is an absolute Unix-socket path under the system temporary
+directory. The same explicit environment overlay is attached to both
+`ProcessSpec` values:
+
+```text
+MITM_INSPECTOR_CAPTURE_SOCKET=/absolute/path/to/mitm-inspector.sock
+MITM_INSPECTOR_SOURCE_ID=mitm-inspector
+MITM_INSPECTOR_MAX_BODY_PREFIX_BYTES=1048576
+MITM_INSPECTOR_MAX_IN_MEMORY_BYTES=134217728
+```
+
+The future app argv additionally has these reserved names for B3:
+
+```text
+--capture-socket <absolute path>
+--capture-source-id <source id>
+--capture-max-body-prefix-bytes <bytes>
+--capture-max-in-memory-bytes <bytes>
+```
+
+Stock mitmdump receives the shared values through the environment because
+project-specific flags cannot be added to its parser before the `-s` addon is
+loaded. B2's addon can consume the exact environment names and remain
+loadable through the ordinary `-s <absolute addon path>` argument.
 
 ## Planning before B3
 
@@ -31,31 +67,37 @@ mitm-inspector plan \
   --app-port 8000
 ```
 
-It prints the eventual two argv vectors and their lifecycle order. The
-equivalent dry-run is `mitm-inspector run --dry-run`; neither command starts a
-proxy, app server, listener, browser, or shell. The existing `--version`
-entrypoint remains available. A live `run` intentionally exits with an
-explanation until B3 provides the app server.
+It prints the eventual argv vectors, IPC contract, preflight report, and
+lifecycle order. The equivalent dry-run is `mitm-inspector run --dry-run`;
+neither command starts a proxy, app server, listener, browser, or shell. A
+live `run` intentionally exits with an explanation until B3 provides the app
+server.
 
 The planned commands are equivalent to:
 
 ```text
-python -m mitm_inspector.api.server --host 127.0.0.1 --port 8000 --proxy-port 8080 ...
-mitmdump --mode reverse:https://api.anthropic.com --listen-host 127.0.0.1 --listen-port 8080 -s src/mitm_inspector/capture/addon.py
+<sys.executable> -m mitm_inspector.api.server --host 127.0.0.1 --port 8000 --proxy-port 8080 ...
+<sibling>/mitmdump --mode reverse:https://api.anthropic.com --listen-host 127.0.0.1 --listen-port 8080 -s <absolute addon path>
 ```
 
-The first child is started and made ready before the proxy child is spawned.
-On shutdown, the proxy is asked to stop before the app. Each child receives a
-bounded graceful shutdown request; still-running children are killed and
-then waited on for up to a second for reaping. Unexpected child exit is
-propagated as a `ChildExitedError` after the sibling is cleaned up. SIGINT, SIGTERM, and
-`KeyboardInterrupt` all use the same idempotent cleanup path.
+The app child is started and made ready before the proxy child. On shutdown,
+the proxy is terminated, fully waited/killed and group-verified before the app
+is touched. Cleanup always attempts both children and aggregates exceptions.
+A surviving process group after the kill deadline leaves the supervisor in
+`FAILED` and raises `CleanupError`; it is never reported as successful
+`STOPPED` cleanup.
+
+SIGINT and SIGTERM handlers are installed before either child starts and are
+removed only after cleanup. They map to exit statuses 130 and 143. A
+`KeyboardInterrupt` maps to 130. Running the supervisor off the main thread
+requires the explicit `SignalPolicy.DISABLED_FOR_TEST` injection; otherwise it
+fails before startup.
 
 Readiness is an injected seam. S0's default probe only detects an immediate
 child exit; B3 can provide a health/readiness probe without changing the
 supervisor or its tests. Process creation is also injected, and production
-creation always receives a list of argv strings with `shell=False`.
+creation always receives a `ProcessSpec` with direct argv and `shell=False`.
 
-The browser is opened only when `open_browser` is explicitly enabled and both
-children have passed readiness. Tests inject the browser opener, so test runs
-never open a browser or start real processes.
+The browser is convenience-only. It is disabled by default; a false return or
+exception from an explicitly enabled opener is nonfatal and sent to the
+injected warning sink (the default emits a Python runtime warning).

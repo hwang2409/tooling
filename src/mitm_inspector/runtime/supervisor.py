@@ -7,16 +7,16 @@ import signal
 import subprocess
 import threading
 import time
+import warnings
 import webbrowser
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from enum import StrEnum
-from pathlib import Path
 from types import FrameType
 from typing import Any, Protocol
 
-from mitm_inspector.runtime.commands import build_app_argv, build_proxy_argv
-from mitm_inspector.runtime.config import RuntimeConfig
+from mitm_inspector.runtime.commands import ProcessSpec, build_app_spec, build_proxy_spec
+from mitm_inspector.runtime.config import RuntimeConfig, validate_preflight
 
 
 class RuntimeState(StrEnum):
@@ -30,8 +30,17 @@ class RuntimeState(StrEnum):
     FAILED = "failed"
 
 
+class SignalPolicy(StrEnum):
+    REQUIRE_MAIN_THREAD = "require_main_thread"
+    DISABLED_FOR_TEST = "disabled_for_test"
+
+
 class RuntimeSupervisorError(RuntimeError):
     """Base error for runtime lifecycle failures."""
+
+
+class SignalHandlingError(RuntimeSupervisorError):
+    """Raised when signals cannot be installed under the selected policy."""
 
 
 class ChildExitedError(RuntimeSupervisorError):
@@ -43,13 +52,38 @@ class ChildExitedError(RuntimeSupervisorError):
         super().__init__(f"{component} exited with status {returncode}")
 
 
+class ChildCleanupFailure(RuntimeSupervisorError):
+    def __init__(self, component: str, errors: tuple[str, ...], group_survived: bool) -> None:
+        self.component = component
+        self.errors = errors
+        self.group_survived = group_survived
+        super().__init__(f"{component} cleanup failed: {', '.join(errors)}")
+
+
+class CleanupError(RuntimeSupervisorError):
+    """One or more children could not be fully stopped and reaped."""
+
+    def __init__(self, failures: tuple[ChildCleanupFailure, ...]) -> None:
+        self.failures = failures
+        details = "; ".join(
+            f"{failure.component}: {', '.join(failure.errors)}"
+            for failure in failures
+        )
+        super().__init__(f"runtime cleanup failed: {details}")
+
+
 class ChildProcess(Protocol):
     @property
     def pid(self) -> int: ...
 
+    @property
+    def process_group_id(self) -> int | None: ...
+
     def poll(self) -> int | None: ...
 
     def wait(self, timeout: float | None = None) -> int: ...
+
+    def group_alive(self) -> bool: ...
 
     def terminate(self) -> None: ...
 
@@ -57,7 +91,7 @@ class ChildProcess(Protocol):
 
 
 class ProcessFactory(Protocol):
-    def spawn(self, argv: Sequence[str]) -> ChildProcess: ...
+    def spawn(self, spec: ProcessSpec) -> ChildProcess: ...
 
 
 class ReadinessProbe(Protocol):
@@ -69,19 +103,34 @@ class ReadinessProbe(Protocol):
     ) -> None: ...
 
 
+class WarningSink(Protocol):
+    def __call__(self, message: str) -> None: ...
+
+
 class BrowserOpener(Protocol):
     def __call__(self, url: str) -> bool: ...
 
 
 class PopenChild:
-    """Child process wrapper that owns a separate process group where supported."""
+    """Child wrapper retaining process-group identity after leader exit."""
 
     def __init__(self, process: subprocess.Popen[bytes]) -> None:
         self._process = process
+        if os.name == "posix":
+            try:
+                self._process_group_id: int | None = os.getpgid(process.pid)
+            except ProcessLookupError:
+                self._process_group_id = process.pid
+        else:
+            self._process_group_id = None
 
     @property
     def pid(self) -> int:
         return self._process.pid
+
+    @property
+    def process_group_id(self) -> int | None:
+        return self._process_group_id
 
     def poll(self) -> int | None:
         return self._process.poll()
@@ -89,15 +138,25 @@ class PopenChild:
     def wait(self, timeout: float | None = None) -> int:
         return self._process.wait(timeout=timeout)
 
+    def group_alive(self) -> bool:
+        if os.name != "posix" or self._process_group_id is None:
+            return self.poll() is None
+        try:
+            os.killpg(self._process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
     def _signal_group(self, signum: int, fallback: Callable[[], None]) -> None:
-        if self.poll() is not None:
-            return
-        if os.name == "posix":
+        if os.name == "posix" and self._process_group_id is not None:
             try:
-                os.killpg(os.getpgid(self.pid), signum)
+                os.killpg(self._process_group_id, signum)
                 return
             except ProcessLookupError:
-                return
+                if self.poll() is not None:
+                    return
         fallback()
 
     def terminate(self) -> None:
@@ -108,20 +167,19 @@ class PopenChild:
 
 
 class SubprocessFactory:
-    """Production process factory; every command is passed as an argv sequence."""
+    """Production process factory; every command is passed as a ProcessSpec."""
 
-    def spawn(self, argv: Sequence[str]) -> ChildProcess:
-        arguments = list(argv)
-        # CREATE_NEW_PROCESS_GROUP is 0x00000200 on Windows.  Keeping the
-        # numeric constant avoids importing a platform-only subprocess symbol
-        # on POSIX while retaining group-aware signal handling on Windows.
+    def spawn(self, spec: ProcessSpec) -> ChildProcess:
+        environment = os.environ.copy()
+        environment.update(spec.env)
         windows_process_group = 0x00000200 if os.name == "nt" else 0
         process = subprocess.Popen(
-            arguments,
+            list(spec.argv),
             shell=False,
             stdin=subprocess.DEVNULL,
             stdout=None,
             stderr=None,
+            env=environment,
             close_fds=os.name != "nt",
             start_new_session=os.name == "posix",
             creationflags=windows_process_group,
@@ -138,41 +196,48 @@ class ImmediateReadinessProbe:
         child: ChildProcess,
         timeout_seconds: float,
     ) -> None:
+        del timeout_seconds
         returncode = child.poll()
         if returncode is not None:
             raise ChildExitedError(component, returncode)
 
 
 class RuntimeSupervisor:
-    """Start app first, then proxy; stop proxy first, then app.
+    """Start app first; stop proxy fully before stopping app.
 
-    The readiness probe is deliberately injected.  The default probe is inert
-    until B3 owns a real health endpoint, while tests can model readiness and
-    failure without starting listeners or child processes.
+    The readiness probe is injected.  The default probe is inert until B3 owns
+    a real health endpoint, while tests can model readiness and failure without
+    starting listeners or child processes.
     """
 
     def __init__(
         self,
         config: RuntimeConfig,
         *,
-        addon_path: Path | str = Path("src/mitm_inspector/capture/addon.py"),
         process_factory: ProcessFactory | None = None,
         readiness_probe: ReadinessProbe | None = None,
+        preflight_checker: Callable[[RuntimeConfig], None] = validate_preflight,
         browser_opener: BrowserOpener | None = None,
+        warning_sink: WarningSink | None = None,
+        signal_policy: SignalPolicy = SignalPolicy.REQUIRE_MAIN_THREAD,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config
-        self.addon_path = addon_path
         self._process_factory = process_factory or SubprocessFactory()
         self._readiness_probe = readiness_probe or ImmediateReadinessProbe()
+        self._preflight_checker = preflight_checker
         self._browser_opener = browser_opener or webbrowser.open
+        self._warning_sink = warning_sink or self._default_warning_sink
+        self._signal_policy = signal_policy
         self._clock = clock
         self._sleep = sleeper
         self._children: dict[str, ChildProcess] = {}
         self._stop_requested = False
         self._stop_reason: str | None = None
+        self._stop_status_code = 0
         self._last_error: BaseException | None = None
+        self._cleanup_failures: tuple[ChildCleanupFailure, ...] = ()
         self._state = RuntimeState.NEW
         self._state_history: list[RuntimeState] = [self._state]
         self._lock = threading.RLock()
@@ -190,6 +255,10 @@ class RuntimeSupervisor:
         return self._last_error
 
     @property
+    def cleanup_failures(self) -> tuple[ChildCleanupFailure, ...]:
+        return self._cleanup_failures
+
+    @property
     def children(self) -> tuple[str, ...]:
         return tuple(self._children)
 
@@ -198,72 +267,101 @@ class RuntimeSupervisor:
         host = f"[{self.config.app_host}]" if ":" in self.config.app_host else self.config.app_host
         return f"http://{host}:{self.config.app_port}/"
 
-    def request_stop(self, reason: str = "requested") -> None:
+    def request_stop(self, reason: str = "requested", status_code: int = 0) -> None:
         with self._lock:
             self._stop_requested = True
             self._stop_reason = reason
+            self._stop_status_code = max(self._stop_status_code, status_code)
+
+    def handle_signal(self, signum: int) -> None:
+        if signum == signal.SIGINT:
+            self.request_stop("SIGINT", 130)
+        elif signum == signal.SIGTERM:
+            self.request_stop("SIGTERM", 143)
+        else:
+            raise ValueError(f"unsupported runtime signal: {signum}")
 
     def start(self) -> None:
         with self._lock:
             if self._state is not RuntimeState.NEW:
                 raise RuntimeSupervisorError(f"cannot start from state {self._state.value}")
             try:
+                self._preflight_checker(self.config)
+                if self._stop_requested:
+                    return
                 self._set_state(RuntimeState.STARTING_APP)
-                self._children["app"] = self._process_factory.spawn(build_app_argv(self.config))
+                self._children["app"] = self._process_factory.spawn(build_app_spec(self.config))
                 self._readiness_probe.wait_until_ready(
                     "app", self._children["app"], self.config.readiness_timeout_seconds
                 )
+                if self._stop_requested:
+                    return
                 self._set_state(RuntimeState.APP_READY)
                 self._set_state(RuntimeState.STARTING_PROXY)
-                self._children["proxy"] = self._process_factory.spawn(
-                    build_proxy_argv(self.config, self.addon_path)
-                )
+                self._children["proxy"] = self._process_factory.spawn(build_proxy_spec(self.config))
                 self._readiness_probe.wait_until_ready(
                     "proxy", self._children["proxy"], self.config.readiness_timeout_seconds
                 )
+                if self._stop_requested:
+                    return
                 self._set_state(RuntimeState.RUNNING)
-                if self.config.open_browser:
-                    self._browser_opener(self.browser_url)
-            except BaseException as exc:
+                self._open_browser_if_requested()
+            except KeyboardInterrupt:
+                self.request_stop("keyboard interrupt", 130)
+                raise
+            except Exception as exc:
                 self._last_error = exc
                 self._set_state(RuntimeState.FAILED)
                 self._shutdown_children()
                 raise
 
     def run(self) -> int:
-        """Run until cancellation; unexpected child exits are raised."""
+        """Run until cancellation; child and cleanup failures are raised."""
 
         try:
-            self.start()
             with self._signal_handlers():
-                while self.state is RuntimeState.RUNNING and not self._stop_requested:
-                    for component in ("proxy", "app"):
-                        child = self._children.get(component)
-                        if child is None:
-                            continue
-                        returncode = child.poll()
-                        if returncode is not None:
-                            raise ChildExitedError(component, returncode)
-                    self._sleep(self.config.poll_interval_seconds)
-            return 0
-        except KeyboardInterrupt:
-            self.request_stop("keyboard interrupt")
-            return 130
-        except ChildExitedError as exc:
+                try:
+                    self.start()
+                    while self.state is RuntimeState.RUNNING and not self._stop_requested:
+                        for component in ("proxy", "app"):
+                            child = self._children.get(component)
+                            if child is None:
+                                continue
+                            returncode = child.poll()
+                            if returncode is not None:
+                                raise ChildExitedError(component, returncode)
+                        self._sleep(self.config.poll_interval_seconds)
+                except KeyboardInterrupt:
+                    self.request_stop("keyboard interrupt", 130)
+                finally:
+                    self.stop()
+            return self._stop_status_code
+        except RuntimeSupervisorError as exc:
             self._last_error = exc
-            self._set_state(RuntimeState.FAILED)
+            if self._state is RuntimeState.NEW:
+                self._set_state(RuntimeState.FAILED)
             raise
-        finally:
-            self.stop()
 
     def stop(self) -> None:
-        """Idempotently perform bounded graceful shutdown followed by kill."""
+        """Idempotently stop proxy fully, then app, aggregating all failures."""
 
         with self._lock:
             if self._state is RuntimeState.STOPPED:
                 return
-            self._set_state(RuntimeState.STOPPING)
-            self._shutdown_children()
+            if self._state is RuntimeState.NEW:
+                if self._stop_requested:
+                    self._set_state(RuntimeState.STOPPING)
+                    self._set_state(RuntimeState.STOPPED)
+                return
+            if self._state is not RuntimeState.FAILED:
+                self._set_state(RuntimeState.STOPPING)
+            try:
+                self._shutdown_children()
+            except CleanupError as exc:
+                self._cleanup_failures = exc.failures
+                self._last_error = exc
+                self._set_state(RuntimeState.FAILED)
+                raise
             if self._state is RuntimeState.STOPPING:
                 self._set_state(RuntimeState.STOPPED)
 
@@ -274,64 +372,118 @@ class RuntimeSupervisor:
         if not self._state_history or self._state_history[-1] is not state:
             self._state_history.append(state)
 
-    def _shutdown_children(self) -> None:
-        live = [
-            (component, child)
-            for component, child in (
-                ("proxy", self._children.get("proxy")),
-                ("app", self._children.get("app")),
-            )
-            if child is not None and child.poll() is None
-        ]
-        for _, child in live:
-            child.terminate()
-        self._wait_for_children(live, self.config.graceful_shutdown_seconds)
-        remaining = [(component, child) for component, child in live if child.poll() is None]
-        for _, child in remaining:
-            child.kill()
-        self._wait_for_children(remaining, self.config.kill_wait_seconds, reap=True)
-
-    def _wait_for_children(
-        self,
-        children: Sequence[tuple[str, ChildProcess]],
-        timeout_seconds: float,
-        *,
-        reap: bool = False,
-    ) -> None:
-        if not children:
+    def _open_browser_if_requested(self) -> None:
+        if not self.config.open_browser:
             return
+        try:
+            opened = self._browser_opener(self.browser_url)
+        except Exception as exc:
+            self._emit_warning(f"browser open failed: {exc}")
+        else:
+            if not opened:
+                self._emit_warning("browser open was not accepted")
+
+    def _emit_warning(self, message: str) -> None:
+        try:
+            self._warning_sink(message)
+        except Exception as exc:
+            warnings.warn(f"runtime warning sink failed: {exc}", RuntimeWarning, stacklevel=3)
+
+    @staticmethod
+    def _default_warning_sink(message: str) -> None:
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
+
+    def _shutdown_children(self) -> None:
+        failures: list[ChildCleanupFailure] = []
+        for component in ("proxy", "app"):
+            child = self._children.get(component)
+            if child is None:
+                continue
+            try:
+                self._shutdown_child(component, child)
+            except ChildCleanupFailure as exc:
+                failures.append(exc)
+            except BaseException as exc:
+                failures.append(
+                    ChildCleanupFailure(component, (f"unexpected cleanup exception: {exc}",), True)
+                )
+        if failures:
+            raise CleanupError(tuple(failures))
+
+    def _shutdown_child(self, component: str, child: ChildProcess) -> None:
+        errors: list[str] = []
+        group_alive = self._safe_group_alive(child, errors)
+        if group_alive:
+            try:
+                child.terminate()
+            except BaseException as exc:
+                errors.append(f"terminate failed: {exc}")
+            if not self._wait_for_group_exit(child, self.config.graceful_shutdown_seconds):
+                try:
+                    child.kill()
+                except BaseException as exc:
+                    errors.append(f"kill failed: {exc}")
+                if not self._wait_for_group_exit(child, self.config.kill_wait_seconds):
+                    errors.append("process group survived kill deadline")
+        try:
+            child.wait(timeout=self.config.kill_wait_seconds)
+        except (subprocess.TimeoutExpired, TimeoutError):
+            if child.poll() is None:
+                errors.append("child leader was not reaped")
+        except BaseException as exc:
+            errors.append(f"wait failed: {exc}")
+        survived = self._safe_group_alive(child, errors)
+        if survived:
+            errors.append("process group is still alive")
+        if errors:
+            raise ChildCleanupFailure(component, tuple(dict.fromkeys(errors)), survived)
+
+    def _safe_group_alive(self, child: ChildProcess, errors: list[str]) -> bool:
+        try:
+            return child.group_alive()
+        except BaseException as exc:
+            errors.append(f"group status failed: {exc}")
+            return child.poll() is None
+
+    def _wait_for_group_exit(self, child: ChildProcess, timeout_seconds: float) -> bool:
         deadline = self._clock() + timeout_seconds
         while self._clock() < deadline:
-            if all(child.poll() is not None for _, child in children):
-                return
+            try:
+                if not child.group_alive():
+                    return True
+            except BaseException:
+                return False
             try:
                 remaining = max(0.0, deadline - self._clock())
                 self._sleep(min(self.config.poll_interval_seconds, remaining))
             except KeyboardInterrupt:
-                break
-        if reap:
-            for _, child in children:
-                if child.poll() is None:
-                    try:
-                        child.wait(timeout=0)
-                    except (subprocess.TimeoutExpired, TimeoutError):
-                        pass
+                return False
+        try:
+            return not child.group_alive()
+        except BaseException:
+            return False
 
     @contextmanager
     def _signal_handlers(self) -> Iterator[None]:
         if threading.current_thread() is not threading.main_thread():
+            if self._signal_policy is not SignalPolicy.DISABLED_FOR_TEST:
+                raise SignalHandlingError(
+                    "runtime signals require the main thread; use DISABLED_FOR_TEST only in tests"
+                )
             yield
             return
         previous: dict[signal.Signals, Any] = {}
 
         def handle(signum: int, _frame: FrameType | None) -> None:
-            self.request_stop(signal.Signals(signum).name)
+            self.handle_signal(signum)
 
         try:
             for signum in (signal.SIGINT, signal.SIGTERM):
                 previous[signum] = signal.getsignal(signum)
                 signal.signal(signum, handle)
             yield
+        except (OSError, ValueError) as exc:
+            raise SignalHandlingError(f"could not install runtime signal handlers: {exc}") from exc
         finally:
             for signum, handler in previous.items():
                 signal.signal(signum, handler)
