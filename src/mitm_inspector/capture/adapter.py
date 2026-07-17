@@ -86,6 +86,7 @@ class _FlowCapture:
     request_headers_captured: bool = False
     response_headers: list[dict[str, str]] | None = None
     response_headers_captured: bool = False
+    response_status: str | None = None
     request: _BodyCapture = field(default_factory=_BodyCapture)
     response: _BodyCapture = field(default_factory=_BodyCapture)
     lifecycle_states: set[str] = field(default_factory=set)
@@ -247,6 +248,12 @@ class CaptureAddon:
             state.response_headers_captured = True
             if flow.response:
                 state.response.content_type = _content_type(flow.response.headers)
+                status = getattr(flow.response, "status_code", None)
+                # Real HTTP responses live in 100..599; anything outside that
+                # range indicates uninitialised state on the mitmproxy side
+                # and must not leak into the emitted metadata.
+                if isinstance(status, int) and 100 <= status <= 599:
+                    state.response_status = str(status)
                 self._install_stream(flow.response, state, "response")
             if not self._try_lifecycle(state, "response_headers"):
                 return
@@ -644,6 +651,8 @@ class CaptureAddon:
         if state.response_headers_captured:
             metadata["response_headers"] = state.response_headers
             metadata["response_body"] = _body_descriptor(state.response)
+            if state.response_status is not None:
+                metadata["response_status"] = state.response_status
         self._send({"protocol_version": "1", "type": "flow.metadata", "metadata": metadata})
 
     def _set_identity(self, state: _FlowCapture, flow: http.HTTPFlow) -> None:

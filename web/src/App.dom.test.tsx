@@ -183,6 +183,45 @@ describe("mounted App connection behavior", () => {
     root = null;
   });
 
+  it("preserves the seen-flow marker across a reconnect that unmounts the flow workspace", async () => {
+    vi.useFakeTimers();
+    const harness = mountedHarness();
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => root?.render(<App transportFactory={harness.factory} />));
+    await act(async () => {
+      harness.handlers[0].onOpen();
+      harness.handlers[0].onMessage(hello("source-a"));
+      harness.handlers[0].onMessage(snapshot("1", "a", [flow("kept-flow")]));
+    });
+    const beforeRow = document.querySelector<HTMLElement>('.flow-grid-row');
+    expect(beforeRow?.classList.contains("is-unseen")).toBe(true);
+    await act(async () => beforeRow?.click());
+    expect(document.querySelector<HTMLElement>('.flow-grid-row')?.classList.contains("is-unseen")).toBe(false);
+    // Resume follow-live so the source-reset that the reconnect issues
+    // wipes the displayed flows and the empty-state branch unmounts the
+    // FlowWorkspace. This is the failure mode the F1 reviewer probed.
+    await click(buttonWithText("Live paused"));
+
+    await act(async () => harness.handlers[0].onClose("dropped"));
+    expect(document.body.textContent).toContain("Reconnecting");
+    await act(async () => vi.advanceTimersByTime(5_000));
+    expect(document.querySelector<HTMLElement>('.flow-grid-row')).toBeNull();
+    await act(async () => {
+      harness.handlers[1].onOpen();
+      harness.handlers[1].onMessage(hello("source-b"));
+      // Same retained flow-id survives the reconnect; the seen marker must
+      // still apply after the workspace unmount/remount cycle.
+      harness.handlers[1].onMessage(snapshot("1", "b", [flow("kept-flow")]));
+    });
+    const afterRow = document.querySelector<HTMLElement>('.flow-grid-row');
+    expect(afterRow).not.toBeNull();
+    expect(afterRow?.classList.contains("is-unseen")).toBe(false);
+    await act(async () => root?.unmount());
+    root = null;
+  });
+
   it("mounts an unsupported transport as an explicit unavailable resync action", async () => {
     const harness = mountedHarness(false);
     const container = document.createElement("div");

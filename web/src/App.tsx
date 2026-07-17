@@ -5,6 +5,8 @@ import type { ConnectionStatusName, TransportFactory } from "./features/connecti
 import { webSocketTransportFactory } from "./features/connection/wsTransport";
 import type { ConnectionViewModel } from "./features/connection/useConnection";
 import { FlowWorkspace } from "./features/flows/FlowWorkspace";
+import { useSeenFlows } from "./features/flows/useSeenFlows";
+export { SEEN_FLOW_LIMIT } from "./features/flows/useSeenFlows";
 import { formatBytes } from "./format";
 import "./styles/shell.css";
 
@@ -39,6 +41,12 @@ export function Workbench({ view }: { view: ConnectionViewModel }) {
   } = view;
   const titleId = useId();
   const [resyncMessage, setResyncMessage] = useState<string | null>(null);
+  // seenFlowIds lives on the workbench so a reconnect — which unmounts
+  // FlowWorkspace via the empty-state branch when displayed flows drop
+  // to zero in follow-live mode — does not throw away the record of
+  // which rows the user has already opened. Implementation and rollover
+  // discipline live in useSeenFlows.
+  const { seen: seenFlowIds, mark: markFlowSeen } = useSeenFlows(browser.flows.ids);
   const statusInfo = statusCopy[status.state];
   const isBusy = status.state === "connecting" || status.state === "reconnecting";
   const isRetrying = status.state === "reconnecting";
@@ -184,7 +192,7 @@ export function Workbench({ view }: { view: ConnectionViewModel }) {
               <div className="empty-hint"><kbd>⌘</kbd><span>Flow search and inspection arrive with the workspace.</span></div>
             </div>
           ) : (
-            <FlowWorkspace browser={browser} followLive={followLive} pauseLive={pauseLive} />
+            <FlowWorkspace browser={browser} followLive={followLive} pauseLive={pauseLive} seenFlowIds={seenFlowIds} onFlowSeen={markFlowSeen} />
           )}
         </section>
       </section>

@@ -124,7 +124,30 @@ describe("SSE framing", () => {
 
     const twoBoms = decodeBody({ state: "captured", size_bytes: "13", encoding: "base64", data: encoded("\uFEFF\uFEFFdata: hello\n\n") }, "sse");
     expect(twoBoms.events).toEqual([]);
-    expect(twoBoms.text).toBe("No complete SSE event frames found.");
+    // Rejects hint at raw text so garbage frames stay legible; the caller
+    // routes through the plain-text fallback rather than a stub message.
+    expect(twoBoms.fallback).toBe("text");
+    expect(twoBoms.text).toBe("\uFEFF\uFEFFdata: hello\n\n");
+  });
+
+  it("preserves the truncated trailing frame in text, copyText, and the parsed suffix", () => {
+    const raw = "data: complete\n\ndata: truncated";
+    const decoded = decodeBody({ state: "captured", size_bytes: String(raw.length), encoding: "base64", data: encoded(raw) }, "sse");
+    expect(decoded.events?.map((event) => event.data)).toEqual(["complete"]);
+    expect(decoded.pendingSseSuffix).toBe("data: truncated");
+    expect(decoded.text).toContain("data: complete");
+    expect(decoded.text).toContain("truncated frame");
+    expect(decoded.text).toContain("data: truncated");
+    expect(decoded.copyText).toBe(decoded.text);
+  });
+
+  it("falls back to raw text when the SSE parser finds no frames", () => {
+    const raw = "not sse at all";
+    const decoded = decodeBody({ state: "captured", size_bytes: String(raw.length), encoding: "base64", data: encoded(raw) }, "sse");
+    expect(decoded.fallback).toBe("text");
+    expect(decoded.events).toEqual([]);
+    expect(decoded.text).toBe(raw);
+    expect(decoded.copyText).toBe(raw);
   });
 });
 

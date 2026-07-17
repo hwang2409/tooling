@@ -204,6 +204,38 @@ def test_truncated_prefix_cannot_exceed_total_or_captured_counts() -> None:
         parse_message(message)
 
 
+def test_response_status_must_be_in_the_100_to_599_http_range() -> None:
+    base_flow = {
+        "flow_id": "f-status",
+        "method": "GET",
+        "scheme": "https",
+        "host": "h",
+        "port": "443",
+        "path": "/x",
+        "request_headers": [],
+        "request_body": {"state": "missing"},
+        "response_headers": [],
+    }
+    validator = schema_validator()
+
+    def wrap(status: str) -> dict[str, object]:
+        return {
+            "protocol_version": "1",
+            "type": "flow.metadata",
+            "metadata": {**base_flow, "response_status": status},
+        }
+
+    accepted = wrap("200")
+    assert list(validator.iter_errors(accepted)) == []
+    parse_message(accepted)
+
+    for bogus in ("0", "1", "99", "600", "999"):
+        rejected = wrap(bogus)
+        assert list(validator.iter_errors(rejected)), bogus
+        with pytest.raises(ProtocolError):
+            parse_message(rejected)
+
+
 def test_gap_order_and_dropped_count_are_authoritative_runtime_invariants() -> None:
     for expected, actual, dropped in (("2", "1", None), ("9", "11", "2")):
         message = {

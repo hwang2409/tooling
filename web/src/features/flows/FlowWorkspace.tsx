@@ -18,12 +18,22 @@ export interface FlowWorkspaceProps {
   pauseLive: () => void;
   gridViewportHeight?: number;
   loadFlowDetail?: FlowDetailLoader;
+  /**
+   * Externally-owned bounded seen-flow set. Hoisted above this component so
+   * a reconnect (which can unmount the workspace via the empty-state
+   * branch) does not throw away the record of which rows were opened.
+   */
+  seenFlowIds?: ReadonlySet<string>;
+  // eslint-disable-next-line no-unused-vars
+  onFlowSeen?: (flowId: string) => void;
 }
 
-export function FlowWorkspace({ browser, followLive, pauseLive, gridViewportHeight, loadFlowDetail }: FlowWorkspaceProps) {
+export function FlowWorkspace({ browser, followLive, pauseLive, gridViewportHeight, loadFlowDetail, seenFlowIds, onFlowSeen }: FlowWorkspaceProps) {
   const workspaceId = useId().replaceAll(":", "");
   const [query, setQuery] = useState("");
   const [selectedFlowId, setSelectedFlowId] = useState<string | null>(null);
+  const [localSeenFlowIds, setLocalSeenFlowIds] = useState<ReadonlySet<string>>(() => new Set());
+  const effectiveSeenFlowIds = seenFlowIds ?? localSeenFlowIds;
 
   const rows = useMemo<readonly FlowRow[]>(
     () => browser.flows.entries.map((metadata) => buildFlowRow(metadata, browser.lifecycles.get(metadata.flow_id))),
@@ -37,6 +47,16 @@ export function FlowWorkspace({ browser, followLive, pauseLive, gridViewportHeig
 
   const selectFlow = (flowId: string) => {
     setSelectedFlowId(flowId);
+    if (onFlowSeen !== undefined) {
+      onFlowSeen(flowId);
+    } else {
+      setLocalSeenFlowIds((previous) => {
+        if (previous.has(flowId)) return previous;
+        const next = new Set(previous);
+        next.add(flowId);
+        return next;
+      });
+    }
     if (followLive) pauseLive();
   };
 
@@ -92,6 +112,7 @@ export function FlowWorkspace({ browser, followLive, pauseLive, gridViewportHeig
         onSelectFlow={selectFlow}
         followLive={followLive}
         viewportHeight={gridViewportHeight}
+        seenFlowIds={effectiveSeenFlowIds}
       />
 
       {selectedFlowId === null ? (

@@ -149,6 +149,7 @@ class FlowMetadata(TypedDict):
     path: str
     request_headers: list[Header]
     response_headers: NotRequired[list[Header]]
+    response_status: NotRequired[str]
     request_body: BodyDescriptor
     response_body: NotRequired[BodyDescriptor]
 
@@ -573,6 +574,13 @@ def _flow_metadata(value: object, *, label: str = "metadata") -> FlowMetadata:
         result["response_headers"] = _headers(
             metadata["response_headers"], label=f"{label}.response_headers"
         )
+    if "response_status" in metadata:
+        status = _u64(metadata["response_status"], label=f"{label}.response_status")
+        # Only real HTTP responses populate this field; anything outside the
+        # 100..599 range is invalid regardless of source.
+        if not 100 <= int(status) <= 599:
+            raise ProtocolError(f"{label}.response_status must be a valid HTTP status code")
+        result["response_status"] = status
     if "response_body" in metadata:
         result["response_body"] = _body(metadata["response_body"], label=f"{label}.response_body")
     return result
