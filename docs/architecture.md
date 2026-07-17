@@ -11,7 +11,7 @@ private mitmproxy modules.
 | `runtime` | Process lifecycle and CLI composition | Proxy internals or UI state |
 | `capture` | Documented mitmproxy hooks, sanitization, bounded emission | API routes, browser concerns, raw `Flow` retention |
 | `store` | Bounded in-memory project-owned messages | Disk persistence or raw traffic |
-| `api` | Future HTTP/WebSocket delivery of protocol-v1 messages | Capture decisions or browser rendering |
+| `api` | Versioned loopback HTTP/WebSocket delivery of protocol-v1 messages and the capture ingest listener | Capture decisions or browser rendering |
 | `web/src/protocol.ts` | Browser validation and protocol typing | Server state or mitmproxy types |
 | web shell | Developer-tool shell and connection affordance | Flow grid, inspector, replay/edit/intercept controls |
 | tests | Contract, architecture, and future integration/e2e seams | Real proxy traffic |
@@ -26,7 +26,9 @@ flow workspace, inspector} → integration/e2e and packaging`.
    before a message can leave the proxy process.
 3. A bounded store retains only project-owned sanitized metadata and bounded
    body prefixes in memory.
-4. The future API emits lifecycle messages and browser snapshot/delta envelopes.
+4. The API ingests capture messages over the private Unix socket, retains
+   them in the bounded store, and emits lifecycle relays plus body-redacted
+   browser snapshot/delta envelopes (see `docs/api.md`).
 5. The web client validates protocol-v1 and renders read-only state.
 
 S0 contains only the seams and inert hook adapter. It does not proxy, open

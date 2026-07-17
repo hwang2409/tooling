@@ -11,11 +11,13 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
-from mitm_inspector.runtime.cli import main
+from mitm_inspector.api.limits import MAX_INGEST_BODY_PREFIX_BYTES
+from mitm_inspector.runtime.cli import default_supervisor_factory, main
 from mitm_inspector.runtime.commands import (
     ProcessSpec,
     build_app_argv,
@@ -41,6 +43,10 @@ from mitm_inspector.runtime.config import (
     preflight_issues,
     validate_private_runtime_dir,
 )
+from mitm_inspector.runtime.readiness import (
+    HttpHealthReadinessProbe,
+    ReadinessTimeoutError,
+)
 from mitm_inspector.runtime.supervisor import (
     BrowserOpener,
     ChildExitedError,
@@ -51,6 +57,7 @@ from mitm_inspector.runtime.supervisor import (
     ProcessGroupProbeError,
     RuntimeState,
     RuntimeSupervisor,
+    RuntimeSupervisorError,
     SignalHandlingError,
     SignalPolicy,
     SubprocessFactory,
@@ -289,11 +296,15 @@ def test_oversized_timeout_is_a_runtime_config_error(tmp_path: Path) -> None:
     "max_pending_messages",
 ])
 def test_integer_caps_are_uint64_bounded(tmp_path: Path, field: str) -> None:
-    accepted: dict[str, object] = {field: MAX_UINT64}
+    accepted_value = MAX_UINT64
+    accepted: dict[str, object] = {}
     if field == "max_body_prefix_bytes":
+        # The body prefix is additionally bounded by the ingest line capacity.
+        accepted_value = MAX_INGEST_BODY_PREFIX_BYTES
         accepted["max_body_bytes"] = MAX_UINT64
+    accepted[field] = accepted_value
     config = runtime_config(tmp_path, **accepted)
-    assert getattr(config, field) == MAX_UINT64
+    assert getattr(config, field) == accepted_value
     rejected = dict(accepted)
     rejected[field] = MAX_UINT64 + 1
     with pytest.raises(RuntimeConfigError, match="unsigned 64-bit"):
@@ -1125,3 +1136,198 @@ def test_real_process_exit_between_group_check_and_signal_is_benign() -> None:
 
     assert supervisor.state is RuntimeState.STOPPED
     assert supervisor.cleanup_failures == ()
+
+
+# -- B3 readiness probing and live CLI wiring -------------------------------
+
+
+def _free_port() -> int:
+    with socket.socket() as probe_socket:
+        probe_socket.bind(("127.0.0.1", 0))
+        return int(probe_socket.getsockname()[1])
+
+
+def _health_server() -> tuple[ThreadingHTTPServer, int]:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - http.server contract
+            if self.path == "/api/v1/health":
+                body = b'{"status":"ok"}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, int(server.server_address[1])
+
+
+def _probe_config(app_port: int, proxy_port: int) -> RuntimeConfig:
+    return RuntimeConfig(
+        app_port=app_port,
+        proxy_port=proxy_port,
+        readiness_timeout_seconds=5.0,
+        poll_interval_seconds=0.01,
+    )
+
+
+def test_http_readiness_probe_accepts_healthy_app_and_listening_proxy() -> None:
+    server, app_port = _health_server()
+    proxy_listener = socket.socket()
+    proxy_listener.bind(("127.0.0.1", 0))
+    proxy_listener.listen(1)
+    proxy_port = int(proxy_listener.getsockname()[1])
+    try:
+        probe = HttpHealthReadinessProbe(_probe_config(app_port, proxy_port))
+        probe.wait_until_ready("app", FakeChild(1, []), 5.0)
+        probe.wait_until_ready("proxy", FakeChild(2, []), 5.0)
+    finally:
+        server.shutdown()
+        server.server_close()
+        proxy_listener.close()
+
+
+def test_http_readiness_probe_requires_a_health_success_not_just_a_listener() -> None:
+    class Refuser(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - http.server contract
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Refuser)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    app_port = int(server.server_address[1])
+    fake_clock = FakeClock()
+    try:
+        probe = HttpHealthReadinessProbe(
+            _probe_config(app_port, _free_port()),
+            clock=fake_clock.clock,
+            sleeper=fake_clock.sleep,
+        )
+        with pytest.raises(ReadinessTimeoutError):
+            probe.wait_until_ready("app", FakeChild(1, []), 0.05)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert fake_clock.sleeps
+
+
+def test_http_readiness_probe_times_out_when_nothing_listens() -> None:
+    fake_clock = FakeClock()
+    probe = HttpHealthReadinessProbe(
+        _probe_config(_free_port(), _free_port()),
+        clock=fake_clock.clock,
+        sleeper=fake_clock.sleep,
+    )
+    with pytest.raises(ReadinessTimeoutError) as excinfo:
+        probe.wait_until_ready("app", FakeChild(1, []), 0.05)
+    assert excinfo.value.component == "app"
+    with pytest.raises(ReadinessTimeoutError):
+        probe.wait_until_ready("proxy", FakeChild(2, []), 0.05)
+
+
+def test_http_readiness_probe_reports_an_exited_child_immediately() -> None:
+    probe = HttpHealthReadinessProbe(_probe_config(_free_port(), _free_port()))
+    child = FakeChild(1, [])
+    child.returncode = 3
+    with pytest.raises(ChildExitedError) as excinfo:
+        probe.wait_until_ready("app", child, 5.0)
+    assert excinfo.value.returncode == 3
+
+
+def test_http_readiness_probe_rejects_unknown_components() -> None:
+    probe = HttpHealthReadinessProbe(_probe_config(_free_port(), _free_port()))
+    with pytest.raises(RuntimeSupervisorError):
+        probe.wait_until_ready("browser", FakeChild(1, []), 0.1)
+
+
+def test_cli_live_run_uses_the_injected_supervisor(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    seen: list[RuntimeConfig] = []
+
+    class FakeSupervisor:
+        def __init__(self, config: RuntimeConfig) -> None:
+            seen.append(config)
+
+        def run(self) -> int:
+            return 7
+
+    assert main(["run"], supervisor_factory=FakeSupervisor) == 7
+    assert len(seen) == 1
+    assert seen[0].app_port == 8000
+    assert "serving: http://127.0.0.1:8000/" in capsys.readouterr().out
+
+
+def test_cli_live_run_reports_supervisor_failures(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FailingSupervisor:
+        def __init__(self, config: RuntimeConfig) -> None:
+            self.config = config
+
+        def run(self) -> int:
+            raise RuntimeSupervisorError("proxy was not ready")
+
+    assert main(["run"], supervisor_factory=FailingSupervisor) == 1
+    assert "proxy was not ready" in capsys.readouterr().err
+
+
+def test_default_supervisor_factory_wires_the_health_probe() -> None:
+    supervisor = default_supervisor_factory(RuntimeConfig())
+    assert isinstance(supervisor, RuntimeSupervisor)
+    assert isinstance(supervisor._readiness_probe, HttpHealthReadinessProbe)
+
+
+def test_app_server_module_serves_health_and_stops_on_sigterm() -> None:
+    app_port = _free_port()
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "mitm_inspector.api.server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(app_port),
+        ],
+        stdin=subprocess.DEVNULL,
+    )
+    try:
+        probe = HttpHealthReadinessProbe(_probe_config(app_port, _free_port()))
+        probe.wait_until_ready("app", PopenChild(process), 10.0)
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=10.0) == 143
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5.0)
+
+
+def test_capture_ipc_bounds_prefix_to_the_ingest_line_capacity() -> None:
+    CaptureIPCConfig(
+        max_body_prefix_bytes=MAX_INGEST_BODY_PREFIX_BYTES,
+        max_in_memory_bytes=MAX_INGEST_BODY_PREFIX_BYTES * 4,
+    )
+    with pytest.raises(RuntimeConfigError):
+        CaptureIPCConfig(
+            max_body_prefix_bytes=MAX_INGEST_BODY_PREFIX_BYTES + 1,
+            max_in_memory_bytes=MAX_INGEST_BODY_PREFIX_BYTES * 4,
+        )
+    with pytest.raises(RuntimeConfigError):
+        RuntimeConfig(
+            max_body_prefix_bytes=MAX_INGEST_BODY_PREFIX_BYTES + 1,
+            max_body_bytes=MAX_INGEST_BODY_PREFIX_BYTES * 4,
+        )

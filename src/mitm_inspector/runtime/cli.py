@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Sequence
+import sys
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
 from mitm_inspector import __version__
 from mitm_inspector.runtime.commands import build_app_argv, build_proxy_argv
@@ -19,6 +20,19 @@ from mitm_inspector.runtime.config import (
     RuntimeConfigError,
     preflight_issues,
 )
+from mitm_inspector.runtime.readiness import HttpHealthReadinessProbe
+from mitm_inspector.runtime.supervisor import RuntimeSupervisor, RuntimeSupervisorError
+
+
+class RunnableSupervisor(Protocol):
+    def run(self) -> int: ...
+
+
+def default_supervisor_factory(config: RuntimeConfig) -> RunnableSupervisor:
+    return RuntimeSupervisor(
+        config,
+        readiness_probe=HttpHealthReadinessProbe(config),
+    )
 
 
 def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
@@ -128,7 +142,7 @@ def _parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser(
         "run",
-        help="reserved for the B3 app server; dry-run is available now",
+        help="start the local app server and stock mitmdump reverse proxy",
     )
     _add_runtime_arguments(run)
     run.add_argument(
@@ -140,11 +154,15 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    supervisor_factory: Callable[[RuntimeConfig], RunnableSupervisor] | None = None,
+) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     if args.command is None:
-        parser.error("choose 'plan' or 'run --dry-run'; live run is deferred until B3")
+        parser.error("choose 'plan' or 'run'")
     try:
         config = _config_from_args(args)
     except RuntimeConfigError as exc:
@@ -153,5 +171,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "plan" or args.dry_run:
         _print_plan(plan, args.json)
         return 0
-    parser.error("live run is deferred until the B3 app server exists; use 'run --dry-run'")
-    return 2
+    factory = supervisor_factory or default_supervisor_factory
+    supervisor = factory(config)
+    print("serving:", plan["app_url"])
+    try:
+        return supervisor.run()
+    except RuntimeSupervisorError as exc:
+        print(f"mitm-inspector: {exc}", file=sys.stderr)
+        return 1

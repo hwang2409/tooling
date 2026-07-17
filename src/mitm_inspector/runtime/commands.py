@@ -81,7 +81,7 @@ def build_app_argv(
     config: RuntimeConfig,
     module: str = DEFAULT_APP_SERVER_MODULE,
 ) -> tuple[str, ...]:
-    """Build the future app-server argv, including the durable IPC flags."""
+    """Build the app-server argv, including the durable IPC flags."""
 
     if not module or any(character.isspace() for character in module) or "\x00" in module:
         raise ValueError("app server module must be a non-empty dotted module name")
@@ -149,6 +149,6 @@ def build_app_server_argv(
     config: RuntimeConfig,
     module: str = DEFAULT_APP_SERVER_MODULE,
 ) -> tuple[str, ...]:
-    """Descriptive alias for the future app-server command."""
+    """Descriptive alias for the app-server command."""
 
     return build_app_argv(config, module)
