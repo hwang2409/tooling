@@ -8,7 +8,7 @@ import type { FlowRow } from "./gridModel";
 export const FLOW_ROW_HEIGHT = 28;
 export const DEFAULT_GRID_VIEWPORT_HEIGHT = FLOW_ROW_HEIGHT * 14;
 const DEFAULT_OVERSCAN = 6;
-const COLUMN_COUNT = 8;
+const COLUMN_COUNT = 10;
 
 export interface FlowGridProps {
   rows: readonly FlowRow[];
@@ -17,6 +17,11 @@ export interface FlowGridProps {
   followLive: boolean;
   viewportHeight?: number;
   overscan?: number;
+  /**
+   * Flow IDs the user has already opened. Rows not in this set render an
+   * "unseen" marker so a caller can spot fresh traffic at a glance.
+   */
+  seenFlowIds?: ReadonlySet<string>;
 }
 
 export interface GridWindow {
@@ -48,6 +53,7 @@ export function FlowGrid({
   followLive,
   viewportHeight = DEFAULT_GRID_VIEWPORT_HEIGHT,
   overscan = DEFAULT_OVERSCAN,
+  seenFlowIds,
 }: FlowGridProps) {
   const gridId = useId().replaceAll(":", "");
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -95,6 +101,8 @@ export function FlowGrid({
     onSelectFlow(rows[nextIndex].flowId);
   };
 
+  const isSeen = (flowId: string) => seenFlowIds === undefined ? true : seenFlowIds.has(flowId);
+
   return (
     <div
       ref={containerRef}
@@ -111,14 +119,16 @@ export function FlowGrid({
       onKeyDown={handleKeyDown}
     >
       <div className="flow-grid-head" role="row" aria-rowindex={1}>
+        <span role="columnheader" className="flow-cell flow-cell-marker" aria-label="new" />
         <span role="columnheader" className="flow-cell flow-cell-index">#</span>
         <span role="columnheader" className="flow-cell flow-cell-method">method</span>
         <span role="columnheader" className="flow-cell flow-cell-host">host</span>
         <span role="columnheader" className="flow-cell flow-cell-path">path</span>
         <span role="columnheader" className="flow-cell flow-cell-phase">phase</span>
+        <span role="columnheader" className="flow-cell flow-cell-status">status</span>
         <span role="columnheader" className="flow-cell flow-cell-size">req</span>
         <span role="columnheader" className="flow-cell flow-cell-size">resp</span>
-        <span role="columnheader" className="flow-cell flow-cell-type">type</span>
+        <span role="columnheader" className="flow-cell flow-cell-duration">dur</span>
       </div>
       {rows.length === 0 ? (
         <p className="flow-grid-empty" role="note">No flows to list.</p>
@@ -128,25 +138,40 @@ export function FlowGrid({
             {rows.slice(start, end).map((row, offset) => {
               const index = start + offset;
               const selected = row.flowId === selectedFlowId;
+              const seen = isSeen(row.flowId);
+              const rowClasses = [
+                "flow-grid-row",
+                `is-${row.phase}`,
+                selected ? "is-selected" : "",
+                seen ? "" : "is-unseen",
+                row.isStreaming ? "is-streaming" : "",
+              ].filter(Boolean).join(" ");
               return (
                 <div
                   key={row.flowId}
                   id={`${gridId}-row-${index}`}
-                  className={`flow-grid-row is-${row.phase}${selected ? " is-selected" : ""}`}
+                  className={rowClasses}
                   role="row"
                   aria-rowindex={index + 2}
                   aria-selected={selected}
                   title={row.url}
                   onClick={() => onSelectFlow(row.flowId)}
                 >
+                  <span role="gridcell" className="flow-cell flow-cell-marker" aria-label={seen ? "" : "unseen"}>
+                    {seen ? "" : <span className="flow-marker-dot" aria-hidden="true" />}
+                  </span>
                   <span role="gridcell" className="flow-cell flow-cell-index">{index + 1}</span>
                   <span role="gridcell" className="flow-cell flow-cell-method">{row.method}</span>
                   <span role="gridcell" className="flow-cell flow-cell-host">{row.scheme === "https" ? "" : "http "}{row.host}:{row.port}</span>
                   <span role="gridcell" className="flow-cell flow-cell-path">{row.path}</span>
                   <span role="gridcell" className="flow-cell flow-cell-phase"><span className={`flow-phase is-${row.phase}`}>{row.phaseLabel}</span></span>
-                  <span role="gridcell" className={`flow-cell flow-cell-size${row.requestBody.truncated ? " is-truncated" : ""}`}>{row.requestBody.text}{row.requestBody.truncated ? "+" : ""}</span>
-                  <span role="gridcell" className={`flow-cell flow-cell-size${row.responseBody.truncated ? " is-truncated" : ""}`}>{row.responseBody.text}{row.responseBody.truncated ? "+" : ""}</span>
-                  <span role="gridcell" className="flow-cell flow-cell-type">{row.contentType}</span>
+                  <span role="gridcell" className={`flow-cell flow-cell-status is-${row.phase}`}>{row.statusLabel}</span>
+                  <span role="gridcell" className={`flow-cell flow-cell-size${row.requestBody.truncated ? " is-truncated" : ""}`}>{row.requestBody.compact}{row.requestBody.truncated ? "+" : ""}</span>
+                  <span role="gridcell" className={`flow-cell flow-cell-size${row.responseBody.truncated ? " is-truncated" : ""}`}>
+                    {row.responseBody.compact}{row.responseBody.truncated ? "+" : ""}
+                    {row.isStreaming && <span className="flow-sse-flag" aria-label="server-sent events"> SSE</span>}
+                  </span>
+                  <span role="gridcell" className="flow-cell flow-cell-duration">{row.durationLabel}</span>
                 </div>
               );
             })}

@@ -58,6 +58,7 @@ export interface FlowMetadata {
   path: string;
   request_headers: Header[];
   response_headers?: Header[];
+  response_status?: DecimalString;
   request_body: BodyDescriptor;
   response_body?: BodyDescriptor;
 }
@@ -386,6 +387,10 @@ function flow(value: unknown, label: string): FlowMetadata {
   headers(metadata.request_headers, `${label}.request_headers`);
   body(metadata.request_body, `${label}.request_body`);
   if (metadata.response_headers !== undefined) headers(metadata.response_headers, `${label}.response_headers`);
+  if (metadata.response_status !== undefined) {
+    const status = decimalValue(metadata.response_status, `${label}.response_status`);
+    if (Number(status) > 599) throw new ProtocolError(`${label}.response_status must be a valid HTTP status code`);
+  }
   if (metadata.response_body !== undefined) body(metadata.response_body, `${label}.response_body`);
   return metadata as unknown as FlowMetadata;
 }

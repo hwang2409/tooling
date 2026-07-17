@@ -17,14 +17,14 @@ function metadata(overrides: Partial<ImmutableFlowMetadata> = {}): ImmutableFlow
   };
 }
 
-function lifecycle(state: ImmutableFlowLifecycle["state"], sequence: string): ImmutableFlowLifecycle {
+function lifecycle(state: ImmutableFlowLifecycle["state"], sequence: string, occurredAt: string = "2026-01-01T00:00:00Z"): ImmutableFlowLifecycle {
   return {
     protocol_version: "1",
     type: "flow.lifecycle",
     source_id: "src",
     flow_id: "flow-1",
     event_id: `event-${sequence}`,
-    occurred_at: "2026-01-01T00:00:00Z",
+    occurred_at: occurredAt,
     sequence,
     state,
   };
@@ -75,8 +75,8 @@ describe("buildFlowRow", () => {
       request_body: { state: "captured", size_bytes: "18446744063223267327", encoding: "base64", data: "" },
       response_body: { state: "truncated", size_bytes: "2097152", captured_bytes: "1048576", encoding: "base64", data: "" },
     }));
-    expect(row.requestBody).toEqual({ text: "17592186034415 MiB", truncated: false });
-    expect(row.responseBody).toEqual({ text: "2 MiB", truncated: true });
+    expect(row.requestBody).toEqual({ text: "17592186034415 MiB", compact: "17179869174G", truncated: false });
+    expect(row.responseBody).toEqual({ text: "2 MiB", compact: "2.0M", truncated: true });
   });
 
   it("shows a dash for missing and absent bodies", () => {
@@ -104,5 +104,49 @@ describe("buildFlowRow", () => {
     expect(none.contentType).toBe("—");
     expect(none.filterable.requestContentType).toBeNull();
     expect(none.filterable.responseContentType).toBeNull();
+  });
+
+  it("carries the response status through when the backend supplied it", () => {
+    const row = buildFlowRow(metadata({ response_status: "200", response_headers: [] }));
+    expect(row.status).toBe("200");
+    expect(row.statusLabel).toBe("200");
+  });
+
+  it("labels the status cell for waiting, error, and unknown outcomes", () => {
+    const awaiting = buildFlowRow(metadata());
+    expect(awaiting.status).toBeNull();
+    expect(awaiting.statusLabel).toBe("…");
+
+    const errored = buildFlowRow(metadata(), [lifecycle("error", "3")]);
+    expect(errored.statusLabel).toBe("err");
+
+    const completedNoStatus = buildFlowRow(metadata({ response_headers: [] }), [lifecycle("flow_completed", "9")]);
+    expect(completedNoStatus.statusLabel).toBe("—");
+  });
+
+  it("computes duration in milliseconds from request_started to response_end", () => {
+    const row = buildFlowRow(metadata(), [
+      lifecycle("request_started", "1", "2026-01-01T00:00:00.000Z"),
+      lifecycle("response_end", "4", "2026-01-01T00:00:01.400Z"),
+      lifecycle("flow_completed", "5", "2026-01-01T00:00:01.500Z"),
+    ]);
+    expect(row.durationMs).toBe(1500);
+    expect(row.durationLabel).toBe("1.5s");
+  });
+
+  it("leaves duration null while no terminal event has been observed", () => {
+    const row = buildFlowRow(metadata(), [lifecycle("request_started", "1")]);
+    expect(row.durationMs).toBeNull();
+    expect(row.durationLabel).toBe("—");
+  });
+
+  it("flags server-sent event streams via the response content type", () => {
+    const streaming = buildFlowRow(metadata({
+      response_body: { state: "captured", size_bytes: "0", encoding: "base64", data: "", content_type: "text/event-stream" },
+    }));
+    expect(streaming.isStreaming).toBe(true);
+
+    const notStreaming = buildFlowRow(metadata({ response_headers: [] }));
+    expect(notStreaming.isStreaming).toBe(false);
   });
 });

@@ -24,6 +24,7 @@ export function FlowWorkspace({ browser, followLive, pauseLive, gridViewportHeig
   const workspaceId = useId().replaceAll(":", "");
   const [query, setQuery] = useState("");
   const [selectedFlowId, setSelectedFlowId] = useState<string | null>(null);
+  const [seenFlowIds, setSeenFlowIds] = useState<ReadonlySet<string>>(() => new Set());
 
   const rows = useMemo<readonly FlowRow[]>(
     () => browser.flows.entries.map((metadata) => buildFlowRow(metadata, browser.lifecycles.get(metadata.flow_id))),
@@ -37,6 +38,12 @@ export function FlowWorkspace({ browser, followLive, pauseLive, gridViewportHeig
 
   const selectFlow = (flowId: string) => {
     setSelectedFlowId(flowId);
+    setSeenFlowIds((previous) => {
+      if (previous.has(flowId)) return previous;
+      const next = new Set(previous);
+      next.add(flowId);
+      return next;
+    });
     if (followLive) pauseLive();
   };
 
@@ -92,6 +99,7 @@ export function FlowWorkspace({ browser, followLive, pauseLive, gridViewportHeig
         onSelectFlow={selectFlow}
         followLive={followLive}
         viewportHeight={gridViewportHeight}
+        seenFlowIds={seenFlowIds}
       />
 
       {selectedFlowId === null ? (
