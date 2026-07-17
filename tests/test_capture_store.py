@@ -1,4 +1,5 @@
 import base64
+import threading
 from collections.abc import Iterator, Mapping
 from types import SimpleNamespace
 
@@ -317,6 +318,162 @@ def test_callback_cannot_block_stream_forwarding_and_runs_only_on_explicit_drain
     assert delivered
 
 
+def test_hostile_callback_runs_only_on_consumer_thread_after_stream_returns() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_emit(_message: ParsedMessageResult) -> None:
+        entered.set()
+        release.wait(timeout=5)
+
+    addon = CaptureAddon(emit=blocked_emit, clock=lambda: "now")
+    flow = fake_flow()
+    addon.requestheaders(flow)
+    addon.responseheaders(flow)
+    chunk = b"data: callback\n\n"
+    assert flow.response.stream(chunk) is chunk
+    assert not entered.is_set()
+    drain_thread = threading.Thread(target=addon.drain)
+    drain_thread.start()
+    assert entered.wait(timeout=1)
+    release.set()
+    drain_thread.join(timeout=1)
+    assert not drain_thread.is_alive()
+
+
+def test_partial_response_error_finishes_response_and_disables_late_stream_chunks() -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    flow = fake_flow()
+    addon.requestheaders(flow)
+    addon.responseheaders(flow)
+    callback = flow.response.stream
+    chunk = b"data: partial\n\n"
+    assert callback(chunk) is chunk
+    addon.error(flow)
+    late = b"data: late\n\n"
+    assert callback(late) is late
+    messages = payloads(addon)
+    states = lifecycle_states(messages)
+    assert states[-6:] == [
+        "response_body",
+        "request_body",
+        "request_end",
+        "response_end",
+        "error",
+        "flow_completed",
+    ]
+    response_end = next(
+        index
+        for index, message in enumerate(messages)
+        if message.get("type") == "flow.lifecycle" and message.get("state") == "response_end"
+    )
+    body_end = [
+        index
+        for index, message in enumerate(messages)
+        if message.get("type") == "body.end" and message.get("body_side") == "response"
+    ]
+    assert body_end and body_end[0] < response_end
+    chunks = [
+        message
+        for message in messages
+        if message.get("type") == "body.chunk" and message.get("body_side") == "response"
+    ]
+    assert len(chunks) == 1
+    assert addon.counters["active_prefix_bytes"] == 0
+
+
+def test_sink_emits_a_final_gap_without_a_later_retained_message() -> None:
+    sink = BoundedMessageSink(max_pending=1)
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.first"}))
+    assert not sink.offer(parse_message({"protocol_version": "1", "type": "future.dropped"}))
+    first_drain = sink.drain()
+    assert [
+        (message.message if isinstance(message, KnownParsedMessage) else message.payload)["type"]
+        for message in first_drain
+    ] == ["future.first", "stream.gap"]
+    gap = first_drain[-1]
+    assert isinstance(gap, KnownParsedMessage)
+    assert gap.message["expected_sequence"] == "1"
+    assert gap.message["actual_sequence"] == "3"
+    assert sink.drain() == []
+
+
+def test_concurrent_drop_events_are_emitted_once_in_one_resyncable_gap() -> None:
+    sink = BoundedMessageSink(max_pending=1)
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.first"}))
+    workers = [
+        threading.Thread(
+            target=sink.offer,
+            args=(parse_message({"protocol_version": "1", "type": f"future.drop.{index}"}),),
+        )
+        for index in range(64)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    messages = sink.drain()
+    gaps = [
+        message
+        for message in messages
+        if isinstance(message, KnownParsedMessage) and message.message["type"] == "stream.gap"
+    ]
+    assert len(gaps) == 1
+    assert gaps[0].message["dropped_count"] == "64"
+    assert sink.dropped_count == 64
+    assert sink.drain() == []
+
+
+def test_active_flow_bounds_evict_zero_body_flood_with_tombstones_and_gaps() -> None:
+    config = CaptureConfig(
+        source_id="source",
+        max_body_prefix_bytes=0,
+        max_in_memory_bytes=1,
+        max_pending_messages=1,
+    )
+    addon = CaptureAddon(config=config, max_active_flows=1, clock=lambda: "now")
+    for index in range(1_000):
+        addon.requestheaders(fake_flow(f"flood-{index}"))
+        assert addon.counters["active_flows"] <= 1
+        assert addon.counters["active_metadata_bytes"] <= 1
+    messages = payloads(addon)
+    assert addon.counters["active_flows"] == 0
+    assert addon.counters["evicted_flows"] == 1_000
+    assert any(message["type"] == "stream.gap" for message in messages)
+
+
+def test_active_flow_age_bound_tombstones_stale_incomplete_flow() -> None:
+    now = [0.0]
+    addon = CaptureAddon(
+        max_active_age_seconds=5,
+        active_clock=lambda: now[0],
+        clock=lambda: "now",
+    )
+    addon.requestheaders(fake_flow("stale"))
+    now[0] = 5.0
+    addon.requestheaders(fake_flow("fresh"))
+    assert addon.counters["evicted_flows"] == 1
+    assert addon.counters["active_flows"] == 1
+    assert "stale" in addon._completed_ids
+
+
+def test_redaction_rejects_str_subclass_before_authorization_coercion() -> None:
+    called = False
+
+    class HostileString(str):
+        def __str__(self) -> str:
+            nonlocal called
+            called = True
+            raise AssertionError("hostile __str__ must not run")
+
+    addon = CaptureAddon(clock=lambda: "now")
+    flow = fake_flow()
+    flow.request.headers = FakeHeaders({"Authorization": HostileString("secret")})
+    with pytest.raises(ValueError, match="exact str or bytes"):
+        addon.requestheaders(flow)
+    assert not called
+
+
 def test_module_addon_load_parses_valid_environment_without_ipc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -555,3 +712,144 @@ def test_newest_first_tracks_coalesced_message_order_exactly() -> None:
         for message in newest
         if isinstance(message, KnownParsedMessage)
     ] == ["flow.metadata", "flow.metadata", "flow.lifecycle"]
+
+
+def test_max_messages_one_never_leaves_an_orphaned_active_record() -> None:
+    store = MemoryStore(max_messages=1, max_messages_per_flow=10)
+    for index in range(20):
+        store.append(
+            parse_message(
+                {
+                    "protocol_version": "1",
+                    "type": "flow.lifecycle",
+                    "source_id": "s",
+                    "flow_id": "one",
+                    "event_id": f"event-{index}",
+                    "occurred_at": "now",
+                    "sequence": str(index),
+                    "state": "request_started",
+                }
+            )
+        )
+        counters = store.counters
+        visible = list(store.newest_first())
+        assert counters["retained_messages"] == len(visible) == 1
+        assert counters["retained_messages"] <= store.max_messages
+
+    terminal_store = MemoryStore(max_messages=1, max_messages_per_flow=1)
+    for side in ("request", "response"):
+        terminal_store.append(
+            parse_message(
+                {
+                    "protocol_version": "1",
+                    "type": "body.end",
+                    "flow_id": "one-terminal",
+                    "body_side": side,
+                    "total_bytes": "0",
+                    "body": {"state": "empty", "size_bytes": "0"},
+                }
+            )
+        )
+        assert terminal_store.counters["retained_messages"] == 1
+        assert len(list(terminal_store.newest_first())) == 1
+
+
+def test_long_sse_stream_evicts_chunks_but_keeps_terminal_messages() -> None:
+    store = MemoryStore(max_messages=20, max_messages_per_flow=3)
+    for index in range(40):
+        store.append(
+            parse_message(
+                {
+                    "protocol_version": "1",
+                    "type": "body.chunk",
+                    "flow_id": "sse",
+                    "body_side": "response",
+                    "chunk_index": str(index),
+                    "offset_bytes": str(index),
+                    "data_base64": base64.b64encode(f"event:{index}\n\n".encode()).decode(),
+                }
+            )
+        )
+    for index, state in enumerate(("request_end", "response_end", "flow_completed")):
+        store.append(
+            parse_message(
+                {
+                    "protocol_version": "1",
+                    "type": "flow.lifecycle",
+                    "source_id": "s",
+                    "flow_id": "sse",
+                    "event_id": f"terminal-{index}",
+                    "occurred_at": "now",
+                    "sequence": str(index),
+                    "state": state,
+                }
+            )
+        )
+    for side in ("request", "response"):
+        store.append(
+            parse_message(
+                {
+                    "protocol_version": "1",
+                    "type": "body.end",
+                    "flow_id": "sse",
+                    "body_side": side,
+                    "total_bytes": "0",
+                    "body": {"state": "empty", "size_bytes": "0"},
+                }
+            )
+        )
+    retained = [
+        message.message
+        for message in store.newest_first()
+        if isinstance(message, KnownParsedMessage)
+    ]
+    assert store.counters["flow_message_evictions"] > 0
+    assert store.counters["retained_messages"] <= 20
+    assert {
+        message.get("state")
+        for message in retained
+        if message.get("type") == "flow.lifecycle"
+    } >= {
+        "request_end",
+        "response_end",
+        "flow_completed",
+    }
+    assert {
+        message.get("body_side")
+        for message in retained
+        if message.get("type") == "body.end"
+    } == {"request", "response"}
+
+
+def test_canonical_memory_budget_counts_unknown_fields_and_nested_snapshots() -> None:
+    unknown = parse_message(
+        {
+            "protocol_version": "1",
+            "type": "future.large",
+            "payload": {"unknown_blob": "x" * (1024 * 1024)},
+        }
+    )
+    store = MemoryStore(max_memory_bytes=128, max_messages=10)
+    store.append(unknown)
+    assert store.counters["retained_messages"] == 0
+    assert store.counters["memory_bytes"] == 0
+    assert store.counters["memory_budget_drops"] == 1
+
+    flows = [flow_metadata_with_body(f"flow-{index}", b"") for index in range(200)]
+    snapshot = parse_message(
+        {
+            "protocol_version": "1",
+            "type": "browser.snapshot",
+            "snapshot_id": "snapshot",
+            "cursor": "0",
+            "flows": flows,
+        }
+    )
+    store.append(snapshot)
+    assert store.counters["memory_bytes"] <= 128
+    assert store.counters["retained_messages"] == 0
+
+    sink = BoundedMessageSink(max_pending=4, max_memory_bytes=128)
+    assert not sink.offer(unknown)
+    assert not sink.offer(snapshot)
+    assert sink.memory_budget_drops == 2

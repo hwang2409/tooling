@@ -28,6 +28,7 @@ class _StoredMessage:
     created_at: float
     message: ParsedMessageResult
     body_bytes: int
+    weight: int
     key: tuple[object, ...] | None = None
 
 
@@ -40,6 +41,7 @@ class _FlowRecord:
     completed: bool = False
     completed_at: float | None = None
     completion_order: int | None = None
+    evicted_messages: int = 0
 
 
 class MemoryStore:
@@ -57,6 +59,7 @@ class MemoryStore:
         *,
         max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS,
         max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+        max_memory_bytes: int = DEFAULT_MAX_BODY_BYTES,
         max_messages: int = DEFAULT_MAX_MESSAGES,
         max_messages_per_flow: int = DEFAULT_MAX_MESSAGES_PER_FLOW,
         max_standalone_messages: int | None = None,
@@ -68,6 +71,8 @@ class MemoryStore:
             raise ValueError("max_age_seconds must not be negative")
         if max_body_bytes < 0:
             raise ValueError("max_body_bytes must not be negative")
+        if max_memory_bytes < 0:
+            raise ValueError("max_memory_bytes must not be negative")
         if max_messages < 1:
             raise ValueError("max_messages must be positive")
         if max_messages_per_flow < 1:
@@ -77,6 +82,7 @@ class MemoryStore:
         self.max_items = max_items
         self.max_age_seconds = max_age_seconds
         self.max_body_bytes = max_body_bytes
+        self.max_memory_bytes = max_memory_bytes
         self.max_messages = max_messages
         self.max_messages_per_flow = max_messages_per_flow
         self.max_standalone_messages = max_standalone_messages or max_messages
@@ -86,12 +92,14 @@ class MemoryStore:
         self._order = 0
         self._message_count = 0
         self._body_bytes = 0
+        self._memory_bytes = 0
         self._expired_flows = 0
         self._evicted_flows = 0
         self._message_evictions = 0
         self._dropped_messages = 0
         self._per_flow_drops = 0
         self._body_budget_drops = 0
+        self._memory_budget_drops = 0
 
     def append(self, message: ParsedMessage) -> None:
         """Revalidate and retain a protocol message without retaining aliases."""
@@ -104,6 +112,7 @@ class MemoryStore:
         flow_id = _flow_id_for(payload)
         self._order += 1
         body_bytes = _message_body_bytes(payload)
+        weight = _message_weight(payload)
 
         if flow_id is None:
             if len(self._standalone) >= self.max_standalone_messages:
@@ -111,11 +120,14 @@ class MemoryStore:
                 self._message_evictions += 1
             self._make_room_for_message()
             self._standalone.append(
-                _StoredMessage(self._order, now, retained, body_bytes)
+                _StoredMessage(self._order, now, retained, body_bytes, weight)
             )
             self._message_count += 1
             self._body_bytes += body_bytes
+            self._memory_bytes += weight
             self._enforce_body_budget()
+            self._enforce_memory_budget()
+            self._assert_invariants()
             return
 
         record = self._flows.get(flow_id)
@@ -127,21 +139,27 @@ class MemoryStore:
             index = record.indexes[key]
             previous = record.messages[index]
             self._body_bytes -= previous.body_bytes
-            replacement = _StoredMessage(self._order, now, retained, body_bytes, key)
+            self._memory_bytes -= previous.weight
+            replacement = _StoredMessage(self._order, now, retained, body_bytes, weight, key)
             record.messages[index] = replacement
             self._body_bytes += body_bytes
+            self._memory_bytes += weight
         else:
             if len(record.messages) >= self.max_messages_per_flow:
-                self._dropped_messages += 1
-                self._per_flow_drops += 1
-                return
-            self._make_room_for_message()
-            stored = _StoredMessage(self._order, now, retained, body_bytes, key)
+                if not self._make_room_for_flow(record, incoming_terminal=_is_terminal(retained)):
+                    self._dropped_messages += 1
+                    self._per_flow_drops += 1
+                    self._assert_invariants()
+                    return
+            else:
+                self._make_room_for_message(protected=record)
+            stored = _StoredMessage(self._order, now, retained, body_bytes, weight, key)
             if key is not None:
                 record.indexes[key] = len(record.messages)
             record.messages.append(stored)
             self._message_count += 1
             self._body_bytes += body_bytes
+            self._memory_bytes += weight
 
         if message_type == "flow.lifecycle" and payload.get("state") == "flow_completed":
             if not record.completed:
@@ -150,6 +168,8 @@ class MemoryStore:
                 record.completion_order = self._order
             self._enforce_completed_limit()
         self._enforce_body_budget()
+        self._enforce_memory_budget()
+        self._assert_invariants()
 
     def newest_first(self) -> Iterator[ParsedMessageResult]:
         """Yield independent messages in true message-newest-first order."""
@@ -177,7 +197,12 @@ class MemoryStore:
             "message_evictions": self._message_evictions,
             "dropped_messages": self._dropped_messages,
             "per_flow_drops": self._per_flow_drops,
+            "flow_message_evictions": sum(
+                record.evicted_messages for record in self._flows.values()
+            ),
             "body_budget_drops": self._body_budget_drops,
+            "memory_bytes": self._memory_bytes,
+            "memory_budget_drops": self._memory_budget_drops,
         }
 
     def clear(self) -> None:
@@ -187,6 +212,8 @@ class MemoryStore:
         self._standalone.clear()
         self._message_count = 0
         self._body_bytes = 0
+        self._memory_bytes = 0
+        self._assert_invariants()
 
     def _purge_expired(self, now: float) -> None:
         expired = [
@@ -204,6 +231,7 @@ class MemoryStore:
         ]
         for index in reversed(stale_standalone):
             self._remove_standalone(index)
+        self._assert_invariants()
 
     def _enforce_completed_limit(self) -> None:
         while sum(record.completed for record in self._flows.values()) > self.max_items:
@@ -218,17 +246,46 @@ class MemoryStore:
             self._remove_flow(oldest.flow_id)
             self._evicted_flows += 1
 
-    def _make_room_for_message(self) -> None:
+    def _make_room_for_message(self, protected: _FlowRecord | None = None) -> None:
         while self._message_count >= self.max_messages:
-            oldest = self._oldest_message()
+            oldest = self._oldest_message(exclude=protected)
+            if oldest is None and protected is not None:
+                oldest = self._oldest_message()
             if oldest is None:
                 return
             kind, owner, index = oldest
             if kind == "flow":
-                self._remove_flow_message(cast_flow(owner), index)
+                flow_owner = cast_flow(owner)
+                self._remove_flow_message(flow_owner, index, keep_empty=flow_owner is protected)
             else:
                 self._remove_standalone(index)
             self._message_evictions += 1
+
+    def _make_room_for_flow(
+        self, record: _FlowRecord, *, incoming_terminal: bool
+    ) -> bool:
+        candidates = [
+            (stored.order, index)
+            for index, stored in enumerate(record.messages)
+            if not _is_terminal(stored.message)
+        ]
+        if not candidates:
+            if not incoming_terminal:
+                return False
+            # Terminal messages are protected from per-flow chunk eviction, but
+            # the global message cap remains absolute.  If this record is the
+            # only global candidate, replace its oldest terminal atomically;
+            # never leave an empty record and append into an orphan.
+            if self._message_count >= self.max_messages:
+                self._make_room_for_message(protected=record)
+                if self._message_count >= self.max_messages:
+                    return False
+            return True
+        _, index = min(candidates)
+        self._remove_flow_message(record, index, keep_empty=True)
+        self._message_evictions += 1
+        record.evicted_messages += 1
+        return True
 
     def _enforce_body_budget(self) -> None:
         while self._body_bytes > self.max_body_bytes:
@@ -243,9 +300,24 @@ class MemoryStore:
             self._body_budget_drops += 1
             self._message_evictions += 1
 
-    def _oldest_message(self) -> tuple[str, object, int] | None:
+    def _enforce_memory_budget(self) -> None:
+        while self._memory_bytes > self.max_memory_bytes:
+            oldest = self._oldest_weighted_message()
+            if oldest is None:
+                return
+            kind, owner, index = oldest
+            if kind == "flow":
+                self._remove_flow_message(cast_flow(owner), index)
+            else:
+                self._remove_standalone(index)
+            self._memory_budget_drops += 1
+            self._message_evictions += 1
+
+    def _oldest_message(self, exclude: _FlowRecord | None = None) -> tuple[str, object, int] | None:
         candidates: list[tuple[int, str, object, int]] = []
         for record in self._flows.values():
+            if record is exclude:
+                continue
             for index, stored in enumerate(record.messages):
                 candidates.append((stored.order, "flow", record, index))
         candidates.extend(
@@ -273,28 +345,74 @@ class MemoryStore:
         _, kind, owner, index = min(candidates, key=lambda item: (item[0], item[1]))
         return kind, owner, index
 
+    def _oldest_weighted_message(self) -> tuple[str, object, int] | None:
+        candidates: list[tuple[int, str, object, int]] = []
+        for record in self._flows.values():
+            for index, stored in enumerate(record.messages):
+                candidates.append((stored.order, "flow", record, index))
+        candidates.extend(
+            (stored.order, "standalone", self._standalone, index)
+            for index, stored in enumerate(self._standalone)
+        )
+        if not candidates:
+            return None
+        _, kind, owner, index = min(candidates, key=lambda item: (item[0], item[1]))
+        return kind, owner, index
+
     def _remove_flow(self, flow_id: str) -> None:
         record = self._flows.pop(flow_id)
         self._message_count -= len(record.messages)
         self._body_bytes -= sum(stored.body_bytes for stored in record.messages)
+        self._memory_bytes -= sum(stored.weight for stored in record.messages)
 
-    def _remove_flow_message(self, record: _FlowRecord, index: int) -> None:
+    def _remove_flow_message(
+        self, record: _FlowRecord, index: int, *, keep_empty: bool = False
+    ) -> None:
         stored = record.messages.pop(index)
         self._message_count -= 1
         self._body_bytes -= stored.body_bytes
+        self._memory_bytes -= stored.weight
         record.indexes = {
             item.key: item_index
             for item_index, item in enumerate(record.messages)
             if item.key is not None
         }
-        if not record.messages:
+        if not record.messages and not keep_empty:
             self._flows.pop(record.flow_id, None)
+
+    def _assert_invariants(self) -> None:
+        visible_messages = len(self._standalone) + sum(
+            len(record.messages) for record in self._flows.values()
+        )
+        visible_body_bytes = sum(
+            stored.body_bytes
+            for stored in self._standalone
+        ) + sum(
+            stored.body_bytes
+            for record in self._flows.values()
+            for stored in record.messages
+        )
+        assert self._message_count == visible_messages
+        assert self._body_bytes == visible_body_bytes
+        visible_memory_bytes = sum(
+            stored.weight for stored in self._standalone
+        ) + sum(
+            stored.weight
+            for record in self._flows.values()
+            for stored in record.messages
+        )
+        assert self._memory_bytes == visible_memory_bytes
+        assert self._message_count <= self.max_messages
+        assert self._body_bytes <= self.max_body_bytes
+        assert self._memory_bytes <= self.max_memory_bytes
+        assert all(record.messages for record in self._flows.values())
 
     def _remove_standalone(self, index: int) -> None:
         stored = self._standalone[index]
         del self._standalone[index]
         self._message_count -= 1
         self._body_bytes -= stored.body_bytes
+        self._memory_bytes -= stored.weight
 
 
 def cast_flow(value: object) -> _FlowRecord:
@@ -328,7 +446,18 @@ def _coalescing_key(
         return ("body.end", payload.get("body_side"))
     if message_type == "body.chunk":
         return ("body.chunk", payload.get("body_side"), payload.get("chunk_index"))
+    if message_type == "flow.lifecycle":
+        return ("flow.lifecycle", payload.get("state"))
     return None
+
+
+def _is_terminal(message: ParsedMessageResult) -> bool:
+    payload = message.message if isinstance(message, KnownParsedMessage) else message.payload
+    return payload.get("type") == "body.end" or (
+        payload.get("type") == "flow.lifecycle"
+        and payload.get("state")
+        in {"request_end", "response_end", "error", "flow_completed"}
+    )
 
 
 def _message_body_bytes(payload: Mapping[str, object]) -> int:
@@ -349,6 +478,26 @@ def _message_body_bytes(payload: Mapping[str, object]) -> int:
             for change in _mappings(changes)
             if change.get("op") == "upsert"
         )
+    return 0
+
+
+def _message_weight(payload: Mapping[str, object]) -> int:
+    """Count all canonical retained data, including unknown nested fields."""
+
+    return _canonical_weight(payload)
+
+
+def _canonical_weight(value: object) -> int:
+    if value is None or isinstance(value, bool):
+        return 1
+    if isinstance(value, int | float):
+        return 8
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, Mapping):
+        return 8 + sum(len(key) + _canonical_weight(item) for key, item in value.items())
+    if isinstance(value, list | tuple):
+        return 8 + sum(_canonical_weight(item) for item in value)
     return 0
 
 
