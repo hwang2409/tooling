@@ -203,6 +203,20 @@ export function gateBodyDecode(body: InspectableBody, selected: boolean, mode: B
   return { selected: true, decoded: decodeBody(body, mode) };
 }
 
+/**
+ * Best-guess view mode for a captured body. Prefers the specialised parsers
+ * (JSON / SSE) whenever the recorded content type hints at them so the
+ * caller sees pretty output on first render, without a manual toggle.
+ */
+export function defaultBodyMode(body: InspectableBody): BodyViewMode {
+  const contentType = (body as { content_type?: string }).content_type;
+  if (typeof contentType !== "string") return "text";
+  const bare = contentType.split(";", 1)[0].trim().toLowerCase();
+  if (bare === "text/event-stream") return "sse";
+  if (bare === "application/json" || bare.endsWith("+json")) return "json";
+  return "text";
+}
+
 export function hexDump(bytes: Uint8Array): string {
   return toHex(bytes);
 }

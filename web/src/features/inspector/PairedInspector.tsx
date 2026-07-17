@@ -3,9 +3,11 @@ import type { KeyboardEvent } from "react";
 
 import type { Header } from "../../protocol";
 import { LIFECYCLE_EVENTS_PER_FLOW } from "../../state/browserState";
-import { bodyMetadata, decodeBody, type DecodedBody } from "./decoders";
+import { bodyMetadata, decodeBody, defaultBodyMode, type DecodedBody, type SseEvent } from "./decoders";
+import { JsonTree, safeParseJson } from "./jsonTree";
 import { inspectorErrorState, lifecycleLabel, lifecyclePhase, orderLifecycle, type InspectorErrorState } from "./lifecycle";
 import type { BodyPane, BodySelection, BodyViewMode, InspectableBody, InspectorBodyPanelProps, InspectorFlow, InspectorHeader, InspectorPane, InspectorProps } from "./models";
+import { flowSummary } from "./summary";
 import "../../styles/inspector.css";
 
 const useInspectorLayoutEffect = typeof document === "undefined" ? useEffect : useLayoutEffect;
@@ -81,7 +83,7 @@ function HeaderList({ headers }: { headers: readonly (Header | InspectorHeader)[
 }
 
 export function InspectorBodyPanel({ body, pane, selected, onSelect }: InspectorBodyPanelProps) {
-  const [mode, setMode] = useState<BodyViewMode>("text");
+  const [mode, setMode] = useState<BodyViewMode>(() => defaultBodyMode(body));
   const metadata = bodyMetadata(body);
   const decoded = selected ? decodeBody(body, mode) : undefined;
   const bodyId = `${useId().replaceAll(":", "")}-body-heading`;
@@ -170,6 +172,7 @@ export function InspectorBodyPanel({ body, pane, selected, onSelect }: Inspector
 }
 
 function BodyOutput({ decoded }: { decoded: DecodedBody }) {
+  const parsed = decoded.mode === "json" && decoded.fallback === "none" ? safeParseJson(decoded.text) : null;
   return (
     <div className="inspector-output-wrap">
       <div className="inspector-output-meta">
@@ -178,9 +181,58 @@ function BodyOutput({ decoded }: { decoded: DecodedBody }) {
         {decoded.invalidEncoding && <span className="inspector-output-warning">invalid UTF-8</span>}
         {decoded.fallback !== "none" && <span className="inspector-output-warning">fallback: {decoded.fallback}</span>}
       </div>
-      <pre className={`inspector-output is-${decoded.mode}`} tabIndex={0} aria-label={`${decoded.mode} body output`}>{decoded.text}</pre>
+      {parsed && parsed.ok ? (
+        <div className={`inspector-output is-${decoded.mode}`} tabIndex={0} aria-label={`${decoded.mode} body output`}>
+          <JsonTree value={parsed.value} />
+        </div>
+      ) : decoded.mode === "sse" && decoded.events !== undefined && decoded.events.length > 0 ? (
+        <div className={`inspector-output is-${decoded.mode}`} tabIndex={0} aria-label={`${decoded.mode} body output`}>
+          <SseBlocks events={decoded.events} />
+        </div>
+      ) : (
+        <pre className={`inspector-output is-${decoded.mode}`} tabIndex={0} aria-label={`${decoded.mode} body output`}>{decoded.text}</pre>
+      )}
       <p className="inspector-copy-note">Derived text is copy-ready from the focused output; raw bytes are never exported automatically.</p>
     </div>
+  );
+}
+
+function SseBlocks({ events }: { events: readonly SseEvent[] }) {
+  return (
+    <ol className="inspector-sse-list">
+      {events.map((event, index) => (
+        <SseBlock key={index} event={event} index={index} />
+      ))}
+    </ol>
+  );
+}
+
+function SseBlock({ event, index }: { event: SseEvent; index: number }) {
+  const [collapsed, setCollapsed] = useState<boolean>(index >= 3);
+  const label = `event ${String(index + 1).padStart(2, "0")}${event.event ? ` · ${event.event}` : ""}`;
+  const parsed = event.data.length > 0 ? safeParseJson(event.data) : null;
+  return (
+    <li className="inspector-sse-item">
+      <button
+        type="button"
+        className="inspector-sse-toggle"
+        aria-expanded={!collapsed}
+        onClick={() => setCollapsed((previous) => !previous)}
+      >
+        <span aria-hidden="true">{collapsed ? "+" : "−"}</span>
+        <span className="inspector-sse-label">{label}</span>
+        {event.id !== undefined && <span className="inspector-sse-meta">id: {event.id}</span>}
+        {event.retry !== undefined && <span className="inspector-sse-meta">retry: {event.retry}</span>}
+      </button>
+      {!collapsed && (
+        <div className="inspector-sse-body">
+          {parsed && parsed.ok ? <JsonTree value={parsed.value} /> : <pre className="inspector-sse-raw">{event.data || "(no data)"}</pre>}
+          {event.comments.map((comment, commentIndex) => (
+            <p key={commentIndex} className="inspector-sse-comment">: {comment}</p>
+          ))}
+        </div>
+      )}
+    </li>
   );
 }
 
@@ -289,6 +341,7 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
   };
 
   const responseBody = bodyFor(flow, "response");
+  const summaryLine = useMemo(() => flowSummary(flow), [flow]);
   return (
     <section data-testid="paired-inspector" className={`paired-inspector ${compact ? "is-compact" : ""} ${className}`.trim()} aria-labelledby={`${inspectorId}-title`}>
       <header className="inspector-header">
@@ -305,6 +358,7 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
           <code>{flow.metadata.flow_id}</code>
         </div>
       </header>
+      <p className="inspector-summary" aria-label="Flow summary">{summaryLine}</p>
 
       <div className="inspector-tabbar" role="tablist" aria-label="Exchange panes" aria-orientation="horizontal" id={`${inspectorId}-exchange-tabs`}>
         {paneOrder.map((item, index) => (
