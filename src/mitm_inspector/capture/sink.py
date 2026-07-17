@@ -29,6 +29,7 @@ from mitm_inspector.protocol import (
 )
 
 MAX_LOSS_RANGES = 256
+_UNSCOPED_OWNER = object()
 
 
 @dataclass(frozen=True)
@@ -69,21 +70,21 @@ class _ReservationGate:
 
     def __init__(self) -> None:
         self._condition = Condition(Lock())
-        self._owned = False
+        self._owner: object | None = None
 
-    def acquire(self, blocking: bool = True) -> bool:
+    def acquire(self, blocking: bool = True, owner: object | None = None) -> bool:
         if blocking:
             with self._condition:
-                while self._owned:
+                while self._owner is not None:
                     self._condition.wait()
-                self._owned = True
+                self._owner = _UNSCOPED_OWNER if owner is None else owner
                 return True
         if not self._condition.acquire(False):
             return False
         try:
-            if self._owned:
+            if self._owner is not None:
                 return False
-            self._owned = True
+            self._owner = _UNSCOPED_OWNER if owner is None else owner
             return True
         finally:
             self._condition.release()
@@ -92,11 +93,13 @@ class _ReservationGate:
         if not self.release_if_owned():
             raise RuntimeError("reservation gate is not owned")
 
-    def release_if_owned(self) -> bool:
+    def release_if_owned(self, owner: object | None = None) -> bool:
         with self._condition:
-            if not self._owned:
+            if self._owner is None or (
+                owner is not None and self._owner is not owner
+            ):
                 return False
-            self._owned = False
+            self._owner = None
             self._condition.notify()
             return True
 
@@ -110,11 +113,11 @@ class _ReservationLease:
 
     def acquire(self, blocking: bool = False) -> bool:
         try:
-            acquired = self._gate.acquire(blocking)
+            acquired = self._gate.acquire(blocking, self)
         except BaseException:
             for _ in range(2):
                 try:
-                    if not self._gate.release_if_owned():
+                    if not self._gate.release_if_owned(self):
                         break
                 except BaseException:
                     continue
@@ -128,14 +131,14 @@ class _ReservationLease:
             return None
         self.phase = _OwnershipPhase.RELEASING
         try:
-            if not self._gate.release_if_owned():
+            if not self._gate.release_if_owned(self):
                 raise RuntimeError("owned reservation was already released")
         except BaseException as error:
             # The gate clears ownership before notification, so a release
             # exception cannot strand the gate.  One bounded retry handles an
             # exception injected immediately before or after the clear.
             try:
-                self._gate.release_if_owned()
+                self._gate.release_if_owned(self)
             except BaseException:
                 pass
             self.phase = _OwnershipPhase.RELEASED
@@ -205,6 +208,7 @@ class _DrainPhase(Enum):
     SNAPSHOTTED = auto()
     ITEMS_DETACHED = auto()
     RANGES_DETACHED = auto()
+    DETACH_LOCKS_RELEASED = auto()
     RESERVATION_RELEASED = auto()
     MATERIALIZED = auto()
     ROLLED_BACK = auto()
@@ -555,6 +559,7 @@ class BoundedMessageSink:
                     phase = _DrainPhase.RANGES_DETACHED
                     self._loss_resync_active = False
                     ranges = _normalize_ranges(removed_ranges)
+                phase = _DrainPhase.DETACH_LOCKS_RELEASED
             except BaseException as error:
                 queue_primary = error
                 raise
@@ -576,6 +581,7 @@ class BoundedMessageSink:
                 if rollback_queue.acquire(blocking=True):
                     try:
                         if phase in {
+                            _DrainPhase.DETACH_LOCKS_RELEASED,
                             _DrainPhase.RESERVATION_RELEASED,
                             _DrainPhase.MATERIALIZED,
                         }:
@@ -597,6 +603,7 @@ class BoundedMessageSink:
                         rollback_queue.close()
                     with self._loss_lock:
                         if phase in {
+                            _DrainPhase.DETACH_LOCKS_RELEASED,
                             _DrainPhase.RESERVATION_RELEASED,
                             _DrainPhase.MATERIALIZED,
                         }:
@@ -693,10 +700,16 @@ class BoundedMessageSink:
         lease = _ReservationLease(self._lock)
         if not lease.acquire(blocking=True):
             return 0
+        primary: BaseException | None = None
         try:
             return len(self._items)
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            lease.close()
+            close_error = lease.close()
+            if primary is None and close_error is not None:
+                raise close_error
 
     @property
     def body_budget_drops(self) -> int:

@@ -558,8 +558,10 @@ def test_reservation_acquire_baseexception_after_ownership_is_recoverable(
     sink = BoundedMessageSink()
     original_acquire = sink._reservation_lock.acquire
 
-    def interrupt_after_acquire(blocking: bool = True) -> bool:
-        acquired = original_acquire(blocking)
+    def interrupt_after_acquire(
+        blocking: bool = True, owner: object | None = None
+    ) -> bool:
+        acquired = original_acquire(blocking, owner)
         if acquired:
             raise KeyboardInterrupt
         return acquired
@@ -577,6 +579,30 @@ def test_reservation_acquire_baseexception_after_ownership_is_recoverable(
     assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
 
 
+def test_interrupted_acquire_cleanup_cannot_release_another_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    holder = sink_module._ReservationLease(sink._reservation_lock)
+    waiter = sink_module._ReservationLease(sink._reservation_lock)
+    assert holder.acquire()
+    original_acquire = sink._reservation_lock.acquire
+
+    def interrupt_before_acquire(
+        blocking: bool = False, owner: object | None = None
+    ) -> bool:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink._reservation_lock, "acquire", interrupt_before_acquire)
+    with pytest.raises(KeyboardInterrupt):
+        waiter.acquire()
+    monkeypatch.undo()
+
+    assert holder.close() is None
+    assert original_acquire(False)
+    sink._reservation_lock.release()
+
+
 def test_reservation_release_baseexception_before_and_after_clear_is_recoverable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -584,12 +610,12 @@ def test_reservation_release_baseexception_before_and_after_clear_is_recoverable
     original_release = sink._reservation_lock.release_if_owned
     calls = 0
 
-    def interrupt_once() -> bool:
+    def interrupt_once(owner: object | None = None) -> bool:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise KeyboardInterrupt
-        return original_release()
+        return original_release(owner)
 
     monkeypatch.setattr(sink._reservation_lock, "release_if_owned", interrupt_once)
     with pytest.raises(KeyboardInterrupt):
@@ -600,8 +626,8 @@ def test_reservation_release_baseexception_before_and_after_clear_is_recoverable
 
     original_release = sink._reservation_lock.release_if_owned
 
-    def release_then_interrupt() -> bool:
-        original_release()
+    def release_then_interrupt(owner: object | None = None) -> bool:
+        original_release(owner)
         raise KeyboardInterrupt
 
     monkeypatch.setattr(sink._reservation_lock, "release_if_owned", release_then_interrupt)
@@ -619,8 +645,10 @@ def test_queue_lock_ownership_boundaries_do_not_strand_slot_or_drain(
     sink = BoundedMessageSink(max_pending=2)
     original_acquire = sink._lock.acquire
 
-    def interrupt_after_queue_acquire(blocking: bool = True) -> bool:
-        acquired = original_acquire(blocking)
+    def interrupt_after_queue_acquire(
+        blocking: bool = True, owner: object | None = None
+    ) -> bool:
+        acquired = original_acquire(blocking, owner)
         if acquired:
             raise KeyboardInterrupt
         return acquired
@@ -634,8 +662,8 @@ def test_queue_lock_ownership_boundaries_do_not_strand_slot_or_drain(
 
     original_release = sink._lock.release_if_owned
 
-    def release_queue_then_interrupt() -> bool:
-        original_release()
+    def release_queue_then_interrupt(owner: object | None = None) -> bool:
+        original_release(owner)
         raise KeyboardInterrupt
 
     monkeypatch.setattr(sink._lock, "release_if_owned", release_queue_then_interrupt)
@@ -819,13 +847,13 @@ def test_keyboard_interrupt_during_drain_reservation_release_restores_transactio
     original_release = sink._reservation_lock.release_if_owned
     calls = 0
 
-    def release_then_interrupt() -> bool:
+    def release_then_interrupt(owner: object | None = None) -> bool:
         nonlocal calls
         calls += 1
         if calls > 1:
-            return original_release()
+            return original_release(owner)
         if after_clear:
-            original_release()
+            original_release(owner)
         raise KeyboardInterrupt
 
     monkeypatch.setattr(sink._reservation_lock, "release_if_owned", release_then_interrupt)
@@ -844,6 +872,69 @@ def test_keyboard_interrupt_during_drain_reservation_release_restores_transactio
         sink._last_delivered_position,
     ) == before
     assert len(sink.drain()) == 1
+
+
+def test_drain_release_failure_merges_loss_recorded_after_detachment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.first"}))
+    original_release = sink._lock.release_if_owned
+    calls = 0
+
+    def release_queue_and_record_loss(owner: object | None = None) -> bool:
+        nonlocal calls
+        calls += 1
+        released = original_release(owner)
+        if calls == 1:
+            assert sink.record_loss()
+            raise KeyboardInterrupt
+        return released
+
+    monkeypatch.setattr(sink._lock, "release_if_owned", release_queue_and_record_loss)
+    with pytest.raises(KeyboardInterrupt):
+        sink.drain()
+    assert sink._next_position_value == 3
+    assert sink.dropped_count == 1
+    assert sink.loss_range_count == 1
+    monkeypatch.undo()
+
+    messages = sink.drain()
+    types = [
+        (message.message if isinstance(message, KnownParsedMessage) else message.payload)["type"]
+        for message in messages
+    ]
+    assert types == ["future.first", "stream.gap"]
+    gap = messages[-1]
+    assert isinstance(gap, KnownParsedMessage)
+    assert gap.message["expected_sequence"] == "1"
+    assert gap.message["actual_sequence"] == "3"
+
+
+def test_pending_count_propagates_lease_close_error_and_releases_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.pending"}))
+    original_release = sink._lock.release_if_owned
+    calls = 0
+
+    def release_then_interrupt(owner: object | None = None) -> bool:
+        nonlocal calls
+        calls += 1
+        released = original_release(owner)
+        if calls == 1:
+            raise KeyboardInterrupt
+        return released
+
+    monkeypatch.setattr(sink._lock, "release_if_owned", release_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        _ = sink.pending_count
+    monkeypatch.undo()
+
+    assert sink.pending_count == 1
+    assert sink._lock.acquire(False)
+    sink._lock.release()
 
 
 def test_keyboard_interrupt_during_loss_detachment_restores_all_ranges() -> None:
