@@ -9,7 +9,8 @@
     "build": "tsc -b && vite build",
     "lint": "eslint src",
     "typecheck": "tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.node.json",
-    "test": "vitest",
+    "test": "vitest --run && npm run test:e2e --",
+    "test:e2e": "npm run build && uv run --python 3.12 python tests/inspector_responsive.py --",
     "preview": "vite preview"
   },
   "dependencies": {
