@@ -1,0 +1,119 @@
+[
+  {
+    "protocol_version": "1",
+    "type": "source.hello",
+    "source_id": "synthetic-source-01",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "capabilities": {"body_chunks": true, "redaction": "headers-and-query"},
+    "limits": {"max_body_prefix_bytes": "1048576", "max_in_memory_bytes": "134217728"},
+    "future_additive_field": "accepted"
+  },
+  {
+    "protocol_version": "1",
+    "type": "flow.metadata",
+    "metadata": {
+      "flow_id": "flow-001",
+      "method": "POST",
+      "scheme": "https",
+      "host": "api.example.test",
+      "port": "443",
+      "path": "/v1/messages",
+      "request_headers": [
+        {"name": "content-type", "value": "application/json"},
+        {"name": "x-trace", "value": "first"},
+        {"name": "x-trace", "value": "second"},
+        {"name": "authorization", "value": "[REDACTED]"},
+        {"name": "x-api-key", "value": "[REDACTED]"},
+        {"name": "cookie", "value": "[REDACTED]"}
+      ],
+      "request_body": {"state": "captured", "size_bytes": "17", "encoding": "base64", "data": "eyJzdHJlYW0iOnRydWV9"},
+      "response_headers": [
+        {"name": "content-type", "value": "text/event-stream"},
+        {"name": "x-trace", "value": "response"}
+      ],
+      "response_body": {"state": "missing"}
+    }
+  },
+  {
+    "protocol_version": "1",
+    "type": "flow.lifecycle",
+    "source_id": "synthetic-source-01",
+    "flow_id": "flow-001",
+    "event_id": "event-response-start",
+    "occurred_at": "2026-01-01T00:00:01Z",
+    "sequence": "2",
+    "state": "response_started"
+  },
+  {
+    "protocol_version": "1",
+    "type": "flow.lifecycle",
+    "source_id": "synthetic-source-01",
+    "flow_id": "flow-001",
+    "event_id": "event-request-end",
+    "occurred_at": "2026-01-01T00:00:02Z",
+    "sequence": "3",
+    "state": "request_end"
+  },
+  {
+    "protocol_version": "1",
+    "type": "body.chunk",
+    "flow_id": "flow-001",
+    "body_side": "response",
+    "chunk_index": "0",
+    "offset_bytes": "0",
+    "data_base64": "ZGF0YTogW1JFREFDVEVEXQ=="
+  },
+  {
+    "protocol_version": "1",
+    "type": "body.end",
+    "flow_id": "flow-001",
+    "body_side": "response",
+    "total_bytes": "1024",
+    "body": {"state": "truncated", "size_bytes": "1024", "captured_bytes": "16", "encoding": "base64", "data": "ZGF0YTogW1JFREFDVEVEXQ=="}
+  },
+  {
+    "protocol_version": "1",
+    "type": "browser.snapshot",
+    "snapshot_id": "snapshot-001",
+    "cursor": "7",
+    "flows": [
+      {
+        "flow_id": "flow-001",
+        "method": "POST",
+        "scheme": "https",
+        "host": "api.example.test",
+        "port": "443",
+        "path": "/v1/messages",
+        "request_headers": [{"name": "x-trace", "value": "first"}, {"name": "x-trace", "value": "second"}],
+        "request_body": {"state": "empty", "size_bytes": "0"},
+        "response_body": {"state": "truncated", "size_bytes": "1024", "captured_bytes": "16", "encoding": "base64", "data": "ZGF0YTogW1JFREFDVEVEXQ=="}
+      }
+    ]
+  },
+  {
+    "protocol_version": "1",
+    "type": "browser.delta",
+    "cursor": "8",
+    "changes": [{"op": "remove", "flow_id": "flow-001"}],
+    "unknown_additive_field": {"safe": true}
+  },
+  {
+    "protocol_version": "1",
+    "type": "stream.gap",
+    "expected_sequence": "9",
+    "actual_sequence": "11",
+    "dropped_count": "1"
+  },
+  {
+    "protocol_version": "1",
+    "type": "browser.resync",
+    "reason": "cursor_gap",
+    "requested_cursor": "8"
+  },
+  {
+    "protocol_version": "1",
+    "type": "future.message",
+    "future_additive_field": true,
+    "sequence": "9007199254740993"
+  }
+]

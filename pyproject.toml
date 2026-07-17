@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mitm-inspector"
+version = "0.1.0"
+description = "A local, read-only mitmproxy traffic inspector foundation"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+dependencies = [
+  "mitmproxy>=12.2,<12.3",
+]
+
+[project.scripts]
+mitm-inspector = "mitm_inspector.runtime.cli:main"
+
+[dependency-groups]
+dev = [
+  "mypy>=1.16,<2",
+  "pytest>=8.4,<9",
+  "ruff>=0.12,<0.13",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mitm_inspector"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["mitm_inspector"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

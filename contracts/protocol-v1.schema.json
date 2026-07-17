@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mitm-inspector.local/contracts/protocol-v1.schema.json",
+  "title": "mitm-inspector protocol v1",
+  "description": "Project-owned, read-only messages. Unknown additive fields are allowed.",
+  "type": "object",
+  "required": ["protocol_version", "type"],
+  "properties": {
+    "protocol_version": {"const": "1"},
+    "type": {"type": "string", "minLength": 1}
+  },
+  "allOf": [
+    {"if": {"properties": {"type": {"const": "source.hello"}}}, "then": {"required": ["source_id", "occurred_at"]}},
+    {"if": {"properties": {"type": {"const": "flow.metadata"}}}, "then": {"required": ["metadata"]}},
+    {"if": {"properties": {"type": {"const": "flow.lifecycle"}}}, "then": {"required": ["source_id", "flow_id", "event_id", "occurred_at", "sequence", "state"]}},
+    {"if": {"properties": {"type": {"const": "body.chunk"}}}, "then": {"required": ["flow_id", "body_side", "chunk_index", "offset_bytes", "data_base64"]}},
+    {"if": {"properties": {"type": {"const": "body.end"}}}, "then": {"required": ["flow_id", "body_side", "total_bytes", "body"]}},
+    {"if": {"properties": {"type": {"const": "stream.gap"}}}, "then": {"required": ["expected_sequence", "actual_sequence"]}},
+    {"if": {"properties": {"type": {"const": "browser.snapshot"}}}, "then": {"required": ["snapshot_id", "cursor", "flows"]}},
+    {"if": {"properties": {"type": {"const": "browser.delta"}}}, "then": {"required": ["cursor", "changes"]}},
+    {"if": {"properties": {"type": {"const": "browser.resync"}}}, "then": {"required": ["reason", "requested_cursor"]}}
+  ],
+  "$defs": {
+    "decimalString": {"type": "string", "pattern": "^(0|[1-9][0-9]*)$"},
+    "header": {
+      "type": "object",
+      "required": ["name", "value"],
+      "properties": {"name": {"type": "string"}, "value": {"type": "string"}}
+    },
+    "body": {
+      "type": "object",
+      "required": ["state"],
+      "properties": {
+        "state": {"enum": ["missing", "empty", "captured", "truncated"]},
+        "size_bytes": {"$ref": "#/$defs/decimalString"},
+        "captured_bytes": {"$ref": "#/$defs/decimalString"},
+        "content_type": {"type": "string"},
+        "encoding": {"const": "base64"},
+        "data": {"type": "string"}
+      }
+    },
+    "flow": {
+      "type": "object",
+      "required": ["flow_id", "method", "scheme", "host", "port", "path", "request_headers", "request_body"],
+      "properties": {
+        "flow_id": {"type": "string"},
+        "method": {"type": "string"},
+        "scheme": {"type": "string"},
+        "host": {"type": "string"},
+        "port": {"$ref": "#/$defs/decimalString"},
+        "path": {"type": "string"},
+        "request_headers": {"type": "array", "items": {"$ref": "#/$defs/header"}},
+        "response_headers": {"type": "array", "items": {"$ref": "#/$defs/header"}},
+        "request_body": {"$ref": "#/$defs/body"},
+        "response_body": {"$ref": "#/$defs/body"}
+      }
+    }
+  }
+}
