@@ -34,7 +34,7 @@ npm install --prefix web                             # pass; generated lockfile
 npm ci --prefix web                                  # pass; 221 packages
 npm run lint --prefix web                            # pass
 npm run typecheck --prefix web                       # pass; app + node projects explicitly checked
-npm test --prefix web -- --run                       # pass, 11 tests
+npm test --prefix web -- --run                       # pass, 13 tests
 npm run build --prefix web                           # pass; Vite production bundle
 
 python3 -m json.tool contracts/protocol-v1.schema.json >/dev/null  # pass

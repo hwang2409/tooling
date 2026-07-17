@@ -117,6 +117,52 @@ describe("shared protocol-v1 conformance", () => {
     expect(requireParsedProtocolMessage(parsedOpaque)).toBe(parsedOpaque);
   });
 
+  it("canonicalizes a known message once before validation and branding", () => {
+    let reads = 0;
+    const raw: Record<string, unknown> = {
+      protocol_version: "1",
+      type: "body.chunk",
+      flow_id: "f",
+      chunk_index: "0",
+      offset_bytes: "0",
+      data_base64: "",
+    };
+    Object.defineProperty(raw, "body_side", {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return reads === 1 ? "request" : "sideways";
+      },
+    });
+
+    const parsed = parseProtocolMessage(raw);
+    expect(reads).toBe(1);
+    expect(parsed.kind).toBe("known");
+    if (parsed.kind !== "known") throw new Error("expected known message");
+    expect(parsed.message.body_side).toBe("request");
+    expect(requireParsedProtocolMessage(parsed)).toBe(parsed);
+  });
+
+  it("canonicalizes an unknown discriminator once before opaque branding", () => {
+    let reads = 0;
+    const raw: Record<string, unknown> = { protocol_version: "1" };
+    Object.defineProperty(raw, "type", {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return reads === 1 ? "future.accessor" : "body.chunk";
+      },
+    });
+
+    const parsed = parseProtocolMessage(raw);
+    expect(reads).toBe(1);
+    expect(parsed.kind).toBe("unknown");
+    if (parsed.kind !== "unknown") throw new Error("expected unknown message");
+    expect(parsed.original_type).toBe("future.accessor");
+    expect(parsed.payload.type).toBe("future.accessor");
+    expect(requireParsedProtocolMessage(parsed)).toBe(parsed);
+  });
+
   it.each([
     { kind: "known", message: { protocol_version: "1", type: "source.hello" } },
     {

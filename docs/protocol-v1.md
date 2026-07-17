@@ -21,6 +21,9 @@ Before validation or type discrimination, every accepted mapping key and JSON
 string is copied to an exact built-in `str`; numeric subclasses are rejected.
 Containers are copied to exact built-in `dict`/`list` values, normalized-key
 collisions are rejected, and only then is the message validated and frozen.
+The browser parser likewise creates one deeply frozen plain-JSON graph before
+validation and brands that same graph, so accessors cannot change values
+between validation and envelope creation.
 Store reads create another fully revalidated wrapper, so a caller can never
 mutate retained state through an object returned by `newest_first()`.
 

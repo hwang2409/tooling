@@ -254,7 +254,7 @@ function freezeJson(
   }
 }
 
-function freezeJsonObject(value: Record<string, unknown>): FrozenJsonObject {
+function freezeJsonObject(value: unknown): FrozenJsonObject {
   const frozen = freezeJson(value, "message");
   if (Array.isArray(frozen) || frozen === null || typeof frozen !== "object") {
     throw new ProtocolError("message must be an object");
@@ -419,7 +419,8 @@ function streamGap(message: Record<string, unknown>): void {
 
 /** Validate, deep-copy, and recursively freeze a protocol-v1 message. */
 export function parseProtocolMessage(value: unknown): ParsedMessage {
-  const message = record(value, "message");
+  const frozenMessage = freezeJsonObject(value);
+  const message = record(frozenMessage, "message");
   if (message.protocol_version !== "1") throw new ProtocolError("protocol_version must be '1'");
   const type = stringValue(message.type, "type");
 
@@ -460,7 +461,6 @@ export function parseProtocolMessage(value: unknown): ParsedMessage {
     decimalValue(message.requested_cursor, "requested_cursor");
   }
 
-  const frozenMessage = freezeJsonObject(message);
   if (knownTypes.has(type)) return knownEnvelope(frozenMessage);
   return opaqueEnvelope(type, frozenMessage);
 }
