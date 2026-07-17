@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from mitm_inspector.api.limits import MAX_INGEST_BODY_PREFIX_BYTES
 from mitm_inspector.runtime.cli import default_supervisor_factory, main
 from mitm_inspector.runtime.commands import (
     ProcessSpec,
@@ -295,11 +296,15 @@ def test_oversized_timeout_is_a_runtime_config_error(tmp_path: Path) -> None:
     "max_pending_messages",
 ])
 def test_integer_caps_are_uint64_bounded(tmp_path: Path, field: str) -> None:
-    accepted: dict[str, object] = {field: MAX_UINT64}
+    accepted_value = MAX_UINT64
+    accepted: dict[str, object] = {}
     if field == "max_body_prefix_bytes":
+        # The body prefix is additionally bounded by the ingest line capacity.
+        accepted_value = MAX_INGEST_BODY_PREFIX_BYTES
         accepted["max_body_bytes"] = MAX_UINT64
+    accepted[field] = accepted_value
     config = runtime_config(tmp_path, **accepted)
-    assert getattr(config, field) == MAX_UINT64
+    assert getattr(config, field) == accepted_value
     rejected = dict(accepted)
     rejected[field] = MAX_UINT64 + 1
     with pytest.raises(RuntimeConfigError, match="unsigned 64-bit"):
@@ -1309,3 +1314,20 @@ def test_app_server_module_serves_health_and_stops_on_sigterm() -> None:
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5.0)
+
+
+def test_capture_ipc_bounds_prefix_to_the_ingest_line_capacity() -> None:
+    CaptureIPCConfig(
+        max_body_prefix_bytes=MAX_INGEST_BODY_PREFIX_BYTES,
+        max_in_memory_bytes=MAX_INGEST_BODY_PREFIX_BYTES * 4,
+    )
+    with pytest.raises(RuntimeConfigError):
+        CaptureIPCConfig(
+            max_body_prefix_bytes=MAX_INGEST_BODY_PREFIX_BYTES + 1,
+            max_in_memory_bytes=MAX_INGEST_BODY_PREFIX_BYTES * 4,
+        )
+    with pytest.raises(RuntimeConfigError):
+        RuntimeConfig(
+            max_body_prefix_bytes=MAX_INGEST_BODY_PREFIX_BYTES + 1,
+            max_body_bytes=MAX_INGEST_BODY_PREFIX_BYTES * 4,
+        )

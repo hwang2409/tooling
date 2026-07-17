@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from mitm_inspector.api.limits import MAX_INGEST_BODY_PREFIX_BYTES
+
 
 class RuntimeConfigError(ValueError):
     """Raised when a runtime setting would make the local boundary unsafe."""
@@ -283,6 +285,13 @@ class CaptureIPCConfig:
         if self.max_body_prefix_bytes > self.max_in_memory_bytes:
             raise RuntimeConfigError(
                 "capture max_body_prefix_bytes cannot exceed max_in_memory_bytes"
+            )
+        if self.max_body_prefix_bytes > MAX_INGEST_BODY_PREFIX_BYTES:
+            # Two base64 body prefixes plus the metadata envelope must fit
+            # one bounded ingest line, or every large flow would drop the
+            # producer connection.
+            raise RuntimeConfigError(
+                "capture max_body_prefix_bytes exceeds the bounded ingest line capacity"
             )
 
     @property

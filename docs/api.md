@@ -78,8 +78,11 @@ unchanged.  The only surface that carries body bytes is
 When `--capture-socket` is provided the server binds the runtime-allocated
 endpoint (mode `0600` inside the mode-`0700` run directory) and accepts
 newline-delimited JSON, one protocol-v1 message per line, at most 8 MiB per
-line.  Parsing is strict: duplicate object keys and non-finite numbers are
-rejected.  Ingest is fail-closed — a malformed line, an invalid protocol
+line.  Both the runtime and the app configuration reject a
+`max_body_prefix_bytes` whose two base64 body prefixes plus the metadata
+envelope could exceed one bounded line (`api/limits.py`), so a legal capture
+configuration can never produce lines the listener would drop.  Parsing is
+strict: duplicate object keys and non-finite numbers are rejected.  Ingest is fail-closed — a malformed line, an invalid protocol
 message, or an out-of-bounds number drops that producer connection and
 increments `rejected_ingest_lines`; accepted messages are revalidated,
 deep-copied, appended to the bounded store, relayed per the rules above, and

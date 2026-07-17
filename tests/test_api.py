@@ -29,6 +29,10 @@ from mitm_inspector.api.httpwire import (
     parse_request_head,
     websocket_accept_key,
 )
+from mitm_inspector.api.limits import (
+    MAX_INGEST_BODY_PREFIX_BYTES,
+    MAX_INGEST_LINE_BYTES,
+)
 from mitm_inspector.api.projection import (
     collect_grid_flows,
     diff_grid_changes,
@@ -1341,5 +1345,72 @@ def test_sweep_task_publishes_expiry_without_traffic(tmp_path: Path) -> None:
             await client.close()
         finally:
             await server.close()
+
+    run_async(scenario)
+
+
+def test_server_config_bounds_prefix_to_the_ingest_line_capacity() -> None:
+    ApiServerConfig(max_body_prefix_bytes=MAX_INGEST_BODY_PREFIX_BYTES)
+    with pytest.raises(ApiServerError):
+        ApiServerConfig(max_body_prefix_bytes=MAX_INGEST_BODY_PREFIX_BYTES + 1)
+
+
+def test_two_max_prefix_bodies_fit_one_bounded_ingest_line() -> None:
+    prefix = b"x" * MAX_INGEST_BODY_PREFIX_BYTES
+    descriptor = captured_body(prefix)
+    message = metadata_message(request_body=descriptor)
+    metadata = message["metadata"]
+    assert isinstance(metadata, dict)
+    metadata["response_headers"] = [
+        {"name": f"x-header-{index}", "value": "v" * 128} for index in range(128)
+    ]
+    metadata["response_body"] = dict(descriptor)
+    parse_message(message)
+    line = json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n"
+    assert len(line) <= MAX_INGEST_LINE_BYTES
+    assert parse_ingest_line(line) == message
+
+
+async def _peer_saw_close(reader: asyncio.StreamReader) -> bool:
+    try:
+        return await reader.read(1024) == b""
+    except ConnectionError:
+        return True
+
+
+def test_close_terminates_connected_websocket_and_ingest_peers(
+    socket_dir: Path,
+) -> None:
+    async def scenario() -> None:
+        server = make_server(socket_dir)
+        await server.start()
+        socket_path = server.config.capture_socket
+        assert socket_path is not None
+        client, _head = await WsClient.connect(server.bound_port)
+        assert client is not None
+        for _ in range(3):
+            await client.read_message()
+        ingest_reader, ingest_writer = await asyncio.open_unix_connection(
+            str(socket_path)
+        )
+        await wait_until(lambda: server.counters["ingest_connections"] == 1)
+        assert server.application.subscriber_count == 1
+
+        # Regression: Server.wait_closed() waits for active connection
+        # handlers, so close() previously hung forever while a WebSocket
+        # client or ingest producer stayed connected.
+        await asyncio.wait_for(server.close(), timeout=5.0)
+
+        # wait_closed() releases on transport teardown; handler finalizers
+        # (subscriber cleanup) run within the next loop ticks.
+        await wait_until(lambda: server.application.subscriber_count == 0)
+        assert await asyncio.wait_for(_peer_saw_close(client.reader), timeout=5.0)
+        assert await asyncio.wait_for(_peer_saw_close(ingest_reader), timeout=5.0)
+        await client.close()
+        ingest_writer.close()
+        try:
+            await ingest_writer.wait_closed()
+        except ConnectionError:
+            pass
 
     run_async(scenario)

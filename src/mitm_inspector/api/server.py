@@ -41,6 +41,10 @@ from mitm_inspector.api.httpwire import (
     parse_request_head,
     websocket_accept_key,
 )
+from mitm_inspector.api.limits import (
+    MAX_INGEST_BODY_PREFIX_BYTES,
+    MAX_INGEST_LINE_BYTES,
+)
 from mitm_inspector.protocol import MAX_U64
 from mitm_inspector.store.memory import MemoryStore
 
@@ -49,7 +53,6 @@ HEALTH_PATH = f"{API_VERSION_PREFIX}/health"
 SNAPSHOT_PATH = f"{API_VERSION_PREFIX}/snapshot"
 STREAM_PATH = f"{API_VERSION_PREFIX}/stream"
 FLOW_PATH_PREFIX = f"{API_VERSION_PREFIX}/flows/"
-MAX_INGEST_LINE_BYTES = 8 * 1024 * 1024
 MAX_CLIENT_MESSAGE_BYTES = 64 * 1024
 SUBSCRIBER_QUEUE_FRAMES = 256
 HEAD_READ_TIMEOUT_SECONDS = 10.0
@@ -122,6 +125,10 @@ class ApiServerConfig:
         _validate_u64(self.max_pending_messages, "max_pending_messages")
         if self.max_body_prefix_bytes > self.max_body_bytes:
             raise ApiServerError("max_body_prefix_bytes cannot exceed max_body_bytes")
+        if self.max_body_prefix_bytes > MAX_INGEST_BODY_PREFIX_BYTES:
+            raise ApiServerError(
+                "max_body_prefix_bytes exceeds the bounded ingest line capacity"
+            )
         if self.capture_socket is not None:
             path = self.capture_socket
             if not isinstance(path, Path) or not path.is_absolute():
@@ -182,6 +189,7 @@ class ApiServer:
         self._http_server: asyncio.Server | None = None
         self._ingest_server: asyncio.Server | None = None
         self._sweep_task: asyncio.Task[None] | None = None
+        self._connections: set[asyncio.StreamWriter] = set()
         self._rejected_ingest_lines = 0
         self._ingest_connections = 0
         self._http_requests = 0
@@ -255,13 +263,26 @@ class ApiServer:
             except asyncio.CancelledError:
                 pass
             self._sweep_task = None
-        for server in (self._ingest_server, self._http_server):
-            if server is None:
-                continue
+        servers = [
+            server
+            for server in (self._ingest_server, self._http_server)
+            if server is not None
+        ]
+        for server in servers:
             server.close()
+        # Server.wait_closed() waits for every active connection handler on
+        # Python 3.12.1+, so a connected WebSocket client or ingest producer
+        # would stall shutdown forever.  Abort live transports first; their
+        # handlers observe the reset and finish promptly.
+        for writer in list(self._connections):
+            try:
+                writer.transport.abort()
+            except (ConnectionError, RuntimeError):
+                pass
+        for server in servers:
             await server.wait_closed()
         self._ingest_server = None
-        await self._close_http()
+        self._http_server = None
 
     async def _close_http(self) -> None:
         if self._http_server is not None:
@@ -284,6 +305,7 @@ class ApiServer:
     async def _handle_ingest_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        self._connections.add(writer)
         self._ingest_connections += 1
         try:
             while True:
@@ -307,6 +329,7 @@ class ApiServer:
                     self._rejected_ingest_lines += 1
                     break
         finally:
+            self._connections.discard(writer)
             await _close_writer(writer)
 
     # -- HTTP and WebSocket ------------------------------------------------
@@ -314,6 +337,7 @@ class ApiServer:
     async def _handle_http_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        self._connections.add(writer)
         self._http_requests += 1
         try:
             try:
@@ -355,6 +379,7 @@ class ApiServer:
         except (ConnectionError, BrokenPipeError):
             pass
         finally:
+            self._connections.discard(writer)
             await _close_writer(writer)
 
     async def _handle_plain_get(self, target: str, writer: asyncio.StreamWriter) -> None:
