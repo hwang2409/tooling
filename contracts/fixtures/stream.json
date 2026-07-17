@@ -26,7 +26,7 @@
         {"name": "x-api-key", "value": "[REDACTED]"},
         {"name": "cookie", "value": "[REDACTED]"}
       ],
-      "request_body": {"state": "captured", "size_bytes": "17", "encoding": "base64", "data": "eyJzdHJlYW0iOnRydWV9"},
+      "request_body": {"state": "captured", "size_bytes": "15", "content_type": "application/json", "encoding": "base64", "data": "eyJzdHJlYW0iOnRydWV9"},
       "response_headers": [
         {"name": "content-type", "value": "text/event-stream"},
         {"name": "x-trace", "value": "response"}
@@ -69,7 +69,7 @@
     "flow_id": "flow-001",
     "body_side": "response",
     "total_bytes": "1024",
-    "body": {"state": "truncated", "size_bytes": "1024", "captured_bytes": "16", "encoding": "base64", "data": "ZGF0YTogW1JFREFDVEVEXQ=="}
+    "body": {"state": "truncated", "size_bytes": "1024", "captured_bytes": "16", "content_type": "text/event-stream", "encoding": "base64", "data": "ZGF0YTogW1JFREFDVEVEXQ=="}
   },
   {
     "protocol_version": "1",
@@ -85,8 +85,8 @@
         "port": "443",
         "path": "/v1/messages",
         "request_headers": [{"name": "x-trace", "value": "first"}, {"name": "x-trace", "value": "second"}],
-        "request_body": {"state": "empty", "size_bytes": "0"},
-        "response_body": {"state": "truncated", "size_bytes": "1024", "captured_bytes": "16", "encoding": "base64", "data": "ZGF0YTogW1JFREFDVEVEXQ=="}
+        "request_body": {"state": "empty", "size_bytes": "0", "content_type": "application/json"},
+        "response_body": {"state": "truncated", "size_bytes": "1024", "captured_bytes": "16", "content_type": "text/event-stream", "encoding": "base64", "data": "ZGF0YTogW1JFREFDVEVEXQ=="}
       }
     ]
   },

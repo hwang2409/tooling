@@ -7,11 +7,12 @@ emitters without making the web app depend on mitmproxy internals.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
 
 from mitmproxy import http
 
-MessageEmitter = Callable[[dict[str, Any]], None]
+from mitm_inspector.protocol import ProtocolMessage
+
+MessageEmitter = Callable[[ProtocolMessage], None]
 
 
 class CaptureAddon:

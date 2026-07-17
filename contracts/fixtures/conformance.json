@@ -1,0 +1,57 @@
+{
+  "valid": [
+    {
+      "protocol_version": "1",
+      "type": "source.hello",
+      "source_id": "conformance-source",
+      "occurred_at": "2026-01-01T00:00:00Z",
+      "capabilities": {"body_chunks": true, "redaction": "headers-and-query"},
+      "limits": {"max_body_prefix_bytes": "1048576", "max_in_memory_bytes": "134217728"},
+      "additive": true
+    },
+    {
+      "protocol_version": "1",
+      "type": "flow.metadata",
+      "metadata": {
+        "flow_id": "conformance-flow",
+        "method": "POST",
+        "scheme": "https",
+        "host": "api.example.test",
+        "port": "443",
+        "path": "/v1/messages",
+        "request_headers": [{"name": "x-order", "value": "one"}, {"name": "x-order", "value": "two"}],
+        "request_body": {"state": "captured", "size_bytes": "3", "content_type": "application/octet-stream", "encoding": "base64", "data": "AQID"},
+        "response_body": {"state": "missing"}
+      }
+    },
+    {"protocol_version": "1", "type": "flow.lifecycle", "source_id": "conformance-source", "flow_id": "conformance-flow", "event_id": "event-1", "occurred_at": "2026-01-01T00:00:01Z", "sequence": "0", "state": "response_started"},
+    {"protocol_version": "1", "type": "body.chunk", "flow_id": "conformance-flow", "body_side": "request", "chunk_index": "0", "offset_bytes": "0", "data_base64": "AQID"},
+    {"protocol_version": "1", "type": "body.end", "flow_id": "conformance-flow", "body_side": "request", "total_bytes": "3", "body": {"state": "captured", "size_bytes": "3", "content_type": "application/octet-stream", "encoding": "base64", "data": "AQID"}},
+    {"protocol_version": "1", "type": "stream.gap", "expected_sequence": "9", "actual_sequence": "11", "dropped_count": "1"},
+    {"protocol_version": "1", "type": "browser.snapshot", "snapshot_id": "conformance-snapshot", "cursor": "18446744073709551615", "flows": []},
+    {"protocol_version": "1", "type": "browser.delta", "cursor": "12", "changes": [{"op": "remove", "flow_id": "conformance-flow"}]},
+    {"protocol_version": "1", "type": "browser.resync", "reason": "cursor_gap", "requested_cursor": "12"},
+    {"protocol_version": "1", "type": "future.additive", "sequence": "18446744073709551616", "new_field": {"safe": true}}
+  ],
+  "invalid": [
+    {"name": "hello-missing-capabilities", "message": {"protocol_version": "1", "type": "source.hello", "source_id": "s", "occurred_at": "now", "limits": {"max_body_prefix_bytes": "1", "max_in_memory_bytes": "1"}}},
+    {"name": "hello-malformed-capabilities", "message": {"protocol_version": "1", "type": "source.hello", "source_id": "s", "occurred_at": "now", "capabilities": {"body_chunks": "yes", "redaction": "headers-and-query"}, "limits": {"max_body_prefix_bytes": "1", "max_in_memory_bytes": "1"}}},
+    {"name": "hello-malformed-limits", "message": {"protocol_version": "1", "type": "source.hello", "source_id": "s", "occurred_at": "now", "capabilities": {"body_chunks": true, "redaction": "headers-and-query"}, "limits": {"max_body_prefix_bytes": 1, "max_in_memory_bytes": "1"}}},
+    {"name": "hello-limit-overflow", "message": {"protocol_version": "1", "type": "source.hello", "source_id": "s", "occurred_at": "now", "capabilities": {"body_chunks": true, "redaction": "headers-and-query"}, "limits": {"max_body_prefix_bytes": "18446744073709551616", "max_in_memory_bytes": "1"}}},
+    {"name": "metadata-null", "message": {"protocol_version": "1", "type": "flow.metadata", "metadata": null}},
+    {"name": "metadata-content-type-number", "message": {"protocol_version": "1", "type": "flow.metadata", "metadata": {"flow_id": "f", "method": "GET", "scheme": "https", "host": "h", "port": "443", "path": "/", "request_headers": [], "request_body": {"state": "empty", "size_bytes": "0", "content_type": 7}}}},
+    {"name": "body-side-invalid", "message": {"protocol_version": "1", "type": "body.chunk", "flow_id": "f", "body_side": "sideways", "chunk_index": "0", "offset_bytes": "0", "data_base64": "AQID"}},
+    {"name": "body-encoding-invalid", "message": {"protocol_version": "1", "type": "body.end", "flow_id": "f", "body_side": "response", "total_bytes": "3", "body": {"state": "captured", "size_bytes": "3", "encoding": "hex", "data": "010203"}}},
+    {"name": "body-data-invalid-base64", "message": {"protocol_version": "1", "type": "body.end", "flow_id": "f", "body_side": "response", "total_bytes": "3", "body": {"state": "captured", "size_bytes": "3", "encoding": "base64", "data": "not-base64!"}}},
+    {"name": "body-empty-size-not-zero", "message": {"protocol_version": "1", "type": "body.end", "flow_id": "f", "body_side": "response", "total_bytes": "0", "body": {"state": "empty", "size_bytes": "1"}}},
+    {"name": "lifecycle-state-invalid", "message": {"protocol_version": "1", "type": "flow.lifecycle", "source_id": "s", "flow_id": "f", "event_id": "e", "occurred_at": "now", "sequence": "1", "state": "invented"}},
+    {"name": "lifecycle-sequence-number", "message": {"protocol_version": "1", "type": "flow.lifecycle", "source_id": "s", "flow_id": "f", "event_id": "e", "occurred_at": "now", "sequence": 1, "state": "request_started"}},
+    {"name": "chunk-offset-overflow", "message": {"protocol_version": "1", "type": "body.chunk", "flow_id": "f", "body_side": "request", "chunk_index": "0", "offset_bytes": "18446744073709551616", "data_base64": "AQID"}},
+    {"name": "truncated-count-overflow", "message": {"protocol_version": "1", "type": "body.end", "flow_id": "f", "body_side": "response", "total_bytes": "3", "body": {"state": "truncated", "size_bytes": "3", "captured_bytes": "18446744073709551616", "encoding": "base64", "data": "AQID"}}},
+    {"name": "gap-sequence-overflow", "message": {"protocol_version": "1", "type": "stream.gap", "expected_sequence": "2", "actual_sequence": "18446744073709551616"}},
+    {"name": "gap-dropped-count-overflow", "message": {"protocol_version": "1", "type": "stream.gap", "expected_sequence": "9", "actual_sequence": "11", "dropped_count": "18446744073709551616"}},
+    {"name": "snapshot-cursor-overflow", "message": {"protocol_version": "1", "type": "browser.snapshot", "snapshot_id": "s", "cursor": "18446744073709551616", "flows": []}},
+    {"name": "delta-operation-invalid", "message": {"protocol_version": "1", "type": "browser.delta", "cursor": "1", "changes": [{"op": "patch", "flow_id": "f"}]}},
+    {"name": "resync-reason-invalid", "message": {"protocol_version": "1", "type": "browser.resync", "reason": "because", "requested_cursor": "1"}}
+  ]
+}

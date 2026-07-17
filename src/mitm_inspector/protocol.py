@@ -1,18 +1,35 @@
-"""Runtime validation for protocol-v1 messages.
+"""Authoritative runtime validation for protocol-v1 messages.
 
-This module deliberately uses project-owned dictionaries and TypedDicts rather
-than mitmproxy objects. Unknown message types and additive fields are retained
-for forward compatibility; known required fields are checked at the boundary.
+Known messages have discriminated TypedDict models and explicit invariants.
+Unknown types and additive fields are retained, but malformed known messages
+are rejected before they reach the capture/store/API boundaries.
 """
 
 from __future__ import annotations
 
+import base64
 import re
 from collections.abc import Mapping, Sequence
-from typing import Any, Literal, NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 PROTOCOL_VERSION = "1"
-_DECIMAL_STRING = re.compile(r"^(0|[1-9][0-9]*)$")
+MAX_U64 = 18_446_744_073_709_551_615
+_U64_PATTERN = re.compile(r"^(0|[1-9][0-9]*)$")
+_BASE64_PATTERN = re.compile(r"^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$")
+BODY_SIDES = ("request", "response")
+LIFECYCLE_STATES = (
+    "request_started",
+    "request_headers",
+    "request_body",
+    "request_end",
+    "response_started",
+    "response_headers",
+    "response_body",
+    "response_end",
+    "error",
+    "flow_completed",
+)
+RESYNC_REASONS = ("cursor_gap", "history_evicted", "initial_connect")
 
 
 class ProtocolError(ValueError):
@@ -24,19 +41,41 @@ class Header(TypedDict):
     value: str
 
 
-class BodyDescriptor(TypedDict):
-    state: Literal["missing", "empty", "captured", "truncated"]
-    size_bytes: NotRequired[str]
-    captured_bytes: NotRequired[str]
+class MissingBody(TypedDict):
+    state: Literal["missing"]
     content_type: NotRequired[str]
-    encoding: NotRequired[Literal["base64"]]
-    data: NotRequired[str]
+
+
+class EmptyBody(TypedDict):
+    state: Literal["empty"]
+    size_bytes: Literal["0"]
+    content_type: NotRequired[str]
+
+
+class CapturedBody(TypedDict):
+    state: Literal["captured"]
+    size_bytes: str
+    content_type: NotRequired[str]
+    encoding: Literal["base64"]
+    data: str
+
+
+class TruncatedBody(TypedDict):
+    state: Literal["truncated"]
+    size_bytes: str
+    captured_bytes: str
+    content_type: NotRequired[str]
+    encoding: Literal["base64"]
+    data: str
+
+
+BodyDescriptor = MissingBody | EmptyBody | CapturedBody | TruncatedBody
 
 
 class FlowMetadata(TypedDict):
     flow_id: str
     method: str
-    scheme: str
+    scheme: Literal["http", "https"]
     host: str
     port: str
     path: str
@@ -46,12 +85,124 @@ class FlowMetadata(TypedDict):
     response_body: NotRequired[BodyDescriptor]
 
 
-class ProtocolMessage(TypedDict):
-    protocol_version: str
+class SourceCapabilities(TypedDict):
+    body_chunks: bool
+    redaction: Literal["headers-and-query"]
+
+
+class SourceLimits(TypedDict):
+    max_body_prefix_bytes: str
+    max_in_memory_bytes: str
+
+
+class SourceHello(TypedDict):
+    protocol_version: Literal["1"]
+    type: Literal["source.hello"]
+    source_id: str
+    occurred_at: str
+    capabilities: SourceCapabilities
+    limits: SourceLimits
+
+
+class FlowMetadataMessage(TypedDict):
+    protocol_version: Literal["1"]
+    type: Literal["flow.metadata"]
+    metadata: FlowMetadata
+
+
+class FlowLifecycle(TypedDict):
+    protocol_version: Literal["1"]
+    type: Literal["flow.lifecycle"]
+    source_id: str
+    flow_id: str
+    event_id: str
+    occurred_at: str
+    sequence: str
+    state: str
+
+
+class BodyChunk(TypedDict):
+    protocol_version: Literal["1"]
+    type: Literal["body.chunk"]
+    flow_id: str
+    body_side: Literal["request", "response"]
+    chunk_index: str
+    offset_bytes: str
+    data_base64: str
+
+
+class BodyEnd(TypedDict):
+    protocol_version: Literal["1"]
+    type: Literal["body.end"]
+    flow_id: str
+    body_side: Literal["request", "response"]
+    total_bytes: str
+    body: BodyDescriptor
+
+
+class StreamGap(TypedDict):
+    protocol_version: Literal["1"]
+    type: Literal["stream.gap"]
+    expected_sequence: str
+    actual_sequence: str
+    dropped_count: NotRequired[str]
+
+
+class BrowserSnapshot(TypedDict):
+    protocol_version: Literal["1"]
+    type: Literal["browser.snapshot"]
+    snapshot_id: str
+    cursor: str
+    flows: list[FlowMetadata]
+
+
+class UpsertChange(TypedDict):
+    op: Literal["upsert"]
+    flow: FlowMetadata
+
+
+class RemoveChange(TypedDict):
+    op: Literal["remove"]
+    flow_id: str
+
+
+DeltaChange = UpsertChange | RemoveChange
+
+
+class BrowserDelta(TypedDict):
+    protocol_version: Literal["1"]
+    type: Literal["browser.delta"]
+    cursor: str
+    changes: list[DeltaChange]
+
+
+class BrowserResync(TypedDict):
+    protocol_version: Literal["1"]
+    type: Literal["browser.resync"]
+    reason: Literal["cursor_gap", "history_evicted", "initial_connect"]
+    requested_cursor: str
+
+
+class UnknownMessage(TypedDict):
+    protocol_version: Literal["1"]
     type: str
 
 
-def _object(value: object, *, label: str = "message") -> dict[str, Any]:
+KnownMessage = (
+    SourceHello
+    | FlowMetadataMessage
+    | FlowLifecycle
+    | BodyChunk
+    | BodyEnd
+    | StreamGap
+    | BrowserSnapshot
+    | BrowserDelta
+    | BrowserResync
+)
+ProtocolMessage = KnownMessage | UnknownMessage
+
+
+def _object(value: object, *, label: str = "message") -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise ProtocolError(f"{label} must be an object")
     return dict(value)
@@ -63,12 +214,18 @@ def _string(value: object, *, label: str) -> str:
     return value
 
 
-def _decimal_string(value: object, *, label: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise ProtocolError(f"{label} must be an unsigned decimal string")
-    candidate = value
-    if not _DECIMAL_STRING.fullmatch(candidate):
-        raise ProtocolError(f"{label} must be an unsigned decimal string")
+def _u64(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not _U64_PATTERN.fullmatch(value):
+        raise ProtocolError(f"{label} must be a uint64 decimal string")
+    if int(value) > MAX_U64:
+        raise ProtocolError(f"{label} exceeds uint64")
+    return value
+
+
+def _enum(value: object, choices: Sequence[str], *, label: str) -> str:
+    candidate = _string(value, label=label)
+    if candidate not in choices:
+        raise ProtocolError(f"{label} is not supported")
     return candidate
 
 
@@ -87,31 +244,62 @@ def _headers(value: object, *, label: str) -> list[Header]:
     return result
 
 
+def _base64_bytes(value: object, *, label: str) -> bytes:
+    data = _string(value, label=label)
+    if not _BASE64_PATTERN.fullmatch(data):
+        raise ProtocolError(f"{label} must be valid base64")
+    try:
+        return base64.b64decode(data, validate=True)
+    except ValueError as error:
+        raise ProtocolError(f"{label} must be valid base64") from error
+
+
 def _body(value: object, *, label: str) -> BodyDescriptor:
     body = _object(value, label=label)
-    state = body.get("state")
-    if state not in {"missing", "empty", "captured", "truncated"}:
-        raise ProtocolError(f"{label}.state is not a supported body state")
-    if state in {"empty", "captured", "truncated"}:
-        _decimal_string(body.get("size_bytes"), label=f"{label}.size_bytes")
-    if state == "truncated":
-        _decimal_string(body.get("captured_bytes"), label=f"{label}.captured_bytes")
-    if state == "captured" or state == "truncated":
-        _string(body.get("encoding"), label=f"{label}.encoding")
-        _string(body.get("data"), label=f"{label}.data")
-    return cast(BodyDescriptor, body)
+    state = _enum(
+        body.get("state"),
+        ("missing", "empty", "captured", "truncated"),
+        label=f"{label}.state",
+    )
+    if "content_type" in body:
+        _string(body["content_type"], label=f"{label}.content_type")
+    if state == "missing":
+        if any(key in body for key in ("size_bytes", "captured_bytes", "encoding", "data")):
+            raise ProtocolError(f"{label} missing state cannot carry body counts or data")
+        return cast(MissingBody, body)
+    size = _u64(body.get("size_bytes"), label=f"{label}.size_bytes")
+    if state == "empty":
+        if size != "0" or any(key in body for key in ("captured_bytes", "encoding", "data")):
+            raise ProtocolError(f"{label} empty state must have only size_bytes=0")
+        return cast(EmptyBody, body)
+    if "captured_bytes" in body and state == "captured":
+        raise ProtocolError(f"{label} captured state cannot carry captured_bytes")
+    if body.get("encoding") != "base64":
+        raise ProtocolError(f"{label}.encoding must be base64")
+    decoded = _base64_bytes(body.get("data"), label=f"{label}.data")
+    if state == "captured":
+        if len(decoded) != int(size):
+            raise ProtocolError(f"{label}.data length does not equal size_bytes")
+        return cast(CapturedBody, body)
+    captured = _u64(body.get("captured_bytes"), label=f"{label}.captured_bytes")
+    if int(captured) > int(size) or len(decoded) > int(captured):
+        raise ProtocolError(f"{label} truncated prefix exceeds declared counts")
+    return cast(TruncatedBody, body)
 
 
 def _flow_metadata(value: object, *, label: str = "metadata") -> FlowMetadata:
     metadata = _object(value, label=label)
-    result = cast(FlowMetadata, metadata)
-    for key in ("flow_id", "method", "scheme", "host", "path"):
+    scheme = _enum(metadata.get("scheme"), ("http", "https"), label=f"{label}.scheme")
+    for key in ("flow_id", "method", "host", "path"):
         _string(metadata.get(key), label=f"{label}.{key}")
-    _decimal_string(metadata.get("port"), label=f"{label}.port")
-    result["request_headers"] = _headers(
-        metadata.get("request_headers"), label=f"{label}.request_headers"
-    )
-    result["request_body"] = _body(metadata.get("request_body"), label=f"{label}.request_body")
+    port = _u64(metadata.get("port"), label=f"{label}.port")
+    request_headers = _headers(metadata.get("request_headers"), label=f"{label}.request_headers")
+    request_body = _body(metadata.get("request_body"), label=f"{label}.request_body")
+    result = cast(FlowMetadata, metadata)
+    result["scheme"] = cast(Literal["http", "https"], scheme)
+    result["port"] = port
+    result["request_headers"] = request_headers
+    result["request_body"] = request_body
     if "response_headers" in metadata:
         result["response_headers"] = _headers(
             metadata["response_headers"], label=f"{label}.response_headers"
@@ -121,73 +309,93 @@ def _flow_metadata(value: object, *, label: str = "metadata") -> FlowMetadata:
     return result
 
 
-def _base(message: dict[str, Any]) -> None:
+def _validate_source_hello(message: dict[str, object]) -> None:
+    _string(message.get("source_id"), label="source_id")
+    _string(message.get("occurred_at"), label="occurred_at")
+    capabilities = _object(message.get("capabilities"), label="capabilities")
+    if not isinstance(capabilities.get("body_chunks"), bool):
+        raise ProtocolError("capabilities.body_chunks must be boolean")
+    _enum(capabilities.get("redaction"), ("headers-and-query",), label="capabilities.redaction")
+    limits = _object(message.get("limits"), label="limits")
+    _u64(limits.get("max_body_prefix_bytes"), label="limits.max_body_prefix_bytes")
+    _u64(limits.get("max_in_memory_bytes"), label="limits.max_in_memory_bytes")
+
+
+def _validate_body_end(message: dict[str, object]) -> None:
+    total = _u64(message.get("total_bytes"), label="total_bytes")
+    body = _body(message.get("body"), label="body")
+    if body["state"] == "missing":
+        if total != "0":
+            raise ProtocolError("missing body must have total_bytes=0")
+    elif body["size_bytes"] != total:
+        raise ProtocolError("body.size_bytes must equal total_bytes")
+
+
+def _validate_gap(message: dict[str, object]) -> None:
+    expected = int(_u64(message.get("expected_sequence"), label="expected_sequence"))
+    actual = int(_u64(message.get("actual_sequence"), label="actual_sequence"))
+    if actual <= expected:
+        raise ProtocolError("actual_sequence must be greater than expected_sequence")
+    if "dropped_count" in message:
+        dropped = int(_u64(message["dropped_count"], label="dropped_count"))
+        if dropped != actual - expected - 1:
+            raise ProtocolError("dropped_count does not match the sequence gap")
+
+
+def _base(message: dict[str, object]) -> str:
     if message.get("protocol_version") != PROTOCOL_VERSION:
         raise ProtocolError(f"protocol_version must be {PROTOCOL_VERSION!r}")
-    _string(message.get("type"), label="type")
+    return _string(message.get("type"), label="type")
 
 
 def parse_message(value: object) -> ProtocolMessage:
-    """Validate and return a protocol-v1 message while retaining extra fields.
-
-    The returned object is a shallow copy, so callers can safely retain
-    additive fields they do not yet understand.
-    """
+    """Validate and return a protocol-v1 message without discarding extensions."""
 
     message = _object(value)
-    _base(message)
-    message_type = cast(str, message["type"])
+    message_type = _base(message)
 
     if message_type == "source.hello":
-        _string(message.get("source_id"), label="source_id")
-        _string(message.get("occurred_at"), label="occurred_at")
+        _validate_source_hello(message)
     elif message_type == "flow.metadata":
         _flow_metadata(message.get("metadata"))
     elif message_type == "flow.lifecycle":
-        _string(message.get("source_id"), label="source_id")
-        _string(message.get("flow_id"), label="flow_id")
-        _string(message.get("event_id"), label="event_id")
-        _string(message.get("occurred_at"), label="occurred_at")
-        _decimal_string(message.get("sequence"), label="sequence")
-        _string(message.get("state"), label="state")
+        for key in ("source_id", "flow_id", "event_id", "occurred_at"):
+            _string(message.get(key), label=key)
+        _u64(message.get("sequence"), label="sequence")
+        _enum(message.get("state"), LIFECYCLE_STATES, label="state")
     elif message_type == "body.chunk":
-        _string(message.get("flow_id"), label="flow_id")
-        _string(message.get("body_side"), label="body_side")
-        _decimal_string(message.get("chunk_index"), label="chunk_index")
-        _decimal_string(message.get("offset_bytes"), label="offset_bytes")
-        _string(message.get("data_base64"), label="data_base64")
+        _enum(message.get("body_side"), BODY_SIDES, label="body_side")
+        _u64(message.get("chunk_index"), label="chunk_index")
+        _u64(message.get("offset_bytes"), label="offset_bytes")
+        _base64_bytes(message.get("data_base64"), label="data_base64")
     elif message_type == "body.end":
         _string(message.get("flow_id"), label="flow_id")
-        _string(message.get("body_side"), label="body_side")
-        _decimal_string(message.get("total_bytes"), label="total_bytes")
-        _body(message.get("body"), label="body")
+        _enum(message.get("body_side"), BODY_SIDES, label="body_side")
+        _validate_body_end(message)
     elif message_type == "stream.gap":
-        _decimal_string(message.get("expected_sequence"), label="expected_sequence")
-        _decimal_string(message.get("actual_sequence"), label="actual_sequence")
+        _validate_gap(message)
     elif message_type == "browser.snapshot":
         _string(message.get("snapshot_id"), label="snapshot_id")
-        _decimal_string(message.get("cursor"), label="cursor")
+        _u64(message.get("cursor"), label="cursor")
         flows = message.get("flows")
         if not isinstance(flows, Sequence) or isinstance(flows, str | bytes | bytearray):
             raise ProtocolError("flows must be an ordered list")
         for index, flow in enumerate(flows):
             _flow_metadata(flow, label=f"flows[{index}]")
     elif message_type == "browser.delta":
-        _decimal_string(message.get("cursor"), label="cursor")
+        _u64(message.get("cursor"), label="cursor")
         changes = message.get("changes")
         if not isinstance(changes, Sequence) or isinstance(changes, str | bytes | bytearray):
             raise ProtocolError("changes must be an ordered list")
         for index, change in enumerate(changes):
             item = _object(change, label=f"changes[{index}]")
-            operation = _string(item.get("op"), label=f"changes[{index}].op")
+            operation = _enum(item.get("op"), ("upsert", "remove"), label=f"changes[{index}].op")
             if operation == "upsert":
                 _flow_metadata(item.get("flow"), label=f"changes[{index}].flow")
-            elif operation == "remove":
-                _string(item.get("flow_id"), label=f"changes[{index}].flow_id")
             else:
-                raise ProtocolError(f"changes[{index}].op is not supported")
+                _string(item.get("flow_id"), label=f"changes[{index}].flow_id")
     elif message_type == "browser.resync":
-        _string(message.get("reason"), label="reason")
-        _decimal_string(message.get("requested_cursor"), label="requested_cursor")
+        _enum(message.get("reason"), RESYNC_REASONS, label="reason")
+        _u64(message.get("requested_cursor"), label="requested_cursor")
 
     return cast(ProtocolMessage, message)

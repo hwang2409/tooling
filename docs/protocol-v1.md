@@ -1,39 +1,66 @@
 # Protocol v1
 
 Protocol-v1 is a JSON message stream owned by this repository. Every message
-has `protocol_version: "1"` and a string `type`. Unknown additive fields and
-unknown message types must be retained/ignored by clients so a newer source can
-talk to an older browser. The machine-readable baseline is
-[`contracts/protocol-v1.schema.json`](../contracts/protocol-v1.schema.json).
+has `protocol_version: "1"` and a string `type`. The JSON Schema,
+`src/mitm_inspector/protocol.py`, and `web/src/protocol.ts` share the same
+known-message vocabulary and invariants. Unknown types use the base schema
+branch; additive fields on known or unknown messages are retained.
 
-All unsigned 64-bit values are decimal strings, including cursors, sequence
-numbers, byte counts, offsets, and chunk indexes. Clients must never parse them
-through JavaScript `number`; the fixture includes a value above `2^53`.
+## Numeric and ordering rules
 
-## Message families
+All unsigned 64-bit values are decimal strings in the inclusive range
+`0..18446744073709551615`. This includes `port`, source limits, lifecycle
+`sequence`, body counts, chunk indexes/offsets, cursors, gap values, and
+`dropped_count`. Python uses bounded integer conversion; TypeScript uses
+`BigInt`, never JavaScript `number`. A `stream.gap` has
+`actual_sequence > expected_sequence`; when present,
+`dropped_count = actual_sequence - expected_sequence - 1`.
 
-- `source.hello`: source identity, protocol version, capabilities, and limits.
-- `flow.metadata`: sanitized request/response metadata. Headers are ordered
-  `{name, value}` arrays, not maps, so duplicate headers survive unchanged.
-- `flow.lifecycle`: independent lifecycle events keyed by `flow_id` and
-  sequenced with decimal strings. Consumers must not assume request completion
-  precedes response start; the fixture intentionally models response-before-
-  request-end ordering.
-- `body.chunk`: incremental base64 bytes for a request or response side.
-- `body.end`: total bytes plus a body descriptor.
-- `stream.gap`: source sequence discontinuity, requiring a browser resync.
-- `browser.snapshot`: complete bounded read model at a cursor.
-- `browser.delta`: ordered upsert/remove changes from the previous cursor.
-- `browser.resync`: a browser request for a fresh snapshot after a gap.
+Lifecycle events are independent observations, not a request/response state
+machine. Consumers must not assume request completion precedes response start;
+`response_started` may arrive before `request_end`. Valid states are:
+`request_started`, `request_headers`, `request_body`, `request_end`,
+`response_started`, `response_headers`, `response_body`, `response_end`,
+`error`, and `flow_completed`.
+
+## Message shapes
+
+- `source.hello`: `source_id`, `occurred_at`, capabilities
+  `{body_chunks:boolean, redaction:"headers-and-query"}`, and limits
+  `{max_body_prefix_bytes, max_in_memory_bytes}`.
+- `flow.metadata`: a sanitized `metadata` flow with non-empty identity fields,
+  `scheme` `http|https`, decimal-string `port`, and ordered header arrays.
+- `flow.lifecycle`: `source_id`, `flow_id`, `event_id`, `occurred_at`, bounded
+  decimal-string `sequence`, and one lifecycle state above.
+- `body.chunk`: `flow_id`, `body_side` `request|response`, bounded decimal-string
+  `chunk_index`/`offset_bytes`, and valid base64 `data_base64`.
+- `body.end`: `flow_id`, `body_side`, bounded `total_bytes`, and a body
+  descriptor whose non-missing `size_bytes` equals `total_bytes`.
+- `stream.gap`: bounded `expected_sequence`, `actual_sequence`, and optional
+  bounded `dropped_count` following the arithmetic rule above.
+- `browser.snapshot`: `snapshot_id`, bounded `cursor`, and complete flow list.
+- `browser.delta`: bounded `cursor` and changes with only `upsert {flow}` or
+  `remove {flow_id}` operations.
+- `browser.resync`: `reason` `cursor_gap|history_evicted|initial_connect` and
+  bounded `requested_cursor`.
 
 ## Body states
 
 Body descriptors distinguish:
 
-- `missing`: no body was observed or retained.
-- `empty`: body was observed and has exactly zero bytes.
-- `captured`: complete retained prefix/body, with base64 data.
-- `truncated`: total size is known but only a bounded captured prefix is present.
+- `missing`: no body was observed or retained; no counts, encoding, or data.
+- `empty`: observed and exactly zero bytes; `size_bytes` must be `"0"`.
+- `captured`: complete retained data; `size_bytes` equals decoded base64 bytes.
+- `truncated`: total `size_bytes` is known, `captured_bytes <= size_bytes`,
+  and decoded base64 prefix length does not exceed `captured_bytes`.
+
+`content_type` is an optional string on every body state. Captured data is
+base64 only; `hex` and arbitrary body-side/state values are invalid. The
+shared `contracts/fixtures/conformance.json` contains positive and adversarial
+negative cases exercised by the schema, Python, and TypeScript tests. JSON
+Schema enforces the types, vocabularies, and bounds; the Python/TypeScript
+boundary validators enforce cross-field arithmetic that JSON Schema cannot
+express over decimal strings.
 
 Body data is sensitive and is exposed only when a user selects a flow in later
 work. S0 has no raw export or replay endpoint.

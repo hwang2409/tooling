@@ -24,8 +24,8 @@ mitmweb APIs. See [docs/architecture.md](docs/architecture.md) and
 
 ## Development
 
-Requirements: Python 3.12+ and Node 20.19+ (the checked-in commands were run
-with Python 3.12.13 and Node 26.0.0).
+Requirements: Python 3.12+ and Node `^20.19.0 || ^22.13.0 || >=24` (the
+checked-in commands were run with Python 3.12.13 and Node 26.0.0).
 
 ```sh
 # Python: creates/uses only .venv in this checkout

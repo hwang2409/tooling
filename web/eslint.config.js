@@ -9,7 +9,7 @@ export default [
     languageOptions: {
       parser: tsParser,
       parserOptions: { ecmaFeatures: { jsx: true }, project: "./tsconfig.app.json" },
-      globals: { document: "readonly", process: "readonly" },
+      globals: { atob: "readonly", document: "readonly", process: "readonly" },
     },
     plugins: { "@typescript-eslint": tsPlugin },
     rules: {

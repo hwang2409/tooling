@@ -2,58 +2,258 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://mitm-inspector.local/contracts/protocol-v1.schema.json",
   "title": "mitm-inspector protocol v1",
-  "description": "Project-owned, read-only messages. Unknown additive fields are allowed.",
-  "type": "object",
-  "required": ["protocol_version", "type"],
-  "properties": {
-    "protocol_version": {"const": "1"},
-    "type": {"type": "string", "minLength": 1}
-  },
-  "allOf": [
-    {"if": {"properties": {"type": {"const": "source.hello"}}}, "then": {"required": ["source_id", "occurred_at"]}},
-    {"if": {"properties": {"type": {"const": "flow.metadata"}}}, "then": {"required": ["metadata"]}},
-    {"if": {"properties": {"type": {"const": "flow.lifecycle"}}}, "then": {"required": ["source_id", "flow_id", "event_id", "occurred_at", "sequence", "state"]}},
-    {"if": {"properties": {"type": {"const": "body.chunk"}}}, "then": {"required": ["flow_id", "body_side", "chunk_index", "offset_bytes", "data_base64"]}},
-    {"if": {"properties": {"type": {"const": "body.end"}}}, "then": {"required": ["flow_id", "body_side", "total_bytes", "body"]}},
-    {"if": {"properties": {"type": {"const": "stream.gap"}}}, "then": {"required": ["expected_sequence", "actual_sequence"]}},
-    {"if": {"properties": {"type": {"const": "browser.snapshot"}}}, "then": {"required": ["snapshot_id", "cursor", "flows"]}},
-    {"if": {"properties": {"type": {"const": "browser.delta"}}}, "then": {"required": ["cursor", "changes"]}},
-    {"if": {"properties": {"type": {"const": "browser.resync"}}}, "then": {"required": ["reason", "requested_cursor"]}}
+  "description": "Project-owned read-only messages. Known types are strict; unknown types use the base branch and retain additive fields.",
+  "oneOf": [
+    {"$ref": "#/$defs/sourceHello"},
+    {"$ref": "#/$defs/flowMetadataMessage"},
+    {"$ref": "#/$defs/flowLifecycle"},
+    {"$ref": "#/$defs/bodyChunk"},
+    {"$ref": "#/$defs/bodyEnd"},
+    {"$ref": "#/$defs/streamGap"},
+    {"$ref": "#/$defs/browserSnapshot"},
+    {"$ref": "#/$defs/browserDelta"},
+    {"$ref": "#/$defs/browserResync"},
+    {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {"not": {"properties": {"type": {"enum": [
+          "source.hello", "flow.metadata", "flow.lifecycle", "body.chunk", "body.end",
+          "stream.gap", "browser.snapshot", "browser.delta", "browser.resync"
+        ]}}}}
+      ]
+    }
   ],
   "$defs": {
-    "decimalString": {"type": "string", "pattern": "^(0|[1-9][0-9]*)$"},
+    "u64": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709550[0-5][0-9]{2}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "base": {
+      "type": "object",
+      "required": ["protocol_version", "type"],
+      "properties": {
+        "protocol_version": {"const": "1"},
+        "type": {"type": "string", "minLength": 1}
+      }
+    },
     "header": {
       "type": "object",
       "required": ["name", "value"],
-      "properties": {"name": {"type": "string"}, "value": {"type": "string"}}
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "value": {"type": "string"}
+      }
     },
     "body": {
       "type": "object",
       "required": ["state"],
       "properties": {
         "state": {"enum": ["missing", "empty", "captured", "truncated"]},
-        "size_bytes": {"$ref": "#/$defs/decimalString"},
-        "captured_bytes": {"$ref": "#/$defs/decimalString"},
+        "size_bytes": {"$ref": "#/$defs/u64"},
+        "captured_bytes": {"$ref": "#/$defs/u64"},
         "content_type": {"type": "string"},
         "encoding": {"const": "base64"},
-        "data": {"type": "string"}
-      }
+        "data": {"type": "string", "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"state": {"const": "missing"}}},
+          "then": {"not": {"anyOf": [
+            {"required": ["size_bytes"]}, {"required": ["captured_bytes"]},
+            {"required": ["encoding"]}, {"required": ["data"]}
+          ]}}
+        },
+        {
+          "if": {"properties": {"state": {"const": "empty"}}},
+          "then": {
+            "required": ["size_bytes"],
+            "properties": {"size_bytes": {"const": "0"}},
+            "not": {"anyOf": [{"required": ["captured_bytes"]}, {"required": ["encoding"]}, {"required": ["data"]}]}
+          }
+        },
+        {
+          "if": {"properties": {"state": {"const": "captured"}}},
+          "then": {
+            "required": ["size_bytes", "encoding", "data"],
+            "not": {"required": ["captured_bytes"]}
+          }
+        },
+        {
+          "if": {"properties": {"state": {"const": "truncated"}}},
+          "then": {"required": ["size_bytes", "captured_bytes", "encoding", "data"]}
+        }
+      ]
     },
     "flow": {
       "type": "object",
       "required": ["flow_id", "method", "scheme", "host", "port", "path", "request_headers", "request_body"],
       "properties": {
-        "flow_id": {"type": "string"},
-        "method": {"type": "string"},
-        "scheme": {"type": "string"},
-        "host": {"type": "string"},
-        "port": {"$ref": "#/$defs/decimalString"},
-        "path": {"type": "string"},
+        "flow_id": {"type": "string", "minLength": 1},
+        "method": {"type": "string", "minLength": 1},
+        "scheme": {"enum": ["http", "https"]},
+        "host": {"type": "string", "minLength": 1},
+        "port": {"$ref": "#/$defs/u64"},
+        "path": {"type": "string", "minLength": 1},
         "request_headers": {"type": "array", "items": {"$ref": "#/$defs/header"}},
         "response_headers": {"type": "array", "items": {"$ref": "#/$defs/header"}},
         "request_body": {"$ref": "#/$defs/body"},
         "response_body": {"$ref": "#/$defs/body"}
       }
+    },
+    "sourceHello": {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {
+          "type": "object",
+          "required": ["source_id", "occurred_at", "capabilities", "limits"],
+          "properties": {
+            "type": {"const": "source.hello"},
+            "source_id": {"type": "string", "minLength": 1},
+            "occurred_at": {"type": "string", "minLength": 1},
+            "capabilities": {
+              "type": "object",
+              "required": ["body_chunks", "redaction"],
+              "properties": {
+                "body_chunks": {"type": "boolean"},
+                "redaction": {"const": "headers-and-query"}
+              }
+            },
+            "limits": {
+              "type": "object",
+              "required": ["max_body_prefix_bytes", "max_in_memory_bytes"],
+              "properties": {
+                "max_body_prefix_bytes": {"$ref": "#/$defs/u64"},
+                "max_in_memory_bytes": {"$ref": "#/$defs/u64"}
+              }
+            }
+          }
+        }
+      ]
+    },
+    "flowMetadataMessage": {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {"type": "object", "required": ["metadata"], "properties": {"type": {"const": "flow.metadata"}, "metadata": {"$ref": "#/$defs/flow"}}}
+      ]
+    },
+    "flowLifecycle": {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {
+          "type": "object",
+          "required": ["source_id", "flow_id", "event_id", "occurred_at", "sequence", "state"],
+          "properties": {
+            "type": {"const": "flow.lifecycle"},
+            "source_id": {"type": "string", "minLength": 1},
+            "flow_id": {"type": "string", "minLength": 1},
+            "event_id": {"type": "string", "minLength": 1},
+            "occurred_at": {"type": "string", "minLength": 1},
+            "sequence": {"$ref": "#/$defs/u64"},
+            "state": {"enum": ["request_started", "request_headers", "request_body", "request_end", "response_started", "response_headers", "response_body", "response_end", "error", "flow_completed"]}
+          }
+        }
+      ]
+    },
+    "bodyChunk": {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {
+          "type": "object",
+          "required": ["flow_id", "body_side", "chunk_index", "offset_bytes", "data_base64"],
+          "properties": {
+            "type": {"const": "body.chunk"},
+            "flow_id": {"type": "string", "minLength": 1},
+            "body_side": {"enum": ["request", "response"]},
+            "chunk_index": {"$ref": "#/$defs/u64"},
+            "offset_bytes": {"$ref": "#/$defs/u64"},
+            "data_base64": {"type": "string", "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"}
+          }
+        }
+      ]
+    },
+    "bodyEnd": {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {
+          "type": "object",
+          "required": ["flow_id", "body_side", "total_bytes", "body"],
+          "properties": {
+            "type": {"const": "body.end"},
+            "flow_id": {"type": "string", "minLength": 1},
+            "body_side": {"enum": ["request", "response"]},
+            "total_bytes": {"$ref": "#/$defs/u64"},
+            "body": {"$ref": "#/$defs/body"}
+          }
+        }
+      ]
+    },
+    "streamGap": {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {
+          "type": "object",
+          "required": ["expected_sequence", "actual_sequence"],
+          "properties": {
+            "type": {"const": "stream.gap"},
+            "expected_sequence": {"$ref": "#/$defs/u64"},
+            "actual_sequence": {"$ref": "#/$defs/u64"},
+            "dropped_count": {"$ref": "#/$defs/u64"}
+          }
+        }
+      ]
+    },
+    "browserSnapshot": {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {
+          "type": "object",
+          "required": ["snapshot_id", "cursor", "flows"],
+          "properties": {
+            "type": {"const": "browser.snapshot"},
+            "snapshot_id": {"type": "string", "minLength": 1},
+            "cursor": {"$ref": "#/$defs/u64"},
+            "flows": {"type": "array", "items": {"$ref": "#/$defs/flow"}}
+          }
+        }
+      ]
+    },
+    "browserDelta": {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {
+          "type": "object",
+          "required": ["cursor", "changes"],
+          "properties": {
+            "type": {"const": "browser.delta"},
+            "cursor": {"$ref": "#/$defs/u64"},
+            "changes": {"type": "array", "items": {"oneOf": [{"$ref": "#/$defs/upsert"}, {"$ref": "#/$defs/remove"}]}}
+          }
+        }
+      ]
+    },
+    "upsert": {
+      "type": "object",
+      "required": ["op", "flow"],
+      "properties": {"op": {"const": "upsert"}, "flow": {"$ref": "#/$defs/flow"}}
+    },
+    "remove": {
+      "type": "object",
+      "required": ["op", "flow_id"],
+      "properties": {"op": {"const": "remove"}, "flow_id": {"type": "string", "minLength": 1}}
+    },
+    "browserResync": {
+      "allOf": [
+        {"$ref": "#/$defs/base"},
+        {
+          "type": "object",
+          "required": ["reason", "requested_cursor"],
+          "properties": {
+            "type": {"const": "browser.resync"},
+            "reason": {"enum": ["cursor_gap", "history_evicted", "initial_connect"]},
+            "requested_cursor": {"$ref": "#/$defs/u64"}
+          }
+        }
+      ]
     }
   }
 }
