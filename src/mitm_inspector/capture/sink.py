@@ -6,7 +6,7 @@ import base64
 from collections import deque
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from threading import Lock
+from threading import Lock, RLock
 
 from mitm_inspector.protocol import (
     MAX_U64,
@@ -26,6 +26,14 @@ MAX_LOSS_RANGES = 256
 class _LossRange:
     start: int
     end: int
+
+
+@dataclass(frozen=True)
+class _LossState:
+    ranges: tuple[_LossRange, ...]
+    resync_active: bool
+    dropped_total: int
+    range_collapses: int
 
 
 class _PositionExhausted(RuntimeError):
@@ -76,7 +84,7 @@ class BoundedMessageSink:
         self._memory_bytes = 0
         self._lock = Lock()
         self._loss_lock = Lock()
-        self._position_lock = Lock()
+        self._position_lock = RLock()
         self._next_position_value = 1
         self._exhausted = False
         self._reservation_lock = Lock()
@@ -146,36 +154,61 @@ class BoundedMessageSink:
     def _commit(self, message: ParsedMessageResult, body_bytes: int, weight: int) -> bool:
         if self._exhausted:
             return False
-        try:
-            position = self._allocate_position()
-        except _PositionExhausted:
-            return False
-        if self._body_bytes + body_bytes > self._max_body_bytes:
-            self._body_budget_drops += 1
-            self._record_drop(position)
-            return False
-        if self._memory_bytes + weight > self._max_memory_bytes:
-            self._memory_budget_drops += 1
-            self._record_drop(position)
-            return False
-        item = _QueuedMessage(position, message, body_bytes, weight)
-        before_body = self._body_bytes
-        before_memory = self._memory_bytes
-        before_accepted = self._accepted
-        try:
-            self._items.append(item)
-            self._body_bytes += body_bytes
-            self._memory_bytes += weight
-            self._accepted += 1
-            return True
-        except BaseException:
-            if self._items and self._items[-1] == item:
-                self._items.pop()
-            self._body_bytes = before_body
-            self._memory_bytes = before_memory
-            self._accepted = before_accepted
-            self._record_drop(position)
-            raise
+        with self._position_lock:
+            position_state = (self._next_position_value, self._exhausted)
+            loss_state = self._loss_state()
+            before_body = self._body_bytes
+            before_memory = self._memory_bytes
+            before_accepted = self._accepted
+            before_body_drops = self._body_budget_drops
+            before_memory_drops = self._memory_budget_drops
+            position: int | None = None
+            item: _QueuedMessage | None = None
+            append_attempted = False
+            try:
+                try:
+                    position = self._allocate_position()
+                except _PositionExhausted:
+                    return False
+                if self._body_bytes + body_bytes > self._max_body_bytes:
+                    self._body_budget_drops += 1
+                    self._record_drop(position)
+                    return False
+                if self._memory_bytes + weight > self._max_memory_bytes:
+                    self._memory_budget_drops += 1
+                    self._record_drop(position)
+                    return False
+                item = _QueuedMessage(position, message, body_bytes, weight)
+                append_attempted = True
+                self._items.append(item)
+                self._body_bytes += body_bytes
+                self._memory_bytes += weight
+                self._accepted += 1
+                return True
+            except BaseException:
+                if (
+                    append_attempted
+                    and item is not None
+                    and self._items
+                    and self._items[-1] == item
+                ):
+                    self._items.pop()
+                self._body_bytes = before_body
+                self._memory_bytes = before_memory
+                self._accepted = before_accepted
+                self._body_budget_drops = before_body_drops
+                self._memory_budget_drops = before_memory_drops
+                self._restore_loss_state(loss_state)
+                if append_attempted and position is not None:
+                    try:
+                        self._record_drop(position)
+                    except BaseException:
+                        self._restore_position_state(position_state)
+                        self._restore_loss_state(loss_state)
+                        raise
+                else:
+                    self._restore_position_state(position_state)
+                raise
 
     def record_loss(self) -> bool:
         """Record a bounded-store/addon loss as a synthetic delivery position."""
@@ -187,12 +220,20 @@ class BoundedMessageSink:
             self._inflight -= 1
 
     def _record_new_loss(self) -> bool:
-        try:
-            position = self._allocate_position()
-        except _PositionExhausted:
-            return False
-        self._record_drop(position)
-        return True
+        with self._position_lock:
+            position_state = (self._next_position_value, self._exhausted)
+            loss_state = self._loss_state()
+            try:
+                try:
+                    position = self._allocate_position()
+                except _PositionExhausted:
+                    return False
+                self._record_drop(position)
+                return True
+            except BaseException:
+                self._restore_position_state(position_state)
+                self._restore_loss_state(loss_state)
+                raise
 
     def _allocate_position(self) -> int:
         with self._position_lock:
@@ -204,6 +245,25 @@ class BoundedMessageSink:
             else:
                 self._next_position_value = position + 1
             return position
+
+    def _loss_state(self) -> _LossState:
+        with self._loss_lock:
+            return _LossState(
+                tuple(self._loss_ranges),
+                self._loss_resync_active,
+                self._dropped_total,
+                self._loss_range_collapses,
+            )
+
+    def _restore_loss_state(self, state: _LossState) -> None:
+        with self._loss_lock:
+            self._loss_ranges = deque(state.ranges)
+            self._loss_resync_active = state.resync_active
+            self._dropped_total = state.dropped_total
+            self._loss_range_collapses = state.range_collapses
+
+    def _restore_position_state(self, state: tuple[int, bool]) -> None:
+        self._next_position_value, self._exhausted = state
 
     __call__ = offer
 
@@ -224,52 +284,79 @@ class BoundedMessageSink:
             raise ValueError("limit must be positive")
         if not self._reservation_lock.acquire(False):
             return []
-        # A producer never waits for this consumer lock.  The consumer also
-        # does not detach work while a producer is preparing a message.
+        detached: list[_QueuedMessage] = []
+        ranges: list[_LossRange] = []
+        original_items: tuple[_QueuedMessage, ...] = ()
+        original_ranges: tuple[_LossRange, ...] = ()
+        original_resync = False
+        old_last = self._last_delivered_position
+        old_forced = self._forced_loss_count
+        before_body = self._body_bytes
+        before_memory = self._memory_bytes
+        reservation_released = False
         try:
             with self._lock:
                 if self._inflight > 0:
                     return []
-                with self._loss_lock:
+                # Position, queue, and loss snapshots are taken before the
+                # first mutation.  The position lock also excludes a loss
+                # producer for this short detachment transaction.
+                with self._position_lock, self._loss_lock:
                     if self._exhausted and self._loss_ranges:
                         # There is no representable sequence after MAX_U64;
                         # retain the queued/loss state in a stable terminal
                         # condition rather than constructing MAX_U64 + 1.
                         return []
-                count_to_drain = (
-                    len(self._items)
-                    if limit is None
-                    else min(limit, len(self._items))
-                )
-                detached = [self._items.popleft() for _ in range(count_to_drain)]
-                self._body_bytes -= sum(item.body_bytes for item in detached)
-                self._memory_bytes -= sum(item.weight for item in detached)
-                old_last = self._last_delivered_position
-                old_forced = self._forced_loss_count
-            with self._loss_lock:
-                ranges = [*self._loss_ranges]
-                self._loss_ranges.clear()
-                resync_active = self._loss_resync_active
-                self._loss_resync_active = False
-                ranges = _normalize_ranges(ranges)
-            original_ranges = [*ranges]
-        finally:
+                    original_items = tuple(self._items)
+                    original_ranges = tuple(self._loss_ranges)
+                    original_resync = self._loss_resync_active
+                    old_last = self._last_delivered_position
+                    old_forced = self._forced_loss_count
+                    before_body = self._body_bytes
+                    before_memory = self._memory_bytes
+                    count_to_drain = (
+                        len(self._items)
+                        if limit is None
+                        else min(limit, len(self._items))
+                    )
+                    for _ in range(count_to_drain):
+                        detached.append(self._items.popleft())
+                    self._body_bytes -= sum(item.body_bytes for item in detached)
+                    self._memory_bytes -= sum(item.weight for item in detached)
+                    removed_ranges: list[_LossRange] = []
+                    while self._loss_ranges:
+                        removed_ranges.append(self._loss_ranges.popleft())
+                    self._loss_resync_active = False
+                    ranges = _normalize_ranges(removed_ranges)
             self._reservation_lock.release()
-        try:
-            return self._drain_detached(detached, ranges, resync_active=resync_active)
+            reservation_released = True
+            return self._drain_detached(detached, ranges, resync_active=original_resync)
         except BaseException:
             with self._lock:
-                self._items.extendleft(reversed(detached))
-                self._body_bytes += sum(item.body_bytes for item in detached)
-                self._memory_bytes += sum(item.weight for item in detached)
+                if reservation_released:
+                    self._items.extendleft(reversed(detached))
+                    self._body_bytes += sum(item.body_bytes for item in detached)
+                    self._memory_bytes += sum(item.weight for item in detached)
+                else:
+                    self._items.clear()
+                    self._items.extend(original_items)
+                    self._body_bytes = before_body
+                    self._memory_bytes = before_memory
                 self._last_delivered_position = old_last
                 self._forced_loss_count = old_forced
             with self._loss_lock:
-                self._loss_ranges = deque(
-                    _normalize_ranges([*self._loss_ranges, *original_ranges])
-                )
-                self._loss_resync_active |= resync_active
+                if reservation_released:
+                    self._loss_ranges = deque(
+                        _normalize_ranges([*self._loss_ranges, *original_ranges])
+                    )
+                    self._loss_resync_active |= original_resync
+                else:
+                    self._loss_ranges = deque(original_ranges)
+                    self._loss_resync_active = original_resync
             raise
+        finally:
+            if not reservation_released:
+                self._reservation_lock.release()
 
     def _drain_detached(
         self,

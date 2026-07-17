@@ -588,6 +588,142 @@ def test_keyboard_interrupt_during_append_rolls_back_transaction() -> None:
     assert sink.loss_range_count == 1
 
 
+def test_keyboard_interrupt_after_enqueue_position_allocation_restores_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    original_allocate = sink._allocate_position
+
+    def interrupt_after_allocate() -> int:
+        original_allocate()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink, "_allocate_position", interrupt_after_allocate)
+    with pytest.raises(KeyboardInterrupt):
+        sink.offer(parse_message({"protocol_version": "1", "type": "future.allocate"}))
+    assert sink._next_position_value == 1
+    assert not sink.exhausted
+    assert sink.pending_count == 0
+    assert sink.dropped_count == 0
+    monkeypatch.undo()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
+    delivered = sink.drain()
+    assert len(delivered) == 1
+    delivered_payload = (
+        delivered[0].message
+        if isinstance(delivered[0], KnownParsedMessage)
+        else delivered[0].payload
+    )
+    assert delivered_payload["delivery_position"] == "1"
+
+
+def test_keyboard_interrupt_after_loss_position_allocation_restores_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    original_allocate = sink._allocate_position
+
+    def interrupt_after_allocate() -> int:
+        original_allocate()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink, "_allocate_position", interrupt_after_allocate)
+    with pytest.raises(KeyboardInterrupt):
+        sink.record_loss()
+    assert sink._next_position_value == 1
+    assert not sink.exhausted
+    assert sink.dropped_count == 0
+    assert sink.loss_range_count == 0
+    monkeypatch.undo()
+    assert sink.record_loss()
+    assert sink.dropped_count == 1
+    assert sink.drain()[0].message["type"] == "stream.gap"  # type: ignore[union-attr]
+
+
+def test_keyboard_interrupt_on_second_popleft_restores_queue_and_counters() -> None:
+    class InterruptingDeque(deque[object]):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def popleft(self) -> object:
+            self.calls += 1
+            if self.calls == 2:
+                raise KeyboardInterrupt
+            return super().popleft()
+
+    sink = BoundedMessageSink(max_pending=2)
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.one"}))
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.two"}))
+    queue = InterruptingDeque()
+    queue.extend(sink._items)
+    sink._items = queue
+    before = (
+        sink.pending_count,
+        sink._body_bytes,
+        sink._memory_bytes,
+        sink.accepted_count,
+        sink.dropped_count,
+        sink.loss_range_count,
+        sink._next_position_value,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        sink.drain()
+    assert (
+        sink.pending_count,
+        sink._body_bytes,
+        sink._memory_bytes,
+        sink.accepted_count,
+        sink.dropped_count,
+        sink.loss_range_count,
+        sink._next_position_value,
+    ) == before
+    assert [item.position for item in sink._items] == [1, 2]
+    assert sink._last_delivered_position == 0
+
+
+def test_keyboard_interrupt_during_loss_detachment_restores_all_ranges() -> None:
+    class InterruptingDeque(deque[object]):
+        def __init__(self, values: tuple[object, ...]) -> None:
+            super().__init__(values)
+            self.calls = 0
+
+        def popleft(self) -> object:
+            self.calls += 1
+            if self.calls == 2:
+                raise KeyboardInterrupt
+            return super().popleft()
+
+    sink = BoundedMessageSink(max_pending=2)
+    assert sink.record_loss()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.keep"}))
+    assert sink.record_loss()
+    original_ranges = tuple(sink._loss_ranges)
+    sink._loss_ranges = InterruptingDeque(original_ranges)
+    before = (
+        sink.pending_count,
+        sink._body_bytes,
+        sink._memory_bytes,
+        sink.accepted_count,
+        sink.dropped_count,
+        sink.loss_range_count,
+        sink._next_position_value,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        sink.drain()
+    assert (
+        sink.pending_count,
+        sink._body_bytes,
+        sink._memory_bytes,
+        sink.accepted_count,
+        sink.dropped_count,
+        sink.loss_range_count,
+        sink._next_position_value,
+    ) == before
+    assert tuple(sink._loss_ranges) == original_ranges
+    assert sink._last_delivered_position == 0
+
+
 def test_keyboard_interrupt_during_drain_restores_detached_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
