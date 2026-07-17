@@ -99,7 +99,9 @@ the proxy is terminated, fully waited/killed and group-verified before the app
 is touched. Cleanup always attempts both children and aggregates exceptions.
 A surviving process group after the kill deadline leaves the supervisor in
 `FAILED` and raises `CleanupError`; it is never reported as successful
-`STOPPED` cleanup.
+`STOPPED` cleanup. A persistent permission-denied process-group probe is also
+unknown rather than dead, so it receives bounded escalation and leaves the
+runtime failed if it cannot be classified.
 
 SIGINT and SIGTERM handlers are installed before either child starts and are
 removed only after cleanup. They map to exit statuses 130 and 143. A

@@ -44,6 +44,17 @@ class RuntimeSupervisorError(RuntimeError):
     """Base error for runtime lifecycle failures."""
 
 
+class ProcessGroupProbeError(RuntimeSupervisorError):
+    """The cached process group could not be classified safely."""
+
+    def __init__(self, process_group_id: int, cause: BaseException) -> None:
+        self.process_group_id = process_group_id
+        self.cause = cause
+        super().__init__(
+            f"could not determine whether process group {process_group_id} is alive: {cause}"
+        )
+
+
 class SignalHandlingError(RuntimeSupervisorError):
     """Raised when signals cannot be installed under the selected policy."""
 
@@ -119,6 +130,9 @@ class BrowserOpener(Protocol):
 class PopenChild:
     """Child wrapper retaining process-group identity after leader exit."""
 
+    _GROUP_PROBE_ATTEMPTS = 12
+    _GROUP_PROBE_DELAY_SECONDS = 0.08
+
     def __init__(self, process: subprocess.Popen[bytes]) -> None:
         self._process = process
         if os.name == "posix":
@@ -143,25 +157,40 @@ class PopenChild:
     def wait(self, timeout: float | None = None) -> int:
         return self._process.wait(timeout=timeout)
 
+    def _probe_group(self) -> bool:
+        if self._process_group_id is None:  # pragma: no cover - POSIX caller only.
+            return self.poll() is None
+        last_permission_error: PermissionError | None = None
+        for _ in range(self._GROUP_PROBE_ATTEMPTS):
+            # Reap a leader that exits while a previous EPERM is being
+            # retried; without this poll macOS can keep reporting the stale
+            # leader's inaccessible group.
+            self.poll()
+            try:
+                os.killpg(self._process_group_id, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError as exc:
+                last_permission_error = exc
+                if _ < self._GROUP_PROBE_ATTEMPTS - 1:
+                    time.sleep(self._GROUP_PROBE_DELAY_SECONDS)
+                continue
+            else:
+                return True
+        if last_permission_error is None:  # pragma: no cover - loop always probes.
+            raise RuntimeSupervisorError("process group probe did not execute")
+        raise ProcessGroupProbeError(self._process_group_id, last_permission_error) from (
+            last_permission_error
+        )
+
     def group_alive(self) -> bool:
         if os.name != "posix" or self._process_group_id is None:
             return self.poll() is None
         # Popen.poll() also reaps the group leader.  On macOS, probing a
         # cached group after that can report EPERM for a stale leader.  Only a
         # successful probe is evidence of a live descendant in this case.
-        if self.poll() is not None:
-            try:
-                os.killpg(self._process_group_id, 0)
-            except (ProcessLookupError, PermissionError):
-                return False
-            return True
-        try:
-            os.killpg(self._process_group_id, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return False
-        return True
+        self.poll()
+        return self._probe_group()
 
     def _signal_group(self, signum: int, fallback: Callable[[], None]) -> None:
         if os.name == "posix" and self._process_group_id is not None:
@@ -179,11 +208,11 @@ class PopenChild:
                 # must remain a cleanup failure.
                 if self.poll() is not None:
                     try:
-                        os.killpg(self._process_group_id, 0)
-                    except ProcessLookupError:
+                        group_alive = self._probe_group()
+                    except ProcessGroupProbeError:
+                        raise
+                    if not group_alive:
                         return
-                    except PermissionError:
-                        raise exc from None
                     raise exc from None
                 raise
         fallback()
@@ -509,7 +538,10 @@ class RuntimeSupervisor:
             return child.group_alive()
         except BaseException as exc:
             errors.append(f"group status failed: {exc}")
-            return child.poll() is None
+            # Unknown is fail-closed: continue through bounded TERM/KILL
+            # escalation instead of claiming a reaped leader means the group
+            # is gone.
+            return True
 
     def _wait_for_group_exit(self, child: ChildProcess, timeout_seconds: float) -> bool:
         deadline = self._clock() + timeout_seconds

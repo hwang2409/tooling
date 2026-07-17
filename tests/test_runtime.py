@@ -48,6 +48,7 @@ from mitm_inspector.runtime.supervisor import (
     CleanupError,
     ImmediateReadinessProbe,
     PopenChild,
+    ProcessGroupProbeError,
     RuntimeState,
     RuntimeSupervisor,
     SignalHandlingError,
@@ -439,6 +440,75 @@ def test_argv_builders_are_direct_vectors(tmp_path: Path) -> None:
     assert all(isinstance(argument, str) for argument in build_proxy_argv(config))
 
 
+class ProbeProcess:
+    pid = 12345
+
+    def poll(self) -> int | None:
+        return 17
+
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
+        return 17
+
+    def terminate(self) -> None:
+        raise AssertionError("fallback terminate must not be called")
+
+    def kill(self) -> None:
+        raise AssertionError("fallback kill must not be called")
+
+
+def test_reaped_group_eperm_reprobe_esrch_is_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("mitm_inspector.runtime.supervisor.os.getpgid", lambda _pid: 54321)
+    probes: list[int] = []
+
+    def killpg(_pgid: int, signum: int) -> None:
+        probes.append(signum)
+        if len(probes) == 1:
+            raise PermissionError(1, "operation not permitted")
+        raise ProcessLookupError
+
+    monkeypatch.setattr("mitm_inspector.runtime.supervisor.os.killpg", killpg)
+    child = PopenChild(ProbeProcess())  # type: ignore[arg-type]
+
+    assert child.group_alive() is False
+    assert probes == [0, 0]
+
+
+def test_reaped_group_persistent_eperm_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("mitm_inspector.runtime.supervisor.os.getpgid", lambda _pid: 54321)
+    probes: list[int] = []
+
+    def killpg(_pgid: int, signum: int) -> None:
+        probes.append(signum)
+        raise PermissionError(1, "operation not permitted")
+
+    monkeypatch.setattr("mitm_inspector.runtime.supervisor.os.killpg", killpg)
+    child = PopenChild(ProbeProcess())  # type: ignore[arg-type]
+
+    with pytest.raises(ProcessGroupProbeError, match="could not determine"):
+        child.group_alive()
+    assert probes == [0] * PopenChild._GROUP_PROBE_ATTEMPTS
+
+
+def test_signal_eperm_then_group_esrch_is_not_a_cleanup_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mitm_inspector.runtime.supervisor.os.getpgid", lambda _pid: 54321)
+    probes: list[int] = []
+
+    def killpg(_pgid: int, signum: int) -> None:
+        probes.append(signum)
+        if signum == signal.SIGTERM:
+            raise PermissionError(1, "operation not permitted")
+        raise ProcessLookupError
+
+    monkeypatch.setattr("mitm_inspector.runtime.supervisor.os.killpg", killpg)
+    child = PopenChild(ProbeProcess())  # type: ignore[arg-type]
+
+    child.terminate()
+    assert probes == [signal.SIGTERM, 0]
+
+
 def test_capture_allocations_are_unique_private_and_cleanable() -> None:
     capture = CaptureIPCConfig()
     first = capture.allocate()
@@ -634,6 +704,29 @@ def test_surviving_group_is_failure_and_second_stop_retries_without_false_succes
         supervisor.stop()
     assert len(events) > first_count
     assert supervisor.state is RuntimeState.FAILED
+
+
+def test_persistent_group_probe_eperm_escalates_and_never_stops(tmp_path: Path) -> None:
+    events: list[str] = []
+
+    class UnknownChild(FakeChild):
+        def group_alive(self) -> bool:
+            raise ProcessGroupProbeError(
+                self.process_group_id,
+                PermissionError(1, "operation not permitted"),
+            )
+
+    factory = FakeFactory(events, lambda pid, seen: UnknownChild(pid, seen))
+    supervisor = fake_supervisor(tmp_path, factory)
+
+    supervisor.start()
+    with pytest.raises(CleanupError, match="could not determine"):
+        supervisor.stop()
+
+    assert supervisor.state is RuntimeState.FAILED
+    assert all(failure.group_survived for failure in supervisor.cleanup_failures)
+    assert "terminate:2" in events and "kill:2" in events
+    assert "terminate:1" in events and "kill:1" in events
 
 
 def test_unexpected_child_exit_is_propagated_after_sibling_cleanup(tmp_path: Path) -> None:
