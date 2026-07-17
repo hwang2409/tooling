@@ -290,7 +290,7 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
 
   const responseBody = bodyFor(flow, "response");
   return (
-    <section className={`paired-inspector ${compact ? "is-compact" : ""} ${className}`.trim()} aria-labelledby={`${inspectorId}-title`}>
+    <section data-testid="paired-inspector" className={`paired-inspector ${compact ? "is-compact" : ""} ${className}`.trim()} aria-labelledby={`${inspectorId}-title`}>
       <header className="inspector-header">
         <div className="inspector-title-lockup">
           <span className="inspector-glyph" aria-hidden="true">↔</span>

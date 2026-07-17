@@ -1,27 +1,72 @@
 :root {
-  color: #e4eeeb;
-  background: #0f171c;
-  font-family: "SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace;
+  color-scheme: light;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  --ink: #e4eeeb;
-  --ink-soft: #c2cfcb;
-  --muted: #a8b9b5;
-  --faint: #94a8a3;
-  --paper: #172128;
-  --paper-deep: #0f171c;
-  --line: #2e424a;
-  --line-dark: #46616b;
-  --amber: #f3b36b;
-  --amber-soft: #493727;
-  --teal: #66cfc2;
-  --teal-soft: #20464a;
-  --danger: #ff8b80;
+
+  /* wiki semantic surfaces, with a small traffic-console signal palette */
+  --ink: #1c1c1c;
+  --ink-soft: #4f4f4f;
+  --muted: #626262;
+  --faint: #707070;
+  --paper: #ffffff;
+  --paper-alt: #fafafa;
+  --paper-deep: #f5f5f5;
+  --line: #dedede;
+  --line-dark: #c7c7c7;
+  --teal: #0f6e66;
+  --teal-soft: #e6f2f0;
+  --amber: #8a5200;
+  --amber-soft: #fff2dc;
+  --danger: #b3261e;
+  --danger-soft: #fce8e6;
+  --focus-ring: #1c1c1c;
+  --radius-s: 4px;
+  --font-interface: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", "SF Mono", Menlo, Consolas, "Roboto Mono", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --ink: #e8e8e8;
+    --ink-soft: #c4c4c4;
+    --muted: #a3a3a3;
+    --faint: #858585;
+    --paper: #171717;
+    --paper-alt: #1d1d1d;
+    --paper-deep: #111111;
+    --line: #303030;
+    --line-dark: #454545;
+    --teal: #78d5cc;
+    --teal-soft: #1d3f3d;
+    --amber: #f0bb70;
+    --amber-soft: #3f2f1e;
+    --danger: #f18b83;
+    --danger-soft: #3e2323;
+    --focus-ring: #f5f5f5;
+  }
 }
 
 * { box-sizing: border-box; }
 html { min-width: 320px; min-height: 100%; background: var(--paper-deep); }
-body { margin: 0; min-width: 320px; min-height: 100vh; }
-button, a { font: inherit; }
-button:focus-visible, a:focus-visible { outline: 2px solid var(--amber); outline-offset: 3px; }
+body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--paper-deep); }
+button, input, a { font: inherit; }
+button:focus-visible, input:focus-visible, a:focus-visible, [tabindex="0"]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--paper), 0 0 0 4px var(--focus-ring);
+}
 h1, h2, h3, p, dl, dd { margin: 0; }
+button, a { -webkit-tap-highlight-color: transparent; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .55; }
+code, kbd, .tabular-nums { font-variant-numeric: tabular-nums; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition-duration: .001ms !important;
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

@@ -9,7 +9,8 @@
     "build": "tsc -b && vite build",
     "lint": "eslint src",
     "typecheck": "tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.node.json",
-    "test": "vitest",
+    "test": "test -x node_modules/.bin/vitest || npm ci && vitest --run && npm run test:e2e --",
+    "test:e2e": "test -x node_modules/.bin/vite || npm ci && npm run build && uv run --python 3.12 python -m playwright install chromium && uv run --python 3.12 python tests/inspector_responsive.py --",
     "preview": "vite preview"
   },
   "dependencies": {
