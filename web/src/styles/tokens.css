@@ -24,7 +24,6 @@
   --radius-s: 4px;
   --font-interface: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: "JetBrains Mono", "SFMono-Regular", "SF Mono", Menlo, Consolas, "Roboto Mono", monospace;
-  --shadow-lifted: 0 2px 6px rgba(0, 0, 0, .1), 0 8px 24px rgba(0, 0, 0, .08);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -46,7 +45,6 @@
     --danger: #f18b83;
     --danger-soft: #3e2323;
     --focus-ring: #f5f5f5;
-    --shadow-lifted: 0 2px 6px rgba(0, 0, 0, .24), 0 8px 24px rgba(0, 0, 0, .32);
   }
 }
 
