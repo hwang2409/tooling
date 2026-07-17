@@ -334,16 +334,22 @@ function dispatchKey(element: MiniElement, key: string) {
 describe("mounted PairedInspector DOM behavior", () => {
   let container: MiniElement;
   let root: ReturnType<typeof createRoot>;
+  let extraRoots: Array<{ container: MiniElement; root: ReturnType<typeof createRoot> }>;
 
   beforeEach(() => {
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container as unknown as Element);
+    extraRoots = [];
   });
 
   afterEach(async () => {
     await act(async () => root.unmount());
     document.body.removeChild(container);
+    for (const extra of extraRoots) {
+      await act(async () => extra.root.unmount());
+      document.body.removeChild(extra.container);
+    }
     document.activeElement = document.body;
   });
 
@@ -386,6 +392,30 @@ describe("mounted PairedInspector DOM behavior", () => {
     await act(async () => dispatchKey(tabs[1], "ArrowRight"));
     expect(onPaneChange).toHaveBeenLastCalledWith("error");
     expect(tabs[2].getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("preserves body selection for same-pane requests and preserves committed panes across handoffs", async () => {
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection") })));
+    await act(async () => find(container, ".inspector-action").click());
+    expect(container.querySelector(".inspector-output")?.textContent).toContain("hello");
+    await act(async () => outerTab(container, "request").click());
+    expect(container.querySelector(".inspector-output")?.textContent).toContain("hello");
+
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection"), activePane: "request" })));
+    expect(container.querySelector(".inspector-output")?.textContent).toContain("hello");
+    await act(async () => outerTab(container, "request").click());
+    expect(container.querySelector(".inspector-output")?.textContent).toContain("hello");
+
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection"), activePane: "response" })));
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection"), activePane: "error" })));
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection") })));
+    expect(outerTab(container, "error").getAttribute("aria-selected")).toBe("true");
+
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection") })));
+    await act(async () => outerTab(container, "response").click());
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection"), activePane: "response" })));
+    await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-selection") })));
+    expect(outerTab(container, "response").getAttribute("aria-selected")).toBe("true");
   });
 
   it("does not steal focus from outer tabs, but recovers when the body control owns focus", async () => {
@@ -440,6 +470,29 @@ describe("mounted PairedInspector DOM behavior", () => {
     expect(container.querySelector("script")).toBeNull();
   });
 
+  it("keeps accessibility IDs unique and locally resolvable for two inspectors", async () => {
+    const otherContainer = document.createElement("div");
+    document.body.appendChild(otherContainer);
+    const otherRoot = createRoot(otherContainer as unknown as Element);
+    extraRoots.push({ container: otherContainer, root: otherRoot });
+    await act(async () => {
+      root.render(createElement(PairedInspector, { flow: makeFlow("flow-one") }));
+      otherRoot.render(createElement(PairedInspector, { flow: makeFlow("flow-two") }));
+    });
+
+    const instanceIds = (instance: MiniElement) => instance.querySelectorAll("[id]").map((element) => element.id);
+    const firstIds = instanceIds(container);
+    const secondIds = instanceIds(otherContainer);
+    expect(new Set(firstIds).size).toBe(firstIds.length);
+    expect(new Set(secondIds).size).toBe(secondIds.length);
+    expect(firstIds.every((id) => !secondIds.includes(id))).toBe(true);
+    for (const instance of [container, otherContainer]) {
+      const ids = new Set(instanceIds(instance));
+      for (const element of instance.querySelectorAll("[aria-controls]")) expect(ids.has(element.getAttribute("aria-controls") ?? "")).toBe(true);
+      for (const element of instance.querySelectorAll("[aria-labelledby]")) expect(ids.has(element.getAttribute("aria-labelledby") ?? "")).toBe(true);
+    }
+  });
+
   it("renders lifecycle observations in sequence and bounds a large invalid base64 payload", async () => {
     await act(async () => root.render(createElement(PairedInspector, { flow: makeFlow("flow-sequence") })));
     const trace = container.querySelectorAll(".inspector-trace-label");
@@ -449,3 +502,10 @@ describe("mounted PairedInspector DOM behavior", () => {
     expect(find(container, ".inspector-output").textContent).toContain("Invalid base64 payload");
   });
 });
+
+function outerTab(container: MiniElement, name: "request" | "response" | "error"): MiniElement {
+  const tabs = find(container, '[aria-label="Exchange panes"]').querySelectorAll('[role="tab"]');
+  const tab = tabs[name === "request" ? 0 : name === "response" ? 1 : 2];
+  if (!tab) throw new Error(`missing ${name} exchange tab`);
+  return tab;
+}

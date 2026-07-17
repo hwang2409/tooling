@@ -83,8 +83,8 @@ export function InspectorBodyPanel({ body, pane, selected, onSelect }: Inspector
   const [mode, setMode] = useState<BodyViewMode>("text");
   const metadata = bodyMetadata(body);
   const decoded = selected ? decodeBody(body, mode) : undefined;
-  const bodyId = `${pane}-body-panel`;
-  const tablistId = useId();
+  const bodyId = `${useId().replaceAll(":", "")}-body-heading`;
+  const tablistId = `${useId().replaceAll(":", "")}-body-tabs`;
   const panelId = `${tablistId}-panel`;
   const sectionRef = useRef<HTMLElement | null>(null);
   const bodyControlRootRef = useRef<HTMLDivElement | null>(null);
@@ -184,14 +184,15 @@ function BodyOutput({ decoded }: { decoded: DecodedBody }) {
 }
 
 function LifecycleStrip({ flow }: { flow: InspectorFlow }) {
+  const lifecycleId = useId().replaceAll(":", "");
   const entries = useMemo(() => orderLifecycle(flow.lifecycle), [flow.lifecycle]);
   const phase = lifecyclePhase(entries);
   return (
-    <section className="inspector-lifecycle" aria-labelledby="lifecycle-heading">
+    <section className="inspector-lifecycle" aria-labelledby={`${lifecycleId}-heading`}>
       <div className="inspector-section-heading">
         <div>
           <p className="inspector-kicker">OBSERVED ORDER</p>
-          <h3 id="lifecycle-heading">Lifecycle trace</h3>
+          <h3 id={`${lifecycleId}-heading`}>Lifecycle trace</h3>
         </div>
         <span className="inspector-lifecycle-note">sequence is authoritative</span>
       </div>
@@ -218,10 +219,11 @@ function LifecycleStrip({ flow }: { flow: InspectorFlow }) {
 }
 
 function ErrorPane({ error }: { error?: string }) {
+  const errorId = useId().replaceAll(":", "");
   return (
-    <section className={`inspector-error-panel ${error ? "has-error" : ""}`} aria-labelledby="error-heading">
+    <section className={`inspector-error-panel ${error ? "has-error" : ""}`} aria-labelledby={`${errorId}-heading`}>
       <p className="inspector-kicker">FLOW OUTCOME</p>
-      <h3 id="error-heading">{error ? "Error observed" : "No error recorded"}</h3>
+      <h3 id={`${errorId}-heading`}>{error ? "Error observed" : "No error recorded"}</h3>
       {error ? <pre className="inspector-error-copy">{error}</pre> : <p className="inspector-muted">No error event was supplied for this flow.</p>}
     </section>
   );
@@ -231,14 +233,34 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
   const [internalPane, setInternalPane] = useState<InspectorPane>("request");
   const [internalSelectedBody, setInternalSelectedBody] = useState<BodySelection | null>(null);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const tablistId = useId();
+  const inspectorId = useId().replaceAll(":", "");
+  const previousActivePaneRef = useRef<InspectorPane | undefined>(activePane);
+  const lastCommittedPaneRef = useRef<InspectorPane>(activePane ?? internalPane);
+  const previousCommittedPaneRef = useRef<InspectorPane>(activePane ?? internalPane);
+  const previousFlowIdRef = useRef(flow.metadata.flow_id);
   const entries = useMemo(() => orderLifecycle(flow.lifecycle), [flow.lifecycle]);
 
-  const pane = activePane ?? internalPane;
+  const pane = activePane ?? (previousActivePaneRef.current === undefined ? internalPane : lastCommittedPaneRef.current);
+
+  useInspectorLayoutEffect(() => {
+    const paneChanged = previousCommittedPaneRef.current !== pane;
+    const flowChanged = previousFlowIdRef.current !== flow.metadata.flow_id;
+
+    if (activePane === undefined) {
+      if (previousActivePaneRef.current !== undefined) setInternalPane(lastCommittedPaneRef.current);
+      lastCommittedPaneRef.current = pane;
+    } else {
+      lastCommittedPaneRef.current = activePane;
+    }
+    if ((paneChanged || flowChanged) && bodySelection === undefined) setInternalSelectedBody(null);
+
+    previousCommittedPaneRef.current = pane;
+    previousFlowIdRef.current = flow.metadata.flow_id;
+    previousActivePaneRef.current = activePane;
+  }, [activePane, bodySelection, flow.metadata.flow_id, pane]);
 
   const selectPane = (nextPane: InspectorPane) => {
     if (activePane === undefined) setInternalPane(nextPane);
-    if (bodySelection === undefined) setInternalSelectedBody(null);
     onPaneChange?.(nextPane);
   };
 
@@ -277,17 +299,17 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
         </div>
       </header>
 
-      <div className="inspector-tabbar" role="tablist" aria-label="Exchange panes" aria-orientation="horizontal" id={tablistId}>
+      <div className="inspector-tabbar" role="tablist" aria-label="Exchange panes" aria-orientation="horizontal" id={`${inspectorId}-exchange-tabs`}>
         {paneOrder.map((item, index) => (
           <button
             key={item}
             ref={(element) => { tabRefs.current[index] = element; }}
-            id={`${tablistId}-${item}`}
+            id={`${inspectorId}-exchange-${item}`}
             className={`inspector-pane-tab is-${item} ${pane === item ? "is-active" : ""}`}
             type="button"
             role="tab"
             aria-selected={pane === item}
-            aria-controls={`${tablistId}-${item}-pane`}
+            aria-controls={`${inspectorId}-exchange-${item}-pane`}
             tabIndex={pane === item ? 0 : -1}
             onClick={() => selectPane(item)}
             onKeyDown={(event) => handleTabKeyDown(event, index)}
@@ -304,10 +326,10 @@ export function PairedInspector({ flow, className = "", compact = false, activeP
           <div
             key={item}
             className="inspector-exchange-tabpanel"
-            id={`${tablistId}-${item}-pane`}
+            id={`${inspectorId}-exchange-${item}-pane`}
             role="tabpanel"
             tabIndex={isActive ? 0 : -1}
-            aria-labelledby={`${tablistId}-${item}`}
+            aria-labelledby={`${inspectorId}-exchange-${item}`}
             hidden={!isActive}
             aria-hidden={isActive ? undefined : "true"}
           >
