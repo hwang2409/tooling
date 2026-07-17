@@ -234,6 +234,10 @@ class ApiServer:
                 )
                 os.chmod(path, 0o600)
             except BaseException:
+                if self._ingest_server is not None:
+                    self._ingest_server.close()
+                    await self._ingest_server.wait_closed()
+                    self._ingest_server = None
                 await self._close_http()
                 raise
         self._sweep_task = asyncio.get_running_loop().create_task(self._sweep_forever())
