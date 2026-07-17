@@ -4,33 +4,32 @@ import { durationMsFromLifecycle } from "../flows/gridModel";
 import type { InspectableBody } from "./models";
 import type { InspectorFlow } from "./models";
 
-/** Best-guess one-line summary of a captured HTTP flow. */
+/**
+ * Best-guess one-line summary of a captured HTTP flow.
+ *
+ * Generic fallback (per acceptance spec) is exactly
+ * `<method> <path> · <status> · <duration>` — no host, no byte counts.
+ * Recognised Anthropic /v1/messages requests get the richer shape
+ * `POST v1/messages · <model> · <n> msgs · <bytes in> / <bytes out> · <duration> · <status>`.
+ */
 export function flowSummary(flow: InspectorFlow): string {
   const method = flow.metadata.method;
-  const host = flow.metadata.host;
   const path = flow.metadata.path;
   const status = normalizedStatus(flow);
   const duration = formatDurationMs(durationMsFromLifecycle(flow.lifecycle ?? []));
   const requestBody = flow.request_body ?? flow.metadata.request_body;
   const responseBody = flow.response_body ?? flow.metadata.response_body;
-  const requestSize = formatBytesCompact(sizeOf(requestBody));
-  const responseSize = formatBytesCompact(sizeOf(responseBody));
 
-  const anthropicSummary = anthropicMessagesSummary(requestBody, path, method);
-  const base = anthropicSummary ?? genericSummary(method, host, path);
-  const tail: string[] = [];
-  if (anthropicSummary === null) {
-    tail.push(`${requestSize} in / ${responseSize} out`);
-  } else {
-    tail.push(`${requestSize} in / ${responseSize} out`);
+  const anthropic = anthropicMessagesSummary(requestBody, path, method);
+  if (anthropic !== null) {
+    const parts = [anthropic, `${formatBytesCompact(sizeOf(requestBody))} in / ${formatBytesCompact(sizeOf(responseBody))} out`, duration];
+    if (status !== null) parts.push(status);
+    return parts.join(" · ");
   }
-  tail.push(duration);
-  if (status !== null) tail.push(status);
-  return `${base} · ${tail.filter(Boolean).join(" · ")}`;
-}
-
-function genericSummary(method: string, host: string, path: string): string {
-  return `${method} ${host}${path}`;
+  const parts = [`${method} ${path}`];
+  if (status !== null) parts.push(status);
+  parts.push(duration);
+  return parts.join(" · ");
 }
 
 function sizeOf(body: InspectableBody | undefined): string | undefined {
@@ -55,7 +54,7 @@ interface AnthropicMessages {
 /**
  * Recognise Anthropic's /v1/messages endpoint and pull out model + msg count
  * from the captured request JSON. Falls back to `null` when the body is not
- * a shape we recognise so the caller can render a generic summary instead.
+ * a shape we recognise so the caller can render the generic summary.
  */
 export function anthropicMessagesSummary(
   requestBody: InspectableBody | undefined,

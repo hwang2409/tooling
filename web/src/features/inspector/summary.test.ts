@@ -33,7 +33,7 @@ function flow(overrides: Partial<InspectorFlow> = {}): InspectorFlow {
 }
 
 describe("flowSummary", () => {
-  it("assembles the generic shape from method, host, path, sizes, duration, and status", () => {
+  it("assembles the generic shape as method path · status · duration with no host or bytes", () => {
     const summary = flowSummary(flow({
       metadata: {
         flow_id: "flow-1", method: "GET", scheme: "https", host: "api.example.test", port: "443", path: "/things",
@@ -46,10 +46,10 @@ describe("flowSummary", () => {
         { protocol_version: "1", type: "flow.lifecycle", source_id: "s", flow_id: "flow-1", event_id: "e2", occurred_at: "2026-01-01T00:00:00.250Z", sequence: "2", state: "response_end" },
       ],
     }));
-    expect(summary).toContain("GET api.example.test/things");
-    expect(summary).toContain("0B in / 1.0K out");
-    expect(summary).toContain("250ms");
-    expect(summary).toContain("200");
+    expect(summary).toBe("GET /things · 200 · 250ms");
+    expect(summary).not.toContain("api.example.test");
+    expect(summary).not.toContain("in / ");
+    expect(summary).not.toContain("out");
   });
 
   it("recognises Anthropic /v1/messages, extracts model, message count, and stream flag", () => {
@@ -87,6 +87,17 @@ describe("flowSummary", () => {
       ],
     }));
     expect(summary).toContain("err");
+    expect(summary).not.toContain("api.example.test");
+  });
+
+  it("omits the status segment entirely from the generic shape when unknown and no error observed", () => {
+    const summary = flowSummary(flow({
+      metadata: { flow_id: "flow-1", method: "GET", scheme: "https", host: "api.example.test", port: "443", path: "/things", request_headers: [], request_body: { state: "missing" } },
+      lifecycle: [
+        { protocol_version: "1", type: "flow.lifecycle", source_id: "s", flow_id: "flow-1", event_id: "e1", occurred_at: "2026-01-01T00:00:00Z", sequence: "1", state: "request_started" },
+      ],
+    }));
+    expect(summary).toBe("GET /things · —");
   });
 
   it("falls back to the generic shape when the request body is missing", () => {

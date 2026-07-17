@@ -169,7 +169,7 @@ export function FlowGrid({
                   <span role="gridcell" className={`flow-cell flow-cell-size${row.requestBody.truncated ? " is-truncated" : ""}`}>{row.requestBody.compact}{row.requestBody.truncated ? "+" : ""}</span>
                   <span role="gridcell" className={`flow-cell flow-cell-size${row.responseBody.truncated ? " is-truncated" : ""}`}>
                     {row.responseBody.compact}{row.responseBody.truncated ? "+" : ""}
-                    {row.isStreaming && <span className="flow-sse-flag" aria-label="server-sent events"> SSE</span>}
+                    {row.isStreaming && <span className="flow-sse-flag" aria-label="server-sent events">{" SSE ▸"}</span>}
                   </span>
                   <span role="gridcell" className="flow-cell flow-cell-duration">{row.durationLabel}</span>
                 </div>

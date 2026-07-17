@@ -162,6 +162,19 @@ describe("mounted FlowGrid", () => {
     expect(onSelect).toHaveBeenLastCalledWith("flow-99");
   });
 
+  it("marks streaming responses with the SSE triangle glyph", async () => {
+    const streamingMetadata = {
+      ...metadata(0),
+      response_body: { state: "captured" as const, size_bytes: "0", encoding: "base64" as const, data: "", content_type: "text/event-stream" },
+    } as ImmutableFlowMetadata;
+    const rows: FlowRow[] = [buildFlowRow(streamingMetadata)];
+    const mounted = await mount(
+      <FlowGrid rows={rows} selectedFlowId={null} onSelectFlow={() => {}} followLive={false} viewportHeight={280} />,
+    );
+    const rendered = mounted.container.querySelector<HTMLElement>(".flow-sse-flag");
+    expect(rendered?.textContent).toBe(" SSE ▸");
+  });
+
   it("renders an explicit empty note when no rows are given", async () => {
     const mounted = await mount(
       <FlowGrid rows={[]} selectedFlowId={null} onSelectFlow={() => {}} followLive={false} viewportHeight={280} />,

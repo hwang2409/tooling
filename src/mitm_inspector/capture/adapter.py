@@ -249,7 +249,10 @@ class CaptureAddon:
             if flow.response:
                 state.response.content_type = _content_type(flow.response.headers)
                 status = getattr(flow.response, "status_code", None)
-                if isinstance(status, int) and 0 <= status <= 599:
+                # Real HTTP responses live in 100..599; anything outside that
+                # range indicates uninitialised state on the mitmproxy side
+                # and must not leak into the emitted metadata.
+                if isinstance(status, int) and 100 <= status <= 599:
                     state.response_status = str(status)
                 self._install_stream(flow.response, state, "response")
             if not self._try_lifecycle(state, "response_headers"):

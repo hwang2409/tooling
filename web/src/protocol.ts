@@ -389,7 +389,8 @@ function flow(value: unknown, label: string): FlowMetadata {
   if (metadata.response_headers !== undefined) headers(metadata.response_headers, `${label}.response_headers`);
   if (metadata.response_status !== undefined) {
     const status = decimalValue(metadata.response_status, `${label}.response_status`);
-    if (Number(status) > 599) throw new ProtocolError(`${label}.response_status must be a valid HTTP status code`);
+    const numericStatus = Number(status);
+    if (numericStatus < 100 || numericStatus > 599) throw new ProtocolError(`${label}.response_status must be a valid HTTP status code`);
   }
   if (metadata.response_body !== undefined) body(metadata.response_body, `${label}.response_body`);
   return metadata as unknown as FlowMetadata;

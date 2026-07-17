@@ -192,7 +192,13 @@ export function decodeBody(body: InspectableBody, mode: BodyViewMode, limit = DE
   }
   if (mode === "sse") {
     const events = parseSseEvents(utf8.text);
-    const text = events.length === 0 ? "No complete SSE event frames found." : formatSse(events);
+    if (events.length === 0) {
+      // Preserve the raw payload verbatim so garbage or partial frames stay
+      // inspectable; the caller renders this via the plain-text fallback.
+      const text = utf8.text || "(empty text)";
+      return { mode, text, copyText: utf8.text, byteLength: base64.bytes.length, invalidEncoding: false, truncated, fallback: "text", events: [] };
+    }
+    const text = formatSse(events);
     return { mode, text, copyText: text, byteLength: base64.bytes.length, invalidEncoding: false, truncated, fallback: "none", events };
   }
   return { mode, text: utf8.text || "(empty text)", copyText: utf8.text, byteLength: base64.bytes.length, invalidEncoding: false, truncated, fallback: "none" };

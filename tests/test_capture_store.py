@@ -158,6 +158,55 @@ def test_response_can_start_before_request_end_and_duplicate_hooks_are_idempoten
     assert states.count("flow_completed") == 1
 
 
+def test_response_status_is_emitted_only_for_real_http_status_codes() -> None:
+    addon = CaptureAddon(source_id="test-source", clock=lambda: "now")
+    good = fake_flow()
+    good.response.status_code = 200
+    addon.requestheaders(good)
+    addon.responseheaders(good)
+    addon.response(good)
+    addon.request(good)
+    good_messages = payloads(addon)
+    metadata_with_status = [
+        message["metadata"]
+        for message in good_messages
+        if message["type"] == "flow.metadata"
+    ]
+    assert metadata_with_status, "expected at least one flow.metadata payload"
+    assert any(
+        isinstance(metadata, Mapping) and metadata.get("response_status") == "200"
+        for metadata in metadata_with_status
+    )
+
+    for bogus in (0, 42, 99, 600, 999):
+        addon = CaptureAddon(source_id="test-source", clock=lambda: "now")
+        flow = fake_flow(flow_id=f"bogus-{bogus}")
+        flow.response.status_code = bogus
+        addon.requestheaders(flow)
+        addon.responseheaders(flow)
+        addon.response(flow)
+        addon.request(flow)
+        for message in payloads(addon):
+            if message["type"] != "flow.metadata":
+                continue
+            metadata = message["metadata"]
+            assert isinstance(metadata, Mapping)
+            assert "response_status" not in metadata, bogus
+
+    addon = CaptureAddon(source_id="test-source", clock=lambda: "now")
+    missing = fake_flow(flow_id="no-status")
+    addon.requestheaders(missing)
+    addon.responseheaders(missing)
+    addon.response(missing)
+    addon.request(missing)
+    for message in payloads(addon):
+        if message["type"] != "flow.metadata":
+            continue
+        metadata = message["metadata"]
+        assert isinstance(metadata, Mapping)
+        assert "response_status" not in metadata
+
+
 def test_successful_completion_does_not_emit_a_capture_loss_gap() -> None:
     addon = CaptureAddon(source_id="test-source", clock=lambda: "now")
     flow = fake_flow(request_body=b"request", response_body=b"response")

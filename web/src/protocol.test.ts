@@ -197,6 +197,23 @@ describe("shared protocol-v1 conformance", () => {
     expect(() => parseProtocolMessage({ protocol_version: "1", type: "stream.gap", expected_sequence: "9", actual_sequence: "11", dropped_count: "2" })).toThrow(ProtocolError);
   });
 
+  it("bounds response_status to the 100..599 HTTP range in schema and validator", () => {
+    const baseFlow = {
+      flow_id: "f-status", method: "GET", scheme: "https", host: "h", port: "443", path: "/x",
+      request_headers: [], request_body: { state: "missing" }, response_headers: [],
+    };
+    const flowMessage = (status: string) => ({
+      protocol_version: "1", type: "flow.metadata",
+      metadata: { ...baseFlow, response_status: status },
+    });
+    expect(validateSchema(flowMessage("200"))).toBe(true);
+    parseProtocolMessage(flowMessage("200"));
+    for (const bad of ["0", "1", "99", "600", "999"]) {
+      expect(validateSchema(flowMessage(bad)), `schema should reject ${bad}`).toBe(false);
+      expect(() => parseProtocolMessage(flowMessage(bad)), `validator should reject ${bad}`).toThrow(ProtocolError);
+    }
+  });
+
   it("contains no secret canaries", () => {
     const serialized = JSON.stringify({ streamMessages, conformance }).toLowerCase();
     for (const canary of ["authorization-canary", "x-api-key-canary", "cookie-canary", "query-secret-canary", "contract-secret"]) {

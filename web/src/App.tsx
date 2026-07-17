@@ -23,6 +23,9 @@ function formatCursor(value: string): string {
   return value.length > 9 ? `${value.slice(0, 3)}…${value.slice(-4)}` : value;
 }
 
+/** Upper bound on remembered seen flow ids. Older entries evict FIFO. */
+export const SEEN_FLOW_LIMIT = 1024;
+
 export interface AppProps {
   transportFactory?: TransportFactory;
 }
@@ -39,6 +42,26 @@ export function Workbench({ view }: { view: ConnectionViewModel }) {
   } = view;
   const titleId = useId();
   const [resyncMessage, setResyncMessage] = useState<string | null>(null);
+  // seenFlowIds lives on the workbench so a reconnect — which unmounts
+  // FlowWorkspace via the empty-state branch when displayed flows drop
+  // to zero in follow-live mode — does not throw away the record of
+  // which rows the user has already opened. Bounded by SEEN_FLOW_LIMIT
+  // with FIFO eviction on the insertion-ordered Set so the working set
+  // stays bounded without discarding entries on transient reconnects.
+  const [seenFlowIds, setSeenFlowIds] = useState<ReadonlySet<string>>(() => new Set());
+  const markFlowSeen = (flowId: string) => {
+    setSeenFlowIds((previous) => {
+      if (previous.has(flowId)) return previous;
+      const next = new Set(previous);
+      next.add(flowId);
+      while (next.size > SEEN_FLOW_LIMIT) {
+        const oldest = next.values().next().value;
+        if (oldest === undefined) break;
+        next.delete(oldest);
+      }
+      return next;
+    });
+  };
   const statusInfo = statusCopy[status.state];
   const isBusy = status.state === "connecting" || status.state === "reconnecting";
   const isRetrying = status.state === "reconnecting";
@@ -184,7 +207,7 @@ export function Workbench({ view }: { view: ConnectionViewModel }) {
               <div className="empty-hint"><kbd>⌘</kbd><span>Flow search and inspection arrive with the workspace.</span></div>
             </div>
           ) : (
-            <FlowWorkspace browser={browser} followLive={followLive} pauseLive={pauseLive} />
+            <FlowWorkspace browser={browser} followLive={followLive} pauseLive={pauseLive} seenFlowIds={seenFlowIds} onFlowSeen={markFlowSeen} />
           )}
         </section>
       </section>
