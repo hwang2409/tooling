@@ -1,13 +1,52 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 
-type ConnectionState = "offline" | "ready";
+import { useConnection } from "./features/connection/useConnection";
+import type { ConnectionStatusName } from "./features/connection/connectionClient";
+import "./styles/shell.css";
+
+const statusCopy: Record<ConnectionStatusName, { label: string; detail: string }> = {
+  disconnected: { label: "Disconnected", detail: "No source is attached" },
+  connecting: { label: "Connecting", detail: "Opening local source" },
+  live: { label: "Live", detail: "Receiving source events" },
+  reconnecting: { label: "Reconnecting", detail: "Retrying the local source" },
+  stale: { label: "Stale", detail: "No events in the last 15 seconds" },
+  error: { label: "Source error", detail: "The source needs attention" },
+};
+
+function formatBytes(value: string | undefined): string {
+  if (!value) return "—";
+  const bytes = Number(value);
+  if (bytes >= 1024 * 1024) return `${Math.round(bytes / (1024 * 1024))} MiB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KiB`;
+  return `${bytes} B`;
+}
+
+function formatCursor(value: string): string {
+  return value.length > 9 ? `${value.slice(0, 3)}…${value.slice(-4)}` : value;
+}
 
 export function App() {
-  const [connection, setConnection] = useState<ConnectionState>("offline");
-  const isReady = connection === "ready";
+  const { browser, status, connect, disconnect, retry, requestResync } = useConnection();
+  const titleId = useId();
+  const [followLive, setFollowLive] = useState(true);
+  const [pausedCursor, setPausedCursor] = useState<string | null>(null);
+  const statusInfo = statusCopy[status.state];
+  const isBusy = status.state === "connecting" || status.state === "reconnecting";
+  const isConnected = status.state === "live" || status.state === "stale";
+  const hasError = status.state === "error";
+  const retainedCount = Object.keys(browser.flows).length;
+  const action = isConnected || isBusy ? disconnect : hasError ? retry : connect;
+  const memoryBudget = browser.sourceLimits?.max_in_memory_bytes ?? "134217728";
+  const displayedCursor = followLive ? browser.cursor : pausedCursor ?? browser.cursor;
+  const toggleFollowLive = () => {
+    if (followLive) setPausedCursor(browser.cursor);
+    else setPausedCursor(null);
+    setFollowLive((value) => !value);
+  };
 
   return (
     <main className="app-shell">
+      <a className="skip-link" href={`#${titleId}`}>Skip to workspace</a>
       <header className="topbar">
         <div className="brand-lockup">
           <span className="brand-mark" aria-hidden="true">⌁</span>
@@ -17,43 +56,96 @@ export function App() {
           </div>
         </div>
         <div className="topbar-actions">
-          <span className={`status-pill ${isReady ? "is-ready" : ""}`}>
-            <span className="status-dot" />
-            {isReady ? "source ready" : "awaiting source"}
-          </span>
-          <button className="connect-button" onClick={() => setConnection(isReady ? "offline" : "ready")}>
-            {isReady ? "Disconnect" : "Connect source"}
+          <div className={`status-pill status-${status.state}`} role="status" aria-live="polite">
+            <span className="status-dot" aria-hidden="true" />
+            <span>{statusInfo.label}</span>
+          </div>
+          <button className="connect-button" onClick={action}>
+            {isBusy ? "Cancel" : isConnected ? "Disconnect" : hasError ? "Try again" : "Connect source"}
           </button>
         </div>
       </header>
 
-      <section className="workspace-frame" aria-label="Traffic workspace">
-        <aside className="rail">
+      <section className="workspace-frame" aria-labelledby={titleId}>
+        <aside className="rail" aria-label="Workspace navigation">
           <div className="rail-label">WORKSPACE</div>
-          <button className="rail-item is-active"><span>◈</span> Live flows</button>
-          <button className="rail-item" disabled><span>≡</span> Saved views <small>soon</small></button>
+          <button className="rail-item is-active" aria-current="page"><span aria-hidden="true">◈</span> Live flows</button>
+          <button className="rail-item" disabled><span aria-hidden="true">≡</span> Saved views <small>soon</small></button>
           <div className="rail-divider" />
           <div className="rail-label">SOURCE</div>
-          <div className="source-card">
-            <span className="source-icon">mitm</span>
-            <div><strong>local proxy</strong><small>{isReady ? "protocol v1" : "not connected"}</small></div>
+          <div className={`source-card source-${status.state}`}>
+            <span className="source-icon" aria-hidden="true">mitm</span>
+            <div>
+              <strong>{browser.sourceId ?? "local proxy"}</strong>
+              <small>{statusInfo.detail}</small>
+            </div>
           </div>
+          {hasError && <p className="source-error">{status.error}</p>}
+          <div className="rail-divider" />
+          <div className="rail-label">RETENTION</div>
+          <dl className="rail-metrics">
+            <div><dt>kept in memory</dt><dd>{retainedCount}</dd></div>
+            <div><dt>body budget</dt><dd>{formatBytes(memoryBudget)}</dd></div>
+            <div><dt>cursor</dt><dd>{formatCursor(browser.cursor)}</dd></div>
+          </dl>
         </aside>
 
-        <section className="content-panel">
+        <section className="content-panel" id={titleId}>
           <div className="panel-heading">
             <div>
-              <p className="eyebrow">FLOW STREAM</p>
+              <p className="eyebrow">CAPTURE SURFACE / 01</p>
               <h2>Live flows</h2>
             </div>
-            <div className="heading-meta"><span className="metric-value">0</span><span>captured</span></div>
+            <div className="heading-meta" aria-label={`${retainedCount} retained flows`}>
+              <span className="metric-value">{retainedCount}</span><span>retained</span>
+            </div>
           </div>
-          <div className="empty-state">
-            <div className="empty-glyph" aria-hidden="true">↯</div>
-            <h3>{isReady ? "Source connected" : "Waiting for captured flows"}</h3>
-            <p>{isReady ? "The read-only workspace is ready for protocol-v1 events." : "Connect a local mitmproxy source to begin a session."}</p>
-            <div className="empty-hint"><kbd>⌘</kbd><span>Search and filter arrive with the flow workspace.</span></div>
+
+          <div className="signal-strip" aria-label={`Stream cursor ${displayedCursor}, status ${statusInfo.label}`}>
+            <div className={`cursor-beam cursor-${status.state}`} aria-hidden="true">
+              <span className="beam-track" /><span className="beam-pulse" />
+            </div>
+            <div className="signal-copy">
+              <span className="signal-label">SOURCE SIGNAL</span>
+              <strong>{statusInfo.label}</strong>
+              <span>{followLive ? `cursor ${browser.cursor}` : `paused at cursor ${displayedCursor}`}</span>
+            </div>
+            <div className="signal-stat"><span>messages</span><strong>{browser.counters.receivedMessages}</strong></div>
+            <div className="signal-stat"><span>changes</span><strong>{browser.counters.appliedChanges}</strong></div>
+            <div className="signal-stat"><span>dropped</span><strong>{browser.counters.droppedMessages}</strong></div>
+            <button className={`follow-control ${followLive ? "is-following" : "is-paused"}`} aria-pressed={followLive} onClick={toggleFollowLive}>
+              <span aria-hidden="true">{followLive ? "↓" : "Ⅱ"}</span>{followLive ? "Following live" : "Live paused"}
+            </button>
           </div>
+
+          {browser.gap ? (
+            <div className="notice notice-warning" role="alert">
+              <span className="notice-mark" aria-hidden="true">!</span>
+              <div><strong>Stream gap at cursor {browser.gap.received}</strong><p>Waiting for a fresh snapshot from the source. History remains visible until it arrives.</p></div>
+              <button className="notice-action" onClick={() => requestResync(browser.resyncRequested ?? browser.cursor)}>Request snapshot</button>
+            </div>
+          ) : hasError ? (
+            <div className="empty-state" role="status">
+              <div className="empty-glyph" aria-hidden="true">×</div>
+              <p className="eyebrow">SOURCE DID NOT OPEN</p>
+              <h3>Connect a local capture source</h3>
+              <p>{status.error ?? "The source adapter is unavailable."}</p>
+              <button className="empty-action" onClick={retry}>Try the source again</button>
+            </div>
+          ) : retainedCount === 0 ? (
+            <div className="empty-state" role="status">
+              <div className="empty-glyph" aria-hidden="true">↯</div>
+              <p className="eyebrow">NO CAPTURED FLOWS</p>
+              <h3>{isConnected ? "Source connected, waiting for traffic" : "Waiting for a local source"}</h3>
+              <p>{isConnected ? "New sanitized flow metadata will appear here as the proxy observes it." : "Connect a local mitmproxy source to begin a read-only session."}</p>
+              <div className="empty-hint"><kbd>⌘</kbd><span>Flow search and inspection arrive with the workspace.</span></div>
+            </div>
+          ) : (
+            <div className="ready-state" role="status">
+              <div className="ready-stamp"><span className="ready-count">{retainedCount}</span><span>flows held in the bounded browser view</span></div>
+              <p>Flow rows and paired request/response inspection are the next workspace layer.</p>
+            </div>
+          )}
         </section>
       </section>
 
