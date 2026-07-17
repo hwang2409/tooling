@@ -58,9 +58,13 @@ is exposed to capture callers.
 Delivery positions are bounded unsigned 64-bit values; exhaustion is a stable
 terminal condition that leaves queued items and loss ranges attached rather
 than emitting an unrepresentable successor position.
-Consumer drains are single-flight, and callback dispatch is single-flight and
-reentrant-safe; callback failures are raised only after the detached batch has
-been fully attempted.
+Consumer drains return a stable `DrainBatch` token whose messages remain
+available until `BoundedMessageSink.acknowledge(batch)` succeeds. A retry
+returns the same token, so queue removal, handoff, gate cleanup, and callback
+acceptance cannot lose a batch. `CaptureAddon.drain` acknowledges only after
+all configured callbacks accept their messages and resumes a failed callback
+from the first unaccepted message. Consumer drains and callback dispatch are
+single-flight and reentrant-safe.
 
 `MemoryStore` retains project-owned parsed messages grouped by flow. It keeps
 the newest 2,000 completed flows or 30 minutes, whichever evicts first, and

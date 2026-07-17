@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from mitm_inspector.capture import metrics as metrics_module
+from mitm_inspector.capture import sequencer as sequencer_module
 from mitm_inspector.capture import sink as sink_module
 from mitm_inspector.capture.addon import (
     CaptureAddon,
@@ -77,6 +78,15 @@ def payloads(addon: CaptureAddon) -> list[dict[str, object]]:
         assert isinstance(message, KnownParsedMessage)
         result.append(dict(message.message))
     return result
+
+
+def acked_sink_drain(
+    sink: BoundedMessageSink, limit: int | None = None
+) -> list[ParsedMessageResult]:
+    batch = sink.drain(limit)
+    messages = list(batch.messages)
+    sink.acknowledge(batch)
+    return messages
 
 
 def lifecycle_states(messages: list[dict[str, object]]) -> list[str]:
@@ -260,6 +270,116 @@ def test_post_commit_body_chunk_fault_reconciles_offset_before_next_chunk(
         and message.message.get("type") == "body.chunk"
     ]
     assert [message.message["chunk_index"] for message in chunks] == ["0", "1"]
+
+
+@pytest.mark.parametrize("side", ["request", "response"])
+def test_committed_body_lifecycle_fault_resumes_accounted_chunk(
+    monkeypatch: pytest.MonkeyPatch, side: str
+) -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    state = addon._ensure_flow(fake_flow())
+    body = state.request if side == "request" else state.response
+    original_release = addon.sink._lock.release_if_owned
+    failed = True
+
+    def release_lifecycle_then_interrupt(owner: object | None = None) -> bool:
+        nonlocal failed
+        released = original_release(owner)
+        if failed:
+            failed = False
+            raise KeyboardInterrupt
+        return released
+
+    monkeypatch.setattr(
+        addon.sink._lock,
+        "release_if_owned",
+        release_lifecycle_then_interrupt,
+    )
+    with pytest.raises(KeyboardInterrupt) as raised:
+        addon._observe_chunk(state, side, b"abc")
+    assert getattr(raised.value, "capture_committed", False)
+    assert body.total_bytes == 3
+    assert len(body.prefix) == 3
+    assert body.lifecycle_emitted
+    assert body.chunk_index == 0
+    monkeypatch.undo()
+
+    addon._observe_chunk(state, side, b"abc")
+    addon._observe_chunk(state, side, b"def")
+    body_chunks = [
+        message
+        for message in addon.drain()
+        if isinstance(message, KnownParsedMessage)
+        and message.message.get("type") == "body.chunk"
+        and message.message.get("body_side") == side
+    ]
+    assert [message.message["chunk_index"] for message in body_chunks] == ["0", "1"]
+    assert [message.message["offset_bytes"] for message in body_chunks] == ["0", "3"]
+    assert body.total_bytes == 6
+
+
+def test_precommit_body_lifecycle_fault_retries_without_reaccounting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    state = addon._ensure_flow(fake_flow())
+    original_offer = addon.sink.offer
+    failed = True
+
+    def fail_once(message: object) -> bool:
+        nonlocal failed
+        if failed:
+            failed = False
+            raise RuntimeError("injected lifecycle admission failure")
+        return original_offer(message)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(addon.sink, "offer", fail_once)
+    with pytest.raises(RuntimeError, match="lifecycle admission"):
+        addon._observe_chunk(state, "request", b"abc")
+    assert state.request.total_bytes == 3
+    assert not state.request.lifecycle_emitted
+    monkeypatch.undo()
+    addon._observe_chunk(state, "request", b"abc")
+    assert state.request.total_bytes == 3
+    assert state.request.chunk_index == 1
+
+
+def test_committed_body_lifecycle_fault_flushes_pending_chunk_at_terminal_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    addon = CaptureAddon(clock=lambda: "now")
+    state = addon._ensure_flow(fake_flow())
+    original_release = addon.sink._lock.release_if_owned
+    failed = True
+
+    def release_lifecycle_then_interrupt(owner: object | None = None) -> bool:
+        nonlocal failed
+        released = original_release(owner)
+        if failed:
+            failed = False
+            raise KeyboardInterrupt
+        return released
+
+    monkeypatch.setattr(addon.sink._lock, "release_if_owned", release_lifecycle_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        addon._observe_chunk(state, "request", b"abc")
+    monkeypatch.undo()
+
+    assert addon._finish_body(state, "request", b"abc")
+    messages = addon.drain()
+    chunks = [
+        message
+        for message in messages
+        if isinstance(message, KnownParsedMessage) and message.message.get("type") == "body.chunk"
+    ]
+    ends = [
+        message
+        for message in messages
+        if isinstance(message, KnownParsedMessage) and message.message.get("type") == "body.end"
+    ]
+    assert len(chunks) == 1
+    assert chunks[0].message["data_base64"] == base64.b64encode(b"abc").decode()
+    assert len(ends) == 1
 
 
 def test_response_completion_is_deferred_until_late_missing_request_end() -> None:
@@ -750,7 +870,8 @@ def test_post_append_fault_reports_committed_offer_without_duplicate(
     monkeypatch.undo()
     drained = sink.drain()
     assert len(drained) == 1
-    assert sink.drain() == []
+    sink.acknowledge(drained)
+    assert acked_sink_drain(sink) == []
 
 
 def test_drain_cleanup_fault_keeps_committed_snapshot_visible_once(
@@ -765,10 +886,13 @@ def test_drain_cleanup_fault_keeps_committed_snapshot_visible_once(
         raise KeyboardInterrupt
 
     monkeypatch.setattr(sink._lock, "release_if_owned", release_then_interrupt)
-    assert len(sink.drain()) == 1
+    batch = sink.drain()
+    assert len(batch) == 1
     monkeypatch.undo()
     assert sink.pending_count == 0
-    assert sink.drain() == []
+    assert len(sink.drain()) == 1
+    sink.acknowledge(batch)
+    assert acked_sink_drain(sink) == []
 
 
 def test_drain_post_commit_fault_keeps_durable_batch_for_retry(
@@ -790,7 +914,68 @@ def test_drain_post_commit_fault_keeps_durable_batch_for_retry(
     monkeypatch.undo()
     recovered = sink.drain()
     assert len(recovered) == 1
-    assert sink.drain() == []
+    sink.acknowledge(recovered)
+    assert acked_sink_drain(sink) == []
+
+
+def test_drain_publication_fault_leaves_queue_and_batch_uncommitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.publish"}))
+    original_batch = sequencer_module.DrainBatch
+
+    def fail_publication(*args: object, **kwargs: object) -> object:
+        raise MemoryError("injected batch publication failure")
+
+    monkeypatch.setattr(sequencer_module, "DrainBatch", fail_publication)
+    with pytest.raises(MemoryError, match="batch publication"):
+        sink.drain()
+    assert sink.pending_count == 1
+    monkeypatch.setattr(sequencer_module, "DrainBatch", original_batch)
+    batch = sink.drain()
+    assert len(batch) == 1
+    sink.acknowledge(batch)
+
+
+def test_ack_fault_after_commit_is_idempotently_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.ack"}))
+    batch = sink.drain()
+    original_ack = sink._sequencer.acknowledge
+
+    def ack_then_interrupt(candidate: object) -> None:
+        original_ack(candidate)  # type: ignore[arg-type]
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink._sequencer, "acknowledge", ack_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        sink.acknowledge(batch)
+    monkeypatch.undo()
+    sink.acknowledge(batch)
+    assert acked_sink_drain(sink) == []
+
+
+def test_drain_recovery_after_caller_return_fault_reuses_same_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.return"}))
+    original_drain = sink.drain
+
+    def return_then_interrupt(*args: object, **kwargs: object) -> object:
+        original_drain(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sink, "drain", return_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        sink.drain()
+    monkeypatch.undo()
+    recovered = sink.drain()
+    assert recovered.token == 1
+    sink.acknowledge(recovered)
 
 
 def test_drain_baseexception_restores_one_atomic_snapshot(
@@ -821,7 +1006,7 @@ def test_sink_queue_and_body_drops_are_in_band_and_delivery_positioned() -> None
     sink = BoundedMessageSink(max_pending=1, max_body_bytes=1)
     assert sink.offer(parse_message({"protocol_version": "1", "type": "future.first"}))
     assert not sink.offer(parse_message({"protocol_version": "1", "type": "future.queue"}))
-    sink.drain()
+    acked_sink_drain(sink)
     assert not sink.offer(
         parse_message(
             {
@@ -849,6 +1034,7 @@ def test_sink_queue_and_body_drops_are_in_band_and_delivery_positioned() -> None
         "stream.gap",
         "future.after",
     ]
+    sink.acknowledge(messages)
     delivered = messages[-1]
     delivered_payload = (
         delivered.message if isinstance(delivered, KnownParsedMessage) else delivered.payload
@@ -938,12 +1124,15 @@ def test_reentrant_callback_drain_is_single_flight_and_keeps_suffix_order() -> N
 
 def test_callback_failure_attempts_entire_batch_without_stranding_suffix() -> None:
     observed: list[str] = []
+    failed = True
 
     def emit(message: ParsedMessageResult) -> None:
         payload = message.message if isinstance(message, KnownParsedMessage) else message.payload
         message_type = str(payload["type"])
         observed.append(message_type)
-        if message_type == "future.one":
+        nonlocal failed
+        if message_type == "future.one" and failed:
+            failed = False
             raise RuntimeError("injected callback failure")
 
     addon = CaptureAddon(emit=emit, clock=lambda: "now")
@@ -951,8 +1140,10 @@ def test_callback_failure_attempts_entire_batch_without_stranding_suffix() -> No
     assert addon.sink.offer(parse_message({"protocol_version": "1", "type": "future.two"}))
     with pytest.raises(RuntimeError, match="injected callback failure"):
         addon.drain()
-    assert observed == ["future.one", "future.two"]
-    assert addon.drain() == []
+    assert observed == ["future.one"]
+    retry = addon.drain()
+    assert len(retry) == 2
+    assert observed == ["future.one", "future.one", "future.two"]
 
 
 def test_partial_response_error_finishes_response_and_disables_late_stream_chunks() -> None:
@@ -1009,7 +1200,8 @@ def test_sink_emits_a_final_gap_without_a_later_retained_message() -> None:
     assert isinstance(gap, KnownParsedMessage)
     assert gap.message["expected_sequence"] == "1"
     assert gap.message["actual_sequence"] == "3"
-    assert sink.drain() == []
+    sink.acknowledge(first_drain)
+    assert acked_sink_drain(sink) == []
 
 
 def test_contended_offer_does_no_payload_work(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1188,6 +1380,37 @@ def test_pending_loss_fold_fault_retries_snapshot_without_double_count(
     assert gap.message["dropped_count"] == "1"
 
 
+def test_pending_reader_snapshot_fault_does_not_consume_loss_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink()
+    assert sink._sequencer.note_loss_without_lock()
+    original_replace = sequencer_module.replace
+    failed = True
+
+    def fail_snapshot(*args: object, **kwargs: object) -> object:
+        nonlocal failed
+        if failed:
+            failed = False
+            raise MemoryError("injected snapshot publication failure")
+        return original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(sequencer_module, "replace", fail_snapshot)
+    with pytest.raises(MemoryError, match="snapshot publication"):
+        sink.offer(parse_message({"protocol_version": "1", "type": "future.snapshot-fault"}))
+    monkeypatch.undo()
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.snapshot-retry"}))
+    drained = acked_sink_drain(sink)
+    assert [
+        (
+            message.message
+            if isinstance(message, KnownParsedMessage)
+            else message.payload
+        )["type"]
+        for message in drained
+    ] == ["stream.gap", "future.snapshot-retry"]
+
+
 def test_reservation_acquire_baseexception_after_ownership_is_recoverable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1358,13 +1581,36 @@ def test_public_drain_retains_lease_after_two_preclear_cleanup_faults(
         return original(owner)
 
     monkeypatch.setattr(sink._lock, "release_if_owned", fail_twice)
-    assert len(sink.drain()) == 1
-    pending_lease = sink._pending_lease
-    assert pending_lease is not None
-    assert sink._lock.is_owned(pending_lease)
+    batch = sink.drain()
+    assert len(batch) == 1
     monkeypatch.undo()
-    assert sink.drain() == []
-    assert sink._pending_lease is None
+    recovered = sink.drain()
+    assert recovered.token == batch.token
+    sink.acknowledge(recovered)
+    assert acked_sink_drain(sink) == []
+
+
+def test_cleanup_obligation_is_published_before_finish_helper_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = BoundedMessageSink(max_pending=2)
+
+    def interrupt_before_finish(_reservation: object) -> None:
+        raise KeyboardInterrupt("before cleanup helper")
+
+    monkeypatch.setattr(sink, "_finish_reservation", interrupt_before_finish)
+    with pytest.raises(KeyboardInterrupt) as raised:
+        sink.offer(parse_message({"protocol_version": "1", "type": "future.helper"}))
+    assert getattr(raised.value, "capture_committed", False)
+    monkeypatch.undo()
+
+    # The next producer retries the gate-owned RELEASING lease before taking
+    # admission.  The committed first message remains visible and a waiter
+    # cannot be stranded behind the interrupted helper.
+    assert sink.offer(parse_message({"protocol_version": "1", "type": "future.after"}))
+    batch = sink.drain()
+    assert len(batch) == 2
+    sink.acknowledge(batch)
 
 
 def test_gate_retries_two_failed_notifications_for_waiter(
@@ -1528,7 +1774,8 @@ def test_uint64_exhaustion_is_stable_without_constructing_next_position() -> Non
     assert drained_payload["delivery_position"] == str(MAX_U64 - 1)
     assert sink.pending_count == 0
     assert sink.loss_range_count == ranges
-    assert sink.drain() == []
+    sink.acknowledge(drained)
+    assert acked_sink_drain(sink) == []
     assert sink.loss_range_count == ranges
 
 
@@ -1544,7 +1791,8 @@ def test_terminal_loss_splits_representable_prefix_from_terminal_position() -> N
     assert drained[1].message["type"] == "stream.gap"
     assert drained[1].message["actual_sequence"] == str(MAX_U64)
     assert sink.loss_range_count == 1
-    assert sink.drain() == []
+    sink.acknowledge(drained)
+    assert acked_sink_drain(sink) == []
 
 
 def test_drain_failure_restores_detached_queue_and_cursor(
@@ -1607,8 +1855,8 @@ def test_producer_losses_during_drain_are_not_cleared_or_duplicated(
         return original_positioner(message, position)
 
     monkeypatch.setattr(sink_module, "_with_delivery_position", paused_positioner)
-    first_result: list[ParsedMessageResult] = []
-    drain_thread = threading.Thread(target=lambda: first_result.extend(sink.drain()))
+    first_batches: list[object] = []
+    drain_thread = threading.Thread(target=lambda: first_batches.append(sink.drain()))
     drain_thread.start()
     assert entered.wait(timeout=1)
     sink.record_loss()
@@ -1617,13 +1865,17 @@ def test_producer_losses_during_drain_are_not_cleared_or_duplicated(
     drain_thread.join(timeout=1)
     assert not drain_thread.is_alive()
 
-    combined = first_result + sink.drain()
+    first_batch = first_batches[0]
+    sink.acknowledge(first_batch)
+    second_batch = sink.drain()
+    combined = list(first_batch) + list(second_batch)  # type: ignore[arg-type]
     types = [
         (message.message if isinstance(message, KnownParsedMessage) else message.payload)["type"]
         for message in combined
     ]
     assert types == ["future.first", "stream.gap"]
     assert types.count("stream.gap") == 1
+    sink.acknowledge(second_batch)
 
 
 def test_overlapping_drains_are_single_flight_and_keep_delivery_order(
@@ -1635,8 +1887,8 @@ def test_overlapping_drains_are_single_flight_and_keep_delivery_order(
     entered = threading.Event()
     release = threading.Event()
     second_done = threading.Event()
-    first_result: list[ParsedMessageResult] = []
-    second_result: list[ParsedMessageResult] = []
+    first_result: list[object] = []
+    second_result: list[object] = []
     original_positioner = sink_module._with_delivery_position
 
     def paused_positioner(message: ParsedMessageResult, position: int) -> ParsedMessageResult:
@@ -1645,10 +1897,10 @@ def test_overlapping_drains_are_single_flight_and_keep_delivery_order(
         return original_positioner(message, position)
 
     monkeypatch.setattr(sink_module, "_with_delivery_position", paused_positioner)
-    first = threading.Thread(target=lambda: first_result.extend(sink.drain()))
+    first = threading.Thread(target=lambda: first_result.append(sink.drain()))
 
     def run_second() -> None:
-        second_result.extend(sink.drain())
+        second_result.append(sink.drain())
         second_done.set()
 
     second = threading.Thread(target=run_second)
@@ -1661,11 +1913,16 @@ def test_overlapping_drains_are_single_flight_and_keep_delivery_order(
     second.join(timeout=1)
     assert not first.is_alive()
     assert not second.is_alive()
+    assert len(first_result) == 1
+    assert len(second_result) == 1
+    first_batch = first_result[0]
+    second_batch = second_result[0]
+    assert first_batch.token == second_batch.token  # type: ignore[union-attr]
     assert [
         (item.message if isinstance(item, KnownParsedMessage) else item.payload)["type"]
-        for item in first_result
+        for item in first_batch  # type: ignore[union-attr]
     ] == ["future.one", "future.two"]
-    assert second_result == []
+    sink.acknowledge(first_batch)  # type: ignore[arg-type]
 
 
 def test_concurrent_drop_events_are_emitted_once_in_one_resyncable_gap() -> None:
@@ -1691,7 +1948,9 @@ def test_concurrent_drop_events_are_emitted_once_in_one_resyncable_gap() -> None
     assert len(gaps) == 1
     assert gaps[0].message["dropped_count"] == "64"
     assert sink.dropped_count == 64
-    assert sink.drain() == []
+    batch = sink.drain()
+    sink.acknowledge(batch)
+    assert acked_sink_drain(sink) == []
 
 
 def test_active_flow_bounds_evict_zero_body_flood_with_tombstones_and_gaps() -> None:

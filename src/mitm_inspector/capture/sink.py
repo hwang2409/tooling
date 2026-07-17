@@ -6,7 +6,6 @@ from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from threading import Lock
 
-from mitm_inspector.capture.gate import OwnershipPhase as _OwnershipPhase
 from mitm_inspector.capture.gate import ReservationGate as _ReservationGate
 from mitm_inspector.capture.gate import ReservationLease as _ReservationLease
 from mitm_inspector.capture.metrics import (
@@ -20,6 +19,7 @@ from mitm_inspector.capture.metrics import (
 )
 from mitm_inspector.capture.sequencer import (
     DeliverySequencer,
+    DrainBatch,
     SequencerState,
 )
 from mitm_inspector.capture.sequencer import (
@@ -61,8 +61,6 @@ class BoundedMessageSink:
         self._lock = _ReservationGate()
         self._reservation_lock = self._lock
         self._consumer_lock = Lock()
-        self._lease_state_lock = Lock()
-        self._pending_lease: _ReservationLease | None = None
 
     @property
     def _state(self) -> SequencerState:
@@ -122,7 +120,7 @@ class BoundedMessageSink:
     def offer(self, message: ParsedMessage | Mapping[str, object]) -> bool:
         """Prepare only after immediate gate admission; never waits for drain."""
 
-        pending_error = self._retry_pending_lease()
+        pending_error = self._retry_gate_cleanup()
         if pending_error is not None:
             raise pending_error
         reservation = _ReservationLease(self._reservation_lock)
@@ -130,14 +128,14 @@ class BoundedMessageSink:
             self._sequencer.record_loss()
             return False
         if not self._sequencer.lock.acquire(False):
-            close_error = self._finish_reservation(reservation)
+            close_error = self._finish_reservation_safely(reservation)
             self._sequencer.record_loss()
             if close_error is not None:
                 raise close_error
             return False
         if not self._sequencer.can_accept_locked(self._max_pending):
             self._sequencer.lock.release()
-            close_error = self._finish_reservation(reservation)
+            close_error = self._finish_reservation_safely(reservation)
             self._sequencer.record_loss()
             if close_error is not None:
                 raise close_error
@@ -174,7 +172,7 @@ class BoundedMessageSink:
             raise
         finally:
             self._sequencer.lock.release()
-            close_error = self._finish_reservation(reservation)
+            close_error = self._finish_reservation_safely(reservation)
             if close_error is not None:
                 if committed:
                     _mark_committed_exception(close_error)
@@ -184,27 +182,22 @@ class BoundedMessageSink:
     def record_loss(self) -> bool:
         return self._sequencer.record_loss()
 
-    def drain(self, limit: int | None = None) -> list[ParsedMessageResult]:
+    def drain(self, limit: int | None = None) -> DrainBatch:
         limit = _validate_drain_limit(limit)
         with self._consumer_lock:
-            pending_error = self._retry_pending_lease()
+            pending_error = self._retry_gate_cleanup()
             if pending_error is not None:
                 raise pending_error
             reservation = _ReservationLease(self._reservation_lock)
             if not reservation.acquire(True):
-                return []
+                raise RuntimeError("blocking reservation acquisition failed")
             committed = False
             primary: BaseException | None = None
-            result: list[ParsedMessageResult] | None = None
+            result: DrainBatch | None = None
             try:
-                recovered = self._sequencer.take_committed_batch()
-                if recovered is not None:
-                    result = recovered
-                else:
-                    result = self._sequencer.drain(
-                        limit, _with_delivery_position, _gap_after_loss
-                    )
-                    self._sequencer.acknowledge_committed_batch()
+                result = self._sequencer.drain(
+                    limit, _with_delivery_position, _gap_after_loss
+                )
                 committed = True
             except BaseException as error:
                 primary = error
@@ -212,7 +205,7 @@ class BoundedMessageSink:
                     _mark_committed_exception(error)
                 raise
             finally:
-                close_error = self._finish_reservation(reservation)
+                close_error = self._finish_reservation_safely(reservation)
                 if close_error is not None:
                     if committed:
                         # Sequencer commit is already authoritative.  Do not
@@ -226,24 +219,36 @@ class BoundedMessageSink:
             return result
 
     def _finish_reservation(self, reservation: _ReservationLease) -> BaseException | None:
-        with self._lease_state_lock:
-            error = reservation.close()
-            if reservation.phase is _OwnershipPhase.RELEASING:
-                self._pending_lease = reservation
-            elif self._pending_lease is reservation:
-                self._pending_lease = None
-        return error
+        reservation.prepare_close()
+        return reservation.close()
 
-    def _retry_pending_lease(self) -> BaseException | None:
-        with self._lease_state_lock:
-            reservation = self._pending_lease
-        if reservation is None:
-            return None
-        error = self._finish_reservation(reservation)
-        return error
+    def _finish_reservation_safely(
+        self, reservation: _ReservationLease
+    ) -> BaseException | None:
+        """Publish cleanup ownership before invoking the fallible helper."""
+
+        reservation.prepare_close()
+        try:
+            return self._finish_reservation(reservation)
+        except BaseException as error:
+            return error
+
+    def _retry_gate_cleanup(self) -> BaseException | None:
+        return self._reservation_lock.retry_cleanup()
+
+    def acknowledge(self, batch: DrainBatch) -> None:
+        """Acknowledge a drain batch after the consumer accepts it."""
+
+        self._sequencer.acknowledge(batch)
 
     def __iter__(self) -> Iterator[ParsedMessageResult]:
-        return iter(self.drain())
+        batch = self.drain()
+        try:
+            yield from batch
+        except BaseException:
+            raise
+        else:
+            self.acknowledge(batch)
 
     @property
     def accepted_count(self) -> int:

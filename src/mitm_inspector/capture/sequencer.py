@@ -9,8 +9,8 @@ the ticket stream for the owner to fold into one loss run later.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field, replace
 from threading import RLock
 
 from mitm_inspector.protocol import (
@@ -37,11 +37,30 @@ class QueuedMessage:
 
 
 @dataclass(frozen=True)
+class DrainBatch:
+    """Stable drain handoff retained until the consumer explicitly acks it."""
+
+    token: int
+    messages: tuple[ParsedMessageResult, ...]
+    _owner: object = field(repr=False, compare=False)
+
+    def __iter__(self) -> Iterator[ParsedMessageResult]:
+        return iter(self.messages)
+
+    def __len__(self) -> int:
+        return len(self.messages)
+
+    def __getitem__(self, index: int) -> ParsedMessageResult:
+        return self.messages[index]
+
+
+@dataclass(frozen=True)
 class SequencerState:
     next_position: int = 1
     exhausted: bool = False
     pending_marker: int = -1
     pending_losses: int = 0
+    committed_batch: DrainBatch | None = None
     trailing_losses: tuple[LossRun, ...] = ()
     items: tuple[QueuedMessage, ...] = ()
     body_bytes: int = 0
@@ -52,6 +71,13 @@ class SequencerState:
     last_delivered: int = 0
     body_budget_drops: int = 0
     memory_budget_drops: int = 0
+
+
+@dataclass
+class _PendingLossSnapshot:
+    marker: int = -1
+    count: int = 0
+    folded: SequencerState | None = None
 
 
 class PositionExhausted(RuntimeError):
@@ -65,7 +91,10 @@ class DeliverySequencer:
         self.lock = RLock()
         self.state = SequencerState()
         self._pending_tickets = itertools.count()
-        self._committed_batch: tuple[ParsedMessageResult, ...] | None = None
+        self._batch_owner = object()
+        self._next_batch_token = 1
+        self._last_acknowledged_batch: int | None = None
+        self._pending_snapshot = _PendingLossSnapshot()
 
     def note_loss_without_lock(self) -> bool:
         """Record an acknowledged loss without waiting for the owner.
@@ -80,28 +109,27 @@ class DeliverySequencer:
 
     def _take_pending(self, state: SequencerState) -> SequencerState:
         marker = next(self._pending_tickets)
-        newly_pending = max(0, marker - state.pending_marker - 1)
-        pending = state.pending_losses + newly_pending
-        # Publish both the consumed marker and the retryable fold snapshot
-        # before calling the fallible loss-folding operation.  A retry then
-        # carries ``pending_losses`` forward instead of deriving it from a
-        # marker that has already been consumed.
-        snapshot = replace(
-            state,
+        snapshot = self._pending_snapshot
+        newly_pending = max(0, marker - snapshot.marker - 1)
+        snapshot.marker = marker
+        snapshot.count += newly_pending
+        if snapshot.folded is None:
+            if snapshot.count:
+                snapshot.folded = self._append_loss_count(state, snapshot.count)
+            else:
+                snapshot.folded = state
+        # The mutable accumulator is the durable publication point.  If any
+        # replace below is interrupted, the consumed reader ticket and the
+        # already-folded result remain available for the retry.
+        candidate = replace(
+            snapshot.folded,
             pending_marker=marker,
-            pending_losses=pending,
+            pending_losses=0,
         )
-        self.state = snapshot
-        if pending <= 0:
-            return snapshot
-        try:
-            folded = self._append_loss_count(snapshot, pending)
-        except BaseException:
-            self.state = snapshot
-            raise
-        folded = replace(folded, pending_losses=0)
-        self.state = folded
-        return folded
+        self.state = candidate
+        snapshot.count = 0
+        snapshot.folded = None
+        return candidate
 
     def _append_loss_count(self, state: SequencerState, count: int) -> SequencerState:
         if count <= 0:
@@ -247,35 +275,37 @@ class DeliverySequencer:
         state = self.state
         return not state.exhausted and len(state.items) < max_pending
 
-    def take_committed_batch(self) -> list[ParsedMessageResult] | None:
-        """Recover a committed drain whose caller faulted before acknowledgement."""
+    def acknowledge(self, batch: DrainBatch) -> None:
+        """Acknowledge a batch only after the consumer accepts all messages."""
 
         with self.lock:
-            if self._committed_batch is None:
-                return None
-            batch = list(self._committed_batch)
-            self._committed_batch = None
-            return batch
-
-    def acknowledge_committed_batch(self) -> None:
-        """Acknowledge the normal sink handoff of the committed batch."""
-
-        with self.lock:
-            self._committed_batch = None
+            if batch._owner is not self._batch_owner:
+                raise ValueError("batch belongs to another sequencer")
+            current = self.state.committed_batch
+            if current is None:
+                if self._last_acknowledged_batch == batch.token:
+                    return
+                raise ValueError("batch is no longer pending")
+            if current.token != batch.token:
+                raise ValueError("batch token is not current")
+            self._last_acknowledged_batch = batch.token
+            self.state = replace(self.state, committed_batch=None)
 
     def has_committed_batch(self) -> bool:
         with self.lock:
-            return self._committed_batch is not None
+            return self.state.committed_batch is not None
 
     def drain(
         self,
         limit: int | None,
         with_position: Callable[[ParsedMessageResult, int], ParsedMessageResult],
         gap_after_loss: Callable[[int, int], ParsedMessageResult],
-    ) -> list[ParsedMessageResult]:
+    ) -> DrainBatch:
         """Materialize and commit one snapshot; rollback is one assignment."""
 
         with self.lock:
+            if self.state.committed_batch is not None:
+                return self.state.committed_batch
             original = self.state
             state = self._take_pending(original)
             count = len(state.items) if limit is None else min(limit, len(state.items))
@@ -331,9 +361,15 @@ class DeliverySequencer:
                 forced=forced,
                 last_delivered=cursor,
             )
+            batch = DrainBatch(
+                self._next_batch_token,
+                tuple(output),
+                self._batch_owner,
+            )
+            committed = replace(committed, committed_batch=batch)
             self.state = committed
-            self._committed_batch = tuple(output)
-            return output
+            self._next_batch_token += 1
+            return batch
 
     def flush_for_read(self) -> None:
         with self.lock:

@@ -22,6 +22,7 @@ class ReservationGate:
         self._condition = Condition(Lock())
         self._owner: object | None = None
         self._notification_pending = False
+        self._cleanup_requested = False
 
     def acquire(self, blocking: bool = True, owner: object | None = None) -> bool:
         if blocking:
@@ -29,6 +30,7 @@ class ReservationGate:
                 while self._owner is not None:
                     self._condition.wait()
                 self._owner = _UNSCOPED_OWNER if owner is None else owner
+                self._cleanup_requested = False
                 return True
         if not self._condition.acquire(False):
             return False
@@ -36,6 +38,7 @@ class ReservationGate:
             if self._owner is not None:
                 return False
             self._owner = _UNSCOPED_OWNER if owner is None else owner
+            self._cleanup_requested = False
             return True
         finally:
             self._condition.release()
@@ -44,17 +47,44 @@ class ReservationGate:
         if not self.release_if_owned():
             raise RuntimeError("reservation gate is not owned")
 
+    def begin_cleanup(self, owner: object) -> None:
+        """Durably mark an acquired owner as requiring cleanup."""
+
+        with self._condition:
+            if self._owner is owner or (
+                self._owner is None and self._cleanup_requested
+            ):
+                self._cleanup_requested = True
+
     def release_if_owned(self, owner: object | None = None) -> bool:
         with self._condition:
             if self._owner is None:
                 if self._notification_pending:
                     self._notify_waiter()
+                    self._cleanup_requested = False
                 return False
             if owner is not None and self._owner is not owner:
                 return False
+            self._cleanup_requested = True
             self._owner = None
             self._notify_waiter()
+            self._cleanup_requested = False
             return True
+
+    def retry_cleanup(self) -> BaseException | None:
+        """Retry the gate-owned cleanup obligation without a caller lease."""
+
+        with self._condition:
+            if not self._cleanup_requested:
+                return None
+            owner = self._owner
+            if owner is not None and getattr(owner, "phase", None) is not OwnershipPhase.RELEASING:
+                return None
+        try:
+            self.release_if_owned(owner)
+        except BaseException as error:
+            return error
+        return None
 
     def is_owned(self, owner: object) -> bool:
         """Return whether ``owner`` still owns the gate."""
@@ -66,7 +96,11 @@ class ReservationGate:
         """Return whether ownership and the pending notification are clear."""
 
         with self._condition:
-            return self._owner is not owner and not self._notification_pending
+            return (
+                self._owner is not owner
+                and not self._notification_pending
+                and not self._cleanup_requested
+            )
 
     def _notify_waiter(self) -> None:
         try:
@@ -101,7 +135,7 @@ class ReservationLease:
         if self.phase not in (OwnershipPhase.OWNED, OwnershipPhase.RELEASING):
             return None
         was_releasing = self.phase is OwnershipPhase.RELEASING
-        self.phase = OwnershipPhase.RELEASING
+        self.prepare_close()
         first_error: BaseException | None = None
         for _ in range(2):
             try:
@@ -124,3 +158,11 @@ class ReservationLease:
         # A failed notification must not make an uncleared owner look
         # released.  The caller can retry close() with the same token.
         return first_error or RuntimeError("owned reservation was not released")
+
+    def prepare_close(self) -> None:
+        """Publish the cleanup obligation before an external close call."""
+
+        if self.phase is OwnershipPhase.OWNED:
+            self.phase = OwnershipPhase.RELEASING
+        if self.phase is OwnershipPhase.RELEASING:
+            self._gate.begin_cleanup(self)
