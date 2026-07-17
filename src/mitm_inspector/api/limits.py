@@ -8,9 +8,15 @@ validate against this bound so a legal capture configuration can never
 produce lines the ingest listener would drop.
 """
 
-from mitm_inspector.protocol import MAX_METADATA_HEADER_BYTES
+from mitm_inspector.protocol import MAX_INGEST_LINE_BYTES, MAX_METADATA_HEADER_BYTES
 
-MAX_INGEST_LINE_BYTES = 8 * 1024 * 1024
+__all__ = [
+    "INGEST_ENVELOPE_ALLOWANCE_BYTES",
+    "INGEST_FIXED_ENVELOPE_BYTES",
+    "MAX_INGEST_BODY_PREFIX_BYTES",
+    "MAX_INGEST_LINE_BYTES",
+]
+
 INGEST_FIXED_ENVELOPE_BYTES = 1024
 # Request and response headers each have this bound; reserve both sections in
 # the line budget even when a given flow only carries one of them.

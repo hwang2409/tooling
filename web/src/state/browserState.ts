@@ -230,7 +230,7 @@ function pruneLifecycle(collection: ImmutableLifecycleCollection, removedFlowIds
   for (const flowId of collection.flowIds) {
     if (!removed.has(flowId)) entries.push([flowId, collection.get(flowId) ?? []]);
   }
-  return createLifecycleCollection(entries);
+  return createLifecycleCollection(entries, collection.truncatedFlowIds);
 }
 
 function withCounter(state: BrowserState, key: keyof Omit<BrowserCounters, "droppedMessages">, amount = 1): BrowserState {

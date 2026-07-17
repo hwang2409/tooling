@@ -14,11 +14,14 @@ next successful drain instead of silently hiding the hole.
 from __future__ import annotations
 
 import asyncio
-import json
 
 from mitm_inspector.api.limits import MAX_INGEST_LINE_BYTES
 from mitm_inspector.capture.adapter import CaptureAddon
-from mitm_inspector.protocol import ParsedMessageResult, parsed_message_to_plain_json
+from mitm_inspector.protocol import (
+    ParsedMessageResult,
+    parsed_message_to_plain_json,
+    serialized_json_bytes,
+)
 
 DEFAULT_DRAIN_LIMIT = 256
 DEFAULT_POLL_INTERVAL_SECONDS = 0.05
@@ -31,8 +34,7 @@ WRITER_CLOSE_TIMEOUT_SECONDS = 0.25
 def serialize_message(message: ParsedMessageResult) -> bytes:
     """Serialize one drained message as a strict single-line JSONL record."""
 
-    text = json.dumps(parsed_message_to_plain_json(message), separators=(",", ":"))
-    return text.encode("utf-8") + b"\n"
+    return serialized_json_bytes(parsed_message_to_plain_json(message)) + b"\n"
 
 
 class CaptureSocketPump:

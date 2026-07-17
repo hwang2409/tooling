@@ -217,6 +217,7 @@ class ApiServer:
         return port
 
     async def start(self) -> None:
+        self._closing = False
         if self._http_server is not None:
             raise ApiServerError("the API server is already started")
         self._http_server = await asyncio.start_server(

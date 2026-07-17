@@ -8,6 +8,7 @@ are rejected before they reach the capture/store/API boundaries.
 from __future__ import annotations
 
 import base64
+import json
 import re
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
@@ -23,6 +24,7 @@ from mitm_inspector.json_boundary import (
 PROTOCOL_VERSION = "1"
 MAX_U64 = 18_446_744_073_709_551_615
 MAX_METADATA_HEADER_BYTES = 64 * 1024
+MAX_INGEST_LINE_BYTES = 8 * 1024 * 1024
 _U64_PATTERN = re.compile(r"^(0|[1-9][0-9]*)$")
 _BASE64_PATTERN = re.compile(r"^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$")
 BODY_SIDES = ("request", "response")
@@ -56,6 +58,35 @@ KNOWN_MESSAGE_TYPES = frozenset(
 
 class ProtocolError(ValueError):
     """Raised when a message cannot be accepted at the protocol boundary."""
+
+
+def _reject_surrogates(value: object, *, label: str) -> None:
+    """Reject surrogateescaped text before it can reach a UTF-8 serializer."""
+
+    if isinstance(value, str):
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+            raise ProtocolError(f"{label} contains surrogate code points")
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _reject_surrogates(key, label=f"{label} key")
+            _reject_surrogates(item, label=f"{label}.{key}")
+        return
+    if isinstance(value, Sequence) and not isinstance(value, bytes | bytearray):
+        for index, item in enumerate(value):
+            _reject_surrogates(item, label=f"{label}[{index}]")
+
+
+def serialized_json_bytes(value: object, *, label: str = "message") -> bytes:
+    """Return compact UTF-8 JSON bytes, rejecting invalid Unicode explicitly."""
+
+    _reject_surrogates(value, label=label)
+    try:
+        # ensure_ascii keeps the output deterministic and makes the final
+        # encoding safe for every valid JSON string.
+        return json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    except UnicodeEncodeError as error:  # pragma: no cover - defensive after validation.
+        raise ProtocolError(f"{label} contains text that cannot be serialized") from error
 
 
 class Header(TypedDict):
@@ -435,12 +466,14 @@ def _object(value: object, *, label: str = "message") -> dict[str, object]:
 def _string(value: object, *, label: str) -> str:
     if not isinstance(value, str) or not value:
         raise ProtocolError(f"{label} must be a non-empty string")
+    _reject_surrogates(value, label=label)
     return value
 
 
 def _text(value: object, *, label: str) -> str:
     if not isinstance(value, str):
         raise ProtocolError(f"{label} must be a string")
+    _reject_surrogates(value, label=label)
     return value
 
 
@@ -594,6 +627,8 @@ def parse_message(value: object) -> ParsedMessageResult:
         _validate_source_hello(message)
     elif message_type == "flow.metadata":
         _flow_metadata(message.get("metadata"))
+        if len(serialized_json_bytes(message, label="flow.metadata")) + 1 > MAX_INGEST_LINE_BYTES:
+            raise ProtocolError("flow.metadata exceeds the ingest line limit")
     elif message_type == "flow.lifecycle":
         for key in ("source_id", "flow_id", "event_id", "occurred_at"):
             _string(message.get(key), label=key)

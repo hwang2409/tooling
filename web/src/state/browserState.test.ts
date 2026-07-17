@@ -470,6 +470,27 @@ describe("per-flow lifecycle retention", () => {
     expect(removed.lifecycles.flowIds).toEqual(["g"]);
   });
 
+  it("preserves surviving truncation markers when pruning another flow", () => {
+    const source = reduce(initialBrowserState, hello("source-a"));
+    const snapshot = reduce(source, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "one", cursor: "1", flows: [flow("f"), flow("g")],
+    });
+    let tracked = snapshot;
+    for (let sequence = 1; sequence <= LIFECYCLE_EVENTS_PER_FLOW + 1; sequence += 1) {
+      tracked = reduce(tracked, lifecycleMessage("f", String(sequence)));
+    }
+    tracked = reduce(tracked, lifecycleMessage("g", String(LIFECYCLE_EVENTS_PER_FLOW + 2)));
+    expect(tracked.lifecycles.isTruncated("f")).toBe(true);
+
+    const removed = reduce(tracked, {
+      protocol_version: "1", type: "browser.delta", cursor: "2", changes: [{ op: "remove", flow_id: "g" }],
+    });
+
+    expect(removed.lifecycles.isTruncated("f")).toBe(true);
+    expect(removed.lifecycles.isTruncated("g")).toBe(false);
+    expect(removed.lifecycles.get("f")).toHaveLength(LIFECYCLE_EVENTS_PER_FLOW);
+  });
+
   it("freezes retained lifecycle events and their containers", () => {
     const source = reduce(initialBrowserState, hello("source-a"));
     const tracked = reduce(source, lifecycleMessage("f", "5"));

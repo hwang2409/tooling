@@ -1396,6 +1396,44 @@ def test_max_prefix_and_header_boundary_is_accepted_and_one_byte_over_rejected()
         parse_message(parse_ingest_line(rejected_line))
 
 
+def test_serialized_header_overhead_controls_fragmented_header_capacity() -> None:
+    def message_with_headers(prefix_size: int, header_count: int) -> dict[str, object]:
+        message = metadata_message(request_body=captured_body(b"x" * prefix_size))
+        metadata = message["metadata"]
+        assert isinstance(metadata, dict)
+        headers = [{"name": "x", "value": "v"} for _ in range(header_count)]
+        metadata["request_headers"] = headers
+        metadata["response_headers"] = headers
+        metadata["response_body"] = captured_body(b"x" * prefix_size)
+        return message
+
+    # Each side is exactly at the documented raw header-byte bound. The
+    # fragmented form still fits while the complete serialized envelope is
+    # below the ingest limit.
+    accepted = message_with_headers(1024 * 1024, MAX_METADATA_HEADER_BYTES // 2)
+    accepted_line = json.dumps(accepted, separators=(",", ":")).encode("utf-8") + b"\n"
+    assert len(accepted_line) <= MAX_INGEST_LINE_BYTES
+    parse_message(accepted)
+
+    # The same legal raw headers cannot be combined with the largest body
+    # prefix once per-header JSON syntax is included in the envelope.
+    rejected = message_with_headers(MAX_INGEST_BODY_PREFIX_BYTES, MAX_METADATA_HEADER_BYTES // 2)
+    rejected_line = json.dumps(rejected, separators=(",", ":")).encode("utf-8") + b"\n"
+    assert len(rejected_line) > MAX_INGEST_LINE_BYTES
+    with pytest.raises(ProtocolError, match="ingest line"):
+        parse_message(rejected)
+
+
+def test_surrogateescaped_header_value_is_rejected_at_protocol_boundary() -> None:
+    message = metadata_message()
+    metadata = message["metadata"]
+    assert isinstance(metadata, dict)
+    metadata["request_headers"] = [{"name": "x", "value": "bad\udc80"}]
+
+    with pytest.raises(ProtocolError, match="surrogate"):
+        parse_message(message)
+
+
 async def _peer_saw_close(reader: asyncio.StreamReader) -> bool:
     try:
         return await reader.read(1024) == b""
@@ -1437,6 +1475,24 @@ def test_close_terminates_connected_websocket_and_ingest_peers(
             await ingest_writer.wait_closed()
         except ConnectionError:
             pass
+
+    run_async(scenario)
+
+
+def test_server_can_restart_and_accept_http_after_close(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        server = make_server(tmp_path, with_ingest=False)
+        await server.start()
+        await server.close()
+
+        await server.start()
+        try:
+            response = await http_request(
+                server.bound_port, get("/api/v1/health", server.bound_port)
+            )
+            assert response.startswith(b"HTTP/1.1 200 ")
+        finally:
+            await server.close()
 
     run_async(scenario)
 
