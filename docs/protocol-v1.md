@@ -6,6 +6,12 @@ has `protocol_version: "1"` and a string `type`. The JSON Schema,
 known-message vocabulary and invariants. Unknown types use the base schema
 branch; additive fields on known or unknown messages are retained.
 
+Parsing returns a discriminated envelope: `{kind:"known", message:<KnownMessage>}`
+for known types, or `{kind:"unknown", original_type, payload}` for an unknown
+type. A type name in the known vocabulary always takes strict validation and
+cannot fall through to the opaque branch. Store and transport boundaries accept
+only these parsed envelopes; raw dictionaries are accepted only by the parser.
+
 ## Numeric and ordering rules
 
 All unsigned 64-bit values are decimal strings in the inclusive range
@@ -56,7 +62,11 @@ Body descriptors distinguish:
 
 `content_type` is an optional string on every body state. Captured data is
 base64 only; `hex` and arbitrary body-side/state values are invalid. The
-shared `contracts/fixtures/conformance.json` contains positive and adversarial
+policy permits empty header values, empty base64 data where a zero-byte chunk
+or body makes that meaningful, and an explicitly present empty `content_type`.
+Identifiers, header names, paths, directions, and enum values remain
+non-empty/validated.
+The shared `contracts/fixtures/conformance.json` contains positive and adversarial
 negative cases exercised by the schema, Python, and TypeScript tests. JSON
 Schema enforces the types, vocabularies, and bounds; the Python/TypeScript
 boundary validators enforce cross-field arithmetic that JSON Schema cannot

@@ -24,7 +24,7 @@ mitmweb APIs. See [docs/architecture.md](docs/architecture.md) and
 
 ## Development
 
-Requirements: Python 3.12+ and Node `^20.19.0 || ^22.13.0 || >=24` (the
+Requirements: Python 3.12+ and Node `^20.19.0 || >=22.12.0` (the
 checked-in commands were run with Python 3.12.13 and Node 26.0.0).
 
 ```sh

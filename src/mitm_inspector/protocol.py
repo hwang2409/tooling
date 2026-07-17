@@ -30,6 +30,19 @@ LIFECYCLE_STATES = (
     "flow_completed",
 )
 RESYNC_REASONS = ("cursor_gap", "history_evicted", "initial_connect")
+KNOWN_MESSAGE_TYPES = frozenset(
+    {
+        "source.hello",
+        "flow.metadata",
+        "flow.lifecycle",
+        "body.chunk",
+        "body.end",
+        "stream.gap",
+        "browser.snapshot",
+        "browser.delta",
+        "browser.resync",
+    }
+)
 
 
 class ProtocolError(ValueError):
@@ -39,6 +52,21 @@ class ProtocolError(ValueError):
 class Header(TypedDict):
     name: str
     value: str
+
+
+LifecycleState = Literal[
+    "request_started",
+    "request_headers",
+    "request_body",
+    "request_end",
+    "response_started",
+    "response_headers",
+    "response_body",
+    "response_end",
+    "error",
+    "flow_completed",
+]
+BodySide = Literal["request", "response"]
 
 
 class MissingBody(TypedDict):
@@ -118,14 +146,14 @@ class FlowLifecycle(TypedDict):
     event_id: str
     occurred_at: str
     sequence: str
-    state: str
+    state: LifecycleState
 
 
 class BodyChunk(TypedDict):
     protocol_version: Literal["1"]
     type: Literal["body.chunk"]
     flow_id: str
-    body_side: Literal["request", "response"]
+    body_side: BodySide
     chunk_index: str
     offset_bytes: str
     data_base64: str
@@ -135,7 +163,7 @@ class BodyEnd(TypedDict):
     protocol_version: Literal["1"]
     type: Literal["body.end"]
     flow_id: str
-    body_side: Literal["request", "response"]
+    body_side: BodySide
     total_bytes: str
     body: BodyDescriptor
 
@@ -183,11 +211,6 @@ class BrowserResync(TypedDict):
     requested_cursor: str
 
 
-class UnknownMessage(TypedDict):
-    protocol_version: Literal["1"]
-    type: str
-
-
 KnownMessage = (
     SourceHello
     | FlowMetadataMessage
@@ -199,7 +222,20 @@ KnownMessage = (
     | BrowserDelta
     | BrowserResync
 )
-ProtocolMessage = KnownMessage | UnknownMessage
+
+
+class KnownEnvelope(TypedDict):
+    kind: Literal["known"]
+    message: KnownMessage
+
+
+class UnknownEnvelope(TypedDict):
+    kind: Literal["unknown"]
+    original_type: str
+    payload: dict[str, object]
+
+
+ParsedMessage = KnownEnvelope | UnknownEnvelope
 
 
 def _object(value: object, *, label: str = "message") -> dict[str, object]:
@@ -211,6 +247,12 @@ def _object(value: object, *, label: str = "message") -> dict[str, object]:
 def _string(value: object, *, label: str) -> str:
     if not isinstance(value, str) or not value:
         raise ProtocolError(f"{label} must be a non-empty string")
+    return value
+
+
+def _text(value: object, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise ProtocolError(f"{label} must be a string")
     return value
 
 
@@ -238,14 +280,14 @@ def _headers(value: object, *, label: str) -> list[Header]:
         result.append(
             Header(
                 name=_string(header.get("name"), label=f"{label}[{index}].name"),
-                value=_string(header.get("value"), label=f"{label}[{index}].value"),
+                value=_text(header.get("value"), label=f"{label}[{index}].value"),
             )
         )
     return result
 
 
 def _base64_bytes(value: object, *, label: str) -> bytes:
-    data = _string(value, label=label)
+    data = _text(value, label=label)
     if not _BASE64_PATTERN.fullmatch(data):
         raise ProtocolError(f"{label} must be valid base64")
     try:
@@ -262,7 +304,7 @@ def _body(value: object, *, label: str) -> BodyDescriptor:
         label=f"{label}.state",
     )
     if "content_type" in body:
-        _string(body["content_type"], label=f"{label}.content_type")
+        _text(body["content_type"], label=f"{label}.content_type")
     if state == "missing":
         if any(key in body for key in ("size_bytes", "captured_bytes", "encoding", "data")):
             raise ProtocolError(f"{label} missing state cannot carry body counts or data")
@@ -348,8 +390,8 @@ def _base(message: dict[str, object]) -> str:
     return _string(message.get("type"), label="type")
 
 
-def parse_message(value: object) -> ProtocolMessage:
-    """Validate and return a protocol-v1 message without discarding extensions."""
+def parse_message(value: object) -> ParsedMessage:
+    """Validate a raw message and return a discriminated parsed envelope."""
 
     message = _object(value)
     message_type = _base(message)
@@ -364,6 +406,7 @@ def parse_message(value: object) -> ProtocolMessage:
         _u64(message.get("sequence"), label="sequence")
         _enum(message.get("state"), LIFECYCLE_STATES, label="state")
     elif message_type == "body.chunk":
+        _string(message.get("flow_id"), label="flow_id")
         _enum(message.get("body_side"), BODY_SIDES, label="body_side")
         _u64(message.get("chunk_index"), label="chunk_index")
         _u64(message.get("offset_bytes"), label="offset_bytes")
@@ -398,4 +441,6 @@ def parse_message(value: object) -> ProtocolMessage:
         _enum(message.get("reason"), RESYNC_REASONS, label="reason")
         _u64(message.get("requested_cursor"), label="requested_cursor")
 
-    return cast(ProtocolMessage, message)
+    if message_type in KNOWN_MESSAGE_TYPES:
+        return KnownEnvelope(kind="known", message=cast(KnownMessage, message))
+    return UnknownEnvelope(kind="unknown", original_type=message_type, payload=message)

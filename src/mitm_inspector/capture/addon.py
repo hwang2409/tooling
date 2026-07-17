@@ -10,9 +10,9 @@ from collections.abc import Callable
 
 from mitmproxy import http
 
-from mitm_inspector.protocol import ProtocolMessage
+from mitm_inspector.protocol import ParsedMessage
 
-MessageEmitter = Callable[[ProtocolMessage], None]
+MessageEmitter = Callable[[ParsedMessage], None]
 
 
 class CaptureAddon:

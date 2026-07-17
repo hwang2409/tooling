@@ -15,6 +15,7 @@ jsonschema 4.26.0
 pytest 8.4.2
 Node v26.0.0
 npm 11.12.1
+Node engine policy: ^20.19.0 || >=22.12.0
 Vite 7.3.6
 Vitest 3.2.7
 Ajv 8.20.0
@@ -27,7 +28,7 @@ Git 2.54.0
 uv sync --python /opt/homebrew/bin/python3.12       # pass; local .venv
 uv run ruff check .                                 # pass
 uv run mypy                                          # pass, 11 source files
-uv run pytest                                        # pass, 17 tests
+uv run pytest                                        # pass, 47 tests
 
 npm install --prefix web                             # pass; generated lockfile
 npm ci --prefix web                                  # pass; 221 packages

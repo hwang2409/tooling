@@ -9,9 +9,13 @@ header policy is deliberately fail-closed for credential-shaped names:
 - `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `api-key`,
   `x-api-key`, `x-auth-token`, `x-amz-security-token`, access/refresh/id
   tokens, and client secrets become `[REDACTED]`.
-- Names are case-insensitive and collapse underscore/hyphen runs; names ending
-  in `-api-key`, `-auth-token`, `-security-token`, or `-secret` are also
-  redacted. This catches variants such as `X_Api_Key` and `X-Auth_Token`.
+- Names are case-insensitive, camel-case aware, and collapse underscore/hyphen
+  runs. Credential-shaped terminal terms (`token`, `key`, `secret`,
+  `credential`, `cookie`, `signature`) and auth/bearer segments are redacted;
+  explicit harmless shape exceptions such as `x-token-count`, `x-key-id`,
+  `x-secret-version`, and `x-signature-version` remain visible. This catches
+  variants such as `X_Api_Key`, `XApiKey`, and `X-Auth_Token` without treating
+  ordinary metadata headers as credentials.
 - Query material is dropped from paths until a query-aware allow-list exists.
 - Raw mitmproxy `Flow` objects never enter the store, API, or browser contract.
 - Body bytes are bounded prefixes in the future store; body data is not shown

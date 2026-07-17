@@ -17,8 +17,36 @@ def project_python_files() -> list[Path]:
     )
 
 
-def _dynamic_import_name(node: ast.Call) -> str | None:
-    if isinstance(node.func, ast.Name) and node.func.id in {"__import__", "import_module"}:
+def _loader_aliases(tree: ast.AST) -> set[str]:
+    aliases = {"__import__", "import_module"}
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "importlib":
+                for alias in node.names:
+                    if alias.name == "import_module":
+                        name = alias.asname or alias.name
+                        if name not in aliases:
+                            aliases.add(name)
+                            changed = True
+            if isinstance(node, ast.Assign | ast.AnnAssign):
+                value = node.value
+                is_loader = isinstance(value, ast.Name) and value.id in aliases
+                is_loader = is_loader or (
+                    isinstance(value, ast.Attribute) and value.attr == "import_module"
+                )
+                if is_loader:
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    for target in targets:
+                        if isinstance(target, ast.Name) and target.id not in aliases:
+                            aliases.add(target.id)
+                            changed = True
+    return aliases
+
+
+def _dynamic_import_name(node: ast.Call, loader_aliases: set[str]) -> str | None:
+    if isinstance(node.func, ast.Name) and node.func.id in loader_aliases:
         function_name = node.func.id
     elif isinstance(node.func, ast.Attribute) and node.func.attr == "import_module":
         function_name = node.func.attr
@@ -36,6 +64,7 @@ def _dynamic_import_name(node: ast.Call) -> str | None:
 
 def find_private_mitm_imports(source: str, filename: str = "<source>") -> list[str]:
     tree = ast.parse(source, filename=filename)
+    loader_aliases = _loader_aliases(tree)
     violations: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -49,7 +78,7 @@ def find_private_mitm_imports(source: str, filename: str = "<source>") -> list[s
         ):
             imported_names = [f"{node.module}.{alias.name}" for alias in node.names]
         elif isinstance(node, ast.Call):
-            dynamic_name = _dynamic_import_name(node)
+            dynamic_name = _dynamic_import_name(node, loader_aliases)
             imported_names = [dynamic_name] if dynamic_name else []
         else:
             imported_names = []
@@ -80,6 +109,8 @@ def test_project_uses_only_approved_public_mitmproxy_imports() -> None:
         "import importlib; importlib.import_module('mitmproxy.tools.web')",
         "from importlib import import_module; import_module('mitmproxy.addons.view')",
         "__import__('mitmproxy.proxy.layers')",
+        "from importlib import import_module as load; load('mitmproxy.tools.web')",
+        "loader = __import__; loader('mitmproxy.addons.view')",
     ],
 )
 def test_private_api_bypass_forms_are_rejected(source: str) -> None:

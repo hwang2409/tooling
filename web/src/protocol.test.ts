@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import schema from "../../contracts/protocol-v1.schema.json";
 import { parseProtocolMessage, ProtocolError } from "./protocol";
+import type { KnownMessage } from "./protocol";
 
 const streamPath = resolve(process.cwd(), "../contracts/fixtures/stream.json");
 const conformancePath = resolve(process.cwd(), "../contracts/fixtures/conformance.json");
@@ -14,6 +15,13 @@ const conformance = JSON.parse(readFileSync(conformancePath, "utf8")) as {
   invalid: Array<{ name: string; message: unknown }>;
 };
 const validateSchema = new Ajv2020({ strict: false }).compile(schema);
+
+function known(message: unknown): KnownMessage {
+  const parsed = parseProtocolMessage(message);
+  expect(parsed.kind).toBe("known");
+  if (parsed.kind !== "known") throw new Error("expected known message");
+  return parsed.message;
+}
 
 describe("shared protocol-v1 conformance", () => {
   it("accepts every positive fixture in the authoritative schema", () => {
@@ -32,21 +40,29 @@ describe("shared protocol-v1 conformance", () => {
   });
 
   it("preserves duplicate ordered headers and response-before-request-end ordering", () => {
-    const parsed = streamMessages.map(parseProtocolMessage);
-    const metadata = parsed[1].metadata as { request_headers: Array<{ name: string; value: string }> };
+    const parsed = streamMessages.filter((message) => (message as { type?: string }).type !== "future.message").map(known);
+    const metadata = parsed[1].metadata as {
+      request_headers: Array<{ name: string; value: string }>;
+      request_body: { content_type?: string };
+    };
     expect(metadata.request_headers.slice(1, 3)).toEqual([
       { name: "x-trace", value: "first" },
       { name: "x-trace", value: "second" },
     ]);
+    const conformanceMetadata = (known(conformance.valid[1]).metadata) as typeof metadata;
+    expect(conformanceMetadata.request_headers[2].value).toBe("");
+    expect(conformanceMetadata.request_body.content_type).toBe("");
     const lifecycle = parsed.filter((message) => message.type === "flow.lifecycle");
     expect(lifecycle.map((message) => message.state)).toEqual(["response_started", "request_end"]);
   });
 
   it("tolerates unknown types and additive fields without numeric coercion", () => {
     const future = parseProtocolMessage(conformance.valid.at(-1));
-    expect(future.type).toBe("future.additive");
-    expect(future.sequence).toBe("18446744073709551616");
-    expect(future.new_field).toEqual({ safe: true });
+    expect(future.kind).toBe("unknown");
+    if (future.kind !== "unknown") throw new Error("expected unknown message");
+    expect(future.original_type).toBe("future.additive");
+    expect(future.payload.sequence).toBe("18446744073709551616");
+    expect(future.payload.new_field).toEqual({ safe: true });
   });
 
   it("rejects a truncated prefix whose count exceeds the total", () => {

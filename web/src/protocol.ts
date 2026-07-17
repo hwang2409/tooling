@@ -157,8 +157,18 @@ export type KnownMessage =
   | BrowserDelta
   | BrowserResync;
 
-export interface UnknownMessage extends ProtocolBase {}
-export type ProtocolMessage = KnownMessage | UnknownMessage;
+export interface KnownEnvelope {
+  kind: "known";
+  message: KnownMessage;
+}
+
+export interface UnknownEnvelope {
+  kind: "unknown";
+  original_type: string;
+  payload: Record<string, unknown>;
+}
+
+export type ParsedMessage = KnownEnvelope | UnknownEnvelope;
 
 export class ProtocolError extends Error {}
 
@@ -171,6 +181,10 @@ const lifecycleStates = new Set<LifecycleState>([
 ]);
 const bodySides = new Set<BodySide>(["request", "response"]);
 const resyncReasons = new Set<ResyncReason>(["cursor_gap", "history_evicted", "initial_connect"]);
+const knownTypes = new Set([
+  "source.hello", "flow.metadata", "flow.lifecycle", "body.chunk", "body.end",
+  "stream.gap", "browser.snapshot", "browser.delta", "browser.resync",
+]);
 
 function record(value: unknown, label: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -183,6 +197,11 @@ function stringValue(value: unknown, label: string): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new ProtocolError(`${label} must be a non-empty string`);
   }
+  return value;
+}
+
+function textValue(value: unknown, label: string): string {
+  if (typeof value !== "string") throw new ProtocolError(`${label} must be a string`);
   return value;
 }
 
@@ -205,13 +224,13 @@ function headers(value: unknown, label: string): Header[] {
     const header = record(item, `${label}[${index}]`);
     return {
       name: stringValue(header.name, `${label}[${index}].name`),
-      value: stringValue(header.value, `${label}[${index}].value`),
+      value: textValue(header.value, `${label}[${index}].value`),
     };
   });
 }
 
 function decodedBase64(value: unknown, label: string): Uint8Array {
-  const data = stringValue(value, label);
+  const data = textValue(value, label);
   if (!base64Pattern.test(data)) throw new ProtocolError(`${label} must be valid base64`);
   try {
     return Uint8Array.from(atob(data), (character) => character.charCodeAt(0));
@@ -226,7 +245,7 @@ function body(value: unknown, label: string): BodyDescriptor {
   if (!["missing", "empty", "captured", "truncated"].includes(state)) {
     throw new ProtocolError(`${label}.state is not supported`);
   }
-  if (descriptor.content_type !== undefined) stringValue(descriptor.content_type, `${label}.content_type`);
+  if (descriptor.content_type !== undefined) textValue(descriptor.content_type, `${label}.content_type`);
   if (state === "missing") {
     if (["size_bytes", "captured_bytes", "encoding", "data"].some((key) => key in descriptor)) {
       throw new ProtocolError(`${label} missing state cannot carry body counts or data`);
@@ -297,7 +316,7 @@ function streamGap(message: Record<string, unknown>): void {
 }
 
 /** Validate a protocol-v1 message without discarding unknown fields or types. */
-export function parseProtocolMessage(value: unknown): ProtocolMessage {
+export function parseProtocolMessage(value: unknown): ParsedMessage {
   const message = record(value, "message");
   if (message.protocol_version !== "1") throw new ProtocolError("protocol_version must be '1'");
   const type = stringValue(message.type, "type");
@@ -339,5 +358,8 @@ export function parseProtocolMessage(value: unknown): ProtocolMessage {
     decimalValue(message.requested_cursor, "requested_cursor");
   }
 
-  return message as ProtocolMessage;
+  if (knownTypes.has(type)) {
+    return { kind: "known", message: message as unknown as KnownMessage };
+  }
+  return { kind: "unknown", original_type: type, payload: message };
 }
