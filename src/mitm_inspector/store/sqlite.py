@@ -9,7 +9,7 @@ import queue
 import sqlite3
 import stat
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -31,6 +31,30 @@ DEFAULT_STORAGE_QUEUE_SIZE = 4_096
 _SENTINEL = object()
 
 
+def _normalize_storage_path(path: Path | str) -> Path:
+    """Resolve storage paths and reject symlinked existing ancestors."""
+
+    raw = Path(path).expanduser()
+    absolute = raw if raw.is_absolute() else Path.cwd() / raw
+    current = absolute
+    ancestors = list(absolute.parents)
+    for ancestor in reversed(ancestors):
+        try:
+            info = ancestor.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            raise PermissionError(f"storage path has a symlinked ancestor: {ancestor}")
+    current_info: os.stat_result | None
+    try:
+        current_info = current.lstat()
+    except FileNotFoundError:
+        current_info = None
+    if current_info is not None and stat.S_ISLNK(current_info.st_mode):
+        raise PermissionError(f"storage path must not be a symlink: {current}")
+    return absolute.resolve(strict=False)
+
+
 def default_storage_path() -> Path:
     """Return the platform-independent local state path for flow history."""
 
@@ -49,6 +73,7 @@ class SQLiteFlowStorage:
         max_flows: int = DEFAULT_STORAGE_MAX_FLOWS,
         max_bytes: int = DEFAULT_STORAGE_MAX_BYTES,
         queue_size: int = DEFAULT_STORAGE_QUEUE_SIZE,
+        trace_sql: Callable[[str], None] | None = None,
     ) -> None:
         if type(max_flows) is not int or max_flows < 1:
             raise ValueError("max_flows must be a positive integer")
@@ -58,10 +83,11 @@ class SQLiteFlowStorage:
             raise ValueError("queue_size must be a positive integer")
         if os.fspath(path) == ":memory:":
             raise ValueError(":memory: disables storage and cannot create SQLiteFlowStorage")
-        self.path = Path(path).expanduser()
+        self.path = _normalize_storage_path(path)
         self.max_flows = max_flows
         self.max_bytes = max_bytes
-        self._budget_disabled = max_bytes < 4_096
+        self._trace_sql = trace_sql
+        self._minimum_storage_bytes = 0
         self._queue: queue.Queue[object] = queue.Queue(maxsize=queue_size)
         self._lock = threading.Lock()
         self._closed = False
@@ -73,9 +99,13 @@ class SQLiteFlowStorage:
             name="mitm-inspector-storage",
             daemon=True,
         )
-        if not self._budget_disabled:
-            self._prepare_database()
-            self._thread.start()
+        self._prepare_database()
+        if self.max_bytes < self._minimum_storage_bytes:
+            raise ValueError(
+                f"storage max_bytes {self.max_bytes} is below the SQLite overhead "
+                f"of {self._minimum_storage_bytes} bytes"
+            )
+        self._thread.start()
 
     @property
     def counters(self) -> dict[str, int]:
@@ -89,8 +119,6 @@ class SQLiteFlowStorage:
     def offer(self, message: ParsedMessage | Mapping[str, object]) -> bool:
         """Queue one validated message, dropping the oldest queued item if full."""
 
-        if self._budget_disabled:
-            return False
         parsed = (
             require_parsed_message(message)
             if isinstance(message, ParsedMessage)
@@ -123,8 +151,6 @@ class SQLiteFlowStorage:
             if self._closed:
                 return
             self._closed = True
-        if self._budget_disabled:
-            return
         self.flush()
         self._queue.put(_SENTINEL)
         self._thread.join()
@@ -134,8 +160,6 @@ class SQLiteFlowStorage:
 
         if type(limit) is not int or limit < 0:
             raise ValueError("replay limit must be a nonnegative integer")
-        if self._budget_disabled:
-            return []
         self.flush()
         with sqlite3.connect(self.path) as connection:
             rows = connection.execute(
@@ -159,6 +183,7 @@ class SQLiteFlowStorage:
                 (limit,),
             ).fetchall()
             result: list[ParsedMessageResult] = []
+            selected_flow_ids = {str(row[0]) for row in rows}
             for row in rows:
                 flow_id = str(row[0])
                 result.append(parse_message(self._metadata_from_row(row)))
@@ -204,14 +229,16 @@ class SQLiteFlowStorage:
                                 }
                             )
                         )
+            if selected_flow_ids:
+                placeholders = ",".join("?" for _ in selected_flow_ids)
                 lifecycle_rows = connection.execute(
-                    """
-                    SELECT source_id, event_id, occurred_at, sequence, state
+                    f"""
+                    SELECT source_id, event_id, occurred_at, sequence, state, flow_id
                     FROM lifecycle
-                    WHERE flow_id = ?
-                    ORDER BY LENGTH(sequence), sequence, event_id
+                    WHERE flow_id IN ({placeholders})
+                    ORDER BY source_id, LENGTH(sequence), sequence, event_id
                     """,
-                    (flow_id,),
+                    tuple(selected_flow_ids),
                 ).fetchall()
                 for lifecycle in lifecycle_rows:
                     result.append(
@@ -220,7 +247,7 @@ class SQLiteFlowStorage:
                                 "protocol_version": "1",
                                 "type": "flow.lifecycle",
                                 "source_id": lifecycle[0],
-                                "flow_id": flow_id,
+                                "flow_id": lifecycle[5],
                                 "event_id": lifecycle[1],
                                 "occurred_at": lifecycle[2],
                                 "sequence": lifecycle[3],
@@ -234,6 +261,7 @@ class SQLiteFlowStorage:
         """Materialize persisted history into a regular bounded memory store."""
 
         groups: dict[str, list[ParsedMessageResult]] = {}
+        lifecycle_messages: list[ParsedMessageResult] = []
         for message in self.replay(limit):
             payload = (
                 message.message if isinstance(message, KnownParsedMessage) else message.payload
@@ -242,19 +270,21 @@ class SQLiteFlowStorage:
             if payload.get("type") == "flow.metadata":
                 metadata = payload.get("metadata")
                 flow_id = metadata.get("flow_id") if isinstance(metadata, Mapping) else None
-            if isinstance(flow_id, str):
+            if payload.get("type") == "flow.lifecycle":
+                lifecycle_messages.append(message)
+            elif isinstance(flow_id, str):
                 groups.setdefault(flow_id, []).append(message)
         for messages in reversed(list(groups.values())):
             for message in messages:
                 store.append(message)
+        for message in lifecycle_messages:
+            store.append(message)
 
     def _prepare_database(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         _validate_private_mode(self.path.parent, stat.S_IFDIR, 0o700)
         _prepare_private_file(self.path)
-        for sidecar in _sidecar_paths(self.path):
-            if sidecar.exists():
-                _validate_private_mode(sidecar, stat.S_IFREG, 0o600)
+        _secure_existing_files(self.path)
         with sqlite3.connect(self.path) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA journal_mode = WAL")
@@ -309,11 +339,17 @@ class SQLiteFlowStorage:
                     ON flows(created_order);
                 """
             )
+            connection.commit()
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            connection.execute("VACUUM")
         _secure_existing_files(self.path)
+        self._minimum_storage_bytes = self.path.stat().st_size
 
     def _run(self) -> None:
         with sqlite3.connect(self.path) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
+            if self._trace_sql is not None:
+                connection.set_trace_callback(self._trace_sql)
             row = connection.execute(
                 "SELECT COALESCE(MAX(created_order), 0) FROM flows"
             ).fetchone()
@@ -560,6 +596,17 @@ class SQLiteFlowStorage:
                 """, parameters
             ).fetchone()
             if oldest is None:
+                if protected_flow_id is not None and over_bytes:
+                    connection.execute(
+                        "DELETE FROM flows WHERE flow_id = ?", (protected_flow_id,)
+                    )
+                    connection.commit()
+                    _checkpoint(connection)
+                    connection.execute("VACUUM")
+                    _checkpoint(connection)
+                    _secure_existing_files(self.path)
+                    protected_flow_id = None
+                    continue
                 return
             connection.execute("DELETE FROM flows WHERE flow_id = ?", (oldest[0],))
             connection.commit()
@@ -680,7 +727,7 @@ def _validate_private_mode(path: Path, expected_type: int, mode: int) -> None:
 
 def _prepare_private_file(path: Path) -> None:
     try:
-        _validate_private_mode(path, stat.S_IFREG, 0o600)
+        path.lstat()
     except FileNotFoundError:
         flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
         descriptor = os.open(path, flags, 0o600)

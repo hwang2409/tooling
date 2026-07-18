@@ -19,10 +19,12 @@ from mitm_inspector.json_boundary import PlainJsonObject
 from mitm_inspector.protocol import (
     MAX_U64,
     KnownParsedMessage,
+    ParsedMessage,
     ParsedMessageResult,
     ProtocolError,
     parse_message,
     parsed_message_to_plain_json,
+    require_parsed_message,
 )
 from mitm_inspector.store.memory import MemoryStore
 from mitm_inspector.store.sqlite import SQLiteFlowStorage
@@ -158,7 +160,11 @@ class ApiApplication:
         and broadcast state are untouched in that case.
         """
 
-        parsed = parse_message(value)
+        parsed = (
+            require_parsed_message(value)
+            if isinstance(value, ParsedMessage)
+            else parse_message(value)
+        )
         self._store.append(parsed)
         if self._storage is not None:
             self._storage.offer(parsed)
@@ -212,13 +218,30 @@ class ApiApplication:
     def _historical_lifecycle_frames(self) -> list[str]:
         """Deliver retained lifecycle history after the initial snapshot."""
 
-        messages: list[str] = []
-        for parsed in reversed(list(self._store.newest_first())):
+        lifecycle_messages: list[tuple[str, str, str, str, str]] = []
+        for parsed in self._store.newest_first():
             payload = self._payload_of(parsed)
             if payload.get("type") != "flow.lifecycle":
                 continue
-            messages.append(self._wire_text(parsed_message_to_plain_json(parsed)))
-        return messages
+            source_id = payload.get("source_id")
+            sequence = payload.get("sequence")
+            event_id = payload.get("event_id")
+            flow_id = payload.get("flow_id")
+            if not (
+                isinstance(source_id, str)
+                and isinstance(sequence, str)
+                and isinstance(event_id, str)
+                and isinstance(flow_id, str)
+            ):
+                continue
+            historical = parsed_message_to_plain_json(parsed)
+            historical["historical"] = True
+            lifecycle_messages.append(
+                (source_id, sequence, event_id, flow_id,
+                 self._wire_text(historical))
+            )
+        lifecycle_messages.sort(key=lambda item: (item[0], len(item[1]), item[1], item[2]))
+        return [item[4] for item in lifecycle_messages]
 
     def unsubscribe(self, subscriber: Subscriber) -> None:
         subscriber.closed = True
@@ -300,12 +323,10 @@ class ApiApplication:
         flow = grid_flow(metadata)
         published = self._state.published
         unchanged = published.get(flow_id) == flow
-        # The just-ingested metadata is now the flow's newest message, which
-        # moves the flow to the end of the oldest-first projection order even
-        # when its content is identical, exactly like a full re-projection.
-        current = dict(published)
-        current.pop(flow_id, None)
-        current[flow_id] = flow
+        # The just-ingested metadata is now the newest flow, so it moves
+        # to the front of the reverse-chronological projection.
+        current = {flow_id: flow}
+        current.update((key, value) for key, value in published.items() if key != flow_id)
         self._state.published = current
         if unchanged:
             return False

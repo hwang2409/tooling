@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -116,17 +117,53 @@ def test_sqlite_round_trip_preserves_metadata_lifecycle_and_bodies(tmp_path: Pat
         storage.close()
 
 
-def test_sqlite_retention_evicts_oldest_flows(tmp_path: Path) -> None:
+def test_replay_preserves_global_interleaved_lifecycle_sequence(tmp_path: Path) -> None:
+    storage = SQLiteFlowStorage(tmp_path / "flows.sqlite")
+    try:
+        for flow_id in ("flow-a", "flow-b"):
+            storage.offer(metadata(flow_id, b"r", b"s"))
+        for flow_id, sequence in (
+            ("flow-a", 1),
+            ("flow-b", 2),
+            ("flow-a", 3),
+            ("flow-b", 4),
+        ):
+            storage.offer(
+                lifecycle(
+                    flow_id,
+                    sequence,
+                    f"2026-01-01T00:00:0{sequence}Z",
+                    "request_started",
+                )
+            )
+        storage.flush()
+        replayed = [
+            parsed_message_to_plain_json(message)
+            for message in storage.replay()
+            if isinstance(message, KnownParsedMessage)
+            and message.message.get("type") == "flow.lifecycle"
+        ]
+        assert [(message["flow_id"], message["sequence"]) for message in replayed] == [
+            ("flow-a", "1"),
+            ("flow-b", "2"),
+            ("flow-a", "3"),
+            ("flow-b", "4"),
+        ]
+    finally:
+        storage.close()
+
+
+def test_sqlite_retention_evicts_oldest_flows_with_max_plus_ten_writes(tmp_path: Path) -> None:
     storage = SQLiteFlowStorage(tmp_path / "flows.sqlite", max_flows=2)
     try:
-        for index in range(3):
+        for index in range(12):
             flow_id = f"flow-{index}"
             storage.offer(metadata(flow_id, b"r", b"s"))
             storage.offer(
                 lifecycle(
                     flow_id,
                     1,
-                    f"2026-01-01T00:00:0{index}Z",
+                    f"2026-01-01T00:00:{index:02d}Z",
                     "request_started",
                 )
             )
@@ -138,12 +175,12 @@ def test_sqlite_retention_evicts_oldest_flows(tmp_path: Path) -> None:
             if isinstance(message, KnownParsedMessage)
             and message.message.get("type") == "flow.metadata"
         ]
-        assert flow_ids == ["flow-2", "flow-1"]
+        assert flow_ids == ["flow-11", "flow-10"]
     finally:
         storage.close()
 
 
-def test_sqlite_replay_materializes_newest_flows_oldest_first_in_browser_store(
+def test_sqlite_replay_materializes_newest_flows_newest_first_in_browser_store(
     tmp_path: Path,
 ) -> None:
     storage = SQLiteFlowStorage(tmp_path / "flows.sqlite")
@@ -156,7 +193,7 @@ def test_sqlite_replay_materializes_newest_flows_oldest_first_in_browser_store(
             )
         memory = MemoryStore(10)
         storage.replay_into(memory, 2)
-        assert list(collect_grid_flows(memory)) == ["flow-1", "flow-2"]
+        assert list(collect_grid_flows(memory)) == ["flow-2", "flow-1"]
     finally:
         storage.close()
 
@@ -216,7 +253,8 @@ def test_partial_body_chunks_survive_a_crash_mid_capture(tmp_path: Path) -> None
 def test_adapter_sink_writer_fresh_backend_replays_browser_state(tmp_path: Path) -> None:
     path = tmp_path / "flows.sqlite"
     storage = SQLiteFlowStorage(path)
-    addon = CaptureAddon(emit=storage.offer, max_body_prefix_bytes=1024)
+    application = ApiApplication(MemoryStore(20), storage=storage)
+    addon = CaptureAddon(emit=application.ingest, max_body_prefix_bytes=1024)
     flow = fake_flow()
     addon.requestheaders(flow)
     addon.responseheaders(flow)
@@ -225,13 +263,12 @@ def test_adapter_sink_writer_fresh_backend_replays_browser_state(tmp_path: Path)
     addon.drain()
     storage.close()
 
-    restarted_storage = SQLiteFlowStorage(path)
+    restarted = ApiServer(
+        ApiServerConfig(storage_path=path, storage_replay=20, max_retained_flows=20)
+    )
     try:
-        memory = MemoryStore(20)
-        restarted_storage.replay_into(memory, 20)
-        application = ApiApplication(memory, source_id="mitm-inspector", storage=restarted_storage)
         frames: list[dict[str, object]] = []
-        application.subscribe(
+        restarted.application.subscribe(
             lambda frame: frames.append(json.loads(frame)) or True,
         )
         snapshot = next(frame for frame in frames if frame["type"] == "browser.snapshot")
@@ -240,8 +277,11 @@ def test_adapter_sink_writer_fresh_backend_replays_browser_state(tmp_path: Path)
             frame["type"] == "flow.lifecycle" and frame["flow_id"] == "adapter-flow"
             for frame in frames
         )
+        detail = json.loads(restarted.application.flow_detail_text("adapter-flow") or "null")
+        assert detail["flow_id"] == "adapter-flow"
+        assert any(message["type"] == "body.chunk" for message in detail["messages"])
     finally:
-        restarted_storage.close()
+        asyncio.run(restarted.close())
 
 
 def test_replay_uses_reverse_chronological_flow_order(tmp_path: Path) -> None:
@@ -273,20 +313,37 @@ def test_replay_after_fresh_backend_instance_delivers_lifecycle_history(tmp_path
     first.offer(lifecycle("restart-flow", 2, "2026-02-01T00:00:01Z", "flow_completed"))
     first.close()
 
-    second = SQLiteFlowStorage(path)
+    second = ApiServer(ApiServerConfig(storage_path=path, storage_replay=20))
     try:
-        memory = MemoryStore(20)
-        second.replay_into(memory, 20)
-        application = ApiApplication(memory, source_id="mitm-inspector", storage=second)
         frames: list[dict[str, object]] = []
-        application.subscribe(lambda frame: frames.append(json.loads(frame)) or True)
+        second.application.subscribe(lambda frame: frames.append(json.loads(frame)) or True)
         lifecycle_frames = [frame for frame in frames if frame["type"] == "flow.lifecycle"]
         assert [frame["state"] for frame in lifecycle_frames] == [
             "request_started",
             "flow_completed",
         ]
     finally:
-        second.close()
+        asyncio.run(second.close())
+
+
+def test_fresh_backend_browser_surface_is_reverse_chronological(tmp_path: Path) -> None:
+    path = tmp_path / "ordered.sqlite"
+    first = SQLiteFlowStorage(path)
+    for index in range(2):
+        first.offer(metadata(f"surface-{index}", b"r", b"s"))
+        first.offer(
+            lifecycle(f"surface-{index}", 1, f"2026-02-01T00:00:0{index}Z", "request_started")
+        )
+    first.close()
+
+    second = ApiServer(ApiServerConfig(storage_path=path, storage_replay=20))
+    try:
+        frames: list[dict[str, object]] = []
+        second.application.subscribe(lambda frame: frames.append(json.loads(frame)) or True)
+        snapshot = next(frame for frame in frames if frame["type"] == "browser.snapshot")
+        assert [flow["flow_id"] for flow in snapshot["flows"]] == ["surface-1", "surface-0"]
+    finally:
+        asyncio.run(second.close())
 
 
 def test_no_storage_and_memory_storage_paths_disable_persistence(tmp_path: Path) -> None:
@@ -319,6 +376,25 @@ def test_storage_byte_retention_bounds_the_database_file_set(tmp_path: Path) -> 
         storage.close()
 
 
+def test_storage_drops_single_oversized_protected_flow_to_honor_byte_cap(tmp_path: Path) -> None:
+    path = tmp_path / "flows.sqlite"
+    max_bytes = 100_000
+    storage = SQLiteFlowStorage(path, max_flows=10_000, max_bytes=max_bytes)
+    try:
+        storage.offer(metadata("oversized", b"x" * 300_000, b"y" * 300_000))
+        storage.flush()
+        files = [path, Path(f"{path}-wal"), Path(f"{path}-shm")]
+        assert sum(file.stat().st_size for file in files if file.exists()) <= max_bytes
+        assert storage.replay() == []
+    finally:
+        storage.close()
+
+
+def test_storage_rejects_caps_below_sqlite_overhead(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="SQLite overhead"):
+        SQLiteFlowStorage(tmp_path / "flows.sqlite", max_bytes=1_000)
+
+
 def test_storage_rejects_loose_permissions_and_creates_private_files(tmp_path: Path) -> None:
     unsafe = tmp_path / "unsafe"
     unsafe.mkdir(mode=0o755)
@@ -333,6 +409,19 @@ def test_storage_rejects_loose_permissions_and_creates_private_files(tmp_path: P
         assert stat.S_IMODE((secure / "flows.sqlite").stat().st_mode) == 0o600
     finally:
         storage.close()
+
+
+@pytest.mark.parametrize("sidecar", ["db", "wal", "shm"])
+def test_storage_rejects_preexisting_loose_database_files(tmp_path: Path, sidecar: str) -> None:
+    path = tmp_path / f"{sidecar}.sqlite"
+    storage = SQLiteFlowStorage(path)
+    storage.close()
+    candidate = path if sidecar == "db" else Path(f"{path}-{sidecar}")
+    if not candidate.exists():
+        candidate.write_bytes(b"sidecar")
+    os.chmod(candidate, 0o644)
+    with pytest.raises(PermissionError):
+        SQLiteFlowStorage(path)
 
 
 def test_representative_load_does_not_drop_messages(tmp_path: Path) -> None:
@@ -350,3 +439,36 @@ def test_representative_load_does_not_drop_messages(tmp_path: Path) -> None:
         assert storage.counters["write_errors"] == 0
     finally:
         storage.close()
+
+
+def test_retention_does_not_run_payload_aggregate_scans_per_message(tmp_path: Path) -> None:
+    traces: list[str] = []
+    storage = SQLiteFlowStorage(
+        tmp_path / "flows.sqlite",
+        max_flows=10_000,
+        max_bytes=32 * 1024 * 1024,
+        trace_sql=traces.append,
+    )
+    try:
+        for index in range(100):
+            assert storage.offer(metadata(f"trace-{index}", b"r", b"s"))
+        storage.flush()
+        assert not any("SUM(" in sql.upper() or "COUNT(" in sql.upper() for sql in traces)
+    finally:
+        storage.close()
+
+
+def test_storage_normalizes_dotdot_and_rejects_ancestor_symlinks(tmp_path: Path) -> None:
+    normalized = tmp_path / "nested" / "flows.sqlite"
+    storage = SQLiteFlowStorage(tmp_path / "nested" / ".." / "nested" / "flows.sqlite")
+    try:
+        assert storage.path == normalized.resolve()
+    finally:
+        storage.close()
+
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    symlink_parent = tmp_path / "linked"
+    symlink_parent.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(PermissionError, match="symlinked ancestor"):
+        SQLiteFlowStorage(symlink_parent / "flows.sqlite")

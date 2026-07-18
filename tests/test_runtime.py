@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import math
 import os
 import re
@@ -17,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from mitm_inspector.api.limits import MAX_INGEST_BODY_PREFIX_BYTES
+from mitm_inspector.api.server import ApiServer, ApiServerConfig, config_from_argv
 from mitm_inspector.runtime.cli import default_supervisor_factory, main
 from mitm_inspector.runtime.commands import (
     ProcessSpec,
@@ -993,6 +996,51 @@ def test_cli_plan_reports_preflight_and_never_launches(capsys: pytest.CaptureFix
 
     assert main(["run", "--dry-run"]) == 0
     assert "start order: app -> proxy" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("flag", "storage_path", "expect_storage"),
+    [
+        ("--no-storage", "ignored.sqlite", False),
+        ("", ":memory:", False),
+        ("", "persistent.sqlite", True),
+    ],
+)
+def test_run_child_argv_preserves_storage_opt_out_behavior(
+    tmp_path: Path, flag: str, storage_path: str, expect_storage: bool
+) -> None:
+    requested_path = (
+        str(tmp_path / storage_path) if storage_path != ":memory:" else storage_path
+    )
+    command = [
+        sys.executable,
+        "-c",
+        "from mitm_inspector.runtime.cli import main; raise SystemExit(main())",
+        "run",
+        "--dry-run",
+        "--json",
+        "--storage-path",
+        requested_path,
+    ]
+    if flag:
+        command.append(flag)
+    completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    plan = json.loads(completed.stdout)
+    child_config = config_from_argv(plan["app"][3:])
+    server = ApiServer(
+        ApiServerConfig(
+            storage_path=child_config.storage_path,
+            no_storage=child_config.no_storage,
+        )
+    )
+    try:
+        assert (server.application.storage is not None) is expect_storage
+        if expect_storage:
+            assert (tmp_path / storage_path).exists()
+        elif storage_path != ":memory:":
+            assert not (tmp_path / storage_path).exists()
+    finally:
+        asyncio.run(server.close())
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process-group semantics are POSIX-specific")

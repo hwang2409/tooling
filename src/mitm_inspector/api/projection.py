@@ -58,7 +58,7 @@ def flow_id_of(metadata: Mapping[str, object]) -> str | None:
 
 
 def collect_grid_flows(store: MemoryStore) -> dict[str, PlainJsonObject]:
-    """Project the store's newest metadata per flow, ordered oldest-first."""
+    """Project the store's newest metadata per flow, newest flow first."""
 
     newest: dict[str, PlainJsonObject] = {}
     for parsed in store.newest_first():
@@ -74,7 +74,7 @@ def collect_grid_flows(store: MemoryStore) -> dict[str, PlainJsonObject]:
         if flow_id is None or flow_id in newest:
             continue
         newest[flow_id] = grid_flow(metadata)
-    return dict(reversed(newest.items()))
+    return newest
 
 
 def diff_grid_changes(

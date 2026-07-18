@@ -90,6 +90,7 @@ export interface FlowLifecycle extends ProtocolBase {
   occurred_at: string;
   sequence: DecimalString;
   state: LifecycleState;
+  historical?: boolean;
 }
 
 export interface BodyChunk extends ProtocolBase {
