@@ -5,6 +5,8 @@ import base64
 import json
 import os
 import stat
+import subprocess
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -395,6 +397,78 @@ def test_storage_rejects_caps_below_sqlite_overhead(tmp_path: Path) -> None:
         SQLiteFlowStorage(tmp_path / "flows.sqlite", max_bytes=1_000)
 
 
+def test_storage_cap_uses_live_file_set_boundary(tmp_path: Path) -> None:
+    probe = SQLiteFlowStorage(tmp_path / "probe.sqlite", max_bytes=10_000_000)
+    baseline = probe._minimum_storage_bytes
+    probe.close()
+
+    with pytest.raises(ValueError, match="SQLite overhead"):
+        SQLiteFlowStorage(tmp_path / "below.sqlite", max_bytes=baseline - 1)
+    accepted = SQLiteFlowStorage(tmp_path / "above.sqlite", max_bytes=baseline + 1)
+    accepted.close()
+
+
+def test_storage_reopens_after_crash_during_retention_checkpoint(tmp_path: Path) -> None:
+    path = tmp_path / "crash.sqlite"
+    script = """
+import base64
+import os
+import sys
+from pathlib import Path
+import mitm_inspector.store.sqlite as sqlite
+
+path = Path(sys.argv[1])
+storage = sqlite.SQLiteFlowStorage(path, max_bytes=100_000)
+original_checkpoint = sqlite._checkpoint
+calls = 0
+
+def crash_checkpoint(connection):
+    global calls
+    calls += 1
+    if calls == 1:
+        os._exit(73)
+    original_checkpoint(connection)
+
+sqlite._checkpoint = crash_checkpoint
+body = {
+    "state": "captured",
+    "size_bytes": "300000",
+    "encoding": "base64",
+    "data": base64.b64encode(b"x" * 300000).decode("ascii"),
+}
+storage.offer({
+    "protocol_version": "1",
+    "type": "flow.metadata",
+    "metadata": {
+        "flow_id": "crash-flow",
+        "method": "POST",
+        "scheme": "https",
+        "host": "example.test",
+        "port": "443",
+        "path": "/",
+        "request_headers": [],
+        "request_body": body,
+        "response_body": body,
+    },
+})
+storage.flush()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 73, completed.stderr
+    reopened = SQLiteFlowStorage(path, max_bytes=100_000)
+    try:
+        assert reopened.replay() == []
+        files = [path, Path(f"{path}-wal"), Path(f"{path}-shm")]
+        assert sum(file.stat().st_size for file in files if file.exists()) <= 100_000
+    finally:
+        reopened.close()
+
+
 def test_storage_rejects_loose_permissions_and_creates_private_files(tmp_path: Path) -> None:
     unsafe = tmp_path / "unsafe"
     unsafe.mkdir(mode=0o755)
@@ -459,12 +533,8 @@ def test_retention_does_not_run_payload_aggregate_scans_per_message(tmp_path: Pa
 
 
 def test_storage_normalizes_dotdot_and_rejects_ancestor_symlinks(tmp_path: Path) -> None:
-    normalized = tmp_path / "nested" / "flows.sqlite"
-    storage = SQLiteFlowStorage(tmp_path / "nested" / ".." / "nested" / "flows.sqlite")
-    try:
-        assert storage.path == normalized.resolve()
-    finally:
-        storage.close()
+    with pytest.raises(ValueError, match="must not contain '..'"):
+        SQLiteFlowStorage(tmp_path / "nested" / ".." / "nested" / "flows.sqlite")
 
     real_parent = tmp_path / "real"
     real_parent.mkdir()

@@ -76,6 +76,8 @@ Durable persistence is configured on `mitm-inspector run` with
 `--no-storage` or `--storage-path :memory:` to disable it. The API child
 receives the same flags; writes are handled by a background SQLite worker and
 oldest flows are evicted when either retention limit is reached.
+The storage path rejects raw paths containing `..` and paths whose existing
+ancestor components include a symlink.
 
 Stock mitmdump receives the shared values through the environment because
 project-specific flags cannot be added to its parser before the `-s` addon is

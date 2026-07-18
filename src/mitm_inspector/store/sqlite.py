@@ -8,6 +8,7 @@ import os
 import queue
 import sqlite3
 import stat
+import tempfile
 import threading
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -35,6 +36,8 @@ def _normalize_storage_path(path: Path | str) -> Path:
     """Resolve storage paths and reject symlinked existing ancestors."""
 
     raw = Path(path).expanduser()
+    if ".." in raw.parts:
+        raise ValueError("storage path must not contain '..'")
     absolute = raw if raw.is_absolute() else Path.cwd() / raw
     current = absolute
     ancestors = list(absolute.parents)
@@ -342,8 +345,45 @@ class SQLiteFlowStorage:
             connection.commit()
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.execute("VACUUM")
+            _checkpoint(connection)
+            self._enforce_retention(connection, None)
+            _checkpoint(connection)
+            connection.execute("SELECT COUNT(*) FROM flows").fetchone()
+            self._minimum_storage_bytes = self._measure_empty_live_overhead(connection)
         _secure_existing_files(self.path)
-        self._minimum_storage_bytes = self.path.stat().st_size
+
+    def _measure_empty_live_overhead(self, source: sqlite3.Connection) -> int:
+        descriptor, raw_path = tempfile.mkstemp(
+            dir=self.path.parent,
+            prefix=f".{self.path.name}.baseline-",
+            suffix=".sqlite",
+        )
+        os.close(descriptor)
+        baseline_path = Path(raw_path)
+        try:
+            with sqlite3.connect(baseline_path) as baseline:
+                baseline.execute("PRAGMA foreign_keys = ON")
+                baseline.execute("PRAGMA journal_mode = WAL")
+                schema = source.execute(
+                    """
+                    SELECT sql FROM sqlite_master
+                    WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+                    ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END, name
+                    """
+                ).fetchall()
+                baseline.executescript(
+                    "\n".join(f"{statement[0]};" for statement in schema)
+                )
+                baseline.commit()
+                baseline.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                baseline.execute("VACUUM")
+                baseline.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                baseline.execute("SELECT COUNT(*) FROM flows").fetchone()
+                return _storage_size(baseline_path)
+        finally:
+            baseline_path.unlink(missing_ok=True)
+            for sidecar in _sidecar_paths(baseline_path):
+                sidecar.unlink(missing_ok=True)
 
     def _run(self) -> None:
         with sqlite3.connect(self.path) as connection:
