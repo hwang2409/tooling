@@ -145,6 +145,23 @@ describe("browser state reducer", () => {
     expect(next.streamGap).toBeNull();
   });
 
+  it("populates replayed lifecycle history after a post-restart reconnect", () => {
+    const source = reduce(initialBrowserState, hello("source-a"));
+    const snapshot = reduce(source, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "restart", cursor: "0",
+      flows: [flow("persisted")],
+    });
+    const replayed = reduce(snapshot, {
+      protocol_version: "1", type: "flow.lifecycle", source_id: "source-a", flow_id: "persisted",
+      event_id: "persisted-1", occurred_at: "2026-01-01T00:00:00Z", sequence: "1",
+      state: "request_started",
+    });
+
+    expect(replayed.lifecycles.get("persisted")?.map((event) => event.state)).toEqual([
+      "request_started",
+    ]);
+  });
+
   it("keys lifecycle sequence by source epoch and ignores late A after switching to B", () => {
     const sourceA = reduce(initialBrowserState, hello("source-a"));
     const sequenceA = reduce(sourceA, {

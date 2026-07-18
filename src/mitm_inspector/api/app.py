@@ -195,11 +195,12 @@ class ApiApplication:
         """Send the connect sequence and register a live subscriber."""
 
         self._reconcile(force=False)
-        frames = (
+        frames: list[str] = [
             self._wire_text(self._hello_message()),
             self._wire_text(self._initial_resync_message()),
             self._wire_text(self._snapshot_message()),
-        )
+        ]
+        frames.extend(self._historical_lifecycle_frames())
         subscriber = Subscriber(deliver=deliver, on_drop=on_drop)
         for frame in frames:
             if not self._safe_deliver(subscriber, frame):
@@ -207,6 +208,17 @@ class ApiApplication:
                 return subscriber
         self._subscribers.append(subscriber)
         return subscriber
+
+    def _historical_lifecycle_frames(self) -> list[str]:
+        """Deliver retained lifecycle history after the initial snapshot."""
+
+        messages: list[str] = []
+        for parsed in reversed(list(self._store.newest_first())):
+            payload = self._payload_of(parsed)
+            if payload.get("type") != "flow.lifecycle":
+                continue
+            messages.append(self._wire_text(parsed_message_to_plain_json(parsed)))
+        return messages
 
     def unsubscribe(self, subscriber: Subscriber) -> None:
         subscriber.closed = True

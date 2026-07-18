@@ -7,6 +7,7 @@ import json
 import os
 import queue
 import sqlite3
+import stat
 import threading
 from collections.abc import Mapping
 from pathlib import Path
@@ -60,18 +61,21 @@ class SQLiteFlowStorage:
         self.path = Path(path).expanduser()
         self.max_flows = max_flows
         self.max_bytes = max_bytes
+        self._budget_disabled = max_bytes < 4_096
         self._queue: queue.Queue[object] = queue.Queue(maxsize=queue_size)
         self._lock = threading.Lock()
         self._closed = False
         self._dropped_messages = 0
         self._write_errors = 0
+        self._next_created_order = 0
         self._thread = threading.Thread(
             target=self._run,
             name="mitm-inspector-storage",
             daemon=True,
         )
-        self._prepare_database()
-        self._thread.start()
+        if not self._budget_disabled:
+            self._prepare_database()
+            self._thread.start()
 
     @property
     def counters(self) -> dict[str, int]:
@@ -85,6 +89,8 @@ class SQLiteFlowStorage:
     def offer(self, message: ParsedMessage | Mapping[str, object]) -> bool:
         """Queue one validated message, dropping the oldest queued item if full."""
 
+        if self._budget_disabled:
+            return False
         parsed = (
             require_parsed_message(message)
             if isinstance(message, ParsedMessage)
@@ -117,6 +123,8 @@ class SQLiteFlowStorage:
             if self._closed:
                 return
             self._closed = True
+        if self._budget_disabled:
+            return
         self.flush()
         self._queue.put(_SENTINEL)
         self._thread.join()
@@ -126,6 +134,8 @@ class SQLiteFlowStorage:
 
         if type(limit) is not int or limit < 0:
             raise ValueError("replay limit must be a nonnegative integer")
+        if self._budget_disabled:
+            return []
         self.flush()
         with sqlite3.connect(self.path) as connection:
             rows = connection.execute(
@@ -152,6 +162,48 @@ class SQLiteFlowStorage:
             for row in rows:
                 flow_id = str(row[0])
                 result.append(parse_message(self._metadata_from_row(row)))
+                for side, body, state, size, content_type in (
+                    ("request", row[12], row[14], row[16], row[8]),
+                    ("response", row[13], row[15], row[17], row[9]),
+                ):
+                    chunk_rows = connection.execute(
+                        """
+                        SELECT chunk_index, offset_bytes, data
+                        FROM body_chunks
+                        WHERE flow_id = ? AND body_side = ?
+                        ORDER BY LENGTH(offset_bytes), offset_bytes, chunk_index
+                        """,
+                        (flow_id, side),
+                    ).fetchall()
+                    for chunk_index, offset_bytes, chunk_data in chunk_rows:
+                        result.append(
+                            parse_message(
+                                {
+                                    "protocol_version": "1",
+                                    "type": "body.chunk",
+                                    "flow_id": flow_id,
+                                    "body_side": side,
+                                    "chunk_index": chunk_index,
+                                    "offset_bytes": offset_bytes,
+                                    "data_base64": base64.b64encode(chunk_data).decode("ascii"),
+                                }
+                            )
+                        )
+                    if state != "missing":
+                        result.append(
+                            parse_message(
+                                {
+                                    "protocol_version": "1",
+                                    "type": "body.end",
+                                    "flow_id": flow_id,
+                                    "body_side": side,
+                                    "total_bytes": str(size),
+                                    "body": _descriptor_from_row(
+                                        body, state, size, content_type
+                                    ),
+                                }
+                            )
+                        )
                 lifecycle_rows = connection.execute(
                     """
                     SELECT source_id, event_id, occurred_at, sequence, state
@@ -197,7 +249,12 @@ class SQLiteFlowStorage:
                 store.append(message)
 
     def _prepare_database(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _validate_private_mode(self.path.parent, stat.S_IFDIR, 0o700)
+        _prepare_private_file(self.path)
+        for sidecar in _sidecar_paths(self.path):
+            if sidecar.exists():
+                _validate_private_mode(sidecar, stat.S_IFREG, 0o600)
         with sqlite3.connect(self.path) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA journal_mode = WAL")
@@ -248,12 +305,19 @@ class SQLiteFlowStorage:
                     ON flows(started_at DESC);
                 CREATE INDEX IF NOT EXISTS lifecycle_flow_sequence
                     ON lifecycle(flow_id, sequence);
+                CREATE INDEX IF NOT EXISTS flows_created_order
+                    ON flows(created_order);
                 """
             )
+        _secure_existing_files(self.path)
 
     def _run(self) -> None:
         with sqlite3.connect(self.path) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
+            row = connection.execute(
+                "SELECT COALESCE(MAX(created_order), 0) FROM flows"
+            ).fetchone()
+            self._next_created_order = int(row[0]) if row is not None else 0
             while True:
                 item = self._queue.get()
                 try:
@@ -283,7 +347,8 @@ class SQLiteFlowStorage:
                 self._write_body_chunk(connection, payload)
             elif message_type == "body.end":
                 self._write_body_end(connection, payload)
-            self._enforce_retention(connection)
+            protected_flow_id = _message_flow_id(payload)
+            self._enforce_retention(connection, protected_flow_id)
 
     def _write_metadata(
         self, connection: sqlite3.Connection, metadata: Mapping[str, object]
@@ -363,7 +428,7 @@ class SQLiteFlowStorage:
                 response[2],
                 request_headers,
                 response_headers,
-                self._next_order(connection),
+                self._next_order(),
             ),
         )
 
@@ -455,47 +520,53 @@ class SQLiteFlowStorage:
             (flow_id,),
         )
 
-    @staticmethod
-    def _next_order(connection: sqlite3.Connection) -> int:
-        row = connection.execute("SELECT COALESCE(MAX(created_order), 0) + 1 FROM flows").fetchone()
-        return int(row[0]) if row is not None else 1
+    def _next_order(self) -> int:
+        self._next_created_order += 1
+        return self._next_created_order
 
-    def _enforce_retention(self, connection: sqlite3.Connection) -> None:
+    def _enforce_retention(
+        self, connection: sqlite3.Connection, protected_flow_id: str | None
+    ) -> None:
+        connection.commit()
         while True:
-            count = int(connection.execute("SELECT COUNT(*) FROM flows").fetchone()[0])
-            size = int(
-                connection.execute(
-                    """
-                    SELECT COALESCE(SUM(bytes), 0) FROM (
-                        SELECT COALESCE(LENGTH(request_body), 0)
-                            + COALESCE(LENGTH(response_body), 0)
-                            + LENGTH(request_headers_json)
-                            + COALESCE(LENGTH(response_headers_json), 0) AS bytes
-                        FROM flows
-                        UNION ALL
-                        SELECT COALESCE(SUM(LENGTH(data)), 0) AS bytes FROM body_chunks
-                        UNION ALL
-                        SELECT COALESCE(SUM(
-                            LENGTH(flow_id) + LENGTH(event_id) + LENGTH(source_id)
-                            + LENGTH(state) + LENGTH(occurred_at) + LENGTH(sequence)
-                        ), 0) AS bytes FROM lifecycle
-                    )
-                    """
-                ).fetchone()[0]
-            )
-            if count <= self.max_flows and size <= self.max_bytes:
+            if protected_flow_id is None:
+                overflow_offset = self.max_flows
+                where = ""
+                parameters: tuple[object, ...] = ()
+            else:
+                overflow_offset = max(0, self.max_flows - 1)
+                where = "WHERE flow_id <> ?"
+                parameters = (protected_flow_id,)
+            too_many = connection.execute(
+                f"""
+                SELECT flow_id FROM flows
+                {where}
+                ORDER BY CASE WHEN started_at IS NULL THEN 1 ELSE 0 END,
+                         COALESCE(started_at, ''), created_order
+                LIMIT 1 OFFSET ?
+                """,
+                (*parameters, overflow_offset),
+            ).fetchone()
+            over_bytes = _storage_size(self.path) > self.max_bytes
+            if too_many is None and not over_bytes:
                 return
             oldest = connection.execute(
-                """
+                f"""
                 SELECT flow_id FROM flows
+                {where}
                 ORDER BY CASE WHEN started_at IS NULL THEN 1 ELSE 0 END,
                          COALESCE(started_at, ''), created_order
                 LIMIT 1
-                """
+                """, parameters
             ).fetchone()
             if oldest is None:
                 return
             connection.execute("DELETE FROM flows WHERE flow_id = ?", (oldest[0],))
+            connection.commit()
+            _checkpoint(connection)
+            connection.execute("VACUUM")
+            _checkpoint(connection)
+            _secure_existing_files(self.path)
 
     @staticmethod
     def _metadata_from_row(row: tuple[object, ...]) -> dict[str, object]:
@@ -536,6 +607,15 @@ def _body_values(value: object) -> tuple[bytes | None, str, int, str | None]:
     return data, state, size, str(content_type) if content_type is not None else None
 
 
+def _message_flow_id(payload: Mapping[str, object]) -> str | None:
+    if payload.get("type") == "flow.metadata":
+        metadata = payload.get("metadata")
+        flow_id = metadata.get("flow_id") if isinstance(metadata, Mapping) else None
+    else:
+        flow_id = payload.get("flow_id")
+    return flow_id if isinstance(flow_id, str) else None
+
+
 def _plain_json(value: object) -> object:
     if isinstance(value, Mapping):
         return {str(key): _plain_json(item) for key, item in value.items()}
@@ -565,6 +645,53 @@ def _descriptor_from_row(
     if body_state == "truncated":
         descriptor["captured_bytes"] = str(len(data))
     return descriptor
+
+
+def _sidecar_paths(path: Path) -> tuple[Path, Path]:
+    return (Path(f"{path}-wal"), Path(f"{path}-shm"))
+
+
+def _storage_size(path: Path) -> int:
+    total = 0
+    for candidate in (path, *_sidecar_paths(path)):
+        try:
+            total += candidate.stat().st_size
+        except FileNotFoundError:
+            pass
+    return total
+
+
+def _checkpoint(connection: sqlite3.Connection) -> None:
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+
+def _validate_private_mode(path: Path, expected_type: int, mode: int) -> None:
+    info = path.lstat()
+    expected = (
+        stat.S_ISDIR(info.st_mode)
+        if expected_type == stat.S_IFDIR
+        else stat.S_ISREG(info.st_mode)
+    )
+    if stat.S_ISLNK(info.st_mode) or not expected:
+        raise PermissionError(f"storage path has an unsafe type: {path}")
+    if stat.S_IMODE(info.st_mode) != mode:
+        raise PermissionError(f"storage path has unsafe permissions: {path}")
+
+
+def _prepare_private_file(path: Path) -> None:
+    try:
+        _validate_private_mode(path, stat.S_IFREG, 0o600)
+    except FileNotFoundError:
+        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+        descriptor = os.open(path, flags, 0o600)
+        os.close(descriptor)
+
+
+def _secure_existing_files(path: Path) -> None:
+    _validate_private_mode(path, stat.S_IFREG, 0o600)
+    for sidecar in _sidecar_paths(path):
+        if sidecar.exists():
+            _validate_private_mode(sidecar, stat.S_IFREG, 0o600)
 
 
 __all__ = [
