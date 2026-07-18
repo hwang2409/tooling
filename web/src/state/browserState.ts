@@ -388,6 +388,12 @@ function applyStreamGap(state: BrowserState, message: StreamGap): BrowserState {
 
 function applyLifecycle(state: BrowserState, message: FlowLifecycle): BrowserState {
   if (state.sourceId === null || message.source_id !== state.sourceId) return stale(state);
+  if (message.historical === true) {
+    return {
+      ...state,
+      lifecycles: recordLifecycle(state.lifecycles, message),
+    };
+  }
   if (state.streamSequence !== null && cursor(message.sequence) <= cursor(state.streamSequence)) return stale(state);
   return {
     ...state,

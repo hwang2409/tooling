@@ -188,6 +188,7 @@ class FlowLifecycle(TypedDict):
     occurred_at: str
     sequence: str
     state: LifecycleState
+    historical: NotRequired[bool]
 
 
 class BodyChunk(TypedDict):

@@ -19,12 +19,15 @@ from mitm_inspector.json_boundary import PlainJsonObject
 from mitm_inspector.protocol import (
     MAX_U64,
     KnownParsedMessage,
+    ParsedMessage,
     ParsedMessageResult,
     ProtocolError,
     parse_message,
     parsed_message_to_plain_json,
+    require_parsed_message,
 )
 from mitm_inspector.store.memory import MemoryStore
+from mitm_inspector.store.sqlite import SQLiteFlowStorage
 
 _RELAYED_KNOWN_TYPES = frozenset({"source.hello", "flow.lifecycle", "stream.gap"})
 _EVICTION_COUNTER_NAMES = (
@@ -100,6 +103,7 @@ class ApiApplication:
         max_in_memory_bytes: int = 128 * 1024 * 1024,
         wall_clock: Callable[[], str] = _utc_now_iso,
         cursor_start: int = 0,
+        storage: SQLiteFlowStorage | None = None,
     ) -> None:
         if type(source_id) is not str or not source_id:
             raise ValueError("source_id must be a non-empty string")
@@ -116,6 +120,7 @@ class ApiApplication:
         self._max_body_prefix_bytes = max_body_prefix_bytes
         self._max_in_memory_bytes = max_in_memory_bytes
         self._wall_clock = wall_clock
+        self._storage = storage
         self._subscribers: list[Subscriber] = []
         self._state = _State(cursor=cursor_start)
         self._counters = _Counters()
@@ -123,6 +128,10 @@ class ApiApplication:
     @property
     def store(self) -> MemoryStore:
         return self._store
+
+    @property
+    def storage(self) -> SQLiteFlowStorage | None:
+        return self._storage
 
     @property
     def cursor(self) -> str:
@@ -140,6 +149,8 @@ class ApiApplication:
         counters["subscribers"] = len(self._subscribers)
         counters["published_flows"] = len(self._state.published)
         counters["store"] = dict(self._store.counters)
+        if self._storage is not None:
+            counters["storage"] = self._storage.counters
         return counters
 
     def ingest(self, value: object) -> IngestResult:
@@ -149,8 +160,14 @@ class ApiApplication:
         and broadcast state are untouched in that case.
         """
 
-        parsed = parse_message(value)
+        parsed = (
+            require_parsed_message(value)
+            if isinstance(value, ParsedMessage)
+            else parse_message(value)
+        )
         self._store.append(parsed)
+        if self._storage is not None:
+            self._storage.offer(parsed)
         self._counters.ingested_messages += 1
         payload = self._payload_of(parsed)
         relayed = False
@@ -184,11 +201,12 @@ class ApiApplication:
         """Send the connect sequence and register a live subscriber."""
 
         self._reconcile(force=False)
-        frames = (
+        frames: list[str] = [
             self._wire_text(self._hello_message()),
             self._wire_text(self._initial_resync_message()),
             self._wire_text(self._snapshot_message()),
-        )
+        ]
+        frames.extend(self._historical_lifecycle_frames())
         subscriber = Subscriber(deliver=deliver, on_drop=on_drop)
         for frame in frames:
             if not self._safe_deliver(subscriber, frame):
@@ -196,6 +214,34 @@ class ApiApplication:
                 return subscriber
         self._subscribers.append(subscriber)
         return subscriber
+
+    def _historical_lifecycle_frames(self) -> list[str]:
+        """Deliver retained lifecycle history after the initial snapshot."""
+
+        lifecycle_messages: list[tuple[str, str, str, str, str]] = []
+        for parsed in self._store.newest_first():
+            payload = self._payload_of(parsed)
+            if payload.get("type") != "flow.lifecycle":
+                continue
+            source_id = payload.get("source_id")
+            sequence = payload.get("sequence")
+            event_id = payload.get("event_id")
+            flow_id = payload.get("flow_id")
+            if not (
+                isinstance(source_id, str)
+                and isinstance(sequence, str)
+                and isinstance(event_id, str)
+                and isinstance(flow_id, str)
+            ):
+                continue
+            historical = parsed_message_to_plain_json(parsed)
+            historical["historical"] = True
+            lifecycle_messages.append(
+                (source_id, sequence, event_id, flow_id,
+                 self._wire_text(historical))
+            )
+        lifecycle_messages.sort(key=lambda item: (item[0], len(item[1]), item[1], item[2]))
+        return [item[4] for item in lifecycle_messages]
 
     def unsubscribe(self, subscriber: Subscriber) -> None:
         subscriber.closed = True
@@ -277,12 +323,10 @@ class ApiApplication:
         flow = grid_flow(metadata)
         published = self._state.published
         unchanged = published.get(flow_id) == flow
-        # The just-ingested metadata is now the flow's newest message, which
-        # moves the flow to the end of the oldest-first projection order even
-        # when its content is identical, exactly like a full re-projection.
-        current = dict(published)
-        current.pop(flow_id, None)
-        current[flow_id] = flow
+        # The just-ingested metadata is now the newest flow, so it moves
+        # to the front of the reverse-chronological projection.
+        current = {flow_id: flow}
+        current.update((key, value) for key, value in published.items() if key != flow_id)
         self._state.published = current
         if unchanged:
             return False

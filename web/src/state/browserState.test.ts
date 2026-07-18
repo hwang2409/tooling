@@ -145,6 +145,49 @@ describe("browser state reducer", () => {
     expect(next.streamGap).toBeNull();
   });
 
+  it("populates replayed lifecycle history after a post-restart reconnect", () => {
+    const source = reduce(initialBrowserState, hello("source-a"));
+    const snapshot = reduce(source, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "restart", cursor: "0",
+      flows: [flow("persisted")],
+    });
+    const replayed = reduce(snapshot, {
+      protocol_version: "1", type: "flow.lifecycle", source_id: "source-a", flow_id: "persisted",
+      event_id: "persisted-1", occurred_at: "2026-01-01T00:00:00Z", sequence: "1",
+      state: "request_started",
+    });
+
+    expect(replayed.lifecycles.get("persisted")?.map((event) => event.state)).toEqual([
+      "request_started",
+    ]);
+  });
+
+  it("accepts interleaved historical lifecycle sequences for every flow", () => {
+    const source = reduce(initialBrowserState, hello("source-a"));
+    const snapshot = reduce(source, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "interleaved", cursor: "0", flows: [],
+    });
+    const messages = [
+      ["a", "1", "a-start", "request_started"],
+      ["b", "2", "b-start", "request_started"],
+      ["a", "3", "a-end", "flow_completed"],
+      ["b", "4", "b-end", "flow_completed"],
+    ] as const;
+    const replayed = messages.reduce((state, [flowId, sequence, eventId, lifecycleState]) => reduce(state, {
+      protocol_version: "1", type: "flow.lifecycle", source_id: "source-a", flow_id: flowId,
+      event_id: eventId, occurred_at: "2026-01-01T00:00:00Z", sequence, state: lifecycleState,
+      historical: true,
+    }), snapshot);
+
+    expect(replayed.lifecycles.get("a")?.map((event) => event.state)).toEqual([
+      "request_started", "flow_completed",
+    ]);
+    expect(replayed.lifecycles.get("b")?.map((event) => event.state)).toEqual([
+      "request_started", "flow_completed",
+    ]);
+    expect(replayed.streamSequence).toBeNull();
+  });
+
   it("keys lifecycle sequence by source epoch and ignores late A after switching to B", () => {
     const sourceA = reduce(initialBrowserState, hello("source-a"));
     const sequenceA = reduce(sourceA, {
