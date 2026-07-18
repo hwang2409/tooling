@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -399,13 +400,49 @@ def test_storage_rejects_caps_below_sqlite_overhead(tmp_path: Path) -> None:
 
 def test_storage_cap_uses_live_file_set_boundary(tmp_path: Path) -> None:
     probe = SQLiteFlowStorage(tmp_path / "probe.sqlite", max_bytes=10_000_000)
-    baseline = probe._minimum_storage_bytes
+    baseline = 0
+    for _ in range(100):
+        files = [probe.path, Path(f"{probe.path}-wal"), Path(f"{probe.path}-shm")]
+        if all(file.exists() for file in files):
+            baseline = sum(file.stat().st_size for file in files)
+            break
+        time.sleep(0.01)
+    assert baseline > 0
     probe.close()
 
     with pytest.raises(ValueError, match="SQLite overhead"):
         SQLiteFlowStorage(tmp_path / "below.sqlite", max_bytes=baseline - 1)
     accepted = SQLiteFlowStorage(tmp_path / "above.sqlite", max_bytes=baseline + 1)
-    accepted.close()
+    try:
+        files = [accepted.path, Path(f"{accepted.path}-wal"), Path(f"{accepted.path}-shm")]
+        assert sum(file.stat().st_size for file in files if file.exists()) <= baseline + 1
+    finally:
+        accepted.close()
+
+
+def test_invalid_cap_reopen_preserves_retained_history(tmp_path: Path) -> None:
+    path = tmp_path / "preserve.sqlite"
+    seeded = SQLiteFlowStorage(path, max_bytes=10_000_000)
+    for index in range(3):
+        seeded.offer(metadata(f"preserved-{index}", bytes([index]), bytes([index + 3])))
+    seeded.flush()
+    before = [parsed_message_to_plain_json(message) for message in seeded.replay()]
+    seeded.close()
+
+    with pytest.raises(ValueError, match="SQLite overhead"):
+        SQLiteFlowStorage(path, max_bytes=1_000)
+
+    reopened = SQLiteFlowStorage(path, max_bytes=10_000_000)
+    try:
+        after = [parsed_message_to_plain_json(message) for message in reopened.replay()]
+        assert after == before
+        assert sum(
+            1
+            for message in after
+            if message["type"] == "flow.metadata"
+        ) == 3
+    finally:
+        reopened.close()
 
 
 def test_storage_reopens_after_crash_during_retention_checkpoint(tmp_path: Path) -> None:

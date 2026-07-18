@@ -346,10 +346,16 @@ class SQLiteFlowStorage:
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.execute("VACUUM")
             _checkpoint(connection)
+            connection.execute("SELECT COUNT(*) FROM flows").fetchone()
+            self._minimum_storage_bytes = self._measure_empty_live_overhead(connection)
+            if self.max_bytes < self._minimum_storage_bytes:
+                raise ValueError(
+                    f"storage max_bytes {self.max_bytes} is below the SQLite overhead "
+                    f"of {self._minimum_storage_bytes} bytes"
+                )
             self._enforce_retention(connection, None)
             _checkpoint(connection)
             connection.execute("SELECT COUNT(*) FROM flows").fetchone()
-            self._minimum_storage_bytes = self._measure_empty_live_overhead(connection)
         _secure_existing_files(self.path)
 
     def _measure_empty_live_overhead(self, source: sqlite3.Connection) -> int:
