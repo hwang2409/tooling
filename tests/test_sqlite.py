@@ -412,10 +412,10 @@ def test_storage_cap_uses_live_file_set_boundary(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="SQLite overhead"):
         SQLiteFlowStorage(tmp_path / "below.sqlite", max_bytes=baseline - 1)
-    accepted = SQLiteFlowStorage(tmp_path / "above.sqlite", max_bytes=baseline + 1)
+    accepted = SQLiteFlowStorage(tmp_path / "above.sqlite", max_bytes=baseline)
     try:
         files = [accepted.path, Path(f"{accepted.path}-wal"), Path(f"{accepted.path}-shm")]
-        assert sum(file.stat().st_size for file in files if file.exists()) <= baseline + 1
+        assert sum(file.stat().st_size for file in files if file.exists()) <= baseline
     finally:
         accepted.close()
 
