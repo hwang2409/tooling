@@ -22,6 +22,7 @@ from mitm_inspector.runtime.config import (
 )
 from mitm_inspector.runtime.readiness import HttpHealthReadinessProbe
 from mitm_inspector.runtime.supervisor import RuntimeSupervisor, RuntimeSupervisorError
+from mitm_inspector.store.sqlite import default_storage_path
 
 
 class RunnableSupervisor(Protocol):
@@ -46,6 +47,11 @@ def _add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-body-bytes", type=int, default=128 * 1024 * 1024)
     parser.add_argument("--max-body-prefix-bytes", type=int, default=1024 * 1024)
     parser.add_argument("--max-pending-messages", type=int, default=4096)
+    parser.add_argument("--storage-path", default=str(default_storage_path()))
+    parser.add_argument("--no-storage", action="store_true")
+    parser.add_argument("--storage-max-flows", type=int, default=10_000)
+    parser.add_argument("--storage-max-bytes", type=int, default=512 * 1024 * 1024)
+    parser.add_argument("--storage-replay", type=int, default=500)
     parser.add_argument("--mitmdump-executable", type=Path, default=DEFAULT_MITMDUMP_EXECUTABLE)
     parser.add_argument("--app-executable", type=Path, default=DEFAULT_APP_EXECUTABLE)
     parser.add_argument(
@@ -75,6 +81,11 @@ def _config_from_args(args: argparse.Namespace) -> RuntimeConfig:
         max_body_bytes=args.max_body_bytes,
         max_body_prefix_bytes=args.max_body_prefix_bytes,
         max_pending_messages=args.max_pending_messages,
+        storage_path=args.storage_path,
+        no_storage=args.no_storage,
+        storage_max_flows=args.storage_max_flows,
+        storage_max_bytes=args.storage_max_bytes,
+        storage_replay=args.storage_replay,
         mitmdump_executable=args.mitmdump_executable,
         app_executable=args.app_executable,
         addon_path=args.addon_path,

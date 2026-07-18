@@ -25,6 +25,7 @@ from mitm_inspector.protocol import (
     parsed_message_to_plain_json,
 )
 from mitm_inspector.store.memory import MemoryStore
+from mitm_inspector.store.sqlite import SQLiteFlowStorage
 
 _RELAYED_KNOWN_TYPES = frozenset({"source.hello", "flow.lifecycle", "stream.gap"})
 _EVICTION_COUNTER_NAMES = (
@@ -100,6 +101,7 @@ class ApiApplication:
         max_in_memory_bytes: int = 128 * 1024 * 1024,
         wall_clock: Callable[[], str] = _utc_now_iso,
         cursor_start: int = 0,
+        storage: SQLiteFlowStorage | None = None,
     ) -> None:
         if type(source_id) is not str or not source_id:
             raise ValueError("source_id must be a non-empty string")
@@ -116,6 +118,7 @@ class ApiApplication:
         self._max_body_prefix_bytes = max_body_prefix_bytes
         self._max_in_memory_bytes = max_in_memory_bytes
         self._wall_clock = wall_clock
+        self._storage = storage
         self._subscribers: list[Subscriber] = []
         self._state = _State(cursor=cursor_start)
         self._counters = _Counters()
@@ -123,6 +126,10 @@ class ApiApplication:
     @property
     def store(self) -> MemoryStore:
         return self._store
+
+    @property
+    def storage(self) -> SQLiteFlowStorage | None:
+        return self._storage
 
     @property
     def cursor(self) -> str:
@@ -140,6 +147,8 @@ class ApiApplication:
         counters["subscribers"] = len(self._subscribers)
         counters["published_flows"] = len(self._state.published)
         counters["store"] = dict(self._store.counters)
+        if self._storage is not None:
+            counters["storage"] = self._storage.counters
         return counters
 
     def ingest(self, value: object) -> IngestResult:
@@ -151,6 +160,8 @@ class ApiApplication:
 
         parsed = parse_message(value)
         self._store.append(parsed)
+        if self._storage is not None:
+            self._storage.offer(parsed)
         self._counters.ingested_messages += 1
         payload = self._payload_of(parsed)
         relayed = False

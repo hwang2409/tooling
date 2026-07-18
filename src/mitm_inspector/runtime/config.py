@@ -14,6 +14,12 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from mitm_inspector.api.limits import MAX_INGEST_BODY_PREFIX_BYTES
+from mitm_inspector.store.sqlite import (
+    DEFAULT_STORAGE_MAX_BYTES,
+    DEFAULT_STORAGE_MAX_FLOWS,
+    DEFAULT_STORAGE_REPLAY,
+    default_storage_path,
+)
 
 
 class RuntimeConfigError(ValueError):
@@ -356,6 +362,11 @@ class RuntimeConfig:
     max_body_bytes: int = 128 * 1024 * 1024
     max_body_prefix_bytes: int = 1024 * 1024
     max_pending_messages: int = 4096
+    storage_path: Path | str = default_storage_path()
+    no_storage: bool = False
+    storage_max_flows: int = DEFAULT_STORAGE_MAX_FLOWS
+    storage_max_bytes: int = DEFAULT_STORAGE_MAX_BYTES
+    storage_replay: int = DEFAULT_STORAGE_REPLAY
     mitmdump_executable: Path = DEFAULT_MITMDUMP_EXECUTABLE
     app_executable: Path = DEFAULT_APP_EXECUTABLE
     addon_path: Path = DEFAULT_ADDON_PATH
@@ -402,6 +413,27 @@ class RuntimeConfig:
             self,
             "max_pending_messages",
             _uint64(self.max_pending_messages, "max_pending_messages", allow_zero=False),
+        )
+        if os.fspath(self.storage_path) != ":memory:":
+            object.__setattr__(
+                self, "storage_path", _absolute_path(self.storage_path, "storage_path")
+            )
+        if type(self.no_storage) is not bool:
+            raise RuntimeConfigError("no_storage must be a boolean")
+        object.__setattr__(
+            self,
+            "storage_max_flows",
+            _uint64(self.storage_max_flows, "storage_max_flows", allow_zero=False),
+        )
+        object.__setattr__(
+            self,
+            "storage_max_bytes",
+            _uint64(self.storage_max_bytes, "storage_max_bytes", allow_zero=True),
+        )
+        object.__setattr__(
+            self,
+            "storage_replay",
+            _uint64(self.storage_replay, "storage_replay", allow_zero=True),
         )
         if self.max_body_prefix_bytes > self.max_body_bytes:
             raise RuntimeConfigError("max_body_prefix_bytes cannot exceed max_body_bytes")

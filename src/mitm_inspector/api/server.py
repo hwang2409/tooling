@@ -47,6 +47,13 @@ from mitm_inspector.api.limits import (
 )
 from mitm_inspector.protocol import MAX_U64
 from mitm_inspector.store.memory import MemoryStore
+from mitm_inspector.store.sqlite import (
+    DEFAULT_STORAGE_MAX_BYTES,
+    DEFAULT_STORAGE_MAX_FLOWS,
+    DEFAULT_STORAGE_REPLAY,
+    SQLiteFlowStorage,
+    default_storage_path,
+)
 
 API_VERSION_PREFIX = "/api/v1"
 HEALTH_PATH = f"{API_VERSION_PREFIX}/health"
@@ -110,6 +117,11 @@ class ApiServerConfig:
     max_pending_messages: int = 4096
     capture_socket: Path | None = None
     sweep_interval_seconds: float = DEFAULT_SWEEP_INTERVAL_SECONDS
+    storage_path: Path | str | None = None
+    no_storage: bool = False
+    storage_max_flows: int = DEFAULT_STORAGE_MAX_FLOWS
+    storage_max_bytes: int = DEFAULT_STORAGE_MAX_BYTES
+    storage_replay: int = DEFAULT_STORAGE_REPLAY
 
     def __post_init__(self) -> None:
         _validate_loopback_host(self.host)
@@ -139,6 +151,18 @@ class ApiServerConfig:
         interval = self.sweep_interval_seconds
         if type(interval) not in {int, float} or not interval > 0:
             raise ApiServerError("sweep interval must be a positive number")
+        if self.storage_path is not None and os.fspath(self.storage_path) != ":memory:":
+            path = Path(self.storage_path).expanduser()
+            if not path.is_absolute():
+                raise ApiServerError("storage path must be absolute")
+            object.__setattr__(self, "storage_path", path)
+        if type(self.no_storage) is not bool:
+            raise ApiServerError("no_storage must be a boolean")
+        _validate_u64(self.storage_max_flows, "storage_max_flows")
+        if type(self.storage_max_bytes) is not int or self.storage_max_bytes < 0:
+            raise ApiServerError("storage_max_bytes must be a nonnegative integer")
+        if type(self.storage_replay) is not int or self.storage_replay < 0:
+            raise ApiServerError("storage_replay must be a nonnegative integer")
 
 
 def _strict_json_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -182,13 +206,27 @@ class ApiServer:
                 max_body_bytes=config.max_body_bytes,
                 max_memory_bytes=config.max_body_bytes,
             )
+            storage = None
+            if (
+                not config.no_storage
+                and config.storage_path is not None
+                and os.fspath(config.storage_path) != ":memory:"
+            ):
+                storage = SQLiteFlowStorage(
+                    config.storage_path,
+                    max_flows=config.storage_max_flows,
+                    max_bytes=config.storage_max_bytes,
+                )
+                storage.replay_into(store, config.storage_replay)
             application = ApiApplication(
                 store,
                 source_id=config.source_id,
                 max_body_prefix_bytes=config.max_body_prefix_bytes,
                 max_in_memory_bytes=config.max_body_bytes,
+                storage=storage,
             )
         self.application = application
+        self._storage = application.storage
         self._http_server: asyncio.Server | None = None
         self._ingest_server: asyncio.Server | None = None
         self._sweep_task: asyncio.Task[None] | None = None
@@ -293,6 +331,9 @@ class ApiServer:
                     continue
         self._ingest_server = None
         self._http_server = None
+        if self._storage is not None:
+            self._storage.close()
+            self._storage = None
 
     def _abort_connections(self) -> None:
         for writer in list(self._connections):
@@ -635,6 +676,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--capture-max-body-prefix-bytes", type=int, default=None)
     parser.add_argument("--capture-max-in-memory-bytes", type=int, default=None)
     parser.add_argument("--capture-max-pending-messages", type=int, default=4096)
+    parser.add_argument("--storage-path", default=str(default_storage_path()))
+    parser.add_argument("--no-storage", action="store_true")
+    parser.add_argument("--storage-max-flows", type=int, default=DEFAULT_STORAGE_MAX_FLOWS)
+    parser.add_argument("--storage-max-bytes", type=int, default=DEFAULT_STORAGE_MAX_BYTES)
+    parser.add_argument("--storage-replay", type=int, default=DEFAULT_STORAGE_REPLAY)
     return parser
 
 
@@ -661,6 +707,11 @@ def config_from_argv(argv: Sequence[str] | None = None) -> ApiServerConfig:
         max_body_prefix_bytes=max_body_prefix,
         max_pending_messages=args.capture_max_pending_messages,
         capture_socket=args.capture_socket,
+        storage_path=args.storage_path,
+        no_storage=args.no_storage,
+        storage_max_flows=args.storage_max_flows,
+        storage_max_bytes=args.storage_max_bytes,
+        storage_replay=args.storage_replay,
     )
 
 

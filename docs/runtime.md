@@ -18,6 +18,9 @@ from the checkout working directory:
 - retention: 2,000 completed flows or 30 minutes
 - body budget: 128 MiB globally, with a 1 MiB captured prefix per side
 - pending-message budget: 4,096 queued capture messages
+- durable flow history: `~/.local/state/mitm-inspector/flows.sqlite` (or
+  `$XDG_STATE_HOME/mitm-inspector/flows.sqlite`), retaining 10,000 flows or
+  512 MiB and replaying the newest 500 flows at startup
 
 All uint64 limits are positive except `max_body_prefix_bytes`, which may be
 zero. This matches B2's environment parser: emitted body memory and pending
@@ -66,6 +69,13 @@ The app argv additionally has these reserved names, consumed by
 --capture-max-in-memory-bytes <bytes>
 --capture-max-pending-messages <count>
 ```
+
+Durable persistence is configured on `mitm-inspector run` with
+`--storage-path <path>`, `--storage-max-flows <count>`,
+`--storage-max-bytes <bytes>`, and `--storage-replay <count>`. Use
+`--no-storage` or `--storage-path :memory:` to disable it. The API child
+receives the same flags; writes are handled by a background SQLite worker and
+oldest flows are evicted when either retention limit is reached.
 
 Stock mitmdump receives the shared values through the environment because
 project-specific flags cannot be added to its parser before the `-s` addon is

@@ -17,6 +17,10 @@ CAPTURE_SOURCE_ID_ARG: Final = "--capture-source-id"
 CAPTURE_MAX_BODY_PREFIX_ARG: Final = "--capture-max-body-prefix-bytes"
 CAPTURE_MAX_MEMORY_ARG: Final = "--capture-max-in-memory-bytes"
 CAPTURE_MAX_PENDING_ARG: Final = "--capture-max-pending-messages"
+STORAGE_PATH_ARG: Final = "--storage-path"
+STORAGE_MAX_FLOWS_ARG: Final = "--storage-max-flows"
+STORAGE_MAX_BYTES_ARG: Final = "--storage-max-bytes"
+STORAGE_REPLAY_ARG: Final = "--storage-replay"
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +118,15 @@ def build_app_argv(
         str(ipc.max_in_memory_bytes),
         CAPTURE_MAX_PENDING_ARG,
         str(ipc.max_pending_messages),
+        STORAGE_PATH_ARG,
+        str(config.storage_path),
+        STORAGE_MAX_FLOWS_ARG,
+        str(config.storage_max_flows),
+        STORAGE_MAX_BYTES_ARG,
+        str(config.storage_max_bytes),
+        STORAGE_REPLAY_ARG,
+        str(config.storage_replay),
+        *(('--no-storage',) if config.no_storage else ()),
     )
 
 
