@@ -5,6 +5,8 @@ import gzip
 import json
 from pathlib import Path
 
+import pytest
+
 from mitm_inspector.api.app import ApiApplication
 from mitm_inspector.api.bodies import (
     MAX_DECODED_BODY_BYTES,
@@ -202,6 +204,28 @@ def test_gzip_trailing_garbage_preserves_raw_descriptor() -> None:
     served, was_decoded = decoded_body_descriptor(original, "gzip")
     assert not was_decoded
     assert served == original
+
+
+def test_invalid_gzip_is_attempted_once_for_descriptor_and_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mitm_inspector.api.bodies as bodies_module
+
+    calls = 0
+    original_decode = bodies_module._decode_content
+
+    def count_decode(data: bytes, encoding: str) -> bodies_module.ContentDecodeResult:
+        nonlocal calls
+        calls += 1
+        return original_decode(data, encoding)
+
+    monkeypatch.setattr(bodies_module, "_decode_content", count_decode)
+    compressed = gzip.compress(b"invalid trailer") + b"garbage"
+    metadata = anthropic_metadata({}, compressed, response_encoding="gzip")
+
+    enriched_flow(metadata)
+
+    assert calls == 1
 
 
 def test_truncated_compressed_prefix_preserves_encoded_size_and_data() -> None:

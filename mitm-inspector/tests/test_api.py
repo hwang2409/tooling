@@ -2007,10 +2007,10 @@ def test_incremental_metadata_projection_matches_full_rescan(
     projection_calls = 0
     original_projection = app_module.collect_grid_flows
 
-    def spy_projection(store: MemoryStore, **kwargs: Any):
+    def spy_projection(store: MemoryStore):
         nonlocal projection_calls
         projection_calls += 1
-        return original_projection(store, **kwargs)
+        return original_projection(store)
 
     monkeypatch.setattr(app_module, "collect_grid_flows", spy_projection)
     application = make_application(max_items=64)
@@ -2040,10 +2040,10 @@ def test_unknown_upsert_prepends_known_upsert_stays_and_resnapshot_matches(
     projection_calls = 0
     original_projection = app_module.collect_grid_flows
 
-    def spy_projection(store: MemoryStore, **kwargs: Any):
+    def spy_projection(store: MemoryStore):
         nonlocal projection_calls
         projection_calls += 1
-        return original_projection(store, **kwargs)
+        return original_projection(store)
 
     monkeypatch.setattr(app_module, "collect_grid_flows", spy_projection)
     application = make_application(max_items=64)
@@ -2077,10 +2077,10 @@ def test_duplicate_metadata_ingest_emits_no_delta(monkeypatch: pytest.MonkeyPatc
     projection_calls = 0
     original_projection = app_module.collect_grid_flows
 
-    def spy_projection(store: MemoryStore, **kwargs: Any):
+    def spy_projection(store: MemoryStore):
         nonlocal projection_calls
         projection_calls += 1
-        return original_projection(store, **kwargs)
+        return original_projection(store)
 
     monkeypatch.setattr(app_module, "collect_grid_flows", spy_projection)
     application = make_application(max_items=64)
@@ -2117,6 +2117,11 @@ def test_repeated_flow_messages_decode_a_large_body_once(
     monkeypatch.setattr(bodies_module, "_decode_content", count_decode)
     application = make_application(max_items=64)
     application.ingest(message)
+
+    def fail_store_rescan() -> None:
+        raise AssertionError("cache-hit ingest must not rescan retained messages")
+
+    monkeypatch.setattr(application.store, "newest_first", fail_store_rescan)
     for sequence in range(1, 12):
         application.ingest(
             lifecycle_message(
@@ -2126,6 +2131,57 @@ def test_repeated_flow_messages_decode_a_large_body_once(
         )
 
     assert decode_calls == 1
+
+
+def test_buffered_lifecycle_burst_does_not_block_event_loop() -> None:
+    async def scenario() -> None:
+        compressed = gzip.compress(os.urandom(1024 * 1024))
+        message = metadata_message(request_body=captured_body(compressed))
+        metadata = message["metadata"]
+        assert isinstance(metadata, dict)
+        metadata["request_headers"] = [
+            {"name": "host", "value": "api.example.test"},
+            {"name": "content-encoding", "value": "gzip"},
+        ]
+        application = make_application(max_items=128)
+        application.ingest(message)
+
+        heartbeat = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        loop.call_soon(heartbeat.set)
+        started = loop.time()
+        for sequence in range(1, 51):
+            application.ingest(
+                lifecycle_message(
+                    "flow-1",
+                    sequence=str(sequence),
+                )
+            )
+        burst_seconds = loop.time() - started
+
+        assert not heartbeat.is_set()
+        await asyncio.wait_for(heartbeat.wait(), timeout=0.1)
+        assert burst_seconds < 0.1
+
+    run_async(scenario)
+
+
+def test_additive_body_field_update_invalidates_projection_cache() -> None:
+    application = make_application(max_items=64)
+    application.ingest(
+        metadata_message(
+            request_body={"state": "missing", "projection_revision": "v1"}
+        )
+    )
+    result = application.ingest(
+        metadata_message(
+            request_body={"state": "missing", "projection_revision": "v2"}
+        )
+    )
+
+    assert result.delta_emitted is True
+    snapshot = json.loads(application.snapshot_text())
+    assert snapshot["flows"][0]["request_body"]["projection_revision"] == "v2"
 
 
 def test_eviction_during_metadata_ingest_falls_back_to_full_projection() -> None:
