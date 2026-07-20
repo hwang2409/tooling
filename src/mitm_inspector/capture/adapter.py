@@ -267,7 +267,10 @@ class CaptureAddon:
         state = self._ensure_request(flow)
         if state.tombstone:
             return
-        response_content = flow.response.raw_content if flow.response else None
+        # Use `.content` so gzip/br/deflate response bodies are decompressed
+        # before capture — otherwise the frontend sees wire bytes and cannot
+        # decode them as JSON/text.
+        response_content = flow.response.get_content(strict=False) if flow.response else None
         if not self._finish_body(state, "response", response_content):
             return
         if "response_end" not in state.lifecycle_states:
@@ -292,7 +295,7 @@ class CaptureAddon:
                 return
             self._metadata(state)
         if state.response_headers_captured and not state.response.ended:
-            response_content = flow.response.raw_content if flow.response else None
+            response_content = flow.response.get_content(strict=False) if flow.response else None
             if not self._finish_body(state, "response", response_content):
                 return
             if "response_end" not in state.lifecycle_states:
