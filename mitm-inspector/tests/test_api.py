@@ -53,6 +53,10 @@ from mitm_inspector.api.server import (
 from mitm_inspector.api.server import (
     main as server_main,
 )
+from mitm_inspector.detail_limits import (
+    MAX_DURABLE_DETAIL_OUTPUT_BYTES,
+    MAX_DURABLE_DETAIL_RETAINED_BODY_BYTES,
+)
 from mitm_inspector.protocol import (
     MAX_U64,
     ProtocolError,
@@ -291,6 +295,20 @@ def test_diff_grid_changes_orders_removes_then_upserts() -> None:
         {"op": "upsert", "flow": {"flow_id": "c"}},
     ]
     assert diff_grid_changes(current, current) == []
+
+
+def test_diff_grid_changes_emits_new_flow_batch_in_canonical_snapshot_order() -> None:
+    published = {"a": {"flow_id": "a"}}
+    current = {
+        "c": {"flow_id": "c"},
+        "b": {"flow_id": "b"},
+        "a": {"flow_id": "a"},
+    }
+
+    changes = diff_grid_changes(published, current)
+    emitted_order = [change["flow"]["flow_id"] for change in changes]
+
+    assert emitted_order == list(current)[:2] == ["c", "b"]
 
 
 # -- application: connect and stream ---------------------------------------
@@ -1600,6 +1618,55 @@ def test_search_endpoint_queries_durable_decoded_bodies_and_validates_input(
             for path in ("/api/v1/search", "/api/v1/search?q="):
                 invalid = await http_request(server.bound_port, get(path, server.bound_port))
                 assert invalid.startswith(b"HTTP/1.1 400 ")
+        finally:
+            await server.close()
+
+    run_async(scenario)
+
+
+def test_durable_detail_bounds_large_evicted_body(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        server = ApiServer(
+            ApiServerConfig(
+                host="127.0.0.1",
+                port=0,
+                max_retained_flows=1,
+                storage_path=tmp_path / "flows.sqlite",
+            )
+        )
+        await server.start()
+        try:
+            large_body = b"x" * 3_000_000
+            server.application.ingest(
+                metadata_message("flow-large", request_body=captured_body(large_body))
+            )
+            server.application.ingest(
+                lifecycle_message("flow-large", state="flow_completed", sequence="1")
+            )
+            server.application.ingest(metadata_message("flow-new"))
+            server.application.ingest(
+                lifecycle_message("flow-new", state="flow_completed", sequence="2")
+            )
+
+            response = await http_request(
+                server.bound_port,
+                get("/api/v1/flows/flow-large", server.bound_port),
+            )
+            assert response.startswith(b"HTTP/1.1 200 ")
+            body = response_body(response)
+            assert len(body) <= MAX_DURABLE_DETAIL_OUTPUT_BYTES
+            detail = json.loads(body)
+            request_end = next(
+                message
+                for message in detail["messages"]
+                if message["type"] == "body.end" and message["body_side"] == "request"
+            )
+            descriptor = request_end["body"]
+            retained = base64.b64decode(descriptor["data"])
+            assert descriptor["state"] == "truncated"
+            assert descriptor["size_bytes"] == str(len(large_body))
+            assert descriptor["captured_bytes"] == str(len(retained))
+            assert len(retained) == MAX_DURABLE_DETAIL_RETAINED_BODY_BYTES
         finally:
             await server.close()
 

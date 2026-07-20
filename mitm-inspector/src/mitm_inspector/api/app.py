@@ -22,6 +22,7 @@ from mitm_inspector.api.projection import (
     diff_grid_changes,
     enriched_flow,
 )
+from mitm_inspector.detail_limits import MAX_DURABLE_DETAIL_OUTPUT_BYTES
 from mitm_inspector.json_boundary import PlainJsonObject
 from mitm_inspector.protocol import (
     MAX_U64,
@@ -69,6 +70,10 @@ class IngestResult:
     parsed: ParsedMessageResult
     relayed: bool
     delta_emitted: bool
+
+
+class FlowDetailTooLarge(RuntimeError):
+    """Raised when bounded durable detail still exceeds its wire ceiling."""
 
 
 @dataclass(slots=True)
@@ -329,6 +334,20 @@ class ApiApplication:
             return None
         return self._flow_detail_text_from_plain_messages(flow_id, messages)
 
+    def durable_flow_detail_bytes(self, flow_id: str) -> bytes | None:
+        """Read, render, and encode one bounded durable detail synchronously."""
+
+        if self._storage is None:
+            return None
+        messages = self._storage.flow_messages(flow_id)
+        detail = self.flow_detail_text_from_messages(flow_id, messages)
+        if detail is None:
+            return None
+        encoded = detail.encode("utf-8")
+        if len(encoded) > MAX_DURABLE_DETAIL_OUTPUT_BYTES:
+            raise FlowDetailTooLarge
+        return encoded
+
     def _flow_detail_text_from_plain_messages(
         self,
         flow_id: str,
@@ -544,6 +563,7 @@ class ApiApplication:
 
 __all__ = [
     "ApiApplication",
+    "FlowDetailTooLarge",
     "IngestResult",
     "Subscriber",
 ]

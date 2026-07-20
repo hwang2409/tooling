@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, urlsplit
 from mitm_inspector.api.app import (
     SUBSCRIBER_QUEUE_FRAMES,
     ApiApplication,
+    FlowDetailTooLarge,
     Subscriber,
 )
 from mitm_inspector.api.httpwire import (
@@ -248,6 +249,7 @@ class ApiServer:
         self._sweep_failures = 0
         self._search_guard = asyncio.Lock()
         self._search_cancel: threading.Event | None = None
+        self._durable_detail_guard = asyncio.Lock()
 
     @property
     def counters(self) -> dict[str, object]:
@@ -529,8 +531,19 @@ class ApiServer:
                 return
             detail = self.application.flow_detail_text(flow_id)
             if detail is None and self._storage is not None:
-                persisted = await asyncio.to_thread(self._storage.flow_messages, flow_id)
-                detail = self.application.flow_detail_text_from_messages(flow_id, persisted)
+                try:
+                    async with self._durable_detail_guard:
+                        durable_detail = await asyncio.to_thread(
+                            self.application.durable_flow_detail_bytes, flow_id
+                        )
+                except FlowDetailTooLarge:
+                    await self._send_simple(writer, 413, b"flow detail exceeds limit")
+                    return
+                if durable_detail is None:
+                    await self._send_simple(writer, 404, b"unknown flow")
+                    return
+                await self._send_response(writer, 200, "application/json", durable_detail)
+                return
             if detail is None:
                 await self._send_simple(writer, 404, b"unknown flow")
                 return
@@ -682,6 +695,7 @@ class ApiServer:
             403: "Forbidden",
             404: "Not Found",
             405: "Method Not Allowed",
+            413: "Payload Too Large",
         }
         reason = reasons.get(status, "Error")
         head = (

@@ -47,7 +47,9 @@ that the session receives:
   expiry without traffic). Canonical flow order is newest-first: a plain
   `upsert` whose `flow_id` is unknown inserts at the front, while an `upsert`
   whose `flow_id` is already known updates that flow in place. Applying those
-  rules makes live and reconnect snapshot order identical.
+  rules makes live and reconnect snapshot order identical. Unknown-flow
+  upserts within one delta are emitted in canonical newest-first order;
+  consumers that prepend them must preserve that batch order.
 - Relayed `flow.lifecycle`, `stream.gap`, `source.hello`, and unknown-type
   messages, byte-independent copies with additive fields retained.
 - Nothing else: `body.chunk`, `body.end`, and raw `flow.metadata` are retained
@@ -80,7 +82,12 @@ unchanged.  The only surface that carries body bytes is
 If the flow has left the in-memory grid but remains in durable retention, the
 endpoint reconstructs it from sqlite using the same sanitized metadata used by
 the search row projection; retained body bytes remain available only through
-this explicit detail endpoint.
+this explicit detail endpoint. Durable reconstruction retains at most 1 MiB of
+body material and 512 messages, marks a bounded prefix `truncated` while
+preserving its observed wire size, and caps encoded JSON at 4 MiB. The complete
+read/render/encode operation runs off the event loop, with durable detail
+requests serialized; an envelope that still exceeds the output ceiling returns
+HTTP 413.
 Gzip/deflate metadata and terminal body descriptors are decoded on this
 surface; compressed chunk messages are omitted when the decoded terminal
 descriptor is available. Stored sqlite bytes are never rewritten.

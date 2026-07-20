@@ -16,6 +16,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
+from mitm_inspector.detail_limits import (
+    MAX_DURABLE_DETAIL_MESSAGES,
+    MAX_DURABLE_DETAIL_RETAINED_BODY_BYTES,
+)
 from mitm_inspector.json_boundary import PlainJsonObject
 from mitm_inspector.protocol import (
     KnownParsedMessage,
@@ -209,60 +213,133 @@ class SQLiteFlowStorage:
             return []
         self.flush()
         with sqlite3.connect(self.path) as connection:
+            lengths = connection.execute(
+                """
+                SELECT COALESCE(length(request_body), 0),
+                       COALESCE(length(response_body), 0)
+                FROM flows WHERE flow_id = ? AND method <> ''
+                """,
+                (flow_id,),
+            ).fetchone()
+            if lengths is None:
+                return []
+            request_bytes, response_bytes = _detail_body_allocations(
+                int(lengths[0]),
+                int(lengths[1]),
+                MAX_DURABLE_DETAIL_RETAINED_BODY_BYTES,
+            )
             row = connection.execute(
                 """
                 SELECT flow_id, source_id, method, scheme, host, port, path,
                        response_status, request_content_type,
                        response_content_type, started_at, ended_at,
-                       request_body, response_body, request_body_state,
+                       substr(request_body, 1, ?), substr(response_body, 1, ?),
+                       request_body_state,
                        response_body_state, request_body_size,
                        response_body_size, request_headers_json,
                        response_headers_json, session_id
                 FROM flows
                 WHERE flow_id = ? AND method <> ''
                 """,
-                (flow_id,),
+                (request_bytes, response_bytes, flow_id),
             ).fetchone()
-            return self._messages_from_rows(connection, [] if row is None else [row])
+            if row is None:
+                return []
+            bounded_row = list(row)
+            for state_index, body_index, stored_length in (
+                (14, 12, int(lengths[0])),
+                (15, 13, int(lengths[1])),
+            ):
+                body = bounded_row[body_index]
+                retained_length = len(body) if isinstance(body, bytes | bytearray) else 0
+                if retained_length < stored_length and bounded_row[state_index] in {
+                    "captured",
+                    "truncated",
+                }:
+                    bounded_row[state_index] = "truncated"
+            retained_body_bytes = request_bytes + response_bytes
+            return self._messages_from_rows(
+                connection,
+                [tuple(bounded_row)],
+                max_messages=MAX_DURABLE_DETAIL_MESSAGES,
+                max_chunk_bytes=(
+                    MAX_DURABLE_DETAIL_RETAINED_BODY_BYTES - retained_body_bytes
+                ),
+                chunks_only_for_missing_bodies=True,
+            )
 
     def _messages_from_rows(
         self,
         connection: sqlite3.Connection,
         rows: list[tuple[object, ...]],
+        *,
+        max_messages: int | None = None,
+        max_chunk_bytes: int | None = None,
+        chunks_only_for_missing_bodies: bool = False,
     ) -> list[ParsedMessageResult]:
         result: list[ParsedMessageResult] = []
+        remaining_chunk_bytes = max_chunk_bytes
         selected_flow_ids = {str(row[0]) for row in rows}
         for row in rows:
+            if max_messages is not None and len(result) >= max_messages:
+                break
             flow_id = str(row[0])
             result.append(parse_message(self._metadata_from_row(row)))
             for side, body, state, size, content_type in (
                 ("request", row[12], row[14], row[16], row[8]),
                 ("response", row[13], row[15], row[17], row[9]),
             ):
-                chunk_rows = connection.execute(
-                    """
-                    SELECT chunk_index, offset_bytes, data
-                    FROM body_chunks
-                    WHERE flow_id = ? AND body_side = ?
-                    ORDER BY LENGTH(offset_bytes), offset_bytes, chunk_index
-                    """,
-                    (flow_id, side),
-                ).fetchall()
-                for chunk_index, offset_bytes, chunk_data in chunk_rows:
-                    result.append(
-                        parse_message(
-                            {
-                                "protocol_version": "1",
-                                "type": "body.chunk",
-                                "flow_id": flow_id,
-                                "body_side": side,
-                                "chunk_index": chunk_index,
-                                "offset_bytes": offset_bytes,
-                                "data_base64": base64.b64encode(chunk_data).decode("ascii"),
-                            }
+                if not chunks_only_for_missing_bodies or state == "missing":
+                    if remaining_chunk_bytes is None:
+                        chunk_rows = connection.execute(
+                            """
+                            SELECT chunk_index, offset_bytes, data
+                            FROM body_chunks
+                            WHERE flow_id = ? AND body_side = ?
+                            ORDER BY LENGTH(offset_bytes), offset_bytes, chunk_index
+                            """,
+                            (flow_id, side),
                         )
-                    )
+                    else:
+                        chunk_rows = connection.execute(
+                            """
+                            SELECT chunk_index, offset_bytes,
+                                   CASE WHEN length(data) <= ? THEN data END
+                            FROM body_chunks
+                            WHERE flow_id = ? AND body_side = ?
+                            ORDER BY LENGTH(offset_bytes), offset_bytes, chunk_index
+                            """,
+                            (remaining_chunk_bytes, flow_id, side),
+                        )
+                    for chunk_index, offset_bytes, chunk_value in chunk_rows:
+                        if max_messages is not None and len(result) >= max_messages:
+                            break
+                        if chunk_value is None:
+                            break
+                        chunk_data = bytes(chunk_value)
+                        if (
+                            remaining_chunk_bytes is not None
+                            and len(chunk_data) > remaining_chunk_bytes
+                        ):
+                            break
+                        result.append(
+                            parse_message(
+                                {
+                                    "protocol_version": "1",
+                                    "type": "body.chunk",
+                                    "flow_id": flow_id,
+                                    "body_side": side,
+                                    "chunk_index": chunk_index,
+                                    "offset_bytes": offset_bytes,
+                                    "data_base64": base64.b64encode(chunk_data).decode("ascii"),
+                                }
+                            )
+                        )
+                        if remaining_chunk_bytes is not None:
+                            remaining_chunk_bytes -= len(chunk_data)
                 if state != "missing":
+                    if max_messages is not None and len(result) >= max_messages:
+                        break
                     result.append(
                         parse_message(
                             {
@@ -287,8 +364,10 @@ class SQLiteFlowStorage:
                 ORDER BY source_id, LENGTH(sequence), sequence, event_id
                 """,
                 tuple(selected_flow_ids),
-            ).fetchall()
+            )
             for lifecycle in lifecycle_rows:
+                if max_messages is not None and len(result) >= max_messages:
+                    break
                 result.append(
                     parse_message(
                         {
@@ -1002,6 +1081,24 @@ class SQLiteFlowStorage:
         if row[9] is not None:
             metadata["response_content_type"] = row[9]
         return {"protocol_version": "1", "type": "flow.metadata", "metadata": metadata}
+
+
+def _detail_body_allocations(
+    request_length: int,
+    response_length: int,
+    limit: int,
+) -> tuple[int, int]:
+    """Split one retained-byte ceiling fairly, then reuse unneeded capacity."""
+
+    half = limit // 2
+    request_bytes = min(request_length, half)
+    response_bytes = min(response_length, limit - half)
+    remaining = limit - request_bytes - response_bytes
+    request_extra = min(request_length - request_bytes, remaining)
+    request_bytes += request_extra
+    remaining -= request_extra
+    response_bytes += min(response_length - response_bytes, remaining)
+    return request_bytes, response_bytes
 
 
 def _body_values(value: object) -> tuple[bytes | None, str, int, str | None]:
