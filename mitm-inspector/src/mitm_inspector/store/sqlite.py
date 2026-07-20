@@ -200,80 +200,110 @@ class SQLiteFlowStorage:
                 """,
                 (limit,),
             ).fetchall()
-            result: list[ParsedMessageResult] = []
-            selected_flow_ids = {str(row[0]) for row in rows}
-            for row in rows:
-                flow_id = str(row[0])
-                result.append(parse_message(self._metadata_from_row(row)))
-                for side, body, state, size, content_type in (
-                    ("request", row[12], row[14], row[16], row[8]),
-                    ("response", row[13], row[15], row[17], row[9]),
-                ):
-                    chunk_rows = connection.execute(
-                        """
-                        SELECT chunk_index, offset_bytes, data
-                        FROM body_chunks
-                        WHERE flow_id = ? AND body_side = ?
-                        ORDER BY LENGTH(offset_bytes), offset_bytes, chunk_index
-                        """,
-                        (flow_id, side),
-                    ).fetchall()
-                    for chunk_index, offset_bytes, chunk_data in chunk_rows:
-                        result.append(
-                            parse_message(
-                                {
-                                    "protocol_version": "1",
-                                    "type": "body.chunk",
-                                    "flow_id": flow_id,
-                                    "body_side": side,
-                                    "chunk_index": chunk_index,
-                                    "offset_bytes": offset_bytes,
-                                    "data_base64": base64.b64encode(chunk_data).decode("ascii"),
-                                }
-                            )
-                        )
-                    if state != "missing":
-                        result.append(
-                            parse_message(
-                                {
-                                    "protocol_version": "1",
-                                    "type": "body.end",
-                                    "flow_id": flow_id,
-                                    "body_side": side,
-                                    "total_bytes": str(size),
-                                    "body": _descriptor_from_row(
-                                        body, state, size, content_type
-                                    ),
-                                }
-                            )
-                        )
-            if selected_flow_ids:
-                placeholders = ",".join("?" for _ in selected_flow_ids)
-                lifecycle_rows = connection.execute(
-                    f"""
-                    SELECT source_id, event_id, occurred_at, sequence, state, flow_id
-                    FROM lifecycle
-                    WHERE flow_id IN ({placeholders})
-                    ORDER BY source_id, LENGTH(sequence), sequence, event_id
+            return self._messages_from_rows(connection, rows)
+
+    def flow_messages(self, flow_id: str) -> list[ParsedMessageResult]:
+        """Read one durable flow as validated oldest-first detail messages."""
+
+        if type(flow_id) is not str or not flow_id:
+            return []
+        self.flush()
+        with sqlite3.connect(self.path) as connection:
+            row = connection.execute(
+                """
+                SELECT flow_id, source_id, method, scheme, host, port, path,
+                       response_status, request_content_type,
+                       response_content_type, started_at, ended_at,
+                       request_body, response_body, request_body_state,
+                       response_body_state, request_body_size,
+                       response_body_size, request_headers_json,
+                       response_headers_json, session_id
+                FROM flows
+                WHERE flow_id = ? AND method <> ''
+                """,
+                (flow_id,),
+            ).fetchone()
+            return self._messages_from_rows(connection, [] if row is None else [row])
+
+    def _messages_from_rows(
+        self,
+        connection: sqlite3.Connection,
+        rows: list[tuple[object, ...]],
+    ) -> list[ParsedMessageResult]:
+        result: list[ParsedMessageResult] = []
+        selected_flow_ids = {str(row[0]) for row in rows}
+        for row in rows:
+            flow_id = str(row[0])
+            result.append(parse_message(self._metadata_from_row(row)))
+            for side, body, state, size, content_type in (
+                ("request", row[12], row[14], row[16], row[8]),
+                ("response", row[13], row[15], row[17], row[9]),
+            ):
+                chunk_rows = connection.execute(
+                    """
+                    SELECT chunk_index, offset_bytes, data
+                    FROM body_chunks
+                    WHERE flow_id = ? AND body_side = ?
+                    ORDER BY LENGTH(offset_bytes), offset_bytes, chunk_index
                     """,
-                    tuple(selected_flow_ids),
+                    (flow_id, side),
                 ).fetchall()
-                for lifecycle in lifecycle_rows:
+                for chunk_index, offset_bytes, chunk_data in chunk_rows:
                     result.append(
                         parse_message(
                             {
                                 "protocol_version": "1",
-                                "type": "flow.lifecycle",
-                                "source_id": lifecycle[0],
-                                "flow_id": lifecycle[5],
-                                "event_id": lifecycle[1],
-                                "occurred_at": lifecycle[2],
-                                "sequence": lifecycle[3],
-                                "state": lifecycle[4],
+                                "type": "body.chunk",
+                                "flow_id": flow_id,
+                                "body_side": side,
+                                "chunk_index": chunk_index,
+                                "offset_bytes": offset_bytes,
+                                "data_base64": base64.b64encode(chunk_data).decode("ascii"),
                             }
                         )
                     )
-            return result
+                if state != "missing":
+                    result.append(
+                        parse_message(
+                            {
+                                "protocol_version": "1",
+                                "type": "body.end",
+                                "flow_id": flow_id,
+                                "body_side": side,
+                                "total_bytes": str(size),
+                                "body": _descriptor_from_row(
+                                    body, state, size, content_type
+                                ),
+                            }
+                        )
+                    )
+        if selected_flow_ids:
+            placeholders = ",".join("?" for _ in selected_flow_ids)
+            lifecycle_rows = connection.execute(
+                f"""
+                SELECT source_id, event_id, occurred_at, sequence, state, flow_id
+                FROM lifecycle
+                WHERE flow_id IN ({placeholders})
+                ORDER BY source_id, LENGTH(sequence), sequence, event_id
+                """,
+                tuple(selected_flow_ids),
+            ).fetchall()
+            for lifecycle in lifecycle_rows:
+                result.append(
+                    parse_message(
+                        {
+                            "protocol_version": "1",
+                            "type": "flow.lifecycle",
+                            "source_id": lifecycle[0],
+                            "flow_id": lifecycle[5],
+                            "event_id": lifecycle[1],
+                            "occurred_at": lifecycle[2],
+                            "sequence": lifecycle[3],
+                            "state": lifecycle[4],
+                        }
+                    )
+                )
+        return result
 
     def replay_into(self, store: MemoryStore, limit: int = DEFAULT_STORAGE_REPLAY) -> None:
         """Materialize persisted history into a regular bounded memory store."""

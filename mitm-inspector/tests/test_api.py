@@ -1572,6 +1572,23 @@ def test_search_endpoint_queries_durable_decoded_bodies_and_validates_input(
             older_match = next(match for match in all_matches if match["flow_id"] == "flow-a")
             assert older_match["flow"]["flow_id"] == "flow-a"
             assert older_match["flow"]["request_body"]["data"] == ""
+            detail_response = await http_request(
+                server.bound_port, get("/api/v1/flows/flow-a", server.bound_port)
+            )
+            assert detail_response.startswith(b"HTTP/1.1 200 ")
+            detail = json.loads(response_body(detail_response))
+            detail_metadata = next(
+                message["metadata"]
+                for message in detail["messages"]
+                if message["type"] == "flow.metadata"
+            )
+            assert detail_metadata["request_headers"] == older_match["flow"]["request_headers"]
+            request_end = next(
+                message
+                for message in detail["messages"]
+                if message["type"] == "body.end" and message["body_side"] == "request"
+            )
+            assert base64.b64decode(request_end["body"]["data"]) == b'{"text":"Needle one"}'
 
             no_match_response = await http_request(
                 server.bound_port, get("/api/v1/search?q=absent", server.bound_port)
@@ -1948,7 +1965,7 @@ def test_incremental_metadata_projection_matches_full_rescan(
     assert projection_calls == 0
 
 
-def test_metadata_update_preserves_published_order_and_emits_single_upsert_delta(
+def test_unknown_upsert_prepends_known_upsert_stays_and_resnapshot_matches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import mitm_inspector.api.app as app_module
@@ -1964,21 +1981,23 @@ def test_metadata_update_preserves_published_order_and_emits_single_upsert_delta
     monkeypatch.setattr(app_module, "collect_grid_flows", spy_projection)
     application = make_application(max_items=64)
     application.ingest(metadata_message("flow-a"))
-    application.ingest(metadata_message("flow-b"))
-    original_order = ["flow-b", "flow-a"]
-    assert list(application._state.published) == original_order
-    projection_calls = 0
     frames: list[str] = []
     application.subscribe(lambda text: frames.append(text) or True)
+    initial = json.loads(frames[-1])
+    assert [flow["flow_id"] for flow in initial["flows"]] == ["flow-a"]
     frames.clear()
+    projection_calls = 0
+    application.ingest(metadata_message("flow-b"))
     application.ingest(metadata_message("flow-a", path="/v1/updated"))
     deltas = [json.loads(frame) for frame in frames if '"browser.delta"' in frame]
-    assert len(deltas) == 1
-    changes = deltas[0]["changes"]
-    assert len(changes) == 1
-    assert changes[0]["op"] == "upsert"
-    assert changes[0]["flow"]["flow_id"] == "flow-a"
-    assert changes[0]["flow"]["path"] == "/v1/updated"
+    assert len(deltas) == 2
+    assert [delta["changes"][0]["op"] for delta in deltas] == ["upsert", "upsert"]
+    assert [delta["changes"][0]["flow"]["flow_id"] for delta in deltas] == [
+        "flow-b",
+        "flow-a",
+    ]
+    assert deltas[1]["changes"][0]["flow"]["path"] == "/v1/updated"
+    original_order = ["flow-b", "flow-a"]
     assert list(application._state.published) == original_order
     snapshot = json.loads(application.snapshot_text())
     assert [flow["flow_id"] for flow in snapshot["flows"]] == original_order

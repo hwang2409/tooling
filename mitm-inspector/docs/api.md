@@ -44,9 +44,10 @@ that the session receives:
   shared across all sessions.  Changes are `upsert`/`remove` operations
   derived from the store's newest `flow.metadata` per flow; store eviction
   and age expiry surface as `remove` operations (an idle sweep task publishes
-  expiry without traffic). Newly published flows enter at the front of the
-  snapshot order. A later upsert replaces an existing flow in place, so the
-  same plain upsert produces identical live and reconnect ordering.
+  expiry without traffic). Canonical flow order is newest-first: a plain
+  `upsert` whose `flow_id` is unknown inserts at the front, while an `upsert`
+  whose `flow_id` is already known updates that flow in place. Applying those
+  rules makes live and reconnect snapshot order identical.
 - Relayed `flow.lifecycle`, `stream.gap`, `source.hello`, and unknown-type
   messages, byte-independent copies with additive fields retained.
 - Nothing else: `body.chunk`, `body.end`, and raw `flow.metadata` are retained
@@ -76,6 +77,10 @@ flow entries pass through a body redaction projection: `captured` and
 unchanged.  The only surface that carries body bytes is
 `GET /api/v1/flows/<flow_id>`, which returns the full retained messages
 (metadata, chunks, body ends, lifecycle) for one explicitly selected flow.
+If the flow has left the in-memory grid but remains in durable retention, the
+endpoint reconstructs it from sqlite using the same sanitized metadata used by
+the search row projection; retained body bytes remain available only through
+this explicit detail endpoint.
 Gzip/deflate metadata and terminal body descriptors are decoded on this
 surface; compressed chunk messages are omitted when the decoded terminal
 descriptor is available. Stored sqlite bytes are never rewritten.

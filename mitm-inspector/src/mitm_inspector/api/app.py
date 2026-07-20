@@ -9,7 +9,7 @@ proxy, tuple, or mutable alias can cross onto a transport.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -309,6 +309,31 @@ class ApiApplication:
         if not messages:
             return None
         messages.reverse()
+        return self._flow_detail_text_from_plain_messages(flow_id, messages)
+
+    def flow_detail_text_from_messages(
+        self,
+        flow_id: str,
+        parsed_messages: Sequence[ParsedMessageResult],
+    ) -> str | None:
+        """Render validated oldest-first durable messages as flow detail."""
+
+        if type(flow_id) is not str or not flow_id:
+            return None
+        messages = [
+            parsed_message_to_plain_json(parsed)
+            for parsed in parsed_messages
+            if self._message_flow_id(self._payload_of(parsed)) == flow_id
+        ]
+        if not messages:
+            return None
+        return self._flow_detail_text_from_plain_messages(flow_id, messages)
+
+    def _flow_detail_text_from_plain_messages(
+        self,
+        flow_id: str,
+        messages: list[PlainJsonObject],
+    ) -> str:
         messages = self._decoded_detail_messages(messages)
         detail: PlainJsonObject = {
             "protocol_version": "1",

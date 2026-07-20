@@ -64,7 +64,9 @@ machine. Consumers must not assume request completion precedes response start;
   bounded `dropped_count` following the arithmetic rule above.
 - `browser.snapshot`: `snapshot_id`, bounded `cursor`, and complete flow list.
 - `browser.delta`: bounded `cursor` and changes with only `upsert {flow}` or
-  `remove {flow_id}` operations.
+  `remove {flow_id}` operations. Flow order is newest-first: an upsert of an
+  unknown `flow_id` prepends, while an upsert of a known `flow_id` replaces it
+  in place.
 - `browser.resync`: `reason` `cursor_gap|history_evicted|initial_connect` and
   bounded `requested_cursor`.
 

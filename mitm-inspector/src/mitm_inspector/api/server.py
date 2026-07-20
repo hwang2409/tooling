@@ -528,6 +528,9 @@ class ApiServer:
                 await self._send_simple(writer, 404, b"unknown flow")
                 return
             detail = self.application.flow_detail_text(flow_id)
+            if detail is None and self._storage is not None:
+                persisted = await asyncio.to_thread(self._storage.flow_messages, flow_id)
+                detail = self.application.flow_detail_text_from_messages(flow_id, persisted)
             if detail is None:
                 await self._send_simple(writer, 404, b"unknown flow")
                 return
