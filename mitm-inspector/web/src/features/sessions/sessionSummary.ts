@@ -79,6 +79,12 @@ export interface SessionIndexStats {
   readonly incrementalUpdates: number;
   /** summarise() invocations — one per session actually recomputed. */
   readonly sessionsRecomputed: number;
+  /**
+   * Session-order work on the incremental path: one visit per binary-search
+   * comparison or dirty-key reposition. Stays O(dirty x log sessions) per
+   * delta — never a scan of all sessions.
+   */
+  readonly orderVisits: number;
 }
 
 export interface SessionIndex {
@@ -110,18 +116,56 @@ export function createSessionIndex(): SessionIndex {
   const groups = new Map<SessionKey, ImmutableFlowMetadata[]>();
   const maxSeqOf = new Map<SessionKey, number>();
   const summaries = new Map<SessionKey, SessionSummary>();
+  // Result ordering, maintained sorted by maxSeq descending. On the
+  // incremental path only dirty keys are repositioned (binary search), so
+  // per-delta order work is O(dirty x log sessions), not a full scan; the
+  // returned array is a pointer copy with no per-session recomputation.
+  const orderedKeys: SessionKey[] = [];
+  const orderedSummaries: SessionSummary[] = [];
   let seqCounter = 0;
   let fullRebuilds = 0;
   let incrementalUpdates = 0;
   let sessionsRecomputed = 0;
+  let orderVisits = 0;
 
   const summariseSession = (key: SessionKey, sessionFlows: readonly ImmutableFlowMetadata[]): SessionSummary => {
     sessionsRecomputed += 1;
     return summarise(key, [...sessionFlows]);
   };
 
+  /** First position whose maxSeq is <= max in the descending-ordered list. */
+  const locate = (max: number): number => {
+    let low = 0;
+    let high = orderedKeys.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      orderVisits += 1;
+      if ((maxSeqOf.get(orderedKeys[mid]) ?? -1) > max) low = mid + 1;
+      else high = mid;
+    }
+    return low;
+  };
+
+  const removeOrdered = (key: SessionKey, max: number): void => {
+    orderVisits += 1;
+    let index = locate(max);
+    if (orderedKeys[index] !== key) index = orderedKeys.indexOf(key);
+    if (index === -1) return;
+    orderedKeys.splice(index, 1);
+    orderedSummaries.splice(index, 1);
+  };
+
+  const insertOrdered = (key: SessionKey, summary: SessionSummary, max: number): void => {
+    orderVisits += 1;
+    const index = locate(max);
+    orderedKeys.splice(index, 0, key);
+    orderedSummaries.splice(index, 0, summary);
+  };
+
   const finalize = (dirty: ReadonlySet<SessionKey>): void => {
     for (const key of dirty) {
+      const previousMax = maxSeqOf.get(key);
+      if (previousMax !== undefined) removeOrdered(key, previousMax);
       const group = groups.get(key);
       if (group === undefined || group.length === 0) {
         groups.delete(key);
@@ -130,12 +174,13 @@ export function createSessionIndex(): SessionIndex {
         continue;
       }
       group.sort((left, right) => (seqOf.get(right.flow_id) ?? 0) - (seqOf.get(left.flow_id) ?? 0));
-      maxSeqOf.set(key, seqOf.get(group[0].flow_id) ?? 0);
-      summaries.set(key, summariseSession(key, group));
+      const newMax = seqOf.get(group[0].flow_id) ?? 0;
+      maxSeqOf.set(key, newMax);
+      const summary = summariseSession(key, group);
+      summaries.set(key, summary);
+      insertOrdered(key, summary, newMax);
     }
-    result = [...groups.keys()]
-      .sort((left, right) => (maxSeqOf.get(right) ?? 0) - (maxSeqOf.get(left) ?? 0))
-      .map((key) => summaries.get(key)!);
+    result = [...orderedSummaries];
   };
 
   const fullRebuild = (entries: readonly ImmutableFlowMetadata[]): void => {
@@ -146,32 +191,45 @@ export function createSessionIndex(): SessionIndex {
     groups.clear();
     maxSeqOf.clear();
     summaries.clear();
+    orderedKeys.length = 0;
+    orderedSummaries.length = 0;
     const base = seqCounter + entries.length;
     seqCounter = base;
-    const dirty = new Set<SessionKey>();
     entries.forEach((flow, index) => {
       const key = deriveFlowFacts(flow).sessionKey;
       flowById.set(flow.flow_id, flow);
       sessionOf.set(flow.flow_id, key);
       seqOf.set(flow.flow_id, base - index);
       const group = groups.get(key);
-      if (group === undefined) groups.set(key, [flow]);
-      else group.push(flow);
-      dirty.add(key);
+      if (group === undefined) {
+        groups.set(key, [flow]);
+        // First appearance in newest-first entries defines the session order.
+        orderedKeys.push(key);
+      } else {
+        group.push(flow);
+      }
     });
-    finalize(dirty);
+    for (const key of orderedKeys) {
+      const group = groups.get(key)!;
+      maxSeqOf.set(key, seqOf.get(group[0].flow_id) ?? 0);
+      const summary = summariseSession(key, group);
+      summaries.set(key, summary);
+      orderedSummaries.push(summary);
+    }
+    result = [...orderedSummaries];
   };
 
-  const applyDelta = (flows: ImmutableFlowCollection, changedFlowIds: readonly string[]): void => {
+  const applyDelta = (flows: ImmutableFlowCollection, changedFlowIds: readonly string[], prependedCount: number): void => {
     incrementalUpdates += 1;
     const dirty = new Set<SessionKey>();
-    // Sequence a batch of brand-new flows in prepend order: the first change
-    // in the batch lands closest to the top of the grid, so it takes the
-    // highest sequence.
-    const newIds = changedFlowIds.filter((flowId) => !flowById.has(flowId) && flows.get(flowId) !== undefined);
-    const base = seqCounter + newIds.length;
+    // The leading changedFlowIds were block-prepended (brand-new or
+    // reinserted) in final grid order: first id sits closest to the top of
+    // the grid, so it takes the highest sequence — including a reinserted id
+    // whose stale sequence must be replaced.
+    const prepended = changedFlowIds.slice(0, prependedCount);
+    const base = seqCounter + prepended.length;
     seqCounter = base;
-    newIds.forEach((flowId, index) => seqOf.set(flowId, base - index));
+    prepended.forEach((flowId, index) => seqOf.set(flowId, base - index));
 
     for (const flowId of changedFlowIds) {
       const metadata = flows.get(flowId);
@@ -184,6 +242,10 @@ export function createSessionIndex(): SessionIndex {
         seqOf.delete(flowId);
         dirty.add(key);
         continue;
+      }
+      if (!seqOf.has(flowId)) {
+        seqCounter += 1;
+        seqOf.set(flowId, seqCounter);
       }
       const key = deriveFlowFacts(metadata).sessionKey;
       const previousKey = sessionOf.get(flowId);
@@ -216,7 +278,7 @@ export function createSessionIndex(): SessionIndex {
       if (flowsUpdate !== undefined) {
         if (lastRevision === flowsUpdate.revision && lastEntries === flows.entries) return result;
         if (lastRevision !== null && flowsUpdate.revision === lastRevision + 1 && flowsUpdate.kind === "delta") {
-          applyDelta(flows, flowsUpdate.changedFlowIds);
+          applyDelta(flows, flowsUpdate.changedFlowIds, flowsUpdate.prependedCount);
         } else {
           fullRebuild(flows.entries);
         }
@@ -229,7 +291,7 @@ export function createSessionIndex(): SessionIndex {
       lastEntries = flows.entries;
       return result;
     },
-    stats: () => ({ fullRebuilds, incrementalUpdates, sessionsRecomputed }),
+    stats: () => ({ fullRebuilds, incrementalUpdates, sessionsRecomputed, orderVisits }),
   };
 }
 

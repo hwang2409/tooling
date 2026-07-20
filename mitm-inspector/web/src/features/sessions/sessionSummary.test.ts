@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import type { FlowsUpdate, ImmutableFlowMetadata } from "../../state/browserState";
+import { parseProtocolMessage } from "../../protocol";
+import { browserReducer, initialBrowserState } from "../../state/browserState";
+import type { BrowserState, FlowsUpdate, ImmutableFlowMetadata } from "../../state/browserState";
 import { parseAnthropicRequest } from "../inspector/anthropic";
 import { collectionOf, conversationCandidates, createSessionIndex, deriveSessions, isSuggestionRequest, looksLikeSuggestionFlow } from "./sessionSummary";
 
@@ -117,28 +119,38 @@ describe("deriveSessions", () => {
 });
 
 describe("createSessionIndex", () => {
-  const delta = (revision: number, changedFlowIds: readonly string[]): FlowsUpdate =>
-    ({ revision, kind: "delta", changedFlowIds });
-  const snapshot = (revision: number): FlowsUpdate => ({ revision, kind: "snapshot", changedFlowIds: [] });
+  const delta = (revision: number, changedFlowIds: readonly string[], prependedCount = 0): FlowsUpdate =>
+    ({ revision, kind: "delta", changedFlowIds, prependedCount });
+  const snapshot = (revision: number): FlowsUpdate =>
+    ({ revision, kind: "snapshot", changedFlowIds: [], prependedCount: 0 });
 
-  it("touches only the sessions owning the changed flow ids", () => {
-    const a1 = flow("a1", { session: "aaaa" });
-    const b1 = flow("b1", { session: "bbbb" });
+  it("touches only the sessions owning the changed flow ids, order work included", () => {
+    const sessionCount = 20;
+    const base = Array.from({ length: sessionCount }, (_, position) =>
+      flow(`f${position}`, { session: `sess-${position}` }));
     const index = createSessionIndex();
-    const first = index.update(collectionOf([a1, b1]), snapshot(1));
-    expect(index.stats().fullRebuilds).toBe(1);
-    const recomputedAfterRebuild = index.stats().sessionsRecomputed;
+    const first = index.update(collectionOf(base), snapshot(1));
+    const afterRebuild = index.stats();
+    expect(afterRebuild.fullRebuilds).toBe(1);
+    // The full rebuild orders by first appearance — no incremental order work.
+    expect(afterRebuild.orderVisits).toBe(0);
 
-    const second = index.update(collectionOf([flow("b2", { session: "bbbb" }), a1, b1]), delta(2, ["b2"]));
-    expect(index.stats().incrementalUpdates).toBe(1);
-    expect(index.stats().fullRebuilds).toBe(1);
-    // Work bound: exactly ONE session resummarized for the delta; the
-    // untouched session is not regrouped and keeps its summary identity.
-    expect(index.stats().sessionsRecomputed).toBe(recomputedAfterRebuild + 1);
-    expect(second.find((session) => session.key === "aaaa"))
-      .toBe(first.find((session) => session.key === "aaaa"));
-    expect(second.map((session) => session.key)).toEqual(["bbbb", "aaaa"]);
-    expect(second.find((session) => session.key === "bbbb")?.flowCount).toBe(2);
+    const extra = flow("extra", { session: "sess-7" });
+    const second = index.update(collectionOf([extra, ...base]), delta(2, ["extra"], 1));
+    const afterDelta = index.stats();
+    expect(afterDelta.incrementalUpdates).toBe(1);
+    expect(afterDelta.fullRebuilds).toBe(1);
+    // Exactly ONE session resummarized; untouched sessions keep identity.
+    expect(afterDelta.sessionsRecomputed - afterRebuild.sessionsRecomputed).toBe(1);
+    expect(second.find((session) => session.key === "sess-3"))
+      .toBe(first.find((session) => session.key === "sess-3"));
+    // Order maintenance is two binary searches repositioning ONE key —
+    // bounded by O(log sessions), never a scan of all 20 sessions.
+    expect(afterDelta.orderVisits - afterRebuild.orderVisits)
+      .toBeLessThanOrEqual(2 * (Math.ceil(Math.log2(sessionCount)) + 2));
+    expect(second[0].key).toBe("sess-7");
+    expect(second[0].flowCount).toBe(2);
+    expect(second).toHaveLength(sessionCount);
   });
 
   it("caches repeated revisions and full-rebuilds on a revision gap", () => {
@@ -151,7 +163,7 @@ describe("createSessionIndex", () => {
     // Skipped revision (coalesced renders, paused view resuming): the delta's
     // changed ids no longer describe the full difference — full rebuild.
     const b1 = flow("b1", { session: "bbbb" });
-    const rebuilt = index.update(collectionOf([b1, a1]), delta(3, ["b1"]));
+    const rebuilt = index.update(collectionOf([b1, a1]), delta(3, ["b1"], 1));
     expect(index.stats().fullRebuilds).toBe(2);
     expect(index.stats().incrementalUpdates).toBe(0);
     expect(rebuilt.map((session) => session.key)).toEqual(["bbbb", "aaaa"]);
@@ -169,52 +181,73 @@ describe("createSessionIndex", () => {
     expect(afterSession.map((session) => session.key)).toEqual(["aaaa"]);
   });
 
-  it("matches from-scratch derivation across randomized delta sequences", () => {
-    let seed = 42;
+  it("matches from-scratch derivation across randomized reducer-driven deltas", () => {
+    // Drive real protocol messages through the reducer so the published
+    // FlowsUpdate (dedupe, final grid order, prepended count) is the exact
+    // production contract — including repeated upserts of one id in a
+    // single delta and remove-then-reinsert of an existing id.
+    let seed = 1337;
     const rand = () => {
       seed = (seed * 1103515245 + 12345) % 2147483648;
       return seed / 2147483648;
     };
     const pick = <Item,>(items: readonly Item[]): Item => items[Math.floor(rand() * items.length)];
     const sessionPool: Array<string | null> = ["s1", "s2", "s3", null];
-    let entries: ImmutableFlowMetadata[] = [];
-    let revision = 1;
-    let nextId = 0;
-    const index = createSessionIndex();
-    index.update(collectionOf(entries), { revision, kind: "snapshot", changedFlowIds: [] });
+    const makeFlow = (flowId: string): ImmutableFlowMetadata => flow(flowId, {
+      session: pick(sessionPool),
+      status: rand() < 0.2 ? "500" : "200",
+      model: rand() < 0.5 ? "claude-opus-4" : "claude-haiku-4",
+    });
 
-    for (let step = 0; step < 120; step += 1) {
-      const changed: string[] = [];
+    let state: BrowserState = [
+      {
+        protocol_version: "1", type: "source.hello", source_id: "source-a",
+        occurred_at: "2026-01-01T00:00:00Z",
+        capabilities: { body_chunks: true, redaction: "headers-and-query" },
+        limits: { max_body_prefix_bytes: "1048576", max_in_memory_bytes: "134217728" },
+      },
+      { protocol_version: "1", type: "browser.snapshot", snapshot_id: "snap-1", cursor: "1", flows: [] },
+    ].reduce((current, message) => browserReducer(current, { type: "protocol", envelope: parseProtocolMessage(message) }), initialBrowserState);
+
+    const index = createSessionIndex();
+    index.update(state.flows, state.flowsUpdate);
+    let cursor = 1;
+    let nextId = 0;
+
+    for (let step = 0; step < 150; step += 1) {
+      const changes: Array<Record<string, unknown>> = [];
       const operation = rand();
-      if (operation < 0.5 || entries.length === 0) {
-        // Batch of brand-new flows, block-prepended in batch order.
-        const fresh: ImmutableFlowMetadata[] = [];
+      const existing = state.flows.entries;
+      if (operation < 0.35 || existing.length === 0) {
         const count = 1 + Math.floor(rand() * 3);
         for (let item = 0; item < count; item += 1) {
-          const created = flow(`f${nextId}`, {
-            session: pick(sessionPool),
-            status: rand() < 0.2 ? "500" : "200",
-            model: rand() < 0.5 ? "claude-opus-4" : "claude-haiku-4",
-          });
+          changes.push({ op: "upsert", flow: makeFlow(`f${nextId}`) });
           nextId += 1;
-          fresh.push(created);
-          changed.push(created.flow_id);
         }
-        entries = [...fresh, ...entries];
-      } else if (operation < 0.8) {
-        // In-place upsert of an existing flow.
-        const target = pick(entries);
-        const updated = { ...target, response_status: "201" } as ImmutableFlowMetadata;
-        entries = entries.map((candidate) => (candidate === target ? updated : candidate));
-        changed.push(target.flow_id);
+      } else if (operation < 0.5) {
+        // Repeated upsert of the SAME new id within one delta.
+        const flowId = `f${nextId}`;
+        nextId += 1;
+        changes.push({ op: "upsert", flow: makeFlow(flowId) });
+        changes.push({ op: "upsert", flow: makeFlow(flowId) });
+      } else if (operation < 0.7) {
+        const target = pick(existing);
+        changes.push({ op: "upsert", flow: { ...target, response_status: "201" } });
+      } else if (operation < 0.85) {
+        changes.push({ op: "remove", flow_id: pick(existing).flow_id });
       } else {
-        const target = pick(entries);
-        entries = entries.filter((candidate) => candidate !== target);
-        changed.push(target.flow_id);
+        // Remove then reinsert the same existing id in one delta: the flow
+        // jumps to the top of the grid.
+        const target = pick(existing);
+        changes.push({ op: "remove", flow_id: target.flow_id });
+        changes.push({ op: "upsert", flow: makeFlow(target.flow_id) });
       }
-      revision += 1;
-      const incremental = index.update(collectionOf(entries), { revision, kind: "delta", changedFlowIds: changed });
-      const scratch = deriveSessions(entries);
+      cursor += 1;
+      const message = { protocol_version: "1", type: "browser.delta", cursor: String(cursor), changes };
+      state = browserReducer(state, { type: "protocol", envelope: parseProtocolMessage(message) });
+
+      const incremental = index.update(state.flows, state.flowsUpdate);
+      const scratch = deriveSessions(state.flows.entries);
       expect(incremental.map((session) => session.key)).toEqual(scratch.map((session) => session.key));
       incremental.forEach((session, position) => {
         const expected = scratch[position];
@@ -225,7 +258,7 @@ describe("createSessionIndex", () => {
         expect(session.firstQuery).toBe(expected.firstQuery);
       });
     }
-    expect(index.stats().incrementalUpdates).toBe(120);
+    expect(index.stats().incrementalUpdates).toBe(150);
     expect(index.stats().fullRebuilds).toBe(1);
   });
 });

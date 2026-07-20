@@ -45,23 +45,42 @@ describe("message normalization and prefix matching", () => {
 
   it("tolerates appended <system-reminder> text blocks only", () => {
     const earlier = normalizeMessage(toolResult("t1", "ok"));
-    const reminder = normalizeMessage({
+    const appended = (text: string) => normalizeMessage({
       role: "user",
       content: [
         { type: "tool_result", tool_use_id: "t1", content: "ok" },
-        { type: "text", text: "<system-reminder>injected</system-reminder>" },
+        { type: "text", text },
       ],
     } as JsonValue);
-    expect(messageMatches(earlier, reminder)).toBe(true);
+    expect(messageMatches(earlier, appended("<system-reminder>injected</system-reminder>"))).toBe(true);
+    expect(messageMatches(earlier, appended(
+      "<system-reminder>one</system-reminder>\n<system-reminder>two</system-reminder>",
+    ))).toBe(true);
     // Ordinary appended user text is a REAL edit, not an injection.
-    const editedText = normalizeMessage({
+    expect(messageMatches(earlier, appended("please also check the logs"))).toBe(false);
+  });
+
+  it("rejects incomplete or padded reminder markup as injection", () => {
+    const earlier = normalizeMessage(toolResult("t1", "ok"));
+    const appended = (text: string) => normalizeMessage({
       role: "user",
       content: [
         { type: "tool_result", tool_use_id: "t1", content: "ok" },
-        { type: "text", text: "please also check the logs" },
+        { type: "text", text },
       ],
     } as JsonValue);
-    expect(messageMatches(earlier, editedText)).toBe(false);
+    // Unclosed reminder.
+    expect(messageMatches(earlier, appended("<system-reminder>never closed"))).toBe(false);
+    // Malformed markup.
+    expect(messageMatches(earlier, appended("<system-reminder foo>x</system-reminder>"))).toBe(false);
+    // Trailing text after the close tag.
+    expect(messageMatches(earlier, appended(
+      "<system-reminder>real</system-reminder> and my actual question",
+    ))).toBe(false);
+    // Leading text before the open tag.
+    expect(messageMatches(earlier, appended(
+      "my question <system-reminder>real</system-reminder>",
+    ))).toBe(false);
   });
 
   it("rejects diverging turns: appended non-text blocks or different content", () => {
@@ -79,6 +98,19 @@ describe("selectCanonicalFlow", () => {
   const u1 = user("fix the bug");
   const a1 = assistant("looking at it");
   const chainEnd = toolResult("t1", "tests pass");
+
+  it("prefix dominance regression: an established chain beats a NEWER shared-root branch", () => {
+    // Round-1 property, restored: within one shared-root component the chain
+    // with more confirming members wins even though the auxiliary branch has
+    // the most recent tip. The retired newest-tip-only policy selected `aux`.
+    const root = candidate("root", [u1], 5);
+    const main1 = candidate("main-1", [u1, a1], 3);
+    const main2 = candidate("main-2", [u1, a1, chainEnd], 2);
+    const aux = candidate("aux", [u1, assistant("side quest")], 0);
+    const selection = selectCanonicalFlow([aux, main2, main1, root]);
+    expect(selection.canonicalId).toBe("main-2");
+    expect(selection.chainIds).toEqual(["root", "main-1", "main-2"]);
+  });
 
   it("shared-root regression: an older equal-length branch must not steal the root from the newer thread", () => {
     // The retired greedy partition consumed the shared root into whichever

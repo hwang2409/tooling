@@ -84,11 +84,33 @@ function deepEqual(left: JsonValue, right: JsonValue): boolean {
   return leftKeys.every((key) => key in rightObject && deepEqual((left as JsonObject)[key], rightObject[key]));
 }
 
-/** Exact shape of a harness-injected reminder: a text block starting with the marker. */
+const REMINDER_OPEN = "<system-reminder>";
+const REMINDER_CLOSE = "</system-reminder>";
+
+/**
+ * Complete anchored reminder markup: one or more full
+ * `<system-reminder>…</system-reminder>` elements with nothing but
+ * whitespace around them. Unclosed tags, malformed markup, or any trailing
+ * text disqualify the block — otherwise arbitrary user text could fabricate
+ * a prefix match.
+ */
+function isReminderMarkup(text: string): boolean {
+  let rest = text.trim();
+  if (rest.length === 0) return false;
+  while (rest.length > 0) {
+    if (!rest.startsWith(REMINDER_OPEN)) return false;
+    const close = rest.indexOf(REMINDER_CLOSE, REMINDER_OPEN.length);
+    if (close === -1) return false;
+    rest = rest.slice(close + REMINDER_CLOSE.length).trimStart();
+  }
+  return true;
+}
+
+/** Exact shape of a harness-injected reminder: a text block of pure reminder markup. */
 function isReminderInjection(value: JsonValue): boolean {
   const object = asObject(value);
   return object !== null && object.type === "text"
-    && typeof object.text === "string" && object.text.startsWith("<system-reminder>");
+    && typeof object.text === "string" && isReminderMarkup(object.text);
 }
 
 /**
@@ -136,6 +158,25 @@ function supersedes(entry: Entry, other: Entry): boolean {
   return other.candidate.order < entry.candidate.order;
 }
 
+interface Chain {
+  readonly tip: Entry;
+  readonly members: readonly Entry[];
+}
+
+/**
+ * TWO-LEVEL SELECTION POLICY — do not re-simplify to either half alone
+ * (each half was shipped solo once and each was a review-verified bug):
+ *
+ *  (a) WITHIN a shared-root component, chain evidence dominates: the chain
+ *      with more confirming members wins regardless of tip recency, so an
+ *      established `root -> main-1 -> main-2` thread beats a newer
+ *      `root -> auxiliary` branch. Equal evidence (equal member counts)
+ *      falls back to the newer tip, so a live branch beats a stale sibling.
+ *
+ *  (b) ACROSS disjoint components — no shared root, i.e. a post-compaction
+ *      restart — the newest tip wins: a shorter restarted history beats the
+ *      stale pre-compaction chain that mere member counting would keep.
+ */
 export function selectCanonicalFlow(candidates: readonly CanonicalCandidate[]): CanonicalSelection {
   const entries: Entry[] = candidates
     .filter((candidate) => !candidate.suggestion)
@@ -145,21 +186,49 @@ export function selectCanonicalFlow(candidates: readonly CanonicalCandidate[]): 
   // Maximal tips: requests that no other request extends. Non-consuming — a
   // shared root is simply not a tip; it belongs to every branch's chain.
   const tips = entries.filter((entry) => !entries.some((other) => other !== entry && supersedes(entry, other)));
+  const chains: Chain[] = tips.map((tip) => ({
+    tip,
+    members: entries.filter((entry) => messagesArePrefix(entry.normalized, tip.normalized)),
+  }));
 
-  // Policy: the live conversation is the maximal chain whose tip was created
-  // most recently. Covers both a newer branch over a stale sibling and a
-  // post-compaction restart over the longer pre-compaction chain.
-  let selected = tips[0];
-  for (const tip of tips.slice(1)) {
-    if (tip.candidate.order < selected.candidate.order) selected = tip;
+  // Group chains that share any member into components (transitively).
+  const components: Chain[][] = [];
+  for (const chain of chains) {
+    const memberSet = new Set(chain.members);
+    const overlapping = components.filter((component) =>
+      component.some((other) => other.members.some((member) => memberSet.has(member))));
+    if (overlapping.length === 0) {
+      components.push([chain]);
+      continue;
+    }
+    const merged = overlapping[0];
+    merged.push(chain);
+    for (const extra of overlapping.slice(1)) {
+      merged.push(...extra);
+      components.splice(components.indexOf(extra), 1);
+    }
   }
 
-  const members = entries
-    .filter((entry) => messagesArePrefix(entry.normalized, selected.normalized))
-    .sort((left, right) =>
-      left.normalized.length - right.normalized.length || right.candidate.order - left.candidate.order);
+  // (a) prefix dominance within a component, newer tip on ties.
+  const representative = (component: readonly Chain[]): Chain =>
+    component.reduce((best, chain) => {
+      if (chain.members.length !== best.members.length) {
+        return chain.members.length > best.members.length ? chain : best;
+      }
+      return chain.tip.candidate.order < best.tip.candidate.order ? chain : best;
+    });
+
+  // (b) newest tip across disjoint components.
+  let selected = representative(components[0]);
+  for (const component of components.slice(1)) {
+    const contender = representative(component);
+    if (contender.tip.candidate.order < selected.tip.candidate.order) selected = contender;
+  }
+
+  const members = [...selected.members].sort((left, right) =>
+    left.normalized.length - right.normalized.length || right.candidate.order - left.candidate.order);
   return {
-    canonicalId: selected.candidate.flowId,
+    canonicalId: selected.tip.candidate.flowId,
     chainIds: members.map((member) => member.candidate.flowId),
   };
 }

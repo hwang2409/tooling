@@ -46,7 +46,14 @@ export type ImmutableFlowLifecycle = DeepReadonly<FlowLifecycle>;
 export interface FlowsUpdate {
   readonly revision: number;
   readonly kind: "reset" | "snapshot" | "delta";
+  /**
+   * Deduplicated ids in FINAL grid order: the block-prepended (brand-new or
+   * removed-and-reinserted) flows first, in their entries order, then the
+   * in-place upserts in entries order, then pure removals.
+   */
   readonly changedFlowIds: readonly string[];
+  /** How many leading changedFlowIds were block-prepended by this delta. */
+  readonly prependedCount: number;
 }
 
 export interface ImmutableFlowCollection {
@@ -98,7 +105,7 @@ export const emptyLifecycleCollection = createLifecycleCollection([]);
 
 const initialBrowserStateValue: BrowserState = {
   flows: emptyFlowCollection,
-  flowsUpdate: { revision: 0, kind: "reset", changedFlowIds: [] },
+  flowsUpdate: { revision: 0, kind: "reset", changedFlowIds: [], prependedCount: 0 },
   lifecycles: emptyLifecycleCollection,
   cursor: "0",
   streamSequence: null,
@@ -273,7 +280,7 @@ function resetForSource(state: BrowserState, message: SourceHello): BrowserState
   return {
     ...state,
     flows: emptyFlowCollection,
-    flowsUpdate: { revision: state.flowsUpdate.revision + 1, kind: "reset", changedFlowIds: [] },
+    flowsUpdate: { revision: state.flowsUpdate.revision + 1, kind: "reset", changedFlowIds: [], prependedCount: 0 },
     lifecycles: emptyLifecycleCollection,
     cursor: "0",
     streamSequence: null,
@@ -300,7 +307,7 @@ function resetForSource(state: BrowserState, message: SourceHello): BrowserState
 function resetForTransport(state: BrowserState): BrowserState {
   return {
     ...initialBrowserState,
-    flowsUpdate: { revision: state.flowsUpdate.revision + 1, kind: "reset", changedFlowIds: [] },
+    flowsUpdate: { revision: state.flowsUpdate.revision + 1, kind: "reset", changedFlowIds: [], prependedCount: 0 },
     sourceEpoch: state.sourceEpoch + 1,
     initialConnectPending: false,
   };
@@ -311,7 +318,7 @@ function applySnapshot(state: BrowserState, message: BrowserSnapshot): BrowserSt
   return {
     ...state,
     flows: createFlowCollection(message.flows),
-    flowsUpdate: { revision: state.flowsUpdate.revision + 1, kind: "snapshot", changedFlowIds: [] },
+    flowsUpdate: { revision: state.flowsUpdate.revision + 1, kind: "snapshot", changedFlowIds: [], prependedCount: 0 },
     cursor: message.cursor,
     snapshotId: message.snapshot_id,
     gap: null,
@@ -368,13 +375,27 @@ function applyDelta(state: BrowserState, message: BrowserDelta): BrowserState {
       if (newIndex !== -1) newEntries.splice(newIndex, 1);
     }
   }
+  const finalEntries = [...newEntries, ...entries];
+  // Publish changed ids deduplicated and in FINAL grid order (prepended
+  // block first), so a delta like [upsert A, upsert B, upsert A] or a
+  // remove-and-reinsert reports the order the grid actually shows.
+  const changedSet = new Set(message.changes.map((change) => (change.op === "upsert" ? change.flow.flow_id : change.flow_id)));
+  const changedFlowIds: string[] = [];
+  for (const entry of finalEntries) {
+    if (changedSet.has(entry.flow_id)) {
+      changedFlowIds.push(entry.flow_id);
+      changedSet.delete(entry.flow_id);
+    }
+  }
+  changedFlowIds.push(...changedSet);
   return {
     ...state,
-    flows: createFlowCollection([...newEntries, ...entries]),
+    flows: createFlowCollection(finalEntries),
     flowsUpdate: {
       revision: state.flowsUpdate.revision + 1,
       kind: "delta",
-      changedFlowIds: message.changes.map((change) => (change.op === "upsert" ? change.flow.flow_id : change.flow_id)),
+      changedFlowIds,
+      prependedCount: newEntries.length,
     },
     lifecycles: pruneLifecycle(state.lifecycles, removedFlowIds),
     cursor: message.cursor,
