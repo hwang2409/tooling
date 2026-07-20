@@ -155,6 +155,22 @@ describe("PacketList", () => {
     expect(container.querySelector(".json-tree")).toBeNull();
   });
 
+  it("shows the placeholder, not an empty pane, for the projection-stripped zero-byte truncated body", async () => {
+    // The browser-stream projection strips every body to this shape, so it is
+    // the default observed descriptor whenever detail has not (yet) loaded.
+    const browser = stateOf([
+      flow("flow-a", {
+        request_body: { state: "truncated", size_bytes: "100", captured_bytes: "0", encoding: "base64", data: "" },
+      }),
+    ]);
+    const { container } = await mountList(browser);
+    await click(rowByPath(container, "/v1/flow-a"));
+    const placeholder = container.querySelector(".packet-detail .packet-nobody");
+    expect(placeholder?.textContent).toBe("no request body");
+    expect(container.querySelector(".packet-detail pre")).toBeNull();
+    expect(container.querySelector(".json-tree")).toBeNull();
+  });
+
   it("falls back to plain text when the request body is not JSON", async () => {
     const browser = stateOf([
       flow("flow-a", {

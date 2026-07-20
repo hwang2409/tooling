@@ -72,14 +72,17 @@ export type BodyText =
 
 /**
  * Reduce a captured body descriptor to displayable text. Absent covers
- * missing and zero-byte bodies; everything else decodes to text (invalid
- * UTF-8 falls back to a hex dump, which still renders as plain text).
+ * missing and zero-byte bodies — including truncated descriptors carrying
+ * zero captured bytes, which is the shape the projection layer emits for
+ * every body in the browser stream. Everything else decodes to text
+ * (invalid UTF-8 falls back to a hex dump, which still renders as text).
  */
 export function bodyText(body: InspectableBody | undefined): BodyText {
   if (body === undefined || body.state === "missing" || body.state === "empty") return { kind: "absent" };
   if (body.state === "redacted") return { kind: "text", text: "(body redacted)", byteLength: 0 };
   const base64 = decodeBase64Bounded(body.data);
   if (base64.invalid) return { kind: "text", text: "(invalid base64 body)", byteLength: 0 };
+  if (base64.bytes.length === 0) return { kind: "absent" };
   const utf8 = decodeUtf8(base64.bytes);
   return { kind: "text", text: utf8.text, byteLength: base64.bytes.length };
 }

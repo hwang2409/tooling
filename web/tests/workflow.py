@@ -1,7 +1,9 @@
 """Single end-to-end proof of the retained workflow.
 
-Feed one captured flow over a fake WebSocket, see its packet row, click it,
-and see the request body rendered as a collapsible JSON tree.
+Mirrors the production body-delivery boundary: the browser snapshot carries
+only a stripped zero-byte body descriptor (the projection layer's shape), so
+the JSON tree can only render after the click triggers a real fetch to
+``GET /api/v1/flows/{id}`` for the full body.
 """
 
 from __future__ import annotations
@@ -13,17 +15,35 @@ import subprocess
 import time
 from pathlib import Path
 
-from playwright.sync_api import Page, expect, sync_playwright
+from playwright.sync_api import Page, Route, expect, sync_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
 PORT = 4173
 BASE_URL = f"http://127.0.0.1:{PORT}"
 
+FLOW_ID = "workflow-flow-a"
 REQUEST_PAYLOAD = {"model": "claude-example", "stream": True}
 REQUEST_BODY = json.dumps(REQUEST_PAYLOAD).encode("utf-8")
 
+# What the projection layer puts in the browser stream: a schema-valid
+# descriptor with the true size but zero captured bytes.
+STRIPPED_REQUEST_BODY = {
+    "state": "truncated",
+    "size_bytes": str(len(REQUEST_BODY)),
+    "captured_bytes": "0",
+    "encoding": "base64",
+    "data": "",
+}
+
+FULL_REQUEST_BODY = {
+    "state": "captured",
+    "size_bytes": str(len(REQUEST_BODY)),
+    "encoding": "base64",
+    "data": base64.b64encode(REQUEST_BODY).decode("ascii"),
+}
+
 FLOW = {
-    "flow_id": "workflow-flow-a",
+    "flow_id": FLOW_ID,
     "session_id": "client-session-a",
     "method": "POST",
     "scheme": "https",
@@ -31,13 +51,22 @@ FLOW = {
     "port": "443",
     "path": "/v1/messages",
     "request_headers": [{"name": "content-type", "value": "application/json"}],
-    "request_body": {
-        "state": "captured",
-        "size_bytes": str(len(REQUEST_BODY)),
-        "encoding": "base64",
-        "data": base64.b64encode(REQUEST_BODY).decode("ascii"),
-    },
+    "request_body": STRIPPED_REQUEST_BODY,
     "response_status": "200",
+}
+
+DETAIL_RESPONSE = {
+    "flow_id": FLOW_ID,
+    "messages": [
+        {
+            "protocol_version": "1",
+            "type": "body.end",
+            "flow_id": FLOW_ID,
+            "body_side": "request",
+            "total_bytes": str(len(REQUEST_BODY)),
+            "body": FULL_REQUEST_BODY,
+        }
+    ],
 }
 
 
@@ -114,6 +143,18 @@ def install_fake_stream(page: Page) -> None:
 
 
 def run_workflow(page: Page) -> None:
+    detail_requests: list[str] = []
+
+    def serve_detail(route: Route) -> None:
+        detail_requests.append(route.request.url)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(DETAIL_RESPONSE),
+        )
+
+    page.route("**/api/v1/flows/*", serve_detail)
+
     page.goto(BASE_URL)
     row = page.locator(".packet-row")
     expect(row).to_have_count(1)
@@ -121,12 +162,17 @@ def run_workflow(page: Page) -> None:
     expect(row).to_contain_text("api.example.test")
     expect(row).to_contain_text("/v1/messages")
     expect(row).to_contain_text("200")
+    # The snapshot carries no body bytes, so nothing may render before the
+    # click-triggered detail fetch.
+    assert detail_requests == [], detail_requests
 
     row.click()
     tree = page.locator(".packet-detail .json-tree")
     expect(tree).to_be_visible()
     expect(tree).to_contain_text("model")
     expect(tree).to_contain_text("claude-example")
+    assert len(detail_requests) == 1, detail_requests
+    assert detail_requests[0].endswith(f"/api/v1/flows/{FLOW_ID}"), detail_requests
 
 
 def main() -> None:

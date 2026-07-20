@@ -54,6 +54,12 @@ describe("bodyText", () => {
     expect(bodyText({ state: "empty", size_bytes: "0" })).toEqual({ kind: "absent" });
   });
 
+  it("treats a zero-byte truncated descriptor (projection stripped shape) as absent, never empty text", () => {
+    const stripped = bodyText({ state: "truncated", size_bytes: "100", captured_bytes: "0", encoding: "base64", data: "" });
+    expect(stripped).toEqual({ kind: "absent" });
+    expect(bodyText({ state: "captured", size_bytes: "0", encoding: "base64", data: "" })).toEqual({ kind: "absent" });
+  });
+
   it("decodes a captured body to text with its byte length", () => {
     const text = JSON.stringify({ hello: "world" });
     const result = bodyText({ state: "captured", size_bytes: String(text.length), encoding: "base64", data: encoded(text) });
