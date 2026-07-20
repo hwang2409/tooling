@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from mitm_inspector.api.bodies import body_content_encoding, decoded_body_descriptor
 from mitm_inspector.api.limits import MAX_INGEST_BODY_PREFIX_BYTES
 from mitm_inspector.api.projection import (
+    FlowProjectionCache,
     LifecycleTimingReducer,
     collect_grid_flow,
     collect_grid_flows,
@@ -140,6 +141,7 @@ class ApiApplication:
         self._subscribers: list[Subscriber] = []
         self._state = _State(cursor=cursor_start)
         self._counters = _Counters()
+        self._projection_caches: dict[str, FlowProjectionCache] = {}
 
     @property
     def store(self) -> MemoryStore:
@@ -375,7 +377,13 @@ class ApiApplication:
             if flow_id is not None:
                 return self._reconcile_single_flow(flow_id)
         self._state.eviction_marks = marks
-        current = collect_grid_flows(self._store)
+        current = collect_grid_flows(
+            self._store,
+            projection_caches=self._projection_caches,
+        )
+        for flow_id in tuple(self._projection_caches):
+            if flow_id not in current:
+                del self._projection_caches[flow_id]
         changes = diff_grid_changes(self._state.published, current)
         self._state.published = current
         if not changes:
@@ -383,8 +391,14 @@ class ApiApplication:
         return self._emit_delta(changes)
 
     def _reconcile_single_flow(self, flow_id: str) -> bool:
-        flow = collect_grid_flow(self._store, flow_id)
+        projection_cache = self._projection_caches.setdefault(flow_id, FlowProjectionCache())
+        flow = collect_grid_flow(
+            self._store,
+            flow_id,
+            projection_cache=projection_cache,
+        )
         if flow is None:
+            self._projection_caches.pop(flow_id, None)
             return False
         published = self._state.published
         unchanged = published.get(flow_id) == flow

@@ -2007,10 +2007,10 @@ def test_incremental_metadata_projection_matches_full_rescan(
     projection_calls = 0
     original_projection = app_module.collect_grid_flows
 
-    def spy_projection(store: MemoryStore):
+    def spy_projection(store: MemoryStore, **kwargs: Any):
         nonlocal projection_calls
         projection_calls += 1
-        return original_projection(store)
+        return original_projection(store, **kwargs)
 
     monkeypatch.setattr(app_module, "collect_grid_flows", spy_projection)
     application = make_application(max_items=64)
@@ -2040,10 +2040,10 @@ def test_unknown_upsert_prepends_known_upsert_stays_and_resnapshot_matches(
     projection_calls = 0
     original_projection = app_module.collect_grid_flows
 
-    def spy_projection(store: MemoryStore):
+    def spy_projection(store: MemoryStore, **kwargs: Any):
         nonlocal projection_calls
         projection_calls += 1
-        return original_projection(store)
+        return original_projection(store, **kwargs)
 
     monkeypatch.setattr(app_module, "collect_grid_flows", spy_projection)
     application = make_application(max_items=64)
@@ -2077,10 +2077,10 @@ def test_duplicate_metadata_ingest_emits_no_delta(monkeypatch: pytest.MonkeyPatc
     projection_calls = 0
     original_projection = app_module.collect_grid_flows
 
-    def spy_projection(store: MemoryStore):
+    def spy_projection(store: MemoryStore, **kwargs: Any):
         nonlocal projection_calls
         projection_calls += 1
-        return original_projection(store)
+        return original_projection(store, **kwargs)
 
     monkeypatch.setattr(app_module, "collect_grid_flows", spy_projection)
     application = make_application(max_items=64)
@@ -2091,6 +2091,41 @@ def test_duplicate_metadata_ingest_emits_no_delta(monkeypatch: pytest.MonkeyPatc
     assert result.delta_emitted is False
     assert application.cursor == before
     assert projection_calls == 0
+
+
+def test_repeated_flow_messages_decode_a_large_body_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mitm_inspector.api.bodies as bodies_module
+
+    compressed = gzip.compress(os.urandom(1024 * 1024))
+    message = metadata_message(request_body=captured_body(compressed))
+    metadata = message["metadata"]
+    assert isinstance(metadata, dict)
+    metadata["request_headers"] = [
+        {"name": "host", "value": "api.example.test"},
+        {"name": "content-encoding", "value": "gzip"},
+    ]
+    decode_calls = 0
+    original_decode = bodies_module._decode_content
+
+    def count_decode(data: bytes, encoding: str) -> bodies_module.ContentDecodeResult:
+        nonlocal decode_calls
+        decode_calls += 1
+        return original_decode(data, encoding)
+
+    monkeypatch.setattr(bodies_module, "_decode_content", count_decode)
+    application = make_application(max_items=64)
+    application.ingest(message)
+    for sequence in range(1, 12):
+        application.ingest(
+            lifecycle_message(
+                "flow-1",
+                sequence=str(sequence),
+            )
+        )
+
+    assert decode_calls == 1
 
 
 def test_eviction_during_metadata_ingest_falls_back_to_full_projection() -> None:

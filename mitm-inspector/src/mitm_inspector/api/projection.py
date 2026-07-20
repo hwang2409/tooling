@@ -8,10 +8,14 @@ schema-valid while stripping the base64 prefix data.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass, field
 
-from mitm_inspector.api.bodies import body_content_encoding, decoded_body_descriptor
+from mitm_inspector.api.bodies import (
+    DecodedBodyParts,
+    body_content_encoding,
+    decoded_body_parts,
+)
 from mitm_inspector.api.summary import flow_summary
 from mitm_inspector.json_boundary import (
     PlainJsonObject,
@@ -22,6 +26,96 @@ from mitm_inspector.protocol import KnownParsedMessage, is_rfc3339_utc
 from mitm_inspector.store.memory import MemoryStore
 
 _DATA_BEARING_STATES = frozenset({"captured", "truncated"})
+
+
+@dataclass(slots=True)
+class FlowProjectionCache:
+    """Memoize one flow's projection while its retained metadata is unchanged."""
+
+    metadata: Mapping[str, object] | None = None
+    flow: PlainJsonObject | None = None
+    _body_parts: dict[
+        str,
+        tuple[tuple[object, object, object, object, object], str | None, DecodedBodyParts],
+    ] = field(default_factory=dict)
+
+    def project(
+        self,
+        metadata: Mapping[str, object],
+        *,
+        started_at: str | None,
+        ended_at: str | None,
+    ) -> PlainJsonObject:
+        if self.metadata is not None and self.flow is not None and self._matches(metadata):
+            copied = dict(self.flow)
+            if started_at is not None:
+                copied["started_at"] = started_at
+            else:
+                copied.pop("started_at", None)
+            if ended_at is not None:
+                copied["ended_at"] = ended_at
+            else:
+                copied.pop("ended_at", None)
+            return copied
+        self.metadata = metadata
+        self.flow = enriched_flow(
+            metadata,
+            started_at=started_at,
+            ended_at=ended_at,
+            body_cache=self,
+        )
+        return dict(self.flow)
+
+    def body_parts(
+        self, side: str, descriptor: object, encoding: str | None
+    ) -> DecodedBodyParts:
+        cached = self._body_parts.get(side)
+        if (
+            cached is not None
+            and _same_body_version(cached[0], _body_version(descriptor))
+            and cached[1] == encoding
+        ):
+            return cached[2]
+        parts = decoded_body_parts(descriptor, encoding)
+        self._body_parts[side] = (_body_version(descriptor), encoding, parts)
+        return parts
+
+    def _matches(self, metadata: Mapping[str, object]) -> bool:
+        if self.metadata is None or self.metadata.keys() != metadata.keys():
+            return False
+        for key, value in metadata.items():
+            previous = self.metadata[key]
+            if key in {"request_body", "response_body"}:
+                if not _same_body_version(_body_version(previous), _body_version(value)):
+                    return False
+            elif previous != value:
+                return False
+        return True
+
+
+def _body_version(descriptor: object) -> tuple[object, object, object, object, object]:
+    if not isinstance(descriptor, Mapping):
+        return (None, None, None, descriptor, None)
+    return (
+        descriptor.get("state"),
+        descriptor.get("size_bytes"),
+        descriptor.get("captured_bytes"),
+        descriptor.get("data"),
+        descriptor.get("content_type"),
+    )
+
+
+def _same_body_version(
+    left: tuple[object, object, object, object, object],
+    right: tuple[object, object, object, object, object],
+) -> bool:
+    return (
+        left[0] == right[0]
+        and left[1] == right[1]
+        and left[2] == right[2]
+        and left[3] is right[3]
+        and left[4] == right[4]
+    )
 
 
 @dataclass(slots=True)
@@ -98,6 +192,7 @@ def enriched_flow(
     *,
     started_at: str | None = None,
     ended_at: str | None = None,
+    body_cache: FlowProjectionCache | None = None,
 ) -> PlainJsonObject:
     """Copy metadata and add decoded bodies, wire facts, and a summary."""
 
@@ -110,7 +205,7 @@ def enriched_flow(
         copied["started_at"] = started_at
     if ended_at is not None:
         copied["ended_at"] = ended_at
-    summary = flow_summary(copied)
+    decoded_bodies: dict[str, bytes | None] = {}
     decoded_encodings: PlainJsonObject = {}
     for side in ("request", "response"):
         body_key = f"{side}_body"
@@ -124,15 +219,22 @@ def enriched_flow(
                 copied[f"{side}_content_type"] = content_type
         encoding = body_content_encoding(copied, side)
         if descriptor is not None:
-            decoded, was_decoded = decoded_body_descriptor(descriptor, encoding)
-            copied[body_key] = decoded
+            parts = (
+                body_cache.body_parts(side, descriptor, encoding)
+                if body_cache is not None
+                else decoded_body_parts(descriptor, encoding)
+            )
+            copied[body_key] = parts.descriptor
+            if parts.data is not None:
+                decoded_bodies[side] = parts.data
+            was_decoded = parts.was_decoded
             if was_decoded and encoding is not None:
                 decoded_encodings[side] = encoding
     if decoded_encodings:
         copied["content_encoding"] = decoded_encodings
     else:
         copied.pop("content_encoding", None)
-    copied["summary"] = summary
+    copied["summary"] = flow_summary(copied, decoded_bodies=decoded_bodies)
     return copied
 
 
@@ -141,7 +243,11 @@ def flow_id_of(metadata: Mapping[str, object]) -> str | None:
     return flow_id if isinstance(flow_id, str) and flow_id else None
 
 
-def collect_grid_flows(store: MemoryStore) -> dict[str, PlainJsonObject]:
+def collect_grid_flows(
+    store: MemoryStore,
+    *,
+    projection_caches: MutableMapping[str, FlowProjectionCache] | None = None,
+) -> dict[str, PlainJsonObject]:
     """Project newest metadata in stable newest-flow-first insertion order."""
 
     newest: dict[str, Mapping[str, object]] = {}
@@ -156,22 +262,38 @@ def collect_grid_flows(store: MemoryStore) -> dict[str, PlainJsonObject]:
             continue
         if message_type != "flow.metadata":
             continue
-        metadata = payload.get("metadata")
-        if not isinstance(metadata, Mapping):
+        candidate_metadata = payload.get("metadata")
+        if not isinstance(candidate_metadata, Mapping):
             continue
-        flow_id = flow_id_of(metadata)
+        flow_id = flow_id_of(candidate_metadata)
         if flow_id is None or flow_id in newest:
             continue
-        newest[flow_id] = metadata
+        newest[flow_id] = candidate_metadata
     flow_order = store.flow_ids_newest_first()
-    return {
-        flow_id: grid_flow_with_timing(newest[flow_id], *timing.values(flow_id))
-        for flow_id in flow_order
-        if flow_id in newest
-    }
+    current: dict[str, PlainJsonObject] = {}
+    for flow_id in flow_order:
+        selected_metadata = newest.get(flow_id)
+        if selected_metadata is None:
+            continue
+        cache = (
+            projection_caches.setdefault(flow_id, FlowProjectionCache())
+            if projection_caches is not None
+            else None
+        )
+        current[flow_id] = grid_flow_with_timing(
+            selected_metadata,
+            *timing.values(flow_id),
+            projection_cache=cache,
+        )
+    return current
 
 
-def collect_grid_flow(store: MemoryStore, target_flow_id: str) -> PlainJsonObject | None:
+def collect_grid_flow(
+    store: MemoryStore,
+    target_flow_id: str,
+    *,
+    projection_cache: FlowProjectionCache | None = None,
+) -> PlainJsonObject | None:
     """Project one retained flow without rebuilding the full grid."""
 
     metadata: Mapping[str, object] | None = None
@@ -194,17 +316,31 @@ def collect_grid_flow(store: MemoryStore, target_flow_id: str) -> PlainJsonObjec
         timing.add(payload)
     if metadata is None:
         return None
-    return grid_flow_with_timing(metadata, *timing.values(target_flow_id))
+    return grid_flow_with_timing(
+        metadata,
+        *timing.values(target_flow_id),
+        projection_cache=projection_cache,
+    )
 
 
 def grid_flow_with_timing(
     metadata: Mapping[str, object],
     started_at: str | None,
     ended_at: str | None,
+    *,
+    projection_cache: FlowProjectionCache | None = None,
 ) -> PlainJsonObject:
     """Enrich and redact one flow while preserving supplied lifecycle timing."""
 
-    copied = enriched_flow(metadata, started_at=started_at, ended_at=ended_at)
+    copied = (
+        projection_cache.project(
+            metadata,
+            started_at=started_at,
+            ended_at=ended_at,
+        )
+        if projection_cache is not None
+        else enriched_flow(metadata, started_at=started_at, ended_at=ended_at)
+    )
     for side in ("request_body", "response_body"):
         if side in copied:
             copied[side] = redacted_body_descriptor(copied[side])
