@@ -20,16 +20,46 @@ from playwright.sync_api import Page, Route, expect, sync_playwright
 ROOT = Path(__file__).resolve().parents[1]
 PORT = 4173
 BASE_URL = f"http://127.0.0.1:{PORT}"
+# The optional search-match.flow projection follows PR #2's schema at
+# 3270074f1d1f00708eee476c1ca88553fe7c1e50.
 
 FLOW_ID = "workflow-flow-a"
 REQUEST_PAYLOAD = {"model": "claude-example", "stream": True}
+REQUEST_PAYLOAD.update(
+    {
+        "max_tokens": 64,
+        "system": [{"type": "text", "text": "be concise"}],
+        "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+    }
+)
 REQUEST_BODY = json.dumps(REQUEST_PAYLOAD).encode("utf-8")
+
+SSE_BODY = "\n\n".join(
+    [
+        'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-example","role":"assistant","usage":{"input_tokens":3}}}',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}',
+        'event: message_stop\ndata: {"type":"message_stop"}',
+        'event: content_block_delta\ndata: {"type":"content_block_delta"',
+    ]
+)
+RESPONSE_BODY = SSE_BODY.encode("utf-8")
 
 # What the projection layer puts in the browser stream: a schema-valid
 # descriptor with the true size but zero captured bytes.
 STRIPPED_REQUEST_BODY = {
     "state": "truncated",
     "size_bytes": str(len(REQUEST_BODY)),
+    "captured_bytes": "0",
+    "encoding": "base64",
+    "data": "",
+}
+
+STRIPPED_RESPONSE_BODY = {
+    "state": "truncated",
+    "size_bytes": str(len(RESPONSE_BODY)),
     "captured_bytes": "0",
     "encoding": "base64",
     "data": "",
@@ -42,6 +72,13 @@ FULL_REQUEST_BODY = {
     "data": base64.b64encode(REQUEST_BODY).decode("ascii"),
 }
 
+FULL_RESPONSE_BODY = {
+    "state": "captured",
+    "size_bytes": str(len(RESPONSE_BODY)),
+    "encoding": "base64",
+    "data": base64.b64encode(RESPONSE_BODY).decode("ascii"),
+}
+
 FLOW = {
     "flow_id": FLOW_ID,
     "session_id": "client-session-a",
@@ -51,8 +88,21 @@ FLOW = {
     "port": "443",
     "path": "/v1/messages",
     "request_headers": [{"name": "content-type", "value": "application/json"}],
+    "response_headers": [{"name": "content-type", "value": "text/event-stream"}],
     "request_body": STRIPPED_REQUEST_BODY,
-    "response_status": "200",
+    "response_body": STRIPPED_RESPONSE_BODY,
+    "response_status": "500",
+}
+
+DURABLE_FLOW = {
+    "flow_id": "durable-only-flow",
+    "method": "POST",
+    "scheme": "https",
+    "host": "retained.example.test",
+    "port": "443",
+    "path": "/v1/durable",
+    "request_headers": [],
+    "request_body": {"state": "missing"},
 }
 
 DETAIL_RESPONSE = {
@@ -65,7 +115,15 @@ DETAIL_RESPONSE = {
             "body_side": "request",
             "total_bytes": str(len(REQUEST_BODY)),
             "body": FULL_REQUEST_BODY,
-        }
+        },
+        {
+            "protocol_version": "1",
+            "type": "body.end",
+            "flow_id": FLOW_ID,
+            "body_side": "response",
+            "total_bytes": str(len(RESPONSE_BODY)),
+            "body": FULL_RESPONSE_BODY,
+        },
     ],
 }
 
@@ -154,6 +212,26 @@ def run_workflow(page: Page) -> None:
         )
 
     page.route("**/api/v1/flows/*", serve_detail)
+    page.route(
+        "**/api/v1/search**",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "matches": [
+                        {
+                            "flow_id": "durable-only-flow",
+                            "field": "request_body",
+                            "snippet": "durable hit",
+                            "flow": DURABLE_FLOW,
+                        }
+                    ],
+                    "truncated": False,
+                }
+            ),
+        ),
+    )
 
     page.goto(BASE_URL)
     row = page.locator(".packet-row")
@@ -161,18 +239,65 @@ def run_workflow(page: Page) -> None:
     expect(row).to_contain_text("POST")
     expect(row).to_contain_text("api.example.test")
     expect(row).to_contain_text("/v1/messages")
-    expect(row).to_contain_text("200")
+    expect(row).to_contain_text("500")
+    assert page.locator(".packet-status-error").evaluate("el => getComputedStyle(el).color") == "rgb(180, 35, 24)"
     # The snapshot carries no body bytes, so nothing may render before the
     # click-triggered detail fetch.
     assert detail_requests == [], detail_requests
 
     row.click()
-    tree = page.locator(".packet-detail .json-tree")
-    expect(tree).to_be_visible()
-    expect(tree).to_contain_text("model")
-    expect(tree).to_contain_text("claude-example")
+    conversation = page.locator("[data-testid='conversation-view']")
+    expect(conversation).to_be_visible()
+    expect(conversation).to_contain_text("answer")
+    expect(conversation).to_contain_text("end_turn")
+    expect(page.locator(".packet-detail .packet-mode").filter(has_text="raw")).to_be_visible()
+    page.locator(".packet-detail .packet-mode").filter(has_text="raw").click()
+    raw_tree = page.locator(".packet-detail .json-tree")
+    expect(raw_tree).to_be_visible()
+    raw_tree.locator(".json-toggle").first.click()
+    expect(raw_tree).to_contain_text("messages")
+    page.locator(".packet-detail .packet-mode").filter(has_text="conversation").click()
+    raw_frames = conversation.locator(".conv-collapse-head").filter(has_text="raw frames")
+    raw_frames.click()
+    expect(conversation).to_contain_text("truncated frame")
     assert len(detail_requests) == 1, detail_requests
     assert detail_requests[0].endswith(f"/api/v1/flows/{FLOW_ID}"), detail_requests
+
+    search = page.locator(".search-input")
+    search.fill("durable")
+    expect(page.locator("#search-status")).to_have_text("1 match")
+    expect(page.locator(".packet-row")).to_have_count(1)
+    expect(page.locator(".packet-row")).to_contain_text("retained.example.test")
+    search.press("Escape")
+    expect(page.locator(".packet-row")).to_have_count(1)
+    expect(page.locator(".packet-row")).to_contain_text("api.example.test")
+
+    for width in (600, 800):
+        page.set_viewport_size({"width": width, "height": 700})
+        document_width = page.evaluate("Math.max(document.body.scrollWidth, document.documentElement.scrollWidth)")
+        assert document_width <= width, (width, document_width)
+        geometry = page.locator(".packet-row").evaluate(
+            """row => {
+                const box = row.getBoundingClientRect();
+                const preview = row.querySelector('.packet-preview').getBoundingClientRect();
+                const status = row.querySelector('.packet-status').getBoundingClientRect();
+                return {
+                    height: box.height,
+                    statusTop: status.top,
+                    rowTop: box.top,
+                    rowBottom: box.bottom,
+                    previewRight: preview.right,
+                    statusLeft: status.left,
+                    sizes: getComputedStyle(row.querySelector('.packet-sizes')).display,
+                    duration: getComputedStyle(row.querySelector('.packet-duration')).display,
+                };
+            }"""
+        )
+        assert 24 <= geometry["height"] <= 32, (width, geometry)
+        assert geometry["rowTop"] <= geometry["statusTop"] <= geometry["rowBottom"], (width, geometry)
+        assert geometry["statusLeft"] >= geometry["previewRight"] - 1, (width, geometry)
+        assert geometry["sizes"] == "none", (width, geometry)
+        assert geometry["duration"] == "none", (width, geometry)
 
 
 def main() -> None:

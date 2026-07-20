@@ -329,21 +329,30 @@ function applyDelta(state: BrowserState, message: BrowserDelta): BrowserState {
   }
 
   const entries = [...state.flows.entries];
+  const newEntries: ImmutableFlowMetadata[] = [];
   const removedFlowIds: string[] = [];
   for (const change of message.changes) {
     const flowId = change.op === "upsert" ? change.flow.flow_id : change.flow_id;
     const index = entries.findIndex((flow) => flow.flow_id === flowId);
     if (change.op === "upsert") {
-      if (index === -1) entries.push(change.flow);
-      else entries[index] = change.flow;
+      if (index !== -1) {
+        entries[index] = change.flow;
+      } else {
+        const newIndex = newEntries.findIndex((flow) => flow.flow_id === flowId);
+        if (newIndex === -1) newEntries.push(change.flow);
+        else newEntries[newIndex] = change.flow;
+      }
     } else if (index !== -1) {
       entries.splice(index, 1);
       removedFlowIds.push(flowId);
+    } else {
+      const newIndex = newEntries.findIndex((flow) => flow.flow_id === flowId);
+      if (newIndex !== -1) newEntries.splice(newIndex, 1);
     }
   }
   return {
     ...state,
-    flows: createFlowCollection(entries),
+    flows: createFlowCollection([...newEntries, ...entries]),
     lifecycles: pruneLifecycle(state.lifecycles, removedFlowIds),
     cursor: message.cursor,
     gap: null,

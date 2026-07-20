@@ -62,6 +62,47 @@ export interface FlowMetadata {
   response_status?: DecimalString;
   request_body: BodyDescriptor;
   response_body?: BodyDescriptor;
+  [key: string]: unknown;
+}
+
+export type FlowSummaryKind = "anthropic_messages" | "anthropic_count_tokens" | "generic";
+export type FlowPreviewSource = "user_text" | "tool_result" | "none";
+
+export interface FlowSummaryPreview {
+  readonly source: FlowPreviewSource;
+  readonly text?: string;
+  readonly tool_name?: string;
+}
+
+export interface FlowSummary {
+  readonly kind: FlowSummaryKind;
+  readonly model?: string;
+  readonly message_count?: DecimalString;
+  readonly stream?: boolean;
+  readonly preview?: FlowSummaryPreview;
+  readonly stop_reason?: string;
+  readonly input_tokens?: DecimalString;
+  readonly output_tokens?: DecimalString;
+  readonly cache_read_input_tokens?: DecimalString;
+  readonly thinking_tokens?: DecimalString;
+  readonly count_tokens_result?: DecimalString;
+}
+
+export interface FlowContentEncoding {
+  readonly request?: string;
+  readonly response?: string;
+}
+
+/** Optional enrichment fields the source may attach to flow metadata. */
+export interface FlowExtras {
+  readonly started_at?: string;
+  readonly ended_at?: string;
+  readonly request_body_size?: DecimalString;
+  readonly response_body_size?: DecimalString;
+  readonly request_content_type?: string;
+  readonly response_content_type?: string;
+  readonly content_encoding?: FlowContentEncoding;
+  readonly summary?: FlowSummary;
 }
 
 interface ProtocolBase {
@@ -472,4 +513,99 @@ export function parseProtocolMessage(value: unknown): ParsedMessage {
 
   if (knownTypes.has(type)) return knownEnvelope(frozenMessage);
   return opaqueEnvelope(type, frozenMessage);
+}
+
+const summaryKinds = new Set<FlowSummaryKind>(["anthropic_messages", "anthropic_count_tokens", "generic"]);
+const previewSources = new Set<FlowPreviewSource>(["user_text", "tool_result", "none"]);
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function optionalDecimal(value: unknown): DecimalString | undefined {
+  if (typeof value !== "string" || !decimalPattern.test(value)) return undefined;
+  return BigInt(value) <= MAX_U64 ? value : undefined;
+}
+
+function optionalTimestamp(value: unknown): string | undefined {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00)$/.test(value) || Number.isNaN(Date.parse(value))) return undefined;
+  return value;
+}
+
+function optionalRecord(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+function summaryPreview(value: unknown): FlowSummaryPreview | undefined {
+  const preview = optionalRecord(value);
+  if (preview === undefined) return undefined;
+  const source = preview.source;
+  if (typeof source !== "string" || !previewSources.has(source as FlowPreviewSource)) return undefined;
+  const result: { -readonly [Key in keyof FlowSummaryPreview]: FlowSummaryPreview[Key] } = {
+    source: source as FlowPreviewSource,
+  };
+  const text = optionalString(preview.text);
+  if (text !== undefined) result.text = text;
+  const toolName = optionalString(preview.tool_name);
+  if (toolName !== undefined) result.tool_name = toolName;
+  return result;
+}
+
+function flowSummary(value: unknown): FlowSummary | undefined {
+  const summary = optionalRecord(value);
+  if (summary === undefined) return undefined;
+  const kind = summary.kind;
+  if (typeof kind !== "string" || !summaryKinds.has(kind as FlowSummaryKind)) return undefined;
+  const result: { -readonly [Key in keyof FlowSummary]: FlowSummary[Key] } = { kind: kind as FlowSummaryKind };
+  const model = optionalString(summary.model);
+  if (model !== undefined) result.model = model;
+  const messageCount = optionalDecimal(summary.message_count);
+  if (messageCount !== undefined) result.message_count = messageCount;
+  if (typeof summary.stream === "boolean") result.stream = summary.stream;
+  const preview = summaryPreview(summary.preview);
+  if (preview !== undefined) result.preview = preview;
+  const stopReason = optionalString(summary.stop_reason);
+  if (stopReason !== undefined) result.stop_reason = stopReason;
+  for (const key of ["input_tokens", "output_tokens", "cache_read_input_tokens", "thinking_tokens", "count_tokens_result"] as const) {
+    const tokens = optionalDecimal(summary[key]);
+    if (tokens !== undefined) result[key] = tokens;
+  }
+  return result;
+}
+
+/**
+ * Tolerantly extract the optional enrichment fields from flow metadata.
+ * Unknown fields are ignored and malformed optional fields are dropped —
+ * this never throws, so a source shipping a newer (or broken) enrichment
+ * shape can never take the flow list down.
+ */
+export function parseFlowExtras(metadata: unknown): FlowExtras {
+  const record = optionalRecord(metadata);
+  if (record === undefined) return {};
+  const extras: { -readonly [Key in keyof FlowExtras]: FlowExtras[Key] } = {};
+  const startedAt = optionalTimestamp(record.started_at);
+  if (startedAt !== undefined) extras.started_at = startedAt;
+  const endedAt = optionalTimestamp(record.ended_at);
+  if (endedAt !== undefined) extras.ended_at = endedAt;
+  const requestSize = optionalDecimal(record.request_body_size);
+  if (requestSize !== undefined) extras.request_body_size = requestSize;
+  const responseSize = optionalDecimal(record.response_body_size);
+  if (responseSize !== undefined) extras.response_body_size = responseSize;
+  const requestContentType = optionalString(record.request_content_type);
+  if (requestContentType !== undefined) extras.request_content_type = requestContentType;
+  const responseContentType = optionalString(record.response_content_type);
+  if (responseContentType !== undefined) extras.response_content_type = responseContentType;
+  const encoding = optionalRecord(record.content_encoding);
+  if (encoding !== undefined) {
+    const contentEncoding: { -readonly [Key in keyof FlowContentEncoding]: FlowContentEncoding[Key] } = {};
+    const request = optionalString(encoding.request);
+    if (request !== undefined) contentEncoding.request = request;
+    const response = optionalString(encoding.response);
+    if (response !== undefined) contentEncoding.response = response;
+    extras.content_encoding = contentEncoding;
+  }
+  const summary = flowSummary(record.summary);
+  if (summary !== undefined) extras.summary = summary;
+  return extras;
 }

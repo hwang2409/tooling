@@ -63,7 +63,7 @@ describe("browser state reducer", () => {
     expect(next.snapshotId).toBe("one");
   });
 
-  it("upserts in place, appends new IDs, and removes without numeric reordering", () => {
+  it("upserts existing IDs in place, puts new IDs first, and removes without numeric reordering", () => {
     const snapshot = reduce(initialBrowserState, {
       protocol_version: "1", type: "browser.snapshot", snapshot_id: "one", cursor: "4",
       flows: [flow("__proto__"), flow("10"), flow("2")],
@@ -74,10 +74,77 @@ describe("browser state reducer", () => {
       ],
     });
 
-    expect(next.flows.ids).toEqual(["__proto__", "10", "1"]);
+    expect(next.flows.ids).toEqual(["1", "__proto__", "10"]);
     expect(next.flows.get("10")?.path).toBe("/v1/messages");
     expect(next.flows.get("2")).toBeUndefined();
     expect(next.counters.appliedChanges).toBe(6);
+  });
+
+  it("keeps live delta order consistent with a stable-order reconnect snapshot", () => {
+    const initial = reduce(initialBrowserState, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "one", cursor: "1",
+      flows: [flow("a"), flow("b")],
+    });
+    const updatedA = { ...flow("a"), response_status: "200" };
+    const live = reduce(initial, {
+      protocol_version: "1", type: "browser.delta", cursor: "2", changes: [{ op: "upsert", flow: updatedA }],
+    });
+    const reconnected = reduce(initialBrowserState, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "two", cursor: "2",
+      flows: [updatedA, flow("b")],
+    });
+
+    expect(live.flows.ids).toEqual(["a", "b"]);
+    expect(reconnected.flows.ids).toEqual(live.flows.ids);
+    expect(live.flows.get("a")?.response_status).toBe("200");
+    expect(reconnected.flows.get("a")?.response_status).toBe("200");
+  });
+
+  it("keeps newest-first order across new-flow and metadata deltas followed by reconnect", () => {
+    const initial = reduce(initialBrowserState, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "one", cursor: "1",
+      flows: [flow("a")],
+    });
+    const live = reduce(initial, {
+      protocol_version: "1", type: "browser.delta", cursor: "2", changes: [
+        { op: "upsert", flow: flow("b") },
+      ],
+    });
+    const updatedA = { ...flow("a"), response_status: "200" };
+    const liveAfterUpdate = reduce(live, {
+      protocol_version: "1", type: "browser.delta", cursor: "3", changes: [
+        { op: "upsert", flow: updatedA },
+      ],
+    });
+    const reconnected = reduce(initialBrowserState, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "two", cursor: "3",
+      flows: [flow("b"), updatedA],
+    });
+
+    expect(liveAfterUpdate.flows.ids).toEqual(["b", "a"]);
+    expect(reconnected.flows.ids).toEqual(liveAfterUpdate.flows.ids);
+    expect(liveAfterUpdate.flows.get("a")?.response_status).toBe("200");
+    expect(reconnected.flows.get("a")?.response_status).toBe("200");
+  });
+
+  it("matches backend order for a multi-change delta and reconnect snapshot", () => {
+    const initial = reduce(initialBrowserState, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "one", cursor: "1",
+      flows: [flow("b"), flow("a")],
+    });
+    const live = reduce(initial, {
+      protocol_version: "1", type: "browser.delta", cursor: "2", changes: [
+        { op: "upsert", flow: flow("d") },
+        { op: "upsert", flow: flow("c") },
+      ],
+    });
+    const reconnected = reduce(initialBrowserState, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "two", cursor: "2",
+      flows: [flow("d"), flow("c"), flow("b"), flow("a")],
+    });
+
+    expect(live.flows.ids).toEqual(["d", "c", "b", "a"]);
+    expect(reconnected.flows.ids).toEqual(live.flows.ids);
   });
 
   it("ignores stale snapshots and deltas without regressing the cursor", () => {
@@ -242,7 +309,7 @@ describe("browser state reducer", () => {
     expect(whilePaused.displayed).toBe(paused.displayed);
     expect(whilePaused.displayed.flows.ids).toEqual(["old"]);
     expect(whilePaused.displayed.counters.receivedMessages).toBe(paused.displayed.counters.receivedMessages);
-    expect(whilePaused.latest.flows.ids).toEqual(["old", "new"]);
+    expect(whilePaused.latest.flows.ids).toEqual(["new", "old"]);
     expect(resumed.followLive).toBe(true);
     expect(resumed.displayed).toBe(resumed.latest);
     expect(resumed.displayed.cursor).toBe("2");

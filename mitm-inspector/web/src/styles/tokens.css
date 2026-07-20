@@ -11,6 +11,8 @@
   --line: #e5e5e5;
   --line-dark: #cccccc;
   --focus-ring: #111111;
+  /* the single permitted chroma: 4xx/5xx statuses and error states only. */
+  --alert: #b42318;
   --font-mono: "JetBrains Mono", "SFMono-Regular", "SF Mono", Menlo, Consolas, "Roboto Mono", monospace;
 }
 

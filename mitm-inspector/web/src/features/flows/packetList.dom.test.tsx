@@ -6,9 +6,11 @@ import { createRoot } from "react-dom/client";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { parseProtocolMessage } from "../../protocol";
+import type { FlowMetadata } from "../../protocol";
 import { browserReducer, initialBrowserState } from "../../state/browserState";
 import type { BrowserState } from "../../state/browserState";
 import type { FlowDetailLoader } from "../inspector/flowDetail";
+import type { SearchFetcher } from "../search/search";
 import { PacketList } from "./PacketList";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -58,11 +60,15 @@ interface Mounted {
 
 const mounts: Mounted[] = [];
 
-async function mountList(browser: BrowserState, loader: FlowDetailLoader = unavailableLoader): Promise<Mounted> {
+async function mountList(
+  browser: BrowserState,
+  loader: FlowDetailLoader = unavailableLoader,
+  searchFetcher?: SearchFetcher,
+): Promise<Mounted> {
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
-  await act(async () => root.render(<PacketList browser={browser} loadFlowDetail={loader} />));
+  await act(async () => root.render(<PacketList browser={browser} loadFlowDetail={loader} searchFetcher={searchFetcher} />));
   const mounted = { root, container };
   mounts.push(mounted);
   return mounted;
@@ -125,6 +131,89 @@ describe("PacketList", () => {
     expect(tree).not.toBeNull();
     expect(tree?.textContent).toContain("model");
     expect(tree?.textContent).toContain("claude");
+  });
+
+  it("defaults Anthropic requests to conversation view with raw JSON one toggle away", async () => {
+    const browser = stateOf([
+      flow("flow-a", {
+        request_body: captured(JSON.stringify({
+          model: "claude",
+          messages: [{ role: "user", content: "hello" }],
+        })),
+      }),
+    ]);
+    const { container } = await mountList(browser);
+    await click(rowByPath(container, "/v1/flow-a"));
+    expect(container.querySelector("[data-testid='conversation-view']")?.textContent).toContain("hello");
+    const raw = Array.from(container.querySelectorAll<HTMLButtonElement>(".packet-mode"))
+      .find((button) => button.textContent === "raw");
+    expect(raw).toBeDefined();
+    await click(raw!);
+    const rawTree = container.querySelector(".packet-detail .json-tree");
+    expect(rawTree).not.toBeNull();
+    await click(rawTree!.querySelector<HTMLButtonElement>(".json-toggle")!);
+    expect(rawTree?.textContent).toContain("messages");
+  });
+
+  it("renders a durable-only search hit and restores the live snapshot on Escape", async () => {
+    const browser = stateOf([flow("flow-a")]);
+    const durable = flow("durable-flow", { host: "retained.example.test", path: "/v1/durable" }) as FlowMetadata;
+    const searchFetcher: SearchFetcher = async () => ({
+      status: "results",
+      query: "durable",
+      matches: [{ flow_id: "durable-flow", field: "request_body", snippet: "durable hit", flow: durable }],
+      truncated: false,
+    });
+    const { container } = await mountList(browser, unavailableLoader, searchFetcher);
+    const input = container.querySelector<HTMLInputElement>(".search-input");
+    if (input === null) throw new Error("search input missing");
+    await act(async () => {
+      const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setValue?.call(input, "durable");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => new Promise((resolve) => globalThis.setTimeout(resolve, 300)));
+    expect(container.querySelectorAll(".packet-row")).toHaveLength(1);
+    expect(container.querySelector(".packet-row")?.textContent).toContain("retained.example.test");
+    expect(container.querySelector("#search-status")?.textContent).toContain("1 match");
+    expect(input.getAttribute("aria-describedby")).toBe("search-status");
+
+    await act(async () => input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Escape" })));
+    expect(container.querySelectorAll(".packet-row")).toHaveLength(1);
+    expect(container.querySelector(".packet-row")?.textContent).toContain("/v1/flow-a");
+  });
+
+  it("renders and opens a durable match when the browser snapshot is empty", async () => {
+    const requested: string[] = [];
+    const durable = flow("durable-flow", { host: "retained.example.test", path: "/v1/durable" }) as FlowMetadata;
+    const loader: FlowDetailLoader = async (flowId) => {
+      requested.push(flowId);
+      return {
+        status: "loaded",
+        overrides: { request_body: captured(JSON.stringify({ model: "claude", messages: [{ role: "user", content: "hello" }] })) },
+      };
+    };
+    const searchFetcher: SearchFetcher = async () => ({
+      status: "results",
+      query: "durable",
+      matches: [{ flow_id: "durable-flow", field: "request_body", snippet: "durable hit", flow: durable }],
+      truncated: false,
+    });
+    const { container } = await mountList(stateOf([]), loader, searchFetcher);
+    const input = container.querySelector<HTMLInputElement>(".search-input");
+    if (input === null) throw new Error("search input missing");
+    await act(async () => {
+      const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setValue?.call(input, "durable");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => new Promise((resolve) => globalThis.setTimeout(resolve, 300)));
+    const row = container.querySelector<HTMLButtonElement>(".packet-row");
+    expect(row?.textContent).toContain("retained.example.test");
+    await click(row!);
+    expect(row?.getAttribute("aria-expanded")).toBe("true");
+    expect(requested).toEqual(["durable-flow"]);
+    expect(container.querySelector("[data-testid='conversation-view']")?.textContent).toContain("hello");
   });
 
   it("replaces the open panel when another row is clicked and closes on re-click", async () => {
