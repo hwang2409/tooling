@@ -21,7 +21,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from mitm_inspector.api.app import ApiApplication, Subscriber
+from mitm_inspector.api.app import (
+    SUBSCRIBER_QUEUE_FRAMES,
+    ApiApplication,
+    Subscriber,
+)
 from mitm_inspector.api.httpwire import (
     MAX_REQUEST_HEAD_BYTES,
     WEBSOCKET_VERSION,
@@ -61,7 +65,6 @@ SNAPSHOT_PATH = f"{API_VERSION_PREFIX}/snapshot"
 STREAM_PATH = f"{API_VERSION_PREFIX}/stream"
 FLOW_PATH_PREFIX = f"{API_VERSION_PREFIX}/flows/"
 MAX_CLIENT_MESSAGE_BYTES = 64 * 1024
-SUBSCRIBER_QUEUE_FRAMES = 256
 HEAD_READ_TIMEOUT_SECONDS = 10.0
 DEFAULT_SWEEP_INTERVAL_SECONDS = 5.0
 
