@@ -1,0 +1,68 @@
+@import "./tokens.css";
+
+.app-shell {
+  min-height: 100vh;
+  color: var(--ink);
+  background: var(--paper);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.packet-empty { margin: 0; padding: 16px 12px; color: var(--muted); font-style: italic; }
+
+.packet-list { margin: 0; padding: 0; list-style: none; }
+.packet { border-bottom: 1px solid var(--line); }
+
+.packet-row {
+  display: grid;
+  grid-template-columns: 52px minmax(120px, 240px) minmax(0, 1fr) 44px;
+  gap: 10px;
+  width: 100%;
+  padding: 4px 10px;
+  color: var(--ink-soft);
+  background: transparent;
+  border: 0;
+  font: inherit;
+  text-align: left;
+}
+.packet-row:hover { color: var(--ink); background: var(--paper-alt); }
+.packet-row:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--focus-ring); }
+.packet-row[aria-expanded="true"] { color: var(--ink); background: var(--paper-deep); font-weight: 600; }
+
+.packet-method { font-weight: 700; text-transform: uppercase; }
+.packet-host, .packet-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.packet-status { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+
+.packet-detail { padding: 8px 10px 10px; border-top: 1px solid var(--line-dark); overflow-x: auto; }
+.packet-nobody { margin: 0; color: var(--muted); font-style: italic; }
+.packet-text { margin: 0; white-space: pre-wrap; word-break: break-word; }
+.packet-response { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--line); }
+.packet-response-label { display: block; margin-bottom: 4px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+
+.json-tree { font: 12px/1.55 var(--font-mono); }
+.json-line { display: flex; align-items: baseline; padding: 1px 0; white-space: pre-wrap; word-break: break-word; }
+.json-line.json-header { align-items: center; }
+.json-children { margin-left: 2px; border-left: 1px dashed var(--line-dark); }
+.json-toggle {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin-right: 6px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1;
+  text-align: center;
+}
+.json-toggle:hover, .json-toggle:focus-visible { color: var(--ink); background: var(--paper-alt); }
+.json-key { flex: 0 0 auto; color: var(--ink); font-weight: 700; white-space: nowrap; }
+.json-string { min-width: 0; color: var(--ink); overflow-wrap: anywhere; }
+.json-number, .json-bool, .json-null { color: var(--muted); font-weight: 500; }
+.json-null { font-style: italic; }
+.json-punct { flex: 0 0 auto; color: var(--muted); }
+.json-collapsed { color: var(--muted); font-style: italic; }

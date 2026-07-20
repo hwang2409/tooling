@@ -1,0 +1,23 @@
+:root {
+  color-scheme: light;
+
+  /* monochrome palette: hierarchy comes from weight, size, and borders. */
+  --ink: #111111;
+  --ink-soft: #3a3a3a;
+  --muted: #565656;
+  --paper: #ffffff;
+  --paper-alt: #fafafa;
+  --paper-deep: #f4f4f4;
+  --line: #e5e5e5;
+  --line-dark: #cccccc;
+  --focus-ring: #111111;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", "SF Mono", Menlo, Consolas, "Roboto Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; background: var(--paper); }
+button { font: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--paper), 0 0 0 4px var(--focus-ring);
+}
