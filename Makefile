@@ -35,6 +35,8 @@ help:
 	@echo "  API   http://127.0.0.1:$(APP_PORT)/     (mitm-inspector backend)"
 	@echo "  PROXY http://127.0.0.1:$(PROXY_PORT)/   (point ANTHROPIC_BASE_URL here)"
 
+## One-shot dev: launch backend + reverse proxy + vite dev server in parallel.
+## Ctrl-C tears down all three. Open http://127.0.0.1:$(DEV_PORT)/ in browser.
 up: install
 	@echo "spinning up: api :$(APP_PORT) | proxy :$(PROXY_PORT) | ui :$(DEV_PORT)"
 	@echo "point anthropic client at:  http://127.0.0.1:$(PROXY_PORT)"
@@ -43,6 +45,7 @@ up: install
 	 uv run --python $(PY_VERSION) mitm-inspector run --app-port $(APP_PORT) --proxy-port $(PROXY_PORT); \
 	 wait
 
+## Prod-shaped: build the SPA, launch backend + proxy + vite preview.
 up-prod: install build
 	@echo "spinning up (preview): api :$(APP_PORT) | proxy :$(PROXY_PORT) | ui :$(PREVIEW_PORT)"
 	@trap 'kill 0' EXIT INT TERM; \
@@ -50,6 +53,7 @@ up-prod: install build
 	 uv run --python $(PY_VERSION) mitm-inspector run --app-port $(APP_PORT) --proxy-port $(PROXY_PORT); \
 	 wait
 
+## Individual processes.
 api:
 	uv run --python $(PY_VERSION) mitm-inspector run --app-port $(APP_PORT) --proxy-port $(PROXY_PORT)
 
@@ -75,6 +79,7 @@ install-web:
 build: install-web
 	cd $(WEB_DIR) && npm run build
 
+## Individual gate steps.
 ruff:
 	uv run --python $(PY_VERSION) ruff check .
 
@@ -96,11 +101,13 @@ vitest:
 e2e:
 	cd $(WEB_DIR) && npm run test:e2e
 
+## Aggregate gates.
 test-py: ruff mypy pytest
 test-web: typecheck lint vitest
-test: test-py test-web
-gate-e2e: test e2e
+test gate: test-py test-web
+gate-e2e: gate e2e
 
+## Cleanup.
 clean-py:
 	rm -rf .venv .mypy_cache .pytest_cache .ruff_cache
 
