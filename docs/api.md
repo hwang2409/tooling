@@ -18,6 +18,7 @@ refused at configuration time, never repaired.
 | --- | --- |
 | `GET /` | Minimal informational page for the browser-open affordance |
 | `GET /api/v1/health` | Readiness/health JSON with application and store counters |
+| `GET /api/v1/counters` | Top-level counter object with the same shape and keys as `/api/v1/health.counters` |
 | `GET /api/v1/snapshot` | One validated `browser.snapshot` message |
 | `GET /api/v1/stream` | WebSocket upgrade for the live session |
 | `GET /api/v1/flows/<flow_id>` | Every retained message for one selected flow, oldest first |
@@ -98,7 +99,13 @@ durable drain/acknowledge contract this listener is built for.
 The store keeps the configured flow/age/body/memory bounds
 (`docs/capture.md`).  `GET /api/v1/health` exposes application counters
 (`ingested_messages`, `relayed_messages`, `emitted_deltas`,
-`emitted_snapshots`, `dropped_subscribers`, `resync_responses`, `cursor`,
+`emitted_snapshots`, `dropped_subscribers`, `subscribers_partial_history`,
+`resync_responses`, `cursor`,
 `cursor_exhausted`, `subscribers`, `published_flows`), server counters
 (`rejected_ingest_lines`, `ingest_connections`, `http_requests`,
 `websocket_connections`, `sweep_failures`), and the nested store counters.
+
+`subscribers_partial_history` counts subscribers whose historical replay was
+truncated because the transport queue could not hold every retained lifecycle
+frame; it is not incremented for the normal case or for initial-frame
+refusals.
