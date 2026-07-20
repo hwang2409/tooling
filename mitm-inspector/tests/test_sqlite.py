@@ -21,7 +21,7 @@ from mitm_inspector.api.server import ApiServer, ApiServerConfig
 from mitm_inspector.capture.addon import CaptureAddon
 from mitm_inspector.protocol import KnownParsedMessage, parsed_message_to_plain_json
 from mitm_inspector.store.memory import MemoryStore
-from mitm_inspector.store.sqlite import SQLiteFlowStorage
+from mitm_inspector.store.sqlite import SearchCancelled, SQLiteFlowStorage
 
 
 class FakeHeaders(dict[str, str]):
@@ -125,6 +125,64 @@ def test_sqlite_round_trip_preserves_metadata_lifecycle_and_bodies(tmp_path: Pat
             "flow.lifecycle",
             "flow.lifecycle",
         ]
+    finally:
+        storage.close()
+
+
+def test_search_orders_mixed_precision_timestamps_chronologically(tmp_path: Path) -> None:
+    storage = SQLiteFlowStorage(tmp_path / "flows.sqlite")
+    try:
+        storage.offer(metadata("new-flow", b"needle new", b"response"))
+        storage.offer(
+            lifecycle("new-flow", 1, "2026-01-01T00:00:00Z", "request_started")
+        )
+        storage.offer(metadata("old-flow", b"needle old", b"response"))
+        storage.offer(
+            lifecycle(
+                "old-flow",
+                2,
+                "2025-01-01T00:00:00.123456Z",
+                "request_started",
+            )
+        )
+        storage.flush()
+
+        matches, truncated = storage.search("needle", 10)
+
+        assert not truncated
+        assert [match["flow_id"] for match in matches] == ["new-flow", "old-flow"]
+        assert all(match["flow"]["request_body"]["data"] == "" for match in matches)
+    finally:
+        storage.close()
+
+
+def test_search_uses_persisted_text_index_and_honors_cancellation(tmp_path: Path) -> None:
+    path = tmp_path / "flows.sqlite"
+    storage = SQLiteFlowStorage(path)
+    try:
+        storage.offer(metadata("flow-1", b"indexed needle", b"response"))
+        storage.flush()
+        with sqlite3.connect(path) as connection:
+            indexed = connection.execute(
+                "SELECT flow_id, field FROM body_search ORDER BY flow_id, field"
+            ).fetchall()
+            plan = connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT body_search.flow_id
+                FROM body_search_fts
+                JOIN body_search ON body_search.rowid = body_search_fts.rowid
+                WHERE body_search_fts.folded_text LIKE '%needle%'
+                LIMIT 2
+                """
+            ).fetchall()
+        assert indexed == [("flow-1", "request_body"), ("flow-1", "response_body")]
+        assert any("VIRTUAL TABLE INDEX" in str(row[3]) for row in plan)
+
+        cancelled = threading.Event()
+        cancelled.set()
+        with pytest.raises(SearchCancelled):
+            storage.search("needle", 10, cancelled)
     finally:
         storage.close()
 
@@ -429,7 +487,7 @@ def test_storage_byte_retention_bounds_the_database_file_set(tmp_path: Path) -> 
 
 def test_storage_drops_single_oversized_protected_flow_to_honor_byte_cap(tmp_path: Path) -> None:
     path = tmp_path / "flows.sqlite"
-    max_bytes = 100_000
+    max_bytes = 150_000
     storage = SQLiteFlowStorage(path, max_flows=10_000, max_bytes=max_bytes)
     try:
         storage.offer(metadata("oversized", b"x" * 300_000, b"y" * 300_000))
@@ -503,7 +561,7 @@ from pathlib import Path
 import mitm_inspector.store.sqlite as sqlite
 
 path = Path(sys.argv[1])
-storage = sqlite.SQLiteFlowStorage(path, max_bytes=100_000)
+storage = sqlite.SQLiteFlowStorage(path, max_bytes=150_000)
 original_checkpoint = sqlite._checkpoint
 calls = 0
 
@@ -545,11 +603,11 @@ storage.flush()
         text=True,
     )
     assert completed.returncode == 73, completed.stderr
-    reopened = SQLiteFlowStorage(path, max_bytes=100_000)
+    reopened = SQLiteFlowStorage(path, max_bytes=150_000)
     try:
         assert reopened.replay() == []
         files = [path, Path(f"{path}-wal"), Path(f"{path}-shm")]
-        assert sum(file.stat().st_size for file in files if file.exists()) <= 100_000
+        assert sum(file.stat().st_size for file in files if file.exists()) <= 150_000
     finally:
         reopened.close()
 

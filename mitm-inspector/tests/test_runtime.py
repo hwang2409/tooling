@@ -1350,6 +1350,7 @@ def test_app_server_module_serves_health_and_stops_on_sigterm() -> None:
             "127.0.0.1",
             "--port",
             str(app_port),
+            "--no-storage",
         ],
         stdin=subprocess.DEVNULL,
     )

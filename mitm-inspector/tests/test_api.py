@@ -1,10 +1,12 @@
 import asyncio
 import base64
+import gzip
 import json
 import os
 import shutil
 import stat as stat_module
 import tempfile
+import threading
 from collections.abc import Callable, Coroutine, Iterator
 from pathlib import Path
 from typing import Any
@@ -51,12 +53,17 @@ from mitm_inspector.api.server import (
 from mitm_inspector.api.server import (
     main as server_main,
 )
+from mitm_inspector.detail_limits import (
+    MAX_DURABLE_DETAIL_OUTPUT_BYTES,
+    MAX_DURABLE_DETAIL_RETAINED_BODY_BYTES,
+)
 from mitm_inspector.protocol import (
     MAX_U64,
     ProtocolError,
     parse_message,
 )
 from mitm_inspector.store.memory import MemoryStore
+from mitm_inspector.store.sqlite import SearchCancelled
 
 ROOT = Path(__file__).parents[1]
 SCHEMA_PATH = ROOT / "contracts" / "protocol-v1.schema.json"
@@ -267,14 +274,14 @@ def test_grid_flow_is_independent_schema_valid_and_body_free() -> None:
     assert metadata["method"] == "POST"
 
 
-def test_collect_grid_flows_uses_newest_metadata_per_flow_oldest_first() -> None:
+def test_collect_grid_flows_uses_newest_metadata_in_stable_flow_order() -> None:
     store = MemoryStore(8, clock=lambda: 0.0)
     store.append(parse_message(metadata_message("flow-a", path="/old")))
     store.append(parse_message(metadata_message("flow-b")))
     store.append(parse_message(metadata_message("flow-a", path="/new")))
     store.append(parse_message(lifecycle_message("flow-a")))
     flows = collect_grid_flows(store)
-    assert list(flows) == ["flow-b", "flow-a"] or list(flows) == ["flow-a", "flow-b"]
+    assert list(flows) == ["flow-b", "flow-a"]
     assert flows["flow-a"]["path"] == "/new"
 
 
@@ -288,6 +295,20 @@ def test_diff_grid_changes_orders_removes_then_upserts() -> None:
         {"op": "upsert", "flow": {"flow_id": "c"}},
     ]
     assert diff_grid_changes(current, current) == []
+
+
+def test_diff_grid_changes_emits_new_flow_batch_in_canonical_snapshot_order() -> None:
+    published = {"a": {"flow_id": "a"}}
+    current = {
+        "c": {"flow_id": "c"},
+        "b": {"flow_id": "b"},
+        "a": {"flow_id": "a"},
+    }
+
+    changes = diff_grid_changes(published, current)
+    emitted_order = [change["flow"]["flow_id"] for change in changes]
+
+    assert emitted_order == list(current)[:2] == ["c", "b"]
 
 
 # -- application: connect and stream ---------------------------------------
@@ -1281,6 +1302,9 @@ def test_websocket_session_streams_snapshot_deltas_and_resync(
             assert changes[0]["flow"]["request_body"]["data"] == ""
             lifecycle = await client.read_message()
             assert lifecycle["type"] == "flow.lifecycle"
+            timing_delta = await client.read_message()
+            assert timing_delta["type"] == "browser.delta"
+            assert timing_delta["changes"][0]["flow"]["started_at"] == "2026-01-01T00:00:00Z"
             gap = await client.read_message()
             assert gap["type"] == "stream.gap"
 
@@ -1302,7 +1326,7 @@ def test_websocket_session_streams_snapshot_deltas_and_resync(
             assert echo["type"] == "browser.resync"
             assert echo["requested_cursor"] == "1"
             assert fresh["type"] == "browser.snapshot"
-            assert fresh["cursor"] == "1"
+            assert fresh["cursor"] == "2"
 
             # A clean client close is answered with a close frame.
             await client.send_raw(mask_frame(0x8, (1000).to_bytes(2, "big")))
@@ -1424,6 +1448,364 @@ def test_flow_detail_endpoint_serves_bodies_only_on_selection(
             assert traversal.startswith(b"HTTP/1.1 404 ")
         finally:
             await server.close()
+
+    run_async(scenario)
+
+
+def test_flow_detail_decodes_gzip_and_surfaces_original_encoding(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        server = make_server(tmp_path, with_ingest=False)
+        await server.start()
+        try:
+            response_text = b'{"stop_reason":"end_turn","usage":{"output_tokens":5}}'
+            compressed = gzip.compress(response_text)
+            metadata = metadata_message()
+            metadata_value = metadata["metadata"]
+            assert isinstance(metadata_value, dict)
+            metadata_value.update(
+                {
+                    "host": "api.anthropic.com",
+                    "response_headers": [
+                        {"name": "content-type", "value": "application/json"},
+                        {"name": "content-encoding", "value": "gzip"},
+                    ],
+                    "response_status": "200",
+                    "response_body": captured_body(compressed),
+                }
+            )
+            server.application.ingest(metadata)
+            server.application.ingest(
+                {
+                    "protocol_version": "1",
+                    "type": "body.end",
+                    "flow_id": "flow-1",
+                    "body_side": "response",
+                    "total_bytes": str(len(compressed)),
+                    "body": captured_body(compressed),
+                }
+            )
+
+            snapshot_response = await http_request(
+                server.bound_port, get("/api/v1/snapshot", server.bound_port)
+            )
+            snapshot = json.loads(response_body(snapshot_response))
+            flow = snapshot["flows"][0]
+            assert flow["response_body_size"] == str(len(compressed))
+            assert flow["content_encoding"] == {"response": "gzip"}
+
+            detail_response = await http_request(
+                server.bound_port, get("/api/v1/flows/flow-1", server.bound_port)
+            )
+            detail = json.loads(response_body(detail_response))
+            decoded_bodies = [
+                base64.b64decode(message["body"]["data"])
+                for message in detail["messages"]
+                if message["type"] == "body.end"
+            ]
+            assert decoded_bodies == [response_text]
+            detail_metadata = next(
+                message["metadata"]
+                for message in detail["messages"]
+                if message["type"] == "flow.metadata"
+            )
+            assert detail_metadata["content_encoding"] == {"response": "gzip"}
+            assert base64.b64decode(detail_metadata["response_body"]["data"]) == response_text
+        finally:
+            await server.close()
+
+    run_async(scenario)
+
+
+def test_search_endpoint_queries_durable_decoded_bodies_and_validates_input(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = ApiServerConfig(
+            host="127.0.0.1",
+            port=0,
+            max_retained_flows=1,
+            storage_path=tmp_path / "flows.sqlite",
+            sweep_interval_seconds=0.05,
+        )
+        server = ApiServer(config)
+        await server.start()
+        try:
+            first = metadata_message("flow-a", request_body=captured_body(b'{"text":"Needle one"}'))
+            first_value = first["metadata"]
+            assert isinstance(first_value, dict)
+            compressed = gzip.compress(b"response needle match")
+            first_value.update(
+                {
+                    "response_headers": [{"name": "content-encoding", "value": "gzip"}],
+                    "response_status": "200",
+                    "response_body": captured_body(compressed),
+                }
+            )
+            second = metadata_message(
+                "flow-b", request_body=captured_body(b'{"text":"needle two"}')
+            )
+            server.application.ingest(first)
+            server.application.ingest(
+                lifecycle_message("flow-a", state="flow_completed", sequence="1")
+            )
+            server.application.ingest(second)
+            server.application.ingest(
+                lifecycle_message("flow-b", state="flow_completed", sequence="2")
+            )
+
+            limited_response = await http_request(
+                server.bound_port, get("/api/v1/search?q=needle&limit=1", server.bound_port)
+            )
+            limited = json.loads(response_body(limited_response))
+            assert limited["truncated"] is True
+            assert len(limited["matches"]) == 1
+            limited_match = limited["matches"][0]
+            assert {
+                key: limited_match[key] for key in ("flow_id", "field", "snippet")
+            } == {
+                "flow_id": "flow-b",
+                "field": "request_body",
+                "snippet": '{"text":"needle two"}',
+            }
+            assert limited_match["flow"]["flow_id"] == "flow-b"
+            assert limited_match["flow"]["request_body"]["data"] == ""
+
+            all_response = await http_request(
+                server.bound_port, get("/api/v1/search?q=needle", server.bound_port)
+            )
+            all_matches = json.loads(response_body(all_response))["matches"]
+            assert [(match["flow_id"], match["field"]) for match in all_matches] == [
+                ("flow-b", "request_body"),
+                ("flow-a", "request_body"),
+                ("flow-a", "response_body"),
+            ]
+            snapshot_response = await http_request(
+                server.bound_port, get("/api/v1/snapshot", server.bound_port)
+            )
+            snapshot_flow_ids = {
+                flow["flow_id"]
+                for flow in json.loads(response_body(snapshot_response))["flows"]
+            }
+            assert "flow-a" not in snapshot_flow_ids
+            older_match = next(match for match in all_matches if match["flow_id"] == "flow-a")
+            assert older_match["flow"]["flow_id"] == "flow-a"
+            assert older_match["flow"]["request_body"]["data"] == ""
+            detail_response = await http_request(
+                server.bound_port, get("/api/v1/flows/flow-a", server.bound_port)
+            )
+            assert detail_response.startswith(b"HTTP/1.1 200 ")
+            detail = json.loads(response_body(detail_response))
+            detail_metadata = next(
+                message["metadata"]
+                for message in detail["messages"]
+                if message["type"] == "flow.metadata"
+            )
+            assert detail_metadata["request_headers"] == older_match["flow"]["request_headers"]
+            request_end = next(
+                message
+                for message in detail["messages"]
+                if message["type"] == "body.end" and message["body_side"] == "request"
+            )
+            assert base64.b64decode(request_end["body"]["data"]) == b'{"text":"Needle one"}'
+
+            no_match_response = await http_request(
+                server.bound_port, get("/api/v1/search?q=absent", server.bound_port)
+            )
+            assert json.loads(response_body(no_match_response)) == {
+                "matches": [],
+                "truncated": False,
+            }
+            for path in ("/api/v1/search", "/api/v1/search?q="):
+                invalid = await http_request(server.bound_port, get(path, server.bound_port))
+                assert invalid.startswith(b"HTTP/1.1 400 ")
+        finally:
+            await server.close()
+
+    run_async(scenario)
+
+
+def test_durable_detail_bounds_large_evicted_body(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        server = ApiServer(
+            ApiServerConfig(
+                host="127.0.0.1",
+                port=0,
+                max_retained_flows=1,
+                storage_path=tmp_path / "flows.sqlite",
+            )
+        )
+        await server.start()
+        try:
+            large_body = b"x" * 3_000_000
+            server.application.ingest(
+                metadata_message("flow-large", request_body=captured_body(large_body))
+            )
+            server.application.ingest(
+                lifecycle_message("flow-large", state="flow_completed", sequence="1")
+            )
+            server.application.ingest(metadata_message("flow-new"))
+            server.application.ingest(
+                lifecycle_message("flow-new", state="flow_completed", sequence="2")
+            )
+
+            response = await http_request(
+                server.bound_port,
+                get("/api/v1/flows/flow-large", server.bound_port),
+            )
+            assert response.startswith(b"HTTP/1.1 200 ")
+            body = response_body(response)
+            assert len(body) <= MAX_DURABLE_DETAIL_OUTPUT_BYTES
+            detail = json.loads(body)
+            request_end = next(
+                message
+                for message in detail["messages"]
+                if message["type"] == "body.end" and message["body_side"] == "request"
+            )
+            descriptor = request_end["body"]
+            retained = base64.b64decode(descriptor["data"])
+            assert descriptor["state"] == "truncated"
+            assert descriptor["size_bytes"] == str(len(large_body))
+            assert descriptor["captured_bytes"] == str(len(retained))
+            assert len(retained) == MAX_DURABLE_DETAIL_RETAINED_BODY_BYTES
+        finally:
+            await server.close()
+
+    run_async(scenario)
+
+
+def test_detail_timing_uses_the_same_lifecycle_sequence_reducer_as_grid() -> None:
+    application = make_application(max_items=32)
+    application.ingest(metadata_message("flow-timing"))
+    terminal_nine = lifecycle_message(
+        "flow-timing", state="flow_completed", sequence="9"
+    )
+    terminal_nine["occurred_at"] = "2026-01-01T12:09:00Z"
+    terminal_five = lifecycle_message(
+        "flow-timing", state="flow_completed", sequence="5"
+    )
+    terminal_five["occurred_at"] = "2026-01-01T12:05:00Z"
+    application.ingest(terminal_nine)
+    application.ingest(terminal_five)
+
+    snapshot = json.loads(application.snapshot_text())
+    detail_text = application.flow_detail_text("flow-timing")
+    assert detail_text is not None
+    detail = json.loads(detail_text)
+    detail_metadata = next(
+        message["metadata"]
+        for message in detail["messages"]
+        if message["type"] == "flow.metadata"
+    )
+    assert snapshot["flows"][0]["ended_at"] == "2026-01-01T12:09:00Z"
+    assert detail_metadata["ended_at"] == "2026-01-01T12:09:00Z"
+
+
+def test_detail_preserves_truncated_compressed_body_total() -> None:
+    application = make_application(max_items=32)
+    compressed = gzip.compress(b"decoded" * 100_000)
+    prefix = compressed[: len(compressed) // 2]
+    truncated = {
+        "state": "truncated",
+        "size_bytes": str(len(compressed)),
+        "captured_bytes": str(len(prefix)),
+        "encoding": "base64",
+        "data": base64.b64encode(prefix).decode("ascii"),
+        "content_type": "application/json",
+    }
+    message = metadata_message("flow-truncated")
+    metadata = message["metadata"]
+    assert isinstance(metadata, dict)
+    metadata.update(
+        {
+            "response_headers": [{"name": "content-encoding", "value": "gzip"}],
+            "response_status": "200",
+            "response_body": truncated,
+        }
+    )
+    application.ingest(message)
+    application.ingest(
+        {
+            "protocol_version": "1",
+            "type": "body.end",
+            "flow_id": "flow-truncated",
+            "body_side": "response",
+            "total_bytes": str(len(compressed)),
+            "body": truncated,
+        }
+    )
+    detail_text = application.flow_detail_text("flow-truncated")
+    assert detail_text is not None
+    detail = json.loads(detail_text)
+    body_end = next(
+        message for message in detail["messages"] if message["type"] == "body.end"
+    )
+    assert body_end["total_bytes"] == str(len(compressed))
+    assert body_end["body"] == truncated
+
+
+def test_new_search_cancels_and_serializes_an_older_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        server = ApiServer(
+            ApiServerConfig(
+                host="127.0.0.1",
+                port=0,
+                storage_path=tmp_path / "flows.sqlite",
+            )
+        )
+        storage = server._storage
+        assert storage is not None
+        first_started = threading.Event()
+        active = 0
+        max_active = 0
+        active_lock = threading.Lock()
+
+        def fake_search(
+            query: str, limit: int, cancel: threading.Event | None = None
+        ) -> tuple[list[object], bool]:
+            nonlocal active, max_active
+            assert limit == 50
+            assert cancel is not None
+            with active_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                if query == "first":
+                    first_started.set()
+                    cancel.wait(timeout=2)
+                    raise SearchCancelled
+                return [], False
+            finally:
+                with active_lock:
+                    active -= 1
+
+        monkeypatch.setattr(storage, "search", fake_search)
+
+        class BufferWriter:
+            def __init__(self) -> None:
+                self.data = bytearray()
+
+            def write(self, data: bytes) -> None:
+                self.data.extend(data)
+
+            async def drain(self) -> None:
+                return
+
+        first_writer = BufferWriter()
+        second_writer = BufferWriter()
+        first_task = asyncio.create_task(
+            server._handle_plain_get("/api/v1/search?q=first", first_writer)  # type: ignore[arg-type]
+        )
+        assert await asyncio.to_thread(first_started.wait, 1)
+        second_task = asyncio.create_task(
+            server._handle_plain_get("/api/v1/search?q=second", second_writer)  # type: ignore[arg-type]
+        )
+        await asyncio.gather(first_task, second_task)
+        assert first_writer.data == b""
+        assert second_writer.data.startswith(b"HTTP/1.1 200 ")
+        assert max_active == 1
+        await server.close()
 
     run_async(scenario)
 
@@ -1650,7 +2032,7 @@ def test_incremental_metadata_projection_matches_full_rescan(
     assert projection_calls == 0
 
 
-def test_incremental_metadata_projection_emits_single_upsert_delta(
+def test_unknown_upsert_prepends_known_upsert_stays_and_resnapshot_matches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import mitm_inspector.api.app as app_module
@@ -1666,19 +2048,26 @@ def test_incremental_metadata_projection_emits_single_upsert_delta(
     monkeypatch.setattr(app_module, "collect_grid_flows", spy_projection)
     application = make_application(max_items=64)
     application.ingest(metadata_message("flow-a"))
-    application.ingest(metadata_message("flow-b"))
-    projection_calls = 0
     frames: list[str] = []
     application.subscribe(lambda text: frames.append(text) or True)
+    initial = json.loads(frames[-1])
+    assert [flow["flow_id"] for flow in initial["flows"]] == ["flow-a"]
     frames.clear()
+    projection_calls = 0
+    application.ingest(metadata_message("flow-b"))
     application.ingest(metadata_message("flow-a", path="/v1/updated"))
     deltas = [json.loads(frame) for frame in frames if '"browser.delta"' in frame]
-    assert len(deltas) == 1
-    changes = deltas[0]["changes"]
-    assert len(changes) == 1
-    assert changes[0]["op"] == "upsert"
-    assert changes[0]["flow"]["flow_id"] == "flow-a"
-    assert changes[0]["flow"]["path"] == "/v1/updated"
+    assert len(deltas) == 2
+    assert [delta["changes"][0]["op"] for delta in deltas] == ["upsert", "upsert"]
+    assert [delta["changes"][0]["flow"]["flow_id"] for delta in deltas] == [
+        "flow-b",
+        "flow-a",
+    ]
+    assert deltas[1]["changes"][0]["flow"]["path"] == "/v1/updated"
+    original_order = ["flow-b", "flow-a"]
+    assert list(application._state.published) == original_order
+    snapshot = json.loads(application.snapshot_text())
+    assert [flow["flow_id"] for flow in snapshot["flows"]] == original_order
     assert projection_calls == 0
 
 

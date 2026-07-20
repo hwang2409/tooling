@@ -84,6 +84,57 @@
         }
       ]
     },
+    "contentEncoding": {
+      "type": "object",
+      "properties": {
+        "request": {"type": "string"},
+        "response": {"type": "string"}
+      }
+    },
+    "flowPreview": {
+      "type": "object",
+      "required": ["source"],
+      "properties": {
+        "source": {"enum": ["user_text", "tool_result", "none"]},
+        "text": {"type": "string"},
+        "tool_name": {"type": "string"}
+      }
+    },
+    "flowSummary": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {"enum": ["anthropic_messages", "anthropic_count_tokens", "generic"]},
+        "model": {"type": "string"},
+        "message_count": {"$ref": "#/$defs/u64"},
+        "stream": {"type": "boolean"},
+        "preview": {"$ref": "#/$defs/flowPreview"},
+        "stop_reason": {"type": "string"},
+        "input_tokens": {"$ref": "#/$defs/u64"},
+        "output_tokens": {"$ref": "#/$defs/u64"},
+        "cache_read_input_tokens": {"$ref": "#/$defs/u64"},
+        "thinking_tokens": {"$ref": "#/$defs/u64"},
+        "count_tokens_result": {"$ref": "#/$defs/u64"}
+      }
+    },
+    "searchMatch": {
+      "type": "object",
+      "required": ["flow_id", "field", "snippet"],
+      "properties": {
+        "flow_id": {"type": "string", "minLength": 1},
+        "field": {"enum": ["request_body", "response_body"]},
+        "snippet": {"type": "string", "maxLength": 160},
+        "flow": {"$ref": "#/$defs/flow"}
+      }
+    },
+    "searchResponse": {
+      "type": "object",
+      "required": ["matches", "truncated"],
+      "properties": {
+        "matches": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/searchMatch"}},
+        "truncated": {"type": "boolean"}
+      }
+    },
     "flow": {
       "type": "object",
       "required": ["flow_id", "method", "scheme", "host", "port", "path", "request_headers", "request_body"],
@@ -99,7 +150,15 @@
         "response_headers": {"type": "array", "items": {"$ref": "#/$defs/header"}},
         "response_status": {"type": "string", "pattern": "^[1-5][0-9][0-9]$"},
         "request_body": {"$ref": "#/$defs/body"},
-        "response_body": {"$ref": "#/$defs/body"}
+        "response_body": {"$ref": "#/$defs/body"},
+        "started_at": {"type": "string", "format": "date-time"},
+        "ended_at": {"type": "string", "format": "date-time"},
+        "request_body_size": {"$ref": "#/$defs/u64"},
+        "response_body_size": {"$ref": "#/$defs/u64"},
+        "request_content_type": {"type": "string"},
+        "response_content_type": {"type": "string"},
+        "content_encoding": {"$ref": "#/$defs/contentEncoding"},
+        "summary": {"$ref": "#/$defs/flowSummary"}
       }
     },
     "sourceHello": {

@@ -51,6 +51,9 @@ machine. Consumers must not assume request completion precedes response start;
   `{max_body_prefix_bytes, max_in_memory_bytes}`.
 - `flow.metadata`: a sanitized `metadata` flow with non-empty identity fields,
   `scheme` `http|https`, decimal-string `port`, and ordered header arrays.
+  Additive projection fields carry RFC3339 UTC `started_at`/`ended_at`, observed
+  wire-byte body sizes, content types, original request/response content
+  encodings when decoding succeeded, and a content-derived `summary`.
 - `flow.lifecycle`: `source_id`, `flow_id`, `event_id`, `occurred_at`, bounded
   decimal-string `sequence`, and one lifecycle state above.
 - `body.chunk`: `flow_id`, `body_side` `request|response`, bounded decimal-string
@@ -61,7 +64,10 @@ machine. Consumers must not assume request completion precedes response start;
   bounded `dropped_count` following the arithmetic rule above.
 - `browser.snapshot`: `snapshot_id`, bounded `cursor`, and complete flow list.
 - `browser.delta`: bounded `cursor` and changes with only `upsert {flow}` or
-  `remove {flow_id}` operations.
+  `remove {flow_id}` operations. Flow order is newest-first: an upsert of an
+  unknown `flow_id` prepends, while an upsert of a known `flow_id` replaces it
+  in place. Multiple unknown-flow upserts are emitted newest-first as one
+  ordered batch, and consumers must preserve that order when prepending them.
 - `browser.resync`: `reason` `cursor_gap|history_evicted|initial_connect` and
   bounded `requested_cursor`.
 
@@ -81,6 +87,25 @@ policy permits empty header values, empty base64 data where a zero-byte chunk
 or body makes that meaningful, and an explicitly present empty `content_type`.
 Identifiers, header names, paths, directions, and enum values remain
 non-empty/validated.
+
+## Flow summaries
+
+Anthropic `/v1/messages` summaries include model, message count, streaming
+mode, the last useful user-text or tool-result preview, and response usage and
+stop fields parsed from either JSON or SSE. `/v1/messages/count_tokens`
+summaries additionally expose `count_tokens_result`. Numeric summary values
+remain bounded decimal strings. Malformed or truncated JSON/SSE contributes
+only the fields that can be parsed; non-Anthropic flows use `kind: "generic"`.
+
+When a retained body uses gzip or deflate, API projection decodes its served
+prefix and records the original coding under `content_encoding`. The separate
+`request_body_size` and `response_body_size` fields always describe observed
+wire bytes before truncation or decoding.
+Decoded output is capped at the ingest body-prefix ceiling. Complete bounded
+streams, including every member of concatenated gzip, are served decoded;
+incomplete, invalid, trailing-data, or over-limit descriptors retain their raw
+encoded representation so the API never invents a decoded total size. Summary
+and durable-search parsing may consume only the bounded partial decoded prefix.
 The shared `contracts/fixtures/conformance.json` contains positive and adversarial
 negative cases exercised by the schema, Python, and TypeScript tests. JSON
 Schema enforces the types, vocabularies, and bounds; the Python/TypeScript

@@ -17,13 +17,16 @@ import re
 import signal
 import stat
 import sys
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from mitm_inspector.api.app import (
     SUBSCRIBER_QUEUE_FRAMES,
     ApiApplication,
+    FlowDetailTooLarge,
     Subscriber,
 )
 from mitm_inspector.api.httpwire import (
@@ -55,6 +58,8 @@ from mitm_inspector.store.sqlite import (
     DEFAULT_STORAGE_MAX_BYTES,
     DEFAULT_STORAGE_MAX_FLOWS,
     DEFAULT_STORAGE_REPLAY,
+    SearchCancelled,
+    SearchMatch,
     SQLiteFlowStorage,
     default_storage_path,
 )
@@ -64,6 +69,7 @@ HEALTH_PATH = f"{API_VERSION_PREFIX}/health"
 COUNTERS_PATH = f"{API_VERSION_PREFIX}/counters"
 SNAPSHOT_PATH = f"{API_VERSION_PREFIX}/snapshot"
 STREAM_PATH = f"{API_VERSION_PREFIX}/stream"
+SEARCH_PATH = f"{API_VERSION_PREFIX}/search"
 FLOW_PATH_PREFIX = f"{API_VERSION_PREFIX}/flows/"
 MAX_CLIENT_MESSAGE_BYTES = 64 * 1024
 HEAD_READ_TIMEOUT_SECONDS = 10.0
@@ -241,6 +247,9 @@ class ApiServer:
         self._http_requests = 0
         self._websocket_connections = 0
         self._sweep_failures = 0
+        self._search_guard = asyncio.Lock()
+        self._search_cancel: threading.Event | None = None
+        self._durable_detail_guard = asyncio.Lock()
 
     @property
     def counters(self) -> dict[str, object]:
@@ -304,6 +313,8 @@ class ApiServer:
 
     async def close(self) -> None:
         self._closing = True
+        if self._search_cancel is not None:
+            self._search_cancel.set()
         if self._sweep_task is not None:
             self._sweep_task.cancel()
             try:
@@ -438,14 +449,14 @@ class ApiServer:
                 if head.method != "GET":
                     await self._send_simple(writer, 405, b"only GET is supported")
                     return
-                target = head.target.split("?", 1)[0]
-                if target == STREAM_PATH:
+                target_path = head.target.split("?", 1)[0]
+                if target_path == STREAM_PATH:
                     await self._handle_websocket(head, reader, writer)
                     return
             except HttpWireError:
                 await self._send_simple(writer, 400, b"malformed request")
                 return
-            await self._handle_plain_get(target, writer)
+            await self._handle_plain_get(head.target, writer)
         except (ConnectionError, BrokenPipeError):
             pass
         finally:
@@ -453,30 +464,86 @@ class ApiServer:
             await _close_writer(writer)
 
     async def _handle_plain_get(self, target: str, writer: asyncio.StreamWriter) -> None:
-        if target == "/":
+        split_target = urlsplit(target)
+        path = split_target.path
+        if path == "/":
             await self._send_response(writer, 200, "text/html; charset=utf-8", _INDEX_BODY)
             return
-        if target == HEALTH_PATH:
+        if path == HEALTH_PATH:
             body = json.dumps(
                 {"status": "ok", "protocol_version": "1", "counters": self.counters},
                 separators=(",", ":"),
             ).encode("utf-8")
             await self._send_response(writer, 200, "application/json", body)
             return
-        if target == COUNTERS_PATH:
+        if path == COUNTERS_PATH:
             body = json.dumps(self.counters, separators=(",", ":")).encode("utf-8")
             await self._send_response(writer, 200, "application/json", body)
             return
-        if target == SNAPSHOT_PATH:
+        if path == SNAPSHOT_PATH:
             body = self.application.snapshot_text().encode("utf-8")
             await self._send_response(writer, 200, "application/json", body)
             return
-        if target.startswith(FLOW_PATH_PREFIX):
-            flow_id = target[len(FLOW_PATH_PREFIX) :]
+        if path == SEARCH_PATH:
+            try:
+                parameters = parse_qs(split_target.query, keep_blank_values=True)
+                query_values = parameters.get("q", [])
+                limit_values = parameters.get("limit", [])
+                if len(query_values) != 1 or not query_values[0] or len(limit_values) > 1:
+                    raise ValueError
+                limit = 50 if not limit_values else int(limit_values[0])
+                if limit < 1:
+                    raise ValueError
+                limit = min(limit, 200)
+            except ValueError:
+                await self._send_simple(writer, 400, b"q and limit must be valid")
+                return
+            if self._storage is None:
+                matches: list[SearchMatch] = []
+                truncated = False
+            else:
+                cancel = threading.Event()
+                previous = self._search_cancel
+                self._search_cancel = cancel
+                if previous is not None:
+                    previous.set()
+                async with self._search_guard:
+                    if cancel.is_set():
+                        return
+                    try:
+                        matches, truncated = await asyncio.to_thread(
+                            self._storage.search, query_values[0], limit, cancel
+                        )
+                    except SearchCancelled:
+                        return
+                    finally:
+                        if self._search_cancel is cancel:
+                            self._search_cancel = None
+            body = json.dumps(
+                {"matches": matches, "truncated": truncated}, separators=(",", ":")
+            ).encode("utf-8")
+            await self._send_response(writer, 200, "application/json", body)
+            return
+        if path.startswith(FLOW_PATH_PREFIX):
+            flow_id = path[len(FLOW_PATH_PREFIX) :]
             if not _FLOW_ID_SEGMENT.fullmatch(flow_id):
                 await self._send_simple(writer, 404, b"unknown flow")
                 return
             detail = self.application.flow_detail_text(flow_id)
+            if detail is None and self._storage is not None:
+                try:
+                    async with self._durable_detail_guard:
+                        durable_detail = await asyncio.to_thread(
+                            self.application.durable_flow_detail_bytes, flow_id
+                        )
+                except FlowDetailTooLarge:
+                    await self._send_simple(writer, 413, b"flow detail exceeds limit")
+                    return
+                if durable_detail is None:
+                    await self._send_simple(writer, 404, b"unknown flow")
+                    return
+                await self._send_response(writer, 200, "application/json", durable_detail)
+                return
             if detail is None:
                 await self._send_simple(writer, 404, b"unknown flow")
                 return
@@ -628,6 +695,7 @@ class ApiServer:
             403: "Forbidden",
             404: "Not Found",
             405: "Method Not Allowed",
+            413: "Payload Too Large",
         }
         reason = reasons.get(status, "Error")
         head = (

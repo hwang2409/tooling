@@ -37,10 +37,22 @@ REQUEST_BODY = json.dumps(REQUEST_PAYLOAD).encode("utf-8")
 
 SSE_BODY = "\n\n".join(
     [
-        'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-example","role":"assistant","usage":{"input_tokens":3}}}',
-        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
-        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}',
-        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}',
+        (
+            'event: message_start\ndata: {"type":"message_start","message":'
+            '{"model":"claude-example","role":"assistant","usage":{"input_tokens":3}}}'
+        ),
+        (
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+            '"content_block":{"type":"text","text":""}}'
+        ),
+        (
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+            '"delta":{"type":"text_delta","text":"answer"}}'
+        ),
+        (
+            'event: message_delta\ndata: {"type":"message_delta",'
+            '"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}'
+        ),
         'event: message_stop\ndata: {"type":"message_stop"}',
         'event: content_block_delta\ndata: {"type":"content_block_delta"',
     ]
@@ -240,7 +252,9 @@ def run_workflow(page: Page) -> None:
     expect(row).to_contain_text("api.example.test")
     expect(row).to_contain_text("/v1/messages")
     expect(row).to_contain_text("500")
-    assert page.locator(".packet-status-error").evaluate("el => getComputedStyle(el).color") == "rgb(180, 35, 24)"
+    assert page.locator(".packet-status-error").evaluate(
+        "el => getComputedStyle(el).color"
+    ) == "rgb(180, 35, 24)"
     # The snapshot carries no body bytes, so nothing may render before the
     # click-triggered detail fetch.
     assert detail_requests == [], detail_requests
@@ -274,7 +288,9 @@ def run_workflow(page: Page) -> None:
 
     for width in (600, 800):
         page.set_viewport_size({"width": width, "height": 700})
-        document_width = page.evaluate("Math.max(document.body.scrollWidth, document.documentElement.scrollWidth)")
+        document_width = page.evaluate(
+            "Math.max(document.body.scrollWidth, document.documentElement.scrollWidth)"
+        )
         assert document_width <= width, (width, document_width)
         geometry = page.locator(".packet-row").evaluate(
             """row => {
@@ -294,7 +310,10 @@ def run_workflow(page: Page) -> None:
             }"""
         )
         assert 24 <= geometry["height"] <= 32, (width, geometry)
-        assert geometry["rowTop"] <= geometry["statusTop"] <= geometry["rowBottom"], (width, geometry)
+        assert geometry["rowTop"] <= geometry["statusTop"] <= geometry["rowBottom"], (
+            width,
+            geometry,
+        )
         assert geometry["statusLeft"] >= geometry["previewRight"] - 1, (width, geometry)
         assert geometry["sizes"] == "none", (width, geometry)
         assert geometry["duration"] == "none", (width, geometry)

@@ -22,6 +22,7 @@ refused at configuration time, never repaired.
 | `GET /api/v1/snapshot` | One validated `browser.snapshot` message |
 | `GET /api/v1/stream` | WebSocket upgrade for the live session |
 | `GET /api/v1/flows/<flow_id>` | Every retained message for one selected flow, oldest first |
+| `GET /api/v1/search?q=<text>&limit=<n>` | Durable body matches, newest first (default 50, maximum 200) |
 
 Every request must carry exactly one loopback `Host` header (DNS-rebinding
 defense); request bodies, non-GET methods, oversized heads, folded headers,
@@ -43,7 +44,12 @@ that the session receives:
   shared across all sessions.  Changes are `upsert`/`remove` operations
   derived from the store's newest `flow.metadata` per flow; store eviction
   and age expiry surface as `remove` operations (an idle sweep task publishes
-  expiry without traffic).
+  expiry without traffic). Canonical flow order is newest-first: a plain
+  `upsert` whose `flow_id` is unknown inserts at the front, while an `upsert`
+  whose `flow_id` is already known updates that flow in place. Applying those
+  rules makes live and reconnect snapshot order identical. Unknown-flow
+  upserts within one delta are emitted in canonical newest-first order;
+  consumers that prepend them must preserve that batch order.
 - Relayed `flow.lifecycle`, `stream.gap`, `source.hello`, and unknown-type
   messages, byte-independent copies with additive fields retained.
 - Nothing else: `body.chunk`, `body.end`, and raw `flow.metadata` are retained
@@ -73,6 +79,29 @@ flow entries pass through a body redaction projection: `captured` and
 unchanged.  The only surface that carries body bytes is
 `GET /api/v1/flows/<flow_id>`, which returns the full retained messages
 (metadata, chunks, body ends, lifecycle) for one explicitly selected flow.
+If the flow has left the in-memory grid but remains in durable retention, the
+endpoint reconstructs it from sqlite using the same sanitized metadata used by
+the search row projection; retained body bytes remain available only through
+this explicit detail endpoint. Durable reconstruction retains at most 1 MiB of
+body material and 512 messages, marks a bounded prefix `truncated` while
+preserving its observed wire size, and caps encoded JSON at 4 MiB. The complete
+read/render/encode operation runs off the event loop, with durable detail
+requests serialized; an envelope that still exceeds the output ceiling returns
+HTTP 413.
+Gzip/deflate metadata and terminal body descriptors are decoded on this
+surface; compressed chunk messages are omitted when the decoded terminal
+descriptor is available. Stored sqlite bytes are never rewritten.
+
+`GET /api/v1/search` performs a case-insensitive substring search over durable
+sqlite request bodies and decodable response bodies. It returns at most the
+requested number of `{flow_id, field, snippet, flow}` objects, with whitespace-
+collapsed snippets bounded to 160 characters and a `truncated` flag when more
+matches exist. `flow` is the same enriched, body-redacted projection used by
+snapshot rows, so matches older than the in-memory snapshot remain renderable;
+the three original match fields remain stable for older clients. Search runs
+against a persisted trigram text projection, materializes at most `limit + 1`
+candidates, and a newer request cooperatively cancels an older scan. A missing
+or empty `q` is rejected with HTTP 400.
 
 ## Capture ingest socket
 

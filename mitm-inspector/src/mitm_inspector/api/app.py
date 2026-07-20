@@ -9,12 +9,20 @@ proxy, tuple, or mutable alias can cross onto a transport.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from mitm_inspector.api.bodies import body_content_encoding, decoded_body_descriptor
 from mitm_inspector.api.limits import MAX_INGEST_BODY_PREFIX_BYTES
-from mitm_inspector.api.projection import collect_grid_flows, diff_grid_changes, grid_flow
+from mitm_inspector.api.projection import (
+    LifecycleTimingReducer,
+    collect_grid_flow,
+    collect_grid_flows,
+    diff_grid_changes,
+    enriched_flow,
+)
+from mitm_inspector.detail_limits import MAX_DURABLE_DETAIL_OUTPUT_BYTES
 from mitm_inspector.json_boundary import PlainJsonObject
 from mitm_inspector.protocol import (
     MAX_U64,
@@ -62,6 +70,10 @@ class IngestResult:
     parsed: ParsedMessageResult
     relayed: bool
     delta_emitted: bool
+
+
+class FlowDetailTooLarge(RuntimeError):
+    """Raised when bounded durable detail still exceeds its wire ceiling."""
 
 
 @dataclass(slots=True)
@@ -183,12 +195,11 @@ class ApiApplication:
         if relayed:
             self._broadcast(self._wire_text(parsed_message_to_plain_json(parsed)))
             self._counters.relayed_messages += 1
-        metadata: Mapping[str, object] | None = None
-        if payload.get("type") == "flow.metadata":
-            candidate = payload.get("metadata")
-            if isinstance(candidate, Mapping):
-                metadata = candidate
-        delta_emitted = self._reconcile(force=metadata is not None, metadata=metadata)
+        changed_flow_id = self._message_flow_id(payload)
+        delta_emitted = self._reconcile(
+            force=changed_flow_id is not None,
+            flow_id=changed_flow_id,
+        )
         return IngestResult(parsed=parsed, relayed=relayed, delta_emitted=delta_emitted)
 
     def sweep(self) -> bool:
@@ -303,6 +314,46 @@ class ApiApplication:
         if not messages:
             return None
         messages.reverse()
+        return self._flow_detail_text_from_plain_messages(flow_id, messages)
+
+    def flow_detail_text_from_messages(
+        self,
+        flow_id: str,
+        parsed_messages: Sequence[ParsedMessageResult],
+    ) -> str | None:
+        """Render validated oldest-first durable messages as flow detail."""
+
+        if type(flow_id) is not str or not flow_id:
+            return None
+        messages = [
+            parsed_message_to_plain_json(parsed)
+            for parsed in parsed_messages
+            if self._message_flow_id(self._payload_of(parsed)) == flow_id
+        ]
+        if not messages:
+            return None
+        return self._flow_detail_text_from_plain_messages(flow_id, messages)
+
+    def durable_flow_detail_bytes(self, flow_id: str) -> bytes | None:
+        """Read, render, and encode one bounded durable detail synchronously."""
+
+        if self._storage is None:
+            return None
+        messages = self._storage.flow_messages(flow_id)
+        detail = self.flow_detail_text_from_messages(flow_id, messages)
+        if detail is None:
+            return None
+        encoded = detail.encode("utf-8")
+        if len(encoded) > MAX_DURABLE_DETAIL_OUTPUT_BYTES:
+            raise FlowDetailTooLarge
+        return encoded
+
+    def _flow_detail_text_from_plain_messages(
+        self,
+        flow_id: str,
+        messages: list[PlainJsonObject],
+    ) -> str:
+        messages = self._decoded_detail_messages(messages)
         detail: PlainJsonObject = {
             "protocol_version": "1",
             "flow_id": flow_id,
@@ -311,18 +362,18 @@ class ApiApplication:
         return json.dumps(detail, separators=(",", ":"))
 
     def _reconcile(
-        self, *, force: bool, metadata: Mapping[str, object] | None = None
+        self,
+        *,
+        force: bool,
+        flow_id: str | None = None,
     ) -> bool:
         counters = self._store.counters
         marks = tuple(counters[name] for name in _EVICTION_COUNTER_NAMES)
         if marks == self._state.eviction_marks:
             if not force:
                 return False
-            if metadata is not None:
-                # Nothing was evicted, so this newest metadata message is the
-                # only possible change; project just its flow instead of
-                # re-scanning and re-copying the entire retained store.
-                return self._reconcile_single_flow(metadata)
+            if flow_id is not None:
+                return self._reconcile_single_flow(flow_id)
         self._state.eviction_marks = marks
         current = collect_grid_flows(self._store)
         changes = diff_grid_changes(self._state.published, current)
@@ -331,18 +382,18 @@ class ApiApplication:
             return False
         return self._emit_delta(changes)
 
-    def _reconcile_single_flow(self, metadata: Mapping[str, object]) -> bool:
-        flow_id = metadata.get("flow_id")
-        if not isinstance(flow_id, str) or not flow_id:
+    def _reconcile_single_flow(self, flow_id: str) -> bool:
+        flow = collect_grid_flow(self._store, flow_id)
+        if flow is None:
             return False
-        flow = grid_flow(metadata)
         published = self._state.published
         unchanged = published.get(flow_id) == flow
-        # The just-ingested metadata is now the newest flow, so it moves
-        # to the front of the reverse-chronological projection.
-        current = {flow_id: flow}
-        current.update((key, value) for key, value in published.items() if key != flow_id)
-        self._state.published = current
+        if flow_id not in published:
+            current = {flow_id: flow}
+            current.update(published)
+            self._state.published = current
+        else:
+            published[flow_id] = flow
         if unchanged:
             return False
         return self._emit_delta([{"op": "upsert", "flow": flow}])
@@ -430,6 +481,63 @@ class ApiApplication:
         }
 
     @staticmethod
+    def _decoded_detail_messages(messages: list[PlainJsonObject]) -> list[PlainJsonObject]:
+        metadata_values = [
+            message.get("metadata")
+            for message in messages
+            if message.get("type") == "flow.metadata"
+            and isinstance(message.get("metadata"), Mapping)
+        ]
+        latest = metadata_values[-1] if metadata_values else None
+        if not isinstance(latest, Mapping):
+            return messages
+        timing = LifecycleTimingReducer()
+        for message in messages:
+            timing.add(message)
+        flow_id = latest.get("flow_id")
+        started_at, ended_at = (
+            timing.values(flow_id) if isinstance(flow_id, str) else (None, None)
+        )
+        encodings = {
+            side: body_content_encoding(latest, side) for side in ("request", "response")
+        }
+        decoded_sides: set[str] = set()
+        for side, encoding in encodings.items():
+            descriptor = latest.get(f"{side}_body")
+            if descriptor is None:
+                continue
+            _decoded, was_decoded = decoded_body_descriptor(descriptor, encoding)
+            if was_decoded:
+                decoded_sides.add(side)
+        result: list[PlainJsonObject] = []
+        for message in messages:
+            message_type = message.get("type")
+            if message_type == "flow.metadata":
+                metadata = message.get("metadata")
+                if isinstance(metadata, Mapping):
+                    message["metadata"] = enriched_flow(
+                        metadata, started_at=started_at, ended_at=ended_at
+                    )
+            elif message_type == "body.chunk":
+                message_side = message.get("body_side")
+                if isinstance(message_side, str) and message_side in decoded_sides:
+                    continue
+            elif message_type == "body.end":
+                message_side = message.get("body_side")
+                body = message.get("body")
+                if isinstance(message_side, str) and body is not None:
+                    decoded, was_decoded = decoded_body_descriptor(
+                        body, encodings.get(message_side)
+                    )
+                    if was_decoded and isinstance(decoded, dict):
+                        message["body"] = decoded
+                        size = decoded.get("size_bytes")
+                        if isinstance(size, str):
+                            message["total_bytes"] = size
+            result.append(message)
+        return result
+
+    @staticmethod
     def _wire_text(message: PlainJsonObject) -> str:
         """Fully revalidate and serialize a message for the wire."""
 
@@ -455,6 +563,7 @@ class ApiApplication:
 
 __all__ = [
     "ApiApplication",
+    "FlowDetailTooLarge",
     "IngestResult",
     "Subscriber",
 ]

@@ -9,16 +9,59 @@ schema-valid while stripping the base64 prefix data.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 
+from mitm_inspector.api.bodies import body_content_encoding, decoded_body_descriptor
+from mitm_inspector.api.summary import flow_summary
 from mitm_inspector.json_boundary import (
     PlainJsonObject,
     PlainJsonValue,
     canonicalize_json,
 )
-from mitm_inspector.protocol import KnownParsedMessage
+from mitm_inspector.protocol import KnownParsedMessage, is_rfc3339_utc
 from mitm_inspector.store.memory import MemoryStore
 
 _DATA_BEARING_STATES = frozenset({"captured", "truncated"})
+
+
+@dataclass(slots=True)
+class LifecycleTimingReducer:
+    """Sequence-aware lifecycle timing shared by every API projection."""
+
+    _started: dict[str, tuple[int, str]] = field(default_factory=dict)
+    _ended: dict[str, tuple[int, str]] = field(default_factory=dict)
+
+    def add(self, payload: Mapping[str, object]) -> None:
+        if payload.get("type") != "flow.lifecycle":
+            return
+        flow_id = payload.get("flow_id")
+        sequence = payload.get("sequence")
+        occurred_at = payload.get("occurred_at")
+        state = payload.get("state")
+        if not (
+            isinstance(flow_id, str)
+            and isinstance(sequence, str)
+            and isinstance(occurred_at, str)
+            and is_rfc3339_utc(occurred_at)
+        ):
+            return
+        candidate = (int(sequence), occurred_at)
+        if state == "request_started" and (
+            flow_id not in self._started or candidate[0] < self._started[flow_id][0]
+        ):
+            self._started[flow_id] = candidate
+        if state in {"flow_completed", "error"} and (
+            flow_id not in self._ended or candidate[0] > self._ended[flow_id][0]
+        ):
+            self._ended[flow_id] = candidate
+
+    def values(self, flow_id: str) -> tuple[str | None, str | None]:
+        started = self._started.get(flow_id)
+        ended = self._ended.get(flow_id)
+        return (
+            started[1] if started is not None else None,
+            ended[1] if ended is not None else None,
+        )
 
 
 def redacted_body_descriptor(descriptor: PlainJsonValue) -> PlainJsonValue:
@@ -43,14 +86,53 @@ def redacted_body_descriptor(descriptor: PlainJsonValue) -> PlainJsonValue:
 def grid_flow(metadata: Mapping[str, object]) -> PlainJsonObject:
     """Copy validated flow metadata into an independent body-redacted flow."""
 
+    copied = enriched_flow(metadata)
+    for side in ("request_body", "response_body"):
+        if side in copied:
+            copied[side] = redacted_body_descriptor(copied[side])
+    return copied
+
+
+def enriched_flow(
+    metadata: Mapping[str, object],
+    *,
+    started_at: str | None = None,
+    ended_at: str | None = None,
+) -> PlainJsonObject:
+    """Copy metadata and add decoded bodies, wire facts, and a summary."""
+
     copied = canonicalize_json(metadata, label="metadata")
     if not isinstance(copied, dict):
         raise ValueError("flow metadata must be an object")
     session_id = copied.get("session_id")
     copied["session_id"] = session_id if isinstance(session_id, str) else None
-    for side in ("request_body", "response_body"):
-        if side in copied:
-            copied[side] = redacted_body_descriptor(copied[side])
+    if started_at is not None:
+        copied["started_at"] = started_at
+    if ended_at is not None:
+        copied["ended_at"] = ended_at
+    summary = flow_summary(copied)
+    decoded_encodings: PlainJsonObject = {}
+    for side in ("request", "response"):
+        body_key = f"{side}_body"
+        descriptor = copied.get(body_key)
+        if isinstance(descriptor, dict):
+            size = descriptor.get("size_bytes")
+            if isinstance(size, str):
+                copied[f"{side}_body_size"] = size
+            content_type = descriptor.get("content_type")
+            if isinstance(content_type, str):
+                copied[f"{side}_content_type"] = content_type
+        encoding = body_content_encoding(copied, side)
+        if descriptor is not None:
+            decoded, was_decoded = decoded_body_descriptor(descriptor, encoding)
+            copied[body_key] = decoded
+            if was_decoded and encoding is not None:
+                decoded_encodings[side] = encoding
+    if decoded_encodings:
+        copied["content_encoding"] = decoded_encodings
+    else:
+        copied.pop("content_encoding", None)
+    copied["summary"] = summary
     return copied
 
 
@@ -60,14 +142,19 @@ def flow_id_of(metadata: Mapping[str, object]) -> str | None:
 
 
 def collect_grid_flows(store: MemoryStore) -> dict[str, PlainJsonObject]:
-    """Project the store's newest metadata per flow, newest flow first."""
+    """Project newest metadata in stable newest-flow-first insertion order."""
 
-    newest: dict[str, PlainJsonObject] = {}
+    newest: dict[str, Mapping[str, object]] = {}
+    timing = LifecycleTimingReducer()
     for parsed in store.newest_first():
         if not isinstance(parsed, KnownParsedMessage):
             continue
         payload = parsed.message
-        if payload.get("type") != "flow.metadata":
+        message_type = payload.get("type")
+        if message_type == "flow.lifecycle":
+            timing.add(payload)
+            continue
+        if message_type != "flow.metadata":
             continue
         metadata = payload.get("metadata")
         if not isinstance(metadata, Mapping):
@@ -75,8 +162,53 @@ def collect_grid_flows(store: MemoryStore) -> dict[str, PlainJsonObject]:
         flow_id = flow_id_of(metadata)
         if flow_id is None or flow_id in newest:
             continue
-        newest[flow_id] = grid_flow(metadata)
-    return newest
+        newest[flow_id] = metadata
+    flow_order = store.flow_ids_newest_first()
+    return {
+        flow_id: grid_flow_with_timing(newest[flow_id], *timing.values(flow_id))
+        for flow_id in flow_order
+        if flow_id in newest
+    }
+
+
+def collect_grid_flow(store: MemoryStore, target_flow_id: str) -> PlainJsonObject | None:
+    """Project one retained flow without rebuilding the full grid."""
+
+    metadata: Mapping[str, object] | None = None
+    timing = LifecycleTimingReducer()
+    for parsed in store.newest_first():
+        if not isinstance(parsed, KnownParsedMessage):
+            continue
+        payload = parsed.message
+        if payload.get("type") == "flow.metadata":
+            candidate = payload.get("metadata")
+            if (
+                metadata is None
+                and isinstance(candidate, Mapping)
+                and flow_id_of(candidate) == target_flow_id
+            ):
+                metadata = candidate
+            continue
+        if payload.get("type") != "flow.lifecycle" or payload.get("flow_id") != target_flow_id:
+            continue
+        timing.add(payload)
+    if metadata is None:
+        return None
+    return grid_flow_with_timing(metadata, *timing.values(target_flow_id))
+
+
+def grid_flow_with_timing(
+    metadata: Mapping[str, object],
+    started_at: str | None,
+    ended_at: str | None,
+) -> PlainJsonObject:
+    """Enrich and redact one flow while preserving supplied lifecycle timing."""
+
+    copied = enriched_flow(metadata, started_at=started_at, ended_at=ended_at)
+    for side in ("request_body", "response_body"):
+        if side in copied:
+            copied[side] = redacted_body_descriptor(copied[side])
+    return copied
 
 
 def diff_grid_changes(

@@ -6,18 +6,26 @@ import base64
 import json
 import os
 import queue
+import re
 import sqlite3
 import stat
 import tempfile
 import threading
 from collections.abc import Callable, Mapping
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
+from mitm_inspector.detail_limits import (
+    MAX_DURABLE_DETAIL_MESSAGES,
+    MAX_DURABLE_DETAIL_RETAINED_BODY_BYTES,
+)
+from mitm_inspector.json_boundary import PlainJsonObject
 from mitm_inspector.protocol import (
     KnownParsedMessage,
     ParsedMessage,
     ParsedMessageResult,
+    is_rfc3339_utc,
     parse_message,
     require_parsed_message,
 )
@@ -30,6 +38,18 @@ DEFAULT_STORAGE_MAX_BYTES = 512 * 1024 * 1024
 DEFAULT_STORAGE_REPLAY = 500
 DEFAULT_STORAGE_QUEUE_SIZE = 4_096
 _SENTINEL = object()
+_WHITESPACE = re.compile(r"\s+")
+
+
+class SearchMatch(TypedDict):
+    flow_id: str
+    field: str
+    snippet: str
+    flow: PlainJsonObject
+
+
+class SearchCancelled(RuntimeError):
+    """Raised when a superseding request cancels durable search work."""
 
 
 def _normalize_storage_path(path: Path | str) -> Path:
@@ -177,33 +197,131 @@ class SQLiteFlowStorage:
                        flows.response_headers_json, flows.session_id
                 FROM flows
                 WHERE method <> ''
-                ORDER BY CASE WHEN flows.started_at IS NULL THEN 1 ELSE 0 END,
-                         LENGTH(COALESCE(flows.started_at, '')) DESC,
-                         COALESCE(flows.started_at, '') DESC,
+                ORDER BY CASE WHEN flows.started_at_sort IS NULL THEN 1 ELSE 0 END,
+                         flows.started_at_sort DESC,
                          flows.created_order DESC
                 LIMIT ?
                 """,
                 (limit,),
             ).fetchall()
-            result: list[ParsedMessageResult] = []
-            selected_flow_ids = {str(row[0]) for row in rows}
-            for row in rows:
-                flow_id = str(row[0])
-                result.append(parse_message(self._metadata_from_row(row)))
-                for side, body, state, size, content_type in (
-                    ("request", row[12], row[14], row[16], row[8]),
-                    ("response", row[13], row[15], row[17], row[9]),
-                ):
-                    chunk_rows = connection.execute(
-                        """
-                        SELECT chunk_index, offset_bytes, data
-                        FROM body_chunks
-                        WHERE flow_id = ? AND body_side = ?
-                        ORDER BY LENGTH(offset_bytes), offset_bytes, chunk_index
-                        """,
-                        (flow_id, side),
-                    ).fetchall()
-                    for chunk_index, offset_bytes, chunk_data in chunk_rows:
+            return self._messages_from_rows(connection, rows)
+
+    def flow_messages(self, flow_id: str) -> list[ParsedMessageResult]:
+        """Read one durable flow as validated oldest-first detail messages."""
+
+        if type(flow_id) is not str or not flow_id:
+            return []
+        self.flush()
+        with sqlite3.connect(self.path) as connection:
+            lengths = connection.execute(
+                """
+                SELECT COALESCE(length(request_body), 0),
+                       COALESCE(length(response_body), 0)
+                FROM flows WHERE flow_id = ? AND method <> ''
+                """,
+                (flow_id,),
+            ).fetchone()
+            if lengths is None:
+                return []
+            request_bytes, response_bytes = _detail_body_allocations(
+                int(lengths[0]),
+                int(lengths[1]),
+                MAX_DURABLE_DETAIL_RETAINED_BODY_BYTES,
+            )
+            row = connection.execute(
+                """
+                SELECT flow_id, source_id, method, scheme, host, port, path,
+                       response_status, request_content_type,
+                       response_content_type, started_at, ended_at,
+                       substr(request_body, 1, ?), substr(response_body, 1, ?),
+                       request_body_state,
+                       response_body_state, request_body_size,
+                       response_body_size, request_headers_json,
+                       response_headers_json, session_id
+                FROM flows
+                WHERE flow_id = ? AND method <> ''
+                """,
+                (request_bytes, response_bytes, flow_id),
+            ).fetchone()
+            if row is None:
+                return []
+            bounded_row = list(row)
+            for state_index, body_index, stored_length in (
+                (14, 12, int(lengths[0])),
+                (15, 13, int(lengths[1])),
+            ):
+                body = bounded_row[body_index]
+                retained_length = len(body) if isinstance(body, bytes | bytearray) else 0
+                if retained_length < stored_length and bounded_row[state_index] in {
+                    "captured",
+                    "truncated",
+                }:
+                    bounded_row[state_index] = "truncated"
+            retained_body_bytes = request_bytes + response_bytes
+            return self._messages_from_rows(
+                connection,
+                [tuple(bounded_row)],
+                max_messages=MAX_DURABLE_DETAIL_MESSAGES,
+                max_chunk_bytes=(
+                    MAX_DURABLE_DETAIL_RETAINED_BODY_BYTES - retained_body_bytes
+                ),
+                chunks_only_for_missing_bodies=True,
+            )
+
+    def _messages_from_rows(
+        self,
+        connection: sqlite3.Connection,
+        rows: list[tuple[object, ...]],
+        *,
+        max_messages: int | None = None,
+        max_chunk_bytes: int | None = None,
+        chunks_only_for_missing_bodies: bool = False,
+    ) -> list[ParsedMessageResult]:
+        result: list[ParsedMessageResult] = []
+        remaining_chunk_bytes = max_chunk_bytes
+        selected_flow_ids = {str(row[0]) for row in rows}
+        for row in rows:
+            if max_messages is not None and len(result) >= max_messages:
+                break
+            flow_id = str(row[0])
+            result.append(parse_message(self._metadata_from_row(row)))
+            for side, body, state, size, content_type in (
+                ("request", row[12], row[14], row[16], row[8]),
+                ("response", row[13], row[15], row[17], row[9]),
+            ):
+                if not chunks_only_for_missing_bodies or state == "missing":
+                    if remaining_chunk_bytes is None:
+                        chunk_rows = connection.execute(
+                            """
+                            SELECT chunk_index, offset_bytes, data
+                            FROM body_chunks
+                            WHERE flow_id = ? AND body_side = ?
+                            ORDER BY LENGTH(offset_bytes), offset_bytes, chunk_index
+                            """,
+                            (flow_id, side),
+                        )
+                    else:
+                        chunk_rows = connection.execute(
+                            """
+                            SELECT chunk_index, offset_bytes,
+                                   CASE WHEN length(data) <= ? THEN data END
+                            FROM body_chunks
+                            WHERE flow_id = ? AND body_side = ?
+                            ORDER BY LENGTH(offset_bytes), offset_bytes, chunk_index
+                            """,
+                            (remaining_chunk_bytes, flow_id, side),
+                        )
+                    for chunk_index, offset_bytes, chunk_value in chunk_rows:
+                        if max_messages is not None and len(result) >= max_messages:
+                            break
+                        if chunk_value is None:
+                            break
+                        chunk_data = bytes(chunk_value)
+                        if (
+                            remaining_chunk_bytes is not None
+                            and len(chunk_data) > remaining_chunk_bytes
+                        ):
+                            break
                         result.append(
                             parse_message(
                                 {
@@ -217,48 +335,54 @@ class SQLiteFlowStorage:
                                 }
                             )
                         )
-                    if state != "missing":
-                        result.append(
-                            parse_message(
-                                {
-                                    "protocol_version": "1",
-                                    "type": "body.end",
-                                    "flow_id": flow_id,
-                                    "body_side": side,
-                                    "total_bytes": str(size),
-                                    "body": _descriptor_from_row(
-                                        body, state, size, content_type
-                                    ),
-                                }
-                            )
-                        )
-            if selected_flow_ids:
-                placeholders = ",".join("?" for _ in selected_flow_ids)
-                lifecycle_rows = connection.execute(
-                    f"""
-                    SELECT source_id, event_id, occurred_at, sequence, state, flow_id
-                    FROM lifecycle
-                    WHERE flow_id IN ({placeholders})
-                    ORDER BY source_id, LENGTH(sequence), sequence, event_id
-                    """,
-                    tuple(selected_flow_ids),
-                ).fetchall()
-                for lifecycle in lifecycle_rows:
+                        if remaining_chunk_bytes is not None:
+                            remaining_chunk_bytes -= len(chunk_data)
+                if state != "missing":
+                    if max_messages is not None and len(result) >= max_messages:
+                        break
                     result.append(
                         parse_message(
                             {
                                 "protocol_version": "1",
-                                "type": "flow.lifecycle",
-                                "source_id": lifecycle[0],
-                                "flow_id": lifecycle[5],
-                                "event_id": lifecycle[1],
-                                "occurred_at": lifecycle[2],
-                                "sequence": lifecycle[3],
-                                "state": lifecycle[4],
+                                "type": "body.end",
+                                "flow_id": flow_id,
+                                "body_side": side,
+                                "total_bytes": str(size),
+                                "body": _descriptor_from_row(
+                                    body, state, size, content_type
+                                ),
                             }
                         )
                     )
-            return result
+        if selected_flow_ids:
+            placeholders = ",".join("?" for _ in selected_flow_ids)
+            lifecycle_rows = connection.execute(
+                f"""
+                SELECT source_id, event_id, occurred_at, sequence, state, flow_id
+                FROM lifecycle
+                WHERE flow_id IN ({placeholders})
+                ORDER BY source_id, LENGTH(sequence), sequence, event_id
+                """,
+                tuple(selected_flow_ids),
+            )
+            for lifecycle in lifecycle_rows:
+                if max_messages is not None and len(result) >= max_messages:
+                    break
+                result.append(
+                    parse_message(
+                        {
+                            "protocol_version": "1",
+                            "type": "flow.lifecycle",
+                            "source_id": lifecycle[0],
+                            "flow_id": lifecycle[5],
+                            "event_id": lifecycle[1],
+                            "occurred_at": lifecycle[2],
+                            "sequence": lifecycle[3],
+                            "state": lifecycle[4],
+                        }
+                    )
+                )
+        return result
 
     def replay_into(self, store: MemoryStore, limit: int = DEFAULT_STORAGE_REPLAY) -> None:
         """Materialize persisted history into a regular bounded memory store."""
@@ -283,6 +407,175 @@ class SQLiteFlowStorage:
         for message in lifecycle_messages:
             store.append(message)
 
+    def search(
+        self,
+        query: str,
+        limit: int,
+        cancel: threading.Event | None = None,
+    ) -> tuple[list[SearchMatch], bool]:
+        """Search the durable text projection with bounded result materialization."""
+
+        from mitm_inspector.api.projection import grid_flow
+
+        if type(query) is not str or not query:
+            raise ValueError("query must be a non-empty string")
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("limit must be from 1 through 200")
+        cancel = cancel or threading.Event()
+        if cancel.is_set():
+            raise SearchCancelled
+        self.flush()
+        folded_query = query.casefold()
+        escaped_query = _escape_like(folded_query)
+        with sqlite3.connect(self.path) as connection:
+            connection.set_progress_handler(lambda: int(cancel.is_set()), 1_000)
+            try:
+                rows = connection.execute(
+                    """
+                    WITH candidates AS MATERIALIZED (
+                        SELECT body_search.rowid, body_search.flow_id, body_search.field
+                        FROM body_search_fts
+                        JOIN body_search ON body_search.rowid = body_search_fts.rowid
+                        JOIN flows ON flows.flow_id = body_search.flow_id
+                        WHERE body_search_fts.folded_text LIKE ? ESCAPE '\\'
+                        ORDER BY
+                            CASE WHEN flows.started_at_sort IS NULL THEN 1 ELSE 0 END,
+                            flows.started_at_sort DESC,
+                            flows.created_order DESC,
+                            CASE body_search.field WHEN 'request_body' THEN 0 ELSE 1 END
+                        LIMIT ?
+                    )
+                    SELECT candidates.flow_id, candidates.field,
+                           substr(
+                               body_search.body_text,
+                               max(1, instr(body_search.folded_text, ?) - 160),
+                               320
+                           ) AS body_window
+                    FROM candidates
+                    JOIN body_search ON body_search.rowid = candidates.rowid
+                    JOIN flows ON flows.flow_id = candidates.flow_id
+                    ORDER BY
+                        CASE WHEN flows.started_at_sort IS NULL THEN 1 ELSE 0 END,
+                        flows.started_at_sort DESC,
+                        flows.created_order DESC,
+                        CASE candidates.field WHEN 'request_body' THEN 0 ELSE 1 END
+                    """,
+                    (f"%{escaped_query}%", limit + 1, folded_query),
+                ).fetchall()
+            except sqlite3.OperationalError as error:
+                if cancel.is_set():
+                    raise SearchCancelled from error
+                raise
+            finally:
+                connection.set_progress_handler(None, 0)
+            truncated = len(rows) > limit
+            projection_cache: dict[str, PlainJsonObject] = {}
+            matches: list[SearchMatch] = []
+            for flow_id_value, field_value, body_window in rows[:limit]:
+                if cancel.is_set():
+                    raise SearchCancelled
+                flow_id = str(flow_id_value)
+                flow = projection_cache.get(flow_id)
+                if flow is None:
+                    metadata_row = connection.execute(
+                        """
+                        SELECT flow_id, source_id, method, scheme, host, port, path,
+                               response_status, request_content_type,
+                               response_content_type, started_at, ended_at,
+                               request_body, response_body, request_body_state,
+                               response_body_state, request_body_size,
+                               response_body_size, request_headers_json,
+                               response_headers_json, session_id
+                        FROM flows WHERE flow_id = ?
+                        """,
+                        (flow_id,),
+                    ).fetchone()
+                    if metadata_row is None:
+                        continue
+                    message = self._metadata_from_row(metadata_row)
+                    metadata = message.get("metadata")
+                    if not isinstance(metadata, Mapping):
+                        continue
+                    projected_flow = grid_flow(metadata)
+                    projection_cache[flow_id] = projected_flow
+                    flow = projected_flow
+                if flow is None:  # pragma: no cover - guarded by construction.
+                    continue
+                window = str(body_window)
+                snippet = _snippet_from_window(window, query)
+                matches.append(
+                    {
+                        "flow_id": flow_id,
+                        "field": str(field_value),
+                        "snippet": snippet,
+                        "flow": flow,
+                    }
+                )
+        return matches, truncated
+
+    def _backfill_started_sort_keys(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            "SELECT flow_id, started_at FROM flows WHERE started_at IS NOT NULL"
+        ).fetchall()
+        connection.executemany(
+            "UPDATE flows SET started_at_sort = ? WHERE flow_id = ?",
+            [
+                (_timestamp_sort_key(str(started_at)), str(flow_id))
+                for flow_id, started_at in rows
+            ],
+        )
+
+    def _rebuild_search_index(self, connection: sqlite3.Connection) -> None:
+        connection.execute("DELETE FROM body_search")
+        connection.execute("INSERT INTO body_search_fts(body_search_fts) VALUES ('rebuild')")
+        flow_ids = connection.execute(
+            "SELECT flow_id FROM flows WHERE method <> '' ORDER BY created_order"
+        ).fetchall()
+        for (flow_id,) in flow_ids:
+            self._refresh_search_flow(connection, str(flow_id))
+
+    def _refresh_search_flow(self, connection: sqlite3.Connection, flow_id: str) -> None:
+        from mitm_inspector.api.bodies import decoded_body_bytes, header_value
+
+        row = connection.execute(
+            """
+            SELECT request_body, response_body, request_body_state,
+                   response_body_state, request_body_size, response_body_size,
+                   request_content_type, response_content_type,
+                   request_headers_json, response_headers_json
+            FROM flows WHERE flow_id = ? AND method <> ''
+            """,
+            (flow_id,),
+        ).fetchone()
+        connection.execute("DELETE FROM body_search WHERE flow_id = ?", (flow_id,))
+        if row is None:
+            return
+        request_headers = json.loads(str(row[8]))
+        response_headers = json.loads(str(row[9])) if row[9] is not None else []
+        for field, body, state, size, content_type, headers in (
+            ("request_body", row[0], row[2], row[4], row[6], request_headers),
+            ("response_body", row[1], row[3], row[5], row[7], response_headers),
+        ):
+            descriptor = _descriptor_from_row(body, state, size, content_type)
+            encoding = header_value(headers, "content-encoding")
+            normalized_encoding = (
+                encoding.strip().casefold() if isinstance(encoding, str) else None
+            )
+            decoded, _was_decoded = decoded_body_bytes(descriptor, normalized_encoding)
+            if decoded is None:
+                continue
+            try:
+                text = decoded.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            connection.execute(
+                """
+                INSERT INTO body_search(flow_id, field, body_text, folded_text)
+                VALUES (?, ?, ?, ?)
+                """,
+                (flow_id, field, text, text.casefold()),
+            )
+
     def _prepare_database(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         _validate_private_mode(self.path.parent, stat.S_IFDIR, 0o700)
@@ -305,6 +598,7 @@ class SQLiteFlowStorage:
                     request_content_type TEXT,
                     response_content_type TEXT,
                     started_at TEXT,
+                    started_at_sort TEXT,
                     ended_at TEXT,
                     request_body BLOB,
                     response_body BLOB,
@@ -335,8 +629,38 @@ class SQLiteFlowStorage:
                     PRIMARY KEY (flow_id, body_side, chunk_index),
                     FOREIGN KEY (flow_id) REFERENCES flows(flow_id) ON DELETE CASCADE
                 );
-                CREATE INDEX IF NOT EXISTS flows_started_at_desc
-                    ON flows(started_at DESC);
+                CREATE TABLE IF NOT EXISTS body_search (
+                    flow_id TEXT NOT NULL,
+                    field TEXT NOT NULL,
+                    body_text TEXT NOT NULL,
+                    folded_text TEXT NOT NULL,
+                    PRIMARY KEY (flow_id, field),
+                    FOREIGN KEY (flow_id) REFERENCES flows(flow_id) ON DELETE CASCADE
+                );
+                CREATE VIRTUAL TABLE IF NOT EXISTS body_search_fts USING fts5(
+                    folded_text,
+                    content='body_search',
+                    content_rowid='rowid',
+                    tokenize='trigram'
+                );
+                CREATE TRIGGER IF NOT EXISTS body_search_ai AFTER INSERT ON body_search BEGIN
+                    INSERT INTO body_search_fts(rowid, folded_text)
+                    VALUES (new.rowid, new.folded_text);
+                END;
+                CREATE TRIGGER IF NOT EXISTS body_search_ad AFTER DELETE ON body_search BEGIN
+                    INSERT INTO body_search_fts(body_search_fts, rowid, folded_text)
+                    VALUES ('delete', old.rowid, old.folded_text);
+                END;
+                CREATE TRIGGER IF NOT EXISTS body_search_au AFTER UPDATE ON body_search BEGIN
+                    INSERT INTO body_search_fts(body_search_fts, rowid, folded_text)
+                    VALUES ('delete', old.rowid, old.folded_text);
+                    INSERT INTO body_search_fts(rowid, folded_text)
+                    VALUES (new.rowid, new.folded_text);
+                END;
+                CREATE TABLE IF NOT EXISTS storage_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS lifecycle_flow_sequence
                     ON lifecycle(flow_id, sequence);
                 CREATE INDEX IF NOT EXISTS flows_created_order
@@ -349,6 +673,22 @@ class SQLiteFlowStorage:
             }
             if "session_id" not in columns:
                 connection.execute("ALTER TABLE flows ADD COLUMN session_id TEXT")
+            if "started_at_sort" not in columns:
+                connection.execute("ALTER TABLE flows ADD COLUMN started_at_sort TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS flows_started_sort_desc "
+                "ON flows(started_at_sort DESC)"
+            )
+            self._backfill_started_sort_keys(connection)
+            version = connection.execute(
+                "SELECT value FROM storage_meta WHERE key = 'body_search_version'"
+            ).fetchone()
+            if version != ("1",):
+                self._rebuild_search_index(connection)
+                connection.execute(
+                    "INSERT OR REPLACE INTO storage_meta(key, value) VALUES (?, ?)",
+                    ("body_search_version", "1"),
+                )
             connection.commit()
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.execute("VACUUM")
@@ -380,7 +720,9 @@ class SQLiteFlowStorage:
                 schema = source.execute(
                     """
                     SELECT sql FROM sqlite_master
-                    WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+                    WHERE sql IS NOT NULL
+                      AND name NOT LIKE 'sqlite_%'
+                      AND name NOT LIKE 'body_search_fts_%'
                     ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END, name
                     """
                 ).fetchall()
@@ -522,6 +864,7 @@ class SQLiteFlowStorage:
                 metadata.get("session_id"),
             ),
         )
+        self._refresh_search_flow(connection, flow_id)
 
     def _write_lifecycle(
         self, connection: sqlite3.Connection, payload: Mapping[str, object]
@@ -545,17 +888,38 @@ class SQLiteFlowStorage:
         )
         connection.execute(
             """
-            UPDATE flows
-            SET source_id = CASE WHEN source_id = '' THEN ? ELSE source_id END,
-                started_at = CASE WHEN started_at IS NULL THEN ? ELSE started_at END,
-                ended_at = CASE WHEN ? IN ('flow_completed', 'error') THEN ? ELSE ended_at END
+            UPDATE flows SET source_id = CASE WHEN source_id = '' THEN ? ELSE source_id END
+            WHERE flow_id = ?
+            """,
+            (payload["source_id"], flow_id),
+        )
+        timing_rows = connection.execute(
+            """
+            SELECT
+                (
+                    SELECT occurred_at FROM lifecycle
+                    WHERE flow_id = ? AND state = 'request_started'
+                    ORDER BY LENGTH(sequence), sequence LIMIT 1
+                ),
+                (
+                    SELECT occurred_at FROM lifecycle
+                    WHERE flow_id = ? AND state IN ('flow_completed', 'error')
+                    ORDER BY LENGTH(sequence) DESC, sequence DESC LIMIT 1
+                )
+            """,
+            (flow_id, flow_id),
+        ).fetchone()
+        started_at = timing_rows[0] if timing_rows is not None else None
+        ended_at = timing_rows[1] if timing_rows is not None else None
+        connection.execute(
+            """
+            UPDATE flows SET started_at = ?, started_at_sort = ?, ended_at = ?
             WHERE flow_id = ?
             """,
             (
-                payload["source_id"],
-                payload["occurred_at"],
-                payload["state"],
-                payload["occurred_at"],
+                started_at,
+                _timestamp_sort_key(started_at) if isinstance(started_at, str) else None,
+                ended_at,
                 flow_id,
             ),
         )
@@ -603,6 +967,7 @@ class SQLiteFlowStorage:
                 flow_id,
             ),
         )
+        self._refresh_search_flow(connection, flow_id)
 
     @staticmethod
     def _ensure_flow(connection: sqlite3.Connection, flow_id: str) -> None:
@@ -632,8 +997,8 @@ class SQLiteFlowStorage:
                 f"""
                 SELECT flow_id FROM flows
                 {where}
-                ORDER BY CASE WHEN started_at IS NULL THEN 1 ELSE 0 END,
-                         COALESCE(started_at, ''), created_order
+                ORDER BY CASE WHEN started_at_sort IS NULL THEN 1 ELSE 0 END,
+                         started_at_sort, created_order
                 LIMIT 1 OFFSET ?
                 """,
                 (*parameters, overflow_offset),
@@ -645,8 +1010,8 @@ class SQLiteFlowStorage:
                 f"""
                 SELECT flow_id FROM flows
                 {where}
-                ORDER BY CASE WHEN started_at IS NULL THEN 1 ELSE 0 END,
-                         COALESCE(started_at, ''), created_order
+                ORDER BY CASE WHEN started_at_sort IS NULL THEN 1 ELSE 0 END,
+                         started_at_sort, created_order
                 LIMIT 1
                 """, parameters
             ).fetchone()
@@ -655,6 +1020,7 @@ class SQLiteFlowStorage:
                     connection.execute(
                         "DELETE FROM flows WHERE flow_id = ?", (protected_flow_id,)
                     )
+                    self._compact_search_index(connection)
                     connection.commit()
                     _checkpoint(connection)
                     connection.execute("VACUUM")
@@ -664,11 +1030,20 @@ class SQLiteFlowStorage:
                     continue
                 return
             connection.execute("DELETE FROM flows WHERE flow_id = ?", (oldest[0],))
+            self._compact_search_index(connection)
             connection.commit()
             _checkpoint(connection)
             connection.execute("VACUUM")
             _checkpoint(connection)
             _secure_existing_files(self.path)
+
+    @staticmethod
+    def _compact_search_index(connection: sqlite3.Connection) -> None:
+        remaining = connection.execute("SELECT 1 FROM body_search LIMIT 1").fetchone()
+        command = "rebuild" if remaining is None else "optimize"
+        connection.execute(
+            "INSERT INTO body_search_fts(body_search_fts) VALUES (?)", (command,)
+        )
 
     @staticmethod
     def _metadata_from_row(row: tuple[object, ...]) -> dict[str, object]:
@@ -693,7 +1068,37 @@ class SQLiteFlowStorage:
             metadata["response_body"] = _descriptor_from_row(
                 row[13], row[15], row[17], row[9]
             )
+        if isinstance(row[10], str) and is_rfc3339_utc(row[10]):
+            metadata["started_at"] = row[10]
+        if isinstance(row[11], str) and is_rfc3339_utc(row[11]):
+            metadata["ended_at"] = row[11]
+        if row[14] != "missing":
+            metadata["request_body_size"] = str(row[16])
+        if row[15] != "missing":
+            metadata["response_body_size"] = str(row[17])
+        if row[8] is not None:
+            metadata["request_content_type"] = row[8]
+        if row[9] is not None:
+            metadata["response_content_type"] = row[9]
         return {"protocol_version": "1", "type": "flow.metadata", "metadata": metadata}
+
+
+def _detail_body_allocations(
+    request_length: int,
+    response_length: int,
+    limit: int,
+) -> tuple[int, int]:
+    """Split one retained-byte ceiling fairly, then reuse unneeded capacity."""
+
+    half = limit // 2
+    request_bytes = min(request_length, half)
+    response_bytes = min(response_length, limit - half)
+    remaining = limit - request_bytes - response_bytes
+    request_extra = min(request_length - request_bytes, remaining)
+    request_bytes += request_extra
+    remaining -= request_extra
+    response_bytes += min(response_length - response_bytes, remaining)
+    return request_bytes, response_bytes
 
 
 def _body_values(value: object) -> tuple[bytes | None, str, int, str | None]:
@@ -764,6 +1169,41 @@ def _storage_size(path: Path) -> int:
     return total
 
 
+def _centered_snippet(text: str, match_start: int, match_length: int) -> str:
+    if len(text) <= 160:
+        return text
+    match_end = min(len(text), match_start + match_length)
+    spare = max(0, 160 - (match_end - match_start))
+    start = max(0, match_start - spare // 2)
+    end = min(len(text), start + 160)
+    start = max(0, end - 160)
+    return text[start:end]
+
+
+def _snippet_from_window(window: str, query: str) -> str:
+    collapsed = _WHITESPACE.sub(" ", window).strip()
+    collapsed_query = _WHITESPACE.sub(" ", query).strip()
+    match_start = collapsed.casefold().find(collapsed_query.casefold())
+    if match_start < 0:
+        match_start = min(len(collapsed), 160)
+    return _centered_snippet(collapsed, match_start, len(collapsed_query))
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _timestamp_sort_key(value: str) -> str | None:
+    if not is_rfc3339_utc(value):
+        return None
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    time_part = value.split("T", 1)[1]
+    fraction = ""
+    if "." in time_part:
+        fraction = time_part.split(".", 1)[1].split("Z", 1)[0].split("+", 1)[0]
+    return f"{parsed:%Y%m%d%H%M%S}|{fraction.rstrip('0')}"
+
+
 def _checkpoint(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
@@ -802,6 +1242,8 @@ __all__ = [
     "DEFAULT_STORAGE_MAX_FLOWS",
     "DEFAULT_STORAGE_QUEUE_SIZE",
     "DEFAULT_STORAGE_REPLAY",
+    "SearchCancelled",
+    "SearchMatch",
     "SQLiteFlowStorage",
     "default_storage_path",
 ]
