@@ -14,9 +14,28 @@ export interface PacketListProps {
   loadFlowDetail?: FlowDetailLoader;
 }
 
+type Row =
+  | { kind: "header"; sessionId: string | null; count: number }
+  | { kind: "flow"; metadata: ImmutableFlowMetadata };
+
+function groupRows(flows: readonly ImmutableFlowMetadata[]): readonly Row[] {
+  const rows: Row[] = [];
+  let cursor = 0;
+  while (cursor < flows.length) {
+    const sessionId = flows[cursor].session_id ?? null;
+    let end = cursor + 1;
+    while (end < flows.length && (flows[end].session_id ?? null) === sessionId) end += 1;
+    rows.push({ kind: "header", sessionId, count: end - cursor });
+    for (let i = cursor; i < end; i += 1) rows.push({ kind: "flow", metadata: flows[i] });
+    cursor = end;
+  }
+  return rows;
+}
+
 export function PacketList({ browser, loadFlowDetail }: PacketListProps) {
   const [openFlowId, setOpenFlowId] = useState<string | null>(null);
   const flows = browser.flows.entries;
+  const rows = useMemo(() => groupRows(flows), [flows]);
   const openFlow = openFlowId === null ? undefined : browser.flows.get(openFlowId);
   const detail = useFlowDetail(openFlow?.flow_id ?? null, loadFlowDetail);
 
@@ -24,7 +43,23 @@ export function PacketList({ browser, loadFlowDetail }: PacketListProps) {
 
   return (
     <ol className="packet-list" aria-label="Captured packets">
-      {flows.map((metadata) => {
+      {rows.map((row, index) => {
+        if (row.kind === "header") {
+          const label = row.sessionId ? `session ${row.sessionId.slice(0, 8)}` : "unassigned";
+          return (
+            <li
+              key={`hdr-${index}-${row.sessionId ?? "unassigned"}`}
+              className="session-header"
+              aria-hidden="true"
+            >
+              <span className="session-header-label">{label}</span>
+              <span className="session-header-count">
+                {row.count} {row.count === 1 ? "flow" : "flows"}
+              </span>
+            </li>
+          );
+        }
+        const { metadata } = row;
         const open = openFlow !== undefined && metadata.flow_id === openFlow.flow_id;
         return (
           <li key={metadata.flow_id} className="packet">

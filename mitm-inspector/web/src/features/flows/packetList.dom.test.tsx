@@ -228,4 +228,68 @@ describe("PacketList", () => {
     await click(rowByPath(container, "/v1/flow-a"));
     expect(container.querySelector(".json-tree")?.textContent).toContain("full");
   });
+
+  it("groups consecutive same-session flows under one session header with a count", async () => {
+    const browser = stateOf([
+      flow("flow-a", { session_id: "aaaaaaaa-1111-2222-3333-444444444444" }),
+      flow("flow-b", { session_id: "aaaaaaaa-1111-2222-3333-444444444444" }),
+      flow("flow-c", { session_id: "bbbbbbbb-9999-8888-7777-666666666666" }),
+    ]);
+    const { container } = await mountList(browser);
+    const headers = container.querySelectorAll(".session-header");
+    expect(headers).toHaveLength(2);
+    expect(headers[0].textContent).toContain("session aaaaaaaa");
+    expect(headers[0].textContent).toContain("2 flows");
+    expect(headers[1].textContent).toContain("session bbbbbbbb");
+    expect(headers[1].textContent).toContain("1 flow");
+    // Rows preserve arrival order across headers.
+    const rows = container.querySelectorAll(".packet-row");
+    expect(rows).toHaveLength(3);
+    expect(rows[0].textContent).toContain("/v1/flow-a");
+    expect(rows[2].textContent).toContain("/v1/flow-c");
+    // Header is not selectable and is hidden from AT.
+    expect(headers[0].getAttribute("aria-hidden")).toBe("true");
+    expect(headers[0].querySelector("button")).toBeNull();
+  });
+
+  it("splits interleaved sessions into distinct headers preserving arrival order", async () => {
+    // Session A appears, then B, then A again — three headers, not two, so the
+    // user can see when sessions interleaved rather than assuming coalescence.
+    const browser = stateOf([
+      flow("flow-a1", { session_id: "aaaa-1" }),
+      flow("flow-b1", { session_id: "bbbb-1" }),
+      flow("flow-a2", { session_id: "aaaa-1" }),
+    ]);
+    const { container } = await mountList(browser);
+    const headers = container.querySelectorAll(".session-header");
+    expect(headers).toHaveLength(3);
+    expect(headers[0].textContent).toContain("aaaa-1");
+    expect(headers[1].textContent).toContain("bbbb-1");
+    expect(headers[2].textContent).toContain("aaaa-1");
+  });
+
+  it("labels a run of null session_id flows as unassigned", async () => {
+    const browser = stateOf([
+      flow("flow-a", { session_id: null }),
+      flow("flow-b", { session_id: null }),
+      flow("flow-c", { session_id: "cccc-1" }),
+    ]);
+    const { container } = await mountList(browser);
+    const headers = container.querySelectorAll(".session-header");
+    expect(headers).toHaveLength(2);
+    expect(headers[0].textContent).toContain("unassigned");
+    expect(headers[0].textContent).toContain("2 flows");
+    expect(headers[1].textContent).toContain("session cccc-1");
+  });
+
+  it("still renders a header when every flow shares a single session", async () => {
+    const browser = stateOf([
+      flow("flow-a", { session_id: "solo-1" }),
+      flow("flow-b", { session_id: "solo-1" }),
+    ]);
+    const { container } = await mountList(browser);
+    const headers = container.querySelectorAll(".session-header");
+    expect(headers).toHaveLength(1);
+    expect(headers[0].textContent).toContain("2 flows");
+  });
 });

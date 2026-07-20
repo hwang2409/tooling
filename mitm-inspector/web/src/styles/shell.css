@@ -14,6 +14,20 @@
 .packet-list { margin: 0; padding: 0; list-style: none; }
 .packet { border-bottom: 1px solid var(--line); }
 
+.session-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 10px 4px;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.session-header:not(:first-child) { border-top: 1px solid var(--line-dark); }
+.session-header-label { flex: 1; }
+.session-header-count { opacity: .6; font-variant-numeric: tabular-nums; }
+
 .packet-row {
   display: grid;
   grid-template-columns: 52px minmax(120px, 240px) minmax(0, 1fr) 44px;
