@@ -127,6 +127,28 @@ describe("PacketList", () => {
     expect(tree?.textContent).toContain("claude");
   });
 
+  it("defaults Anthropic requests to conversation view with raw JSON one toggle away", async () => {
+    const browser = stateOf([
+      flow("flow-a", {
+        request_body: captured(JSON.stringify({
+          model: "claude",
+          messages: [{ role: "user", content: "hello" }],
+        })),
+      }),
+    ]);
+    const { container } = await mountList(browser);
+    await click(rowByPath(container, "/v1/flow-a"));
+    expect(container.querySelector("[data-testid='conversation-view']")?.textContent).toContain("hello");
+    const raw = Array.from(container.querySelectorAll<HTMLButtonElement>(".packet-mode"))
+      .find((button) => button.textContent === "raw");
+    expect(raw).toBeDefined();
+    await click(raw!);
+    const rawTree = container.querySelector(".packet-detail .json-tree");
+    expect(rawTree).not.toBeNull();
+    await click(rawTree!.querySelector<HTMLButtonElement>(".json-toggle")!);
+    expect(rawTree?.textContent).toContain("messages");
+  });
+
   it("replaces the open panel when another row is clicked and closes on re-click", async () => {
     const bodyFor = (name: string) => captured(JSON.stringify({ name }));
     const browser = stateOf([

@@ -22,7 +22,7 @@ function contrast(foreground: string, background: string): number {
   return (light + 0.05) / (dark + 0.05);
 }
 
-const foregrounds = ["ink", "ink-soft", "muted"] as const;
+const foregrounds = ["ink", "ink-soft", "muted", "alert"] as const;
 const backgrounds = ["paper", "paper-alt", "paper-deep"] as const;
 
 describe("token contrast", () => {

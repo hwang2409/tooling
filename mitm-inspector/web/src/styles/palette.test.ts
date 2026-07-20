@@ -20,6 +20,7 @@ const ALLOWED_HEXES = new Set<string>([
   "#f4f4f4",
   "#e5e5e5",
   "#cccccc",
+  "#b42318", // --alert: the single permitted chroma, 4xx/5xx/error states only (MITMWEB-F7)
 ].map((hex) => hex.toLowerCase()));
 
 /**
