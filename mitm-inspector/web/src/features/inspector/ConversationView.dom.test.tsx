@@ -89,6 +89,36 @@ describe("ConversationView", () => {
     expect(container.textContent).toContain("future_field");
   });
 
+  it("renders message text as markdown by default with the plain text one toggle away", async () => {
+    const request = parseAnthropicRequest({
+      model: "claude",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "# Heading\n\nwith **bold** text" }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "# not markdown" }] },
+      ],
+    } as JsonValue);
+    if (request === null) throw new Error("request fixture did not parse");
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    mounts.push({ root, container });
+    await act(async () => root.render(<ConversationView request={request} extras={{}} />));
+
+    expect(container.querySelector(".conv-message h1")?.textContent).toBe("Heading");
+    expect(container.querySelector(".conv-message strong")?.textContent).toBe("bold");
+    // Tool output is data, not prose: it must stay literal even in markdown mode.
+    expect(container.querySelector(".conv-card-tool-result h1")).toBeNull();
+    expect(container.querySelector(".conv-card-tool-result")?.textContent).toContain("# not markdown");
+
+    const plain = Array.from(container.querySelectorAll<HTMLButtonElement>(".conv-text-modes .packet-mode"))
+      .find((button) => button.textContent === "plain");
+    expect(plain).toBeDefined();
+    await act(async () => plain?.click());
+    // No information loss: the exact source text is one toggle away.
+    expect(container.querySelector(".conv-message h1")).toBeNull();
+    expect(container.textContent).toContain("# Heading\n\nwith **bold** text");
+  });
+
   it("keeps lifted, malformed, and future conversation values visible", async () => {
     const request = parseAnthropicRequest({
       model: "request-model",

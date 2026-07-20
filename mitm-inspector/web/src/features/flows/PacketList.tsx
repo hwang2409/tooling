@@ -17,11 +17,16 @@ import { deriveRowCells } from "./rowSummary";
 import "../../styles/shell.css";
 
 export interface PacketListProps {
-  browser: BrowserState;
+  browser?: BrowserState;
+  /** Explicit flow subset (e.g. one session); overrides the browser grid. */
+  flows?: readonly ImmutableFlowMetadata[];
+  showSearch?: boolean;
   loadFlowDetail?: FlowDetailLoader;
   searchFetcher?: SearchFetcher;
   onSearchActiveChange?: (active: boolean) => void;
 }
+
+const NO_FLOWS: readonly ImmutableFlowMetadata[] = [];
 
 type Row =
   | { kind: "header"; sessionId: string | null; count: number }
@@ -80,15 +85,17 @@ function snippetLabel(matches: readonly SearchMatch[]): string {
   return `${prefix}: ${first.snippet}${suffix}`;
 }
 
-export function PacketList({ browser, loadFlowDetail, searchFetcher, onSearchActiveChange }: PacketListProps) {
+export function PacketList({ browser, flows: flowsOverride, showSearch = true, loadFlowDetail, searchFetcher, onSearchActiveChange }: PacketListProps) {
   const [openFlowId, setOpenFlowId] = useState<string | null>(null);
   const search = useSearch(searchFetcher);
   const searchActive = search.state.status !== "idle";
   useEffect(() => {
     onSearchActiveChange?.(searchActive);
   }, [searchActive, onSearchActiveChange]);
+  // Leaving the view mid-search must release the live-feed pause.
+  useEffect(() => () => onSearchActiveChange?.(false), [onSearchActiveChange]);
 
-  const flows = browser.flows.entries;
+  const flows = flowsOverride ?? browser?.flows.entries ?? NO_FLOWS;
   const matchesByFlow = useMemo(() => {
     if (search.state.status !== "results" && search.state.status !== "empty") return null;
     const byFlow = new Map<string, SearchMatch[]>();
@@ -111,7 +118,7 @@ export function PacketList({ browser, loadFlowDetail, searchFetcher, onSearchAct
 
   return (
     <div className="packet-pane">
-      <SearchBar search={search} />
+      {showSearch ? <SearchBar search={search} /> : null}
       {visibleFlows.length === 0 ? (
         <p className="packet-empty">{matchesByFlow === null ? "no packets captured" : "no matching packets"}</p>
       ) : (
@@ -191,7 +198,7 @@ function responseContentType(metadata: ImmutableFlowMetadata): string | undefine
   return header?.value;
 }
 
-function PacketDetail({ metadata, detail }: { metadata: ImmutableFlowMetadata; detail: FlowDetailResult | null }) {
+export function PacketDetail({ metadata, detail }: { metadata: ImmutableFlowMetadata; detail: FlowDetailResult | null }) {
   const overrides = detail?.status === "loaded" ? detail.overrides : undefined;
   const requestBody = overrides?.request_body ?? metadata.request_body;
   const responseBody = overrides?.response_body ?? metadata.response_body;
