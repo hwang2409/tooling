@@ -40,6 +40,28 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _decoded_response_bytes(response: object | None) -> bytes | None:
+    """Return response body bytes with content-encoding decoded when possible.
+
+    Real mitmproxy responses expose ``get_content(strict=False)`` which
+    transparently gunzips/brotlis wire bytes. Test fakes only expose
+    ``raw_content``. Fall back to the raw attribute so both work.
+    """
+
+    if response is None:
+        return None
+    getter = getattr(response, "get_content", None)
+    if callable(getter):
+        try:
+            decoded = getter(strict=False)
+        except Exception:
+            decoded = None
+        if decoded is None or isinstance(decoded, bytes):
+            return decoded
+    raw = getattr(response, "raw_content", None)
+    return raw if raw is None or isinstance(raw, bytes) else None
+
+
 def _validate_active_limits(max_flows: object, max_age: object) -> None:
     if type(max_flows) is not int or max_flows < 1 or max_flows > MAX_U64:
         raise ValueError("max_active_flows must be an exact bounded integer")
@@ -268,10 +290,7 @@ class CaptureAddon:
         state = self._ensure_request(flow)
         if state.tombstone:
             return
-        # Use `.content` so gzip/br/deflate response bodies are decompressed
-        # before capture — otherwise the frontend sees wire bytes and cannot
-        # decode them as JSON/text.
-        response_content = flow.response.get_content(strict=False) if flow.response else None
+        response_content = _decoded_response_bytes(flow.response)
         if not self._finish_body(state, "response", response_content):
             return
         if "response_end" not in state.lifecycle_states:
@@ -296,7 +315,7 @@ class CaptureAddon:
                 return
             self._metadata(state)
         if state.response_headers_captured and not state.response.ended:
-            response_content = flow.response.get_content(strict=False) if flow.response else None
+            response_content = _decoded_response_bytes(flow.response)
             if not self._finish_body(state, "response", response_content):
                 return
             if "response_end" not in state.lifecycle_states:
