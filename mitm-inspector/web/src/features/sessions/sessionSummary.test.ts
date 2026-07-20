@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import type { ImmutableFlowMetadata } from "../../state/browserState";
+import type { FlowsUpdate, ImmutableFlowMetadata } from "../../state/browserState";
 import { parseAnthropicRequest } from "../inspector/anthropic";
-import { conversationCandidates, createSessionIndex, deriveSessions, isSuggestionRequest, looksLikeSuggestionFlow } from "./sessionSummary";
+import { collectionOf, conversationCandidates, createSessionIndex, deriveSessions, isSuggestionRequest, looksLikeSuggestionFlow } from "./sessionSummary";
 
 interface FlowOptions {
   session?: string | null;
@@ -117,36 +117,116 @@ describe("deriveSessions", () => {
 });
 
 describe("createSessionIndex", () => {
-  it("only resummarizes sessions whose flow membership changed", () => {
+  const delta = (revision: number, changedFlowIds: readonly string[]): FlowsUpdate =>
+    ({ revision, kind: "delta", changedFlowIds });
+  const snapshot = (revision: number): FlowsUpdate => ({ revision, kind: "snapshot", changedFlowIds: [] });
+
+  it("touches only the sessions owning the changed flow ids", () => {
     const a1 = flow("a1", { session: "aaaa" });
     const b1 = flow("b1", { session: "bbbb" });
     const index = createSessionIndex();
-    const first = index.update([a1, b1]);
-    const second = index.update([flow("b2", { session: "bbbb" }), a1, b1]);
-    // Untouched session keeps its summary object identity across the delta.
+    const first = index.update(collectionOf([a1, b1]), snapshot(1));
+    expect(index.stats().fullRebuilds).toBe(1);
+    const recomputedAfterRebuild = index.stats().sessionsRecomputed;
+
+    const second = index.update(collectionOf([flow("b2", { session: "bbbb" }), a1, b1]), delta(2, ["b2"]));
+    expect(index.stats().incrementalUpdates).toBe(1);
+    expect(index.stats().fullRebuilds).toBe(1);
+    // Work bound: exactly ONE session resummarized for the delta; the
+    // untouched session is not regrouped and keeps its summary identity.
+    expect(index.stats().sessionsRecomputed).toBe(recomputedAfterRebuild + 1);
     expect(second.find((session) => session.key === "aaaa"))
       .toBe(first.find((session) => session.key === "aaaa"));
-    const updated = second.find((session) => session.key === "bbbb");
-    expect(updated).not.toBe(first.find((session) => session.key === "bbbb"));
-    expect(updated?.flowCount).toBe(2);
+    expect(second.map((session) => session.key)).toEqual(["bbbb", "aaaa"]);
+    expect(second.find((session) => session.key === "bbbb")?.flowCount).toBe(2);
   });
 
-  it("returns the previous result identity while flows are unchanged", () => {
-    const flows = [flow("a1", { session: "aaaa" }), flow("b1", { session: "bbbb" })];
+  it("caches repeated revisions and full-rebuilds on a revision gap", () => {
+    const a1 = flow("a1", { session: "aaaa" });
     const index = createSessionIndex();
-    const first = index.update(flows);
-    expect(index.update(flows)).toBe(first);
-    // Same flow identities in a fresh array (paused view re-render).
-    expect(index.update([...flows])).toBe(first);
+    const collection = collectionOf([a1]);
+    const first = index.update(collection, snapshot(1));
+    expect(index.update(collection, snapshot(1))).toBe(first);
+    expect(index.stats().fullRebuilds).toBe(1);
+    // Skipped revision (coalesced renders, paused view resuming): the delta's
+    // changed ids no longer describe the full difference — full rebuild.
+    const b1 = flow("b1", { session: "bbbb" });
+    const rebuilt = index.update(collectionOf([b1, a1]), delta(3, ["b1"]));
+    expect(index.stats().fullRebuilds).toBe(2);
+    expect(index.stats().incrementalUpdates).toBe(0);
+    expect(rebuilt.map((session) => session.key)).toEqual(["bbbb", "aaaa"]);
   });
 
-  it("drops pruned sessions on the next update", () => {
+  it("handles incremental removals including whole-session pruning", () => {
     const a1 = flow("a1", { session: "aaaa" });
     const b1 = flow("b1", { session: "bbbb" });
+    const b2 = flow("b2", { session: "bbbb" });
     const index = createSessionIndex();
-    index.update([a1, b1]);
-    const pruned = index.update([b1]);
-    expect(pruned.map((session) => session.key)).toEqual(["bbbb"]);
+    index.update(collectionOf([b2, a1, b1]), snapshot(1));
+    const afterOne = index.update(collectionOf([b2, a1]), delta(2, ["b1"]));
+    expect(afterOne.find((session) => session.key === "bbbb")?.flowCount).toBe(1);
+    const afterSession = index.update(collectionOf([a1]), delta(3, ["b2"]));
+    expect(afterSession.map((session) => session.key)).toEqual(["aaaa"]);
+  });
+
+  it("matches from-scratch derivation across randomized delta sequences", () => {
+    let seed = 42;
+    const rand = () => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed / 2147483648;
+    };
+    const pick = <Item,>(items: readonly Item[]): Item => items[Math.floor(rand() * items.length)];
+    const sessionPool: Array<string | null> = ["s1", "s2", "s3", null];
+    let entries: ImmutableFlowMetadata[] = [];
+    let revision = 1;
+    let nextId = 0;
+    const index = createSessionIndex();
+    index.update(collectionOf(entries), { revision, kind: "snapshot", changedFlowIds: [] });
+
+    for (let step = 0; step < 120; step += 1) {
+      const changed: string[] = [];
+      const operation = rand();
+      if (operation < 0.5 || entries.length === 0) {
+        // Batch of brand-new flows, block-prepended in batch order.
+        const fresh: ImmutableFlowMetadata[] = [];
+        const count = 1 + Math.floor(rand() * 3);
+        for (let item = 0; item < count; item += 1) {
+          const created = flow(`f${nextId}`, {
+            session: pick(sessionPool),
+            status: rand() < 0.2 ? "500" : "200",
+            model: rand() < 0.5 ? "claude-opus-4" : "claude-haiku-4",
+          });
+          nextId += 1;
+          fresh.push(created);
+          changed.push(created.flow_id);
+        }
+        entries = [...fresh, ...entries];
+      } else if (operation < 0.8) {
+        // In-place upsert of an existing flow.
+        const target = pick(entries);
+        const updated = { ...target, response_status: "201" } as ImmutableFlowMetadata;
+        entries = entries.map((candidate) => (candidate === target ? updated : candidate));
+        changed.push(target.flow_id);
+      } else {
+        const target = pick(entries);
+        entries = entries.filter((candidate) => candidate !== target);
+        changed.push(target.flow_id);
+      }
+      revision += 1;
+      const incremental = index.update(collectionOf(entries), { revision, kind: "delta", changedFlowIds: changed });
+      const scratch = deriveSessions(entries);
+      expect(incremental.map((session) => session.key)).toEqual(scratch.map((session) => session.key));
+      incremental.forEach((session, position) => {
+        const expected = scratch[position];
+        expect(session.flows.map((entry) => entry.flow_id)).toEqual(expected.flows.map((entry) => entry.flow_id));
+        expect(session.flowCount).toBe(expected.flowCount);
+        expect(session.hasError).toBe(expected.hasError);
+        expect(session.models).toEqual(expected.models);
+        expect(session.firstQuery).toBe(expected.firstQuery);
+      });
+    }
+    expect(index.stats().incrementalUpdates).toBe(120);
+    expect(index.stats().fullRebuilds).toBe(1);
   });
 });
 

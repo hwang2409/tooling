@@ -10,6 +10,8 @@ import { parseProtocolMessage } from "../../protocol";
 import { browserReducer, initialBrowserState } from "../../state/browserState";
 import type { BrowserState } from "../../state/browserState";
 import type { FlowDetailLoader } from "../inspector/flowDetail";
+import { createSessionIndex } from "./sessionSummary";
+import type { SessionIndex } from "./sessionSummary";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -130,7 +132,11 @@ const mounts: Array<{ root: ReturnType<typeof createRoot>; container: HTMLDivEle
 
 type DetailBodies = Record<string, { request: string; response?: string }>;
 
-async function mountWorkspace(browser: BrowserState, bodies: DetailBodies | (() => DetailBodies) = DETAIL_BODIES) {
+async function mountWorkspace(
+  browser: BrowserState,
+  bodies: DetailBodies | (() => DetailBodies) = DETAIL_BODIES,
+  sessionIndex?: SessionIndex,
+) {
   const requested: string[] = [];
   const loadFlowDetail: FlowDetailLoader = async (flowId) => {
     requested.push(flowId);
@@ -150,7 +156,9 @@ async function mountWorkspace(browser: BrowserState, bodies: DetailBodies | (() 
   const root = createRoot(container);
   mounts.push({ root, container });
   const render = async (nextBrowser: BrowserState) => {
-    await act(async () => root.render(<Workspace browser={nextBrowser} loadFlowDetail={loadFlowDetail} />));
+    await act(async () => root.render(
+      <Workspace browser={nextBrowser} loadFlowDetail={loadFlowDetail} sessionIndex={sessionIndex} />,
+    ));
   };
   await render(browser);
   return { container, requested, render };
@@ -268,7 +276,7 @@ describe("Workspace session-first navigation", () => {
     expect(sessionRows(container)).toHaveLength(1);
   });
 
-  it("prefix-dedupe regression: a newer equal-count utility branch never becomes the conversation", async () => {
+  it("prefix regression: an older equal-count branch never steals the conversation from the live thread", async () => {
     const session = "cccc9999-0000-1111-2222-333333333333";
     const branchRequest = JSON.stringify({
       model: "claude-opus-4",
@@ -283,17 +291,18 @@ describe("Workspace session-first navigation", () => {
       messages: [{ role: "user", content: "fix the bug" }],
     });
     const flows = [
-      // Newest, same message_count as the main thread, no suggestion marker:
-      // the retired count/recency heuristic selected THIS flow.
-      sessionFlow("branch-flow", {
-        session_id: session,
-        started_at: "2026-01-01T00:03:00Z",
-        summary: { kind: "anthropic_messages", model: "claude-opus-4", message_count: "3", preview: { source: "user_text", text: "what quota remains?" } },
-      }),
       sessionFlow("main2-flow", {
         session_id: session,
-        started_at: "2026-01-01T00:02:00Z",
+        started_at: "2026-01-01T00:03:00Z",
         summary: { kind: "anthropic_messages", model: "claude-opus-4", message_count: "3", preview: { source: "tool_result", tool_name: "Bash" } },
+      }),
+      // Older equal-count divergent branch sharing the root: the retired
+      // greedy partition let it steal the shared root and dominate by
+      // member count.
+      sessionFlow("branch-flow", {
+        session_id: session,
+        started_at: "2026-01-01T00:02:00Z",
+        summary: { kind: "anthropic_messages", model: "claude-opus-4", message_count: "3", preview: { source: "user_text", text: "what quota remains?" } },
       }),
       sessionFlow("old-main-flow", {
         session_id: session,
@@ -310,8 +319,8 @@ describe("Workspace session-first navigation", () => {
     await settle();
     expect(new Set(requested)).toEqual(new Set(["branch-flow", "main2-flow", "old-main-flow"]));
     const conversation = container.querySelector("[data-testid='conversation-view']");
-    // Canonical = tip of the dominant prefix chain {old-main -> main2}, so
-    // the chat shows the main thread and its response as the final turn.
+    // Canonical = the maximal chain with the newest tip ({old-main -> main2}),
+    // so the chat shows the main thread and its response as the final turn.
     expect(conversation?.textContent).toContain("tests pass");
     expect(conversation?.textContent).toContain("final assistant turn");
     expect(conversation?.textContent).not.toContain("quota");
@@ -368,5 +377,65 @@ describe("Workspace session-first navigation", () => {
     await settle();
     expect(requested).toEqual(["live-flow", "live-flow"]);
     expect(container.querySelector("[data-testid='conversation-view']")?.textContent).toContain("late final answer");
+  });
+
+  it("renders the auxiliary/flow view, not a fake chat, when every candidate is suggestion-mode", async () => {
+    const session = "eeee7777-0000-1111-2222-333333333333";
+    const flows = [
+      sessionFlow("sugg-2", {
+        session_id: session,
+        started_at: "2026-01-01T00:02:00Z",
+        summary: { kind: "anthropic_messages", model: "claude-opus-4", message_count: "3", preview: { source: "tool_result", tool_name: "Bash" } },
+      }),
+      sessionFlow("sugg-1", {
+        session_id: session,
+        started_at: "2026-01-01T00:01:00Z",
+        summary: { kind: "anthropic_messages", model: "claude-opus-4", message_count: "3", preview: { source: "user_text", text: "[SUGGESTION MODE: propose] x" } },
+      }),
+    ];
+    const { container } = await mountWorkspace(stateOf(flows), {
+      "sugg-2": { request: SUGGESTION_REQUEST },
+      "sugg-1": { request: SUGGESTION_REQUEST },
+    });
+    await click(sessionRows(container)[0]);
+    await settle();
+    // No verifiable main thread: never promote a rejected suggestion call
+    // into a fake conversation.
+    expect(container.querySelector("[data-testid='conversation-view']")).toBeNull();
+    expect(container.textContent).toContain("auxiliary calls (2)");
+    // The auxiliary group arrives expanded so the flows are immediately visible.
+    expect(container.querySelectorAll(".session-aux .packet-row")).toHaveLength(2);
+  });
+
+  it("keeps one incremental session index across deltas (guards against fresh-index-per-render)", async () => {
+    const inner = createSessionIndex();
+    const index: SessionIndex = {
+      update: (flows, flowsUpdate) => inner.update(flows, flowsUpdate),
+      stats: () => inner.stats(),
+    };
+    const state1 = stateOf(FLOWS);
+    const deltaEnvelope = parseProtocolMessage({
+      protocol_version: "1",
+      type: "browser.delta",
+      cursor: "2",
+      changes: [{
+        op: "upsert",
+        flow: sessionFlow("aux-new", {
+          started_at: "2026-01-01T00:04:00Z",
+          summary: { kind: "anthropic_count_tokens", model: "claude-haiku-4", count_tokens_result: "9" },
+        }),
+      }],
+    });
+    const state2 = browserReducer(state1, { type: "protocol", envelope: deltaEnvelope });
+
+    const { container, render } = await mountWorkspace(state1, DETAIL_BODIES, index);
+    expect(inner.stats().fullRebuilds).toBe(1);
+    await render(state2);
+    // The delta must flow through the SAME index incrementally; a fresh
+    // index per render would register another full rebuild (or bypass this
+    // index entirely) and fail here.
+    expect(inner.stats().fullRebuilds).toBe(1);
+    expect(inner.stats().incrementalUpdates).toBe(1);
+    expect(sessionRows(container)[0].textContent).toContain("4f");
   });
 });

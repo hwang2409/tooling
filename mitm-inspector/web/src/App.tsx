@@ -25,6 +25,7 @@ export interface WorkspaceProps {
   loadFlowDetail?: FlowDetailLoader;
   searchFetcher?: SearchFetcher;
   onSearchActiveChange?: (active: boolean) => void;
+  sessionIndex?: SessionIndex;
 }
 
 /**
@@ -32,13 +33,15 @@ export interface WorkspaceProps {
  * session's conversation; the raw packet grid stays one switch away so
  * non-Anthropic and debugging flows lose nothing.
  */
-export function Workspace({ browser, loadFlowDetail, searchFetcher, onSearchActiveChange }: WorkspaceProps) {
+export function Workspace({ browser, loadFlowDetail, searchFetcher, onSearchActiveChange, sessionIndex }: WorkspaceProps) {
   const [view, setView] = useState<WorkspaceView>({ kind: "sessions" });
-  // Stateful incremental index: unchanged sessions keep their summary
-  // objects across deltas; only sessions whose flows changed resummarize.
+  // One stateful index for the component's lifetime: consecutive deltas
+  // update only the sessions owning the changed flow ids (see
+  // createSessionIndex); a fresh index here would degrade every delta to a
+  // full rebuild.
   const indexRef = useRef<SessionIndex | null>(null);
-  if (indexRef.current === null) indexRef.current = createSessionIndex();
-  const sessions = indexRef.current.update(browser.flows.entries);
+  if (indexRef.current === null) indexRef.current = sessionIndex ?? createSessionIndex();
+  const sessions = indexRef.current.update(browser.flows, browser.flowsUpdate);
 
   let body;
   if (view.kind === "flows") {

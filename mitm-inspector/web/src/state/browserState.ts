@@ -37,6 +37,18 @@ export interface BrowserCounters {
 export type ImmutableFlowMetadata = DeepReadonly<FlowMetadata>;
 export type ImmutableFlowLifecycle = DeepReadonly<FlowLifecycle>;
 
+/**
+ * Provenance of the current flow collection, so downstream aggregation can
+ * update incrementally: consecutive "delta" revisions carry exactly the flow
+ * ids that changed; any reset/snapshot (or a skipped revision) demands a
+ * full rebuild.
+ */
+export interface FlowsUpdate {
+  readonly revision: number;
+  readonly kind: "reset" | "snapshot" | "delta";
+  readonly changedFlowIds: readonly string[];
+}
+
 export interface ImmutableFlowCollection {
   readonly ids: readonly string[];
   readonly entries: readonly ImmutableFlowMetadata[];
@@ -57,6 +69,7 @@ export interface ImmutableLifecycleCollection {
 
 export interface BrowserState {
   readonly flows: ImmutableFlowCollection;
+  readonly flowsUpdate: FlowsUpdate;
   readonly lifecycles: ImmutableLifecycleCollection;
   readonly cursor: string;
   readonly streamSequence: string | null;
@@ -85,6 +98,7 @@ export const emptyLifecycleCollection = createLifecycleCollection([]);
 
 const initialBrowserStateValue: BrowserState = {
   flows: emptyFlowCollection,
+  flowsUpdate: { revision: 0, kind: "reset", changedFlowIds: [] },
   lifecycles: emptyLifecycleCollection,
   cursor: "0",
   streamSequence: null,
@@ -147,6 +161,7 @@ function freezeCopy<T>(value: T): T {
 function freezeBrowserState(state: BrowserState): BrowserState {
   return Object.freeze({
     ...state,
+    flowsUpdate: Object.freeze({ ...state.flowsUpdate, changedFlowIds: Object.freeze([...state.flowsUpdate.changedFlowIds]) }),
     sourceLimits: state.sourceLimits === null ? null : freezeCopy(state.sourceLimits),
     sourceCapabilities: state.sourceCapabilities === null ? null : freezeCopy(state.sourceCapabilities),
     gap: state.gap === null ? null : Object.freeze({ ...state.gap }),
@@ -258,6 +273,7 @@ function resetForSource(state: BrowserState, message: SourceHello): BrowserState
   return {
     ...state,
     flows: emptyFlowCollection,
+    flowsUpdate: { revision: state.flowsUpdate.revision + 1, kind: "reset", changedFlowIds: [] },
     lifecycles: emptyLifecycleCollection,
     cursor: "0",
     streamSequence: null,
@@ -284,6 +300,7 @@ function resetForSource(state: BrowserState, message: SourceHello): BrowserState
 function resetForTransport(state: BrowserState): BrowserState {
   return {
     ...initialBrowserState,
+    flowsUpdate: { revision: state.flowsUpdate.revision + 1, kind: "reset", changedFlowIds: [] },
     sourceEpoch: state.sourceEpoch + 1,
     initialConnectPending: false,
   };
@@ -294,6 +311,7 @@ function applySnapshot(state: BrowserState, message: BrowserSnapshot): BrowserSt
   return {
     ...state,
     flows: createFlowCollection(message.flows),
+    flowsUpdate: { revision: state.flowsUpdate.revision + 1, kind: "snapshot", changedFlowIds: [] },
     cursor: message.cursor,
     snapshotId: message.snapshot_id,
     gap: null,
@@ -353,6 +371,11 @@ function applyDelta(state: BrowserState, message: BrowserDelta): BrowserState {
   return {
     ...state,
     flows: createFlowCollection([...newEntries, ...entries]),
+    flowsUpdate: {
+      revision: state.flowsUpdate.revision + 1,
+      kind: "delta",
+      changedFlowIds: message.changes.map((change) => (change.op === "upsert" ? change.flow.flow_id : change.flow_id)),
+    },
     lifecycles: pruneLifecycle(state.lifecycles, removedFlowIds),
     cursor: message.cursor,
     gap: null,

@@ -4,19 +4,23 @@ import type { JsonValue } from "../inspector/jsonTree";
  * Canonical main-thread selection over fetched request bodies.
  *
  * Every main-thread request resends the full conversation history, so
- * consecutive main-thread requests form a prefix chain once two benign
- * mutations are normalized away:
- *   - `cache_control` markers move between requests (content identical), and
- *   - earlier messages can GAIN appended system-reminder text blocks in
- *     later requests (the latest request's version is canonical).
+ * consecutive main-thread requests form prefix chains once two benign — and
+ * ONLY two — mutations are normalized away:
+ *   - `cache_control` markers move between requests (stripped at the one
+ *     place Anthropic puts them: the top level of a content block, never
+ *     inside tool inputs or other nested data), and
+ *   - earlier messages can gain appended `<system-reminder>` text blocks in
+ *     later requests (any other appended block breaks the prefix).
  *
- * Utility side-calls (quota, topic detection, branched probes) share at most
- * a prefix root and then diverge, so they land in their own short chains.
- * The chat therefore renders the tip of the DOMINANT chain — the one with
- * the most members — never a newer-but-off-chain branch, even when that
- * branch matches the main thread's message count. Suggestion-mode requests
- * are excluded up front: they duplicate the main history with an injected
- * prompt and must never become the rendered conversation.
+ * Chains are built non-consuming: a request extends every chain whose
+ * messages are a prefix of its own, so a shared root belongs to all of its
+ * branches rather than being stolen by whichever branch sorts first. The
+ * conversation renders the tip of the maximal chain whose tip is most recent
+ * by created order (grid order): a live branch beats a stale sibling, and a
+ * post-compaction restart (shorter history, newer tip) beats the stale
+ * pre-compaction chain. Suggestion-mode requests are excluded up front: they
+ * duplicate the main history with an injected prompt and must never become
+ * the rendered conversation.
  */
 
 export interface CanonicalCandidate {
@@ -25,13 +29,13 @@ export interface CanonicalCandidate {
   readonly messages: readonly JsonValue[];
   /** Body-verified suggestion-mode request (see isSuggestionRequest). */
   readonly suggestion: boolean;
-  /** Grid position, 0 = newest. */
+  /** Created order: grid position, 0 = newest. */
   readonly order: number;
 }
 
 export interface CanonicalSelection {
   readonly canonicalId: string | null;
-  /** Members of the dominant prefix chain, oldest first. */
+  /** Members of the selected prefix chain, oldest (shortest) first. */
   readonly chainIds: readonly string[];
 }
 
@@ -42,26 +46,26 @@ function asObject(value: JsonValue | undefined): JsonObject | null {
   return value;
 }
 
-function stripCacheControl(value: JsonValue): JsonValue {
-  if (value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map(stripCacheControl);
-  const result: JsonObject = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (key === "cache_control") continue;
-    result[key] = stripCacheControl(item);
-  }
-  return result;
+/** Strip cache_control at a content block's top level only — nowhere else. */
+function normalizeBlock(block: JsonValue): JsonValue {
+  const object = asObject(block);
+  if (object === null || !("cache_control" in object)) return block;
+  const copy = { ...object };
+  delete copy.cache_control;
+  return copy;
 }
 
-/** Strip cache_control everywhere and expand string content shorthand. */
+/** Expand string content shorthand and normalize each content block. */
 export function normalizeMessage(message: JsonValue): JsonValue {
-  const stripped = stripCacheControl(message);
-  const object = asObject(stripped);
-  if (object === null) return stripped;
+  const object = asObject(message);
+  if (object === null) return message;
   if (typeof object.content === "string") {
     return { ...object, content: [{ type: "text", text: object.content }] };
   }
-  return stripped;
+  if (Array.isArray(object.content)) {
+    return { ...object, content: object.content.map(normalizeBlock) };
+  }
+  return object;
 }
 
 function deepEqual(left: JsonValue, right: JsonValue): boolean {
@@ -80,15 +84,19 @@ function deepEqual(left: JsonValue, right: JsonValue): boolean {
   return leftKeys.every((key) => key in rightObject && deepEqual((left as JsonObject)[key], rightObject[key]));
 }
 
-function isTextBlock(value: JsonValue): boolean {
+/** Exact shape of a harness-injected reminder: a text block starting with the marker. */
+function isReminderInjection(value: JsonValue): boolean {
   const object = asObject(value);
-  return object !== null && object.type === "text";
+  return object !== null && object.type === "text"
+    && typeof object.text === "string" && object.text.startsWith("<system-reminder>");
 }
 
 /**
  * Whether an earlier request's message is the same turn as a later request's
  * message at the same index: equal after normalization, or the later version
- * gained appended text blocks (system-reminder injection).
+ * gained appended system-reminder text blocks. Ordinary appended content —
+ * user text, tool blocks, anything without the reminder marker — breaks the
+ * match.
  */
 export function messageMatches(earlier: JsonValue, later: JsonValue): boolean {
   if (deepEqual(earlier, later)) return true;
@@ -101,7 +109,7 @@ export function messageMatches(earlier: JsonValue, later: JsonValue): boolean {
   if (!Array.isArray(earlierContent) || !Array.isArray(laterContent)) return false;
   if (laterContent.length < earlierContent.length) return false;
   if (!earlierContent.every((block, index) => deepEqual(block, laterContent[index]))) return false;
-  if (!laterContent.slice(earlierContent.length).every(isTextBlock)) return false;
+  if (!laterContent.slice(earlierContent.length).every(isReminderInjection)) return false;
   const rest = (object: JsonObject) => {
     const copy = { ...object };
     delete copy.content;
@@ -116,54 +124,42 @@ export function messagesArePrefix(earlier: readonly JsonValue[], later: readonly
   return earlier.every((message, index) => messageMatches(message, later[index]));
 }
 
-interface ChainEntry {
+interface Entry {
   readonly candidate: CanonicalCandidate;
   readonly normalized: readonly JsonValue[];
 }
 
-interface Chain {
-  members: ChainEntry[];
-  tip: ChainEntry;
+/** Whether `other` extends `entry`: strictly longer, or an equal-length newer retransmit. */
+function supersedes(entry: Entry, other: Entry): boolean {
+  if (!messagesArePrefix(entry.normalized, other.normalized)) return false;
+  if (other.normalized.length > entry.normalized.length) return true;
+  return other.candidate.order < entry.candidate.order;
 }
 
 export function selectCanonicalFlow(candidates: readonly CanonicalCandidate[]): CanonicalSelection {
-  const entries: ChainEntry[] = candidates
+  const entries: Entry[] = candidates
     .filter((candidate) => !candidate.suggestion)
     .map((candidate) => ({ candidate, normalized: candidate.messages.map(normalizeMessage) }));
-  // Shortest first so each chain grows tip-by-tip; older first within equal
-  // length so a retransmitted identical request advances the tip to the
-  // newest copy.
-  entries.sort((left, right) =>
-    left.normalized.length - right.normalized.length || right.candidate.order - left.candidate.order);
+  if (entries.length === 0) return { canonicalId: null, chainIds: [] };
 
-  const chains: Chain[] = [];
-  for (const entry of entries) {
-    let best: Chain | null = null;
-    for (const chain of chains) {
-      if (!messagesArePrefix(chain.tip.normalized, entry.normalized)) continue;
-      if (best === null || chain.tip.normalized.length > best.tip.normalized.length) best = chain;
-    }
-    if (best === null) chains.push({ members: [entry], tip: entry });
-    else {
-      best.members.push(entry);
-      best.tip = entry;
-    }
-  }
-  if (chains.length === 0) return { canonicalId: null, chainIds: [] };
+  // Maximal tips: requests that no other request extends. Non-consuming — a
+  // shared root is simply not a tip; it belongs to every branch's chain.
+  const tips = entries.filter((entry) => !entries.some((other) => other !== entry && supersedes(entry, other)));
 
-  const newestOrder = (chain: Chain) => Math.min(...chain.members.map((member) => member.candidate.order));
-  let dominant = chains[0];
-  for (const chain of chains.slice(1)) {
-    if (chain.members.length !== dominant.members.length) {
-      if (chain.members.length > dominant.members.length) dominant = chain;
-    } else if (chain.tip.normalized.length !== dominant.tip.normalized.length) {
-      if (chain.tip.normalized.length > dominant.tip.normalized.length) dominant = chain;
-    } else if (newestOrder(chain) < newestOrder(dominant)) {
-      dominant = chain;
-    }
+  // Policy: the live conversation is the maximal chain whose tip was created
+  // most recently. Covers both a newer branch over a stale sibling and a
+  // post-compaction restart over the longer pre-compaction chain.
+  let selected = tips[0];
+  for (const tip of tips.slice(1)) {
+    if (tip.candidate.order < selected.candidate.order) selected = tip;
   }
+
+  const members = entries
+    .filter((entry) => messagesArePrefix(entry.normalized, selected.normalized))
+    .sort((left, right) =>
+      left.normalized.length - right.normalized.length || right.candidate.order - left.candidate.order);
   return {
-    canonicalId: dominant.tip.candidate.flowId,
-    chainIds: dominant.members.map((member) => member.candidate.flowId),
+    canonicalId: selected.candidate.flowId,
+    chainIds: members.map((member) => member.candidate.flowId),
   };
 }

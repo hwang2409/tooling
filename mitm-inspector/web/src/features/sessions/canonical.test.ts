@@ -15,11 +15,26 @@ function candidate(flowId: string, messages: readonly JsonValue[], order: number
 }
 
 describe("message normalization and prefix matching", () => {
-  it("ignores cache_control markers moving between requests", () => {
+  it("ignores cache_control markers moving between requests (block top level)", () => {
     const earlier = normalizeMessage(user("hello", { cache_control: { type: "ephemeral" } }));
     const later = normalizeMessage(user("hello"));
     expect(messageMatches(earlier, later)).toBe(true);
     expect(messagesArePrefix([earlier], [later, normalizeMessage(assistant("hi"))])).toBe(true);
+  });
+
+  it("does NOT strip cache_control nested inside data such as tool inputs", () => {
+    // A tool input legitimately containing a `cache_control` key is data;
+    // collapsing it would fabricate false prefixes across differing calls.
+    const withKey = normalizeMessage({
+      role: "assistant",
+      content: [{ type: "tool_use", name: "Bash", input: { command: "ls", cache_control: "keep-me" } }],
+    } as JsonValue);
+    const withoutKey = normalizeMessage({
+      role: "assistant",
+      content: [{ type: "tool_use", name: "Bash", input: { command: "ls" } }],
+    } as JsonValue);
+    expect(messageMatches(withKey, withoutKey)).toBe(false);
+    expect(messageMatches(withoutKey, withKey)).toBe(false);
   });
 
   it("expands string content shorthand before comparing", () => {
@@ -28,16 +43,25 @@ describe("message normalization and prefix matching", () => {
     expect(messageMatches(shorthand, expanded)).toBe(true);
   });
 
-  it("tolerates system-reminder text blocks appended to an earlier message in a later request", () => {
+  it("tolerates appended <system-reminder> text blocks only", () => {
     const earlier = normalizeMessage(toolResult("t1", "ok"));
-    const later = normalizeMessage({
+    const reminder = normalizeMessage({
       role: "user",
       content: [
         { type: "tool_result", tool_use_id: "t1", content: "ok" },
         { type: "text", text: "<system-reminder>injected</system-reminder>" },
       ],
     } as JsonValue);
-    expect(messageMatches(earlier, later)).toBe(true);
+    expect(messageMatches(earlier, reminder)).toBe(true);
+    // Ordinary appended user text is a REAL edit, not an injection.
+    const editedText = normalizeMessage({
+      role: "user",
+      content: [
+        { type: "tool_result", tool_use_id: "t1", content: "ok" },
+        { type: "text", text: "please also check the logs" },
+      ],
+    } as JsonValue);
+    expect(messageMatches(earlier, editedText)).toBe(false);
   });
 
   it("rejects diverging turns: appended non-text blocks or different content", () => {
@@ -56,17 +80,30 @@ describe("selectCanonicalFlow", () => {
   const a1 = assistant("looking at it");
   const chainEnd = toolResult("t1", "tests pass");
 
-  it("prefix-dedupe regression: a newer equal-count off-chain branch must not beat the dominant chain", () => {
-    // Old heuristic (message_count desc, then recency) picks `branch`: it is
-    // newer than `main` with the same count and carries no suggestion marker.
-    // The prefix chains disagree: {old-main -> main} has two members while
-    // the diverging branch is a singleton, so `main` is canonical.
-    const branch = candidate("branch", [u1, assistant("different reply"), user("what quota remains?")], 0);
-    const main = candidate("main", [u1, a1, chainEnd], 1);
-    const oldMain = candidate("old-main", [u1], 2);
-    const selection = selectCanonicalFlow([branch, main, oldMain]);
-    expect(selection.canonicalId).toBe("main");
-    expect(selection.chainIds).toEqual(["old-main", "main"]);
+  it("shared-root regression: an older equal-length branch must not steal the root from the newer thread", () => {
+    // The retired greedy partition consumed the shared root into whichever
+    // equal-length branch sorted first (the OLDER one), making that chain
+    // dominant by member count. Non-consuming chains give the root to both
+    // branches; the newer tip wins.
+    const utilityOlder = candidate("utility-older", [u1, assistant("checking quota"), user("what quota remains?")], 2);
+    const mainNewest = candidate("main-newest", [u1, a1, chainEnd], 0);
+    const root = candidate("root", [u1], 4);
+    const selection = selectCanonicalFlow([utilityOlder, mainNewest, root]);
+    expect(selection.canonicalId).toBe("main-newest");
+    expect(selection.chainIds).toEqual(["root", "main-newest"]);
+  });
+
+  it("compaction regression: a shorter post-compaction restart beats the stale longer chain", () => {
+    // The retired member-count dominance kept rendering the pre-compaction
+    // chain (3 members) after the client restarted with a compacted history.
+    const stale1 = candidate("r1", [u1], 5);
+    const stale2 = candidate("r2", [u1, a1, chainEnd], 4);
+    const stale3 = candidate("r3", [u1, a1, chainEnd, assistant("more"), user("go on")], 3);
+    const restartRoot = candidate("s1", [user("compacted summary of prior work")], 1);
+    const restartTip = candidate("s2", [user("compacted summary of prior work"), assistant("resuming")], 0);
+    const selection = selectCanonicalFlow([stale1, stale2, stale3, restartRoot, restartTip]);
+    expect(selection.canonicalId).toBe("s2");
+    expect(selection.chainIds).toEqual(["s1", "s2"]);
   });
 
   it("never selects a suggestion-mode request even when it is the newest and longest", () => {
@@ -87,7 +124,7 @@ describe("selectCanonicalFlow", () => {
     expect(selection.chainIds).toEqual(["old-main", "main"]);
   });
 
-  it("breaks singleton ties toward the newest flow and returns null with no candidates", () => {
+  it("breaks tie between divergent tips toward the newest and returns null with no candidates", () => {
     const older = candidate("older", [user("a")], 1);
     const newer = candidate("newer", [user("b")], 0);
     expect(selectCanonicalFlow([older, newer]).canonicalId).toBe("newer");

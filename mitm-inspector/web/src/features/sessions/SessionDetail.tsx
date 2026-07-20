@@ -70,12 +70,21 @@ export function SessionDetail({ summary, onBack, loadFlowDetail }: SessionDetail
   const effectiveMode: SessionMode = candidates.length === 0 ? "flows" : mode;
 
   const details = useFlowDetails(effectiveMode === "conversation" ? candidates : NO_FLOWS, loadFlowDetail);
+  // Created order for the tip-recency policy is the GRID position of the
+  // flow (0 = newest), not the metadata-ranking position of the candidate.
+  const gridOrder = useMemo(
+    () => new Map(summary.flows.map((flow, index) => [flow.flow_id, index])),
+    [summary.flows],
+  );
   const parsed = useMemo(
-    () => candidates.map((flow, order) => parseCandidate(flow, order, details.get(flow.flow_id))),
-    [candidates, details],
+    () => candidates.map((flow) => parseCandidate(flow, gridOrder.get(flow.flow_id) ?? 0, details.get(flow.flow_id))),
+    [candidates, gridOrder, details],
   );
   const settled = effectiveMode === "conversation" && parsed.every((candidate) => candidate.detail !== null);
 
+  // Body-verified selection only. When nothing verifiable and non-suggestion
+  // remains, canonical stays null and the drill-in shows the auxiliary/flow
+  // view instead of promoting a rejected flow into a fake chat.
   const canonical = useMemo(() => {
     if (!settled) return null;
     const usable = parsed
@@ -87,11 +96,7 @@ export function SessionDetail({ summary, onBack, loadFlowDetail }: SessionDetail
         order: candidate.order,
       }));
     const selected = selectCanonicalFlow(usable).canonicalId;
-    // No verifiable body anywhere (all fetches unavailable/errored): fall
-    // back to the metadata ranking so the drill-in still shows something.
-    const fallback = parsed.find((candidate) => candidate.request === null || !isSuggestionRequest(candidate.request));
-    const chosenId = selected ?? fallback?.flow.flow_id ?? parsed[0]?.flow.flow_id ?? null;
-    return parsed.find((candidate) => candidate.flow.flow_id === chosenId) ?? null;
+    return selected === null ? null : parsed.find((candidate) => candidate.flow.flow_id === selected) ?? null;
   }, [settled, parsed]);
 
   const auxiliary = useMemo(
@@ -131,18 +136,34 @@ export function SessionDetail({ summary, onBack, loadFlowDetail }: SessionDetail
       </div>
       {effectiveMode === "conversation" ? (
         <div className="session-conversation">
-          {canonical === null
-            ? <p className="packet-empty">loading conversation…</p>
-            : <PacketDetail metadata={canonical.flow} detail={canonical.detail} />}
-          {canonical !== null && auxiliary.length > 0 ? (
-            <Collapse
-              className="session-aux"
-              label={`auxiliary calls (${auxiliary.length})`}
-              meta={<span className="conv-section-meta">suggestion + utility side-calls</span>}
-            >
-              <PacketList flows={auxiliary} showSearch={false} loadFlowDetail={loadFlowDetail} />
-            </Collapse>
-          ) : null}
+          {!settled ? (
+            <p className="packet-empty">loading conversation…</p>
+          ) : canonical === null ? (
+            <>
+              <p className="packet-empty">no main-thread conversation in this session — auxiliary calls only</p>
+              <Collapse
+                className="session-aux"
+                label={`auxiliary calls (${auxiliary.length})`}
+                meta={<span className="conv-section-meta">suggestion + utility side-calls</span>}
+                defaultOpen
+              >
+                <PacketList flows={auxiliary} showSearch={false} loadFlowDetail={loadFlowDetail} />
+              </Collapse>
+            </>
+          ) : (
+            <>
+              <PacketDetail metadata={canonical.flow} detail={canonical.detail} />
+              {auxiliary.length > 0 ? (
+                <Collapse
+                  className="session-aux"
+                  label={`auxiliary calls (${auxiliary.length})`}
+                  meta={<span className="conv-section-meta">suggestion + utility side-calls</span>}
+                >
+                  <PacketList flows={auxiliary} showSearch={false} loadFlowDetail={loadFlowDetail} />
+                </Collapse>
+              ) : null}
+            </>
+          )}
         </div>
       ) : (
         <PacketList flows={summary.flows} showSearch={false} loadFlowDetail={loadFlowDetail} />

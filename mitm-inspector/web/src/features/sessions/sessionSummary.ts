@@ -1,7 +1,7 @@
 /* eslint-disable no-unused-vars */
 
 import { parseFlowExtras } from "../../protocol";
-import type { ImmutableFlowMetadata } from "../../state/browserState";
+import type { FlowsUpdate, ImmutableFlowCollection, ImmutableFlowMetadata } from "../../state/browserState";
 import type { AnthropicRequest } from "../inspector/anthropic";
 
 /**
@@ -74,68 +74,183 @@ function parsedTime(value: string | undefined): number | null {
   return Number.isNaN(parsed) ? null : parsed;
 }
 
-export interface SessionIndex {
-  /** Project the current grid flows onto session summaries. */
-  readonly update: (flows: readonly ImmutableFlowMetadata[]) => readonly SessionSummary[];
+export interface SessionIndexStats {
+  readonly fullRebuilds: number;
+  readonly incrementalUpdates: number;
+  /** summarise() invocations — one per session actually recomputed. */
+  readonly sessionsRecomputed: number;
 }
 
-function sameFlows(left: readonly ImmutableFlowMetadata[], right: readonly ImmutableFlowMetadata[]): boolean {
-  return left.length === right.length && left.every((flow, index) => flow === right[index]);
+export interface SessionIndex {
+  /** Project the flow collection onto session summaries, incrementally when the provenance allows. */
+  readonly update: (flows: ImmutableFlowCollection, flowsUpdate?: FlowsUpdate) => readonly SessionSummary[];
+  readonly stats: () => SessionIndexStats;
 }
 
 /**
- * Incremental session aggregation. Grouping is a single pass of WeakMap hits
- * and identity pushes over the entries array the reducer already rebuilt for
- * the delta; the expensive per-session summarisation only re-runs for
- * sessions whose flow membership actually changed (the reducer reuses frozen
- * metadata objects for untouched flows, so identity comparison is exact).
- * A snapshot/source reset replaces every object and naturally rebuilds all.
+ * Delta-driven session aggregation. Consecutive "delta" revisions update
+ * only the sessions owning the changed flow ids: everything else keeps its
+ * summary object, its group, and is never regrouped or rescanned. A
+ * snapshot, source reset, or a skipped revision (e.g. coalesced renders or
+ * a paused view resuming) falls back to one full rebuild.
+ *
+ * Session order is newest-first by each session's newest flow. Internally
+ * that is a monotonic arrival sequence per flow — new flows are prepended by
+ * the delta contract, so descending sequence within a batch mirrors the
+ * entries order exactly, in-place upserts keep their position, and removals
+ * preserve relative order.
  */
 export function createSessionIndex(): SessionIndex {
-  let previousFlows: readonly ImmutableFlowMetadata[] | null = null;
-  let previousResult: readonly SessionSummary[] = [];
-  let previousGroups = new Map<SessionKey, readonly ImmutableFlowMetadata[]>();
-  let previousSummaries = new Map<SessionKey, SessionSummary>();
+  let lastRevision: number | null = null;
+  let lastEntries: readonly ImmutableFlowMetadata[] | null = null;
+  let result: readonly SessionSummary[] = [];
+  const flowById = new Map<string, ImmutableFlowMetadata>();
+  const sessionOf = new Map<string, SessionKey>();
+  const seqOf = new Map<string, number>();
+  const groups = new Map<SessionKey, ImmutableFlowMetadata[]>();
+  const maxSeqOf = new Map<SessionKey, number>();
+  const summaries = new Map<SessionKey, SessionSummary>();
+  let seqCounter = 0;
+  let fullRebuilds = 0;
+  let incrementalUpdates = 0;
+  let sessionsRecomputed = 0;
+
+  const summariseSession = (key: SessionKey, sessionFlows: readonly ImmutableFlowMetadata[]): SessionSummary => {
+    sessionsRecomputed += 1;
+    return summarise(key, [...sessionFlows]);
+  };
+
+  const finalize = (dirty: ReadonlySet<SessionKey>): void => {
+    for (const key of dirty) {
+      const group = groups.get(key);
+      if (group === undefined || group.length === 0) {
+        groups.delete(key);
+        maxSeqOf.delete(key);
+        summaries.delete(key);
+        continue;
+      }
+      group.sort((left, right) => (seqOf.get(right.flow_id) ?? 0) - (seqOf.get(left.flow_id) ?? 0));
+      maxSeqOf.set(key, seqOf.get(group[0].flow_id) ?? 0);
+      summaries.set(key, summariseSession(key, group));
+    }
+    result = [...groups.keys()]
+      .sort((left, right) => (maxSeqOf.get(right) ?? 0) - (maxSeqOf.get(left) ?? 0))
+      .map((key) => summaries.get(key)!);
+  };
+
+  const fullRebuild = (entries: readonly ImmutableFlowMetadata[]): void => {
+    fullRebuilds += 1;
+    flowById.clear();
+    sessionOf.clear();
+    seqOf.clear();
+    groups.clear();
+    maxSeqOf.clear();
+    summaries.clear();
+    const base = seqCounter + entries.length;
+    seqCounter = base;
+    const dirty = new Set<SessionKey>();
+    entries.forEach((flow, index) => {
+      const key = deriveFlowFacts(flow).sessionKey;
+      flowById.set(flow.flow_id, flow);
+      sessionOf.set(flow.flow_id, key);
+      seqOf.set(flow.flow_id, base - index);
+      const group = groups.get(key);
+      if (group === undefined) groups.set(key, [flow]);
+      else group.push(flow);
+      dirty.add(key);
+    });
+    finalize(dirty);
+  };
+
+  const applyDelta = (flows: ImmutableFlowCollection, changedFlowIds: readonly string[]): void => {
+    incrementalUpdates += 1;
+    const dirty = new Set<SessionKey>();
+    // Sequence a batch of brand-new flows in prepend order: the first change
+    // in the batch lands closest to the top of the grid, so it takes the
+    // highest sequence.
+    const newIds = changedFlowIds.filter((flowId) => !flowById.has(flowId) && flows.get(flowId) !== undefined);
+    const base = seqCounter + newIds.length;
+    seqCounter = base;
+    newIds.forEach((flowId, index) => seqOf.set(flowId, base - index));
+
+    for (const flowId of changedFlowIds) {
+      const metadata = flows.get(flowId);
+      if (metadata === undefined) {
+        const key = sessionOf.get(flowId);
+        if (key === undefined) continue;
+        groups.set(key, (groups.get(key) ?? []).filter((flow) => flow.flow_id !== flowId));
+        flowById.delete(flowId);
+        sessionOf.delete(flowId);
+        seqOf.delete(flowId);
+        dirty.add(key);
+        continue;
+      }
+      const key = deriveFlowFacts(metadata).sessionKey;
+      const previousKey = sessionOf.get(flowId);
+      if (previousKey === undefined) {
+        const group = groups.get(key);
+        if (group === undefined) groups.set(key, [metadata]);
+        else group.push(metadata);
+      } else if (previousKey === key) {
+        const group = groups.get(key) ?? [];
+        const index = group.findIndex((flow) => flow.flow_id === flowId);
+        if (index === -1) group.push(metadata);
+        else group[index] = metadata;
+        groups.set(key, group);
+      } else {
+        groups.set(previousKey, (groups.get(previousKey) ?? []).filter((flow) => flow.flow_id !== flowId));
+        dirty.add(previousKey);
+        const group = groups.get(key);
+        if (group === undefined) groups.set(key, [metadata]);
+        else group.push(metadata);
+      }
+      flowById.set(flowId, metadata);
+      sessionOf.set(flowId, key);
+      dirty.add(key);
+    }
+    finalize(dirty);
+  };
+
   return {
-    update(flows) {
-      if (previousFlows !== null && (flows === previousFlows || sameFlows(flows, previousFlows))) {
-        previousFlows = flows;
-        return previousResult;
+    update(flows, flowsUpdate) {
+      if (flowsUpdate !== undefined) {
+        if (lastRevision === flowsUpdate.revision && lastEntries === flows.entries) return result;
+        if (lastRevision !== null && flowsUpdate.revision === lastRevision + 1 && flowsUpdate.kind === "delta") {
+          applyDelta(flows, flowsUpdate.changedFlowIds);
+        } else {
+          fullRebuild(flows.entries);
+        }
+        lastRevision = flowsUpdate.revision;
+      } else {
+        if (lastEntries === flows.entries) return result;
+        fullRebuild(flows.entries);
+        lastRevision = null;
       }
-      const groups = new Map<SessionKey, ImmutableFlowMetadata[]>();
-      for (const flow of flows) {
-        const key = deriveFlowFacts(flow).sessionKey;
-        const existing = groups.get(key);
-        if (existing === undefined) groups.set(key, [flow]);
-        else existing.push(flow);
-      }
-      const summaries = new Map<SessionKey, SessionSummary>();
-      const result: SessionSummary[] = [];
-      for (const [key, sessionFlows] of groups) {
-        const priorGroup = previousGroups.get(key);
-        const priorSummary = previousSummaries.get(key);
-        const summary = priorGroup !== undefined && priorSummary !== undefined && sameFlows(priorGroup, sessionFlows)
-          ? priorSummary
-          : summarise(key, sessionFlows);
-        summaries.set(key, summary);
-        result.push(summary);
-      }
-      previousFlows = flows;
-      previousGroups = groups;
-      previousSummaries = summaries;
-      previousResult = result;
+      lastEntries = flows.entries;
       return result;
     },
+    stats: () => ({ fullRebuilds, incrementalUpdates, sessionsRecomputed }),
+  };
+}
+
+/** Wrap a plain entries array as a flow collection (tests, one-shot derives). */
+export function collectionOf(entries: readonly ImmutableFlowMetadata[]): ImmutableFlowCollection {
+  const byId = new Map(entries.map((flow) => [flow.flow_id, flow]));
+  return {
+    ids: entries.map((flow) => flow.flow_id),
+    entries,
+    size: entries.length,
+    get: (flowId: string) => byId.get(flowId),
   };
 }
 
 /**
- * Group the newest-first grid flows into one summary per session. Session
- * order follows each session's newest flow, so the list is newest-first too.
- * Null session ids collapse into a single "unassigned" bucket.
+ * One-shot grouping of the newest-first grid flows into session summaries.
+ * Session order follows each session's newest flow; null session ids
+ * collapse into a single "unassigned" bucket.
  */
 export function deriveSessions(flows: readonly ImmutableFlowMetadata[]): readonly SessionSummary[] {
-  return createSessionIndex().update(flows);
+  return createSessionIndex().update(collectionOf(flows));
 }
 
 function summarise(key: SessionKey, flows: readonly ImmutableFlowMetadata[]): SessionSummary {
