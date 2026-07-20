@@ -42,6 +42,7 @@ interface JsonNodeProps {
   keyLabel?: string;
   trailingComma?: boolean;
   forceCollapsed?: boolean;
+  embedded?: boolean;
 }
 
 /**
@@ -58,6 +59,25 @@ function JsonScalar({ value }: { value: JsonValue }) {
   if (typeof value === "boolean") return <span className="json-bool">{String(value)}</span>;
   if (typeof value === "number") return <span className="json-number">{Number.isFinite(value) ? String(value) : "null"}</span>;
   return <span className="json-string">&quot;{escapeJsonString(value as string)}&quot;</span>;
+}
+
+/**
+ * A string value that itself parses as a JSON object or array. Common in
+ * gateway payloads where structured content gets stringified (`"user":"{...}"`).
+ * We surface these as nested trees so the escaped `\"` never reaches the user.
+ * Only triggers when the trimmed string starts with `{` or `[` — a cheap
+ * heuristic that keeps plain strings from being probed on every render.
+ */
+function embeddedJson(value: string): JsonValue | null {
+  const trimmed = value.trim();
+  if (trimmed.length < 2) return null;
+  const first = trimmed.charCodeAt(0);
+  if (first !== 0x7b /* { */ && first !== 0x5b /* [ */) return null;
+  const parsed = safeParseJson(trimmed);
+  if (!parsed.ok) return null;
+  const inner = parsed.value;
+  if (inner === null || typeof inner !== "object") return null;
+  return inner;
 }
 
 // eslint-disable-next-line no-control-regex -- JSON string escaping intentionally targets the ASCII control range.
@@ -78,7 +98,7 @@ function escapeJsonString(value: string): string {
   });
 }
 
-function JsonNode({ value, depth, keyLabel, trailingComma, forceCollapsed }: JsonNodeProps) {
+function JsonNode({ value, depth, keyLabel, trailingComma, forceCollapsed, embedded }: JsonNodeProps) {
   const isObject = value !== null && typeof value === "object";
   const isArray = Array.isArray(value);
   const [collapsed, setCollapsed] = useState<boolean>(() => isObject ? (forceCollapsed === true ? true : shouldStartCollapsed(value, depth)) : false);
@@ -86,8 +106,26 @@ function JsonNode({ value, depth, keyLabel, trailingComma, forceCollapsed }: Jso
   const prefix = keyLabel !== undefined
     ? <span className="json-key">&quot;{escapeJsonString(keyLabel)}&quot;</span>
     : null;
+  const embeddedMark = embedded === true
+    ? <span className="json-embedded" title="parsed from a JSON string value">json</span>
+    : null;
 
   if (!isObject) {
+    if (typeof value === "string") {
+      const inner = embeddedJson(value);
+      if (inner !== null) {
+        return (
+          <JsonNode
+            value={inner}
+            depth={depth}
+            keyLabel={keyLabel}
+            trailingComma={trailingComma}
+            forceCollapsed={forceCollapsed}
+            embedded
+          />
+        );
+      }
+    }
     return (
       <div className="json-line" style={{ paddingLeft: depth * 12 }}>
         {prefix}{prefix ? <span className="json-punct">: </span> : null}
@@ -107,6 +145,7 @@ function JsonNode({ value, depth, keyLabel, trailingComma, forceCollapsed }: Jso
     return (
       <div className="json-line" style={{ paddingLeft: depth * 12 }}>
         {prefix}{prefix ? <span className="json-punct">: </span> : null}
+        {embeddedMark}
         <span className="json-punct">{open}{close}</span>
         {trailingComma ? <span className="json-punct">,</span> : null}
       </div>
@@ -124,6 +163,7 @@ function JsonNode({ value, depth, keyLabel, trailingComma, forceCollapsed }: Jso
           onClick={() => setCollapsed((previous) => !previous)}
         >{collapsed ? "+" : "−"}</button>
         {prefix}{prefix ? <span className="json-punct">: </span> : null}
+        {embeddedMark}
         <span className="json-punct">{open}</span>
         {collapsed ? (
           <>
