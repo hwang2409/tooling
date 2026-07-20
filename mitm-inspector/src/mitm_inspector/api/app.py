@@ -188,13 +188,9 @@ def _retime_grid_flow(
     """Update timing in the same canonical position without touching bodies."""
 
     values = dict(flow)
-    if started_at is None:
-        values.pop("started_at", None)
-    else:
+    if started_at is not None:
         values["started_at"] = started_at
-    if ended_at is None:
-        values.pop("ended_at", None)
-    else:
+    if ended_at is not None:
         values["ended_at"] = ended_at
     return canonical_grid_flow(values)
 

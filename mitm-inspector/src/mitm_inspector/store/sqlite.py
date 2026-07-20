@@ -797,6 +797,12 @@ class SQLiteFlowStorage:
             if "response_headers" in metadata
             else None
         )
+        metadata_started_at = metadata.get("started_at")
+        if not isinstance(metadata_started_at, str):
+            metadata_started_at = None
+        metadata_ended_at = metadata.get("ended_at")
+        if not isinstance(metadata_ended_at, str):
+            metadata_ended_at = None
         connection.execute(
             """
             INSERT INTO flows (
@@ -804,8 +810,9 @@ class SQLiteFlowStorage:
                 request_content_type, response_content_type, request_body,
                 response_body, request_body_state, response_body_state,
                 request_body_size, response_body_size, request_headers_json,
-                response_headers_json, created_order, session_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                response_headers_json, started_at, started_at_sort, ended_at,
+                created_order, session_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(flow_id) DO UPDATE SET
                 method = excluded.method,
                 scheme = excluded.scheme,
@@ -836,6 +843,28 @@ class SQLiteFlowStorage:
                 response_headers_json = COALESCE(
                     excluded.response_headers_json, flows.response_headers_json
                 ),
+                started_at = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM lifecycle
+                        WHERE flow_id = excluded.flow_id AND state = 'request_started'
+                    ) THEN flows.started_at
+                    ELSE excluded.started_at
+                END,
+                started_at_sort = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM lifecycle
+                        WHERE flow_id = excluded.flow_id AND state = 'request_started'
+                    ) THEN flows.started_at_sort
+                    ELSE excluded.started_at_sort
+                END,
+                ended_at = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM lifecycle
+                        WHERE flow_id = excluded.flow_id
+                          AND state IN ('flow_completed', 'error')
+                    ) THEN flows.ended_at
+                    ELSE excluded.ended_at
+                END,
                 session_id = COALESCE(excluded.session_id, flows.session_id),
                 created_order = CASE
                     WHEN flows.created_order = 0 THEN excluded.created_order
@@ -860,6 +889,11 @@ class SQLiteFlowStorage:
                 response[2],
                 request_headers,
                 response_headers,
+                metadata_started_at,
+                _timestamp_sort_key(metadata_started_at)
+                if metadata_started_at is not None
+                else None,
+                metadata_ended_at,
                 self._next_order(),
                 metadata.get("session_id"),
             ),
@@ -899,12 +933,16 @@ class SQLiteFlowStorage:
                 (
                     SELECT occurred_at FROM lifecycle
                     WHERE flow_id = ? AND state = 'request_started'
-                    ORDER BY LENGTH(sequence), sequence LIMIT 1
+                    ORDER BY LENGTH(sequence), sequence,
+                             occurred_at DESC, source_id DESC, event_id DESC
+                    LIMIT 1
                 ),
                 (
                     SELECT occurred_at FROM lifecycle
                     WHERE flow_id = ? AND state IN ('flow_completed', 'error')
-                    ORDER BY LENGTH(sequence) DESC, sequence DESC LIMIT 1
+                    ORDER BY LENGTH(sequence) DESC, sequence DESC,
+                             occurred_at DESC, source_id DESC, event_id DESC
+                    LIMIT 1
                 )
             """,
             (flow_id, flow_id),
@@ -913,7 +951,9 @@ class SQLiteFlowStorage:
         ended_at = timing_rows[1] if timing_rows is not None else None
         connection.execute(
             """
-            UPDATE flows SET started_at = ?, started_at_sort = ?, ended_at = ?
+            UPDATE flows SET started_at = COALESCE(?, started_at),
+                             started_at_sort = COALESCE(?, started_at_sort),
+                             ended_at = COALESCE(?, ended_at)
             WHERE flow_id = ?
             """,
             (
@@ -1080,7 +1120,14 @@ class SQLiteFlowStorage:
             metadata["request_content_type"] = row[8]
         if row[9] is not None:
             metadata["response_content_type"] = row[9]
-        return {"protocol_version": "1", "type": "flow.metadata", "metadata": metadata}
+        from mitm_inspector.api.projection import canonical_grid_flow
+
+        canonical_metadata = canonical_grid_flow(metadata)
+        return {
+            "protocol_version": "1",
+            "type": "flow.metadata",
+            "metadata": canonical_metadata,
+        }
 
 
 def _detail_body_allocations(
