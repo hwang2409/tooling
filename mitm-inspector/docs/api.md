@@ -44,7 +44,9 @@ that the session receives:
   shared across all sessions.  Changes are `upsert`/`remove` operations
   derived from the store's newest `flow.metadata` per flow; store eviction
   and age expiry surface as `remove` operations (an idle sweep task publishes
-  expiry without traffic).
+  expiry without traffic). Newly published flows enter at the front of the
+  snapshot order. A later upsert replaces an existing flow in place, so the
+  same plain upsert produces identical live and reconnect ordering.
 - Relayed `flow.lifecycle`, `stream.gap`, `source.hello`, and unknown-type
   messages, byte-independent copies with additive fields retained.
 - Nothing else: `body.chunk`, `body.end`, and raw `flow.metadata` are retained

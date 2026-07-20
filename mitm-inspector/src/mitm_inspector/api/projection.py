@@ -142,7 +142,7 @@ def flow_id_of(metadata: Mapping[str, object]) -> str | None:
 
 
 def collect_grid_flows(store: MemoryStore) -> dict[str, PlainJsonObject]:
-    """Project newest metadata plus retained lifecycle timing per flow."""
+    """Project newest metadata in stable newest-flow-first insertion order."""
 
     newest: dict[str, Mapping[str, object]] = {}
     timing = LifecycleTimingReducer()
@@ -163,9 +163,11 @@ def collect_grid_flows(store: MemoryStore) -> dict[str, PlainJsonObject]:
         if flow_id is None or flow_id in newest:
             continue
         newest[flow_id] = metadata
+    flow_order = store.flow_ids_newest_first()
     return {
-        flow_id: grid_flow_with_timing(metadata, *timing.values(flow_id))
-        for flow_id, metadata in newest.items()
+        flow_id: grid_flow_with_timing(newest[flow_id], *timing.values(flow_id))
+        for flow_id in flow_order
+        if flow_id in newest
     }
 
 

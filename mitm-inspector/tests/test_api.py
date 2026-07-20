@@ -270,14 +270,14 @@ def test_grid_flow_is_independent_schema_valid_and_body_free() -> None:
     assert metadata["method"] == "POST"
 
 
-def test_collect_grid_flows_uses_newest_metadata_per_flow_oldest_first() -> None:
+def test_collect_grid_flows_uses_newest_metadata_in_stable_flow_order() -> None:
     store = MemoryStore(8, clock=lambda: 0.0)
     store.append(parse_message(metadata_message("flow-a", path="/old")))
     store.append(parse_message(metadata_message("flow-b")))
     store.append(parse_message(metadata_message("flow-a", path="/new")))
     store.append(parse_message(lifecycle_message("flow-a")))
     flows = collect_grid_flows(store)
-    assert list(flows) == ["flow-b", "flow-a"] or list(flows) == ["flow-a", "flow-b"]
+    assert list(flows) == ["flow-b", "flow-a"]
     assert flows["flow-a"]["path"] == "/new"
 
 
@@ -1948,7 +1948,7 @@ def test_incremental_metadata_projection_matches_full_rescan(
     assert projection_calls == 0
 
 
-def test_incremental_metadata_projection_emits_single_upsert_delta(
+def test_metadata_update_preserves_published_order_and_emits_single_upsert_delta(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import mitm_inspector.api.app as app_module
@@ -1965,6 +1965,8 @@ def test_incremental_metadata_projection_emits_single_upsert_delta(
     application = make_application(max_items=64)
     application.ingest(metadata_message("flow-a"))
     application.ingest(metadata_message("flow-b"))
+    original_order = ["flow-b", "flow-a"]
+    assert list(application._state.published) == original_order
     projection_calls = 0
     frames: list[str] = []
     application.subscribe(lambda text: frames.append(text) or True)
@@ -1977,6 +1979,9 @@ def test_incremental_metadata_projection_emits_single_upsert_delta(
     assert changes[0]["op"] == "upsert"
     assert changes[0]["flow"]["flow_id"] == "flow-a"
     assert changes[0]["flow"]["path"] == "/v1/updated"
+    assert list(application._state.published) == original_order
+    snapshot = json.loads(application.snapshot_text())
+    assert [flow["flow_id"] for flow in snapshot["flows"]] == original_order
     assert projection_calls == 0
 
 

@@ -194,7 +194,6 @@ class ApiApplication:
         delta_emitted = self._reconcile(
             force=changed_flow_id is not None,
             flow_id=changed_flow_id,
-            move_to_front=payload.get("type") == "flow.metadata",
         )
         return IngestResult(parsed=parsed, relayed=relayed, delta_emitted=delta_emitted)
 
@@ -323,7 +322,6 @@ class ApiApplication:
         *,
         force: bool,
         flow_id: str | None = None,
-        move_to_front: bool = False,
     ) -> bool:
         counters = self._store.counters
         marks = tuple(counters[name] for name in _EVICTION_COUNTER_NAMES)
@@ -331,7 +329,7 @@ class ApiApplication:
             if not force:
                 return False
             if flow_id is not None:
-                return self._reconcile_single_flow(flow_id, move_to_front=move_to_front)
+                return self._reconcile_single_flow(flow_id)
         self._state.eviction_marks = marks
         current = collect_grid_flows(self._store)
         changes = diff_grid_changes(self._state.published, current)
@@ -340,15 +338,15 @@ class ApiApplication:
             return False
         return self._emit_delta(changes)
 
-    def _reconcile_single_flow(self, flow_id: str, *, move_to_front: bool) -> bool:
+    def _reconcile_single_flow(self, flow_id: str) -> bool:
         flow = collect_grid_flow(self._store, flow_id)
         if flow is None:
             return False
         published = self._state.published
         unchanged = published.get(flow_id) == flow
-        if move_to_front:
+        if flow_id not in published:
             current = {flow_id: flow}
-            current.update((key, value) for key, value in published.items() if key != flow_id)
+            current.update(published)
             self._state.published = current
         else:
             published[flow_id] = flow

@@ -265,6 +265,13 @@ class MemoryStore:
         for stored in sorted(entries, key=lambda item: item.order, reverse=True):
             yield require_parsed_message(stored.message)
 
+    def flow_ids_newest_first(self) -> tuple[str, ...]:
+        """Return retained flow ids by stable reverse insertion order."""
+
+        self._purge_expired(self._clock())
+        self._maybe_rebuild_eviction_indexes()
+        return tuple(reversed(self._flows))
+
     @property
     def counters(self) -> dict[str, int]:
         """Return observable bounded-retention counters."""
