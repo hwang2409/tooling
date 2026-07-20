@@ -2184,6 +2184,45 @@ def test_additive_body_field_update_invalidates_projection_cache() -> None:
     assert snapshot["flows"][0]["request_body"]["projection_revision"] == "v2"
 
 
+def test_replaced_lifecycle_event_rebuilds_timing_and_emits_upsert() -> None:
+    application = make_application(max_items=64)
+    application.ingest(metadata_message())
+    first = lifecycle_message(sequence="1")
+    first["occurred_at"] = "2026-01-01T00:00:01Z"
+    application.ingest(first)
+
+    replacement = lifecycle_message(sequence="1")
+    replacement["occurred_at"] = "2026-01-01T00:00:09Z"
+    result = application.ingest(replacement)
+
+    assert result.delta_emitted is True
+    live = json.loads(application.snapshot_text())["flows"][0]
+    fresh = collect_grid_flows(application.store)["flow-1"]
+    assert live["started_at"] == "2026-01-01T00:00:09Z"
+    assert json.dumps(live, separators=(",", ":")) == json.dumps(
+        fresh, separators=(",", ":")
+    )
+
+
+def test_prederived_metadata_has_byte_identical_cached_and_cold_projection() -> None:
+    message = metadata_message(request_body=captured_body(b"body"))
+    metadata = message["metadata"]
+    assert isinstance(metadata, dict)
+    metadata["request_body_size"] = "999"
+    metadata["request_content_type"] = "text/pre-derived"
+    metadata["summary"] = {"kind": "generic"}
+
+    application = make_application(max_items=64)
+    application.ingest(message)
+    application.ingest(lifecycle_message(sequence="1"))
+
+    live = application._state.published["flow-1"]
+    fresh = collect_grid_flows(application.store)["flow-1"]
+    assert json.dumps(live, separators=(",", ":")) == json.dumps(
+        fresh, separators=(",", ":")
+    )
+
+
 def test_eviction_during_metadata_ingest_falls_back_to_full_projection() -> None:
     application = make_application(max_items=4)
     for index in range(8):

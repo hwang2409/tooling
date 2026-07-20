@@ -25,6 +25,17 @@ from mitm_inspector.protocol import KnownParsedMessage, is_rfc3339_utc
 from mitm_inspector.store.memory import MemoryStore
 
 _DATA_BEARING_STATES = frozenset({"captured", "truncated"})
+_DERIVED_FLOW_ORDER = (
+    "started_at",
+    "ended_at",
+    "request_body_size",
+    "request_content_type",
+    "response_body_size",
+    "response_content_type",
+    "content_encoding",
+    "summary",
+)
+_DERIVED_FLOW_FIELDS = frozenset(_DERIVED_FLOW_ORDER)
 
 
 @dataclass(slots=True)
@@ -86,6 +97,19 @@ def redacted_body_descriptor(descriptor: PlainJsonValue) -> PlainJsonValue:
     return redacted
 
 
+def canonical_grid_flow(flow: Mapping[str, PlainJsonValue]) -> PlainJsonObject:
+    """Assemble projection fields in one stable top-level order."""
+
+    result: PlainJsonObject = {}
+    for key, value in flow.items():
+        if key not in _DERIVED_FLOW_FIELDS:
+            result[key] = value
+    for key in _DERIVED_FLOW_ORDER:
+        if key in flow:
+            result[key] = flow[key]
+    return result
+
+
 def grid_flow(metadata: Mapping[str, object]) -> PlainJsonObject:
     """Copy validated flow metadata into an independent body-redacted flow."""
 
@@ -140,7 +164,7 @@ def enriched_flow(
     else:
         copied.pop("content_encoding", None)
     copied["summary"] = flow_summary(copied, decoded_bodies=decoded_bodies)
-    return copied
+    return canonical_grid_flow(copied)
 
 
 def flow_id_of(metadata: Mapping[str, object]) -> str | None:

@@ -17,6 +17,7 @@ from mitm_inspector.api.bodies import body_content_encoding, decoded_body_descri
 from mitm_inspector.api.limits import MAX_INGEST_BODY_PREFIX_BYTES
 from mitm_inspector.api.projection import (
     LifecycleTimingReducer,
+    canonical_grid_flow,
     collect_grid_flows,
     diff_grid_changes,
     enriched_flow,
@@ -179,18 +180,6 @@ def _metadata_projection_key(metadata: Mapping[str, object]) -> tuple[object, ..
     )
 
 
-_DERIVED_FLOW_FIELDS = frozenset(
-    {
-        "request_body_size",
-        "request_content_type",
-        "response_body_size",
-        "response_content_type",
-        "content_encoding",
-        "summary",
-    }
-)
-
-
 def _retime_grid_flow(
     flow: PlainJsonObject,
     started_at: str | None,
@@ -198,24 +187,16 @@ def _retime_grid_flow(
 ) -> PlainJsonObject:
     """Update timing in the same canonical position without touching bodies."""
 
-    result: PlainJsonObject = {}
-    inserted = False
-    for key, value in flow.items():
-        if key == "started_at" or key == "ended_at":
-            continue
-        if not inserted and key in _DERIVED_FLOW_FIELDS:
-            if started_at is not None:
-                result["started_at"] = started_at
-            if ended_at is not None:
-                result["ended_at"] = ended_at
-            inserted = True
-        result[key] = value
-    if not inserted:
-        if started_at is not None:
-            result["started_at"] = started_at
-        if ended_at is not None:
-            result["ended_at"] = ended_at
-    return result
+    values = dict(flow)
+    if started_at is None:
+        values.pop("started_at", None)
+    else:
+        values["started_at"] = started_at
+    if ended_at is None:
+        values.pop("ended_at", None)
+    else:
+        values["ended_at"] = ended_at
+    return canonical_grid_flow(values)
 
 
 class ApiApplication:
@@ -526,7 +507,10 @@ class ApiApplication:
         if payload.get("type") == "flow.metadata":
             live_flow.metadata = self._store.latest_flow_metadata(flow_id)
         elif payload.get("type") == "flow.lifecycle":
-            live_flow.timing.add(payload)
+            timing = LifecycleTimingReducer()
+            for retained in self._store.trusted_flow_messages(flow_id):
+                timing.add(self._payload_of(retained))
+            live_flow.timing = timing
 
     def _sync_live_flows(self, current: Mapping[str, PlainJsonObject]) -> None:
         synced: dict[str, _LiveFlow] = {}
