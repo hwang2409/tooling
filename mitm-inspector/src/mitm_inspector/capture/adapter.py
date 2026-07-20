@@ -40,24 +40,11 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _decoded_response_bytes(response: object | None) -> bytes | None:
-    """Return response body bytes with content-encoding decoded when possible.
-
-    Real mitmproxy responses expose ``get_content(strict=False)`` which
-    transparently gunzips/brotlis wire bytes. Test fakes only expose
-    ``raw_content``. Fall back to the raw attribute so both work.
-    """
+def _raw_response_bytes(response: object | None) -> bytes | None:
+    """Return response wire bytes without mutating content encoding."""
 
     if response is None:
         return None
-    getter = getattr(response, "get_content", None)
-    if callable(getter):
-        try:
-            decoded = getter(strict=False)
-        except Exception:
-            decoded = None
-        if decoded is None or isinstance(decoded, bytes):
-            return decoded
     raw = getattr(response, "raw_content", None)
     return raw if raw is None or isinstance(raw, bytes) else None
 
@@ -290,7 +277,7 @@ class CaptureAddon:
         state = self._ensure_request(flow)
         if state.tombstone:
             return
-        response_content = _decoded_response_bytes(flow.response)
+        response_content = _raw_response_bytes(flow.response)
         if not self._finish_body(state, "response", response_content):
             return
         if "response_end" not in state.lifecycle_states:
@@ -315,7 +302,7 @@ class CaptureAddon:
                 return
             self._metadata(state)
         if state.response_headers_captured and not state.response.ended:
-            response_content = _decoded_response_bytes(flow.response)
+            response_content = _raw_response_bytes(flow.response)
             if not self._finish_body(state, "response", response_content):
                 return
             if "response_end" not in state.lifecycle_states:

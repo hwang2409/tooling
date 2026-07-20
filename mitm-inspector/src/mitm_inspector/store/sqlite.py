@@ -6,18 +6,20 @@ import base64
 import json
 import os
 import queue
+import re
 import sqlite3
 import stat
 import tempfile
 import threading
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 from mitm_inspector.protocol import (
     KnownParsedMessage,
     ParsedMessage,
     ParsedMessageResult,
+    is_rfc3339_utc,
     parse_message,
     require_parsed_message,
 )
@@ -30,6 +32,13 @@ DEFAULT_STORAGE_MAX_BYTES = 512 * 1024 * 1024
 DEFAULT_STORAGE_REPLAY = 500
 DEFAULT_STORAGE_QUEUE_SIZE = 4_096
 _SENTINEL = object()
+_WHITESPACE = re.compile(r"\s+")
+
+
+class SearchMatch(TypedDict):
+    flow_id: str
+    field: str
+    snippet: str
 
 
 def _normalize_storage_path(path: Path | str) -> Path:
@@ -282,6 +291,70 @@ class SQLiteFlowStorage:
                 store.append(message)
         for message in lifecycle_messages:
             store.append(message)
+
+    def search(self, query: str, limit: int) -> tuple[list[SearchMatch], bool]:
+        """Search retained request/response bodies newest-first."""
+
+        from mitm_inspector.api.bodies import decoded_body_bytes, header_value
+
+        if type(query) is not str or not query:
+            raise ValueError("query must be a non-empty string")
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("limit must be from 1 through 200")
+        self.flush()
+        folded_query = query.casefold()
+        matches: list[SearchMatch] = []
+        with sqlite3.connect(self.path) as connection:
+            rows = connection.execute(
+                """
+                SELECT flow_id, request_body, response_body,
+                       request_body_state, response_body_state,
+                       request_body_size, response_body_size,
+                       request_content_type, response_content_type,
+                       request_headers_json, response_headers_json
+                FROM flows
+                WHERE method <> ''
+                ORDER BY CASE WHEN started_at IS NULL THEN 1 ELSE 0 END,
+                         LENGTH(COALESCE(started_at, '')) DESC,
+                         COALESCE(started_at, '') DESC,
+                         created_order DESC
+                """
+            )
+            for row in rows:
+                request_headers = json.loads(str(row[9]))
+                response_headers = json.loads(str(row[10])) if row[10] is not None else []
+                for field, body, state, size, content_type, headers in (
+                    ("request_body", row[1], row[3], row[5], row[7], request_headers),
+                    ("response_body", row[2], row[4], row[6], row[8], response_headers),
+                ):
+                    descriptor = _descriptor_from_row(body, state, size, content_type)
+                    encoding = header_value(headers, "content-encoding")
+                    normalized_encoding = (
+                        encoding.strip().casefold() if isinstance(encoding, str) else None
+                    )
+                    decoded, _was_decoded = decoded_body_bytes(
+                        descriptor, normalized_encoding
+                    )
+                    if decoded is None:
+                        continue
+                    try:
+                        text = decoded.decode("utf-8")
+                    except UnicodeDecodeError:
+                        continue
+                    collapsed = _WHITESPACE.sub(" ", text).strip()
+                    index = collapsed.casefold().find(folded_query)
+                    if index < 0:
+                        continue
+                    if len(matches) >= limit:
+                        return matches, True
+                    matches.append(
+                        {
+                            "flow_id": str(row[0]),
+                            "field": field,
+                            "snippet": _centered_snippet(collapsed, index, len(query)),
+                        }
+                    )
+        return matches, False
 
     def _prepare_database(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -693,6 +766,18 @@ class SQLiteFlowStorage:
             metadata["response_body"] = _descriptor_from_row(
                 row[13], row[15], row[17], row[9]
             )
+        if isinstance(row[10], str) and is_rfc3339_utc(row[10]):
+            metadata["started_at"] = row[10]
+        if isinstance(row[11], str) and is_rfc3339_utc(row[11]):
+            metadata["ended_at"] = row[11]
+        if row[14] != "missing":
+            metadata["request_body_size"] = str(row[16])
+        if row[15] != "missing":
+            metadata["response_body_size"] = str(row[17])
+        if row[8] is not None:
+            metadata["request_content_type"] = row[8]
+        if row[9] is not None:
+            metadata["response_content_type"] = row[9]
         return {"protocol_version": "1", "type": "flow.metadata", "metadata": metadata}
 
 
@@ -764,6 +849,17 @@ def _storage_size(path: Path) -> int:
     return total
 
 
+def _centered_snippet(text: str, match_start: int, match_length: int) -> str:
+    if len(text) <= 160:
+        return text
+    match_end = min(len(text), match_start + match_length)
+    spare = max(0, 160 - (match_end - match_start))
+    start = max(0, match_start - spare // 2)
+    end = min(len(text), start + 160)
+    start = max(0, end - 160)
+    return text[start:end]
+
+
 def _checkpoint(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
@@ -802,6 +898,7 @@ __all__ = [
     "DEFAULT_STORAGE_MAX_FLOWS",
     "DEFAULT_STORAGE_QUEUE_SIZE",
     "DEFAULT_STORAGE_REPLAY",
+    "SearchMatch",
     "SQLiteFlowStorage",
     "default_storage_path",
 ]

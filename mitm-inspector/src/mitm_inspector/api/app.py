@@ -13,8 +13,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from mitm_inspector.api.bodies import body_content_encoding, decoded_body_descriptor
 from mitm_inspector.api.limits import MAX_INGEST_BODY_PREFIX_BYTES
-from mitm_inspector.api.projection import collect_grid_flows, diff_grid_changes, grid_flow
+from mitm_inspector.api.projection import (
+    collect_grid_flow,
+    collect_grid_flows,
+    diff_grid_changes,
+    enriched_flow,
+)
 from mitm_inspector.json_boundary import PlainJsonObject
 from mitm_inspector.protocol import (
     MAX_U64,
@@ -22,6 +28,7 @@ from mitm_inspector.protocol import (
     ParsedMessage,
     ParsedMessageResult,
     ProtocolError,
+    is_rfc3339_utc,
     parse_message,
     parsed_message_to_plain_json,
     require_parsed_message,
@@ -183,12 +190,12 @@ class ApiApplication:
         if relayed:
             self._broadcast(self._wire_text(parsed_message_to_plain_json(parsed)))
             self._counters.relayed_messages += 1
-        metadata: Mapping[str, object] | None = None
-        if payload.get("type") == "flow.metadata":
-            candidate = payload.get("metadata")
-            if isinstance(candidate, Mapping):
-                metadata = candidate
-        delta_emitted = self._reconcile(force=metadata is not None, metadata=metadata)
+        changed_flow_id = self._message_flow_id(payload)
+        delta_emitted = self._reconcile(
+            force=changed_flow_id is not None,
+            flow_id=changed_flow_id,
+            move_to_front=payload.get("type") == "flow.metadata",
+        )
         return IngestResult(parsed=parsed, relayed=relayed, delta_emitted=delta_emitted)
 
     def sweep(self) -> bool:
@@ -303,6 +310,7 @@ class ApiApplication:
         if not messages:
             return None
         messages.reverse()
+        messages = self._decoded_detail_messages(messages)
         detail: PlainJsonObject = {
             "protocol_version": "1",
             "flow_id": flow_id,
@@ -311,18 +319,19 @@ class ApiApplication:
         return json.dumps(detail, separators=(",", ":"))
 
     def _reconcile(
-        self, *, force: bool, metadata: Mapping[str, object] | None = None
+        self,
+        *,
+        force: bool,
+        flow_id: str | None = None,
+        move_to_front: bool = False,
     ) -> bool:
         counters = self._store.counters
         marks = tuple(counters[name] for name in _EVICTION_COUNTER_NAMES)
         if marks == self._state.eviction_marks:
             if not force:
                 return False
-            if metadata is not None:
-                # Nothing was evicted, so this newest metadata message is the
-                # only possible change; project just its flow instead of
-                # re-scanning and re-copying the entire retained store.
-                return self._reconcile_single_flow(metadata)
+            if flow_id is not None:
+                return self._reconcile_single_flow(flow_id, move_to_front=move_to_front)
         self._state.eviction_marks = marks
         current = collect_grid_flows(self._store)
         changes = diff_grid_changes(self._state.published, current)
@@ -331,18 +340,18 @@ class ApiApplication:
             return False
         return self._emit_delta(changes)
 
-    def _reconcile_single_flow(self, metadata: Mapping[str, object]) -> bool:
-        flow_id = metadata.get("flow_id")
-        if not isinstance(flow_id, str) or not flow_id:
+    def _reconcile_single_flow(self, flow_id: str, *, move_to_front: bool) -> bool:
+        flow = collect_grid_flow(self._store, flow_id)
+        if flow is None:
             return False
-        flow = grid_flow(metadata)
         published = self._state.published
         unchanged = published.get(flow_id) == flow
-        # The just-ingested metadata is now the newest flow, so it moves
-        # to the front of the reverse-chronological projection.
-        current = {flow_id: flow}
-        current.update((key, value) for key, value in published.items() if key != flow_id)
-        self._state.published = current
+        if move_to_front:
+            current = {flow_id: flow}
+            current.update((key, value) for key, value in published.items() if key != flow_id)
+            self._state.published = current
+        else:
+            published[flow_id] = flow
         if unchanged:
             return False
         return self._emit_delta([{"op": "upsert", "flow": flow}])
@@ -428,6 +437,69 @@ class ApiApplication:
             "cursor": str(self._state.cursor),
             "flows": list(self._state.published.values()),
         }
+
+    @staticmethod
+    def _decoded_detail_messages(messages: list[PlainJsonObject]) -> list[PlainJsonObject]:
+        metadata_values = [
+            message.get("metadata")
+            for message in messages
+            if message.get("type") == "flow.metadata"
+            and isinstance(message.get("metadata"), Mapping)
+        ]
+        latest = metadata_values[-1] if metadata_values else None
+        if not isinstance(latest, Mapping):
+            return messages
+        started_at: str | None = None
+        ended_at: str | None = None
+        for message in messages:
+            if message.get("type") != "flow.lifecycle":
+                continue
+            occurred_at = message.get("occurred_at")
+            state = message.get("state")
+            if not isinstance(occurred_at, str) or not is_rfc3339_utc(occurred_at):
+                continue
+            if state == "request_started" and started_at is None:
+                started_at = occurred_at
+            if state in {"flow_completed", "error"}:
+                ended_at = occurred_at
+        encodings = {
+            side: body_content_encoding(latest, side) for side in ("request", "response")
+        }
+        decoded_sides: set[str] = set()
+        for side, encoding in encodings.items():
+            descriptor = latest.get(f"{side}_body")
+            if descriptor is None:
+                continue
+            _decoded, was_decoded = decoded_body_descriptor(descriptor, encoding)
+            if was_decoded:
+                decoded_sides.add(side)
+        result: list[PlainJsonObject] = []
+        for message in messages:
+            message_type = message.get("type")
+            if message_type == "flow.metadata":
+                metadata = message.get("metadata")
+                if isinstance(metadata, Mapping):
+                    message["metadata"] = enriched_flow(
+                        metadata, started_at=started_at, ended_at=ended_at
+                    )
+            elif message_type == "body.chunk":
+                message_side = message.get("body_side")
+                if isinstance(message_side, str) and message_side in decoded_sides:
+                    continue
+            elif message_type == "body.end":
+                message_side = message.get("body_side")
+                body = message.get("body")
+                if isinstance(message_side, str) and body is not None:
+                    decoded, was_decoded = decoded_body_descriptor(
+                        body, encodings.get(message_side)
+                    )
+                    if was_decoded and isinstance(decoded, dict):
+                        message["body"] = decoded
+                        size = decoded.get("size_bytes")
+                        if isinstance(size, str):
+                            message["total_bytes"] = size
+            result.append(message)
+        return result
 
     @staticmethod
     def _wire_text(message: PlainJsonObject) -> str:

@@ -22,6 +22,7 @@ refused at configuration time, never repaired.
 | `GET /api/v1/snapshot` | One validated `browser.snapshot` message |
 | `GET /api/v1/stream` | WebSocket upgrade for the live session |
 | `GET /api/v1/flows/<flow_id>` | Every retained message for one selected flow, oldest first |
+| `GET /api/v1/search?q=<text>&limit=<n>` | Durable body matches, newest first (default 50, maximum 200) |
 
 Every request must carry exactly one loopback `Host` header (DNS-rebinding
 defense); request bodies, non-GET methods, oversized heads, folded headers,
@@ -73,6 +74,15 @@ flow entries pass through a body redaction projection: `captured` and
 unchanged.  The only surface that carries body bytes is
 `GET /api/v1/flows/<flow_id>`, which returns the full retained messages
 (metadata, chunks, body ends, lifecycle) for one explicitly selected flow.
+Gzip/deflate metadata and terminal body descriptors are decoded on this
+surface; compressed chunk messages are omitted when the decoded terminal
+descriptor is available. Stored sqlite bytes are never rewritten.
+
+`GET /api/v1/search` performs a case-insensitive substring search over durable
+sqlite request bodies and decodable response bodies. It returns at most the
+requested number of `{flow_id, field, snippet}` objects, with whitespace-
+collapsed snippets bounded to 160 characters and a `truncated` flag when more
+matches exist. A missing or empty `q` is rejected with HTTP 400.
 
 ## Capture ingest socket
 

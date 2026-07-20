@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import gzip
 import json
 import os
 import shutil
@@ -1281,6 +1282,9 @@ def test_websocket_session_streams_snapshot_deltas_and_resync(
             assert changes[0]["flow"]["request_body"]["data"] == ""
             lifecycle = await client.read_message()
             assert lifecycle["type"] == "flow.lifecycle"
+            timing_delta = await client.read_message()
+            assert timing_delta["type"] == "browser.delta"
+            assert timing_delta["changes"][0]["flow"]["started_at"] == "2026-01-01T00:00:00Z"
             gap = await client.read_message()
             assert gap["type"] == "stream.gap"
 
@@ -1302,7 +1306,7 @@ def test_websocket_session_streams_snapshot_deltas_and_resync(
             assert echo["type"] == "browser.resync"
             assert echo["requested_cursor"] == "1"
             assert fresh["type"] == "browser.snapshot"
-            assert fresh["cursor"] == "1"
+            assert fresh["cursor"] == "2"
 
             # A clean client close is answered with a close frame.
             await client.send_raw(mask_frame(0x8, (1000).to_bytes(2, "big")))
@@ -1422,6 +1426,141 @@ def test_flow_detail_endpoint_serves_bodies_only_on_selection(
                 port, get("/api/v1/flows/../../etc/passwd", port)
             )
             assert traversal.startswith(b"HTTP/1.1 404 ")
+        finally:
+            await server.close()
+
+    run_async(scenario)
+
+
+def test_flow_detail_decodes_gzip_and_surfaces_original_encoding(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        server = make_server(tmp_path, with_ingest=False)
+        await server.start()
+        try:
+            response_text = b'{"stop_reason":"end_turn","usage":{"output_tokens":5}}'
+            compressed = gzip.compress(response_text)
+            metadata = metadata_message()
+            metadata_value = metadata["metadata"]
+            assert isinstance(metadata_value, dict)
+            metadata_value.update(
+                {
+                    "host": "api.anthropic.com",
+                    "response_headers": [
+                        {"name": "content-type", "value": "application/json"},
+                        {"name": "content-encoding", "value": "gzip"},
+                    ],
+                    "response_status": "200",
+                    "response_body": captured_body(compressed),
+                }
+            )
+            server.application.ingest(metadata)
+            server.application.ingest(
+                {
+                    "protocol_version": "1",
+                    "type": "body.end",
+                    "flow_id": "flow-1",
+                    "body_side": "response",
+                    "total_bytes": str(len(compressed)),
+                    "body": captured_body(compressed),
+                }
+            )
+
+            snapshot_response = await http_request(
+                server.bound_port, get("/api/v1/snapshot", server.bound_port)
+            )
+            snapshot = json.loads(response_body(snapshot_response))
+            flow = snapshot["flows"][0]
+            assert flow["response_body_size"] == str(len(compressed))
+            assert flow["content_encoding"] == {"response": "gzip"}
+
+            detail_response = await http_request(
+                server.bound_port, get("/api/v1/flows/flow-1", server.bound_port)
+            )
+            detail = json.loads(response_body(detail_response))
+            decoded_bodies = [
+                base64.b64decode(message["body"]["data"])
+                for message in detail["messages"]
+                if message["type"] == "body.end"
+            ]
+            assert decoded_bodies == [response_text]
+            detail_metadata = next(
+                message["metadata"]
+                for message in detail["messages"]
+                if message["type"] == "flow.metadata"
+            )
+            assert detail_metadata["content_encoding"] == {"response": "gzip"}
+            assert base64.b64decode(detail_metadata["response_body"]["data"]) == response_text
+        finally:
+            await server.close()
+
+    run_async(scenario)
+
+
+def test_search_endpoint_queries_durable_decoded_bodies_and_validates_input(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = ApiServerConfig(
+            host="127.0.0.1",
+            port=0,
+            storage_path=tmp_path / "flows.sqlite",
+            sweep_interval_seconds=0.05,
+        )
+        server = ApiServer(config)
+        await server.start()
+        try:
+            first = metadata_message("flow-a", request_body=captured_body(b'{"text":"Needle one"}'))
+            first_value = first["metadata"]
+            assert isinstance(first_value, dict)
+            compressed = gzip.compress(b"response needle match")
+            first_value.update(
+                {
+                    "response_headers": [{"name": "content-encoding", "value": "gzip"}],
+                    "response_status": "200",
+                    "response_body": captured_body(compressed),
+                }
+            )
+            second = metadata_message(
+                "flow-b", request_body=captured_body(b'{"text":"needle two"}')
+            )
+            server.application.ingest(first)
+            server.application.ingest(second)
+
+            limited_response = await http_request(
+                server.bound_port, get("/api/v1/search?q=needle&limit=1", server.bound_port)
+            )
+            limited = json.loads(response_body(limited_response))
+            assert limited == {
+                "matches": [
+                    {
+                        "flow_id": "flow-b",
+                        "field": "request_body",
+                        "snippet": '{"text":"needle two"}',
+                    }
+                ],
+                "truncated": True,
+            }
+
+            all_response = await http_request(
+                server.bound_port, get("/api/v1/search?q=needle", server.bound_port)
+            )
+            all_matches = json.loads(response_body(all_response))["matches"]
+            assert [(match["flow_id"], match["field"]) for match in all_matches] == [
+                ("flow-b", "request_body"),
+                ("flow-a", "request_body"),
+                ("flow-a", "response_body"),
+            ]
+
+            no_match_response = await http_request(
+                server.bound_port, get("/api/v1/search?q=absent", server.bound_port)
+            )
+            assert json.loads(response_body(no_match_response)) == {
+                "matches": [],
+                "truncated": False,
+            }
+            for path in ("/api/v1/search", "/api/v1/search?q="):
+                invalid = await http_request(server.bound_port, get(path, server.bound_port))
+                assert invalid.startswith(b"HTTP/1.1 400 ")
         finally:
             await server.close()
 

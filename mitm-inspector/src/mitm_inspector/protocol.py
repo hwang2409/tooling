@@ -11,6 +11,7 @@ import base64
 import json
 import re
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Literal, NotRequired, TypedDict, cast, final
 
@@ -27,6 +28,9 @@ MAX_METADATA_HEADER_BYTES = 64 * 1024
 MAX_INGEST_LINE_BYTES = 8 * 1024 * 1024
 _U64_PATTERN = re.compile(r"^(0|[1-9][0-9]*)$")
 _BASE64_PATTERN = re.compile(r"^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$")
+_RFC3339_UTC_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00)$"
+)
 BODY_SIDES = ("request", "response")
 LIFECYCLE_STATES = (
     "request_started",
@@ -140,6 +144,31 @@ class TruncatedBody(TypedDict):
 BodyDescriptor = MissingBody | EmptyBody | CapturedBody | TruncatedBody
 
 
+class ContentEncoding(TypedDict):
+    request: NotRequired[str]
+    response: NotRequired[str]
+
+
+class FlowPreview(TypedDict):
+    source: Literal["user_text", "tool_result", "none"]
+    text: NotRequired[str]
+    tool_name: NotRequired[str]
+
+
+class FlowSummary(TypedDict):
+    kind: Literal["anthropic_messages", "anthropic_count_tokens", "generic"]
+    model: NotRequired[str]
+    message_count: NotRequired[str]
+    stream: NotRequired[bool]
+    preview: NotRequired[FlowPreview]
+    stop_reason: NotRequired[str]
+    input_tokens: NotRequired[str]
+    output_tokens: NotRequired[str]
+    cache_read_input_tokens: NotRequired[str]
+    thinking_tokens: NotRequired[str]
+    count_tokens_result: NotRequired[str]
+
+
 class FlowMetadata(TypedDict):
     flow_id: str
     session_id: NotRequired[str | None]
@@ -153,6 +182,14 @@ class FlowMetadata(TypedDict):
     response_status: NotRequired[str]
     request_body: BodyDescriptor
     response_body: NotRequired[BodyDescriptor]
+    started_at: NotRequired[str]
+    ended_at: NotRequired[str]
+    request_body_size: NotRequired[str]
+    response_body_size: NotRequired[str]
+    request_content_type: NotRequired[str]
+    response_content_type: NotRequired[str]
+    content_encoding: NotRequired[ContentEncoding]
+    summary: NotRequired[FlowSummary]
 
 
 class SourceCapabilities(TypedDict):
@@ -593,7 +630,78 @@ def _flow_metadata(value: object, *, label: str = "metadata") -> FlowMetadata:
         result["response_status"] = status
     if "response_body" in metadata:
         result["response_body"] = _body(metadata["response_body"], label=f"{label}.response_body")
+    for key in ("started_at", "ended_at"):
+        if key in metadata:
+            result[key] = _rfc3339_utc(metadata[key], label=f"{label}.{key}")  # type: ignore[literal-required]
+    for key in ("request_body_size", "response_body_size"):
+        if key in metadata:
+            result[key] = _u64(metadata[key], label=f"{label}.{key}")  # type: ignore[literal-required]
+    for key in ("request_content_type", "response_content_type"):
+        if key in metadata:
+            result[key] = _string(metadata[key], label=f"{label}.{key}")  # type: ignore[literal-required]
+    if "content_encoding" in metadata:
+        encoding = _object(metadata["content_encoding"], label=f"{label}.content_encoding")
+        for side in ("request", "response"):
+            if side in encoding:
+                _string(encoding[side], label=f"{label}.content_encoding.{side}")
+        result["content_encoding"] = cast(ContentEncoding, encoding)
+    if "summary" in metadata:
+        result["summary"] = _flow_summary(metadata["summary"], label=f"{label}.summary")
     return result
+
+
+def _rfc3339_utc(value: object, *, label: str) -> str:
+    text = _string(value, label=label)
+    if not is_rfc3339_utc(text):
+        raise ProtocolError(f"{label} must be an RFC3339 UTC timestamp")
+    return text
+
+
+def is_rfc3339_utc(value: str) -> bool:
+    """Return whether text is an RFC3339 timestamp with a UTC offset."""
+
+    if _RFC3339_UTC_PATTERN.fullmatch(value) is None:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() == UTC.utcoffset(parsed)
+
+
+def _flow_summary(value: object, *, label: str) -> FlowSummary:
+    summary = _object(value, label=label)
+    _enum(
+        summary.get("kind"),
+        ("anthropic_messages", "anthropic_count_tokens", "generic"),
+        label=f"{label}.kind",
+    )
+    for key in ("model", "stop_reason"):
+        if key in summary:
+            _string(summary[key], label=f"{label}.{key}")
+    for key in (
+        "message_count",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "thinking_tokens",
+        "count_tokens_result",
+    ):
+        if key in summary:
+            _u64(summary[key], label=f"{label}.{key}")
+    if "stream" in summary and not isinstance(summary["stream"], bool):
+        raise ProtocolError(f"{label}.stream must be boolean")
+    if "preview" in summary:
+        preview = _object(summary["preview"], label=f"{label}.preview")
+        _enum(
+            preview.get("source"),
+            ("user_text", "tool_result", "none"),
+            label=f"{label}.preview.source",
+        )
+        for key in ("text", "tool_name"):
+            if key in preview:
+                _string(preview[key], label=f"{label}.preview.{key}")
+    return cast(FlowSummary, summary)
 
 
 def _validate_source_hello(message: dict[str, object]) -> None:
