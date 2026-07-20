@@ -334,7 +334,7 @@ function applyDelta(state: BrowserState, message: BrowserDelta): BrowserState {
     const flowId = change.op === "upsert" ? change.flow.flow_id : change.flow_id;
     const index = entries.findIndex((flow) => flow.flow_id === flowId);
     if (change.op === "upsert") {
-      if (index === -1) entries.push(change.flow);
+      if (index === -1) entries.unshift(change.flow);
       else entries[index] = change.flow;
     } else if (index !== -1) {
       entries.splice(index, 1);

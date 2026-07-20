@@ -88,4 +88,54 @@ describe("ConversationView", () => {
     await act(async () => more?.click());
     expect(container.textContent).toContain("future_field");
   });
+
+  it("keeps lifted, malformed, and future conversation values visible", async () => {
+    const request = parseAnthropicRequest({
+      model: "request-model",
+      thinking: { type: "enabled", budget_tokens: 64, future_thinking: "thinking-marker" },
+      system: null,
+      messages: [{
+        role: "user",
+        content: [{ type: "future_block", future_block_marker: "future-block-marker" }],
+        future_message: "future-message-marker",
+      }],
+    } as JsonValue);
+    if (request === null) throw new Error("request fixture did not parse");
+
+    const response = JSON.stringify({
+      model: "response-model-marker",
+      role: "response-role-marker",
+      content: [{ type: "text", text: "done" }],
+      future_response: "future-response-marker",
+    });
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    mounts.push({ root, container });
+    await act(async () => root.render(<ConversationView request={request} extras={{}} responseText={response} />));
+
+    const thinking = Array.from(container.querySelectorAll<HTMLButtonElement>(".conv-collapse-head"))
+      .find((button) => button.textContent?.includes("thinking details"));
+    expect(thinking).toBeDefined();
+    await act(async () => thinking?.click());
+    const system = Array.from(container.querySelectorAll<HTMLButtonElement>(".conv-collapse-head"))
+      .find((button) => button.textContent?.includes("system (1)"));
+    expect(system).toBeDefined();
+    await act(async () => system?.click());
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const closedMore = Array.from(container.querySelectorAll<HTMLButtonElement>(".conv-more .conv-collapse-head"))
+        .find((button) => button.getAttribute("aria-expanded") === "false");
+      if (closedMore === undefined) break;
+      await act(async () => closedMore.click());
+    }
+
+    expect(container.textContent).toContain("thinking-marker");
+    expect(container.textContent).toContain("null");
+    expect(container.textContent).toContain("response-model-marker");
+    expect(container.textContent).toContain("response-role-marker");
+    expect(container.textContent).toContain("future-block-marker");
+    expect(container.textContent).toContain("future-message-marker");
+    expect(container.textContent).toContain("future-response-marker");
+  });
 });

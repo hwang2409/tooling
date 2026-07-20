@@ -134,6 +134,7 @@
 .conv-header-label, .conv-role, .conv-section-meta, .conv-muted, .conv-size { color: var(--muted); }
 .conv-header-label, .conv-role { font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 .conv-header-value { color: var(--ink); }
+.conv-response-meta { margin-left: 8px; color: var(--ink); font-size: 10px; font-weight: 400; letter-spacing: normal; text-transform: none; }
 .conv-section { margin-top: 8px; }
 .conv-collapse { border: 1px solid var(--line); }
 .conv-collapse + .conv-collapse { margin-top: 4px; }

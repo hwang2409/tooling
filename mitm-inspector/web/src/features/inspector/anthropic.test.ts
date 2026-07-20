@@ -30,7 +30,7 @@ describe("anthropic conversation model", () => {
 
   it("keeps malformed and future members as raw inspectable values", () => {
     const parsed = parseAnthropicRequest({
-      system: [null],
+      system: null,
       tools: [null],
       messages: [null, {
         role: "user",
@@ -52,14 +52,31 @@ describe("anthropic conversation model", () => {
     expect(parsed?.outputConfig).toBe("future-format-shape");
     expect(parsed?.extra).toEqual([["max_tokens", "not-a-number"]]);
 
+    const extendedThinking = { type: "enabled", budget_tokens: 64, future_thinking: { marker: "thinking-marker" } };
+    const thinkingRequest = parseAnthropicRequest({
+      thinking: extendedThinking,
+      system: [{ type: "text", text: "system" }],
+      messages: [{ role: "user", content: "hello" }],
+    } as JsonValue);
+    expect(thinkingRequest?.thinking).toEqual(extendedThinking);
+
     const response = parseAnthropicResponse({
+      model: "response-model-marker",
+      role: "response-role-marker",
+      content: [{ type: "text", text: "done" }],
+      stop_reason: "end_turn",
+    } as JsonValue);
+    expect(response?.model).toBe("response-model-marker");
+    expect(response?.role).toBe("response-role-marker");
+
+    const malformedResponse = parseAnthropicResponse({
       model: 4,
       role: { future: true },
       content: [{ type: "text", text: "done" }],
       stop_reason: null,
       usage: { input_tokens: 3, future_usage: { keep: true } },
     } as JsonValue);
-    expect(response?.extra).toEqual([
+    expect(malformedResponse?.extra).toEqual([
       ["model", 4],
       ["role", { future: true }],
       ["stop_reason", null],

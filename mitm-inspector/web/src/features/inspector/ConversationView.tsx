@@ -244,6 +244,11 @@ function HeaderStrip({ request, extras, response }: { request: AnthropicRequest;
           <JsonTree value={request.outputConfig} startCollapsed />
         </Collapse>
       ) : null}
+      {request.thinking !== undefined ? (
+        <Collapse className="conv-header-raw" label="thinking details">
+          <JsonTree value={request.thinking} />
+        </Collapse>
+      ) : null}
       <MoreFields extra={request.extra} />
     </div>
   );
@@ -327,11 +332,23 @@ function SseFrames({ assembled }: { assembled: AssembledStream }) {
   );
 }
 
+function ResponseMeta({ model, role }: { model?: string; role?: string }) {
+  return (
+    <div className="conv-role conv-role-response">
+      response
+      {role !== undefined ? <span className="conv-response-meta">role {role}</span> : null}
+      {model !== undefined ? <span className="conv-response-meta">model {model}</span> : null}
+    </div>
+  );
+}
+
 function ResponseSection({ response, toolNames }: { response: ResponseView; toolNames: ReadonlyMap<string, string> }) {
   if (response.kind === "absent") return null;
   return (
     <section className="conv-section conv-response">
-      <div className="conv-role conv-role-response">response</div>
+      {response.kind === "sse" ? <ResponseMeta model={response.assembled.model} role={response.assembled.role} /> : null}
+      {response.kind === "json" ? <ResponseMeta model={response.parsed.model} role={response.parsed.role} /> : null}
+      {response.kind !== "sse" && response.kind !== "json" ? <ResponseMeta /> : null}
       {response.kind === "sse" ? (
         <>
           {response.assembled.blocks.map((block, index) => (

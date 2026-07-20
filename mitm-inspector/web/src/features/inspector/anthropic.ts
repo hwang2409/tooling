@@ -181,7 +181,7 @@ export function parseContentBlock(value: JsonValue): ContentBlock {
       block.isError = object.is_error;
       claimed.push("is_error");
     }
-    if (typeof object.content === "string" || Array.isArray(object.content)) claimed.push("content");
+    if (object.content !== undefined) claimed.push("content");
     block.extra = extraFields(object, claimed);
     if (object.cache_control !== undefined) block.cacheControl = object.cache_control;
     return block;
@@ -192,7 +192,8 @@ export function parseContentBlock(value: JsonValue): ContentBlock {
 
 /** Normalise message/tool_result content: string shorthand becomes one text block. */
 export function contentBlocks(value: JsonValue | undefined): ContentBlock[] {
-  if (value === undefined || value === null) return [];
+  if (value === undefined) return [];
+  if (value === null) return [{ kind: "unknown", raw: value }];
   if (typeof value === "string") return [{ kind: "text", text: value, extra: [] }];
   if (!Array.isArray(value)) return [{ kind: "unknown", raw: value }];
   return value.map(parseContentBlock);
@@ -231,7 +232,7 @@ function parseMessage(value: JsonValue): MessageView {
   const claimed: string[] = [];
   const role = typeof object.role === "string" ? object.role : "?";
   if (typeof object.role === "string") claimed.push("role");
-  if (typeof object.content === "string" || Array.isArray(object.content)) claimed.push("content");
+  if (object.content !== undefined) claimed.push("content");
   return {
     role,
     blocks: contentBlocks(object.content),
