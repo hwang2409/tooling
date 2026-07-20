@@ -37,13 +37,11 @@ function bodyEndMessage(side: "request" | "response", data: string) {
 }
 
 describe("overridesFromDetailMessages", () => {
-  it("uses the newest metadata for headers and bodies", () => {
+  it("uses the newest metadata for bodies", () => {
     const overrides = overridesFromDetailMessages([
       metadataMessage(false),
       metadataMessage(true, "/v1/updated"),
     ]);
-    expect(overrides.request_headers?.[0].name).toBe("authorization");
-    expect(overrides.response_headers?.[0].value).toBe("application/json");
     expect(overrides.request_body).toEqual({ state: "captured", size_bytes: "4", encoding: "base64", data: "Ym9keQ==" });
     expect(overrides.response_body).toEqual({ state: "empty", size_bytes: "0" });
   });

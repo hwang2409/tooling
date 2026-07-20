@@ -3,15 +3,13 @@
 import { useEffect, useState } from "react";
 
 import { parseProtocolMessage } from "../../protocol";
-import type { BodyDescriptor, FlowMetadata, Header } from "../../protocol";
+import type { BodyDescriptor, FlowMetadata } from "../../protocol";
 import type { DeepReadonly } from "../../immutable";
 import type { InspectableBody } from "./models";
 
 export const FLOW_DETAIL_PATH_PREFIX = "/api/v1/flows/";
 
 export interface FlowDetailOverrides {
-  request_headers?: readonly DeepReadonly<Header>[];
-  response_headers?: readonly DeepReadonly<Header>[];
   request_body?: InspectableBody;
   response_body?: InspectableBody;
 }
@@ -28,7 +26,7 @@ interface BodyEndLike {
   body: BodyDescriptor;
 }
 
-/** Project the retained per-flow messages onto inspector body/header overrides. */
+/** Project the retained per-flow messages onto inspector body overrides. */
 export function overridesFromDetailMessages(messages: readonly unknown[]): FlowDetailOverrides {
   let metadata: DeepReadonly<FlowMetadata> | null = null;
   let requestEnd: InspectableBody | undefined;
@@ -52,8 +50,6 @@ export function overridesFromDetailMessages(messages: readonly unknown[]): FlowD
   }
   const overrides: FlowDetailOverrides = {};
   if (metadata !== null) {
-    overrides.request_headers = metadata.request_headers;
-    if (metadata.response_headers !== undefined) overrides.response_headers = metadata.response_headers;
     overrides.request_body = metadata.request_body;
     if (metadata.response_body !== undefined) overrides.response_body = metadata.response_body;
   }
@@ -85,7 +81,7 @@ export const fetchFlowDetail: FlowDetailLoader = async (flowId, signal) => {
   return { status: "loaded", overrides: overridesFromDetailMessages(messages) };
 };
 
-/** Load body/header detail for the selected flow; falls back to grid metadata on failure. */
+/** Load body detail for the selected flow; falls back to grid metadata on failure. */
 export function useFlowDetail(
   flowId: string | null,
   loader: FlowDetailLoader = fetchFlowDetail,
