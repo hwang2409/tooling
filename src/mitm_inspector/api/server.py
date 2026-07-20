@@ -21,7 +21,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from mitm_inspector.api.app import ApiApplication, Subscriber
+from mitm_inspector.api.app import (
+    SUBSCRIBER_QUEUE_FRAMES,
+    ApiApplication,
+    Subscriber,
+)
 from mitm_inspector.api.httpwire import (
     MAX_REQUEST_HEAD_BYTES,
     WEBSOCKET_VERSION,
@@ -57,11 +61,11 @@ from mitm_inspector.store.sqlite import (
 
 API_VERSION_PREFIX = "/api/v1"
 HEALTH_PATH = f"{API_VERSION_PREFIX}/health"
+COUNTERS_PATH = f"{API_VERSION_PREFIX}/counters"
 SNAPSHOT_PATH = f"{API_VERSION_PREFIX}/snapshot"
 STREAM_PATH = f"{API_VERSION_PREFIX}/stream"
 FLOW_PATH_PREFIX = f"{API_VERSION_PREFIX}/flows/"
 MAX_CLIENT_MESSAGE_BYTES = 64 * 1024
-SUBSCRIBER_QUEUE_FRAMES = 256
 HEAD_READ_TIMEOUT_SECONDS = 10.0
 DEFAULT_SWEEP_INTERVAL_SECONDS = 5.0
 
@@ -457,6 +461,10 @@ class ApiServer:
                 {"status": "ok", "protocol_version": "1", "counters": self.counters},
                 separators=(",", ":"),
             ).encode("utf-8")
+            await self._send_response(writer, 200, "application/json", body)
+            return
+        if target == COUNTERS_PATH:
+            body = json.dumps(self.counters, separators=(",", ":")).encode("utf-8")
             await self._send_response(writer, 200, "application/json", body)
             return
         if target == SNAPSHOT_PATH:

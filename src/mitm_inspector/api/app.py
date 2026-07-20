@@ -30,6 +30,8 @@ from mitm_inspector.store.memory import MemoryStore
 from mitm_inspector.store.sqlite import SQLiteFlowStorage
 
 _RELAYED_KNOWN_TYPES = frozenset({"source.hello", "flow.lifecycle", "stream.gap"})
+SUBSCRIBER_QUEUE_FRAMES = 256
+_INITIAL_SUBSCRIBER_FRAMES = 3
 _EVICTION_COUNTER_NAMES = (
     "evicted_flows",
     "expired_flows",
@@ -69,6 +71,7 @@ class _Counters:
     emitted_deltas: int = 0
     emitted_snapshots: int = 0
     dropped_subscribers: int = 0
+    subscribers_partial_history: int = 0
     resync_responses: int = 0
 
     def as_dict(self) -> dict[str, int]:
@@ -78,6 +81,7 @@ class _Counters:
             "emitted_deltas": self.emitted_deltas,
             "emitted_snapshots": self.emitted_snapshots,
             "dropped_subscribers": self.dropped_subscribers,
+            "subscribers_partial_history": self.subscribers_partial_history,
             "resync_responses": self.resync_responses,
         }
 
@@ -201,18 +205,29 @@ class ApiApplication:
         """Send the connect sequence and register a live subscriber."""
 
         self._reconcile(force=False)
-        frames: list[str] = [
+        initial_frames = [
             self._wire_text(self._hello_message()),
             self._wire_text(self._initial_resync_message()),
             self._wire_text(self._snapshot_message()),
         ]
-        frames.extend(self._historical_lifecycle_frames())
         subscriber = Subscriber(deliver=deliver, on_drop=on_drop)
-        for frame in frames:
+        for frame in initial_frames:
             if not self._safe_deliver(subscriber, frame):
                 self._drop(subscriber)
                 return subscriber
         self._subscribers.append(subscriber)
+
+        historical = self._historical_lifecycle_frames()
+        history_capacity = SUBSCRIBER_QUEUE_FRAMES - _INITIAL_SUBSCRIBER_FRAMES
+        partial_history = len(historical) > history_capacity
+        if partial_history:
+            historical = historical[-history_capacity:]
+        for frame in historical:
+            if not self._safe_deliver(subscriber, frame):
+                partial_history = True
+                break
+        if partial_history:
+            self._counters.subscribers_partial_history += 1
         return subscriber
 
     def _historical_lifecycle_frames(self) -> list[str]:

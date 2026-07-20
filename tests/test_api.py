@@ -41,6 +41,7 @@ from mitm_inspector.api.projection import (
     redacted_body_descriptor,
 )
 from mitm_inspector.api.server import (
+    SUBSCRIBER_QUEUE_FRAMES,
     ApiServer,
     ApiServerConfig,
     ApiServerError,
@@ -314,6 +315,99 @@ def test_subscribe_sends_hello_initial_resync_then_snapshot() -> None:
     assert resync["requested_cursor"] == "0"
     assert snapshot["cursor"] == "0"
     assert snapshot["flows"] == []
+
+
+def test_subscribe_registers_after_initial_frames_before_history() -> None:
+    application = make_application(max_items=8)
+    application.ingest(lifecycle_message(flow_id="history-flow"))
+    registration_counts: list[int] = []
+
+    def deliver(frame: str) -> bool:
+        del frame
+        registration_counts.append(len(application._subscribers))
+        return True
+
+    subscriber = application.subscribe(deliver)
+
+    assert registration_counts == [0, 0, 0, 1]
+    assert application._subscribers == [subscriber]
+
+
+def test_subscribe_replays_fitting_history_without_partial_counter() -> None:
+    application = make_application(max_items=8)
+    for index in range(2):
+        application.ingest(
+            lifecycle_message(flow_id=f"flow-{index}", sequence=str(index + 1))
+        )
+    collector = Collector()
+
+    subscriber = application.subscribe(collector.deliver)
+
+    assert not subscriber.closed
+    assert application.subscriber_count == 1
+    assert [message["type"] for message in collector.messages()] == [
+        "source.hello",
+        "browser.resync",
+        "browser.snapshot",
+        "flow.lifecycle",
+        "flow.lifecycle",
+    ]
+    assert application.counters["subscribers_partial_history"] == 0
+
+
+def test_subscribe_stops_on_historical_delivery_refusal_without_dropping_subscriber() -> None:
+    history_count = 10
+    application = make_application(max_items=history_count + 1)
+    for index in range(history_count):
+        application.ingest(
+            lifecycle_message(flow_id=f"flow-{index:04}", sequence=str(index + 1))
+        )
+    accepted_historical = 7
+    collector = Collector(accept=3 + accepted_historical)
+
+    subscriber = application.subscribe(collector.deliver)
+
+    assert not subscriber.closed
+    assert subscriber in application._subscribers
+    assert len(collector.frames) == 3 + accepted_historical
+    assert application.counters["subscribers_partial_history"] == 1
+    assert application.counters["dropped_subscribers"] == 0
+
+
+def test_subscribe_retains_newest_history_when_replay_is_truncated() -> None:
+    history_count = SUBSCRIBER_QUEUE_FRAMES - 2
+    application = make_application(max_items=history_count + 1)
+    for index in range(history_count):
+        application.ingest(
+            lifecycle_message(flow_id=f"flow-{index:04}", sequence=str(index + 1))
+        )
+    collector = Collector(accept=SUBSCRIBER_QUEUE_FRAMES)
+
+    application.subscribe(collector.deliver)
+
+    lifecycle_frames = [
+        message for message in collector.messages() if message["type"] == "flow.lifecycle"
+    ]
+    assert len(lifecycle_frames) == SUBSCRIBER_QUEUE_FRAMES - 3
+    assert lifecycle_frames[0]["flow_id"] == "flow-0001"
+    assert lifecycle_frames[-1]["flow_id"] == f"flow-{history_count - 1:04}"
+
+
+@pytest.mark.parametrize("failure_index", [0, 1, 2])
+def test_subscribe_initial_frame_failure_drops_without_partial_counter(
+    failure_index: int,
+) -> None:
+    application = make_application()
+    refused = Collector(accept=failure_index)
+
+    subscriber = application.subscribe(refused.deliver, on_drop=refused.on_drop)
+
+    assert subscriber.closed
+    assert refused.dropped
+    assert application.subscriber_count == 0
+    assert subscriber not in application._subscribers
+    assert application.counters["dropped_subscribers"] == 1
+    assert application.counters["subscribers_partial_history"] == 0
 
 
 def test_ingest_metadata_emits_redacted_delta_with_incremented_cursor() -> None:
@@ -928,6 +1022,14 @@ def test_http_health_root_snapshot_and_errors(tmp_path: Path) -> None:
             snapshot = await http_request(port, get("/api/v1/snapshot", port))
             message = assert_valid_wire_text(response_body(snapshot).decode())
             assert message["type"] == "browser.snapshot"
+
+            counters = await http_request(port, get("/api/v1/counters", port))
+            counters_head, _, _ = counters.partition(b"\r\n\r\n")
+            assert counters.startswith(b"HTTP/1.1 200 ")
+            assert b"Content-Type: application/json" in counters_head
+            counters_payload = json.loads(response_body(counters))
+            assert "subscribers_partial_history" in counters_payload
+            assert "dropped_subscribers" in counters_payload
 
             missing = await http_request(port, get("/api/v1/nope", port))
             assert missing.startswith(b"HTTP/1.1 404 ")
