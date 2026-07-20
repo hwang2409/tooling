@@ -80,9 +80,14 @@ descriptor is available. Stored sqlite bytes are never rewritten.
 
 `GET /api/v1/search` performs a case-insensitive substring search over durable
 sqlite request bodies and decodable response bodies. It returns at most the
-requested number of `{flow_id, field, snippet}` objects, with whitespace-
+requested number of `{flow_id, field, snippet, flow}` objects, with whitespace-
 collapsed snippets bounded to 160 characters and a `truncated` flag when more
-matches exist. A missing or empty `q` is rejected with HTTP 400.
+matches exist. `flow` is the same enriched, body-redacted projection used by
+snapshot rows, so matches older than the in-memory snapshot remain renderable;
+the three original match fields remain stable for older clients. Search runs
+against a persisted trigram text projection, materializes at most `limit + 1`
+candidates, and a newer request cooperatively cancels an older scan. A missing
+or empty `q` is rejected with HTTP 400.
 
 ## Capture ingest socket
 

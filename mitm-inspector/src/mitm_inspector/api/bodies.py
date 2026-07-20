@@ -6,11 +6,25 @@ import base64
 import binascii
 import zlib
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Literal
 
+from mitm_inspector.api.limits import MAX_INGEST_BODY_PREFIX_BYTES
 from mitm_inspector.json_boundary import PlainJsonObject, PlainJsonValue
 
 _BODY_STATES_WITH_DATA = frozenset({"captured", "truncated"})
 _SUPPORTED_ENCODINGS = frozenset({"gzip", "x-gzip", "deflate"})
+_DECOMPRESS_INPUT_CHUNK_BYTES = 64 * 1024
+_MAX_CONCATENATED_MEMBERS = 256
+MAX_DECODED_BODY_BYTES = MAX_INGEST_BODY_PREFIX_BYTES
+
+
+@dataclass(frozen=True, slots=True)
+class ContentDecodeResult:
+    """One bounded content-decoding attempt."""
+
+    data: bytes
+    status: Literal["complete", "incomplete", "limit", "invalid"]
 
 
 def header_value(headers: object, name: str) -> str | None:
@@ -61,9 +75,9 @@ def decoded_body_bytes(descriptor: object, encoding: str | None) -> tuple[bytes 
     if encoding is None:
         return raw, False
     decoded = _decode_content(raw, encoding)
-    if decoded is None:
+    if decoded.status == "invalid":
         return None, False
-    return decoded[0], True
+    return decoded.data, True
 
 
 def decoded_body_descriptor(
@@ -83,42 +97,99 @@ def decoded_body_descriptor(
     except (ValueError, binascii.Error):
         return descriptor, False
     decoded_result = _decode_content(raw, encoding)
-    if decoded_result is None:
+    # A decoded descriptor needs an exact decoded total. Incomplete streams
+    # and output-ceiling hits retain their encoded representation instead of
+    # inventing size_bytes/total_bytes for an unknowable body.
+    if descriptor.get("state") != "captured" or decoded_result.status != "complete":
         return descriptor, False
-    decoded, complete = decoded_result
-    state = "captured" if descriptor.get("state") == "captured" and complete else "truncated"
+    decoded = decoded_result.data
     result: PlainJsonObject = {
-        "state": state,
+        "state": "captured",
         "size_bytes": str(len(decoded)),
         "encoding": "base64",
         "data": base64.b64encode(decoded).decode("ascii"),
     }
-    if state == "truncated":
-        result["captured_bytes"] = str(len(decoded))
     content_type = descriptor.get("content_type")
     if isinstance(content_type, str):
         result["content_type"] = content_type
     return result, True
 
 
-def _decode_content(data: bytes, encoding: str) -> tuple[bytes, bool] | None:
+def _decode_content(data: bytes, encoding: str) -> ContentDecodeResult:
     if encoding not in _SUPPORTED_ENCODINGS:
-        return None
+        return ContentDecodeResult(b"", "invalid")
     window_bits = 16 + zlib.MAX_WBITS if encoding in {"gzip", "x-gzip"} else zlib.MAX_WBITS
     attempts = (window_bits, -zlib.MAX_WBITS) if encoding == "deflate" else (window_bits,)
     for attempt in attempts:
-        try:
-            decoder = zlib.decompressobj(attempt)
-            decoded = decoder.decompress(data)
-            decoded += decoder.flush()
-        except zlib.error:
-            continue
-        return decoded, decoder.eof
-    return None
+        result = _decode_members(data, attempt, concatenated=encoding in {"gzip", "x-gzip"})
+        if result.status != "invalid":
+            return result
+    return ContentDecodeResult(b"", "invalid")
+
+
+def _decode_members(data: bytes, window_bits: int, *, concatenated: bool) -> ContentDecodeResult:
+    if not data:
+        return ContentDecodeResult(b"", "incomplete")
+    output = bytearray()
+    remaining_input = data
+    member_count = 0
+    while remaining_input:
+        member_count += 1
+        if member_count > _MAX_CONCATENATED_MEMBERS:
+            return ContentDecodeResult(bytes(output), "limit")
+        member = _decode_member(
+            remaining_input,
+            window_bits,
+            output_limit=MAX_DECODED_BODY_BYTES - len(output),
+        )
+        output.extend(member.data)
+        if member.status != "complete":
+            return ContentDecodeResult(bytes(output), member.status)
+        remaining_input = member.trailing
+        if not concatenated and remaining_input:
+            return ContentDecodeResult(bytes(output), "invalid")
+    return ContentDecodeResult(bytes(output), "complete")
+
+
+@dataclass(frozen=True, slots=True)
+class _MemberDecodeResult:
+    data: bytes
+    trailing: bytes
+    status: Literal["complete", "incomplete", "limit", "invalid"]
+
+
+def _decode_member(data: bytes, window_bits: int, *, output_limit: int) -> _MemberDecodeResult:
+    decoder = zlib.decompressobj(window_bits)
+    output = bytearray()
+    offset = 0
+    pending = b""
+    try:
+        while offset < len(data) or pending:
+            if not pending:
+                end = min(len(data), offset + _DECOMPRESS_INPUT_CHUNK_BYTES)
+                pending = data[offset:end]
+                offset = end
+            remaining = output_limit - len(output)
+            decoded = decoder.decompress(pending, remaining + 1)
+            if len(decoded) > remaining:
+                output.extend(decoded[:remaining])
+                return _MemberDecodeResult(bytes(output), b"", "limit")
+            output.extend(decoded)
+            pending = decoder.unconsumed_tail
+            if decoder.eof:
+                trailing = decoder.unused_data + pending + data[offset:]
+                return _MemberDecodeResult(bytes(output), trailing, "complete")
+            if remaining == 0:
+                return _MemberDecodeResult(bytes(output), b"", "limit")
+    except zlib.error:
+        return _MemberDecodeResult(bytes(output), b"", "invalid")
+    return _MemberDecodeResult(bytes(output), b"", "incomplete")
 
 
 __all__ = [
     "body_content_encoding",
+    "ContentDecodeResult",
+    "MAX_DECODED_BODY_BYTES",
     "decoded_body_bytes",
     "decoded_body_descriptor",
     "header_value",

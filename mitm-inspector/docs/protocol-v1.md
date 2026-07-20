@@ -98,6 +98,11 @@ When a retained body uses gzip or deflate, API projection decodes its served
 prefix and records the original coding under `content_encoding`. The separate
 `request_body_size` and `response_body_size` fields always describe observed
 wire bytes before truncation or decoding.
+Decoded output is capped at the ingest body-prefix ceiling. Complete bounded
+streams, including every member of concatenated gzip, are served decoded;
+incomplete, invalid, trailing-data, or over-limit descriptors retain their raw
+encoded representation so the API never invents a decoded total size. Summary
+and durable-search parsing may consume only the bounded partial decoded prefix.
 The shared `contracts/fixtures/conformance.json` contains positive and adversarial
 negative cases exercised by the schema, Python, and TypeScript tests. JSON
 Schema enforces the types, vocabularies, and bounds; the Python/TypeScript

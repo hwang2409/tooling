@@ -9,6 +9,7 @@ schema-valid while stripping the base64 prefix data.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 from mitm_inspector.api.bodies import body_content_encoding, decoded_body_descriptor
 from mitm_inspector.api.summary import flow_summary
@@ -21,6 +22,46 @@ from mitm_inspector.protocol import KnownParsedMessage, is_rfc3339_utc
 from mitm_inspector.store.memory import MemoryStore
 
 _DATA_BEARING_STATES = frozenset({"captured", "truncated"})
+
+
+@dataclass(slots=True)
+class LifecycleTimingReducer:
+    """Sequence-aware lifecycle timing shared by every API projection."""
+
+    _started: dict[str, tuple[int, str]] = field(default_factory=dict)
+    _ended: dict[str, tuple[int, str]] = field(default_factory=dict)
+
+    def add(self, payload: Mapping[str, object]) -> None:
+        if payload.get("type") != "flow.lifecycle":
+            return
+        flow_id = payload.get("flow_id")
+        sequence = payload.get("sequence")
+        occurred_at = payload.get("occurred_at")
+        state = payload.get("state")
+        if not (
+            isinstance(flow_id, str)
+            and isinstance(sequence, str)
+            and isinstance(occurred_at, str)
+            and is_rfc3339_utc(occurred_at)
+        ):
+            return
+        candidate = (int(sequence), occurred_at)
+        if state == "request_started" and (
+            flow_id not in self._started or candidate[0] < self._started[flow_id][0]
+        ):
+            self._started[flow_id] = candidate
+        if state in {"flow_completed", "error"} and (
+            flow_id not in self._ended or candidate[0] > self._ended[flow_id][0]
+        ):
+            self._ended[flow_id] = candidate
+
+    def values(self, flow_id: str) -> tuple[str | None, str | None]:
+        started = self._started.get(flow_id)
+        ended = self._ended.get(flow_id)
+        return (
+            started[1] if started is not None else None,
+            ended[1] if ended is not None else None,
+        )
 
 
 def redacted_body_descriptor(descriptor: PlainJsonValue) -> PlainJsonValue:
@@ -104,35 +145,14 @@ def collect_grid_flows(store: MemoryStore) -> dict[str, PlainJsonObject]:
     """Project newest metadata plus retained lifecycle timing per flow."""
 
     newest: dict[str, Mapping[str, object]] = {}
-    started: dict[str, tuple[int, str]] = {}
-    ended: dict[str, tuple[int, str]] = {}
+    timing = LifecycleTimingReducer()
     for parsed in store.newest_first():
         if not isinstance(parsed, KnownParsedMessage):
             continue
         payload = parsed.message
         message_type = payload.get("type")
         if message_type == "flow.lifecycle":
-            flow_id = payload.get("flow_id")
-            sequence = payload.get("sequence")
-            occurred_at = payload.get("occurred_at")
-            state = payload.get("state")
-            if not (
-                isinstance(flow_id, str)
-                and isinstance(sequence, str)
-                and isinstance(occurred_at, str)
-            ):
-                continue
-            if not is_rfc3339_utc(occurred_at):
-                continue
-            candidate = (int(sequence), occurred_at)
-            if state == "request_started" and (
-                flow_id not in started or candidate[0] < started[flow_id][0]
-            ):
-                started[flow_id] = candidate
-            if state in {"flow_completed", "error"} and (
-                flow_id not in ended or candidate[0] > ended[flow_id][0]
-            ):
-                ended[flow_id] = candidate
+            timing.add(payload)
             continue
         if message_type != "flow.metadata":
             continue
@@ -144,11 +164,7 @@ def collect_grid_flows(store: MemoryStore) -> dict[str, PlainJsonObject]:
             continue
         newest[flow_id] = metadata
     return {
-        flow_id: grid_flow_with_timing(
-            metadata,
-            started_at=started[flow_id][1] if flow_id in started else None,
-            ended_at=ended[flow_id][1] if flow_id in ended else None,
-        )
+        flow_id: grid_flow_with_timing(metadata, *timing.values(flow_id))
         for flow_id, metadata in newest.items()
     }
 
@@ -157,8 +173,7 @@ def collect_grid_flow(store: MemoryStore, target_flow_id: str) -> PlainJsonObjec
     """Project one retained flow without rebuilding the full grid."""
 
     metadata: Mapping[str, object] | None = None
-    started: tuple[int, str] | None = None
-    ended: tuple[int, str] | None = None
+    timing = LifecycleTimingReducer()
     for parsed in store.newest_first():
         if not isinstance(parsed, KnownParsedMessage):
             continue
@@ -174,34 +189,14 @@ def collect_grid_flow(store: MemoryStore, target_flow_id: str) -> PlainJsonObjec
             continue
         if payload.get("type") != "flow.lifecycle" or payload.get("flow_id") != target_flow_id:
             continue
-        sequence = payload.get("sequence")
-        occurred_at = payload.get("occurred_at")
-        state = payload.get("state")
-        if not isinstance(sequence, str) or not isinstance(occurred_at, str):
-            continue
-        if not is_rfc3339_utc(occurred_at):
-            continue
-        candidate_time = (int(sequence), occurred_at)
-        if state == "request_started" and (
-            started is None or candidate_time[0] < started[0]
-        ):
-            started = candidate_time
-        if state in {"flow_completed", "error"} and (
-            ended is None or candidate_time[0] > ended[0]
-        ):
-            ended = candidate_time
+        timing.add(payload)
     if metadata is None:
         return None
-    return grid_flow_with_timing(
-        metadata,
-        started_at=started[1] if started is not None else None,
-        ended_at=ended[1] if ended is not None else None,
-    )
+    return grid_flow_with_timing(metadata, *timing.values(target_flow_id))
 
 
 def grid_flow_with_timing(
     metadata: Mapping[str, object],
-    *,
     started_at: str | None,
     ended_at: str | None,
 ) -> PlainJsonObject:

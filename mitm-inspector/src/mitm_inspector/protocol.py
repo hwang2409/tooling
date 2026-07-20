@@ -638,7 +638,7 @@ def _flow_metadata(value: object, *, label: str = "metadata") -> FlowMetadata:
             result[key] = _u64(metadata[key], label=f"{label}.{key}")  # type: ignore[literal-required]
     for key in ("request_content_type", "response_content_type"):
         if key in metadata:
-            result[key] = _string(metadata[key], label=f"{label}.{key}")  # type: ignore[literal-required]
+            result[key] = _text(metadata[key], label=f"{label}.{key}")  # type: ignore[literal-required]
     if "content_encoding" in metadata:
         encoding = _object(metadata["content_encoding"], label=f"{label}.content_encoding")
         for side in ("request", "response"):
@@ -678,7 +678,7 @@ def _flow_summary(value: object, *, label: str) -> FlowSummary:
     )
     for key in ("model", "stop_reason"):
         if key in summary:
-            _string(summary[key], label=f"{label}.{key}")
+            _text(summary[key], label=f"{label}.{key}")
     for key in (
         "message_count",
         "input_tokens",
@@ -700,7 +700,7 @@ def _flow_summary(value: object, *, label: str) -> FlowSummary:
         )
         for key in ("text", "tool_name"):
             if key in preview:
-                _string(preview[key], label=f"{label}.preview.{key}")
+                _text(preview[key], label=f"{label}.preview.{key}")
     return cast(FlowSummary, summary)
 
 

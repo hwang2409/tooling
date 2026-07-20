@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from mitm_inspector.api.bodies import body_content_encoding, decoded_body_descriptor
 from mitm_inspector.api.limits import MAX_INGEST_BODY_PREFIX_BYTES
 from mitm_inspector.api.projection import (
+    LifecycleTimingReducer,
     collect_grid_flow,
     collect_grid_flows,
     diff_grid_changes,
@@ -28,7 +29,6 @@ from mitm_inspector.protocol import (
     ParsedMessage,
     ParsedMessageResult,
     ProtocolError,
-    is_rfc3339_utc,
     parse_message,
     parsed_message_to_plain_json,
     require_parsed_message,
@@ -449,19 +449,13 @@ class ApiApplication:
         latest = metadata_values[-1] if metadata_values else None
         if not isinstance(latest, Mapping):
             return messages
-        started_at: str | None = None
-        ended_at: str | None = None
+        timing = LifecycleTimingReducer()
         for message in messages:
-            if message.get("type") != "flow.lifecycle":
-                continue
-            occurred_at = message.get("occurred_at")
-            state = message.get("state")
-            if not isinstance(occurred_at, str) or not is_rfc3339_utc(occurred_at):
-                continue
-            if state == "request_started" and started_at is None:
-                started_at = occurred_at
-            if state in {"flow_completed", "error"}:
-                ended_at = occurred_at
+            timing.add(message)
+        flow_id = latest.get("flow_id")
+        started_at, ended_at = (
+            timing.values(flow_id) if isinstance(flow_id, str) else (None, None)
+        )
         encodings = {
             side: body_content_encoding(latest, side) for side in ("request", "response")
         }

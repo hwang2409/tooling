@@ -687,7 +687,10 @@ def _coalescing_key(
     if message_type == "body.chunk":
         return ("body.chunk", payload.get("body_side"), payload.get("chunk_index"))
     if message_type == "flow.lifecycle":
-        return ("flow.lifecycle", payload.get("state"))
+        # Distinct lifecycle observations can arrive out of sequence. Retain
+        # each event so timing projection can choose by protocol sequence;
+        # exact event replays still coalesce idempotently.
+        return ("flow.lifecycle", payload.get("state"), payload.get("event_id"))
     return None
 
 

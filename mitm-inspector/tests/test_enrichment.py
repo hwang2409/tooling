@@ -6,6 +6,11 @@ import json
 from pathlib import Path
 
 from mitm_inspector.api.app import ApiApplication
+from mitm_inspector.api.bodies import (
+    MAX_DECODED_BODY_BYTES,
+    decoded_body_bytes,
+    decoded_body_descriptor,
+)
 from mitm_inspector.api.projection import collect_grid_flows, enriched_flow, grid_flow
 from mitm_inspector.protocol import parse_message
 from mitm_inspector.store.memory import MemoryStore
@@ -169,6 +174,82 @@ def test_gzip_body_is_decoded_in_metadata_and_original_encoding_is_exposed() -> 
     assert projected["response_body"]["size_bytes"] == str(len(response))
     assert projected["response_body_size"] == str(len(compressed))
     assert projected["content_encoding"] == {"response": "gzip"}
+
+
+def test_content_decoding_is_bounded_and_over_limit_descriptor_falls_back_raw() -> None:
+    compressed = gzip.compress(b"x" * (MAX_DECODED_BODY_BYTES + 1))
+    original = descriptor(compressed)
+
+    decoded, was_decoded = decoded_body_bytes(original, "gzip")
+    served, descriptor_was_decoded = decoded_body_descriptor(original, "gzip")
+
+    assert was_decoded
+    assert decoded == b"x" * MAX_DECODED_BODY_BYTES
+    assert not descriptor_was_decoded
+    assert served == original
+
+
+def test_concatenated_gzip_members_are_all_decoded() -> None:
+    compressed = gzip.compress(b"first-member") + gzip.compress(b"second-member")
+    served, was_decoded = decoded_body_descriptor(descriptor(compressed), "gzip")
+    assert was_decoded
+    assert base64.b64decode(served["data"]) == b"first-membersecond-member"
+
+
+def test_gzip_trailing_garbage_preserves_raw_descriptor() -> None:
+    compressed = gzip.compress(b"valid-member") + b"not-another-member"
+    original = descriptor(compressed)
+    served, was_decoded = decoded_body_descriptor(original, "gzip")
+    assert not was_decoded
+    assert served == original
+
+
+def test_truncated_compressed_prefix_preserves_encoded_size_and_data() -> None:
+    compressed = gzip.compress(b"decoded" * 100_000)
+    prefix = compressed[: len(compressed) // 2]
+    original = descriptor(prefix)
+    original.update(
+        {
+            "state": "truncated",
+            "size_bytes": str(len(compressed)),
+            "captured_bytes": str(len(prefix)),
+        }
+    )
+    served, was_decoded = decoded_body_descriptor(original, "gzip")
+    assert not was_decoded
+    assert served == original
+
+
+def test_empty_compressed_capture_preserves_raw_descriptor() -> None:
+    original = descriptor(b"")
+    served, was_decoded = decoded_body_descriptor(original, "gzip")
+    assert not was_decoded
+    assert served == original
+
+
+def test_empty_derived_strings_remain_valid_protocol_values() -> None:
+    response = json.dumps({"stop_reason": ""}).encode()
+    metadata = anthropic_metadata({"model": "", "messages": []}, response)
+    request_body = metadata["request_body"]
+    response_body = metadata["response_body"]
+    assert isinstance(request_body, dict)
+    assert isinstance(response_body, dict)
+    request_body["content_type"] = ""
+    response_body["content_type"] = ""
+    projected = grid_flow(metadata)
+    parse_message(
+        {
+            "protocol_version": "1",
+            "type": "browser.snapshot",
+            "snapshot_id": "empty-values",
+            "cursor": "0",
+            "flows": [projected],
+        }
+    )
+    assert projected["request_content_type"] == ""
+    assert projected["response_content_type"] == ""
+    assert projected["summary"]["model"] == ""
+    assert projected["summary"]["stop_reason"] == ""
 
 
 def test_restart_replay_preserves_enriched_projection(tmp_path: Path) -> None:

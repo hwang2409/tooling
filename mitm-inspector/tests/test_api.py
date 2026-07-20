@@ -6,6 +6,7 @@ import os
 import shutil
 import stat as stat_module
 import tempfile
+import threading
 from collections.abc import Callable, Coroutine, Iterator
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,7 @@ from mitm_inspector.protocol import (
     parse_message,
 )
 from mitm_inspector.store.memory import MemoryStore
+from mitm_inspector.store.sqlite import SearchCancelled
 
 ROOT = Path(__file__).parents[1]
 SCHEMA_PATH = ROOT / "contracts" / "protocol-v1.schema.json"
@@ -1503,6 +1505,7 @@ def test_search_endpoint_queries_durable_decoded_bodies_and_validates_input(
         config = ApiServerConfig(
             host="127.0.0.1",
             port=0,
+            max_retained_flows=1,
             storage_path=tmp_path / "flows.sqlite",
             sweep_interval_seconds=0.05,
         )
@@ -1524,22 +1527,30 @@ def test_search_endpoint_queries_durable_decoded_bodies_and_validates_input(
                 "flow-b", request_body=captured_body(b'{"text":"needle two"}')
             )
             server.application.ingest(first)
+            server.application.ingest(
+                lifecycle_message("flow-a", state="flow_completed", sequence="1")
+            )
             server.application.ingest(second)
+            server.application.ingest(
+                lifecycle_message("flow-b", state="flow_completed", sequence="2")
+            )
 
             limited_response = await http_request(
                 server.bound_port, get("/api/v1/search?q=needle&limit=1", server.bound_port)
             )
             limited = json.loads(response_body(limited_response))
-            assert limited == {
-                "matches": [
-                    {
-                        "flow_id": "flow-b",
-                        "field": "request_body",
-                        "snippet": '{"text":"needle two"}',
-                    }
-                ],
-                "truncated": True,
+            assert limited["truncated"] is True
+            assert len(limited["matches"]) == 1
+            limited_match = limited["matches"][0]
+            assert {
+                key: limited_match[key] for key in ("flow_id", "field", "snippet")
+            } == {
+                "flow_id": "flow-b",
+                "field": "request_body",
+                "snippet": '{"text":"needle two"}',
             }
+            assert limited_match["flow"]["flow_id"] == "flow-b"
+            assert limited_match["flow"]["request_body"]["data"] == ""
 
             all_response = await http_request(
                 server.bound_port, get("/api/v1/search?q=needle", server.bound_port)
@@ -1550,6 +1561,17 @@ def test_search_endpoint_queries_durable_decoded_bodies_and_validates_input(
                 ("flow-a", "request_body"),
                 ("flow-a", "response_body"),
             ]
+            snapshot_response = await http_request(
+                server.bound_port, get("/api/v1/snapshot", server.bound_port)
+            )
+            snapshot_flow_ids = {
+                flow["flow_id"]
+                for flow in json.loads(response_body(snapshot_response))["flows"]
+            }
+            assert "flow-a" not in snapshot_flow_ids
+            older_match = next(match for match in all_matches if match["flow_id"] == "flow-a")
+            assert older_match["flow"]["flow_id"] == "flow-a"
+            assert older_match["flow"]["request_body"]["data"] == ""
 
             no_match_response = await http_request(
                 server.bound_port, get("/api/v1/search?q=absent", server.bound_port)
@@ -1563,6 +1585,143 @@ def test_search_endpoint_queries_durable_decoded_bodies_and_validates_input(
                 assert invalid.startswith(b"HTTP/1.1 400 ")
         finally:
             await server.close()
+
+    run_async(scenario)
+
+
+def test_detail_timing_uses_the_same_lifecycle_sequence_reducer_as_grid() -> None:
+    application = make_application(max_items=32)
+    application.ingest(metadata_message("flow-timing"))
+    terminal_nine = lifecycle_message(
+        "flow-timing", state="flow_completed", sequence="9"
+    )
+    terminal_nine["occurred_at"] = "2026-01-01T12:09:00Z"
+    terminal_five = lifecycle_message(
+        "flow-timing", state="flow_completed", sequence="5"
+    )
+    terminal_five["occurred_at"] = "2026-01-01T12:05:00Z"
+    application.ingest(terminal_nine)
+    application.ingest(terminal_five)
+
+    snapshot = json.loads(application.snapshot_text())
+    detail_text = application.flow_detail_text("flow-timing")
+    assert detail_text is not None
+    detail = json.loads(detail_text)
+    detail_metadata = next(
+        message["metadata"]
+        for message in detail["messages"]
+        if message["type"] == "flow.metadata"
+    )
+    assert snapshot["flows"][0]["ended_at"] == "2026-01-01T12:09:00Z"
+    assert detail_metadata["ended_at"] == "2026-01-01T12:09:00Z"
+
+
+def test_detail_preserves_truncated_compressed_body_total() -> None:
+    application = make_application(max_items=32)
+    compressed = gzip.compress(b"decoded" * 100_000)
+    prefix = compressed[: len(compressed) // 2]
+    truncated = {
+        "state": "truncated",
+        "size_bytes": str(len(compressed)),
+        "captured_bytes": str(len(prefix)),
+        "encoding": "base64",
+        "data": base64.b64encode(prefix).decode("ascii"),
+        "content_type": "application/json",
+    }
+    message = metadata_message("flow-truncated")
+    metadata = message["metadata"]
+    assert isinstance(metadata, dict)
+    metadata.update(
+        {
+            "response_headers": [{"name": "content-encoding", "value": "gzip"}],
+            "response_status": "200",
+            "response_body": truncated,
+        }
+    )
+    application.ingest(message)
+    application.ingest(
+        {
+            "protocol_version": "1",
+            "type": "body.end",
+            "flow_id": "flow-truncated",
+            "body_side": "response",
+            "total_bytes": str(len(compressed)),
+            "body": truncated,
+        }
+    )
+    detail_text = application.flow_detail_text("flow-truncated")
+    assert detail_text is not None
+    detail = json.loads(detail_text)
+    body_end = next(
+        message for message in detail["messages"] if message["type"] == "body.end"
+    )
+    assert body_end["total_bytes"] == str(len(compressed))
+    assert body_end["body"] == truncated
+
+
+def test_new_search_cancels_and_serializes_an_older_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        server = ApiServer(
+            ApiServerConfig(
+                host="127.0.0.1",
+                port=0,
+                storage_path=tmp_path / "flows.sqlite",
+            )
+        )
+        storage = server._storage
+        assert storage is not None
+        first_started = threading.Event()
+        active = 0
+        max_active = 0
+        active_lock = threading.Lock()
+
+        def fake_search(
+            query: str, limit: int, cancel: threading.Event | None = None
+        ) -> tuple[list[object], bool]:
+            nonlocal active, max_active
+            assert limit == 50
+            assert cancel is not None
+            with active_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                if query == "first":
+                    first_started.set()
+                    cancel.wait(timeout=2)
+                    raise SearchCancelled
+                return [], False
+            finally:
+                with active_lock:
+                    active -= 1
+
+        monkeypatch.setattr(storage, "search", fake_search)
+
+        class BufferWriter:
+            def __init__(self) -> None:
+                self.data = bytearray()
+
+            def write(self, data: bytes) -> None:
+                self.data.extend(data)
+
+            async def drain(self) -> None:
+                return
+
+        first_writer = BufferWriter()
+        second_writer = BufferWriter()
+        first_task = asyncio.create_task(
+            server._handle_plain_get("/api/v1/search?q=first", first_writer)  # type: ignore[arg-type]
+        )
+        assert await asyncio.to_thread(first_started.wait, 1)
+        second_task = asyncio.create_task(
+            server._handle_plain_get("/api/v1/search?q=second", second_writer)  # type: ignore[arg-type]
+        )
+        await asyncio.gather(first_task, second_task)
+        assert first_writer.data == b""
+        assert second_writer.data.startswith(b"HTTP/1.1 200 ")
+        assert max_active == 1
+        await server.close()
 
     run_async(scenario)
 

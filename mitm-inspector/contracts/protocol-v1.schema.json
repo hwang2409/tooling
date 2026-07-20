@@ -117,6 +117,24 @@
         "count_tokens_result": {"$ref": "#/$defs/u64"}
       }
     },
+    "searchMatch": {
+      "type": "object",
+      "required": ["flow_id", "field", "snippet"],
+      "properties": {
+        "flow_id": {"type": "string", "minLength": 1},
+        "field": {"enum": ["request_body", "response_body"]},
+        "snippet": {"type": "string", "maxLength": 160},
+        "flow": {"$ref": "#/$defs/flow"}
+      }
+    },
+    "searchResponse": {
+      "type": "object",
+      "required": ["matches", "truncated"],
+      "properties": {
+        "matches": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/searchMatch"}},
+        "truncated": {"type": "boolean"}
+      }
+    },
     "flow": {
       "type": "object",
       "required": ["flow_id", "method", "scheme", "host", "port", "path", "request_headers", "request_body"],

@@ -17,6 +17,7 @@ import re
 import signal
 import stat
 import sys
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +57,7 @@ from mitm_inspector.store.sqlite import (
     DEFAULT_STORAGE_MAX_BYTES,
     DEFAULT_STORAGE_MAX_FLOWS,
     DEFAULT_STORAGE_REPLAY,
+    SearchCancelled,
     SearchMatch,
     SQLiteFlowStorage,
     default_storage_path,
@@ -244,6 +246,8 @@ class ApiServer:
         self._http_requests = 0
         self._websocket_connections = 0
         self._sweep_failures = 0
+        self._search_guard = asyncio.Lock()
+        self._search_cancel: threading.Event | None = None
 
     @property
     def counters(self) -> dict[str, object]:
@@ -307,6 +311,8 @@ class ApiServer:
 
     async def close(self) -> None:
         self._closing = True
+        if self._search_cancel is not None:
+            self._search_cancel.set()
         if self._sweep_task is not None:
             self._sweep_task.cancel()
             try:
@@ -494,9 +500,23 @@ class ApiServer:
                 matches: list[SearchMatch] = []
                 truncated = False
             else:
-                matches, truncated = await asyncio.to_thread(
-                    self._storage.search, query_values[0], limit
-                )
+                cancel = threading.Event()
+                previous = self._search_cancel
+                self._search_cancel = cancel
+                if previous is not None:
+                    previous.set()
+                async with self._search_guard:
+                    if cancel.is_set():
+                        return
+                    try:
+                        matches, truncated = await asyncio.to_thread(
+                            self._storage.search, query_values[0], limit, cancel
+                        )
+                    except SearchCancelled:
+                        return
+                    finally:
+                        if self._search_cancel is cancel:
+                            self._search_cancel = None
             body = json.dumps(
                 {"matches": matches, "truncated": truncated}, separators=(",", ":")
             ).encode("utf-8")
