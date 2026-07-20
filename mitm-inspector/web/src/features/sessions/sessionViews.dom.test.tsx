@@ -128,26 +128,32 @@ function stateOf(flows: unknown[]): BrowserState {
 
 const mounts: Array<{ root: ReturnType<typeof createRoot>; container: HTMLDivElement }> = [];
 
-async function mountWorkspace(browser: BrowserState, loader?: FlowDetailLoader) {
+type DetailBodies = Record<string, { request: string; response?: string }>;
+
+async function mountWorkspace(browser: BrowserState, bodies: DetailBodies | (() => DetailBodies) = DETAIL_BODIES) {
   const requested: string[] = [];
-  const loadFlowDetail: FlowDetailLoader = loader ?? (async (flowId) => {
+  const loadFlowDetail: FlowDetailLoader = async (flowId) => {
     requested.push(flowId);
-    const bodies = DETAIL_BODIES[flowId];
-    if (bodies === undefined) return { status: "unavailable" };
+    const current = typeof bodies === "function" ? bodies() : bodies;
+    const entry = current[flowId];
+    if (entry === undefined) return { status: "unavailable" };
     return {
       status: "loaded",
       overrides: {
-        request_body: captured(bodies.request),
-        ...(bodies.response !== undefined ? { response_body: captured(bodies.response) } : {}),
+        request_body: captured(entry.request),
+        ...(entry.response !== undefined ? { response_body: captured(entry.response) } : {}),
       },
     };
-  });
+  };
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
   mounts.push({ root, container });
-  await act(async () => root.render(<Workspace browser={browser} loadFlowDetail={loadFlowDetail} />));
-  return { container, requested };
+  const render = async (nextBrowser: BrowserState) => {
+    await act(async () => root.render(<Workspace browser={nextBrowser} loadFlowDetail={loadFlowDetail} />));
+  };
+  await render(browser);
+  return { container, requested, render };
 }
 
 afterEach(async () => {
@@ -252,14 +258,115 @@ describe("Workspace session-first navigation", () => {
   });
 
   it("shows a quiet retention notice when the selected session has been pruned", async () => {
-    const { container } = await mountWorkspace(stateOf(FLOWS));
+    const { container, render } = await mountWorkspace(stateOf(FLOWS));
     await click(sessionRows(container)[0]);
     await settle();
     // Simulate retention pruning the whole session away.
-    const pruned = stateOf([FLOWS[3]]);
-    await act(async () => mounts[0].root.render(<Workspace browser={pruned} loadFlowDetail={async () => ({ status: "unavailable" })} />));
+    await render(stateOf([FLOWS[3]]));
     expect(container.textContent).toContain("session no longer retained");
     await click(container.querySelector(".session-back"));
     expect(sessionRows(container)).toHaveLength(1);
+  });
+
+  it("prefix-dedupe regression: a newer equal-count utility branch never becomes the conversation", async () => {
+    const session = "cccc9999-0000-1111-2222-333333333333";
+    const branchRequest = JSON.stringify({
+      model: "claude-opus-4",
+      messages: [
+        { role: "user", content: "fix the bug" },
+        { role: "assistant", content: "checking quota" },
+        { role: "user", content: "what quota remains?" },
+      ],
+    });
+    const oldMainRequest = JSON.stringify({
+      model: "claude-opus-4",
+      messages: [{ role: "user", content: "fix the bug" }],
+    });
+    const flows = [
+      // Newest, same message_count as the main thread, no suggestion marker:
+      // the retired count/recency heuristic selected THIS flow.
+      sessionFlow("branch-flow", {
+        session_id: session,
+        started_at: "2026-01-01T00:03:00Z",
+        summary: { kind: "anthropic_messages", model: "claude-opus-4", message_count: "3", preview: { source: "user_text", text: "what quota remains?" } },
+      }),
+      sessionFlow("main2-flow", {
+        session_id: session,
+        started_at: "2026-01-01T00:02:00Z",
+        summary: { kind: "anthropic_messages", model: "claude-opus-4", message_count: "3", preview: { source: "tool_result", tool_name: "Bash" } },
+      }),
+      sessionFlow("old-main-flow", {
+        session_id: session,
+        started_at: "2026-01-01T00:01:00Z",
+        summary: { kind: "anthropic_messages", model: "claude-opus-4", message_count: "1", preview: { source: "user_text", text: "fix the bug" } },
+      }),
+    ];
+    const { container, requested } = await mountWorkspace(stateOf(flows), {
+      "branch-flow": { request: branchRequest },
+      "main2-flow": { request: MAIN_REQUEST, response: MAIN_RESPONSE },
+      "old-main-flow": { request: oldMainRequest },
+    });
+    await click(sessionRows(container)[0]);
+    await settle();
+    expect(new Set(requested)).toEqual(new Set(["branch-flow", "main2-flow", "old-main-flow"]));
+    const conversation = container.querySelector("[data-testid='conversation-view']");
+    // Canonical = tip of the dominant prefix chain {old-main -> main2}, so
+    // the chat shows the main thread and its response as the final turn.
+    expect(conversation?.textContent).toContain("tests pass");
+    expect(conversation?.textContent).toContain("final assistant turn");
+    expect(conversation?.textContent).not.toContain("quota");
+    // The off-chain branch stays reachable in the auxiliary group.
+    const aux = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-aux .conv-collapse-head"))
+      .find((button) => button.textContent?.includes("auxiliary calls (2)"));
+    expect(aux).toBeDefined();
+  });
+
+  it("refetches the same flow when it transitions incomplete-to-complete and shows the final turn", async () => {
+    const session = "dddd8888-0000-1111-2222-333333333333";
+    const liveRequest = JSON.stringify({ model: "claude-opus-4", messages: [{ role: "user", content: "hello" }] });
+    const liveResponse = JSON.stringify({
+      model: "claude-opus-4",
+      role: "assistant",
+      content: [{ type: "text", text: "late final answer" }],
+      stop_reason: "end_turn",
+    });
+    const inFlight = {
+      flow_id: "live-flow",
+      session_id: session,
+      method: "POST",
+      scheme: "https",
+      host: "api.anthropic.test",
+      port: "443",
+      path: "/v1/messages",
+      request_headers: [{ name: "content-type", value: "application/json" }],
+      request_body: { state: "truncated", size_bytes: "64", captured_bytes: "0", encoding: "base64", data: "" },
+      started_at: "2026-01-01T00:00:00Z",
+      summary: { kind: "anthropic_messages", model: "claude-opus-4", message_count: "1", preview: { source: "user_text", text: "hello" } },
+    };
+    const completed = {
+      ...inFlight,
+      response_headers: [{ name: "content-type", value: "application/json" }],
+      response_status: "200",
+      response_body: { state: "truncated", size_bytes: "128", captured_bytes: "0", encoding: "base64", data: "" },
+      ended_at: "2026-01-01T00:00:09Z",
+    };
+    let complete = false;
+    const { container, requested, render } = await mountWorkspace(
+      stateOf([inFlight]),
+      () => ({ "live-flow": complete ? { request: liveRequest, response: liveResponse } : { request: liveRequest } }),
+    );
+    await click(sessionRows(container)[0]);
+    await settle();
+    expect(requested).toEqual(["live-flow"]);
+    expect(container.querySelector("[data-testid='conversation-view']")?.textContent).toContain("hello");
+    expect(container.textContent).not.toContain("late final answer");
+
+    // The flow completes: same id, new terminal fields. The detail cache must
+    // invalidate and refetch instead of pinning the response-less body.
+    complete = true;
+    await render(stateOf([completed]));
+    await settle();
+    expect(requested).toEqual(["live-flow", "live-flow"]);
+    expect(container.querySelector("[data-testid='conversation-view']")?.textContent).toContain("late final answer");
   });
 });

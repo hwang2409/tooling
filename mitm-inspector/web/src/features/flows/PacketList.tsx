@@ -6,7 +6,7 @@ import type { BrowserState, ImmutableFlowMetadata } from "../../state/browserSta
 import { parseFlowExtras } from "../../protocol";
 import { bodyText } from "../inspector/decoders";
 import type { BodyText } from "../inspector/decoders";
-import { useFlowDetail } from "../inspector/flowDetail";
+import { flowDetailVersion, useFlowDetail } from "../inspector/flowDetail";
 import type { FlowDetailLoader, FlowDetailResult } from "../inspector/flowDetail";
 import { JsonTree, LARGE_TREE_COLLAPSE_THRESHOLD, safeParseJson } from "../inspector/jsonTree";
 import { parseAnthropicRequest } from "../inspector/anthropic";
@@ -114,7 +114,11 @@ export function PacketList({ browser, flows: flowsOverride, showSearch = true, l
   }, [flows, matchesByFlow]);
   const rows = useMemo(() => groupRows(visibleFlows), [visibleFlows]);
   const openFlow = openFlowId === null ? undefined : visibleFlows.find((flow) => flow.flow_id === openFlowId);
-  const detail = useFlowDetail(openFlow?.flow_id ?? null, loadFlowDetail);
+  const detail = useFlowDetail(
+    openFlow?.flow_id ?? null,
+    loadFlowDetail,
+    openFlow === undefined ? undefined : flowDetailVersion(openFlow),
+  );
 
   return (
     <div className="packet-pane">

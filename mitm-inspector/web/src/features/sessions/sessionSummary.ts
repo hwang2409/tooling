@@ -1,3 +1,5 @@
+/* eslint-disable no-unused-vars */
+
 import { parseFlowExtras } from "../../protocol";
 import type { ImmutableFlowMetadata } from "../../state/browserState";
 import type { AnthropicRequest } from "../inspector/anthropic";
@@ -72,20 +74,68 @@ function parsedTime(value: string | undefined): number | null {
   return Number.isNaN(parsed) ? null : parsed;
 }
 
+export interface SessionIndex {
+  /** Project the current grid flows onto session summaries. */
+  readonly update: (flows: readonly ImmutableFlowMetadata[]) => readonly SessionSummary[];
+}
+
+function sameFlows(left: readonly ImmutableFlowMetadata[], right: readonly ImmutableFlowMetadata[]): boolean {
+  return left.length === right.length && left.every((flow, index) => flow === right[index]);
+}
+
+/**
+ * Incremental session aggregation. Grouping is a single pass of WeakMap hits
+ * and identity pushes over the entries array the reducer already rebuilt for
+ * the delta; the expensive per-session summarisation only re-runs for
+ * sessions whose flow membership actually changed (the reducer reuses frozen
+ * metadata objects for untouched flows, so identity comparison is exact).
+ * A snapshot/source reset replaces every object and naturally rebuilds all.
+ */
+export function createSessionIndex(): SessionIndex {
+  let previousFlows: readonly ImmutableFlowMetadata[] | null = null;
+  let previousResult: readonly SessionSummary[] = [];
+  let previousGroups = new Map<SessionKey, readonly ImmutableFlowMetadata[]>();
+  let previousSummaries = new Map<SessionKey, SessionSummary>();
+  return {
+    update(flows) {
+      if (previousFlows !== null && (flows === previousFlows || sameFlows(flows, previousFlows))) {
+        previousFlows = flows;
+        return previousResult;
+      }
+      const groups = new Map<SessionKey, ImmutableFlowMetadata[]>();
+      for (const flow of flows) {
+        const key = deriveFlowFacts(flow).sessionKey;
+        const existing = groups.get(key);
+        if (existing === undefined) groups.set(key, [flow]);
+        else existing.push(flow);
+      }
+      const summaries = new Map<SessionKey, SessionSummary>();
+      const result: SessionSummary[] = [];
+      for (const [key, sessionFlows] of groups) {
+        const priorGroup = previousGroups.get(key);
+        const priorSummary = previousSummaries.get(key);
+        const summary = priorGroup !== undefined && priorSummary !== undefined && sameFlows(priorGroup, sessionFlows)
+          ? priorSummary
+          : summarise(key, sessionFlows);
+        summaries.set(key, summary);
+        result.push(summary);
+      }
+      previousFlows = flows;
+      previousGroups = groups;
+      previousSummaries = summaries;
+      previousResult = result;
+      return result;
+    },
+  };
+}
+
 /**
  * Group the newest-first grid flows into one summary per session. Session
  * order follows each session's newest flow, so the list is newest-first too.
  * Null session ids collapse into a single "unassigned" bucket.
  */
 export function deriveSessions(flows: readonly ImmutableFlowMetadata[]): readonly SessionSummary[] {
-  const groups = new Map<SessionKey, ImmutableFlowMetadata[]>();
-  for (const flow of flows) {
-    const key = deriveFlowFacts(flow).sessionKey;
-    const existing = groups.get(key);
-    if (existing === undefined) groups.set(key, [flow]);
-    else existing.push(flow);
-  }
-  return Array.from(groups, ([key, sessionFlows]) => summarise(key, sessionFlows));
+  return createSessionIndex().update(flows);
 }
 
 function summarise(key: SessionKey, flows: readonly ImmutableFlowMetadata[]): SessionSummary {

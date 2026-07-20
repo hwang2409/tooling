@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { ImmutableFlowMetadata } from "../../state/browserState";
 import { parseAnthropicRequest } from "../inspector/anthropic";
-import { conversationCandidates, deriveSessions, isSuggestionRequest, looksLikeSuggestionFlow } from "./sessionSummary";
+import { conversationCandidates, createSessionIndex, deriveSessions, isSuggestionRequest, looksLikeSuggestionFlow } from "./sessionSummary";
 
 interface FlowOptions {
   session?: string | null;
@@ -113,6 +113,40 @@ describe("deriveSessions", () => {
     const after = deriveSessions(retained);
     expect(after.map((session) => session.key)).toEqual(["aaaa", "bbbb"]);
     expect(after.map((session) => session.flowCount)).toEqual([1, 1]);
+  });
+});
+
+describe("createSessionIndex", () => {
+  it("only resummarizes sessions whose flow membership changed", () => {
+    const a1 = flow("a1", { session: "aaaa" });
+    const b1 = flow("b1", { session: "bbbb" });
+    const index = createSessionIndex();
+    const first = index.update([a1, b1]);
+    const second = index.update([flow("b2", { session: "bbbb" }), a1, b1]);
+    // Untouched session keeps its summary object identity across the delta.
+    expect(second.find((session) => session.key === "aaaa"))
+      .toBe(first.find((session) => session.key === "aaaa"));
+    const updated = second.find((session) => session.key === "bbbb");
+    expect(updated).not.toBe(first.find((session) => session.key === "bbbb"));
+    expect(updated?.flowCount).toBe(2);
+  });
+
+  it("returns the previous result identity while flows are unchanged", () => {
+    const flows = [flow("a1", { session: "aaaa" }), flow("b1", { session: "bbbb" })];
+    const index = createSessionIndex();
+    const first = index.update(flows);
+    expect(index.update(flows)).toBe(first);
+    // Same flow identities in a fresh array (paused view re-render).
+    expect(index.update([...flows])).toBe(first);
+  });
+
+  it("drops pruned sessions on the next update", () => {
+    const a1 = flow("a1", { session: "aaaa" });
+    const b1 = flow("b1", { session: "bbbb" });
+    const index = createSessionIndex();
+    index.update([a1, b1]);
+    const pruned = index.update([b1]);
+    expect(pruned.map((session) => session.key)).toEqual(["bbbb"]);
   });
 });
 

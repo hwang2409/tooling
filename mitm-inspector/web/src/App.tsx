@@ -1,6 +1,6 @@
 /* eslint-disable no-unused-vars */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { useConnection } from "./features/connection/useConnection";
 import type { TransportFactory } from "./features/connection/connectionClient";
@@ -10,8 +10,8 @@ import type { FlowDetailLoader } from "./features/inspector/flowDetail";
 import type { SearchFetcher } from "./features/search/search";
 import { SessionDetail } from "./features/sessions/SessionDetail";
 import { SessionList } from "./features/sessions/SessionList";
-import { deriveSessions } from "./features/sessions/sessionSummary";
-import type { SessionKey } from "./features/sessions/sessionSummary";
+import { createSessionIndex } from "./features/sessions/sessionSummary";
+import type { SessionIndex, SessionKey } from "./features/sessions/sessionSummary";
 import type { BrowserState } from "./state/browserState";
 import "./styles/shell.css";
 
@@ -34,7 +34,11 @@ export interface WorkspaceProps {
  */
 export function Workspace({ browser, loadFlowDetail, searchFetcher, onSearchActiveChange }: WorkspaceProps) {
   const [view, setView] = useState<WorkspaceView>({ kind: "sessions" });
-  const sessions = useMemo(() => deriveSessions(browser.flows.entries), [browser.flows.entries]);
+  // Stateful incremental index: unchanged sessions keep their summary
+  // objects across deltas; only sessions whose flows changed resummarize.
+  const indexRef = useRef<SessionIndex | null>(null);
+  if (indexRef.current === null) indexRef.current = createSessionIndex();
+  const sessions = indexRef.current.update(browser.flows.entries);
 
   let body;
   if (view.kind === "flows") {
