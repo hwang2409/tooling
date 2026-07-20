@@ -92,12 +92,14 @@ def metadata_message(
     *,
     request_body: dict[str, object] | None = None,
     path: str = "/v1/messages",
+    session_id: str | None = None,
 ) -> dict[str, object]:
     return {
         "protocol_version": "1",
         "type": "flow.metadata",
         "metadata": {
             "flow_id": flow_id,
+            "session_id": session_id,
             "method": "POST",
             "scheme": "https",
             "host": "api.example.test",
@@ -318,13 +320,14 @@ def test_ingest_metadata_emits_redacted_delta_with_incremented_cursor() -> None:
     application = make_application()
     collector = Collector()
     application.subscribe(collector.deliver)
-    application.ingest(metadata_message(request_body=captured_body()))
+    application.ingest(metadata_message(request_body=captured_body(), session_id="session-1"))
     delta = collector.messages()[-1]
     assert delta["type"] == "browser.delta"
     assert delta["cursor"] == "1"
     changes = delta["changes"]
     assert isinstance(changes, list) and len(changes) == 1
     assert changes[0]["op"] == "upsert"
+    assert changes[0]["flow"]["session_id"] == "session-1"
     body = changes[0]["flow"]["request_body"]
     assert body["state"] == "truncated"
     assert body["captured_bytes"] == "0"

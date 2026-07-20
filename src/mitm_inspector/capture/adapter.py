@@ -81,6 +81,7 @@ class _BodyCapture:
 class _FlowCapture:
     flow_id: str
     created_at: float
+    session_id: str | None = None
     identity: dict[str, str] = field(default_factory=dict)
     request_headers: list[dict[str, str]] = field(default_factory=list)
     request_headers_captured: bool = False
@@ -397,7 +398,14 @@ class CaptureAddon:
                     completed=True,
                     tombstone=True,
                 )
-            state = _FlowCapture(flow_id=flow_id, created_at=self._active_clock())
+            client_conn = getattr(flow, "client_conn", None)
+            client_conn_id = getattr(client_conn, "id", None)
+            session_id = client_conn_id if type(client_conn_id) is str else None
+            state = _FlowCapture(
+                flow_id=flow_id,
+                created_at=self._active_clock(),
+                session_id=session_id,
+            )
             self._flows[flow_id] = state
         return state
 
@@ -640,6 +648,7 @@ class CaptureAddon:
             return
         metadata: dict[str, object] = {
             "flow_id": state.flow_id,
+            "session_id": state.session_id,
             "method": "GET",
             "scheme": "https",
             "host": "unknown",
@@ -791,6 +800,7 @@ class CaptureAddon:
         """Drop secret-bearing state even if a caller retains the Flow."""
 
         state.identity.clear()
+        state.session_id = None
         state.request_headers.clear()
         state.response_headers = None
         state.lifecycle_states.clear()
@@ -902,6 +912,8 @@ def _state_weight(state: _FlowCapture) -> int:
     """Bound copied metadata, including every header value."""
 
     weight = len(state.flow_id)
+    if state.session_id is not None:
+        weight += len(state.session_id)
     weight += sum(len(key) + len(value) for key, value in state.identity.items())
     weight += sum(
         len(header["name"]) + len(header["value"])

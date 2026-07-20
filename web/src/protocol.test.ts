@@ -47,6 +47,7 @@ describe("shared protocol-v1 conformance", () => {
   it("preserves duplicate ordered headers and response-before-request-end ordering", () => {
     const parsed = streamMessages.filter((message) => (message as { type?: string }).type !== "future.message").map(known);
     const metadata = parsed[1].metadata as {
+      session_id?: string | null;
       request_headers: Array<{ name: string; value: string }>;
       request_body: { content_type?: string };
     };
@@ -55,8 +56,17 @@ describe("shared protocol-v1 conformance", () => {
       { name: "x-trace", value: "second" },
     ]);
     const conformanceMetadata = (known(conformance.valid[1]).metadata) as typeof metadata;
+    expect(conformanceMetadata.session_id).toBe("session-conformance");
     expect(conformanceMetadata.request_headers[2].value).toBe("");
     expect(conformanceMetadata.request_body.content_type).toBe("");
+    const nullSession = conformance.valid
+      .filter((message): message is { type: string; metadata: { flow_id: string; session_id: string | null } } =>
+        typeof message === "object" && message !== null
+        && (message as { type?: unknown }).type === "flow.metadata"
+        && typeof (message as { metadata?: { flow_id?: unknown } }).metadata?.flow_id === "string"
+        && (message as { metadata: { flow_id: string } }).metadata.flow_id === "conformance-null-session")
+      .at(0);
+    expect(nullSession?.metadata.session_id).toBeNull();
     const lifecycle = parsed.filter((message) => message.type === "flow.lifecycle");
     expect(lifecycle.map((message) => message.state)).toEqual(["response_started", "request_end"]);
   });

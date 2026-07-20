@@ -11,6 +11,16 @@ import { FlowWorkspace } from "./FlowWorkspace";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
+const testStorage = new Map<string, string>();
+Object.defineProperty(globalThis, "localStorage", {
+  configurable: true,
+  value: {
+    getItem: (key: string) => testStorage.get(key) ?? null,
+    setItem: (key: string, value: string) => testStorage.set(key, value),
+    clear: () => testStorage.clear(),
+  },
+});
+
 function flow(flowId: string, overrides: Record<string, unknown> = {}) {
   return {
     flow_id: flowId,
@@ -45,10 +55,10 @@ function snapshot(cursor: string, flows: unknown[]) {
   return { protocol_version: "1", type: "browser.snapshot", snapshot_id: `snap-${cursor}`, cursor, flows };
 }
 
-function lifecycleEvent(flowId: string, state: string, sequence: string) {
+function lifecycleEvent(flowId: string, state: string, sequence: string, occurredAt = "2026-01-01T12:00:00Z") {
   return {
     protocol_version: "1", type: "flow.lifecycle", source_id: "source-a", flow_id: flowId,
-    event_id: `${flowId}-${sequence}`, occurred_at: "2026-01-01T00:00:01Z", sequence, state,
+    event_id: `${flowId}-${sequence}`, occurred_at: occurredAt, sequence, state,
   };
 }
 
@@ -118,9 +128,71 @@ afterEach(async () => {
     await act(async () => mounted.root.unmount());
     mounted.container.remove();
   }
+  globalThis.localStorage.clear();
 });
 
 describe("mounted FlowWorkspace", () => {
+  it("groups flows by session, keeps the unassigned bucket last, and collapses headers", async () => {
+    const initialMessages = [
+      hello(),
+      snapshot("1", [
+        flow("newer", { session_id: "22222222-aaaa" }),
+        flow("older", { session_id: "11111111-bbbb" }),
+        flow("same-session", { session_id: "11111111-bbbb" }),
+        flow("unassigned"),
+      ]),
+      lifecycleEvent("older", "request_started", "1", "2026-01-01T12:00:00Z"),
+      lifecycleEvent("same-session", "request_started", "2", "2026-01-01T12:00:01Z"),
+      lifecycleEvent("newer", "request_started", "3", "2026-01-01T12:01:00Z"),
+    ];
+    const browser = reduceAll(initialMessages);
+    const mounted = await mountWorkspace(browser);
+    const groupBy = mounted.container.querySelector<HTMLSelectElement>("select[aria-label='Group flows by']");
+    expect(groupBy).not.toBeNull();
+    await act(async () => {
+      groupBy!.value = "session";
+      groupBy!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    const headers = () => Array.from(mounted.container.querySelectorAll<HTMLElement>(".flow-grid-session"));
+    expect(headers()).toHaveLength(3);
+    expect(headers()[0].textContent).toContain("session 11111111 · 2 flows · 12:00:00 · 1.0s");
+    expect(headers()[1].textContent).toContain("session 22222222 · 1 flows · 12:01:00 · 0ms");
+    expect(headers()[2].textContent).toContain("unassigned · 1 flows");
+    expect(mounted.container.textContent).toContain("/v1/older");
+
+    await act(async () => headers()[0].querySelector("button")?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(mounted.container.textContent).not.toContain("/v1/older");
+    expect(headers()[0].textContent).toContain("▸");
+
+    const withFreshSession = reduceAll([
+      ...initialMessages,
+      {
+        protocol_version: "1", type: "browser.delta", cursor: "2",
+        changes: [{ op: "upsert", flow: flow("fresh", { session_id: "33333333-cccc" }) }],
+      },
+      lifecycleEvent("fresh", "request_started", "4", "2026-01-01T12:02:00Z"),
+    ]);
+    await rerender(mounted, withFreshSession);
+    expect(mounted.container.textContent).toContain("session 33333333 · 1 flows · 12:02:00 · 0ms");
+  });
+
+  it("persists the session grouping choice across workspace mounts", async () => {
+    const browser = reduceAll([hello(), snapshot("1", [flow("alpha", { session_id: "aaaaaaaa" })])]);
+    const first = await mountWorkspace(browser);
+    const groupBy = first.container.querySelector<HTMLSelectElement>("select[aria-label='Group flows by']")!;
+    await act(async () => {
+      groupBy.value = "session";
+      groupBy.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(groupBy.value).toBe("session");
+    await act(async () => first.root.unmount());
+    first.container.remove();
+    mounts.splice(mounts.indexOf(first), 1);
+    const second = await mountWorkspace(browser);
+    expect(second.container.querySelector<HTMLSelectElement>("select[aria-label='Group flows by']")?.value).toBe("session");
+  });
+
   it("renders one 28px grid row per retained flow with lifecycle-derived phases", async () => {
     const browser = reduceAll([
       hello(),

@@ -9,6 +9,11 @@
 .flow-filter-input.has-error { border-color: var(--danger); }
 .flow-filter-input::placeholder { color: var(--faint); }
 .flow-filter-count { color: var(--muted); font-family: var(--font-mono); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.flow-group-label { color: var(--faint); font-family: var(--font-mono); font-size: 10px; font-weight: 700; letter-spacing: .12em; white-space: nowrap; }
+.flow-group-select { padding: 7px 8px; color: var(--ink); border: 1px solid var(--line-dark); border-radius: var(--radius-s); background: var(--paper-alt); font-family: var(--font-mono); font-size: 11px; }
+.flow-grid-session { display: flex; height: 28px; align-items: center; border-bottom: 1px solid var(--line-dark); background: var(--paper-deep); color: var(--ink); font-family: var(--font-mono); font-size: 10px; font-weight: 700; letter-spacing: .04em; }
+.flow-grid-session-toggle { width: 100%; height: 100%; padding: 0 10px; color: inherit; border: 0; background: transparent; text-align: left; font: inherit; cursor: pointer; }
+.flow-grid-session-toggle:hover { background: var(--paper-alt); }
 .flow-filter-error { margin: 0; padding: 8px 10px; color: var(--danger); border: 1px solid var(--danger); border-radius: var(--radius-s); background: var(--danger-soft); font-family: var(--font-mono); font-size: 11px; }
 
 /* Two-pane split: grid on the left, inspector docked to the right. Collapses

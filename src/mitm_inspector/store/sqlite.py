@@ -174,7 +174,7 @@ class SQLiteFlowStorage:
                        flows.response_body, flows.request_body_state,
                        flows.response_body_state, flows.request_body_size,
                        flows.response_body_size, flows.request_headers_json,
-                       flows.response_headers_json
+                       flows.response_headers_json, flows.session_id
                 FROM flows
                 WHERE method <> ''
                 ORDER BY CASE WHEN flows.started_at IS NULL THEN 1 ELSE 0 END,
@@ -314,7 +314,8 @@ class SQLiteFlowStorage:
                     response_body_size INTEGER NOT NULL DEFAULT 0,
                     request_headers_json TEXT NOT NULL DEFAULT '[]',
                     response_headers_json TEXT,
-                    created_order INTEGER NOT NULL DEFAULT 0
+                    created_order INTEGER NOT NULL DEFAULT 0,
+                    session_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS lifecycle (
                     flow_id TEXT NOT NULL,
@@ -342,6 +343,12 @@ class SQLiteFlowStorage:
                     ON flows(created_order);
                 """
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(flows)").fetchall()
+            }
+            if "session_id" not in columns:
+                connection.execute("ALTER TABLE flows ADD COLUMN session_id TEXT")
             connection.commit()
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.execute("VACUUM")
@@ -455,8 +462,8 @@ class SQLiteFlowStorage:
                 request_content_type, response_content_type, request_body,
                 response_body, request_body_state, response_body_state,
                 request_body_size, response_body_size, request_headers_json,
-                response_headers_json, created_order
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                response_headers_json, created_order, session_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(flow_id) DO UPDATE SET
                 method = excluded.method,
                 scheme = excluded.scheme,
@@ -487,6 +494,7 @@ class SQLiteFlowStorage:
                 response_headers_json = COALESCE(
                     excluded.response_headers_json, flows.response_headers_json
                 ),
+                session_id = COALESCE(excluded.session_id, flows.session_id),
                 created_order = CASE
                     WHEN flows.created_order = 0 THEN excluded.created_order
                     ELSE flows.created_order
@@ -511,6 +519,7 @@ class SQLiteFlowStorage:
                 request_headers,
                 response_headers,
                 self._next_order(),
+                metadata.get("session_id"),
             ),
         )
 
@@ -667,6 +676,7 @@ class SQLiteFlowStorage:
         response_headers = json.loads(str(row[19])) if row[19] is not None else None
         metadata: dict[str, object] = {
             "flow_id": row[0],
+            "session_id": row[20],
             "method": row[2],
             "scheme": row[3],
             "host": row[4],
