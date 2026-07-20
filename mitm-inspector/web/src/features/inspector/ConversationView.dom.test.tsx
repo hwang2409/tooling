@@ -26,6 +26,7 @@ describe("ConversationView", () => {
       stream: false,
       max_tokens: 128,
       thinking: { type: "enabled", budget_tokens: 64 },
+      output_config: { effort: "high", format: { type: "json_schema", schema: { type: "object" } } },
       system: [{ type: "text", text: "system instruction", cache_control: { type: "ephemeral" } }],
       tools: [{ name: "lookup", input_schema: { type: "object", properties: { q: { type: "string" } } } }],
       messages: [{
@@ -56,6 +57,17 @@ describe("ConversationView", () => {
     await act(async () => root.render(<ConversationView request={request} extras={{}} responseText={response} />));
 
     expect(container.querySelector(".conv")?.textContent).toContain("claude-sonnet-4-20250514");
+    expect(container.textContent).toContain("output_config");
+    const outputConfig = Array.from(container.querySelectorAll<HTMLButtonElement>(".conv-collapse-head"))
+      .find((button) => button.textContent?.includes("output_config"));
+    expect(outputConfig).toBeDefined();
+    await act(async () => outputConfig?.click());
+    const outputTreeToggle = outputConfig?.parentElement?.querySelector<HTMLButtonElement>(".json-toggle");
+    expect(outputTreeToggle).toBeDefined();
+    await act(async () => outputTreeToggle?.click());
+    const outputNestedToggles = outputConfig?.parentElement?.querySelectorAll<HTMLButtonElement>(".json-toggle");
+    await act(async () => outputNestedToggles?.[outputNestedToggles.length - 1]?.click());
+    expect(container.textContent).toContain("json_schema");
     const system = Array.from(container.querySelectorAll<HTMLButtonElement>(".conv-collapse-head"))
       .find((button) => button.textContent?.includes("system (1)"));
     expect(system).toBeDefined();

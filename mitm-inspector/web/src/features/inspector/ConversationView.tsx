@@ -239,6 +239,11 @@ function HeaderStrip({ request, extras, response }: { request: AnthropicRequest;
           <span className="conv-header-value">{value}</span>
         </span>
       ))}
+      {request.outputConfig !== undefined ? (
+        <Collapse className="conv-header-raw" label="output_config">
+          <JsonTree value={request.outputConfig} startCollapsed />
+        </Collapse>
+      ) : null}
       <MoreFields extra={request.extra} />
     </div>
   );

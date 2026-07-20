@@ -187,6 +187,8 @@ export interface AnthropicRequest {
   stream?: boolean;
   maxTokens?: number;
   effort?: string | number;
+  /** Raw output_config, retained so structured-output/future children stay inspectable. */
+  outputConfig?: JsonValue;
   thinking?: JsonValue;
   system: ContentBlock[];
   tools: ToolView[];
@@ -223,19 +225,42 @@ export function parseAnthropicRequest(value: JsonValue): AnthropicRequest | null
   if (object === null || !Array.isArray(object.messages)) return null;
   const request: AnthropicRequest = {
     system: contentBlocks(object.system),
-    tools: Array.isArray(object.tools) ? object.tools.map(parseTool) : [],
+    tools: Array.isArray(object.tools) ? object.tools.map(parseTool) : object.tools === undefined ? [] : [parseTool(object.tools)],
     messages: object.messages.map(parseMessage),
-    extra: extraFields(object, ["model", "stream", "max_tokens", "effort", "thinking", "output_config", "system", "tools", "messages"]),
+    extra: [],
   };
-  if (typeof object.model === "string") request.model = object.model;
-  if (typeof object.stream === "boolean") request.stream = object.stream;
-  if (typeof object.max_tokens === "number") request.maxTokens = object.max_tokens;
-  if (typeof object.effort === "string" || typeof object.effort === "number") request.effort = object.effort;
+  const claimed = ["messages"];
+  if (typeof object.model === "string") {
+    request.model = object.model;
+    claimed.push("model");
+  }
+  if (typeof object.stream === "boolean") {
+    request.stream = object.stream;
+    claimed.push("stream");
+  }
+  if (typeof object.max_tokens === "number") {
+    request.maxTokens = object.max_tokens;
+    claimed.push("max_tokens");
+  }
+  if (typeof object.effort === "string" || typeof object.effort === "number") {
+    request.effort = object.effort;
+    claimed.push("effort");
+  }
   const outputConfig = asObject(object.output_config);
   if (request.effort === undefined && outputConfig !== null && (typeof outputConfig.effort === "string" || typeof outputConfig.effort === "number")) {
     request.effort = outputConfig.effort;
   }
-  if (object.thinking !== undefined) request.thinking = object.thinking;
+  if (object.output_config !== undefined) {
+    request.outputConfig = object.output_config;
+    claimed.push("output_config");
+  }
+  if (object.thinking !== undefined) {
+    request.thinking = object.thinking;
+    claimed.push("thinking");
+  }
+  if (object.system !== undefined) claimed.push("system");
+  if (object.tools !== undefined) claimed.push("tools");
+  request.extra = extraFields(object, claimed);
   return request;
 }
 

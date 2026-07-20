@@ -46,6 +46,10 @@ describe("shared protocol-v1 conformance", () => {
       summary: { kind: "anthropic_messages", model: "claude", message_count: "2", preview: { source: "user_text", text: "hi" } },
     });
     expect(parseFlowExtras({ started_at: "1", request_body_size: "-1", summary: { kind: "future" } })).toEqual({});
+    expect(parseFlowExtras({ started_at: "2026-01-01T00:00:00+00:00", ended_at: "2026-01-01T00:00:01+00:00" })).toEqual({
+      started_at: "2026-01-01T00:00:00+00:00",
+      ended_at: "2026-01-01T00:00:01+00:00",
+    });
   });
 
   it("accepts every positive fixture in the authoritative schema", () => {

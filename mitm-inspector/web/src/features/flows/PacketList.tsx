@@ -60,13 +60,15 @@ function SearchBar({ search }: { search: SearchController }) {
         className="search-input"
         placeholder="search bodies"
         aria-label="Search captured bodies"
+        aria-describedby="search-status"
+        aria-controls="packet-list"
         value={search.query}
         onChange={(event) => search.setQuery(event.target.value)}
         onKeyDown={(event) => {
           if (event.key === "Escape") search.clear();
         }}
       />
-      {status !== null ? <span className="search-status">{status}</span> : null}
+      <span id="search-status" className="search-status" role="status" aria-live="polite" aria-atomic="true">{status ?? ""}</span>
     </div>
   );
 }
@@ -88,9 +90,9 @@ export function PacketList({ browser, loadFlowDetail, searchFetcher, onSearchAct
 
   const flows = browser.flows.entries;
   const matchesByFlow = useMemo(() => {
-    if (search.state.status !== "results") return null;
+    if (search.state.status !== "results" && search.state.status !== "empty") return null;
     const byFlow = new Map<string, SearchMatch[]>();
-    for (const match of search.state.matches) {
+    for (const match of search.state.status === "results" ? search.state.matches : []) {
       const existing = byFlow.get(match.flow_id);
       if (existing === undefined) byFlow.set(match.flow_id, [match]);
       else existing.push(match);
@@ -98,10 +100,11 @@ export function PacketList({ browser, loadFlowDetail, searchFetcher, onSearchAct
     return byFlow;
   }, [search.state]);
 
-  const visibleFlows = useMemo(
-    () => (matchesByFlow === null ? flows : flows.filter((flow) => matchesByFlow.has(flow.flow_id))),
-    [flows, matchesByFlow],
-  );
+  const visibleFlows = useMemo(() => {
+    if (matchesByFlow === null) return flows;
+    const byId = new Map(flows.map((flow) => [flow.flow_id, flow]));
+    return Array.from(matchesByFlow, ([flowId, matches]) => byId.get(flowId) ?? durableFlow(matches[0]));
+  }, [flows, matchesByFlow]);
   const rows = useMemo(() => groupRows(visibleFlows), [visibleFlows]);
   const openFlow = openFlowId === null ? undefined : browser.flows.get(openFlowId);
   const detail = useFlowDetail(openFlow?.flow_id ?? null, loadFlowDetail);
@@ -114,7 +117,7 @@ export function PacketList({ browser, loadFlowDetail, searchFetcher, onSearchAct
       ) : visibleFlows.length === 0 && searchActive ? (
         <p className="packet-empty">no matching packets</p>
       ) : (
-        <ol className="packet-list" aria-label="Captured packets">
+        <ol id="packet-list" className="packet-list" aria-label="Captured packets">
           {rows.map((row, index) => {
             if (row.kind === "header") {
               const label = row.sessionId ? `session ${row.sessionId.slice(0, 8)}` : "unassigned";
@@ -164,6 +167,25 @@ export function PacketList({ browser, loadFlowDetail, searchFetcher, onSearchAct
       )}
     </div>
   );
+}
+
+/**
+ * Older search responses contain only ids/snippets. Keep those results
+ * visible until the additive durable metadata field is available, while
+ * using the real metadata whenever the backend provides it.
+ */
+function durableFlow(match: SearchMatch): ImmutableFlowMetadata {
+  if (match.flow !== undefined) return match.flow as ImmutableFlowMetadata;
+  return {
+    flow_id: match.flow_id,
+    method: "?",
+    scheme: "https",
+    host: "retained",
+    port: "443",
+    path: `/${match.flow_id}`,
+    request_headers: [],
+    request_body: { state: "missing" },
+  } as ImmutableFlowMetadata;
 }
 
 function responseContentType(metadata: ImmutableFlowMetadata): string | undefined {

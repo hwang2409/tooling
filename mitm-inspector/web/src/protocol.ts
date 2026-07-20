@@ -528,7 +528,7 @@ function optionalDecimal(value: unknown): DecimalString | undefined {
 }
 
 function optionalTimestamp(value: unknown): string | undefined {
-  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value) || Number.isNaN(Date.parse(value))) return undefined;
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00)$/.test(value) || Number.isNaN(Date.parse(value))) return undefined;
   return value;
 }
 

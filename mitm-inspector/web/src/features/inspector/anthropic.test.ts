@@ -8,7 +8,7 @@ describe("anthropic conversation model", () => {
     const request: JsonValue = {
       model: "claude-sonnet-4-20250514",
       stream: true,
-      output_config: { effort: "high" },
+      output_config: { effort: "high", format: { type: "json_schema", schema: { type: "object" } }, future: true },
       system: [{ type: "text", text: "be concise", cache_control: { type: "ephemeral" } }],
       tools: [{ name: "lookup", description: "look things up", input_schema: { type: "object" }, vendor_extension: true }],
       messages: [{ role: "user", content: "hello", future_message_key: { keep: true } }],
@@ -19,12 +19,30 @@ describe("anthropic conversation model", () => {
     expect(parsed?.messages[0].extra).toEqual([["future_message_key", { keep: true }]]);
     expect(parsed?.extra).toEqual([["future_request_key", "still reachable"]]);
     expect(parsed?.effort).toBe("high");
+    expect(parsed?.outputConfig).toEqual({ effort: "high", format: { type: "json_schema", schema: { type: "object" } }, future: true });
     expect(parsed?.tools[0].raw).toEqual({
       name: "lookup",
       description: "look things up",
       input_schema: { type: "object" },
       vendor_extension: true,
     });
+  });
+
+  it("keeps malformed and future members as raw inspectable values", () => {
+    const parsed = parseAnthropicRequest({
+      system: [null],
+      tools: [null],
+      messages: [null, { role: "user", content: [null, { type: "future_block", future: true }] }],
+      max_tokens: "not-a-number",
+      output_config: "future-format-shape",
+    } as JsonValue);
+    expect(parsed?.system[0]).toEqual({ kind: "unknown", raw: null });
+    expect(parsed?.tools[0].raw).toBeNull();
+    expect(parsed?.messages[0].blocks[0]).toEqual({ kind: "unknown", raw: null });
+    expect(parsed?.messages[1].blocks[0]).toEqual({ kind: "unknown", raw: null });
+    expect(parsed?.messages[1].blocks[1]).toEqual({ kind: "unknown", raw: { type: "future_block", future: true } });
+    expect(parsed?.outputConfig).toBe("future-format-shape");
+    expect(parsed?.extra).toEqual([["max_tokens", "not-a-number"]]);
   });
 
   it("reassembles thinking, text, and tool input SSE deltas while retaining raw frames", () => {

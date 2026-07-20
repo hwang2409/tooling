@@ -2,6 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import type { FlowMetadata } from "../../protocol";
+import { parseProtocolMessage } from "../../protocol";
+
 export const SEARCH_PATH = "/api/v1/search";
 export const SEARCH_MIN_QUERY_LENGTH = 2;
 export const SEARCH_DEBOUNCE_MS = 250;
@@ -11,6 +14,8 @@ export interface SearchMatch {
   readonly flow_id: string;
   readonly field: "request_body" | "response_body";
   readonly snippet: string;
+  /** Optional durable metadata, added by the retention-backed search API. */
+  readonly flow?: FlowMetadata;
 }
 
 export type SearchState =
@@ -29,15 +34,30 @@ function parseMatches(payload: unknown): { matches: SearchMatch[]; truncated: bo
   const matches: SearchMatch[] = [];
   for (const raw of rawMatches) {
     if (typeof raw !== "object" || raw === null) continue;
-    const match = raw as { flow_id?: unknown; field?: unknown; snippet?: unknown };
-    if (typeof match.flow_id !== "string") continue;
+    const match = raw as { flow_id?: unknown; field?: unknown; snippet?: unknown; flow?: unknown };
+    if (typeof match.flow_id !== "string" || match.flow_id.length === 0) continue;
+    if (match.field !== "request_body" && match.field !== "response_body") continue;
+    if (typeof match.snippet !== "string") continue;
+    const parsedFlow = match.flow === undefined ? undefined : parseSearchFlow(match.flow);
     matches.push({
       flow_id: match.flow_id,
-      field: match.field === "response_body" ? "response_body" : "request_body",
-      snippet: typeof match.snippet === "string" ? match.snippet : "",
+      field: match.field,
+      snippet: match.snippet,
+      ...(parsedFlow === undefined ? {} : { flow: parsedFlow }),
     });
   }
   return { matches, truncated: (payload as { truncated?: unknown }).truncated === true };
+}
+
+/** Validate optional durable metadata with the same boundary as stream flows. */
+function parseSearchFlow(value: unknown): FlowMetadata | undefined {
+  try {
+    const parsed = parseProtocolMessage({ protocol_version: "1", type: "flow.metadata", metadata: value });
+    if (parsed.kind !== "known" || parsed.message.type !== "flow.metadata") return undefined;
+    return parsed.message.metadata as unknown as FlowMetadata;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
