@@ -25,6 +25,10 @@ function extraFields(object: JsonObject, claimed: readonly string[]): ExtraField
   return Object.entries(object).filter(([key]) => !claimedSet.has(key));
 }
 
+function hasField(object: JsonObject, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(object, key);
+}
+
 export interface TextBlock {
   kind: "text";
   text: string;
@@ -106,7 +110,7 @@ function imageBlock(object: JsonObject): ImageBlock {
       sourceLabel = source.type;
     }
   }
-  const block: ImageBlock = { kind: "image", sourceLabel, extra: extraFields(object, ["type", "source", "cache_control"]) };
+  const block: ImageBlock = { kind: "image", sourceLabel, extra: extraFields(object, ["type", "cache_control"]) };
   if (mediaType !== undefined) block.mediaType = mediaType;
   if (dataUri !== undefined) block.dataUri = dataUri;
   if (object.cache_control !== undefined) block.cacheControl = object.cache_control;
@@ -125,35 +129,60 @@ export function parseContentBlock(value: JsonValue): ContentBlock {
     return block;
   }
   if (type === "thinking" && typeof object.thinking === "string") {
-    const block: ThinkingBlock = { kind: "thinking", thinking: object.thinking, extra: extraFields(object, ["type", "thinking", "signature", "cache_control"]) };
-    if (typeof object.signature === "string") block.signature = object.signature;
+    const claimed = ["type", "thinking", "cache_control"];
+    const block: ThinkingBlock = { kind: "thinking", thinking: object.thinking, extra: [] };
+    if (typeof object.signature === "string") {
+      block.signature = object.signature;
+      claimed.push("signature");
+    }
+    block.extra = extraFields(object, claimed);
     if (object.cache_control !== undefined) block.cacheControl = object.cache_control;
     return block;
   }
   if (type === "redacted_thinking") {
-    const block: RedactedThinkingBlock = { kind: "redacted_thinking", extra: extraFields(object, ["type", "data"]) };
-    if (typeof object.data === "string") block.data = object.data;
+    const claimed = ["type"];
+    const block: RedactedThinkingBlock = { kind: "redacted_thinking", extra: [] };
+    if (typeof object.data === "string") {
+      block.data = object.data;
+      claimed.push("data");
+    }
+    block.extra = extraFields(object, claimed);
     return block;
   }
   if (type === "tool_use" && typeof object.name === "string") {
+    const claimed = ["type", "name", "cache_control"];
     const block: ToolUseBlock = {
       kind: "tool_use",
       name: object.name,
       input: object.input ?? null,
-      extra: extraFields(object, ["type", "id", "name", "input", "cache_control"]),
+      extra: [],
     };
-    if (typeof object.id === "string") block.id = object.id;
+    if (typeof object.id === "string") {
+      block.id = object.id;
+      claimed.push("id");
+    }
+    if (hasField(object, "input")) claimed.push("input");
+    block.extra = extraFields(object, claimed);
     if (object.cache_control !== undefined) block.cacheControl = object.cache_control;
     return block;
   }
   if (type === "tool_result") {
+    const claimed = ["type", "cache_control"];
     const block: ToolResultBlock = {
       kind: "tool_result",
       content: contentBlocks(object.content),
-      extra: extraFields(object, ["type", "tool_use_id", "is_error", "content", "cache_control"]),
+      extra: [],
     };
-    if (typeof object.tool_use_id === "string") block.toolUseId = object.tool_use_id;
-    if (typeof object.is_error === "boolean") block.isError = object.is_error;
+    if (typeof object.tool_use_id === "string") {
+      block.toolUseId = object.tool_use_id;
+      claimed.push("tool_use_id");
+    }
+    if (typeof object.is_error === "boolean") {
+      block.isError = object.is_error;
+      claimed.push("is_error");
+    }
+    if (typeof object.content === "string" || Array.isArray(object.content)) claimed.push("content");
+    block.extra = extraFields(object, claimed);
     if (object.cache_control !== undefined) block.cacheControl = object.cache_control;
     return block;
   }
@@ -199,10 +228,14 @@ export interface AnthropicRequest {
 function parseMessage(value: JsonValue): MessageView {
   const object = asObject(value);
   if (object === null) return { role: "?", blocks: [{ kind: "unknown", raw: value }], extra: [] };
+  const claimed: string[] = [];
+  const role = typeof object.role === "string" ? object.role : "?";
+  if (typeof object.role === "string") claimed.push("role");
+  if (typeof object.content === "string" || Array.isArray(object.content)) claimed.push("content");
   return {
-    role: typeof object.role === "string" ? object.role : "?",
+    role,
     blocks: contentBlocks(object.content),
-    extra: extraFields(object, ["role", "content"]),
+    extra: extraFields(object, claimed),
   };
 }
 
@@ -277,14 +310,25 @@ export interface AnthropicResponse {
 export function parseAnthropicResponse(value: JsonValue): AnthropicResponse | null {
   const object = asObject(value);
   if (object === null || !Array.isArray(object.content)) return null;
+  const claimed = ["content"];
   const response: AnthropicResponse = {
     blocks: contentBlocks(object.content),
-    extra: extraFields(object, ["model", "role", "content", "stop_reason", "usage"]),
+    extra: [],
   };
-  if (typeof object.model === "string") response.model = object.model;
-  if (typeof object.role === "string") response.role = object.role;
-  if (typeof object.stop_reason === "string") response.stopReason = object.stop_reason;
+  if (typeof object.model === "string") {
+    response.model = object.model;
+    claimed.push("model");
+  }
+  if (typeof object.role === "string") {
+    response.role = object.role;
+    claimed.push("role");
+  }
+  if (typeof object.stop_reason === "string") {
+    response.stopReason = object.stop_reason;
+    claimed.push("stop_reason");
+  }
   if (object.usage !== undefined) response.usage = object.usage;
+  response.extra = extraFields(object, claimed);
   return response;
 }
 

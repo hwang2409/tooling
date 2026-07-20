@@ -183,6 +183,39 @@ describe("PacketList", () => {
     expect(container.querySelector(".packet-row")?.textContent).toContain("/v1/flow-a");
   });
 
+  it("renders and opens a durable match when the browser snapshot is empty", async () => {
+    const requested: string[] = [];
+    const durable = flow("durable-flow", { host: "retained.example.test", path: "/v1/durable" }) as FlowMetadata;
+    const loader: FlowDetailLoader = async (flowId) => {
+      requested.push(flowId);
+      return {
+        status: "loaded",
+        overrides: { request_body: captured(JSON.stringify({ model: "claude", messages: [{ role: "user", content: "hello" }] })) },
+      };
+    };
+    const searchFetcher: SearchFetcher = async () => ({
+      status: "results",
+      query: "durable",
+      matches: [{ flow_id: "durable-flow", field: "request_body", snippet: "durable hit", flow: durable }],
+      truncated: false,
+    });
+    const { container } = await mountList(stateOf([]), loader, searchFetcher);
+    const input = container.querySelector<HTMLInputElement>(".search-input");
+    if (input === null) throw new Error("search input missing");
+    await act(async () => {
+      const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setValue?.call(input, "durable");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => new Promise((resolve) => globalThis.setTimeout(resolve, 300)));
+    const row = container.querySelector<HTMLButtonElement>(".packet-row");
+    expect(row?.textContent).toContain("retained.example.test");
+    await click(row!);
+    expect(row?.getAttribute("aria-expanded")).toBe("true");
+    expect(requested).toEqual(["durable-flow"]);
+    expect(container.querySelector("[data-testid='conversation-view']")?.textContent).toContain("hello");
+  });
+
   it("replaces the open panel when another row is clicked and closes on re-click", async () => {
     const bodyFor = (name: string) => captured(JSON.stringify({ name }));
     const browser = stateOf([

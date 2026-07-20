@@ -9,6 +9,21 @@ describe("body search", () => {
         { flow_id: "flow-a", field: "response_body", snippet: "launch notes" },
         { flow_id: "future", field: "headers", snippet: "misleading" },
         { flow_id: "bad-snippet", field: "request_body", snippet: 4 },
+        {
+          flow_id: "mismatch",
+          field: "request_body",
+          snippet: "wrong identity",
+          flow: {
+            flow_id: "wrong-id",
+            method: "POST",
+            scheme: "https",
+            host: "wrong.example.test",
+            port: "443",
+            path: "/wrong",
+            request_headers: [],
+            request_body: { state: "missing" },
+          },
+        },
       ],
       truncated: true,
     }), { status: 200, headers: { "content-type": "application/json" } }));

@@ -90,19 +90,19 @@
 .packet-preview-none, .packet-preview-muted, .packet-snippet { color: var(--muted); }
 .packet-preview-user { color: var(--ink); }
 .packet-preview-tool { color: var(--muted); font-style: italic; }
-.packet-status-error { color: var(--alert); font-weight: 700; }
 .packet-status { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.packet-status.packet-status-error { color: var(--alert); font-weight: 700; }
 
 @media (max-width: 800px) {
   .packet-row {
-    grid-template-columns: 52px minmax(0, 86px) minmax(0, 1fr) 32px 44px;
+    grid-template-columns: 52px minmax(0, 86px) minmax(0, 1fr) 32px minmax(0, 1fr) 44px;
     gap: 6px;
   }
   .packet-sizes, .packet-duration { display: none; }
 }
 
 @media (max-width: 600px) {
-  .packet-row { grid-template-columns: 48px minmax(0, 70px) minmax(0, 1fr) 28px 42px; padding-inline: 6px; }
+  .packet-row { grid-template-columns: 48px minmax(0, 70px) minmax(0, 1fr) 28px minmax(0, 1fr) 42px; padding-inline: 6px; }
   .session-header { padding-inline: 6px; }
   .search-bar { padding-inline: 6px; }
 }

@@ -44,9 +44,11 @@ export function formatDuration(milliseconds: number): string {
   if (!Number.isFinite(milliseconds) || milliseconds < 0) return PLACEHOLDER;
   if (milliseconds < 1000) return `${Math.round(milliseconds)}ms`;
   const seconds = milliseconds / 1000;
-  if (seconds < 60) return `${seconds.toFixed(1)}s`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m${String(Math.round(seconds % 60)).padStart(2, "0")}s`;
+  const roundedTenths = Math.round(seconds * 10) / 10;
+  if (roundedTenths < 60) return `${roundedTenths.toFixed(1)}s`;
+  const totalSeconds = Math.round(seconds);
+  const minutes = Math.floor(totalSeconds / 60);
+  return `${minutes}m${String(totalSeconds % 60).padStart(2, "0")}s`;
 }
 
 export function durationBetween(startedAt: string | undefined, endedAt: string | undefined): string {

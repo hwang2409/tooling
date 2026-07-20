@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { JsonValue } from "./jsonTree";
-import { assembleSse, parseAnthropicRequest, splitSseFrames } from "./anthropic";
+import { assembleSse, parseAnthropicRequest, parseAnthropicResponse, splitSseFrames } from "./anthropic";
 
 describe("anthropic conversation model", () => {
   it("normalises shorthand content and preserves unknown fields", () => {
@@ -32,7 +32,14 @@ describe("anthropic conversation model", () => {
     const parsed = parseAnthropicRequest({
       system: [null],
       tools: [null],
-      messages: [null, { role: "user", content: [null, { type: "future_block", future: true }] }],
+      messages: [null, {
+        role: "user",
+        content: [
+          null,
+          { type: "future_block", future: true },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "a", future_source: { keep: true } } },
+        ],
+      }],
       max_tokens: "not-a-number",
       output_config: "future-format-shape",
     } as JsonValue);
@@ -41,8 +48,23 @@ describe("anthropic conversation model", () => {
     expect(parsed?.messages[0].blocks[0]).toEqual({ kind: "unknown", raw: null });
     expect(parsed?.messages[1].blocks[0]).toEqual({ kind: "unknown", raw: null });
     expect(parsed?.messages[1].blocks[1]).toEqual({ kind: "unknown", raw: { type: "future_block", future: true } });
+    expect(parsed?.messages[1].blocks[2]).toMatchObject({ kind: "image", extra: [["source", { type: "base64", media_type: "image/png", data: "a", future_source: { keep: true } }]] });
     expect(parsed?.outputConfig).toBe("future-format-shape");
     expect(parsed?.extra).toEqual([["max_tokens", "not-a-number"]]);
+
+    const response = parseAnthropicResponse({
+      model: 4,
+      role: { future: true },
+      content: [{ type: "text", text: "done" }],
+      stop_reason: null,
+      usage: { input_tokens: 3, future_usage: { keep: true } },
+    } as JsonValue);
+    expect(response?.extra).toEqual([
+      ["model", 4],
+      ["role", { future: true }],
+      ["stop_reason", null],
+      ["usage", { input_tokens: 3, future_usage: { keep: true } }],
+    ]);
   });
 
   it("reassembles thinking, text, and tool input SSE deltas while retaining raw frames", () => {

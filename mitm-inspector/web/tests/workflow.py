@@ -20,6 +20,8 @@ from playwright.sync_api import Page, Route, expect, sync_playwright
 ROOT = Path(__file__).resolve().parents[1]
 PORT = 4173
 BASE_URL = f"http://127.0.0.1:{PORT}"
+# The optional search-match.flow projection follows PR #2's schema at
+# 3270074f1d1f00708eee476c1ca88553fe7c1e50.
 
 FLOW_ID = "workflow-flow-a"
 REQUEST_PAYLOAD = {"model": "claude-example", "stream": True}
@@ -89,7 +91,7 @@ FLOW = {
     "response_headers": [{"name": "content-type", "value": "text/event-stream"}],
     "request_body": STRIPPED_REQUEST_BODY,
     "response_body": STRIPPED_RESPONSE_BODY,
-    "response_status": "200",
+    "response_status": "500",
 }
 
 DURABLE_FLOW = {
@@ -237,7 +239,8 @@ def run_workflow(page: Page) -> None:
     expect(row).to_contain_text("POST")
     expect(row).to_contain_text("api.example.test")
     expect(row).to_contain_text("/v1/messages")
-    expect(row).to_contain_text("200")
+    expect(row).to_contain_text("500")
+    assert page.locator(".packet-status-error").evaluate("el => getComputedStyle(el).color") == "rgb(180, 35, 24)"
     # The snapshot carries no body bytes, so nothing may render before the
     # click-triggered detail fetch.
     assert detail_requests == [], detail_requests
@@ -273,6 +276,28 @@ def run_workflow(page: Page) -> None:
         page.set_viewport_size({"width": width, "height": 700})
         document_width = page.evaluate("Math.max(document.body.scrollWidth, document.documentElement.scrollWidth)")
         assert document_width <= width, (width, document_width)
+        geometry = page.locator(".packet-row").evaluate(
+            """row => {
+                const box = row.getBoundingClientRect();
+                const preview = row.querySelector('.packet-preview').getBoundingClientRect();
+                const status = row.querySelector('.packet-status').getBoundingClientRect();
+                return {
+                    height: box.height,
+                    statusTop: status.top,
+                    rowTop: box.top,
+                    rowBottom: box.bottom,
+                    previewRight: preview.right,
+                    statusLeft: status.left,
+                    sizes: getComputedStyle(row.querySelector('.packet-sizes')).display,
+                    duration: getComputedStyle(row.querySelector('.packet-duration')).display,
+                };
+            }"""
+        )
+        assert 24 <= geometry["height"] <= 32, (width, geometry)
+        assert geometry["rowTop"] <= geometry["statusTop"] <= geometry["rowBottom"], (width, geometry)
+        assert geometry["statusLeft"] >= geometry["previewRight"] - 1, (width, geometry)
+        assert geometry["sizes"] == "none", (width, geometry)
+        assert geometry["duration"] == "none", (width, geometry)
 
 
 def main() -> None:

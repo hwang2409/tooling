@@ -106,16 +106,14 @@ export function PacketList({ browser, loadFlowDetail, searchFetcher, onSearchAct
     return Array.from(matchesByFlow, ([flowId, matches]) => byId.get(flowId) ?? durableFlow(matches[0]));
   }, [flows, matchesByFlow]);
   const rows = useMemo(() => groupRows(visibleFlows), [visibleFlows]);
-  const openFlow = openFlowId === null ? undefined : browser.flows.get(openFlowId);
+  const openFlow = openFlowId === null ? undefined : visibleFlows.find((flow) => flow.flow_id === openFlowId);
   const detail = useFlowDetail(openFlow?.flow_id ?? null, loadFlowDetail);
 
   return (
     <div className="packet-pane">
       <SearchBar search={search} />
-      {flows.length === 0 ? (
-        <p className="packet-empty">no packets captured</p>
-      ) : visibleFlows.length === 0 && searchActive ? (
-        <p className="packet-empty">no matching packets</p>
+      {visibleFlows.length === 0 ? (
+        <p className="packet-empty">{matchesByFlow === null ? "no packets captured" : "no matching packets"}</p>
       ) : (
         <ol id="packet-list" className="packet-list" aria-label="Captured packets">
           {rows.map((row, index) => {

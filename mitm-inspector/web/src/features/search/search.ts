@@ -39,6 +39,7 @@ function parseMatches(payload: unknown): { matches: SearchMatch[]; truncated: bo
     if (match.field !== "request_body" && match.field !== "response_body") continue;
     if (typeof match.snippet !== "string") continue;
     const parsedFlow = match.flow === undefined ? undefined : parseSearchFlow(match.flow);
+    if (parsedFlow !== undefined && parsedFlow.flow_id !== match.flow_id) continue;
     matches.push({
       flow_id: match.flow_id,
       field: match.field,

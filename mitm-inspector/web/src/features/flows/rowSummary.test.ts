@@ -64,4 +64,11 @@ describe("row summary", () => {
     expect(formatDuration(-1)).toBe("—");
     expect(durationBetween("2026-01-01T00:00:01Z", "2026-01-01T00:00:00Z")).toBe("—");
   });
+
+  it("carries rounded duration seconds into minutes", () => {
+    expect(formatDuration(59_949)).toBe("59.9s");
+    expect(formatDuration(59_950)).toBe("1m00s");
+    expect(formatDuration(119_499)).toBe("1m59s");
+    expect(formatDuration(119_500)).toBe("2m00s");
+  });
 });

@@ -80,6 +80,26 @@ describe("browser state reducer", () => {
     expect(next.counters.appliedChanges).toBe(6);
   });
 
+  it("keeps live delta order consistent with a stable-order reconnect snapshot", () => {
+    const initial = reduce(initialBrowserState, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "one", cursor: "1",
+      flows: [flow("a"), flow("b")],
+    });
+    const updatedA = { ...flow("a"), response_status: "200" };
+    const live = reduce(initial, {
+      protocol_version: "1", type: "browser.delta", cursor: "2", changes: [{ op: "upsert", flow: updatedA }],
+    });
+    const reconnected = reduce(initialBrowserState, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "two", cursor: "2",
+      flows: [updatedA, flow("b")],
+    });
+
+    expect(live.flows.ids).toEqual(["a", "b"]);
+    expect(reconnected.flows.ids).toEqual(live.flows.ids);
+    expect(live.flows.get("a")?.response_status).toBe("200");
+    expect(reconnected.flows.get("a")?.response_status).toBe("200");
+  });
+
   it("ignores stale snapshots and deltas without regressing the cursor", () => {
     const snapshot = reduce(initialBrowserState, {
       protocol_version: "1", type: "browser.snapshot", snapshot_id: "one", cursor: "4", flows: [flow("kept")],
