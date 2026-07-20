@@ -142,6 +142,7 @@ BodyDescriptor = MissingBody | EmptyBody | CapturedBody | TruncatedBody
 
 class FlowMetadata(TypedDict):
     flow_id: str
+    session_id: NotRequired[str | None]
     method: str
     scheme: Literal["http", "https"]
     host: str
@@ -567,6 +568,14 @@ def _flow_metadata(value: object, *, label: str = "metadata") -> FlowMetadata:
     request_headers = _headers(metadata.get("request_headers"), label=f"{label}.request_headers")
     request_body = _body(metadata.get("request_body"), label=f"{label}.request_body")
     result = cast(FlowMetadata, metadata)
+    if "session_id" in metadata:
+        session_id_value = metadata["session_id"]
+        session_id = (
+            None
+            if session_id_value is None
+            else _string(session_id_value, label=f"{label}.session_id")
+        )
+        result["session_id"] = session_id
     result["scheme"] = cast(Literal["http", "https"], scheme)
     result["port"] = port
     result["request_headers"] = request_headers

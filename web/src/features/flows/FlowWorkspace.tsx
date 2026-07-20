@@ -12,6 +12,17 @@ import { buildFlowRow } from "./gridModel";
 import type { FlowRow } from "./gridModel";
 import "../../styles/flows.css";
 
+const GROUP_BY_STORAGE_KEY = "mitm-inspector:flows:group-by";
+type GroupBy = "none" | "session";
+
+function storedGroupBy(): GroupBy {
+  try {
+    return globalThis.localStorage.getItem(GROUP_BY_STORAGE_KEY) === "session" ? "session" : "none";
+  } catch {
+    return "none";
+  }
+}
+
 export interface FlowWorkspaceProps {
   browser: BrowserState;
   followLive: boolean;
@@ -31,6 +42,7 @@ export interface FlowWorkspaceProps {
 export function FlowWorkspace({ browser, followLive, pauseLive, gridViewportHeight, loadFlowDetail, seenFlowIds, onFlowSeen }: FlowWorkspaceProps) {
   const workspaceId = useId().replaceAll(":", "");
   const [query, setQuery] = useState("");
+  const [groupBy, setGroupBy] = useState<GroupBy>(storedGroupBy);
   const [selectedFlowId, setSelectedFlowId] = useState<string | null>(null);
   const [localSeenFlowIds, setLocalSeenFlowIds] = useState<ReadonlySet<string>>(() => new Set());
   const effectiveSeenFlowIds = seenFlowIds ?? localSeenFlowIds;
@@ -99,6 +111,25 @@ export function FlowWorkspace({ browser, followLive, pauseLive, gridViewportHeig
         <span className="flow-filter-count" aria-label={`${filteredRows.length} of ${rows.length} flows shown`}>
           {filteredRows.length}/{rows.length}
         </span>
+        <label className="flow-group-label" htmlFor={`${workspaceId}-group-by`}>GROUP BY</label>
+        <select
+          id={`${workspaceId}-group-by`}
+          className="flow-group-select"
+          aria-label="Group flows by"
+          value={groupBy}
+          onChange={(event) => {
+            const value: GroupBy = event.target.value === "session" ? "session" : "none";
+            setGroupBy(value);
+            try {
+              globalThis.localStorage.setItem(GROUP_BY_STORAGE_KEY, value);
+            } catch {
+              // Storage can be unavailable in private or restricted contexts.
+            }
+          }}
+        >
+          <option value="none">none</option>
+          <option value="session">session</option>
+        </select>
       </div>
       {!filter.ok && (
         <p id={`${workspaceId}-filter-error`} className="flow-filter-error" role="alert">
@@ -110,6 +141,7 @@ export function FlowWorkspace({ browser, followLive, pauseLive, gridViewportHeig
         <div className="flow-main-grid">
           <FlowGrid
             rows={filteredRows}
+            groupBy={groupBy}
             selectedFlowId={selectedFlowId}
             onSelectFlow={selectFlow}
             followLive={followLive}

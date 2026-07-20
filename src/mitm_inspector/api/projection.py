@@ -46,6 +46,8 @@ def grid_flow(metadata: Mapping[str, object]) -> PlainJsonObject:
     copied = canonicalize_json(metadata, label="metadata")
     if not isinstance(copied, dict):
         raise ValueError("flow metadata must be an object")
+    session_id = copied.get("session_id")
+    copied["session_id"] = session_id if isinstance(session_id, str) else None
     for side in ("request_body", "response_body"):
         if side in copied:
             copied[side] = redacted_body_descriptor(copied[side])

@@ -43,6 +43,8 @@ def fake_flow(
     *,
     request_body: bytes | None = None,
     response_body: bytes | None = None,
+    session_id: str | None = None,
+    include_client_conn: bool = True,
 ) -> SimpleNamespace:
     request = SimpleNamespace(
         method="POST",
@@ -71,7 +73,33 @@ def fake_flow(
         raw_content=response_body,
         stream=False,
     )
-    return SimpleNamespace(id=flow_id, request=request, response=response, error=None)
+    flow = SimpleNamespace(id=flow_id, request=request, response=response, error=None)
+    if include_client_conn:
+        flow.client_conn = SimpleNamespace(id=session_id)
+    return flow
+
+
+def test_capture_emits_client_connection_id_and_maps_missing_connection_to_null() -> None:
+    addon = CaptureAddon(source_id="test-source", clock=lambda: "now")
+    flow = fake_flow(session_id="client-connection-uuid")
+    addon.requestheaders(flow)
+    metadata = next(
+        message["metadata"]
+        for message in payloads(addon)
+        if message["type"] == "flow.metadata"
+    )
+    assert isinstance(metadata, Mapping)
+    assert metadata["session_id"] == "client-connection-uuid"
+
+    addon = CaptureAddon(source_id="test-source", clock=lambda: "now")
+    addon.requestheaders(fake_flow(flow_id="missing-connection", include_client_conn=False))
+    metadata = next(
+        message["metadata"]
+        for message in payloads(addon)
+        if message["type"] == "flow.metadata"
+    )
+    assert isinstance(metadata, Mapping)
+    assert metadata["session_id"] is None
 
 
 def payloads(addon: CaptureAddon) -> list[dict[str, object]]:

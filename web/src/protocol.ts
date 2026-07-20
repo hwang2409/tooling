@@ -51,6 +51,7 @@ export type BodyDescriptor = MissingBody | EmptyBody | CapturedBody | TruncatedB
 
 export interface FlowMetadata {
   flow_id: string;
+  session_id?: string | null;
   method: string;
   scheme: "http" | "https";
   host: string;
@@ -382,6 +383,7 @@ function body(value: unknown, label: string): BodyDescriptor {
 function flow(value: unknown, label: string): FlowMetadata {
   const metadata = record(value, label);
   for (const key of ["flow_id", "method", "host", "path"]) stringValue(metadata[key], `${label}.${key}`);
+  if (metadata.session_id !== undefined && metadata.session_id !== null) stringValue(metadata.session_id, `${label}.session_id`);
   const scheme = stringValue(metadata.scheme, `${label}.scheme`);
   if (scheme !== "http" && scheme !== "https") throw new ProtocolError(`${label}.scheme is not supported`);
   decimalValue(metadata.port, `${label}.port`);

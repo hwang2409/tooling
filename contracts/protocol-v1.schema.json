@@ -89,6 +89,7 @@
       "required": ["flow_id", "method", "scheme", "host", "port", "path", "request_headers", "request_body"],
       "properties": {
         "flow_id": {"type": "string", "minLength": 1},
+        "session_id": {"type": ["string", "null"], "minLength": 1},
         "method": {"type": "string", "minLength": 1},
         "scheme": {"enum": ["http", "https"]},
         "host": {"type": "string", "minLength": 1},

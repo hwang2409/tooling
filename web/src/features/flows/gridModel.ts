@@ -19,6 +19,9 @@ export interface BodyCell {
 
 export interface FlowRow {
   readonly flowId: string;
+  readonly sessionId: string | null;
+  readonly firstSeenAtMs: number | null;
+  readonly lastSeenAtMs: number | null;
   readonly method: string;
   readonly scheme: "http" | "https";
   readonly host: string;
@@ -77,6 +80,18 @@ function statusLabelFor(phase: FlowPhase, status: string | null): string {
   return "—";
 }
 
+function lifecycleTimeBounds(lifecycle: readonly ImmutableFlowLifecycle[]): { first: number | null; last: number | null } {
+  let first: number | null = null;
+  let last: number | null = null;
+  for (const event of lifecycle) {
+    const at = Date.parse(event.occurred_at);
+    if (!Number.isFinite(at)) continue;
+    if (first === null || at < first) first = at;
+    if (last === null || at > last) last = at;
+  }
+  return { first, last };
+}
+
 export function durationMsFromLifecycle(lifecycle: readonly ImmutableFlowLifecycle[]): number | null {
   if (lifecycle.length === 0) return null;
   let startedAt: number | null = null;
@@ -111,9 +126,13 @@ export function buildFlowRow(
   const status = typeof metadata.response_status === "string" ? metadata.response_status : null;
   const durationMs = durationMsFromLifecycle(lifecycle);
   const isStreaming = bareContentType(responseContentType) === "text/event-stream";
+  const lifecycleTimes = lifecycleTimeBounds(lifecycle);
 
   return {
     flowId: metadata.flow_id,
+    sessionId: typeof metadata.session_id === "string" ? metadata.session_id : null,
+    firstSeenAtMs: lifecycleTimes.first,
+    lastSeenAtMs: lifecycleTimes.last,
     method: metadata.method,
     scheme: metadata.scheme,
     host: metadata.host,

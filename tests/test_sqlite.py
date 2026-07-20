@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import os
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -60,12 +61,19 @@ def body(data: bytes, *, state: str = "captured") -> dict[str, object]:
     }
 
 
-def metadata(flow_id: str, request: bytes, response: bytes) -> dict[str, object]:
+def metadata(
+    flow_id: str,
+    request: bytes,
+    response: bytes,
+    *,
+    session_id: str | None = None,
+) -> dict[str, object]:
     return {
         "protocol_version": "1",
         "type": "flow.metadata",
         "metadata": {
             "flow_id": flow_id,
+            "session_id": session_id,
             "method": "POST",
             "scheme": "https",
             "host": "example.test",
@@ -96,7 +104,7 @@ def lifecycle(flow_id: str, sequence: int, occurred_at: str, state: str) -> dict
 def test_sqlite_round_trip_preserves_metadata_lifecycle_and_bodies(tmp_path: Path) -> None:
     storage = SQLiteFlowStorage(tmp_path / "flows.sqlite")
     try:
-        storage.offer(metadata("flow-1", b"request\x00", b"response\xff"))
+        storage.offer(metadata("flow-1", b"request\x00", b"response\xff", session_id="session-1"))
         storage.offer(lifecycle("flow-1", 1, "2026-01-01T00:00:00Z", "request_started"))
         storage.offer(lifecycle("flow-1", 2, "2026-01-01T00:00:01Z", "flow_completed"))
         storage.flush()
@@ -109,6 +117,7 @@ def test_sqlite_round_trip_preserves_metadata_lifecycle_and_bodies(tmp_path: Pat
         assert isinstance(metadata_value, dict)
         assert base64.b64decode(metadata_value["request_body"]["data"]) == b"request\x00"
         assert base64.b64decode(metadata_value["response_body"]["data"]) == b"response\xff"
+        assert metadata_value["session_id"] == "session-1"
         assert [message["type"] for message in messages] == [
             "flow.metadata",
             "body.end",
@@ -118,6 +127,45 @@ def test_sqlite_round_trip_preserves_metadata_lifecycle_and_bodies(tmp_path: Pat
         ]
     finally:
         storage.close()
+
+
+def test_sqlite_open_migrates_an_existing_flows_table_with_null_sessions(tmp_path: Path) -> None:
+    path = tmp_path / "flows.sqlite"
+    storage = SQLiteFlowStorage(path)
+    storage.offer(metadata("old-flow", b"r", b"s"))
+    storage.flush()
+    storage.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("ALTER TABLE flows RENAME TO flows_with_session")
+        connection.execute(
+            """
+            CREATE TABLE flows AS
+            SELECT flow_id, source_id, method, scheme, host, port, path,
+                   response_status, request_content_type, response_content_type,
+                   started_at, ended_at, request_body, response_body,
+                   request_body_state, response_body_state, request_body_size,
+                   response_body_size, request_headers_json, response_headers_json,
+                   created_order
+            FROM flows_with_session
+            """
+        )
+        connection.execute("DROP TABLE flows_with_session")
+        connection.commit()
+    migrated = SQLiteFlowStorage(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(flows)").fetchall()
+            }
+        assert "session_id" in columns
+        replayed = [parsed_message_to_plain_json(message) for message in migrated.replay()]
+        replayed_metadata = next(
+            message for message in replayed if message["type"] == "flow.metadata"
+        )
+        assert replayed_metadata["metadata"]["session_id"] is None
+    finally:
+        migrated.close()
 
 
 def test_replay_preserves_global_interleaved_lifecycle_sequence(tmp_path: Path) -> None:
