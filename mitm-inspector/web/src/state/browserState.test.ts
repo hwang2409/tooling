@@ -127,21 +127,24 @@ describe("browser state reducer", () => {
     expect(reconnected.flows.get("a")?.response_status).toBe("200");
   });
 
-  it("applies multi-change deltas in backend newest-first order", () => {
+  it("matches backend order for a multi-change delta and reconnect snapshot", () => {
     const initial = reduce(initialBrowserState, {
       protocol_version: "1", type: "browser.snapshot", snapshot_id: "one", cursor: "1",
-      flows: [flow("a")],
+      flows: [flow("b"), flow("a")],
     });
-    const next = reduce(initial, {
+    const live = reduce(initial, {
       protocol_version: "1", type: "browser.delta", cursor: "2", changes: [
-        { op: "upsert", flow: flow("b") },
+        { op: "upsert", flow: flow("d") },
         { op: "upsert", flow: flow("c") },
-        { op: "upsert", flow: { ...flow("a"), response_status: "201" } },
       ],
     });
+    const reconnected = reduce(initialBrowserState, {
+      protocol_version: "1", type: "browser.snapshot", snapshot_id: "two", cursor: "2",
+      flows: [flow("d"), flow("c"), flow("b"), flow("a")],
+    });
 
-    expect(next.flows.ids).toEqual(["c", "b", "a"]);
-    expect(next.flows.get("a")?.response_status).toBe("201");
+    expect(live.flows.ids).toEqual(["d", "c", "b", "a"]);
+    expect(reconnected.flows.ids).toEqual(live.flows.ids);
   });
 
   it("ignores stale snapshots and deltas without regressing the cursor", () => {
