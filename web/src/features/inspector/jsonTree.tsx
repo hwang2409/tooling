@@ -42,7 +42,6 @@ interface JsonNodeProps {
   keyLabel?: string;
   trailingComma?: boolean;
   forceCollapsed?: boolean;
-  embedded?: boolean;
 }
 
 /**
@@ -98,16 +97,13 @@ function escapeJsonString(value: string): string {
   });
 }
 
-function JsonNode({ value, depth, keyLabel, trailingComma, forceCollapsed, embedded }: JsonNodeProps) {
+function JsonNode({ value, depth, keyLabel, trailingComma, forceCollapsed }: JsonNodeProps) {
   const isObject = value !== null && typeof value === "object";
   const isArray = Array.isArray(value);
   const [collapsed, setCollapsed] = useState<boolean>(() => isObject ? (forceCollapsed === true ? true : shouldStartCollapsed(value, depth)) : false);
 
   const prefix = keyLabel !== undefined
     ? <span className="json-key">&quot;{escapeJsonString(keyLabel)}&quot;</span>
-    : null;
-  const embeddedMark = embedded === true
-    ? <span className="json-embedded" title="parsed from a JSON string value">json</span>
     : null;
 
   if (!isObject) {
@@ -121,7 +117,6 @@ function JsonNode({ value, depth, keyLabel, trailingComma, forceCollapsed, embed
             keyLabel={keyLabel}
             trailingComma={trailingComma}
             forceCollapsed={forceCollapsed}
-            embedded
           />
         );
       }
@@ -145,7 +140,6 @@ function JsonNode({ value, depth, keyLabel, trailingComma, forceCollapsed, embed
     return (
       <div className="json-line" style={{ paddingLeft: depth * 12 }}>
         {prefix}{prefix ? <span className="json-punct">: </span> : null}
-        {embeddedMark}
         <span className="json-punct">{open}{close}</span>
         {trailingComma ? <span className="json-punct">,</span> : null}
       </div>
@@ -163,7 +157,6 @@ function JsonNode({ value, depth, keyLabel, trailingComma, forceCollapsed, embed
           onClick={() => setCollapsed((previous) => !previous)}
         >{collapsed ? "+" : "−"}</button>
         {prefix}{prefix ? <span className="json-punct">: </span> : null}
-        {embeddedMark}
         <span className="json-punct">{open}</span>
         {collapsed ? (
           <>
