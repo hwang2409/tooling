@@ -14,7 +14,11 @@ _SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTA
 _WHITESPACE = re.compile(r"\s+")
 
 
-def flow_summary(metadata: Mapping[str, object]) -> PlainJsonObject:
+def flow_summary(
+    metadata: Mapping[str, object],
+    *,
+    decoded_bodies: Mapping[str, bytes | None] | None = None,
+) -> PlainJsonObject:
     """Derive the additive protocol-v1 summary for one projected flow."""
 
     host = metadata.get("host")
@@ -23,19 +27,19 @@ def flow_summary(metadata: Mapping[str, object]) -> PlainJsonObject:
         return {"kind": "generic"}
     if path == "/v1/messages":
         summary: PlainJsonObject = {"kind": "anthropic_messages"}
-        request = _json_body(metadata, "request")
+        request = _json_body(metadata, "request", decoded_bodies)
         if request is not None:
             _request_fields(summary, request)
-        response_objects = _response_objects(metadata)
+        response_objects = _response_objects(metadata, decoded_bodies)
         for event in response_objects:
             _response_fields(summary, event)
         return summary
     if path == "/v1/messages/count_tokens":
         summary = {"kind": "anthropic_count_tokens"}
-        request = _json_body(metadata, "request")
+        request = _json_body(metadata, "request", decoded_bodies)
         if request is not None:
             _request_fields(summary, request)
-        for response_object in _response_objects(metadata):
+        for response_object in _response_objects(metadata, decoded_bodies):
             value = _decimal(response_object.get("input_tokens"))
             if value is not None:
                 summary["count_tokens_result"] = value
@@ -43,10 +47,17 @@ def flow_summary(metadata: Mapping[str, object]) -> PlainJsonObject:
     return {"kind": "generic"}
 
 
-def _json_body(metadata: Mapping[str, object], side: str) -> dict[str, object] | None:
+def _json_body(
+    metadata: Mapping[str, object],
+    side: str,
+    decoded_bodies: Mapping[str, bytes | None] | None,
+) -> dict[str, object] | None:
     descriptor = metadata.get(f"{side}_body")
-    encoding = body_content_encoding(metadata, side)
-    body, _decoded = decoded_body_bytes(descriptor, encoding)
+    if decoded_bodies is not None and side in decoded_bodies:
+        body = decoded_bodies[side]
+    else:
+        encoding = body_content_encoding(metadata, side)
+        body, _decoded = decoded_body_bytes(descriptor, encoding)
     if body is None:
         return None
     try:
@@ -142,10 +153,16 @@ def _preceding_tool_name(
     return None
 
 
-def _response_objects(metadata: Mapping[str, object]) -> list[dict[str, object]]:
+def _response_objects(
+    metadata: Mapping[str, object],
+    decoded_bodies: Mapping[str, bytes | None] | None,
+) -> list[dict[str, object]]:
     descriptor = metadata.get("response_body")
-    encoding = body_content_encoding(metadata, "response")
-    body, _decoded = decoded_body_bytes(descriptor, encoding)
+    if decoded_bodies is not None and "response" in decoded_bodies:
+        body = decoded_bodies["response"]
+    else:
+        encoding = body_content_encoding(metadata, "response")
+        body, _decoded = decoded_body_bytes(descriptor, encoding)
     if body is None:
         return []
     try:

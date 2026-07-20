@@ -7,7 +7,7 @@ import binascii
 import zlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
 from mitm_inspector.api.limits import MAX_INGEST_BODY_PREFIX_BYTES
 from mitm_inspector.json_boundary import PlainJsonObject, PlainJsonValue
@@ -25,6 +25,16 @@ class ContentDecodeResult:
 
     data: bytes
     status: Literal["complete", "incomplete", "limit", "invalid"]
+
+
+@dataclass(frozen=True, slots=True)
+class DecodedBodyParts:
+    """The served descriptor and decoded bytes from one decode attempt."""
+
+    descriptor: PlainJsonValue
+    data: bytes | None
+    was_decoded: bool
+    data_was_decoded: bool
 
 
 def header_value(headers: object, name: str) -> str | None:
@@ -61,23 +71,8 @@ def body_content_encoding(metadata: Mapping[str, object], side: str) -> str | No
 def decoded_body_bytes(descriptor: object, encoding: str | None) -> tuple[bytes | None, bool]:
     """Decode a descriptor's retained bytes and optional HTTP content coding."""
 
-    if not isinstance(descriptor, Mapping):
-        return None, False
-    if descriptor.get("state") not in _BODY_STATES_WITH_DATA:
-        return None, False
-    data = descriptor.get("data")
-    if not isinstance(data, str):
-        return None, False
-    try:
-        raw = base64.b64decode(data, validate=True)
-    except (ValueError, binascii.Error):
-        return None, False
-    if encoding is None:
-        return raw, False
-    decoded = _decode_content(raw, encoding)
-    if decoded.status == "invalid":
-        return None, False
-    return decoded.data, True
+    parts = decoded_body_parts(descriptor, encoding)
+    return parts.data, parts.data_was_decoded
 
 
 def decoded_body_descriptor(
@@ -85,23 +80,34 @@ def decoded_body_descriptor(
 ) -> tuple[PlainJsonValue, bool]:
     """Return a descriptor whose prefix is decoded when its coding is supported."""
 
-    if not isinstance(descriptor, dict) or descriptor.get("state") not in _BODY_STATES_WITH_DATA:
-        return descriptor, False
-    if encoding is None:
-        return descriptor, False
+    parts = decoded_body_parts(descriptor, encoding)
+    return parts.descriptor, parts.was_decoded
+
+
+def decoded_body_parts(descriptor: object, encoding: str | None) -> DecodedBodyParts:
+    """Decode a body once and return both projections that need its result."""
+
+    if not isinstance(descriptor, Mapping):
+        return DecodedBodyParts(cast(PlainJsonValue, descriptor), None, False, False)
+    if descriptor.get("state") not in _BODY_STATES_WITH_DATA:
+        return DecodedBodyParts(cast(PlainJsonValue, descriptor), None, False, False)
     data = descriptor.get("data")
     if not isinstance(data, str):
-        return descriptor, False
+        return DecodedBodyParts(cast(PlainJsonValue, descriptor), None, False, False)
     try:
         raw = base64.b64decode(data, validate=True)
     except (ValueError, binascii.Error):
-        return descriptor, False
+        return DecodedBodyParts(cast(PlainJsonValue, descriptor), None, False, False)
+    if encoding is None:
+        return DecodedBodyParts(cast(PlainJsonValue, descriptor), raw, False, False)
     decoded_result = _decode_content(raw, encoding)
+    if decoded_result.status == "invalid":
+        return DecodedBodyParts(cast(PlainJsonValue, descriptor), None, False, False)
     # A decoded descriptor needs an exact decoded total. Incomplete streams
     # and output-ceiling hits retain their encoded representation instead of
     # inventing size_bytes/total_bytes for an unknowable body.
     if descriptor.get("state") != "captured" or decoded_result.status != "complete":
-        return descriptor, False
+        return DecodedBodyParts(cast(PlainJsonValue, descriptor), decoded_result.data, False, True)
     decoded = decoded_result.data
     result: PlainJsonObject = {
         "state": "captured",
@@ -112,7 +118,7 @@ def decoded_body_descriptor(
     content_type = descriptor.get("content_type")
     if isinstance(content_type, str):
         result["content_type"] = content_type
-    return result, True
+    return DecodedBodyParts(result, decoded, True, True)
 
 
 def _decode_content(data: bytes, encoding: str) -> ContentDecodeResult:
@@ -189,8 +195,10 @@ def _decode_member(data: bytes, window_bits: int, *, output_limit: int) -> _Memb
 __all__ = [
     "body_content_encoding",
     "ContentDecodeResult",
+    "DecodedBodyParts",
     "MAX_DECODED_BODY_BYTES",
     "decoded_body_bytes",
     "decoded_body_descriptor",
+    "decoded_body_parts",
     "header_value",
 ]

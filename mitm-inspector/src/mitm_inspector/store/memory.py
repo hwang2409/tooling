@@ -265,6 +265,31 @@ class MemoryStore:
         for stored in sorted(entries, key=lambda item: item.order, reverse=True):
             yield require_parsed_message(stored.message)
 
+    def latest_flow_metadata(self, flow_id: str) -> Mapping[str, object] | None:
+        """Return retained metadata without crossing the validation boundary."""
+
+        self._purge_expired(self._clock())
+        record = self._flows.get(flow_id)
+        if record is None:
+            return None
+        index = record.indexes.get(("metadata",))
+        if index is None:
+            return None
+        stored = record.messages[index]
+        if not stored.active or not isinstance(stored.message, KnownParsedMessage):
+            return None
+        metadata = stored.message.message.get("metadata")
+        return metadata if isinstance(metadata, Mapping) else None
+
+    def trusted_flow_messages(self, flow_id: str) -> tuple[ParsedMessageResult, ...]:
+        """Return immutable retained messages for internal projection rebuilds."""
+
+        self._purge_expired(self._clock())
+        record = self._flows.get(flow_id)
+        if record is None:
+            return ()
+        return tuple(stored.message for stored in record.messages if stored.active)
+
     def flow_ids_newest_first(self) -> tuple[str, ...]:
         """Return retained flow ids by stable reverse insertion order."""
 

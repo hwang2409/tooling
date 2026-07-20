@@ -37,6 +37,7 @@ from mitm_inspector.api.limits import (
     MAX_METADATA_HEADER_BYTES,
 )
 from mitm_inspector.api.projection import (
+    LifecycleTimingReducer,
     collect_grid_flows,
     diff_grid_changes,
     grid_flow,
@@ -63,7 +64,7 @@ from mitm_inspector.protocol import (
     parse_message,
 )
 from mitm_inspector.store.memory import MemoryStore
-from mitm_inspector.store.sqlite import SearchCancelled
+from mitm_inspector.store.sqlite import SearchCancelled, SQLiteFlowStorage
 
 ROOT = Path(__file__).parents[1]
 SCHEMA_PATH = ROOT / "contracts" / "protocol-v1.schema.json"
@@ -2091,6 +2092,218 @@ def test_duplicate_metadata_ingest_emits_no_delta(monkeypatch: pytest.MonkeyPatc
     assert result.delta_emitted is False
     assert application.cursor == before
     assert projection_calls == 0
+
+
+def test_repeated_flow_messages_decode_a_large_body_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mitm_inspector.api.bodies as bodies_module
+
+    compressed = gzip.compress(os.urandom(1024 * 1024))
+    message = metadata_message(request_body=captured_body(compressed))
+    metadata = message["metadata"]
+    assert isinstance(metadata, dict)
+    metadata["request_headers"] = [
+        {"name": "host", "value": "api.example.test"},
+        {"name": "content-encoding", "value": "gzip"},
+    ]
+    decode_calls = 0
+    original_decode = bodies_module._decode_content
+
+    def count_decode(data: bytes, encoding: str) -> bodies_module.ContentDecodeResult:
+        nonlocal decode_calls
+        decode_calls += 1
+        return original_decode(data, encoding)
+
+    monkeypatch.setattr(bodies_module, "_decode_content", count_decode)
+    application = make_application(max_items=64)
+    application.ingest(message)
+
+    def fail_store_rescan() -> None:
+        raise AssertionError("cache-hit ingest must not rescan retained messages")
+
+    monkeypatch.setattr(application.store, "newest_first", fail_store_rescan)
+    for sequence in range(1, 12):
+        application.ingest(
+            lifecycle_message(
+                "flow-1",
+                sequence=str(sequence),
+            )
+        )
+
+    assert decode_calls == 1
+
+
+def test_buffered_lifecycle_burst_does_not_block_event_loop() -> None:
+    async def scenario() -> None:
+        compressed = gzip.compress(os.urandom(1024 * 1024))
+        message = metadata_message(request_body=captured_body(compressed))
+        metadata = message["metadata"]
+        assert isinstance(metadata, dict)
+        metadata["request_headers"] = [
+            {"name": "host", "value": "api.example.test"},
+            {"name": "content-encoding", "value": "gzip"},
+        ]
+        application = make_application(max_items=128)
+        application.ingest(message)
+
+        heartbeat = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        loop.call_soon(heartbeat.set)
+        started = loop.time()
+        for sequence in range(1, 51):
+            application.ingest(
+                lifecycle_message(
+                    "flow-1",
+                    sequence=str(sequence),
+                )
+            )
+        burst_seconds = loop.time() - started
+
+        assert not heartbeat.is_set()
+        await asyncio.wait_for(heartbeat.wait(), timeout=0.1)
+        assert burst_seconds < 0.1
+
+    run_async(scenario)
+
+
+def test_additive_body_field_update_invalidates_projection_cache() -> None:
+    application = make_application(max_items=64)
+    application.ingest(
+        metadata_message(
+            request_body={"state": "missing", "projection_revision": "v1"}
+        )
+    )
+    result = application.ingest(
+        metadata_message(
+            request_body={"state": "missing", "projection_revision": "v2"}
+        )
+    )
+
+    assert result.delta_emitted is True
+    snapshot = json.loads(application.snapshot_text())
+    assert snapshot["flows"][0]["request_body"]["projection_revision"] == "v2"
+
+
+def test_replaced_lifecycle_event_rebuilds_timing_and_emits_upsert() -> None:
+    application = make_application(max_items=64)
+    application.ingest(metadata_message())
+    first = lifecycle_message(sequence="1")
+    first["occurred_at"] = "2026-01-01T00:00:01Z"
+    application.ingest(first)
+
+    replacement = lifecycle_message(sequence="1")
+    replacement["occurred_at"] = "2026-01-01T00:00:09Z"
+    result = application.ingest(replacement)
+
+    assert result.delta_emitted is True
+    live = json.loads(application.snapshot_text())["flows"][0]
+    fresh = collect_grid_flows(application.store)["flow-1"]
+    assert live["started_at"] == "2026-01-01T00:00:09Z"
+    assert json.dumps(live, separators=(",", ":")) == json.dumps(
+        fresh, separators=(",", ":")
+    )
+
+
+def test_equal_sequence_lifecycle_timing_is_traversal_independent() -> None:
+    first = lifecycle_message(sequence="1", source_id="source-a")
+    first["event_id"] = "event-a"
+    first["occurred_at"] = "2026-01-01T00:00:01Z"
+    second = lifecycle_message(sequence="1", source_id="source-b")
+    second["event_id"] = "event-b"
+    second["occurred_at"] = "2026-01-01T00:00:02Z"
+
+    forward = LifecycleTimingReducer()
+    reverse = LifecycleTimingReducer()
+    forward.add(first)
+    forward.add(second)
+    reverse.add(second)
+    reverse.add(first)
+
+    assert forward.values("flow-1") == reverse.values("flow-1")
+    assert forward.values("flow-1") == ("2026-01-01T00:00:02Z", None)
+
+    application = make_application(max_items=64)
+    application.ingest(metadata_message())
+    application.ingest(first)
+    result = application.ingest(second)
+    assert result.delta_emitted is True
+    live = json.loads(application.snapshot_text())["flows"][0]
+    cold = collect_grid_flows(application.store)["flow-1"]
+    assert json.dumps(live, separators=(",", ":")) == json.dumps(
+        cold, separators=(",", ":")
+    )
+    assert live["started_at"] == "2026-01-01T00:00:02Z"
+
+
+def test_prederived_metadata_has_byte_identical_cached_and_cold_projection() -> None:
+    message = metadata_message(request_body=captured_body(b"body"))
+    metadata = message["metadata"]
+    assert isinstance(metadata, dict)
+    metadata["request_body_size"] = "999"
+    metadata["request_content_type"] = "text/pre-derived"
+    metadata["summary"] = {"kind": "generic"}
+
+    application = make_application(max_items=64)
+    application.ingest(message)
+    application.ingest(lifecycle_message(sequence="1"))
+
+    live = application._state.published["flow-1"]
+    fresh = collect_grid_flows(application.store)["flow-1"]
+    assert json.dumps(live, separators=(",", ":")) == json.dumps(
+        fresh, separators=(",", ":")
+    )
+
+
+def test_projection_assembly_matches_durable_replay_with_metadata_timing(
+    tmp_path: Path,
+) -> None:
+    message = metadata_message(request_body=captured_body(b"body"), session_id="session-1")
+    metadata = message["metadata"]
+    assert isinstance(metadata, dict)
+    original = dict(metadata)
+    metadata.clear()
+    metadata.update(
+        {
+            "host": original["host"],
+            "request_body_size": "999",
+            "flow_id": original["flow_id"],
+            "request_content_type": "text/pre-derived",
+            "method": original["method"],
+            "summary": {"kind": "generic"},
+            "path": original["path"],
+            "ended_at": "2025-12-31T23:59:59Z",
+            "request_body": original["request_body"],
+            "session_id": original["session_id"],
+            "request_headers": original["request_headers"],
+            "scheme": original["scheme"],
+            "port": original["port"],
+            "started_at": "2025-12-31T00:00:00Z",
+        }
+    )
+
+    storage = SQLiteFlowStorage(tmp_path / "flows.sqlite")
+    try:
+        application = ApiApplication(MemoryStore(64), storage=storage)
+        application.ingest(message)
+        lifecycle = lifecycle_message(sequence="1")
+        lifecycle["occurred_at"] = "2026-01-01T00:00:01Z"
+        application.ingest(lifecycle)
+
+        live = application._state.published["flow-1"]
+        cold = collect_grid_flows(application.store)["flow-1"]
+        storage.flush()
+        replayed = MemoryStore(64)
+        storage.replay_into(replayed)
+        durable = collect_grid_flows(replayed)["flow-1"]
+
+        live_text = json.dumps(live, separators=(",", ":"))
+        assert live_text == json.dumps(cold, separators=(",", ":"))
+        assert live_text == json.dumps(durable, separators=(",", ":"))
+        assert durable["started_at"] == "2026-01-01T00:00:01Z"
+        assert durable["ended_at"] == "2025-12-31T23:59:59Z"
+    finally:
+        storage.close()
 
 
 def test_eviction_during_metadata_ingest_falls_back_to_full_projection() -> None:

@@ -17,10 +17,11 @@ from mitm_inspector.api.bodies import body_content_encoding, decoded_body_descri
 from mitm_inspector.api.limits import MAX_INGEST_BODY_PREFIX_BYTES
 from mitm_inspector.api.projection import (
     LifecycleTimingReducer,
-    collect_grid_flow,
+    canonical_grid_flow,
     collect_grid_flows,
     diff_grid_changes,
     enriched_flow,
+    grid_flow_with_timing,
 )
 from mitm_inspector.detail_limits import MAX_DURABLE_DETAIL_OUTPUT_BYTES
 from mitm_inspector.json_boundary import PlainJsonObject
@@ -107,6 +108,93 @@ class _State:
     snapshot_sequence: int = 0
 
 
+@dataclass(slots=True)
+class _GridProjectionCache:
+    """Retain only the small, redacted projection produced for the grid."""
+
+    base_key: tuple[object, ...] | None = None
+    key: tuple[object, ...] | None = None
+    flow: PlainJsonObject | None = None
+
+    def project(
+        self,
+        metadata: Mapping[str, object],
+        *,
+        started_at: str | None,
+        ended_at: str | None,
+    ) -> PlainJsonObject:
+        base_key = _metadata_projection_key(metadata)
+        key = (*base_key, started_at, ended_at)
+        if self.key == key and self.flow is not None:
+            return dict(self.flow)
+        if self.base_key == base_key and self.flow is not None:
+            self.flow = _retime_grid_flow(self.flow, started_at, ended_at)
+            self.key = key
+            return dict(self.flow)
+        flow = grid_flow_with_timing(metadata, started_at, ended_at)
+        self.base_key = base_key
+        self.key = key
+        self.flow = flow
+        return dict(flow)
+
+    def seed(
+        self,
+        metadata: Mapping[str, object],
+        flow: PlainJsonObject,
+        *,
+        started_at: str | None,
+        ended_at: str | None,
+    ) -> None:
+        self.base_key = _metadata_projection_key(metadata)
+        self.key = (*self.base_key, started_at, ended_at)
+        self.flow = flow
+
+
+@dataclass(slots=True)
+class _LiveFlow:
+    metadata: Mapping[str, object] | None = None
+    timing: LifecycleTimingReducer = field(default_factory=LifecycleTimingReducer)
+    projection: _GridProjectionCache = field(default_factory=_GridProjectionCache)
+
+
+def _body_version(descriptor: object) -> tuple[object, ...]:
+    """Identify every descriptor field without comparing retained body data."""
+
+    if not isinstance(descriptor, Mapping):
+        return (type(descriptor), id(descriptor))
+    fields = tuple(
+        sorted(
+            (str(key), type(value), id(value))
+            for key, value in descriptor.items()
+            if key != "data"
+        )
+    )
+    return (id(descriptor), id(descriptor.get("data")), fields)
+
+
+def _metadata_projection_key(metadata: Mapping[str, object]) -> tuple[object, ...]:
+    return (
+        id(metadata),
+        _body_version(metadata.get("request_body")),
+        _body_version(metadata.get("response_body")),
+    )
+
+
+def _retime_grid_flow(
+    flow: PlainJsonObject,
+    started_at: str | None,
+    ended_at: str | None,
+) -> PlainJsonObject:
+    """Update timing in the same canonical position without touching bodies."""
+
+    values = dict(flow)
+    if started_at is not None:
+        values["started_at"] = started_at
+    if ended_at is not None:
+        values["ended_at"] = ended_at
+    return canonical_grid_flow(values)
+
+
 class ApiApplication:
     """Protocol-v1 session logic shared by the WebSocket and HTTP surfaces."""
 
@@ -140,6 +228,7 @@ class ApiApplication:
         self._subscribers: list[Subscriber] = []
         self._state = _State(cursor=cursor_start)
         self._counters = _Counters()
+        self._live_flows: dict[str, _LiveFlow] = {}
 
     @property
     def store(self) -> MemoryStore:
@@ -181,11 +270,12 @@ class ApiApplication:
             if isinstance(value, ParsedMessage)
             else parse_message(value)
         )
+        payload = self._payload_of(parsed)
         self._store.append(parsed)
+        self._track_live_flow(payload)
         if self._storage is not None:
             self._storage.offer(parsed)
         self._counters.ingested_messages += 1
-        payload = self._payload_of(parsed)
         relayed = False
         if isinstance(parsed, KnownParsedMessage):
             if payload.get("type") in _RELAYED_KNOWN_TYPES:
@@ -376,6 +466,7 @@ class ApiApplication:
                 return self._reconcile_single_flow(flow_id)
         self._state.eviction_marks = marks
         current = collect_grid_flows(self._store)
+        self._sync_live_flows(current)
         changes = diff_grid_changes(self._state.published, current)
         self._state.published = current
         if not changes:
@@ -383,9 +474,15 @@ class ApiApplication:
         return self._emit_delta(changes)
 
     def _reconcile_single_flow(self, flow_id: str) -> bool:
-        flow = collect_grid_flow(self._store, flow_id)
-        if flow is None:
+        live_flow = self._live_flows.get(flow_id)
+        if live_flow is None or live_flow.metadata is None:
             return False
+        started_at, ended_at = live_flow.timing.values(flow_id)
+        flow = live_flow.projection.project(
+            live_flow.metadata,
+            started_at=started_at,
+            ended_at=ended_at,
+        )
         published = self._state.published
         unchanged = published.get(flow_id) == flow
         if flow_id not in published:
@@ -397,6 +494,39 @@ class ApiApplication:
         if unchanged:
             return False
         return self._emit_delta([{"op": "upsert", "flow": flow}])
+
+    def _track_live_flow(self, payload: Mapping[str, object]) -> None:
+        flow_id = self._message_flow_id(payload)
+        if flow_id is None:
+            return
+        live_flow = self._live_flows.setdefault(flow_id, _LiveFlow())
+        if payload.get("type") == "flow.metadata":
+            live_flow.metadata = self._store.latest_flow_metadata(flow_id)
+        elif payload.get("type") == "flow.lifecycle":
+            timing = LifecycleTimingReducer()
+            for retained in self._store.trusted_flow_messages(flow_id):
+                timing.add(self._payload_of(retained))
+            live_flow.timing = timing
+
+    def _sync_live_flows(self, current: Mapping[str, PlainJsonObject]) -> None:
+        synced: dict[str, _LiveFlow] = {}
+        for flow_id, flow in current.items():
+            metadata = self._store.latest_flow_metadata(flow_id)
+            if metadata is None:
+                continue
+            timing = LifecycleTimingReducer()
+            for parsed in self._store.trusted_flow_messages(flow_id):
+                timing.add(self._payload_of(parsed))
+            started_at, ended_at = timing.values(flow_id)
+            live_flow = _LiveFlow(metadata=metadata, timing=timing)
+            live_flow.projection.seed(
+                metadata,
+                flow,
+                started_at=started_at,
+                ended_at=ended_at,
+            )
+            synced[flow_id] = live_flow
+        self._live_flows = synced
 
     def _emit_delta(self, changes: list[PlainJsonObject]) -> bool:
         if self._state.cursor >= MAX_U64:
