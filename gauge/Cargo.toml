@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gauge-cli",
+    "crates/gauge-exporters",
+    "crates/gauge-query",
+    "crates/gauge-server",
+    "crates/gauge-store",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"

@@ -1,0 +1,16 @@
+[package]
+name = "gauge-exporters"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+sysinfo = "0.39.6"
+
+[[bin]]
+name = "gauge-node"
+path = "src/bin/gauge-node.rs"
+
+[[bin]]
+name = "gauge-proc"
+path = "src/bin/gauge-proc.rs"
