@@ -14,6 +14,7 @@
       "type": "flow.metadata",
       "metadata": {
         "flow_id": "conformance-flow",
+        "session_id": "session-conformance",
         "method": "POST",
         "scheme": "https",
         "host": "api.example.test",
@@ -22,6 +23,21 @@
         "request_headers": [{"name": "x-order", "value": "one"}, {"name": "x-order", "value": "two"}, {"name": "x-empty", "value": ""}],
         "request_body": {"state": "captured", "size_bytes": "3", "content_type": "", "encoding": "base64", "data": "AQID"},
         "response_body": {"state": "missing"}
+      }
+    },
+    {
+      "protocol_version": "1",
+      "type": "flow.metadata",
+      "metadata": {
+        "flow_id": "conformance-null-session",
+        "session_id": null,
+        "method": "GET",
+        "scheme": "https",
+        "host": "api.example.test",
+        "port": "443",
+        "path": "/health",
+        "request_headers": [],
+        "request_body": {"state": "missing"}
       }
     },
     {"protocol_version": "1", "type": "flow.lifecycle", "source_id": "conformance-source", "flow_id": "conformance-flow", "event_id": "event-1", "occurred_at": "2026-01-01T00:00:01Z", "sequence": "0", "state": "response_started"},
@@ -41,6 +57,10 @@
     {"name": "hello-limit-overflow", "message": {"protocol_version": "1", "type": "source.hello", "source_id": "s", "occurred_at": "now", "capabilities": {"body_chunks": true, "redaction": "headers-and-query"}, "limits": {"max_body_prefix_bytes": "18446744073709551616", "max_in_memory_bytes": "1"}}},
     {"name": "metadata-null", "message": {"protocol_version": "1", "type": "flow.metadata", "metadata": null}},
     {"name": "metadata-content-type-number", "message": {"protocol_version": "1", "type": "flow.metadata", "metadata": {"flow_id": "f", "method": "GET", "scheme": "https", "host": "h", "port": "443", "path": "/", "request_headers": [], "request_body": {"state": "empty", "size_bytes": "0", "content_type": 7}}}},
+    {"name": "metadata-session-id-empty", "message": {"protocol_version": "1", "type": "flow.metadata", "metadata": {"flow_id": "f", "session_id": "", "method": "GET", "scheme": "https", "host": "h", "port": "443", "path": "/", "request_headers": [], "request_body": {"state": "missing"}}}},
+    {"name": "metadata-session-id-number", "message": {"protocol_version": "1", "type": "flow.metadata", "metadata": {"flow_id": "f", "session_id": 7, "method": "GET", "scheme": "https", "host": "h", "port": "443", "path": "/", "request_headers": [], "request_body": {"state": "missing"}}}},
+    {"name": "metadata-session-id-list", "message": {"protocol_version": "1", "type": "flow.metadata", "metadata": {"flow_id": "f", "session_id": [], "method": "GET", "scheme": "https", "host": "h", "port": "443", "path": "/", "request_headers": [], "request_body": {"state": "missing"}}}},
+    {"name": "metadata-session-id-bool", "message": {"protocol_version": "1", "type": "flow.metadata", "metadata": {"flow_id": "f", "session_id": true, "method": "GET", "scheme": "https", "host": "h", "port": "443", "path": "/", "request_headers": [], "request_body": {"state": "missing"}}}},
     {"name": "body-side-invalid", "message": {"protocol_version": "1", "type": "body.chunk", "flow_id": "f", "body_side": "sideways", "chunk_index": "0", "offset_bytes": "0", "data_base64": "AQID"}},
     {"name": "chunk-flow-id-missing", "message": {"protocol_version": "1", "type": "body.chunk", "body_side": "request", "chunk_index": "0", "offset_bytes": "0", "data_base64": "AQID"}},
     {"name": "chunk-flow-id-empty", "message": {"protocol_version": "1", "type": "body.chunk", "flow_id": "", "body_side": "request", "chunk_index": "0", "offset_bytes": "0", "data_base64": "AQID"}},

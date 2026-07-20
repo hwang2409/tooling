@@ -157,8 +157,16 @@ def test_shared_fixture_preserves_ordered_duplicates_and_lifecycle_order() -> No
         {"name": "x-trace", "value": "second"},
     )
     conformance_metadata = known(conformance()["valid"][1])["metadata"]
+    assert conformance_metadata["session_id"] == "session-conformance"
     assert conformance_metadata["request_headers"][2]["value"] == ""
     assert conformance_metadata["request_body"]["content_type"] == ""
+    null_session = next(
+        known(message)["metadata"]
+        for message in conformance()["valid"]
+        if message.get("type") == "flow.metadata"
+        and message["metadata"]["flow_id"] == "conformance-null-session"
+    )
+    assert null_session["session_id"] is None
     lifecycle = [message for message in messages if message["type"] == "flow.lifecycle"]
     assert [message["state"] for message in lifecycle] == ["response_started", "request_end"]
 

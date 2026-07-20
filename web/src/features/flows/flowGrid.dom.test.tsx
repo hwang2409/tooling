@@ -89,6 +89,27 @@ describe("computeGridWindow", () => {
 });
 
 describe("mounted FlowGrid", () => {
+  it("keeps grouped session headers and the final flow reachable at the bottom of an overflowed grid", async () => {
+    const rows = Array.from({ length: 20 }, (_, index) => {
+      const session = Math.floor(index / 4);
+      return buildFlowRow({ ...metadata(index), session_id: `s000000${session}` });
+    });
+    const mounted = await mount(
+      <FlowGrid rows={rows} groupBy="session" selectedFlowId={null} onSelectFlow={() => {}} followLive={false} viewportHeight={112} overscan={1} />,
+    );
+    const grid = mounted.grid();
+    const canvas = mounted.container.querySelector<HTMLElement>(".flow-grid-canvas");
+    if (!canvas) throw new Error("grid canvas not mounted");
+    Object.defineProperty(grid, "clientHeight", { configurable: true, value: 112 });
+    Object.defineProperty(grid, "scrollHeight", {
+      configurable: true,
+      get: () => Number.parseInt(canvas.style.height, 10),
+    });
+    await scrollTo(grid, grid.scrollHeight - grid.clientHeight);
+    expect(mounted.container.textContent).toContain("session s0000004");
+    expect(mounted.container.textContent).toContain("/v1/item/19");
+  });
+
   it("virtualizes rows: renders only the visible window out of the full row count", async () => {
     const rows = makeRows(500);
     const mounted = await mount(

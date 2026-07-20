@@ -13,16 +13,24 @@ PORT = 4173
 BASE_URL = f"http://127.0.0.1:{PORT}"
 WIDTHS = (600, 800, 1024, 1440)
 
-FLOW = {
-    "flow_id": "browser-responsive-flow",
+FLOW_ONE = {
+    "flow_id": "browser-responsive-flow-a",
+    "session_id": "client-session-a",
     "method": "POST",
     "scheme": "https",
     "host": "api.example.test",
     "port": "443",
-    "path": "/stream",
+    "path": "/stream/a",
     "request_headers": [{"name": "content-type", "value": "application/json"}],
     "request_body": {"state": "empty", "size_bytes": "0"},
 }
+FLOW_TWO = {
+    **FLOW_ONE,
+    "flow_id": "browser-responsive-flow-b",
+    "session_id": "client-session-b",
+    "path": "/stream/b",
+}
+FLOWS = [FLOW_ONE, FLOW_TWO]
 
 
 def wait_for_server(server: subprocess.Popen[str]) -> None:
@@ -67,16 +75,28 @@ def install_fake_stream(page: Page) -> None:
             cursor: "1",
             flows: __FLOW_JSON__,
           };
-          const lifecycle = {
-            protocol_version: "1",
-            type: "flow.lifecycle",
-            source_id: "browser-test-source",
-            flow_id: "browser-responsive-flow",
-            event_id: "browser-test-lifecycle",
-            occurred_at: "2026-01-01T00:00:01Z",
-            sequence: "1",
-            state: "response_started",
-          };
+          const lifecycles = [
+            {
+              protocol_version: "1",
+              type: "flow.lifecycle",
+              source_id: "browser-test-source",
+              flow_id: "browser-responsive-flow-a",
+              event_id: "browser-test-lifecycle-a",
+              occurred_at: "2026-01-01T00:00:01Z",
+              sequence: "1",
+              state: "request_started",
+            },
+            {
+              protocol_version: "1",
+              type: "flow.lifecycle",
+              source_id: "browser-test-source",
+              flow_id: "browser-responsive-flow-b",
+              event_id: "browser-test-lifecycle-b",
+              occurred_at: "2026-01-01T00:00:02Z",
+              sequence: "2",
+              state: "request_started",
+            },
+          ];
           class FakeWebSocket {
             static OPEN = 1;
             readyState = 0;
@@ -90,7 +110,7 @@ def install_fake_stream(page: Page) -> None:
                 if (this.readyState !== 0) return;
                 this.readyState = FakeWebSocket.OPEN;
                 this.onopen?.();
-                for (const message of [hello, snapshot, lifecycle]) {
+                for (const message of [hello, snapshot, ...lifecycles]) {
                   setTimeout(() => this.onmessage?.({ data: JSON.stringify(message) }), 0);
                 }
               }, 0);
@@ -107,12 +127,40 @@ def install_fake_stream(page: Page) -> None:
     )
 
 
-FLOW_JSON = json.dumps([FLOW])
+FLOW_JSON = json.dumps(FLOWS)
+
+
+def run_session_journey(page: Page) -> None:
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(BASE_URL)
+    page.wait_for_load_state("networkidle")
+    page.locator(".flow-grid-row").first.wait_for()
+    group_by = page.locator("select[aria-label='Group flows by']")
+    group_by.select_option("session")
+    headers = page.locator(".flow-grid-session")
+    assert headers.count() == 2
+    assert "session client-" in headers.nth(0).inner_text()
+    assert "session client-" in headers.nth(1).inner_text()
+
+    page.reload()
+    page.wait_for_load_state("networkidle")
+    page.locator(".flow-grid-row").first.wait_for()
+    assert page.locator("select[aria-label='Group flows by']").input_value() == "session"
+    headers = page.locator(".flow-grid-session")
+    assert headers.count() == 2
+    first_header_button = headers.nth(0).locator("button")
+    first_header_button.click()
+    assert page.locator(".flow-grid-row").filter(has_text="/stream/a").count() == 0
+    first_header_button.click()
+    assert page.locator(".flow-grid-row").filter(has_text="/stream/a").count() == 1
 
 
 def check_width(page: Page, width: int) -> None:
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(BASE_URL)
+    page.wait_for_load_state("networkidle")
+    page.evaluate("localStorage.clear()")
+    page.reload()
     page.wait_for_load_state("networkidle")
     page.locator(".flow-grid-row").first.wait_for()
     page.locator(".flow-grid-row").first.click()
@@ -174,6 +222,7 @@ def main() -> None:
             browser = playwright.chromium.launch(headless=True)
             page = browser.new_page()
             install_fake_stream(page)
+            run_session_journey(page)
             for width in WIDTHS:
                 check_width(page, width)
             browser.close()
