@@ -362,7 +362,16 @@ function summarise(key: SessionKey, flows: readonly ImmutableFlowMetadata[]): Se
       lastTime = ended;
       lastActivity = facts.endedAt ?? facts.startedAt;
     }
-    if (firstQuery === undefined && facts.userText !== undefined) firstQuery = facts.userText;
+    // Suggestion-mode side-calls surface the injected suggestion prompt as
+    // their preview; after pruning they can be the oldest retained flow, and
+    // showing that internal prompt as the session's opening query would be
+    // wrong. Skip them and fall through to the next eligible user text.
+    // Suggestion-mode side-calls surface the injected suggestion prompt as
+    // their preview; after pruning they can be the oldest retained flow, and
+    // showing that internal prompt as the session's opening query would be
+    // wrong. Skip them and fall through to the next eligible user text.
+    if (firstQuery === undefined && facts.userText !== undefined
+      && !facts.userText.startsWith(SUGGESTION_PREFIX)) firstQuery = facts.userText;
     if (facts.model !== undefined && !models.includes(facts.model)) models.push(facts.model);
     if (facts.isError) hasError = true;
   }

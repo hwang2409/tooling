@@ -10,6 +10,10 @@ import { parseProtocolMessage } from "../../protocol";
 import { browserReducer, initialBrowserState } from "../../state/browserState";
 import type { BrowserState } from "../../state/browserState";
 import type { FlowDetailLoader } from "../inspector/flowDetail";
+import { createCanonicalIndex } from "./canonical";
+import type { CanonicalIndex } from "./canonical";
+import { createCandidateParser } from "./SessionDetail";
+import type { CandidateParser } from "./SessionDetail";
 import { createSessionIndex } from "./sessionSummary";
 import type { SessionIndex } from "./sessionSummary";
 
@@ -132,10 +136,16 @@ const mounts: Array<{ root: ReturnType<typeof createRoot>; container: HTMLDivEle
 
 type DetailBodies = Record<string, { request: string; response?: string }>;
 
+interface MountInstruments {
+  sessionIndex?: SessionIndex;
+  candidateParser?: CandidateParser;
+  canonicalIndex?: CanonicalIndex;
+}
+
 async function mountWorkspace(
   browser: BrowserState,
   bodies: DetailBodies | (() => DetailBodies) = DETAIL_BODIES,
-  sessionIndex?: SessionIndex,
+  { sessionIndex, candidateParser, canonicalIndex }: MountInstruments = {},
 ) {
   const requested: string[] = [];
   const loadFlowDetail: FlowDetailLoader = async (flowId) => {
@@ -157,7 +167,13 @@ async function mountWorkspace(
   mounts.push({ root, container });
   const render = async (nextBrowser: BrowserState) => {
     await act(async () => root.render(
-      <Workspace browser={nextBrowser} loadFlowDetail={loadFlowDetail} sessionIndex={sessionIndex} />,
+      <Workspace
+        browser={nextBrowser}
+        loadFlowDetail={loadFlowDetail}
+        sessionIndex={sessionIndex}
+        candidateParser={candidateParser}
+        canonicalIndex={canonicalIndex}
+      />,
     ));
   };
   await render(browser);
@@ -455,6 +471,119 @@ describe("Workspace session-first navigation", () => {
     expect(container.querySelectorAll(".session-aux .packet-row")).toHaveLength(2);
   });
 
+  it("context regression: an identical-history different-model side-call never steals the conversation", async () => {
+    const session = "abab5555-0000-1111-2222-333333333333";
+    // The haiku side-call resends the main thread's EXACT message history
+    // under its own model/system and is the newest flow in the session.
+    const cloneRequest = JSON.stringify({
+      model: "claude-haiku-4",
+      system: "you generate titles",
+      messages: JSON.parse(MAIN_REQUEST).messages,
+    });
+    const cloneResponse = JSON.stringify({
+      model: "claude-haiku-4",
+      role: "assistant",
+      content: [{ type: "text", text: "borrowed-history side answer" }],
+      stop_reason: "end_turn",
+    });
+    const oldMainRequest = JSON.stringify({
+      model: "claude-opus-4",
+      messages: [{ role: "user", content: "fix the bug" }],
+    });
+    const flows = [
+      sessionFlow("haiku-clone", {
+        session_id: session,
+        started_at: "2026-01-01T00:03:00Z",
+        summary: { kind: "anthropic_messages", model: "claude-haiku-4", message_count: "3", preview: { source: "tool_result", tool_name: "Bash" } },
+      }),
+      sessionFlow("main-flow", {
+        session_id: session,
+        started_at: "2026-01-01T00:02:00Z",
+        summary: { kind: "anthropic_messages", model: "claude-opus-4", message_count: "3", preview: { source: "user_text", text: "fix the bug" } },
+      }),
+      sessionFlow("old-main-flow", {
+        session_id: session,
+        started_at: "2026-01-01T00:01:00Z",
+        summary: { kind: "anthropic_messages", model: "claude-opus-4", message_count: "1", preview: { source: "user_text", text: "fix the bug" } },
+      }),
+    ];
+    const { container } = await mountWorkspace(stateOf(flows), {
+      "haiku-clone": { request: cloneRequest, response: cloneResponse },
+      "main-flow": { request: MAIN_REQUEST, response: MAIN_RESPONSE },
+      "old-main-flow": { request: oldMainRequest },
+    });
+    await click(sessionRows(container)[0]);
+    await settle();
+    const conversation = container.querySelector("[data-testid='conversation-view']");
+    // The main thread renders with ITS response — a different-context call
+    // with an equal history must not win purely by being newer.
+    expect(conversation?.textContent).toContain("final assistant turn");
+    expect(conversation?.textContent).not.toContain("borrowed-history side answer");
+    expect(container.textContent).toContain("auxiliary calls (2)");
+  });
+
+  it("work pin: a delta touching the open session reparses and re-relates only the changed candidate", async () => {
+    const session = "cdcd4444-0000-1111-2222-333333333333";
+    const chainMessages = (length: number) => Array.from({ length }, (_, index) =>
+      ({ role: index % 2 === 0 ? "user" : "assistant", content: `turn ${index}` }));
+    const chainRequest = (length: number) =>
+      JSON.stringify({ model: "claude-opus-4", messages: chainMessages(length) });
+    const chainFlow = (length: number) => sessionFlow(`chain-${length}`, {
+      session_id: session,
+      started_at: `2026-01-01T00:0${length}:00Z`,
+      summary: {
+        kind: "anthropic_messages",
+        model: "claude-opus-4",
+        message_count: String(length),
+        preview: { source: "user_text", text: "turn 0" },
+      },
+    });
+    const initialLengths = [4, 3, 2, 1];
+    const bodies: DetailBodies = Object.fromEntries(
+      [5, ...initialLengths].map((length) => [`chain-${length}`, { request: chainRequest(length) }]),
+    );
+    const parser = createCandidateParser();
+    const index = createCanonicalIndex();
+    const state1 = stateOf(initialLengths.map(chainFlow));
+    const { container, requested, render } = await mountWorkspace(state1, bodies, {
+      candidateParser: parser,
+      canonicalIndex: index,
+    });
+    await click(sessionRows(container)[0]);
+    await settle();
+    expect(container.querySelector("[data-testid='conversation-view']")?.textContent).toContain("turn 3");
+    const baseParses = parser.stats().parses;
+    const basePrefix = index.stats().prefixEvaluations;
+    const baseNormalizations = index.stats().normalizations;
+    expect(baseNormalizations).toBe(initialLengths.length);
+
+    // One delta extends the conversation: a single new flow prepends, every
+    // grid order shifts, nothing else changes.
+    const deltaEnvelope = parseProtocolMessage({
+      protocol_version: "1",
+      type: "browser.delta",
+      cursor: "2",
+      changes: [{ op: "upsert", flow: chainFlow(5) }],
+    });
+    await render(browserReducer(state1, { type: "protocol", envelope: deltaEnvelope }));
+    await settle();
+    expect(container.querySelector("[data-testid='conversation-view']")?.textContent).toContain("turn 4");
+    // Detail fetch: only the new flow.
+    expect(requested.filter((flowId) => flowId === "chain-5")).toHaveLength(1);
+    expect(requested).toHaveLength(initialLengths.length + 1);
+    // Parse cache: the new flow parses (metadata-only, then loaded); the
+    // four unchanged candidates are cache hits. A full-reparse regression
+    // reprocesses every candidate on every render and fails this bound.
+    expect(parser.stats().parses - baseParses).toBeLessThanOrEqual(2);
+    // Canonical index: one new candidate normalized, related against the
+    // existing four — never a whole-session rescan (which would add
+    // O(candidates^2) evaluations across the delta's renders).
+    expect(index.stats().normalizations - baseNormalizations).toBe(1);
+    const prefixDelta = index.stats().prefixEvaluations - basePrefix;
+    expect(prefixDelta).toBeGreaterThanOrEqual(1);
+    expect(prefixDelta).toBeLessThanOrEqual(2 * (initialLengths.length + 1));
+  });
+
   it("keeps one incremental session index across deltas (guards against fresh-index-per-render)", async () => {
     const inner = createSessionIndex();
     const index: SessionIndex = {
@@ -476,7 +605,7 @@ describe("Workspace session-first navigation", () => {
     });
     const state2 = browserReducer(state1, { type: "protocol", envelope: deltaEnvelope });
 
-    const { container, render } = await mountWorkspace(state1, DETAIL_BODIES, index);
+    const { container, render } = await mountWorkspace(state1, DETAIL_BODIES, { sessionIndex: index });
     expect(inner.stats().fullRebuilds).toBe(1);
     await render(state2);
     // The delta must flow through the SAME index incrementally; a fresh

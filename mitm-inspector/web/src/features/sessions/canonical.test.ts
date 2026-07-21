@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { JsonValue } from "../inspector/jsonTree";
 import type { CanonicalCandidate } from "./canonical";
-import { messageMatches, messagesArePrefix, normalizeMessage, selectCanonicalFlow } from "./canonical";
+import { createCanonicalIndex, messageMatches, messagesArePrefix, normalizeMessage, requestContextKey, selectCanonicalFlow } from "./canonical";
 
 const user = (text: string, extra: Record<string, JsonValue> = {}) =>
   ({ role: "user", content: [{ type: "text", text, ...extra }] }) as JsonValue;
@@ -10,8 +10,14 @@ const assistant = (text: string) => ({ role: "assistant", content: [{ type: "tex
 const toolResult = (id: string, text: string) =>
   ({ role: "user", content: [{ type: "tool_result", tool_use_id: id, content: text }] }) as JsonValue;
 
-function candidate(flowId: string, messages: readonly JsonValue[], order: number, suggestion = false): CanonicalCandidate {
-  return { flowId, messages, suggestion, order };
+function candidate(
+  flowId: string,
+  messages: readonly JsonValue[],
+  order: number,
+  suggestion = false,
+  contextKey?: string,
+): CanonicalCandidate {
+  return { flowId, messages, suggestion, order, ...(contextKey !== undefined ? { contextKey } : {}) };
 }
 
 describe("message normalization and prefix matching", () => {
@@ -206,11 +212,125 @@ describe("selectCanonicalFlow", () => {
     expect(selection.chainIds).toEqual(["old-main", "main"]);
   });
 
+  it("context regression: an identical-history different-context call cannot beat the main thread by recency", () => {
+    // Round-6 finding: a one-off haiku side-call resent the main thread's
+    // exact message history under its own model/system and, being newest,
+    // superseded the main tip — the conversation rendered the side-call's
+    // response. Context identity must gate equal-history recency wins.
+    const mainKey = requestContextKey({ model: "claude-opus-4", system: "you are the main agent" } as JsonValue);
+    const auxKey = requestContextKey({ model: "claude-haiku-4", system: "you generate titles" } as JsonValue);
+    const root = candidate("root", [u1], 5, false, mainKey);
+    const main1 = candidate("main-1", [u1, a1], 3, false, mainKey);
+    const main2 = candidate("main-2", [u1, a1, chainEnd], 2, false, mainKey);
+    const clone = candidate("aux-clone", [u1, a1, chainEnd], 0, false, auxKey);
+    const selection = selectCanonicalFlow([clone, main2, main1, root]);
+    expect(selection.canonicalId).toBe("main-2");
+    // The borrowed-history side-call is not part of the rendered thread.
+    expect(selection.chainIds).toEqual(["root", "main-1", "main-2"]);
+    // Same context, equal history: the newer retransmit still supersedes.
+    const retransmit = candidate("retransmit", [u1, a1, chainEnd], 0, false, mainKey);
+    expect(selectCanonicalFlow([retransmit, main2, main1, root]).canonicalId).toBe("retransmit");
+  });
+
   it("breaks tie between divergent tips toward the newest and returns null with no candidates", () => {
     const older = candidate("older", [user("a")], 1);
     const newer = candidate("newer", [user("b")], 0);
     expect(selectCanonicalFlow([older, newer]).canonicalId).toBe("newer");
     expect(selectCanonicalFlow([]).canonicalId).toBeNull();
     expect(selectCanonicalFlow([candidate("s", [u1], 0, true)]).canonicalId).toBeNull();
+  });
+});
+
+describe("requestContextKey", () => {
+  it("normalizes shorthand and cache markers but distinguishes model, system, and tools", () => {
+    const shorthand = { model: "claude-opus-4", system: "be helpful", messages: [] } as JsonValue;
+    const blocks = {
+      model: "claude-opus-4",
+      system: [{ type: "text", text: "be helpful", cache_control: { type: "ephemeral" } }],
+      messages: [],
+    } as JsonValue;
+    expect(requestContextKey(blocks)).toBe(requestContextKey(shorthand));
+    expect(requestContextKey({ model: "claude-haiku-4", system: "be helpful" } as JsonValue))
+      .not.toBe(requestContextKey(shorthand));
+    expect(requestContextKey({ model: "claude-opus-4", system: "you generate titles" } as JsonValue))
+      .not.toBe(requestContextKey(shorthand));
+    expect(requestContextKey({ model: "claude-opus-4", system: "be helpful", tools: [{ name: "Bash" }] } as JsonValue))
+      .not.toBe(requestContextKey(shorthand));
+  });
+
+  it("is key-order independent and tolerates cache markers moving between tools", () => {
+    const left = { tools: [{ name: "Bash", description: "shell", input_schema: { type: "object" } }] } as JsonValue;
+    const right = { tools: [{ input_schema: { type: "object" }, description: "shell", name: "Bash" }] } as JsonValue;
+    expect(requestContextKey(left)).toBe(requestContextKey(right));
+    const marked = { tools: [{ name: "Bash", description: "shell", input_schema: { type: "object" }, cache_control: { type: "ephemeral" } }] } as JsonValue;
+    expect(requestContextKey(marked)).toBe(requestContextKey(left));
+  });
+});
+
+describe("createCanonicalIndex", () => {
+  const history = (length: number): JsonValue[] =>
+    Array.from({ length }, (_, index) => (index % 2 === 0 ? user(`turn ${index}`) : assistant(`turn ${index}`)));
+
+  it("does linear work for one changed candidate and zero work for unchanged updates", () => {
+    const size = 24;
+    // One prefix chain: candidate i resends the first i+1 messages; the
+    // longest history is the newest (order 1), matching real traffic.
+    const base = Array.from({ length: size }, (_, index) =>
+      candidate(`c${index}`, history(index + 1), size - index));
+    const index = createCanonicalIndex();
+    const first = index.update(base);
+    expect(first.canonicalId).toBe(`c${size - 1}`);
+    const initial = index.stats();
+    expect(initial.normalizations).toBe(size);
+
+    // Identical candidates: no new work, same selection object.
+    expect(index.update(base)).toBe(first);
+    expect(index.stats().prefixEvaluations).toBe(initial.prefixEvaluations);
+    expect(index.stats().normalizations).toBe(initial.normalizations);
+
+    // A delta prepends one flow: every order shifts, ONE candidate is new.
+    // The pin: one normalization and at most 2 x candidates prefix
+    // evaluations — a full-reparse/rescan regression reprocesses all
+    // candidates (O(n^2) evaluations here) and fails both bounds.
+    const shifted = base.map((entry) => ({ ...entry, order: entry.order + 1 }));
+    const extended = [...shifted, candidate("c-new", history(size + 1), 0)];
+    const second = index.update(extended);
+    expect(second.canonicalId).toBe("c-new");
+    const afterAdd = index.stats();
+    expect(afterAdd.normalizations - initial.normalizations).toBe(1);
+    const evaluationDelta = afterAdd.prefixEvaluations - initial.prefixEvaluations;
+    expect(evaluationDelta).toBeGreaterThanOrEqual(1);
+    expect(evaluationDelta).toBeLessThanOrEqual(2 * size);
+
+    // Removal does no prefix evaluations at all.
+    const pruned = extended.filter((entry) => entry.flowId !== "c12");
+    expect(index.update(pruned).canonicalId).toBe("c-new");
+    expect(index.stats().prefixEvaluations).toBe(afterAdd.prefixEvaluations);
+    expect(index.stats().normalizations).toBe(afterAdd.normalizations);
+  });
+
+  it("matches one-shot selection across incremental add, change, and removal", () => {
+    const index = createCanonicalIndex();
+    const states: CanonicalCandidate[][] = [];
+    const rootOnly = [candidate("root", history(1), 0)];
+    states.push(rootOnly);
+    states.push([candidate("root", history(1), 1), candidate("main-1", history(3), 0)]);
+    states.push([
+      candidate("root", history(1), 2),
+      candidate("main-1", history(3), 1),
+      candidate("aux", [...history(3).slice(0, 2), assistant("side quest")], 0),
+    ]);
+    // Prune the root; the divergent aux stays, main keeps dominance via tip
+    // recency... verified against the pure one-shot selection either way.
+    states.push([
+      candidate("main-1", history(3), 1),
+      candidate("aux", [...history(3).slice(0, 2), assistant("side quest")], 0),
+    ]);
+    for (const state of states) {
+      const incremental = index.update(state);
+      const scratch = selectCanonicalFlow(state);
+      expect(incremental.canonicalId).toBe(scratch.canonicalId);
+      expect(incremental.chainIds).toEqual(scratch.chainIds);
+    }
   });
 });

@@ -83,6 +83,22 @@ describe("deriveSessions", () => {
     expect(sessions[0].firstQuery).toBe("initial ask");
   });
 
+  it("firstQuery regression: skips suggestion-mode flows even when they are the oldest retained", () => {
+    // After pruning, the oldest RETAINED flow can be an auxiliary
+    // suggestion-mode call; its preview is the injected internal prompt and
+    // must never surface as the session's opening query on the home row.
+    const sessions = deriveSessions([
+      flow("a3", { session: "aaaa", userText: "real follow-up" }),
+      flow("a2", { session: "aaaa", userText: "[SUGGESTION MODE: propose next] internals" }),
+    ]);
+    expect(sessions[0].firstQuery).toBe("real follow-up");
+    // All-suggestion sessions fall through to no query at all.
+    const onlySuggestions = deriveSessions([
+      flow("s1", { session: "bbbb", userText: "[SUGGESTION MODE: propose next] internals" }),
+    ]);
+    expect(onlySuggestions[0].firstQuery).toBeUndefined();
+  });
+
   it("collects distinct models oldest-first and flags 4xx/5xx errors", () => {
     const sessions = deriveSessions([
       flow("a3", { session: "aaaa", model: "claude-opus-4", status: "529" }),

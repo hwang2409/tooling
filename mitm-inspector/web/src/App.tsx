@@ -9,6 +9,8 @@ import { PacketList } from "./features/flows/PacketList";
 import type { FlowDetailLoader } from "./features/inspector/flowDetail";
 import type { SearchFetcher } from "./features/search/search";
 import { SessionDetail } from "./features/sessions/SessionDetail";
+import type { CandidateParser } from "./features/sessions/SessionDetail";
+import type { CanonicalIndex } from "./features/sessions/canonical";
 import { SessionList } from "./features/sessions/SessionList";
 import { createSessionIndex } from "./features/sessions/sessionSummary";
 import type { SessionIndex, SessionKey } from "./features/sessions/sessionSummary";
@@ -26,6 +28,9 @@ export interface WorkspaceProps {
   searchFetcher?: SearchFetcher;
   onSearchActiveChange?: (active: boolean) => void;
   sessionIndex?: SessionIndex;
+  /** Instrumented drill-in instances for tests; SessionDetail defaults its own. */
+  candidateParser?: CandidateParser;
+  canonicalIndex?: CanonicalIndex;
 }
 
 /**
@@ -33,7 +38,7 @@ export interface WorkspaceProps {
  * session's conversation; the raw packet grid stays one switch away so
  * non-Anthropic and debugging flows lose nothing.
  */
-export function Workspace({ browser, loadFlowDetail, searchFetcher, onSearchActiveChange, sessionIndex }: WorkspaceProps) {
+export function Workspace({ browser, loadFlowDetail, searchFetcher, onSearchActiveChange, sessionIndex, candidateParser, canonicalIndex }: WorkspaceProps) {
   const [view, setView] = useState<WorkspaceView>({ kind: "sessions" });
   // One stateful index for the component's lifetime: consecutive deltas
   // update only the sessions owning the changed flow ids (see
@@ -70,6 +75,8 @@ export function Workspace({ browser, loadFlowDetail, searchFetcher, onSearchActi
         onBack={() => setView({ kind: "sessions" })}
         loadFlowDetail={loadFlowDetail}
         sourceEpoch={browser.sourceEpoch}
+        candidateParser={candidateParser}
+        canonicalIndex={canonicalIndex}
       />
     );
   } else {

@@ -1,4 +1,6 @@
-import { useMemo, useState } from "react";
+/* eslint-disable no-unused-vars */
+
+import { useMemo, useRef, useState } from "react";
 
 import { PacketDetail, PacketList } from "../flows/PacketList";
 import { PLACEHOLDER, durationBetween, shortModel } from "../flows/rowSummary";
@@ -11,7 +13,8 @@ import type { FlowDetailLoader, FlowDetailResult } from "../inspector/flowDetail
 import { safeParseJson } from "../inspector/jsonTree";
 import type { JsonValue } from "../inspector/jsonTree";
 import type { ImmutableFlowMetadata } from "../../state/browserState";
-import { selectCanonicalFlow } from "./canonical";
+import { createCanonicalIndex, requestContextKey } from "./canonical";
+import type { CanonicalIndex } from "./canonical";
 import { sessionLabel } from "./SessionList";
 import { conversationCandidates, isSuggestionRequest } from "./sessionSummary";
 import type { SessionSummary } from "./sessionSummary";
@@ -22,11 +25,15 @@ export interface SessionDetailProps {
   loadFlowDetail?: FlowDetailLoader;
   /** Capture incarnation — part of detail-cache identity across reconnects. */
   sourceEpoch?: number;
+  /** Instrumented instances for tests; production creates its own. */
+  candidateParser?: CandidateParser;
+  canonicalIndex?: CanonicalIndex;
 }
 
 type SessionMode = "conversation" | "flows";
 
 const NO_FLOWS: readonly ImmutableFlowMetadata[] = [];
+const NO_PARSED: readonly ParsedCandidate[] = [];
 
 interface ParsedCandidate {
   readonly flow: ImmutableFlowMetadata;
@@ -34,6 +41,9 @@ interface ParsedCandidate {
   readonly detail: FlowDetailResult | null;
   readonly request: AnthropicRequest | null;
   readonly rawMessages: readonly JsonValue[] | null;
+  /** Body-verified suggestion-mode request; false until the body loads. */
+  readonly suggestion: boolean;
+  readonly contextKey?: string;
 }
 
 function parseCandidate(
@@ -41,7 +51,7 @@ function parseCandidate(
   order: number,
   detail: FlowDetailResult | undefined,
 ): ParsedCandidate {
-  const base = { flow, order, detail: detail ?? null, request: null, rawMessages: null };
+  const base = { flow, order, detail: detail ?? null, request: null, rawMessages: null, suggestion: false };
   if (detail?.status !== "loaded") return base;
   const requestBody = detail.overrides.request_body ?? flow.request_body;
   const decoded = bodyText(requestBody);
@@ -52,7 +62,73 @@ function parseCandidate(
   if (request === null) return base;
   const object = parsed.value as { messages?: JsonValue };
   const rawMessages = Array.isArray(object.messages) ? object.messages : null;
-  return { ...base, request, rawMessages };
+  return {
+    ...base,
+    request,
+    rawMessages,
+    suggestion: isSuggestionRequest(request),
+    contextKey: requestContextKey(parsed.value),
+  };
+}
+
+export interface CandidateParserStats {
+  /** parseCandidate executions — cache misses only. */
+  readonly parses: number;
+}
+
+export interface CandidateParser {
+  readonly parseAll: (
+    flows: readonly ImmutableFlowMetadata[],
+    orderOf: ReadonlyMap<string, number>,
+    details: ReadonlyMap<string, FlowDetailResult>,
+    sourceEpoch: number | undefined,
+  ) => readonly ParsedCandidate[];
+  readonly stats: () => CandidateParserStats;
+}
+
+/**
+ * Per-flow body-projection cache. The reducer deep-freezes and reuses flow
+ * metadata objects across deltas and useFlowDetails keeps result identity
+ * per flow id + detail version + epoch, so (flow, detail, epoch) identity is
+ * exactly "flow version + source epoch": a delta touching other flows reuses
+ * every cached projection; only the changed flow reparses. Grid-order shifts
+ * rewrap the cached projection without touching the body.
+ */
+export function createCandidateParser(): CandidateParser {
+  interface CacheEntry {
+    readonly flow: ImmutableFlowMetadata;
+    readonly detail: FlowDetailResult | null;
+    readonly epoch: number | undefined;
+    readonly value: ParsedCandidate;
+  }
+  const cache = new Map<string, CacheEntry>();
+  let parses = 0;
+  return {
+    parseAll(flows, orderOf, details, sourceEpoch) {
+      const live = new Set<string>();
+      const result = flows.map((flow) => {
+        live.add(flow.flow_id);
+        const order = orderOf.get(flow.flow_id) ?? 0;
+        const detail = details.get(flow.flow_id) ?? null;
+        const cached = cache.get(flow.flow_id);
+        if (cached !== undefined && cached.flow === flow && cached.detail === detail && cached.epoch === sourceEpoch) {
+          if (cached.value.order === order) return cached.value;
+          const value = { ...cached.value, order };
+          cache.set(flow.flow_id, { flow, detail, epoch: sourceEpoch, value });
+          return value;
+        }
+        parses += 1;
+        const value = parseCandidate(flow, order, detail ?? undefined);
+        cache.set(flow.flow_id, { flow, detail, epoch: sourceEpoch, value });
+        return value;
+      });
+      for (const flowId of [...cache.keys()]) {
+        if (!live.has(flowId)) cache.delete(flowId);
+      }
+      return result;
+    },
+    stats: () => ({ parses }),
+  };
 }
 
 /**
@@ -65,7 +141,7 @@ function parseCandidate(
  * off-chain utility side-calls stay reachable in a collapsed auxiliary
  * group, and the full flow grid is one toggle away.
  */
-export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch }: SessionDetailProps) {
+export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, candidateParser, canonicalIndex }: SessionDetailProps) {
   const candidates = useMemo(() => conversationCandidates(summary.flows), [summary.flows]);
   // The unassigned bucket keeps the grid experience as its default drill-in.
   const [mode, setMode] = useState<SessionMode>(summary.key === null ? "flows" : "conversation");
@@ -78,9 +154,19 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch }: 
     () => new Map(summary.flows.map((flow, index) => [flow.flow_id, index])),
     [summary.flows],
   );
+  // One stateful parser + canonical index per drill-in: consecutive deltas
+  // reparse and re-relate only the changed candidates (see
+  // createCandidateParser / createCanonicalIndex); fresh instances per render
+  // would degrade every delta to a whole-session reparse and rescan.
+  const parserRef = useRef<CandidateParser | null>(null);
+  if (parserRef.current === null) parserRef.current = candidateParser ?? createCandidateParser();
+  const indexRef = useRef<CanonicalIndex | null>(null);
+  if (indexRef.current === null) indexRef.current = canonicalIndex ?? createCanonicalIndex();
   const parsed = useMemo(
-    () => candidates.map((flow) => parseCandidate(flow, gridOrder.get(flow.flow_id) ?? 0, details.get(flow.flow_id))),
-    [candidates, gridOrder, details],
+    () => (effectiveMode === "conversation"
+      ? parserRef.current!.parseAll(candidates, gridOrder, details, sourceEpoch)
+      : NO_PARSED),
+    [effectiveMode, candidates, gridOrder, details, sourceEpoch],
   );
   const settled = effectiveMode === "conversation" && parsed.every((candidate) => candidate.detail !== null);
 
@@ -94,10 +180,11 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch }: 
       .map((candidate) => ({
         flowId: candidate.flow.flow_id,
         messages: candidate.rawMessages!,
-        suggestion: isSuggestionRequest(candidate.request!),
+        suggestion: candidate.suggestion,
         order: candidate.order,
+        ...(candidate.contextKey !== undefined ? { contextKey: candidate.contextKey } : {}),
       }));
-    const selected = selectCanonicalFlow(usable).canonicalId;
+    const selected = indexRef.current!.update(usable).canonicalId;
     return selected === null ? null : parsed.find((candidate) => candidate.flow.flow_id === selected) ?? null;
   }, [settled, parsed]);
 

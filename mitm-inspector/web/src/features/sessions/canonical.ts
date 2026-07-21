@@ -1,3 +1,5 @@
+/* eslint-disable no-unused-vars */
+
 import type { JsonValue } from "../inspector/jsonTree";
 
 /**
@@ -31,6 +33,14 @@ export interface CanonicalCandidate {
   readonly suggestion: boolean;
   /** Created order: grid position, 0 = newest. */
   readonly order: number;
+  /**
+   * Normalized request-context identity (model + system + tools) from
+   * requestContextKey. A request that resends an identical message history
+   * under a DIFFERENT context (a one-off haiku side-call borrowing the main
+   * history) is a different conversation and must never supersede the main
+   * thread by mere recency. Absent keys compare equal.
+   */
+  readonly contextKey?: string;
 }
 
 export interface CanonicalSelection {
@@ -66,6 +76,37 @@ export function normalizeMessage(message: JsonValue): JsonValue {
     return { ...object, content: object.content.map(normalizeBlock) };
   }
   return object;
+}
+
+/** Key-order-independent serialization so contexts compare structurally. */
+function stableStringify(value: JsonValue): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const object = value as JsonObject;
+  const keys = Object.keys(object).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(object[key])}`).join(",")}}`;
+}
+
+/**
+ * Request-context identity for canonical selection: model + system + tools,
+ * with the same benign normalizations as messages (string system shorthand
+ * expanded, cache_control stripped at block/tool top level only) so a
+ * cache-marker move never splits a context.
+ */
+export function requestContextKey(body: JsonValue): string {
+  const object = asObject(body);
+  if (object === null) return "";
+  const context: JsonObject = {};
+  if (object.model !== undefined) context.model = object.model;
+  if (object.system !== undefined) {
+    context.system = typeof object.system === "string"
+      ? [{ type: "text", text: object.system }]
+      : Array.isArray(object.system) ? object.system.map(normalizeBlock) : object.system;
+  }
+  if (object.tools !== undefined) {
+    context.tools = Array.isArray(object.tools) ? object.tools.map(normalizeBlock) : object.tools;
+  }
+  return stableStringify(context);
 }
 
 function deepEqual(left: JsonValue, right: JsonValue): boolean {
@@ -161,105 +202,289 @@ export function messagesArePrefix(earlier: readonly JsonValue[], later: readonly
   return earlier.every((message, index) => messageMatches(message, later[index]));
 }
 
-interface Entry {
-  readonly candidate: CanonicalCandidate;
+interface IndexEntry {
+  readonly id: string;
+  /** Refreshed on every update — the grid order shifts as flows prepend. */
+  candidate: CanonicalCandidate;
   readonly normalized: readonly JsonValue[];
-}
-
-/** Whether `other` extends `entry`: strictly longer, or an equal-length newer retransmit. */
-function supersedes(entry: Entry, other: Entry): boolean {
-  if (!messagesArePrefix(entry.normalized, other.normalized)) return false;
-  if (other.normalized.length > entry.normalized.length) return true;
-  return other.candidate.order < entry.candidate.order;
-}
-
-interface Chain {
-  readonly tip: Entry;
-  readonly members: readonly Entry[];
+  /** Interned history identity: equal normalized histories share a stamp. */
+  readonly stamp: number;
 }
 
 /**
- * TWO-LEVEL SELECTION POLICY — do not re-simplify to either half alone
- * (each half was shipped solo once and each was a review-verified bug):
- *
- *  (a) WITHIN a shared-root component, chain evidence dominates: the chain
- *      with more confirming members wins regardless of tip recency, so an
- *      established `root -> main-1 -> main-2` thread beats a newer
- *      `root -> auxiliary` branch. Equal evidence (equal member counts)
- *      falls back to the newer tip, so a live branch beats a stale sibling.
- *
- *  (b) ACROSS disjoint components — no shared root, i.e. a post-compaction
- *      restart — the newest tip wins: a shorter restarted history beats the
- *      stale pre-compaction chain that mere member counting would keep.
+ * Whether `later` extends `earlier`: strictly longer, or an equal-length
+ * newer retransmit UNDER THE SAME REQUEST CONTEXT. A different-context call
+ * (other model/system/tools) resending an identical history is a borrowing
+ * side-call, not a continuation — it must never displace the thread it
+ * copied purely by being newer.
  */
-export function selectCanonicalFlow(candidates: readonly CanonicalCandidate[]): CanonicalSelection {
-  const entries: Entry[] = candidates
-    .filter((candidate) => !candidate.suggestion)
-    .map((candidate) => ({ candidate, normalized: candidate.messages.map(normalizeMessage) }));
-  if (entries.length === 0) return { canonicalId: null, chainIds: [] };
+function supersedes(earlier: IndexEntry, later: IndexEntry, earlierPrefixOfLater: boolean): boolean {
+  if (!earlierPrefixOfLater) return false;
+  if (later.normalized.length > earlier.normalized.length) return true;
+  return later.candidate.contextKey === earlier.candidate.contextKey
+    && later.candidate.order < earlier.candidate.order;
+}
 
-  // Maximal tips: requests that no other request extends. Non-consuming — a
-  // shared root is simply not a tip; it belongs to every branch's chain.
-  const tips = entries.filter((entry) => !entries.some((other) => other !== entry && supersedes(entry, other)));
-  const chains: Chain[] = tips.map((tip) => ({
-    tip,
-    members: entries.filter((entry) => messagesArePrefix(entry.normalized, tip.normalized)),
-  }));
+export interface CanonicalIndexStats {
+  /** Histories normalized — exactly one per new or changed candidate. */
+  readonly normalizations: number;
+  /**
+   * messagesArePrefix evaluations. O(changed x candidates) per update;
+   * unchanged candidates never re-evaluate (relations are kept incrementally).
+   */
+  readonly prefixEvaluations: number;
+  /** Whole-history deep-equality evaluations for stage interning. */
+  readonly historyEquals: number;
+  readonly selections: number;
+}
 
-  // Group chains that share any member into components (transitively).
-  const components: Chain[][] = [];
-  for (const chain of chains) {
-    const memberSet = new Set(chain.members);
-    const overlapping = components.filter((component) =>
-      component.some((other) => other.members.some((member) => memberSet.has(member))));
-    if (overlapping.length === 0) {
-      components.push([chain]);
-      continue;
-    }
-    const merged = overlapping[0];
-    merged.push(chain);
-    for (const extra of overlapping.slice(1)) {
-      merged.push(...extra);
-      components.splice(components.indexOf(extra), 1);
-    }
-  }
+export interface CanonicalIndex {
+  readonly update: (candidates: readonly CanonicalCandidate[]) => CanonicalSelection;
+  readonly stats: () => CanonicalIndexStats;
+}
 
-  // Chain evidence = DISTINCT history stages, deduplicated by DEEP EQUALITY
-  // of the complete normalized history — not by raw member count (duplicate
-  // retransmits must not inflate a branch) and not by length alone
-  // (reminder-only evolution yields distinct histories of equal length that
-  // are real evidence of activity).
-  const distinctStages = (chain: Chain): number => {
-    const seen: Array<readonly JsonValue[]> = [];
-    for (const member of chain.members) {
-      const duplicate = seen.some((history) =>
-        history.length === member.normalized.length
-        && history.every((message, index) => deepEqual(message, member.normalized[index])));
-      if (!duplicate) seen.push(member.normalized);
+/** Prefix directions of a related pair, from the owning entry's perspective. */
+interface PairView {
+  readonly out: boolean;
+  readonly into: boolean;
+}
+
+/**
+ * Incremental canonical selection. Candidates are diffed by messages
+ * reference + context key: unchanged candidates keep their normalized
+ * history, stage stamp, and pairwise prefix relations, so a delta touching
+ * an open session costs O(changed x candidates) prefix evaluations instead
+ * of renormalizing and rescanning the whole session (the shipped-and-reviewed
+ * O(n^2) regression).
+ *
+ * ORDER INVARIANT: supersede contributions for a pair are applied when the
+ * pair is (re)computed and reversed on removal using CURRENT orders. That is
+ * sound because the grid contract preserves relative created order among
+ * retained flows — a reordered flow (remove + reinsert) always arrives as a
+ * changed candidate and gets its pairs recomputed.
+ */
+export function createCanonicalIndex(): CanonicalIndex {
+  const entries = new Map<string, IndexEntry>();
+  /** Sparse symmetric relation over related pairs only (some prefix holds). */
+  const rel = new Map<string, Map<string, PairView>>();
+  /** How many other entries supersede this one; tips have count 0. */
+  const supersededBy = new Map<string, number>();
+  /** Ids whose normalized messages are a prefix of this entry's (excl. self). */
+  const prefixesInto = new Map<string, Set<string>>();
+  interface StampGroup { readonly stamp: number; readonly history: readonly JsonValue[]; holders: number }
+  const stampsByLength = new Map<number, StampGroup[]>();
+  let nextStamp = 0;
+  let normalizations = 0;
+  let prefixEvaluations = 0;
+  let historyEquals = 0;
+  let selections = 0;
+  let lastSelection: CanonicalSelection | null = null;
+
+  const intern = (normalized: readonly JsonValue[]): number => {
+    const groups = stampsByLength.get(normalized.length) ?? [];
+    for (const group of groups) {
+      historyEquals += 1;
+      if (normalized.every((message, index) => deepEqual(message, group.history[index]))) {
+        group.holders += 1;
+        return group.stamp;
+      }
     }
-    return seen.length;
+    const group: StampGroup = { stamp: nextStamp, history: normalized, holders: 1 };
+    nextStamp += 1;
+    groups.push(group);
+    stampsByLength.set(normalized.length, groups);
+    return group.stamp;
   };
 
-  // (a) prefix dominance within a component, newer tip on ties.
-  const representative = (component: readonly Chain[]): Chain =>
-    component.reduce((best, chain) => {
-      const stages = distinctStages(chain);
-      const bestStages = distinctStages(best);
-      if (stages !== bestStages) return stages > bestStages ? chain : best;
-      return chain.tip.candidate.order < best.tip.candidate.order ? chain : best;
-    });
+  const releaseStamp = (entry: IndexEntry): void => {
+    const groups = stampsByLength.get(entry.normalized.length) ?? [];
+    const position = groups.findIndex((group) => group.stamp === entry.stamp);
+    if (position === -1) return;
+    groups[position].holders -= 1;
+    if (groups[position].holders === 0) groups.splice(position, 1);
+  };
 
-  // (b) newest tip across disjoint components.
-  let selected = representative(components[0]);
-  for (const component of components.slice(1)) {
-    const contender = representative(component);
-    if (contender.tip.candidate.order < selected.tip.candidate.order) selected = contender;
+  const applyPair = (a: IndexEntry, b: IndexEntry, view: PairView, sign: 1 | -1): void => {
+    const bump = (id: string) => supersededBy.set(id, (supersededBy.get(id) ?? 0) + sign);
+    if (view.out) {
+      const set = prefixesInto.get(b.id)!;
+      if (sign === 1) set.add(a.id);
+      else set.delete(a.id);
+      if (supersedes(a, b, true)) bump(a.id);
+    }
+    if (view.into) {
+      const set = prefixesInto.get(a.id)!;
+      if (sign === 1) set.add(b.id);
+      else set.delete(b.id);
+      if (supersedes(b, a, true)) bump(b.id);
+    }
+  };
+
+  const removeEntry = (entry: IndexEntry): void => {
+    for (const [otherId, view] of rel.get(entry.id)!) {
+      applyPair(entry, entries.get(otherId)!, view, -1);
+      rel.get(otherId)!.delete(entry.id);
+    }
+    rel.delete(entry.id);
+    prefixesInto.delete(entry.id);
+    supersededBy.delete(entry.id);
+    entries.delete(entry.id);
+    releaseStamp(entry);
+  };
+
+  const addEntry = (candidate: CanonicalCandidate): void => {
+    normalizations += 1;
+    const normalized = candidate.messages.map(normalizeMessage);
+    const entry: IndexEntry = { id: candidate.flowId, candidate, normalized, stamp: intern(normalized) };
+    const pairs = new Map<string, PairView>();
+    rel.set(entry.id, pairs);
+    prefixesInto.set(entry.id, new Set());
+    supersededBy.set(entry.id, 0);
+    for (const other of entries.values()) {
+      prefixEvaluations += 2;
+      const out = messagesArePrefix(normalized, other.normalized);
+      const into = messagesArePrefix(other.normalized, normalized);
+      if (!out && !into) continue;
+      const view: PairView = { out, into };
+      pairs.set(other.id, view);
+      rel.get(other.id)!.set(entry.id, { out: into, into: out });
+      applyPair(entry, other, view, 1);
+    }
+    entries.set(entry.id, entry);
+  };
+
+  interface Chain {
+    readonly tip: IndexEntry;
+    readonly members: readonly IndexEntry[];
   }
 
-  const members = [...selected.members].sort((left, right) =>
-    left.normalized.length - right.normalized.length || right.candidate.order - left.candidate.order);
+  /**
+   * TWO-LEVEL SELECTION POLICY — do not re-simplify to either half alone
+   * (each half was shipped solo once and each was a review-verified bug):
+   *
+   *  (a) WITHIN a shared-root component, chain evidence dominates: the chain
+   *      with more confirming members wins regardless of tip recency, so an
+   *      established `root -> main-1 -> main-2` thread beats a newer
+   *      `root -> auxiliary` branch. Equal evidence (equal member counts)
+   *      falls back to the newer tip, so a live branch beats a stale sibling.
+   *
+   *  (b) ACROSS disjoint components — no shared root, i.e. a post-compaction
+   *      restart — the newest tip wins: a shorter restarted history beats the
+   *      stale pre-compaction chain that mere member counting would keep.
+   */
+  const select = (): CanonicalSelection => {
+    selections += 1;
+    if (entries.size === 0) return { canonicalId: null, chainIds: [] };
+
+    // Maximal tips: requests that no other request extends. Non-consuming — a
+    // shared root is simply not a tip; it belongs to every branch's chain.
+    const chains: Chain[] = [];
+    for (const entry of entries.values()) {
+      if ((supersededBy.get(entry.id) ?? 0) !== 0) continue;
+      const members = [...prefixesInto.get(entry.id)!].map((id) => entries.get(id)!);
+      members.push(entry);
+      chains.push({ tip: entry, members });
+    }
+
+    // Group chains that share any member into components (transitively).
+    const components: Chain[][] = [];
+    for (const chain of chains) {
+      const memberIds = new Set(chain.members.map((member) => member.id));
+      const overlapping = components.filter((component) =>
+        component.some((other) => other.members.some((member) => memberIds.has(member.id))));
+      if (overlapping.length === 0) {
+        components.push([chain]);
+        continue;
+      }
+      const merged = overlapping[0];
+      merged.push(chain);
+      for (const extra of overlapping.slice(1)) {
+        merged.push(...extra);
+        components.splice(components.indexOf(extra), 1);
+      }
+    }
+
+    // Chain evidence = DISTINCT history stages (interned stamps: deep
+    // equality of the complete normalized history — duplicate retransmits
+    // never inflate a branch, while reminder-only evolution still counts)
+    // among members sharing the TIP'S REQUEST CONTEXT. A different-context
+    // member merely borrowed the history; counting it would let a one-off
+    // side-call inherit the main thread's evidence.
+    const stageCounts = new Map<Chain, number>();
+    const distinctStages = (chain: Chain): number => {
+      const cached = stageCounts.get(chain);
+      if (cached !== undefined) return cached;
+      const stamps = new Set<number>();
+      for (const member of chain.members) {
+        if (member.candidate.contextKey !== chain.tip.candidate.contextKey) continue;
+        stamps.add(member.stamp);
+      }
+      stageCounts.set(chain, stamps.size);
+      return stamps.size;
+    };
+
+    // (a) prefix dominance within a component, newer tip on ties.
+    const representative = (component: readonly Chain[]): Chain =>
+      component.reduce((best, chain) => {
+        const stages = distinctStages(chain);
+        const bestStages = distinctStages(best);
+        if (stages !== bestStages) return stages > bestStages ? chain : best;
+        return chain.tip.candidate.order < best.tip.candidate.order ? chain : best;
+      });
+
+    // (b) newest tip across disjoint components.
+    let selected = representative(components[0]);
+    for (const component of components.slice(1)) {
+      const contender = representative(component);
+      if (contender.tip.candidate.order < selected.tip.candidate.order) selected = contender;
+    }
+
+    // The rendered thread is the tip-context members only: a borrowed-history
+    // different-context member stays auxiliary.
+    const members = selected.members
+      .filter((member) => member.candidate.contextKey === selected.tip.candidate.contextKey)
+      .sort((left, right) =>
+        left.normalized.length - right.normalized.length || right.candidate.order - left.candidate.order);
+    return {
+      canonicalId: selected.tip.candidate.flowId,
+      chainIds: members.map((member) => member.candidate.flowId),
+    };
+  };
+
   return {
-    canonicalId: selected.tip.candidate.flowId,
-    chainIds: members.map((member) => member.candidate.flowId),
+    update(candidates) {
+      let structural = false;
+      let orderChanged = false;
+      const seen = new Set<string>();
+      for (const candidate of candidates) {
+        if (candidate.suggestion) continue;
+        seen.add(candidate.flowId);
+        const existing = entries.get(candidate.flowId);
+        if (existing !== undefined
+          && existing.candidate.messages === candidate.messages
+          && existing.candidate.contextKey === candidate.contextKey) {
+          if (existing.candidate.order !== candidate.order) orderChanged = true;
+          existing.candidate = candidate;
+          continue;
+        }
+        if (existing !== undefined) removeEntry(existing);
+        addEntry(candidate);
+        structural = true;
+      }
+      for (const entry of [...entries.values()]) {
+        if (seen.has(entry.id)) continue;
+        removeEntry(entry);
+        structural = true;
+      }
+      if (!structural && !orderChanged && lastSelection !== null) return lastSelection;
+      lastSelection = select();
+      return lastSelection;
+    },
+    stats: () => ({ normalizations, prefixEvaluations, historyEquals, selections }),
   };
+}
+
+/** One-shot canonical selection (tests, non-incremental callers). */
+export function selectCanonicalFlow(candidates: readonly CanonicalCandidate[]): CanonicalSelection {
+  return createCanonicalIndex().update(candidates);
 }
