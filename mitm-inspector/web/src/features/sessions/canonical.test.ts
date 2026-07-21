@@ -259,6 +259,17 @@ describe("selectCanonicalFlow", () => {
     expect(selection.chainIds).toEqual(["main"]);
   });
 
+  it("context regression: A/B/A chooses the newest owning-context tip", () => {
+    const mainKey = requestContextKey({ model: "claude-opus-4", system: "main" } as JsonValue);
+    const cloneKey = requestContextKey({ model: "claude-haiku-4", system: "side call" } as JsonValue);
+    const mainOld = candidate("main-old", [u1, a1], 2, false, mainKey);
+    const clone = candidate("clone", [u1, a1], 1, false, cloneKey);
+    const mainNew = candidate("main-new", [u1, a1], 0, false, mainKey);
+    const selection = selectCanonicalFlow([mainNew, clone, mainOld]);
+    expect(selection.canonicalId).toBe("main-new");
+    expect(selection.chainIds).toEqual(["main-old", "main-new"]);
+  });
+
   it("context regression: growing lineage survives A/B/C context evolution", () => {
     const keyA = requestContextKey({ model: "claude-opus-4", system: "A" } as JsonValue);
     const keyB = requestContextKey({ model: "claude-opus-4", system: "B" } as JsonValue);

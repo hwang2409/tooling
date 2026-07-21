@@ -298,6 +298,32 @@ describe("Workspace session-first navigation", () => {
     expect(container.querySelector(".packet-detail .json-tree")).not.toBeNull();
   });
 
+  it("manually renders a settled unparseable candidate in the raw inspector", async () => {
+    const malformed = sessionFlow("malformed-flow", {
+      started_at: "2026-01-01T00:00:30Z",
+      ended_at: "2026-01-01T00:00:40Z",
+      summary: {
+        kind: "anthropic_messages",
+        model: "claude-haiku-4",
+        message_count: "2",
+        preview: { source: "user_text", text: "opaque body" },
+      },
+    });
+    const { container } = await mountWorkspace(
+      stateOf([FLOWS[1], malformed]),
+      { ...DETAIL_BODIES, "malformed-flow": { request: "{malformed" } },
+    );
+    await click(sessionRows(container)[0]);
+    await settle();
+    await click(container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']"));
+    const option = container.querySelector<HTMLButtonElement>("[data-flow-id='malformed-flow']");
+    expect(option?.disabled).toBe(false);
+    await click(option);
+    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("manual");
+    expect(container.querySelector(".packet-detail .packet-text")?.textContent).toContain("{malformed");
+    expect(container.querySelector("[data-testid='conversation-view']")).toBeNull();
+  });
+
   it("resets manual source choice across source reconnect while SessionDetail stays mounted", async () => {
     const initial = stateOf(FLOWS);
     const { container, render } = await mountWorkspace(initial);

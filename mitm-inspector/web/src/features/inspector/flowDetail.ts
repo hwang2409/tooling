@@ -173,28 +173,41 @@ export function useFlowDetails(
   const requestsRef = useRef(requests);
   requestsRef.current = requests;
   const resultsRef = useRef(new Map<string, VersionedResult>());
+  const inFlightRef = useRef(new Map<string, { version: string; controller: AbortController }>());
   const [generation, setGeneration] = useState(0);
 
   useEffect(() => {
     const wanted = requestsRef.current;
     const wantedVersions = new Map(wanted.map((request) => [request.flowId, request.version]));
-    const controller = new AbortController();
-    let active = true;
-    for (const flowId of [...resultsRef.current.keys()]) {
-      if (!wantedVersions.has(flowId)) resultsRef.current.delete(flowId);
+    for (const [flowId, entry] of resultsRef.current) {
+      if (wantedVersions.get(flowId) !== entry.version) resultsRef.current.delete(flowId);
+    }
+    for (const [flowId, request] of inFlightRef.current) {
+      if (wantedVersions.get(flowId) === request.version) continue;
+      request.controller.abort();
+      inFlightRef.current.delete(flowId);
     }
     const record = (flowId: string, version: string, result: FlowDetailResult) => {
-      if (!active || wantedVersions.get(flowId) !== version) return;
+      if (inFlightRef.current.get(flowId)?.version !== version) return;
+      inFlightRef.current.delete(flowId);
+      if (requestsRef.current.find((request) => request.flowId === flowId)?.version !== version) return;
       resultsRef.current.set(flowId, { version, result });
       setGeneration((value) => value + 1);
     };
     for (const { flowId, version } of wanted) {
       const existing = resultsRef.current.get(flowId);
       if (existing !== undefined && existing.version === version) continue;
+      const inFlight = inFlightRef.current.get(flowId);
+      if (inFlight !== undefined && inFlight.version === version) continue;
+      const controller = new AbortController();
+      inFlightRef.current.set(flowId, { version, controller });
       loader(flowId, controller.signal)
         .then((result) => record(flowId, version, result))
         .catch((error: unknown) => {
-          if (controller.signal.aborted) return;
+          if (controller.signal.aborted) {
+            if (inFlightRef.current.get(flowId)?.version === version) inFlightRef.current.delete(flowId);
+            return;
+          }
           record(flowId, version, {
             status: "error",
             error: error instanceof Error ? error.message : "Flow detail request failed.",
@@ -202,10 +215,21 @@ export function useFlowDetails(
         });
     }
     return () => {
-      active = false;
-      controller.abort();
+      const latestVersions = new Map(requestsRef.current.map((request) => [request.flowId, request.version]));
+      for (const [flowId, request] of inFlightRef.current) {
+        if (latestVersions.get(flowId) === request.version) continue;
+        request.controller.abort();
+        inFlightRef.current.delete(flowId);
+      }
     };
   }, [key, loader]);
+
+  useEffect(() => () => {
+    for (const [flowId, request] of inFlightRef.current) {
+      request.controller.abort();
+      inFlightRef.current.delete(flowId);
+    }
+  }, []);
 
   return useMemo(() => {
     const view = new Map<string, FlowDetailResult>();

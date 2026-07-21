@@ -186,7 +186,10 @@ function SourcePicker({ flows, parsed, selection, renderedFlowId, settled, onSel
       {flows.map((flow, index) => {
         const candidate = parsedById.get(flow.flow_id);
         const marker = sourceMarker(flow, candidate, selection);
-        const disabled = !settled || candidate?.detail === null || candidate?.request === null;
+        // Settled malformed, unavailable, or error details remain selectable
+        // so PacketDetail can expose their raw inspector view. Only pending
+        // detail loads are temporarily unavailable as picker targets.
+        const disabled = !settled || candidate === undefined || candidate.detail === null;
         return (
           <button
             key={flow.flow_id}

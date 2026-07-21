@@ -476,6 +476,34 @@ export function createCanonicalIndex(): CanonicalIndex {
       return stamps.size;
     };
 
+    /**
+     * The terminal history stage owns an equal-history component. Repeated
+     * retransmits are evidence of that context's ownership; when contexts
+     * tie, the context that was established first wins the protection tie.
+     * This keeps a later A retransmit in an A/B/A sequence eligible to win,
+     * while a newer one-off B clone remains auxiliary.
+     */
+    const owningContext = (left: Chain, right: Chain): string => {
+      const terminalLength = left.tip.normalized.length;
+      const terminal = new Map<string, { count: number; oldestOrder: number }>();
+      const seen = new Set<string>();
+      for (const member of [...left.members, ...right.members]) {
+        if (member.normalized.length !== terminalLength || seen.has(member.id)) continue;
+        seen.add(member.id);
+        const context = member.candidate.contextKey ?? "";
+        const current = terminal.get(context);
+        if (current === undefined) terminal.set(context, { count: 1, oldestOrder: member.candidate.order });
+        else terminal.set(context, {
+          count: current.count + 1,
+          oldestOrder: Math.max(current.oldestOrder, member.candidate.order),
+        });
+      }
+      return [...terminal.entries()].reduce((best, entry) => {
+        if (entry[1].count !== best[1].count) return entry[1].count > best[1].count ? entry : best;
+        return entry[1].oldestOrder > best[1].oldestOrder ? entry : best;
+      })[0];
+    };
+
     // (a) prefix dominance within a component, newer tip on ties.
     const representative = (component: readonly Chain[]): Chain =>
       component.reduce((best, chain) => {
@@ -485,9 +513,15 @@ export function createCanonicalIndex(): CanonicalIndex {
         if ((chain.tip.stamp === best.tip.stamp
           || historiesAreEquivalent(chain.tip.normalized, best.tip.normalized))
           && chain.tip.candidate.contextKey !== best.tip.candidate.contextKey) {
-          // Equal-history different-context calls are not continuations. If
-          // pruning leaves one established stage, retain older thread rather
-          // than letting a newer borrowing clone win the tie.
+          // Equal-history different-context calls are not continuations. The
+          // terminal stage's owning context wins; recency then chooses the
+          // newest tip within that context instead of freezing the oldest tip.
+          const owner = owningContext(chain, best);
+          const chainOwns = (chain.tip.candidate.contextKey ?? "") === owner;
+          const bestOwns = (best.tip.candidate.contextKey ?? "") === owner;
+          if (chainOwns !== bestOwns) return chainOwns ? chain : best;
+          // If both tips are in the owner context, ordinary recency below
+          // selects the newest owning retransmit.
           return chain.tip.candidate.order > best.tip.candidate.order ? chain : best;
         }
         return chain.tip.candidate.order < best.tip.candidate.order ? chain : best;
