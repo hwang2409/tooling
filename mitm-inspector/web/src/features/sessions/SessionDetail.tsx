@@ -272,7 +272,23 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
   const [pickerOpen, setPickerOpen] = useState(false);
   const [viewMode, setViewMode] = useState<"conversation" | "raw">("conversation");
   const sourceButtonRef = useRef<HTMLButtonElement | null>(null);
+  const sourceControlRef = useRef<HTMLDivElement | null>(null);
   const effectiveMode: SessionMode = candidates.length === 0 ? "flows" : mode;
+
+  // Outside-click dismissal for the kebab popup: a pointerdown outside the
+  // control (button + popup) closes it. Attached only while open so we don't
+  // leak listeners across mounts. Escape lives inside SourcePicker where the
+  // focus is captured.
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target !== null && sourceControlRef.current?.contains(target)) return;
+      setPickerOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [pickerOpen]);
 
   // Manual choice belongs only to this session incarnation. A source reset can
   // reuse flow ids, so sourceEpoch is part of the reset boundary.
@@ -414,11 +430,12 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
               >flows</button>
             </div>
             {showKebab ? (
-              <div className="session-source-control">
+              <div className="session-source-control" ref={sourceControlRef}>
                 <button
                   type="button"
                   ref={sourceButtonRef}
                   className="session-source-toggle"
+                  aria-haspopup="dialog"
                   aria-expanded={pickerOpen}
                   aria-controls="session-source-picker"
                   aria-label={

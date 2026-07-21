@@ -388,6 +388,38 @@ describe("Workspace session-first navigation", () => {
     expect(document.activeElement).toBe(source);
   });
 
+  it("kebab button declares aria-haspopup and toggles aria-expanded on open/close", async () => {
+    const { container } = await mountWorkspace(stateOf(FLOWS));
+    await click(sessionRows(container)[0]);
+    await settle();
+    const source = container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']");
+    expect(source?.getAttribute("aria-haspopup")).toBe("dialog");
+    expect(source?.getAttribute("aria-expanded")).toBe("false");
+    await click(source);
+    expect(source?.getAttribute("aria-expanded")).toBe("true");
+    await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(source?.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("closes the kebab popup on outside pointerdown but keeps it open on inside interaction", async () => {
+    const { container } = await mountWorkspace(stateOf(FLOWS));
+    await click(sessionRows(container)[0]);
+    await settle();
+    const source = container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']");
+    await click(source);
+    expect(container.querySelector("#session-source-picker")).not.toBeNull();
+
+    // pointerdown INSIDE the popup must not close it.
+    const insideTarget = container.querySelector<HTMLButtonElement>("#session-source-picker [data-testid='session-view-mode']");
+    await act(async () => insideTarget?.dispatchEvent(new Event("pointerdown", { bubbles: true })));
+    expect(container.querySelector("#session-source-picker")).not.toBeNull();
+
+    // pointerdown OUTSIDE the control closes it.
+    await act(async () => document.body.dispatchEvent(new Event("pointerdown", { bubbles: true })));
+    expect(container.querySelector("#session-source-picker")).toBeNull();
+    expect(source?.getAttribute("aria-expanded")).toBe("false");
+  });
+
   it("keeps the per-session flow grid one toggle away and navigates back home", async () => {
     const { container } = await mountWorkspace(stateOf(FLOWS));
     await click(sessionRows(container)[0]);
