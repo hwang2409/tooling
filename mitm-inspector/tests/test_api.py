@@ -61,7 +61,9 @@ from mitm_inspector.detail_limits import (
 from mitm_inspector.protocol import (
     MAX_U64,
     ProtocolError,
+    _trusted_parsed_message_to_plain_json,
     parse_message,
+    parsed_message_to_plain_json,
 )
 from mitm_inspector.store.memory import MemoryStore
 from mitm_inspector.store.sqlite import SearchCancelled, SQLiteFlowStorage
@@ -699,6 +701,43 @@ def test_flow_detail_returns_full_messages_oldest_first() -> None:
     assert SECRET_BODY_B64 in detail_text
     assert application.flow_detail_text("missing-flow") is None
     assert application.flow_detail_text("") is None
+
+
+def test_trusted_serializer_matches_public_serializer_for_validated_message() -> None:
+    parsed = parse_message(metadata_message(request_body=captured_body()))
+    assert _trusted_parsed_message_to_plain_json(parsed) == parsed_message_to_plain_json(parsed)
+
+
+def test_flow_detail_from_messages_revalidates_hostile_wrapper() -> None:
+    parsed = parse_message(metadata_message(request_body=captured_body()))
+    assert hasattr(parsed, "message")
+    hostile = parsed_message_to_plain_json(parsed)
+    body = hostile["metadata"]["request_body"]
+    assert isinstance(body, dict)
+    body["data"] = "not-valid-base64"
+    object.__setattr__(parsed, "_message", hostile)
+
+    with pytest.raises(ProtocolError):
+        make_application().flow_detail_text_from_messages("flow-1", [parsed])
+
+
+def test_flow_detail_index_sorts_coalesced_replacement_by_order() -> None:
+    application = make_application()
+    application.ingest(body_chunk_message())
+    chunk_one = body_chunk_message()
+    chunk_one["chunk_index"] = "1"
+    application.ingest(chunk_one)
+    # Replacing chunk zero keeps its list slot but gives it the newest order.
+    application.ingest(body_chunk_message())
+
+    detail_text = application.flow_detail_text("flow-1")
+    assert detail_text is not None
+    chunks = [
+        message["chunk_index"]
+        for message in json.loads(detail_text)["messages"]
+        if message["type"] == "body.chunk"
+    ]
+    assert chunks == ["1", "0"]
 
 
 # -- http wire -------------------------------------------------------------

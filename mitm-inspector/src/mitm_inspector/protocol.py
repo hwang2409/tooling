@@ -438,7 +438,7 @@ def parsed_message_to_plain_json(value: object) -> PlainJsonObject:
     return _copy_plain_object(canonical.payload, label="payload")
 
 
-def trusted_parsed_message_to_plain_json(value: ParsedMessageResult) -> PlainJsonObject:
+def _trusted_parsed_message_to_plain_json(value: ParsedMessageResult) -> PlainJsonObject:
     """Copy a message that already crossed the protocol boundary.
 
     Store reads return immutable wrappers created by ``parse_message``. The

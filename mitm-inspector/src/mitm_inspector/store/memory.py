@@ -288,7 +288,13 @@ class MemoryStore:
         record = self._flows.get(flow_id)
         if record is None:
             return ()
-        return tuple(stored.message for stored in record.messages if stored.active)
+        return tuple(
+            stored.message
+            for stored in sorted(
+                (stored for stored in record.messages if stored.active),
+                key=lambda stored: stored.order,
+            )
+        )
 
     def flow_ids_newest_first(self) -> tuple[str, ...]:
         """Return retained flow ids by stable reverse insertion order."""
