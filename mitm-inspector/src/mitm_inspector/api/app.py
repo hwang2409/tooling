@@ -31,6 +31,7 @@ from mitm_inspector.protocol import (
     ParsedMessage,
     ParsedMessageResult,
     ProtocolError,
+    _trusted_parsed_message_to_plain_json,
     parse_message,
     parsed_message_to_plain_json,
     require_parsed_message,
@@ -396,14 +397,18 @@ class ApiApplication:
         if type(flow_id) is not str or not flow_id:
             return None
         messages: list[PlainJsonObject] = []
-        for parsed in self._store.newest_first():
+        # The store already indexes messages by flow. Scanning and sorting the
+        # complete retained history here made every detail request O(all
+        # retained messages), then revalidated each selected body a second
+        # time while serializing it. This is an internal store read, so copy
+        # the immutable parsed messages without repeating protocol validation.
+        for parsed in self._store.trusted_flow_messages(flow_id):
             payload = self._payload_of(parsed)
             if self._message_flow_id(payload) != flow_id:
                 continue
-            messages.append(parsed_message_to_plain_json(parsed))
+            messages.append(_trusted_parsed_message_to_plain_json(parsed))
         if not messages:
             return None
-        messages.reverse()
         return self._flow_detail_text_from_plain_messages(flow_id, messages)
 
     def flow_detail_text_from_messages(
@@ -430,13 +435,31 @@ class ApiApplication:
         if self._storage is None:
             return None
         messages = self._storage.flow_messages(flow_id)
-        detail = self.flow_detail_text_from_messages(flow_id, messages)
+        detail = self._flow_detail_text_from_trusted_messages(flow_id, messages)
         if detail is None:
             return None
         encoded = detail.encode("utf-8")
         if len(encoded) > MAX_DURABLE_DETAIL_OUTPUT_BYTES:
             raise FlowDetailTooLarge
         return encoded
+
+    def _flow_detail_text_from_trusted_messages(
+        self,
+        flow_id: str,
+        parsed_messages: Sequence[ParsedMessageResult],
+    ) -> str | None:
+        """Render messages read from the already-validated SQLite boundary."""
+
+        if type(flow_id) is not str or not flow_id:
+            return None
+        messages = [
+            _trusted_parsed_message_to_plain_json(parsed)
+            for parsed in parsed_messages
+            if self._message_flow_id(self._payload_of(parsed)) == flow_id
+        ]
+        if not messages:
+            return None
+        return self._flow_detail_text_from_plain_messages(flow_id, messages)
 
     def _flow_detail_text_from_plain_messages(
         self,

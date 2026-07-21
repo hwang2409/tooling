@@ -438,6 +438,24 @@ def parsed_message_to_plain_json(value: object) -> PlainJsonObject:
     return _copy_plain_object(canonical.payload, label="payload")
 
 
+def _trusted_parsed_message_to_plain_json(value: ParsedMessageResult) -> PlainJsonObject:
+    """Copy a message that already crossed the protocol boundary.
+
+    Store reads return immutable wrappers created by ``parse_message``. The
+    normal transport helper intentionally revalidates arbitrary wrappers, but
+    doing that again for a selected flow repeats base64 validation over the
+    entire retained body. This narrower helper is only for those trusted
+    internal reads; untrusted transport inputs must use
+    ``parsed_message_to_plain_json``.
+    """
+
+    if isinstance(value, KnownParsedMessage):
+        return _copy_plain_object(value.message, label="message")
+    if isinstance(value, OpaqueParsedMessage):
+        return _copy_plain_object(value.payload, label="payload")
+    raise ProtocolError("message must be a parsed wrapper")
+
+
 def _copy_plain_json(
     value: object,
     *,
