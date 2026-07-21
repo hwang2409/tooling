@@ -144,10 +144,13 @@ describe("createSessionIndex", () => {
     expect(afterDelta.sessionsRecomputed - afterRebuild.sessionsRecomputed).toBe(1);
     expect(second.find((session) => session.key === "sess-3"))
       .toBe(first.find((session) => session.key === "sess-3"));
-    // Order maintenance is two binary searches repositioning ONE key —
-    // bounded by O(log sessions), never a scan of all 20 sessions.
-    expect(afterDelta.orderVisits - afterRebuild.orderVisits)
-      .toBeLessThanOrEqual(2 * (Math.ceil(Math.log2(sessionCount)) + 2));
+    // Order maintenance is two binary searches repositioning ONE key. The
+    // POSITIVE lower bound proves the instrumented incremental path actually
+    // ran (a full-sort revert records zero visits and fails it); the upper
+    // bound proves it stays O(log sessions), never a 20-session scan.
+    const orderWork = afterDelta.orderVisits - afterRebuild.orderVisits;
+    expect(orderWork).toBeGreaterThanOrEqual(2 + 2 * Math.floor(Math.log2(sessionCount)));
+    expect(orderWork).toBeLessThanOrEqual(2 * (Math.ceil(Math.log2(sessionCount)) + 2));
     expect(second[0].key).toBe("sess-7");
     expect(second[0].flowCount).toBe(2);
     expect(second).toHaveLength(sessionCount);
@@ -179,6 +182,46 @@ describe("createSessionIndex", () => {
     expect(afterOne.find((session) => session.key === "bbbb")?.flowCount).toBe(1);
     const afterSession = index.update(collectionOf([a1]), delta(3, ["b2"]));
     expect(afterSession.map((session) => session.key)).toEqual(["aaaa"]);
+  });
+
+  it("pins deduplicated final-grid-order changed ids: upsert A, upsert B, remove A, upsert A", () => {
+    const boot = [
+      {
+        protocol_version: "1", type: "source.hello", source_id: "source-a",
+        occurred_at: "2026-01-01T00:00:00Z",
+        capabilities: { body_chunks: true, redaction: "headers-and-query" },
+        limits: { max_body_prefix_bytes: "1048576", max_in_memory_bytes: "134217728" },
+      },
+      { protocol_version: "1", type: "browser.snapshot", snapshot_id: "snap-1", cursor: "1", flows: [] },
+    ].reduce<BrowserState>(
+      (current, message) => browserReducer(current, { type: "protocol", envelope: parseProtocolMessage(message) }),
+      initialBrowserState,
+    );
+    const index = createSessionIndex();
+    index.update(boot.flows, boot.flowsUpdate);
+
+    const message = {
+      protocol_version: "1", type: "browser.delta", cursor: "2",
+      changes: [
+        { op: "upsert", flow: flow("a-flow", { session: "aaaa" }) },
+        { op: "upsert", flow: flow("b-flow", { session: "bbbb" }) },
+        { op: "remove", flow_id: "a-flow" },
+        { op: "upsert", flow: flow("a-flow", { session: "aaaa" }) },
+      ],
+    };
+    const state = browserReducer(boot, { type: "protocol", envelope: parseProtocolMessage(message) });
+    // The grid ends as [B, A]: A's first upsert was removed mid-delta and A
+    // was reinserted after B. Raw message.changes ids would report the
+    // duplicated [A, B, A] — the published contract is deduplicated ids in
+    // FINAL grid order.
+    expect(state.flows.ids).toEqual(["b-flow", "a-flow"]);
+    expect(state.flowsUpdate.changedFlowIds).toEqual(["b-flow", "a-flow"]);
+    expect(state.flowsUpdate.prependedCount).toBe(2);
+
+    const incremental = index.update(state.flows, state.flowsUpdate);
+    const scratch = deriveSessions(state.flows.entries);
+    expect(incremental.map((session) => session.key)).toEqual(["bbbb", "aaaa"]);
+    expect(incremental.map((session) => session.key)).toEqual(scratch.map((session) => session.key));
   });
 
   it("matches from-scratch derivation across randomized reducer-driven deltas", () => {

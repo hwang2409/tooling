@@ -4,6 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#ffffff" />
+    <!-- Captured traffic is attacker-controlled: never let rendered content
+         phone home. data: is required for inline captured image payloads. -->
+    <meta http-equiv="Content-Security-Policy" content="img-src 'self' data:" />
+
     <title>mitm-inspector</title>
   </head>
   <body>

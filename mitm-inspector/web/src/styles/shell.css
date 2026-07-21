@@ -75,7 +75,7 @@
 .md a { color: var(--ink); text-decoration: underline; text-underline-offset: 2px; }
 .md blockquote { margin: 4px 0; padding: 2px 8px; border-left: 3px solid var(--line-dark); color: var(--muted); }
 .md hr { margin: 8px 0; border: 0; border-top: 1px solid var(--line); }
-.md img { max-width: min(320px, 100%); max-height: 240px; object-fit: contain; }
+.md-img { padding: 0 3px; color: var(--muted); background: var(--paper-deep); border: 1px solid var(--line); border-radius: 2px; font-family: var(--font-mono); overflow-wrap: anywhere; }
 
 @media (max-width: 800px) {
   .session-row { grid-template-columns: 62px minmax(0, 70px) 30px minmax(0, 1fr) 56px; gap: 6px; }

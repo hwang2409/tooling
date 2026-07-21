@@ -149,7 +149,12 @@ export function createSessionIndex(): SessionIndex {
   const removeOrdered = (key: SessionKey, max: number): void => {
     orderVisits += 1;
     let index = locate(max);
-    if (orderedKeys[index] !== key) index = orderedKeys.indexOf(key);
+    if (orderedKeys[index] !== key) {
+      // Defensive linear fallback — instrumented so any degradation to
+      // scanning shows up in the pinned work counts.
+      orderVisits += orderedKeys.length;
+      index = orderedKeys.indexOf(key);
+    }
     if (index === -1) return;
     orderedKeys.splice(index, 1);
     orderedSummaries.splice(index, 1);

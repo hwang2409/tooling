@@ -99,9 +99,24 @@ function isReminderMarkup(text: string): boolean {
   if (rest.length === 0) return false;
   while (rest.length > 0) {
     if (!rest.startsWith(REMINDER_OPEN)) return false;
-    const close = rest.indexOf(REMINDER_CLOSE, REMINDER_OPEN.length);
-    if (close === -1) return false;
-    rest = rest.slice(close + REMINDER_CLOSE.length).trimStart();
+    // Balanced scan: every nested open tag must close before the element
+    // ends, otherwise "<system-reminder>outer <system-reminder>inner
+    // </system-reminder>" would count as complete despite the unclosed outer.
+    let depth = 1;
+    let position = REMINDER_OPEN.length;
+    while (depth > 0) {
+      const nextOpen = rest.indexOf(REMINDER_OPEN, position);
+      const nextClose = rest.indexOf(REMINDER_CLOSE, position);
+      if (nextClose === -1) return false;
+      if (nextOpen !== -1 && nextOpen < nextClose) {
+        depth += 1;
+        position = nextOpen + REMINDER_OPEN.length;
+      } else {
+        depth -= 1;
+        position = nextClose + REMINDER_CLOSE.length;
+      }
+    }
+    rest = rest.slice(position).trimStart();
   }
   return true;
 }
@@ -209,12 +224,18 @@ export function selectCanonicalFlow(candidates: readonly CanonicalCandidate[]): 
     }
   }
 
+  // Chain evidence = DISTINCT history stages, not raw member count: all
+  // members are prefixes of the tip, so equal-length members are the same
+  // stage and duplicate retransmits must not inflate a branch's weight.
+  const distinctStages = (chain: Chain): number =>
+    new Set(chain.members.map((member) => member.normalized.length)).size;
+
   // (a) prefix dominance within a component, newer tip on ties.
   const representative = (component: readonly Chain[]): Chain =>
     component.reduce((best, chain) => {
-      if (chain.members.length !== best.members.length) {
-        return chain.members.length > best.members.length ? chain : best;
-      }
+      const stages = distinctStages(chain);
+      const bestStages = distinctStages(best);
+      if (stages !== bestStages) return stages > bestStages ? chain : best;
       return chain.tip.candidate.order < best.tip.candidate.order ? chain : best;
     });
 

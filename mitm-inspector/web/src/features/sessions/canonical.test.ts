@@ -60,6 +60,25 @@ describe("message normalization and prefix matching", () => {
     expect(messageMatches(earlier, appended("please also check the logs"))).toBe(false);
   });
 
+  it("rejects unbalanced nested reminder markup, accepts balanced nesting", () => {
+    const earlier = normalizeMessage(toolResult("t1", "ok"));
+    const appended = (text: string) => normalizeMessage({
+      role: "user",
+      content: [
+        { type: "tool_result", tool_use_id: "t1", content: "ok" },
+        { type: "text", text },
+      ],
+    } as JsonValue);
+    // Reviewer probe: inner close must not satisfy the unclosed outer open.
+    expect(messageMatches(earlier, appended(
+      "<system-reminder>outer <system-reminder>inner</system-reminder>",
+    ))).toBe(false);
+    // Fully balanced nesting is complete markup.
+    expect(messageMatches(earlier, appended(
+      "<system-reminder>outer <system-reminder>inner</system-reminder> tail</system-reminder>",
+    ))).toBe(true);
+  });
+
   it("rejects incomplete or padded reminder markup as injection", () => {
     const earlier = normalizeMessage(toolResult("t1", "ok"));
     const appended = (text: string) => normalizeMessage({
@@ -136,6 +155,20 @@ describe("selectCanonicalFlow", () => {
     const selection = selectCanonicalFlow([stale1, stale2, stale3, restartRoot, restartTip]);
     expect(selection.canonicalId).toBe("s2");
     expect(selection.chainIds).toEqual(["s1", "s2"]);
+  });
+
+  it("duplicate retransmits do not inflate branch evidence: distinct stages decide", () => {
+    // The auxiliary branch has three MEMBERS (root + two identical
+    // retransmits) but only two distinct history stages; the main chain has
+    // three stages. Raw member counting would tie 3-3 and hand the win to
+    // the newer auxiliary tip.
+    const root = candidate("root", [u1], 6);
+    const main1 = candidate("main-1", [u1, a1], 4);
+    const main2 = candidate("main-2", [u1, a1, chainEnd], 3);
+    const auxOld = candidate("aux-old", [u1, assistant("side quest")], 2);
+    const auxNew = candidate("aux-new", [u1, assistant("side quest")], 0);
+    const selection = selectCanonicalFlow([root, main1, main2, auxOld, auxNew]);
+    expect(selection.canonicalId).toBe("main-2");
   });
 
   it("never selects a suggestion-mode request even when it is the newest and longest", () => {
