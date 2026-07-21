@@ -1,4 +1,4 @@
-"""Loopback asyncio HTTP/WebSocket server and capture ingest listener.
+"""Loopback asyncio HTTP server and capture ingest listener.
 
 ``python -m mitm_inspector.api.server`` accepts exactly the argv contract
 reserved by the runtime boundary.  The HTTP surface binds a loopback TCP
@@ -23,30 +23,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from mitm_inspector.api.app import (
-    SUBSCRIBER_QUEUE_FRAMES,
-    ApiApplication,
-    FlowDetailTooLarge,
-    Subscriber,
-)
+from mitm_inspector.api.app import ApiApplication, FlowDetailTooLarge
 from mitm_inspector.api.httpwire import (
     MAX_REQUEST_HEAD_BYTES,
-    WEBSOCKET_VERSION,
-    Close,
-    FrameDecoder,
     HttpWireError,
-    Ping,
-    Pong,
-    RequestHead,
-    TextMessage,
-    WebSocketWireError,
-    encode_close_frame,
-    encode_pong_frame,
-    encode_text_frame,
     is_loopback_host_header,
-    is_loopback_origin,
     parse_request_head,
-    websocket_accept_key,
 )
 from mitm_inspector.api.limits import (
     MAX_INGEST_BODY_PREFIX_BYTES,
@@ -67,11 +49,10 @@ from mitm_inspector.store.sqlite import (
 API_VERSION_PREFIX = "/api/v1"
 HEALTH_PATH = f"{API_VERSION_PREFIX}/health"
 COUNTERS_PATH = f"{API_VERSION_PREFIX}/counters"
-SNAPSHOT_PATH = f"{API_VERSION_PREFIX}/snapshot"
-STREAM_PATH = f"{API_VERSION_PREFIX}/stream"
+SESSIONS_PATH = f"{API_VERSION_PREFIX}/sessions"
+SESSION_PATH_PREFIX = f"{SESSIONS_PATH}/"
 SEARCH_PATH = f"{API_VERSION_PREFIX}/search"
 FLOW_PATH_PREFIX = f"{API_VERSION_PREFIX}/flows/"
-MAX_CLIENT_MESSAGE_BYTES = 64 * 1024
 HEAD_READ_TIMEOUT_SECONDS = 10.0
 DEFAULT_SWEEP_INTERVAL_SECONDS = 5.0
 
@@ -80,8 +61,8 @@ _LOOPBACK_NAMES = frozenset({"localhost"})
 
 _INDEX_BODY = (
     b"<!doctype html><title>mitm-inspector</title>"
-    b"<p>mitm-inspector local API. The browser UI connects to "
-    b"<code>/api/v1/stream</code>.</p>"
+    b"<p>mitm-inspector local API. The browser UI reads captured sessions "
+    b"over HTTP.</p>"
 )
 
 
@@ -151,9 +132,7 @@ class ApiServerConfig:
         if self.max_body_prefix_bytes > self.max_body_bytes:
             raise ApiServerError("max_body_prefix_bytes cannot exceed max_body_bytes")
         if self.max_body_prefix_bytes > MAX_INGEST_BODY_PREFIX_BYTES:
-            raise ApiServerError(
-                "max_body_prefix_bytes exceeds the bounded ingest line capacity"
-            )
+            raise ApiServerError("max_body_prefix_bytes exceeds the bounded ingest line capacity")
         if self.capture_socket is not None:
             path = self.capture_socket
             if not isinstance(path, Path) or not path.is_absolute():
@@ -245,7 +224,6 @@ class ApiServer:
         self._rejected_ingest_lines = 0
         self._ingest_connections = 0
         self._http_requests = 0
-        self._websocket_connections = 0
         self._sweep_failures = 0
         self._search_guard = asyncio.Lock()
         self._search_cancel: threading.Event | None = None
@@ -257,7 +235,6 @@ class ApiServer:
         counters["rejected_ingest_lines"] = self._rejected_ingest_lines
         counters["ingest_connections"] = self._ingest_connections
         counters["http_requests"] = self._http_requests
-        counters["websocket_connections"] = self._websocket_connections
         counters["sweep_failures"] = self._sweep_failures
         return counters
 
@@ -286,9 +263,7 @@ class ApiServer:
                 info = os.lstat(path)
                 if not stat.S_ISSOCK(info.st_mode):
                     await self._close_http()
-                    raise ApiServerError(
-                        f"capture endpoint exists and is not a socket: {path}"
-                    )
+                    raise ApiServerError(f"capture endpoint exists and is not a socket: {path}")
                 path.unlink()
             try:
                 self._ingest_server = await asyncio.start_unix_server(
@@ -323,14 +298,12 @@ class ApiServer:
                 pass
             self._sweep_task = None
         servers = [
-            server
-            for server in (self._ingest_server, self._http_server)
-            if server is not None
+            server for server in (self._ingest_server, self._http_server) if server is not None
         ]
         for server in servers:
             server.close()
         # Server.wait_closed() waits for every active connection handler on
-        # Python 3.12.1+, so a connected WebSocket client or ingest producer
+        # Python 3.12.1+, so a connected HTTP or ingest producer
         # would stall shutdown forever.  Abort live transports and re-check:
         # a connection accepted in the same tick may have a handler that has
         # not run yet, so it is not in the snapshot; handlers observe
@@ -409,7 +382,7 @@ class ApiServer:
             self._connections.discard(writer)
             await _close_writer(writer)
 
-    # -- HTTP and WebSocket ------------------------------------------------
+    # -- HTTP ---------------------------------------------------------------
 
     async def _handle_http_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -449,10 +422,6 @@ class ApiServer:
                 if head.method != "GET":
                     await self._send_simple(writer, 405, b"only GET is supported")
                     return
-                target_path = head.target.split("?", 1)[0]
-                if target_path == STREAM_PATH:
-                    await self._handle_websocket(head, reader, writer)
-                    return
             except HttpWireError:
                 await self._send_simple(writer, 400, b"malformed request")
                 return
@@ -480,9 +449,15 @@ class ApiServer:
             body = json.dumps(self.counters, separators=(",", ":")).encode("utf-8")
             await self._send_response(writer, 200, "application/json", body)
             return
-        if path == SNAPSHOT_PATH:
-            body = self.application.snapshot_text().encode("utf-8")
-            await self._send_response(writer, 200, "application/json", body)
+        if path == SESSIONS_PATH:
+            await self._handle_sessions(split_target.query, writer)
+            return
+        if path.startswith(SESSION_PATH_PREFIX):
+            session_id = path[len(SESSION_PATH_PREFIX) :]
+            if not _FLOW_ID_SEGMENT.fullmatch(session_id):
+                await self._send_simple(writer, 404, b"unknown session")
+                return
+            await self._handle_session_detail(session_id, writer)
             return
         if path == SEARCH_PATH:
             try:
@@ -551,135 +526,42 @@ class ApiServer:
             return
         await self._send_simple(writer, 404, b"unknown path")
 
-    async def _handle_websocket(
-        self,
-        head: RequestHead,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-    ) -> None:
+    async def _handle_sessions(self, query: str, writer: asyncio.StreamWriter) -> None:
         try:
-            upgrade = head.single_header("upgrade")
-            version = head.single_header("sec-websocket-version")
-            key = head.single_header("sec-websocket-key")
-            origin = head.single_header("origin")
-        except HttpWireError:
-            await self._send_simple(writer, 400, b"malformed websocket handshake")
+            parameters = parse_qs(query, keep_blank_values=True)
+            limit_values = parameters.get("limit", [])
+            before_values = parameters.get("before", [])
+            if len(limit_values) > 1 or len(before_values) > 1:
+                raise ValueError
+            limit = 100 if not limit_values else int(limit_values[0])
+            before = before_values[0] if before_values else None
+            if not 1 <= limit <= 200:
+                raise ValueError
+        except ValueError:
+            await self._send_simple(writer, 400, b"limit and before must be valid")
             return
-        if (
-            upgrade is None
-            or upgrade.lower() != "websocket"
-            or "upgrade" not in head.token_list("connection")
-            or version != WEBSOCKET_VERSION
-            or key is None
-        ):
-            await self._send_simple(writer, 400, b"malformed websocket handshake")
-            return
-        if origin is not None and not is_loopback_origin(origin):
-            await self._send_simple(writer, 403, b"origin is not loopback")
-            return
-        try:
-            accept = websocket_accept_key(key)
-        except WebSocketWireError:
-            await self._send_simple(writer, 400, b"malformed websocket key")
-            return
-        writer.write(
-            b"HTTP/1.1 101 Switching Protocols\r\n"
-            b"Upgrade: websocket\r\n"
-            b"Connection: Upgrade\r\n"
-            b"Sec-WebSocket-Accept: " + accept.encode("ascii") + b"\r\n\r\n"
+        if self._storage is None:
+            payload = {"sessions": []}
+        else:
+            payload = {
+                "sessions": await asyncio.to_thread(self._storage.session_summaries, limit, before)
+            }
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        await self._send_response(writer, 200, "application/json", body)
+
+    async def _handle_session_detail(self, session_id: str, writer: asyncio.StreamWriter) -> None:
+        detail = (
+            None
+            if self._storage is None
+            else await asyncio.to_thread(self._storage.session_detail, session_id)
         )
-        await writer.drain()
-        self._websocket_connections += 1
-        await self._run_websocket_session(reader, writer)
-
-    async def _run_websocket_session(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
-        queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=SUBSCRIBER_QUEUE_FRAMES)
-
-        def deliver(text: str) -> bool:
-            try:
-                queue.put_nowait(encode_text_frame(text))
-            except asyncio.QueueFull:
-                return False
-            return True
-
-        def on_drop() -> None:
-            # Waking the transport closes both session tasks; the client
-            # reconnects and receives a coherent fresh snapshot.
-            writer.close()
-
-        subscriber = self.application.subscribe(deliver, on_drop=on_drop)
-        if subscriber.closed:
-            await _close_writer(writer)
+        if detail is None:
+            await self._send_simple(writer, 404, b"unknown session")
             return
-        pump = asyncio.get_running_loop().create_task(self._pump_frames(queue, writer))
-        close_frame = encode_close_frame(1000)
-        try:
-            close_frame = await self._read_websocket(reader, queue, subscriber)
-        finally:
-            self.application.unsubscribe(subscriber)
-            pump.cancel()
-            try:
-                await pump
-            except asyncio.CancelledError:
-                pass
-            try:
-                writer.write(close_frame)
-                await writer.drain()
-            except (ConnectionError, RuntimeError):
-                pass
+        body = json.dumps(detail, separators=(",", ":")).encode("utf-8")
+        await self._send_response(writer, 200, "application/json", body)
 
-    async def _read_websocket(
-        self,
-        reader: asyncio.StreamReader,
-        queue: asyncio.Queue[bytes],
-        subscriber: Subscriber,
-    ) -> bytes:
-        decoder = FrameDecoder(max_message_bytes=MAX_CLIENT_MESSAGE_BYTES)
-        while True:
-            data = await reader.read(4096)
-            if not data:
-                return encode_close_frame(1001)
-            try:
-                events = decoder.feed(data)
-            except WebSocketWireError:
-                return encode_close_frame(1002)
-            for event in events:
-                if isinstance(event, Close):
-                    return encode_close_frame(1000)
-                if isinstance(event, Ping):
-                    try:
-                        queue.put_nowait(encode_pong_frame(event.payload))
-                    except asyncio.QueueFull:
-                        return encode_close_frame(1013)
-                    continue
-                if isinstance(event, Pong):
-                    continue
-                if isinstance(event, TextMessage):
-                    try:
-                        value = parse_ingest_line(event.text.encode("utf-8"))
-                        frames = self.application.handle_client_message(value)
-                    except ValueError:
-                        return encode_close_frame(1002)
-                    for frame in frames:
-                        if not deliverable(subscriber, queue, frame):
-                            return encode_close_frame(1013)
-
-    async def _pump_frames(
-        self, queue: asyncio.Queue[bytes], writer: asyncio.StreamWriter
-    ) -> None:
-        try:
-            while True:
-                frame = await queue.get()
-                writer.write(frame)
-                await writer.drain()
-        except (ConnectionError, RuntimeError):
-            return
-
-    async def _send_simple(
-        self, writer: asyncio.StreamWriter, status: int, body: bytes
-    ) -> None:
+    async def _send_simple(self, writer: asyncio.StreamWriter, status: int, body: bytes) -> None:
         await self._send_response(writer, status, "text/plain; charset=utf-8", body)
 
     async def _send_response(
@@ -711,18 +593,6 @@ class ApiServer:
             await writer.drain()
         except (ConnectionError, RuntimeError):
             pass
-
-
-def deliverable(subscriber: Subscriber, queue: asyncio.Queue[bytes], text: str) -> bool:
-    """Enqueue one session-scoped frame while respecting the shared bound."""
-
-    if subscriber.closed:
-        return False
-    try:
-        queue.put_nowait(encode_text_frame(text))
-    except asyncio.QueueFull:
-        return False
-    return True
 
 
 async def _close_writer(writer: asyncio.StreamWriter) -> None:

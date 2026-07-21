@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 import base64
-import json
 import os
 import sqlite3
 import stat
@@ -15,10 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from mitm_inspector.api.app import ApiApplication
 from mitm_inspector.api.projection import collect_grid_flows
 from mitm_inspector.api.server import ApiServer, ApiServerConfig
-from mitm_inspector.capture.addon import CaptureAddon
 from mitm_inspector.protocol import KnownParsedMessage, parsed_message_to_plain_json
 from mitm_inspector.store.memory import MemoryStore
 from mitm_inspector.store.sqlite import SearchCancelled, SQLiteFlowStorage
@@ -133,9 +129,7 @@ def test_search_orders_mixed_precision_timestamps_chronologically(tmp_path: Path
     storage = SQLiteFlowStorage(tmp_path / "flows.sqlite")
     try:
         storage.offer(metadata("new-flow", b"needle new", b"response"))
-        storage.offer(
-            lifecycle("new-flow", 1, "2026-01-01T00:00:00Z", "request_started")
-        )
+        storage.offer(lifecycle("new-flow", 1, "2026-01-01T00:00:00Z", "request_started"))
         storage.offer(metadata("old-flow", b"needle old", b"response"))
         storage.offer(
             lifecycle(
@@ -213,8 +207,7 @@ def test_sqlite_open_migrates_an_existing_flows_table_with_null_sessions(tmp_pat
     try:
         with sqlite3.connect(path) as connection:
             columns = {
-                str(row[1])
-                for row in connection.execute("PRAGMA table_info(flows)").fetchall()
+                str(row[1]) for row in connection.execute("PRAGMA table_info(flows)").fetchall()
             }
         assert "session_id" in columns
         replayed = [parsed_message_to_plain_json(message) for message in migrated.replay()]
@@ -297,9 +290,7 @@ def test_sqlite_replay_materializes_newest_flows_newest_first_in_browser_store(
         for index in range(3):
             flow_id = f"flow-{index}"
             storage.offer(metadata(flow_id, b"r", b"s"))
-            storage.offer(
-                lifecycle(flow_id, 1, f"2026-01-01T00:00:0{index}Z", "request_started")
-            )
+            storage.offer(lifecycle(flow_id, 1, f"2026-01-01T00:00:0{index}Z", "request_started"))
         memory = MemoryStore(10)
         storage.replay_into(memory, 2)
         assert list(collect_grid_flows(memory)) == ["flow-2", "flow-1"]
@@ -359,49 +350,13 @@ def test_partial_body_chunks_survive_a_crash_mid_capture(tmp_path: Path) -> None
         restarted.close()
 
 
-def test_adapter_sink_writer_fresh_backend_replays_browser_state(tmp_path: Path) -> None:
-    path = tmp_path / "flows.sqlite"
-    storage = SQLiteFlowStorage(path)
-    application = ApiApplication(MemoryStore(20), storage=storage)
-    addon = CaptureAddon(emit=application.ingest, max_body_prefix_bytes=1024)
-    flow = fake_flow()
-    addon.requestheaders(flow)
-    addon.responseheaders(flow)
-    addon.response(flow)
-    addon.request(flow)
-    addon.drain()
-    storage.close()
-
-    restarted = ApiServer(
-        ApiServerConfig(storage_path=path, storage_replay=20, max_retained_flows=20)
-    )
-    try:
-        frames: list[dict[str, object]] = []
-        restarted.application.subscribe(
-            lambda frame: frames.append(json.loads(frame)) or True,
-        )
-        snapshot = next(frame for frame in frames if frame["type"] == "browser.snapshot")
-        assert [flow["flow_id"] for flow in snapshot["flows"]] == ["adapter-flow"]
-        assert any(
-            frame["type"] == "flow.lifecycle" and frame["flow_id"] == "adapter-flow"
-            for frame in frames
-        )
-        detail = json.loads(restarted.application.flow_detail_text("adapter-flow") or "null")
-        assert detail["flow_id"] == "adapter-flow"
-        assert any(message["type"] == "body.chunk" for message in detail["messages"])
-    finally:
-        asyncio.run(restarted.close())
-
-
 def test_replay_uses_reverse_chronological_flow_order(tmp_path: Path) -> None:
     storage = SQLiteFlowStorage(tmp_path / "flows.sqlite")
     try:
         for index in range(3):
             flow_id = f"ordered-{index}"
             storage.offer(metadata(flow_id, b"r", b"s"))
-            storage.offer(
-                lifecycle(flow_id, 1, f"2026-02-01T00:00:0{index}Z", "request_started")
-            )
+            storage.offer(lifecycle(flow_id, 1, f"2026-02-01T00:00:0{index}Z", "request_started"))
         replayed = storage.replay(2)
         metadata_ids = [
             parsed_message_to_plain_json(message)["metadata"]["flow_id"]
@@ -412,47 +367,6 @@ def test_replay_uses_reverse_chronological_flow_order(tmp_path: Path) -> None:
         assert metadata_ids == ["ordered-2", "ordered-1"]
     finally:
         storage.close()
-
-
-def test_replay_after_fresh_backend_instance_delivers_lifecycle_history(tmp_path: Path) -> None:
-    path = tmp_path / "flows.sqlite"
-    first = SQLiteFlowStorage(path)
-    first.offer(metadata("restart-flow", b"r", b"s"))
-    first.offer(lifecycle("restart-flow", 1, "2026-02-01T00:00:00Z", "request_started"))
-    first.offer(lifecycle("restart-flow", 2, "2026-02-01T00:00:01Z", "flow_completed"))
-    first.close()
-
-    second = ApiServer(ApiServerConfig(storage_path=path, storage_replay=20))
-    try:
-        frames: list[dict[str, object]] = []
-        second.application.subscribe(lambda frame: frames.append(json.loads(frame)) or True)
-        lifecycle_frames = [frame for frame in frames if frame["type"] == "flow.lifecycle"]
-        assert [frame["state"] for frame in lifecycle_frames] == [
-            "request_started",
-            "flow_completed",
-        ]
-    finally:
-        asyncio.run(second.close())
-
-
-def test_fresh_backend_browser_surface_is_reverse_chronological(tmp_path: Path) -> None:
-    path = tmp_path / "ordered.sqlite"
-    first = SQLiteFlowStorage(path)
-    for index in range(2):
-        first.offer(metadata(f"surface-{index}", b"r", b"s"))
-        first.offer(
-            lifecycle(f"surface-{index}", 1, f"2026-02-01T00:00:0{index}Z", "request_started")
-        )
-    first.close()
-
-    second = ApiServer(ApiServerConfig(storage_path=path, storage_replay=20))
-    try:
-        frames: list[dict[str, object]] = []
-        second.application.subscribe(lambda frame: frames.append(json.loads(frame)) or True)
-        snapshot = next(frame for frame in frames if frame["type"] == "browser.snapshot")
-        assert [flow["flow_id"] for flow in snapshot["flows"]] == ["surface-1", "surface-0"]
-    finally:
-        asyncio.run(second.close())
 
 
 def test_no_storage_and_memory_storage_paths_disable_persistence(tmp_path: Path) -> None:
@@ -475,12 +389,15 @@ def test_storage_byte_retention_bounds_the_database_file_set(tmp_path: Path) -> 
         storage.flush()
         files = [path, Path(f"{path}-wal"), Path(f"{path}-shm")]
         assert sum(file.stat().st_size for file in files if file.exists()) <= max_bytes
-        assert sum(
-            1
-            for message in storage.replay()
-            if isinstance(message, KnownParsedMessage)
-            and message.message.get("type") == "flow.metadata"
-        ) < 100
+        assert (
+            sum(
+                1
+                for message in storage.replay()
+                if isinstance(message, KnownParsedMessage)
+                and message.message.get("type") == "flow.metadata"
+            )
+            < 100
+        )
     finally:
         storage.close()
 
@@ -542,11 +459,7 @@ def test_invalid_cap_reopen_preserves_retained_history(tmp_path: Path) -> None:
     try:
         after = [parsed_message_to_plain_json(message) for message in reopened.replay()]
         assert after == before
-        assert sum(
-            1
-            for message in after
-            if message["type"] == "flow.metadata"
-        ) == 3
+        assert sum(1 for message in after if message["type"] == "flow.metadata") == 3
     finally:
         reopened.close()
 
