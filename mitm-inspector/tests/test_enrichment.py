@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from mitm_inspector.api.app import ApiApplication
 from mitm_inspector.api.bodies import (
     MAX_DECODED_BODY_BYTES,
     decoded_body_bytes,
@@ -38,9 +37,7 @@ def anthropic_metadata(
     response_encoding: str | None = None,
 ) -> dict[str, object]:
     request_bytes = json.dumps(request).encode()
-    response_headers: list[dict[str, str]] = [
-        {"name": "content-type", "value": "application/json"}
-    ]
+    response_headers: list[dict[str, str]] = [{"name": "content-type", "value": "application/json"}]
     if response_encoding is not None:
         response_headers.append({"name": "content-encoding", "value": response_encoding})
     metadata: dict[str, object] = {
@@ -302,15 +299,3 @@ def test_restart_replay_preserves_enriched_projection(tmp_path: Path) -> None:
         assert replayed["ended_at"] == "2026-07-20T12:00:01Z"
     finally:
         storage.close()
-
-
-def test_projection_timing_updates_are_emitted_from_lifecycle() -> None:
-    application = ApiApplication(MemoryStore(32))
-    metadata = anthropic_metadata({"messages": []})
-    application.ingest(metadata_message(metadata))
-    result = application.ingest(
-        lifecycle("flow-1", 1, "request_started", "2026-07-20T12:00:00Z")
-    )
-    assert result.delta_emitted
-    snapshot = json.loads(application.snapshot_text())
-    assert snapshot["flows"][0]["started_at"] == "2026-07-20T12:00:00Z"

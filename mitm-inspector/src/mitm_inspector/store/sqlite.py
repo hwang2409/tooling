@@ -262,11 +262,152 @@ class SQLiteFlowStorage:
                 connection,
                 [tuple(bounded_row)],
                 max_messages=MAX_DURABLE_DETAIL_MESSAGES,
-                max_chunk_bytes=(
-                    MAX_DURABLE_DETAIL_RETAINED_BODY_BYTES - retained_body_bytes
-                ),
+                max_chunk_bytes=(MAX_DURABLE_DETAIL_RETAINED_BODY_BYTES - retained_body_bytes),
                 chunks_only_for_missing_bodies=True,
             )
+
+    def session_summaries(
+        self, limit: int = 100, before: str | None = None
+    ) -> list[PlainJsonObject]:
+        """Return redacted session metadata in newest-first order."""
+
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("session limit must be from 1 through 200")
+        if before is not None and (type(before) is not str or not before):
+            raise ValueError("session before must be a non-empty timestamp")
+        self.flush()
+        with sqlite3.connect(self.path) as connection:
+            rows = self._metadata_rows(
+                connection,
+                where=("AND started_at_sort < ?" if before is not None else ""),
+                parameters=(_timestamp_sort_key(before),) if before is not None else (),
+                order="DESC",
+            )
+        groups: dict[str | None, list[PlainJsonObject]] = {}
+        for row in rows:
+            metadata = self._metadata_from_row(row)["metadata"]
+            if not isinstance(metadata, Mapping):
+                continue
+            projected = self._redacted_grid_flow(metadata)
+            session_id = metadata.get("session_id")
+            key = session_id if isinstance(session_id, str) else None
+            groups.setdefault(key, []).append(projected)
+        summaries = [self._session_summary(key, flows) for key, flows in groups.items()]
+        summaries.sort(key=self._session_sort_key, reverse=True)
+        return summaries[:limit]
+
+    def session_detail(self, session_id: str) -> PlainJsonObject | None:
+        """Return one session's redacted flows in chronological order."""
+
+        if type(session_id) is not str or not session_id:
+            return None
+        self.flush()
+        where = "AND session_id IS NULL" if session_id == "unassigned" else "AND session_id = ?"
+        parameters: tuple[object, ...] = () if session_id == "unassigned" else (session_id,)
+        with sqlite3.connect(self.path) as connection:
+            rows = self._metadata_rows(
+                connection,
+                where=where,
+                parameters=parameters,
+                order="ASC",
+            )
+        flows: list[PlainJsonObject] = []
+        actual_id: str | None = None
+        for row in rows:
+            metadata = self._metadata_from_row(row)["metadata"]
+            if not isinstance(metadata, Mapping):
+                continue
+            if actual_id is None and isinstance(metadata.get("session_id"), str):
+                actual_id = metadata["session_id"]
+            flows.append(self._redacted_grid_flow(metadata))
+        if not flows:
+            return None
+        return {
+            "session_id": actual_id,
+            "flow_count": len(flows),
+            "flows": flows,
+        }
+
+    @staticmethod
+    def _metadata_rows(
+        connection: sqlite3.Connection,
+        *,
+        where: str,
+        parameters: tuple[object, ...],
+        order: str,
+    ) -> list[tuple[object, ...]]:
+        if order not in {"ASC", "DESC"}:
+            raise ValueError("metadata order must be ASC or DESC")
+        return connection.execute(
+            f"""
+            SELECT flow_id, source_id, method, scheme, host, port, path,
+                   response_status, request_content_type,
+                   response_content_type, started_at, ended_at,
+                   request_body, response_body, request_body_state,
+                   response_body_state, request_body_size,
+                   response_body_size, request_headers_json,
+                   response_headers_json, session_id
+            FROM flows
+            WHERE method <> '' {where}
+            ORDER BY CASE WHEN started_at_sort IS NULL THEN 1 ELSE 0 END,
+                     started_at_sort {order}, created_order {order}
+            """,
+            parameters,
+        ).fetchall()
+
+    @staticmethod
+    def _redacted_grid_flow(metadata: Mapping[str, object]) -> PlainJsonObject:
+        from mitm_inspector.api.projection import grid_flow
+
+        return grid_flow(metadata)
+
+    @classmethod
+    def _session_summary(
+        cls, session_id: str | None, flows: list[PlainJsonObject]
+    ) -> PlainJsonObject:
+        chronological = list(reversed(flows))
+        models: list[str] = []
+        first_query: str | None = None
+        started: str | None = None
+        last_activity: str | None = None
+        has_error = False
+        for flow in chronological:
+            value = flow.get("started_at")
+            if started is None and isinstance(value, str):
+                started = value
+            ended = flow.get("ended_at")
+            candidate_activity = ended if isinstance(ended, str) else value
+            if isinstance(candidate_activity, str):
+                last_activity = candidate_activity
+            status = flow.get("response_status")
+            if isinstance(status, str) and status.isdigit() and int(status) >= 400:
+                has_error = True
+            summary = flow.get("summary")
+            if not isinstance(summary, Mapping):
+                continue
+            model = summary.get("model")
+            if isinstance(model, str) and model not in models:
+                models.append(model)
+            if first_query is None:
+                preview = summary.get("preview")
+                if isinstance(preview, Mapping) and preview.get("source") == "user_text":
+                    text = preview.get("text")
+                    if isinstance(text, str):
+                        first_query = text
+        return {
+            "session_id": session_id,
+            "first_query": first_query,
+            "flow_count": len(flows),
+            "started_at": started,
+            "last_activity": last_activity,
+            "models": models,
+            "has_error": has_error,
+        }
+
+    @staticmethod
+    def _session_sort_key(summary: PlainJsonObject) -> tuple[int, str]:
+        value = summary.get("started_at")
+        return (1 if isinstance(value, str) else 0, value if isinstance(value, str) else "")
 
     def _messages_from_rows(
         self,
@@ -348,9 +489,7 @@ class SQLiteFlowStorage:
                                 "flow_id": flow_id,
                                 "body_side": side,
                                 "total_bytes": str(size),
-                                "body": _descriptor_from_row(
-                                    body, state, size, content_type
-                                ),
+                                "body": _descriptor_from_row(body, state, size, content_type),
                             }
                         )
                     )
@@ -519,10 +658,7 @@ class SQLiteFlowStorage:
         ).fetchall()
         connection.executemany(
             "UPDATE flows SET started_at_sort = ? WHERE flow_id = ?",
-            [
-                (_timestamp_sort_key(str(started_at)), str(flow_id))
-                for flow_id, started_at in rows
-            ],
+            [(_timestamp_sort_key(str(started_at)), str(flow_id)) for flow_id, started_at in rows],
         )
 
     def _rebuild_search_index(self, connection: sqlite3.Connection) -> None:
@@ -558,9 +694,7 @@ class SQLiteFlowStorage:
         ):
             descriptor = _descriptor_from_row(body, state, size, content_type)
             encoding = header_value(headers, "content-encoding")
-            normalized_encoding = (
-                encoding.strip().casefold() if isinstance(encoding, str) else None
-            )
+            normalized_encoding = encoding.strip().casefold() if isinstance(encoding, str) else None
             decoded, _was_decoded = decoded_body_bytes(descriptor, normalized_encoding)
             if decoded is None:
                 continue
@@ -668,16 +802,14 @@ class SQLiteFlowStorage:
                 """
             )
             columns = {
-                str(row[1])
-                for row in connection.execute("PRAGMA table_info(flows)").fetchall()
+                str(row[1]) for row in connection.execute("PRAGMA table_info(flows)").fetchall()
             }
             if "session_id" not in columns:
                 connection.execute("ALTER TABLE flows ADD COLUMN session_id TEXT")
             if "started_at_sort" not in columns:
                 connection.execute("ALTER TABLE flows ADD COLUMN started_at_sort TEXT")
             connection.execute(
-                "CREATE INDEX IF NOT EXISTS flows_started_sort_desc "
-                "ON flows(started_at_sort DESC)"
+                "CREATE INDEX IF NOT EXISTS flows_started_sort_desc ON flows(started_at_sort DESC)"
             )
             self._backfill_started_sort_keys(connection)
             version = connection.execute(
@@ -726,9 +858,7 @@ class SQLiteFlowStorage:
                     ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END, name
                     """
                 ).fetchall()
-                baseline.executescript(
-                    "\n".join(f"{statement[0]};" for statement in schema)
-                )
+                baseline.executescript("\n".join(f"{statement[0]};" for statement in schema))
                 baseline.commit()
                 baseline.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 baseline.execute("VACUUM")
@@ -745,9 +875,7 @@ class SQLiteFlowStorage:
             connection.execute("PRAGMA foreign_keys = ON")
             if self._trace_sql is not None:
                 connection.set_trace_callback(self._trace_sql)
-            row = connection.execute(
-                "SELECT COALESCE(MAX(created_order), 0) FROM flows"
-            ).fetchone()
+            row = connection.execute("SELECT COALESCE(MAX(created_order), 0) FROM flows").fetchone()
             self._next_created_order = int(row[0]) if row is not None else 0
             while True:
                 item = self._queue.get()
@@ -791,9 +919,7 @@ class SQLiteFlowStorage:
             _plain_json(metadata["request_headers"]), separators=(",", ":")
         )
         response_headers = (
-            json.dumps(
-                _plain_json(metadata["response_headers"]), separators=(",", ":")
-            )
+            json.dumps(_plain_json(metadata["response_headers"]), separators=(",", ":"))
             if "response_headers" in metadata
             else None
         )
@@ -1053,13 +1179,12 @@ class SQLiteFlowStorage:
                 ORDER BY CASE WHEN started_at_sort IS NULL THEN 1 ELSE 0 END,
                          started_at_sort, created_order
                 LIMIT 1
-                """, parameters
+                """,
+                parameters,
             ).fetchone()
             if oldest is None:
                 if protected_flow_id is not None and over_bytes:
-                    connection.execute(
-                        "DELETE FROM flows WHERE flow_id = ?", (protected_flow_id,)
-                    )
+                    connection.execute("DELETE FROM flows WHERE flow_id = ?", (protected_flow_id,))
                     self._compact_search_index(connection)
                     connection.commit()
                     _checkpoint(connection)
@@ -1081,9 +1206,7 @@ class SQLiteFlowStorage:
     def _compact_search_index(connection: sqlite3.Connection) -> None:
         remaining = connection.execute("SELECT 1 FROM body_search LIMIT 1").fetchone()
         command = "rebuild" if remaining is None else "optimize"
-        connection.execute(
-            "INSERT INTO body_search_fts(body_search_fts) VALUES (?)", (command,)
-        )
+        connection.execute("INSERT INTO body_search_fts(body_search_fts) VALUES (?)", (command,))
 
     @staticmethod
     def _metadata_from_row(row: tuple[object, ...]) -> dict[str, object]:
@@ -1105,9 +1228,7 @@ class SQLiteFlowStorage:
         if row[7] is not None:
             metadata["response_status"] = row[7]
         if row[15] != "missing" or row[13] is not None or row[19] is not None:
-            metadata["response_body"] = _descriptor_from_row(
-                row[13], row[15], row[17], row[9]
-            )
+            metadata["response_body"] = _descriptor_from_row(row[13], row[15], row[17], row[9])
         if isinstance(row[10], str) and is_rfc3339_utc(row[10]):
             metadata["started_at"] = row[10]
         if isinstance(row[11], str) and is_rfc3339_utc(row[11]):
@@ -1258,9 +1379,7 @@ def _checkpoint(connection: sqlite3.Connection) -> None:
 def _validate_private_mode(path: Path, expected_type: int, mode: int) -> None:
     info = path.lstat()
     expected = (
-        stat.S_ISDIR(info.st_mode)
-        if expected_type == stat.S_IFDIR
-        else stat.S_ISREG(info.st_mode)
+        stat.S_ISDIR(info.st_mode) if expected_type == stat.S_IFDIR else stat.S_ISREG(info.st_mode)
     )
     if stat.S_ISLNK(info.st_mode) or not expected:
         raise PermissionError(f"storage path has an unsafe type: {path}")

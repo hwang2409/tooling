@@ -171,57 +171,35 @@ def ensure_port_available() -> None:
     raise RuntimeError(f"preview port {PORT} is already in use")
 
 
-def install_fake_stream(page: Page) -> None:
-    page.add_init_script(
-        """
-        (() => {
-          const hello = {
-            protocol_version: "1",
-            type: "source.hello",
-            source_id: "workflow-test-source",
-            occurred_at: "2026-01-01T00:00:00Z",
-            capabilities: { body_chunks: true, redaction: "headers-and-query" },
-            limits: { max_body_prefix_bytes: "1048576", max_in_memory_bytes: "134217728" },
-          };
-          const snapshot = {
-            protocol_version: "1",
-            type: "browser.snapshot",
-            snapshot_id: "workflow-test-snapshot",
-            cursor: "1",
-            flows: [__FLOW_JSON__],
-          };
-          class FakeWebSocket {
-            static OPEN = 1;
-            readyState = 0;
-            onopen = null;
-            onmessage = null;
-            onerror = null;
-            onclose = null;
-            constructor(url) {
-              this.url = url;
-              setTimeout(() => {
-                if (this.readyState !== 0) return;
-                this.readyState = FakeWebSocket.OPEN;
-                this.onopen?.();
-                for (const message of [hello, snapshot]) {
-                  setTimeout(() => this.onmessage?.({ data: JSON.stringify(message) }), 0);
-                }
-              }, 0);
-            }
-            send() {}
-            close() {
-              this.readyState = 3;
-              this.onclose?.({ code: 1000, reason: "", wasClean: true });
-            }
-          }
-          window.WebSocket = FakeWebSocket;
-        })();
-        """.replace("__FLOW_JSON__", json.dumps(FLOW))
-    )
-
-
 def run_workflow(page: Page) -> None:
     detail_requests: list[str] = []
+
+    page.route(
+        "**/api/v1/sessions",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "sessions": [{
+                    "session_id": "client-session-a",
+                    "first_query": "hello **world**",
+                    "flow_count": 1,
+                    "started_at": "2026-01-01T00:00:00Z",
+                    "last_activity": "2026-01-01T00:00:02Z",
+                    "models": ["claude-example"],
+                    "has_error": True,
+                }]
+            }),
+        ),
+    )
+    page.route(
+        "**/api/v1/sessions/client-session-a",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"session_id": "client-session-a", "flow_count": 1, "flows": [FLOW]}),
+        ),
+    )
 
     def serve_detail(route: Route) -> None:
         detail_requests.append(route.request.url)
@@ -312,69 +290,13 @@ def run_workflow(page: Page) -> None:
     page.locator(".session-back").click()
     expect(page.locator(".session-row")).to_have_count(1)
 
-    # Global flow grid keeps the full packet experience and search.
-    page.locator(".app-nav .packet-mode").filter(has_text="flows").click()
-    row = page.locator(".packet-row")
-    expect(row).to_have_count(1)
-    # Summary-enriched anthropic flows render the dense msg badge shape.
-    expect(row).to_contain_text("msg")
-    expect(row).to_contain_text("example")
-    expect(row).to_contain_text("hello **world**")
-    expect(row).to_contain_text("500")
-    assert page.locator(".packet-status-error").evaluate(
-        "el => getComputedStyle(el).color"
-    ) == "rgb(180, 35, 24)"
-
-    search = page.locator(".search-input")
-    search.fill("durable")
-    expect(page.locator("#search-status")).to_have_text("1 match")
-    expect(page.locator(".packet-row")).to_have_count(1)
-    expect(page.locator(".packet-row")).to_contain_text("retained.example.test")
-    search.press("Escape")
-    expect(page.locator(".packet-row")).to_have_count(1)
-    expect(page.locator(".packet-row")).to_contain_text("hello **world**")
-
     for width in (600, 800):
         page.set_viewport_size({"width": width, "height": 700})
         document_width = page.evaluate(
             "Math.max(document.body.scrollWidth, document.documentElement.scrollWidth)"
         )
         assert document_width <= width, (width, document_width)
-        geometry = page.locator(".packet-row").evaluate(
-            """row => {
-                const box = row.getBoundingClientRect();
-                const preview = row.querySelector('.packet-preview').getBoundingClientRect();
-                const status = row.querySelector('.packet-status').getBoundingClientRect();
-                return {
-                    height: box.height,
-                    statusTop: status.top,
-                    rowTop: box.top,
-                    rowBottom: box.bottom,
-                    previewRight: preview.right,
-                    statusLeft: status.left,
-                    sizes: getComputedStyle(row.querySelector('.packet-sizes')).display,
-                    duration: getComputedStyle(row.querySelector('.packet-duration')).display,
-                };
-            }"""
-        )
-        assert 24 <= geometry["height"] <= 32, (width, geometry)
-        assert geometry["rowTop"] <= geometry["statusTop"] <= geometry["rowBottom"], (
-            width,
-            geometry,
-        )
-        assert geometry["statusLeft"] >= geometry["previewRight"] - 1, (width, geometry)
-        assert geometry["sizes"] == "none", (width, geometry)
-        assert geometry["duration"] == "none", (width, geometry)
-
-    # The session list must also fit narrow viewports without overflow.
-    page.locator(".app-nav .packet-mode").filter(has_text="sessions").click()
-    expect(page.locator(".session-row")).to_have_count(1)
-    for width in (600, 800):
-        page.set_viewport_size({"width": width, "height": 700})
-        document_width = page.evaluate(
-            "Math.max(document.body.scrollWidth, document.documentElement.scrollWidth)"
-        )
-        assert document_width <= width, (width, document_width)
+        assert page.evaluate("document.body.scrollWidth <= window.innerWidth")
 
 
 def main() -> None:
@@ -391,7 +313,6 @@ def main() -> None:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
             page = browser.new_page()
-            install_fake_stream(page)
             run_workflow(page)
             browser.close()
     finally:

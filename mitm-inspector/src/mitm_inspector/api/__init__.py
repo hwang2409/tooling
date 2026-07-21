@@ -1,4 +1,4 @@
-"""Versioned loopback HTTP/WebSocket API boundary for protocol-v1 messages.
+"""Versioned loopback HTTP API boundary for captured protocol-v1 messages.
 
 The server entry point stays in :mod:`mitm_inspector.api.server` and is not
 re-exported here, so ``python -m mitm_inspector.api.server`` never imports

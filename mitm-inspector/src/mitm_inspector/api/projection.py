@@ -1,7 +1,7 @@
 """Body-redacted grid projection of retained flow metadata.
 
-The browser grid stream (``browser.snapshot``/``browser.delta``) must never
-carry captured body bytes; bodies are delivered only through the explicit
+The session list and detail endpoints must never carry captured body bytes;
+bodies are delivered only through the explicit
 per-flow selection endpoint.  The projection keeps every descriptor
 schema-valid while stripping the base64 prefix data.
 """
@@ -95,8 +95,7 @@ class LifecycleTimingReducer:
         ):
             self._started[flow_id] = candidate
         if state in {"flow_completed", "error"} and (
-            flow_id not in self._ended
-            or candidate > self._ended[flow_id]
+            flow_id not in self._ended or candidate > self._ended[flow_id]
         ):
             self._ended[flow_id] = candidate
 
