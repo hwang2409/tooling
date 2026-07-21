@@ -242,6 +242,23 @@ describe("selectCanonicalFlow", () => {
     expect(selection.chainIds).toEqual(["main"]);
   });
 
+  it("context regression: reminder-divergent equal-history clone stays auxiliary", () => {
+    const mainKey = requestContextKey({ model: "claude-opus-4", system: "main" } as JsonValue);
+    const cloneKey = requestContextKey({ model: "claude-haiku-4", system: "side call" } as JsonValue);
+    const reminderHistory = [{
+      role: "user",
+      content: [
+        { type: "text", text: "fix the bug" },
+        { type: "text", text: "<system-reminder>injected context</system-reminder>" },
+      ],
+    }, a1] as JsonValue[];
+    const main = candidate("main", [u1, a1], 1, false, mainKey);
+    const clone = candidate("clone", reminderHistory, 0, false, cloneKey);
+    const selection = selectCanonicalFlow([clone, main]);
+    expect(selection.canonicalId).toBe("main");
+    expect(selection.chainIds).toEqual(["main"]);
+  });
+
   it("context regression: growing lineage survives A/B/C context evolution", () => {
     const keyA = requestContextKey({ model: "claude-opus-4", system: "A" } as JsonValue);
     const keyB = requestContextKey({ model: "claude-opus-4", system: "B" } as JsonValue);

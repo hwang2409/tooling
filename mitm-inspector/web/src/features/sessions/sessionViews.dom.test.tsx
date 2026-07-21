@@ -298,8 +298,9 @@ describe("Workspace session-first navigation", () => {
     expect(container.querySelector(".packet-detail .json-tree")).not.toBeNull();
   });
 
-  it("resets manual source choice when switching sessions", async () => {
-    const { container } = await mountWorkspace(stateOf(FLOWS));
+  it("resets manual source choice across source reconnect while SessionDetail stays mounted", async () => {
+    const initial = stateOf(FLOWS);
+    const { container, render } = await mountWorkspace(initial);
     await click(sessionRows(container)[0]);
     await settle();
     await click(container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']"));
@@ -307,14 +308,49 @@ describe("Workspace session-first navigation", () => {
     await click(options[1]);
     expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("manual");
 
-    await click(container.querySelector<HTMLButtonElement>(".session-back"));
-    await click(sessionRows(container)[1]);
-    await click(container.querySelector<HTMLButtonElement>(".session-back"));
-    await click(sessionRows(container)[0]);
+    // Same workspace view and same session key; only source incarnation changes.
+    await render({ ...initial, sourceEpoch: initial.sourceEpoch + 1 });
     await settle();
     expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("main-flo");
     expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("auto");
     expect(container.querySelector("[data-testid='rendered-source']")?.textContent).not.toContain("manual");
+  });
+
+  it("does not restore a picked flow after prune and reinsert", async () => {
+    const initial = stateOf(FLOWS);
+    const { container, render } = await mountWorkspace(initial);
+    await click(sessionRows(container)[0]);
+    await settle();
+    await click(container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']"));
+    const options = Array.from(container.querySelectorAll<HTMLButtonElement>("[data-testid='session-source-option']"));
+    await click(options[1]);
+    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("manual");
+
+    await render(stateOf([FLOWS[1]]));
+    await settle();
+    await render(initial);
+    await settle();
+    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("main-flo");
+    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("auto");
+    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).not.toContain("manual");
+  });
+
+  it("uses a labeled native-button dialog with Escape and focus return", async () => {
+    const { container } = await mountWorkspace(stateOf(FLOWS));
+    await click(sessionRows(container)[0]);
+    await settle();
+    const source = container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']");
+    await click(source);
+    const picker = container.querySelector("#session-source-picker");
+    expect(picker?.getAttribute("role")).toBe("dialog");
+    expect(picker?.getAttribute("aria-labelledby")).toBe("session-source-picker-label");
+    expect(container.querySelector("[role='listbox']")).toBeNull();
+    const firstOption = container.querySelector<HTMLButtonElement>("[data-testid='session-source-option']");
+    expect(document.activeElement).toBe(firstOption);
+
+    await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(container.querySelector("#session-source-picker")).toBeNull();
+    expect(document.activeElement).toBe(source);
   });
 
   it("keeps the per-session flow grid one toggle away and navigates back home", async () => {

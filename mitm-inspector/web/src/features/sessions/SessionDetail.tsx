@@ -156,14 +156,31 @@ interface SourcePickerProps {
   readonly settled: boolean;
   readonly onSelect: (flowId: string) => void;
   readonly onAuto: () => void;
+  readonly onClose: () => void;
 }
 
-function SourcePicker({ flows, parsed, selection, renderedFlowId, settled, onSelect, onAuto }: SourcePickerProps) {
+function SourcePicker({ flows, parsed, selection, renderedFlowId, settled, onSelect, onAuto, onClose }: SourcePickerProps) {
   const parsedById = new Map(parsed.map((candidate) => [candidate.flow.flow_id, candidate]));
+  const firstOptionRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    firstOptionRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      onClose();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
   return (
-    <div className="session-source-picker" id="session-source-picker" role="listbox" aria-label="Choose rendered request">
+    <div
+      className="session-source-picker"
+      id="session-source-picker"
+      role="dialog"
+      aria-labelledby="session-source-picker-label"
+    >
       <div className="session-source-picker-head">
-        <span>render request</span>
+        <span id="session-source-picker-label">render request</span>
         <button type="button" className="session-source-auto" onClick={onAuto}>auto-pick</button>
       </div>
       {flows.map((flow, index) => {
@@ -174,8 +191,8 @@ function SourcePicker({ flows, parsed, selection, renderedFlowId, settled, onSel
           <button
             key={flow.flow_id}
             type="button"
-            role="option"
-            aria-selected={renderedFlowId === flow.flow_id}
+            ref={index === 0 ? firstOptionRef : undefined}
+            aria-pressed={renderedFlowId === flow.flow_id}
             disabled={disabled}
             className="session-source-option"
             data-testid="session-source-option"
@@ -208,6 +225,7 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
   const [mode, setMode] = useState<SessionMode>(summary.key === null ? "flows" : "conversation");
   const [manualFlowId, setManualFlowId] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const sourceButtonRef = useRef<HTMLButtonElement | null>(null);
   const effectiveMode: SessionMode = candidates.length === 0 ? "flows" : mode;
 
   // Manual choice belongs only to this session incarnation. A source reset can
@@ -285,6 +303,10 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
   );
   const models = summary.models.map(shortModel).join(" · ");
   const duration = durationBetween(summary.startedAt, summary.lastActivity);
+  const closePicker = () => {
+    setPickerOpen(false);
+    sourceButtonRef.current?.focus();
+  };
 
   return (
     <section className="session-detail" data-testid="session-detail">
@@ -317,6 +339,7 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
           <div className="session-source-control">
             <button
               type="button"
+              ref={sourceButtonRef}
               className={`session-render-source${manual !== null ? " session-render-source-manual" : ""}`}
               aria-expanded={pickerOpen}
               aria-controls="session-source-picker"
@@ -336,12 +359,13 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
                 settled={settled}
                 onSelect={(flowId) => {
                   setManualFlowId(flowId);
-                  setPickerOpen(false);
+                  closePicker();
                 }}
                 onAuto={() => {
                   setManualFlowId(null);
-                  setPickerOpen(false);
+                  closePicker();
                 }}
+                onClose={closePicker}
               />
             ) : null}
           </div>

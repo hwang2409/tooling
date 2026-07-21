@@ -202,6 +202,18 @@ export function messagesArePrefix(earlier: readonly JsonValue[], later: readonly
   return earlier.every((message, index) => messageMatches(message, later[index]));
 }
 
+/**
+ * Equal-length histories can differ only by the same reminder injection that
+ * messageMatches permits while building prefix relations. This comparison is
+ * deliberately symmetric: either history may be the version with the
+ * appended harness reminder, while cache markers are already normalized.
+ */
+function historiesAreEquivalent(left: readonly JsonValue[], right: readonly JsonValue[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((message, index) =>
+    messageMatches(message, right[index]) || messageMatches(right[index], message));
+}
+
 interface IndexEntry {
   readonly id: string;
   /** Refreshed on every update — the grid order shifts as flows prepend. */
@@ -470,7 +482,8 @@ export function createCanonicalIndex(): CanonicalIndex {
         const stages = distinctStages(chain);
         const bestStages = distinctStages(best);
         if (stages !== bestStages) return stages > bestStages ? chain : best;
-        if (chain.tip.stamp === best.tip.stamp
+        if ((chain.tip.stamp === best.tip.stamp
+          || historiesAreEquivalent(chain.tip.normalized, best.tip.normalized))
           && chain.tip.candidate.contextKey !== best.tip.candidate.contextKey) {
           // Equal-history different-context calls are not continuations. If
           // pruning leaves one established stage, retain older thread rather
