@@ -79,10 +79,16 @@ export function useSessions(fetcher: SessionFetcher = fetchSessions): {
 export function useSessionDetail(
   key: SessionKey | undefined,
   fetcher: SessionDetailFetcher = fetchSessionDetail,
-): { readonly flows: readonly ImmutableFlowMetadata[] | null; readonly loading: boolean; readonly error: string | null } {
+): {
+  readonly flows: readonly ImmutableFlowMetadata[] | null;
+  readonly loading: boolean;
+  readonly error: string | null;
+  readonly retry: () => void;
+} {
   const [flows, setFlows] = useState<readonly ImmutableFlowMetadata[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
   useEffect(() => {
     if (key === undefined) {
       setFlows(null);
@@ -98,6 +104,6 @@ export function useSessionDetail(
       .then((value) => { if (!controller.signal.aborted) { setFlows(value); setLoading(false); } })
       .catch((reason: unknown) => { if (!controller.signal.aborted) { setError(reason instanceof Error ? reason.message : "Session detail request failed."); setLoading(false); } });
     return () => controller.abort();
-  }, [fetcher, key]);
-  return { flows, loading, error };
+  }, [fetcher, key, retryCount]);
+  return { flows, loading, error, retry: () => setRetryCount((count) => count + 1) };
 }

@@ -1,9 +1,12 @@
 import asyncio
 import base64
+import gzip
 import json
 from pathlib import Path
 
+from mitm_inspector.api.app import ApiApplication
 from mitm_inspector.api.server import ApiServer, ApiServerConfig
+from mitm_inspector.store.memory import MemoryStore
 
 
 def metadata(flow_id: str, session_id: str | None, prompt: str) -> dict[str, object]:
@@ -86,8 +89,11 @@ def test_http_session_list_and_detail_are_sqlite_backed(tmp_path: Path) -> None:
             sessions = json.loads(body)["sessions"]
             assert sessions[0]["session_id"] == "session-a"
             assert sessions[0]["flow_count"] == 2
-            assert sessions[0]["first_query"] == "first prompt"
-            assert sessions[0]["models"] == ["claude-test"]
+            # Session browsing is metadata-only. Bodies are fetched only after
+            # selecting an individual flow, so summaries cannot inspect body
+            # content for a query preview or model.
+            assert sessions[0]["first_query"] is None
+            assert sessions[0]["models"] == []
 
             head, body = await request(server.bound_port, "/api/v1/sessions/session-a")
             assert head.startswith(b"HTTP/1.1 200 ")
@@ -101,3 +107,52 @@ def test_http_session_list_and_detail_are_sqlite_backed(tmp_path: Path) -> None:
             await server.close()
 
     asyncio.run(scenario())
+
+
+def test_flow_detail_decodes_gzip_response_body() -> None:
+    compressed = gzip.compress(b'{"ok":true}')
+    descriptor = {
+        "state": "captured",
+        "size_bytes": str(len(compressed)),
+        "encoding": "base64",
+        "data": base64.b64encode(compressed).decode("ascii"),
+        "content_type": "application/json",
+    }
+    application = ApiApplication(MemoryStore())
+    application.ingest(
+        {
+            "protocol_version": "1",
+            "type": "flow.metadata",
+            "metadata": {
+                "flow_id": "flow-gzip",
+                "method": "GET",
+                "scheme": "https",
+                "host": "example.test",
+                "port": "443",
+                "path": "/gzip",
+                "request_headers": [],
+                "response_headers": [{"name": "content-encoding", "value": "gzip"}],
+                "response_status": "200",
+                "request_body": {"state": "empty", "size_bytes": "0"},
+                "response_body": descriptor,
+            },
+        }
+    )
+    application.ingest(
+        {
+            "protocol_version": "1",
+            "type": "body.end",
+            "flow_id": "flow-gzip",
+            "body_side": "response",
+            "total_bytes": str(len(compressed)),
+            "body": descriptor,
+        }
+    )
+
+    detail = application.flow_detail_text("flow-gzip")
+    assert detail is not None
+    messages = json.loads(detail)["messages"]
+    body_end = next(message for message in messages if message["type"] == "body.end")
+    assert body_end["body"]["data"] == base64.b64encode(b'{"ok":true}').decode("ascii")
+    assert body_end["body"]["size_bytes"] == str(len(b'{"ok":true}'))
+    assert body_end["total_bytes"] == str(len(b'{"ok":true}'))

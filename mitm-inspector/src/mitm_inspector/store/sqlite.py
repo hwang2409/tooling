@@ -37,6 +37,7 @@ DEFAULT_STORAGE_MAX_FLOWS = 10_000
 DEFAULT_STORAGE_MAX_BYTES = 512 * 1024 * 1024
 DEFAULT_STORAGE_REPLAY = 500
 DEFAULT_STORAGE_QUEUE_SIZE = 4_096
+SESSION_FLOW_LIMIT = 2_000
 _SENTINEL = object()
 _WHITESPACE = re.compile(r"\s+")
 
@@ -277,15 +278,16 @@ class SQLiteFlowStorage:
             raise ValueError("session before must be a non-empty timestamp")
         self.flush()
         with sqlite3.connect(self.path) as connection:
-            rows = self._metadata_rows(
+            rows = self._session_rows(
                 connection,
                 where=("AND started_at_sort < ?" if before is not None else ""),
                 parameters=(_timestamp_sort_key(before),) if before is not None else (),
+                limit=limit * SESSION_FLOW_LIMIT,
                 order="DESC",
             )
         groups: dict[str | None, list[PlainJsonObject]] = {}
         for row in rows:
-            metadata = self._metadata_from_row(row)["metadata"]
+            metadata = self._metadata_from_session_row(row)["metadata"]
             if not isinstance(metadata, Mapping):
                 continue
             projected = self._redacted_grid_flow(metadata)
@@ -305,16 +307,17 @@ class SQLiteFlowStorage:
         where = "AND session_id IS NULL" if session_id == "unassigned" else "AND session_id = ?"
         parameters: tuple[object, ...] = () if session_id == "unassigned" else (session_id,)
         with sqlite3.connect(self.path) as connection:
-            rows = self._metadata_rows(
+            rows = self._session_rows(
                 connection,
                 where=where,
                 parameters=parameters,
+                limit=SESSION_FLOW_LIMIT,
                 order="ASC",
             )
         flows: list[PlainJsonObject] = []
         actual_id: str | None = None
         for row in rows:
-            metadata = self._metadata_from_row(row)["metadata"]
+            metadata = self._metadata_from_session_row(row)["metadata"]
             if not isinstance(metadata, Mapping):
                 continue
             if actual_id is None and isinstance(metadata.get("session_id"), str):
@@ -329,31 +332,72 @@ class SQLiteFlowStorage:
         }
 
     @staticmethod
-    def _metadata_rows(
+    def _session_rows(
         connection: sqlite3.Connection,
         *,
         where: str,
         parameters: tuple[object, ...],
+        limit: int,
         order: str,
     ) -> list[tuple[object, ...]]:
         if order not in {"ASC", "DESC"}:
-            raise ValueError("metadata order must be ASC or DESC")
+            raise ValueError("session order must be ASC or DESC")
         return connection.execute(
             f"""
             SELECT flow_id, source_id, method, scheme, host, port, path,
                    response_status, request_content_type,
                    response_content_type, started_at, ended_at,
-                   request_body, response_body, request_body_state,
-                   response_body_state, request_body_size,
-                   response_body_size, request_headers_json,
-                   response_headers_json, session_id
+                   request_body_state, response_body_state,
+                   request_body_size, response_body_size, session_id
             FROM flows
             WHERE method <> '' {where}
             ORDER BY CASE WHEN started_at_sort IS NULL THEN 1 ELSE 0 END,
                      started_at_sort {order}, created_order {order}
+            LIMIT ?
             """,
-            parameters,
+            (*parameters, limit),
         ).fetchall()
+
+    @staticmethod
+    def _metadata_from_session_row(row: tuple[object, ...]) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "flow_id": row[0],
+            "session_id": row[16],
+            "method": row[2],
+            "scheme": row[3],
+            "host": row[4],
+            "port": row[5],
+            "path": row[6],
+            # Headers and body bytes are intentionally absent from the session
+            # projection. The selected flow endpoint owns those reads.
+            "request_headers": [],
+            "request_body": _descriptor_from_row(None, row[12], row[14], row[8]),
+        }
+        if row[7] is not None:
+            metadata["response_status"] = row[7]
+        if row[13] != "missing":
+            metadata["response_body"] = _descriptor_from_row(
+                None, row[13], row[15], row[9]
+            )
+        if isinstance(row[10], str) and is_rfc3339_utc(row[10]):
+            metadata["started_at"] = row[10]
+        if isinstance(row[11], str) and is_rfc3339_utc(row[11]):
+            metadata["ended_at"] = row[11]
+        if row[12] != "missing":
+            metadata["request_body_size"] = str(row[14])
+        if row[13] != "missing":
+            metadata["response_body_size"] = str(row[15])
+        if row[8] is not None:
+            metadata["request_content_type"] = row[8]
+        if row[9] is not None:
+            metadata["response_content_type"] = row[9]
+        from mitm_inspector.api.projection import canonical_grid_flow
+
+        return {
+            "protocol_version": "1",
+            "type": "flow.metadata",
+            "metadata": canonical_grid_flow(metadata),
+        }
 
     @staticmethod
     def _redacted_grid_flow(metadata: Mapping[str, object]) -> PlainJsonObject:

@@ -10,6 +10,8 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from mitm_inspector.api.bodies import body_content_encoding, decoded_body_descriptor
+from mitm_inspector.api.projection import enriched_flow
 from mitm_inspector.detail_limits import MAX_DURABLE_DETAIL_OUTPUT_BYTES
 from mitm_inspector.json_boundary import PlainJsonObject
 from mitm_inspector.protocol import (
@@ -140,10 +142,60 @@ class ApiApplication:
     def _detail_text(flow_id: str, messages: list[PlainJsonObject]) -> str | None:
         if not messages:
             return None
+        messages = ApiApplication._decode_detail_messages(messages)
         return json.dumps(
             {"protocol_version": "1", "flow_id": flow_id, "messages": messages},
             separators=(",", ":"),
         )
+
+    @staticmethod
+    def _decode_detail_messages(messages: list[PlainJsonObject]) -> list[PlainJsonObject]:
+        metadata_values = [
+            message.get("metadata")
+            for message in messages
+            if message.get("type") == "flow.metadata"
+            and isinstance(message.get("metadata"), Mapping)
+        ]
+        latest = metadata_values[-1] if metadata_values else None
+        if not isinstance(latest, Mapping):
+            return messages
+        encodings = {
+            side: body_content_encoding(latest, side) for side in ("request", "response")
+        }
+        decoded_sides: set[str] = set()
+        result: list[PlainJsonObject] = []
+        for side, encoding in encodings.items():
+            descriptor = latest.get(f"{side}_body")
+            if descriptor is not None:
+                _decoded, was_decoded = decoded_body_descriptor(descriptor, encoding)
+                if was_decoded:
+                    decoded_sides.add(side)
+        for original in messages:
+            message = dict(original)
+            message_type = message.get("type")
+            if message_type == "flow.metadata":
+                metadata = message.get("metadata")
+                if isinstance(metadata, Mapping):
+                    enriched = enriched_flow(metadata)
+                    message["metadata"] = enriched
+            elif message_type == "body.chunk":
+                side = message.get("body_side")
+                if isinstance(side, str) and side in decoded_sides:
+                    continue
+            elif message_type == "body.end":
+                side = message.get("body_side")
+                body = message.get("body")
+                if isinstance(side, str) and body is not None:
+                    decoded, was_decoded = decoded_body_descriptor(
+                        body, encodings.get(side)
+                    )
+                    if was_decoded and isinstance(decoded, dict):
+                        message["body"] = decoded
+                        size = decoded.get("size_bytes")
+                        if isinstance(size, str):
+                            message["total_bytes"] = size
+            result.append(message)
+        return result
 
     @staticmethod
     def _payload_of(parsed: ParsedMessageResult) -> Mapping[str, object]:

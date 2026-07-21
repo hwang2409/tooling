@@ -117,6 +117,27 @@ function HttpWorkspace({ loadFlowDetail, sessionFetcher, sessionDetailFetcher }:
   const selectedSummary = selected === undefined ? undefined : sessions.find((session) => session.key === selected);
   const detail = useSessionDetail(selectedSummary?.key, sessionDetailFetcher);
   if (selectedSummary !== undefined) {
+    if (detail.loading) {
+      return (
+        <div>
+          <div className="session-detail-bar">
+            <button type="button" className="session-back" onClick={() => setSelected(undefined)}>← sessions</button>
+          </div>
+          <p className="packet-empty">loading session…</p>
+        </div>
+      );
+    }
+    if (detail.error !== null) {
+      return (
+        <div>
+          <div className="session-detail-bar">
+            <button type="button" className="session-back" onClick={() => setSelected(undefined)}>← sessions</button>
+          </div>
+          <p className="packet-empty">{detail.error}</p>
+          <button type="button" className="packet-mode" onClick={detail.retry}>retry</button>
+        </div>
+      );
+    }
     const summary = { ...selectedSummary, flows: detail.flows ?? [] };
     return (
       <SessionDetail
