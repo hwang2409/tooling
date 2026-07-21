@@ -256,13 +256,18 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
   const parsed = useMemo(() => {
     if (effectiveMode !== "conversation") return NO_PARSED;
     // Captured bodies are arbitrary: a pathological payload must degrade the
-    // drill-in to the flow view, never crash session rendering.
+    // drill-in to the auxiliary/flow listing, never crash session rendering.
+    // The parser is stateful and may have mutated caches before throwing, so
+    // discard it — the next render rebuilds from scratch rather than serving
+    // half-updated state.
     try {
       return parserRef.current!.parseAll(candidates, gridOrder, details, sourceEpoch);
-    } catch {
+    } catch (error) {
+      console.error("session drill-in degraded: candidate parsing failed", error);
+      parserRef.current = candidateParser ?? createCandidateParser();
       return NO_PARSED;
     }
-  }, [effectiveMode, candidates, gridOrder, details, sourceEpoch]);
+  }, [effectiveMode, candidates, gridOrder, details, sourceEpoch, candidateParser]);
   const settled = effectiveMode === "conversation" && parsed.every((candidate) => candidate.detail !== null);
 
   // Body-verified selection only. When nothing verifiable and non-suggestion
@@ -281,12 +286,17 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
       }));
     try {
       return indexRef.current!.update(usable);
-    } catch {
+    } catch (error) {
       // Same degradation contract as parsing: selection failure renders the
-      // flow view instead of crashing the drill-in.
+      // auxiliary/flow listing instead of crashing the drill-in. The index
+      // mutates incrementally before selecting, so a mid-update throw leaves
+      // it corrupted — discard it or the memoized fast-path would keep
+      // serving the stale pre-throw selection forever.
+      console.error("session drill-in degraded: canonical selection failed", error);
+      indexRef.current = canonicalIndex ?? createCanonicalIndex();
       return null;
     }
-  }, [settled, parsed]);
+  }, [settled, parsed, canonicalIndex]);
 
   const canonical = useMemo(() => {
     const selected = selection?.canonicalId;

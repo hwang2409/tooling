@@ -521,24 +521,25 @@ describe("createCanonicalIndex", () => {
 });
 
 describe("robustness on pathological captured input", () => {
-  it("validates large reminder markup in linear time", () => {
-    // The retired slice-per-element scan was quadratic: ~360 KB of repeated
-    // reminder elements took multiple seconds per comparison. The linear
-    // token scan must stay comfortably under a second including JSDOM
-    // overhead; the generous bound still fails the quadratic implementation.
+  it("accepts a large run of repeated complete reminder elements", () => {
     const markup = "<system-reminder>captured note</system-reminder>\n".repeat(8000);
     const earlier = user("hello");
     const later = { role: "user", content: [{ type: "text", text: "hello" }, { type: "text", text: markup }] } as JsonValue;
-    const started = performance.now();
     expect(messageMatches(earlier, later)).toBe(true);
-    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it("accepts unicode whitespace between reminder elements like the retired trim()-based scanner", () => {
+    const markup = "<system-reminder>a</system-reminder>\u00a0\u3000\u2028<system-reminder>b</system-reminder>\ufeff";
+    const earlier = user("hello");
+    const later = { role: "user", content: [{ type: "text", text: "hello" }, { type: "text", text: markup }] } as JsonValue;
+    expect(messageMatches(earlier, later)).toBe(true);
   });
 
   it("validates deeply nested reminder markup in linear time", () => {
     // Nesting is the quadratic hot spot of the retired scanner: every inner
-    // iteration re-scanned forward to the first close tag, so depth-20000
+    // iteration re-scanned forward to the first close tag, so depth-40000
     // balanced markup cost hundreds of millions of character comparisons.
-    const nested = "<system-reminder>".repeat(20000) + "</system-reminder>".repeat(20000);
+    const nested = "<system-reminder>".repeat(40000) + "</system-reminder>".repeat(40000);
     const earlier = user("hello");
     const later = { role: "user", content: [{ type: "text", text: "hello" }, { type: "text", text: nested }] } as JsonValue;
     const started = performance.now();

@@ -184,19 +184,30 @@ const REMINDER_CLOSE = "</system-reminder>";
  * text disqualify the block — otherwise arbitrary user text could fabricate
  * a prefix match.
  */
+function isWhitespaceCode(code: number): boolean {
+  if (code === 0x20 || (code >= 0x09 && code <= 0x0d)) return true;
+  if (code < 0x80) return false;
+  // Same set String.prototype.trim strips (ES WhiteSpace + LineTerminator),
+  // so tokenized scanning accepts exactly what the retired trim()-based
+  // scanner accepted.
+  return code === 0x00a0 || code === 0x1680 || (code >= 0x2000 && code <= 0x200a)
+    || code === 0x2028 || code === 0x2029 || code === 0x202f || code === 0x205f
+    || code === 0x3000 || code === 0xfeff;
+}
+
 function isWhitespaceOnly(text: string, from: number, to: number): boolean {
   for (let index = from; index < to; index += 1) {
-    const code = text.charCodeAt(index);
-    if (code !== 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d && code !== 0x0b && code !== 0x0c) return false;
+    if (!isWhitespaceCode(text.charCodeAt(index))) return false;
   }
   return true;
 }
 
 function isReminderMarkup(text: string): boolean {
-  // Single linear pass: collect every tag occurrence once (each indexOf
-  // resumes past the previous match), then walk the token stream with a
-  // depth counter. The previous per-element slice+trim implementation was
-  // quadratic — a 560 KB reminder block took ~750 ms per comparison.
+  // Tokenize once (each indexOf resumes past the previous match), then walk
+  // the token stream with a depth counter — O(n log n) for the token sort,
+  // effectively linear in text size. The previous scanner re-scanned to the
+  // first close tag on every nested iteration: quadratic, and a deeply
+  // nested reminder block froze drill-in for seconds per comparison.
   const tokens: Array<readonly [start: number, open: boolean]> = [];
   for (let at = text.indexOf(REMINDER_OPEN); at !== -1; at = text.indexOf(REMINDER_OPEN, at + REMINDER_OPEN.length)) {
     tokens.push([at, true]);

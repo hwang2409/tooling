@@ -606,6 +606,43 @@ describe("Workspace session-first navigation", () => {
     expect(container.querySelectorAll(".session-aux .packet-row")).toHaveLength(2);
   });
 
+  it("degrades to the auxiliary/flow view instead of crashing when candidate parsing throws", async () => {
+    const session = "dead9999-0000-1111-2222-333333333333";
+    const flows = [
+      sessionFlow("boom-1", {
+        session_id: session,
+        started_at: "2026-01-01T00:01:00Z",
+        summary: { kind: "anthropic_messages", model: "claude-opus-4", message_count: "1", preview: { source: "user_text", text: "hello" } },
+      }),
+    ];
+    const throwingParser: CandidateParser = {
+      parseAll: () => {
+        throw new Error("pathological captured payload");
+      },
+      stats: () => ({ parses: 0, retainedEntries: 0 }),
+    };
+    const errors: unknown[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args);
+    };
+    try {
+      const { container } = await mountWorkspace(
+        stateOf(flows),
+        { "boom-1": { request: JSON.stringify({ model: "claude-opus-4", messages: [{ role: "user", content: "hello" }] }) } },
+        { candidateParser: throwingParser },
+      );
+      await click(sessionRows(container)[0]);
+      await settle();
+      // No crash, no fake conversation; the session's flows stay reachable.
+      expect(container.querySelector("[data-testid='conversation-view']")).toBeNull();
+      expect(container.querySelectorAll(".packet-row").length).toBeGreaterThan(0);
+      expect(errors.length).toBeGreaterThan(0);
+    } finally {
+      console.error = originalError;
+    }
+  });
+
   it("context regression: an identical-history different-model side-call never steals the conversation", async () => {
     const session = "abab5555-0000-1111-2222-333333333333";
     // The haiku side-call resends the main thread's EXACT message history
