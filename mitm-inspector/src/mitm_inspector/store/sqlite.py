@@ -280,17 +280,17 @@ class SQLiteFlowStorage:
         with sqlite3.connect(self.path) as connection:
             rows = self._session_summary_rows(
                 connection,
-                before=_timestamp_sort_key(before) if before is not None else None,
+                before=before,
                 limit=limit,
             )
         return [
             {
                 "session_id": row[0],
-                "first_query": None,
+                "first_query": self._first_query_from_body(row[5]),
                 "flow_count": int(row[1]),
                 "started_at": row[2],
                 "last_activity": row[3],
-                "models": [],
+                "models": self._models_from_json(row[6]),
                 "has_error": bool(row[4]),
             }
             for row in rows
@@ -338,46 +338,146 @@ class SQLiteFlowStorage:
     ) -> list[tuple[object, ...]]:
         """Return one aggregate row for each of the newest sessions."""
 
-        before_filter = "AND started_at_sort < ?" if before is not None else ""
+        before_filter = "WHERE latest_activity_jd < julianday(?)" if before is not None else ""
         parameters: tuple[object, ...]
         if before is None:
             parameters = (limit,)
         else:
-            parameters = (before, limit, before)
+            parameters = (before, limit)
         return connection.execute(
             f"""
-            WITH selected_sessions AS (
-                SELECT session_id, MAX(started_at_sort) AS latest
+            WITH session_cursors AS (
+                SELECT session_id,
+                       MAX(julianday(COALESCE(ended_at, started_at))) AS latest_activity_jd
                 FROM flows
-                WHERE method <> '' {before_filter}
+                WHERE method <> ''
                 GROUP BY session_id
-                ORDER BY CASE WHEN latest IS NULL THEN 1 ELSE 0 END,
-                         latest DESC
+            ), selected_sessions AS (
+                SELECT session_id, latest_activity_jd
+                FROM session_cursors
+                {before_filter}
+                ORDER BY CASE WHEN latest_activity_jd IS NULL THEN 1 ELSE 0 END,
+                         latest_activity_jd DESC
                 LIMIT ?
             ), session_aggregates AS (
                 SELECT flows.session_id,
                        COUNT(*) AS flow_count,
-                       MIN(flows.started_at) AS started_at,
-                       MAX(COALESCE(flows.ended_at, flows.started_at)) AS last_activity,
+                       MIN(flows.started_at_sort) AS started_at_sort,
+                       MAX(
+                           julianday(COALESCE(flows.ended_at, flows.started_at))
+                       ) AS last_activity_jd,
                        MAX(
                            CASE
                                WHEN CAST(flows.response_status AS INTEGER) >= 400 THEN 1
                                ELSE 0
                            END
                        ) AS has_error,
-                       selected_sessions.latest AS latest
+                       selected_sessions.latest_activity_jd AS cursor_jd
                 FROM flows
                 JOIN selected_sessions
                   ON flows.session_id IS selected_sessions.session_id
-                WHERE flows.method <> '' {before_filter}
+                WHERE flows.method <> ''
                 GROUP BY flows.session_id
             )
-            SELECT session_id, flow_count, started_at, last_activity, has_error
+            SELECT session_aggregates.session_id,
+                   session_aggregates.flow_count,
+                   (
+                       SELECT candidate.started_at
+                       FROM flows AS candidate
+                       WHERE candidate.session_id IS session_aggregates.session_id
+                         AND candidate.started_at_sort IS session_aggregates.started_at_sort
+                       ORDER BY candidate.created_order ASC
+                       LIMIT 1
+                   ) AS started_at,
+                   (
+                       SELECT COALESCE(candidate.ended_at, candidate.started_at)
+                       FROM flows AS candidate
+                       WHERE candidate.session_id IS session_aggregates.session_id
+                         AND julianday(COALESCE(candidate.ended_at, candidate.started_at))
+                             = session_aggregates.last_activity_jd
+                       ORDER BY candidate.created_order DESC
+                       LIMIT 1
+                   ) AS last_activity,
+                   session_aggregates.has_error,
+                   (
+                       SELECT body_search.body_text
+                       FROM flows AS candidate
+                       JOIN body_search ON body_search.flow_id = candidate.flow_id
+                       WHERE candidate.session_id IS session_aggregates.session_id
+                         AND body_search.field = 'request_body'
+                         AND EXISTS (
+                             SELECT 1
+                             FROM json_each(
+                                 CASE
+                                     WHEN json_valid(body_search.body_text) THEN
+                                         CASE
+                                             WHEN json_type(
+                                                 body_search.body_text, '$.messages'
+                                             ) = 'array'
+                                             THEN json_extract(body_search.body_text, '$.messages')
+                                             ELSE '[]'
+                                         END
+                                     ELSE '[]'
+                                 END
+                             ) AS message
+                             WHERE json_extract(message.value, '$.role') = 'user'
+                         )
+                       ORDER BY CASE WHEN candidate.started_at_sort IS NULL THEN 1 ELSE 0 END,
+                                candidate.started_at_sort ASC, candidate.created_order ASC
+                       LIMIT 1
+                   ) AS first_request_body,
+                   (
+                       SELECT json_group_array(model)
+                       FROM (
+                           SELECT CASE
+                                      WHEN json_valid(body_search.body_text)
+                                      THEN json_extract(body_search.body_text, '$.model')
+                                  END AS model,
+                                  MIN(candidate.started_at_sort) AS first_started_sort,
+                                  MIN(candidate.created_order) AS first_created_order
+                           FROM flows AS candidate
+                           JOIN body_search ON body_search.flow_id = candidate.flow_id
+                           WHERE candidate.session_id IS session_aggregates.session_id
+                             AND body_search.field = 'request_body'
+                             AND json_valid(body_search.body_text)
+                           GROUP BY model
+                           ORDER BY CASE WHEN first_started_sort IS NULL THEN 1 ELSE 0 END,
+                                    first_started_sort ASC, first_created_order ASC
+                       )
+                   ) AS models_json
             FROM session_aggregates
-            ORDER BY CASE WHEN latest IS NULL THEN 1 ELSE 0 END, latest DESC
+            ORDER BY CASE WHEN cursor_jd IS NULL THEN 1 ELSE 0 END, cursor_jd DESC
             """,
             parameters,
         ).fetchall()
+
+    @staticmethod
+    def _first_query_from_body(body: object) -> str | None:
+        if not isinstance(body, str):
+            return None
+        from mitm_inspector.api.summary import flow_summary
+
+        summary = flow_summary(
+            {"host": "api.anthropic.com", "path": "/v1/messages"},
+            decoded_bodies={"request": body.encode("utf-8")},
+        )
+        preview = summary.get("preview")
+        if not isinstance(preview, Mapping) or preview.get("source") != "user_text":
+            return None
+        text = preview.get("text")
+        return text if isinstance(text, str) else None
+
+    @staticmethod
+    def _models_from_json(value: object) -> list[str]:
+        if not isinstance(value, str):
+            return []
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [model for model in parsed if isinstance(model, str)]
 
     @staticmethod
     def _session_rows(

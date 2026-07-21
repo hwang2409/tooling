@@ -88,11 +88,8 @@ def test_http_session_list_and_detail_are_sqlite_backed(tmp_path: Path) -> None:
             sessions = json.loads(body)["sessions"]
             assert sessions[0]["session_id"] == "session-a"
             assert sessions[0]["flow_count"] == 2
-            # Session browsing is metadata-only. Bodies are fetched only after
-            # selecting an individual flow, so summaries cannot inspect body
-            # content for a query preview or model.
-            assert sessions[0]["first_query"] is None
-            assert sessions[0]["models"] == []
+            assert sessions[0]["first_query"] == "first prompt"
+            assert sessions[0]["models"] == ["claude-test"]
 
             head, body = await request(server.bound_port, "/api/v1/sessions/session-a")
             assert head.startswith(b"HTTP/1.1 200 ")
@@ -146,6 +143,55 @@ def test_session_list_cap_is_by_session_count(tmp_path: Path, monkeypatch) -> No
             1,
             1,
         ]
+        assert summaries[0]["first_query"] == "prompt-0"
+        assert summaries[0]["models"] == ["claude-test"]
+    finally:
+        storage.close()
+
+
+def test_session_list_uses_precision_safe_timestamps(tmp_path: Path) -> None:
+    storage = SQLiteFlowStorage(tmp_path / "flows.sqlite")
+    try:
+        for flow_id, started, ended in (
+            ("fractional", "2026-07-21T15:00:00.001Z", "2026-07-21T15:00:00.001Z"),
+            ("whole-second", "2026-07-21T15:00:00Z", "2026-07-21T15:00:00Z"),
+        ):
+            storage.offer(metadata(flow_id, "session-precision", flow_id))
+            storage.offer(lifecycle(flow_id, "1", "request_started", started))
+            storage.offer(lifecycle(flow_id, "2", "flow_completed", ended))
+        storage.flush()
+
+        summary = storage.session_summaries(limit=1)[0]
+        assert summary["started_at"] == "2026-07-21T15:00:00Z"
+        assert summary["last_activity"] == "2026-07-21T15:00:00.001Z"
+    finally:
+        storage.close()
+
+
+def test_session_list_cursor_is_session_level(tmp_path: Path) -> None:
+    storage = SQLiteFlowStorage(tmp_path / "flows.sqlite")
+    try:
+        for flow_id, session_id, timestamp in (
+            ("a-old", "session-a", "2026-01-01T00:01:00Z"),
+            ("a-new", "session-a", "2026-01-01T00:02:00Z"),
+            ("b-old", "session-b", "2026-01-01T00:10:00Z"),
+            ("b-new", "session-b", "2026-01-01T00:25:00Z"),
+            ("c-new", "session-c", "2026-01-01T00:30:00Z"),
+        ):
+            storage.offer(metadata(flow_id, session_id, flow_id))
+            storage.offer(lifecycle(flow_id, "1", "request_started", timestamp))
+        storage.flush()
+
+        first_page = storage.session_summaries(limit=2)
+        second_page = storage.session_summaries(
+            limit=2, before="2026-01-01T00:25:00Z"
+        )
+        assert [summary["session_id"] for summary in first_page] == [
+            "session-c",
+            "session-b",
+        ]
+        assert [summary["session_id"] for summary in second_page] == ["session-a"]
+        assert second_page[0]["flow_count"] == 2
     finally:
         storage.close()
 
