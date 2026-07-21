@@ -23,19 +23,26 @@ export function SessionList({ sessions, onOpen }: SessionListProps) {
         return (
           <li key={session.key === null ? "unassigned" : `s:${session.key}`} className="session-item">
             <button type="button" className="session-row" onClick={() => onOpen(session.key)}>
-              <span className="session-time">{formatClockTime(session.startedAt)}</span>
-              <span className={`session-id${session.key === null ? " session-id-unassigned" : ""}`}>
-                {sessionLabel(session.key)}
+              <span className="session-row-primary">
+                <span className={`session-query${session.firstQuery === undefined ? " session-query-none" : ""}`}>
+                  {session.firstQuery === undefined ? "no user prompt captured" : `“${session.firstQuery}”`}
+                </span>
+                {session.hasError ? (
+                  <span className="session-status session-status-error">err</span>
+                ) : null}
               </span>
-              <span className="session-count">{session.flowCount}f</span>
-              <span className="session-models">{models.length > 0 ? models : PLACEHOLDER}</span>
-              <span className={`session-query${session.firstQuery === undefined ? " session-query-none" : ""}`}>
-                {session.firstQuery === undefined ? PLACEHOLDER : `“${session.firstQuery}”`}
-              </span>
-              <span className="session-last">{formatClockTime(session.lastActivity)}</span>
-              <span className="session-duration">{durationBetween(session.startedAt, session.lastActivity)}</span>
-              <span className={`session-status${session.hasError ? " session-status-error" : ""}`}>
-                {session.hasError ? "err" : ""}
+              <span className="session-row-meta">
+                <span className={`session-id${session.key === null ? " session-id-unassigned" : ""}`}>
+                  {sessionLabel(session.key)}
+                </span>
+                <span className="session-time">
+                  {formatClockTime(session.startedAt)}
+                  {" – "}
+                  <span className="session-last">{formatClockTime(session.lastActivity)}</span>
+                </span>
+                <span className="session-duration">{durationBetween(session.startedAt, session.lastActivity)}</span>
+                <span className="session-count">{session.flowCount}f</span>
+                <span className="session-models">{models.length > 0 ? models : PLACEHOLDER}</span>
               </span>
             </button>
           </li>
