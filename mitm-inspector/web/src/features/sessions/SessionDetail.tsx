@@ -1,12 +1,12 @@
 /* eslint-disable no-unused-vars */
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 
 import { PacketDetail, PacketList } from "../flows/PacketList";
 import { PLACEHOLDER, deriveRowCells, durationBetween, shortModel } from "../flows/rowSummary";
 import { parseAnthropicRequest } from "../inspector/anthropic";
 import type { AnthropicRequest } from "../inspector/anthropic";
-import { Collapse } from "../inspector/ConversationView";
 import { bodyText } from "../inspector/decoders";
 import { useFlowDetails } from "../inspector/flowDetail";
 import type { FlowDetailLoader, FlowDetailResult } from "../inspector/flowDetail";
@@ -320,109 +320,96 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
     return [canonical.flow, ...available.filter((flow) => flow.flow_id !== canonical.flow.flow_id)];
   }, [candidates, canonical, summary.flows]);
 
-  const auxiliary = useMemo(
-    () => (rendered === null ? summary.flows : summary.flows.filter((flow) => flow.flow_id !== rendered.flow.flow_id)),
-    [summary.flows, rendered],
-  );
   const models = summary.models.map(shortModel).join(" · ");
   const duration = durationBetween(summary.startedAt, summary.lastActivity);
+  const showSourcePicker = effectiveMode === "conversation" && candidates.length > 1;
   const closePicker = () => {
     setPickerOpen(false);
     sourceButtonRef.current?.focus();
   };
 
+  const metaBits: ReactNode[] = [];
+  if (models.length > 0) metaBits.push(<span key="models">{models}</span>);
+  metaBits.push(
+    <span key="flows">{summary.flowCount} {summary.flowCount === 1 ? "flow" : "flows"}</span>,
+  );
+  if (duration !== PLACEHOLDER) metaBits.push(<span key="dur">{duration}</span>);
+  if (summary.hasError) metaBits.push(<span key="err" className="session-status-error">err</span>);
+
   return (
     <section className="session-detail" data-testid="session-detail">
-      <div className="session-detail-bar">
-        <button type="button" className="session-back" onClick={onBack}>← sessions</button>
-        <span className="session-detail-title">{sessionLabel(summary.key)}</span>
-        <span className="session-detail-meta">
-          {summary.flowCount} {summary.flowCount === 1 ? "flow" : "flows"}
-          {models.length > 0 ? ` · ${models}` : ""}
-          {duration === PLACEHOLDER ? "" : ` · ${duration}`}
-          {summary.hasError ? " · " : ""}
-          {summary.hasError ? <span className="session-status-error">err</span> : null}
-        </span>
-        <div className="packet-detail-modes session-detail-modes">
-          <button
-            type="button"
-            className="packet-mode"
-            aria-pressed={effectiveMode === "conversation"}
-            disabled={candidates.length === 0}
-            onClick={() => setMode("conversation")}
-          >conversation</button>
-          <button
-            type="button"
-            className="packet-mode"
-            aria-pressed={effectiveMode === "flows"}
-            onClick={() => setMode("flows")}
-          >flows</button>
-        </div>
-        {effectiveMode === "conversation" && (rendered !== null || candidates.length > 0) ? (
-          <div className="session-source-control">
-            <button
-              type="button"
-              ref={sourceButtonRef}
-              className={`session-render-source${manual !== null ? " session-render-source-manual" : ""}`}
-              aria-expanded={pickerOpen}
-              aria-controls="session-source-picker"
-              data-testid="rendered-source"
-              onClick={() => setPickerOpen((open) => !open)}
-            >
-              <span>{rendered === null ? "choose request to render" : `rendered from request ${rendered.flow.flow_id.slice(0, 8)}`}</span>
-              <span aria-hidden="true">·</span>
-              <span className="session-render-source-state">{manual !== null ? "manual" : "auto"}</span>
-            </button>
-            {pickerOpen ? (
-              <SourcePicker
-                flows={pickerFlows}
-                parsed={parsed}
-                selection={selection}
-                renderedFlowId={rendered?.flow.flow_id ?? null}
-                settled={settled}
-                onSelect={(flowId) => {
-                  setManualFlowId(flowId);
-                  closePicker();
-                }}
-                onAuto={() => {
-                  setManualFlowId(null);
-                  closePicker();
-                }}
-                onClose={closePicker}
-              />
+      <header className="session-detail-bar">
+        <button type="button" className="session-back" onClick={onBack}>
+          <span aria-hidden="true">←</span> sessions
+        </button>
+        <h1 className="session-detail-title">{sessionLabel(summary.key)}</h1>
+        <div className="session-detail-subhead">
+          <div className="session-detail-meta">
+            {metaBits.map((bit, index) => (
+              <span key={index} className="session-detail-meta-item">{bit}</span>
+            ))}
+          </div>
+          <div className="session-detail-controls">
+            <div className="packet-detail-modes session-detail-modes">
+              <button
+                type="button"
+                className="packet-mode"
+                aria-pressed={effectiveMode === "conversation"}
+                disabled={candidates.length === 0}
+                onClick={() => setMode("conversation")}
+              >conversation</button>
+              <button
+                type="button"
+                className="packet-mode"
+                aria-pressed={effectiveMode === "flows"}
+                onClick={() => setMode("flows")}
+              >flows</button>
+            </div>
+            {showSourcePicker ? (
+              <div className="session-source-control">
+                <button
+                  type="button"
+                  ref={sourceButtonRef}
+                  className="session-source-toggle"
+                  aria-expanded={pickerOpen}
+                  aria-controls="session-source-picker"
+                  aria-label={rendered === null ? "choose request to render" : `rendered from request ${rendered.flow.flow_id.slice(0, 8)} (${manual !== null ? "manual" : "auto"})`}
+                  data-testid="rendered-source"
+                  data-source-label={rendered === null ? "choose request to render" : `rendered from request ${rendered.flow.flow_id.slice(0, 8)}`}
+                  data-source-state={manual !== null ? "manual" : "auto"}
+                  onClick={() => setPickerOpen((open) => !open)}
+                >···</button>
+                {pickerOpen ? (
+                  <SourcePicker
+                    flows={pickerFlows}
+                    parsed={parsed}
+                    selection={selection}
+                    renderedFlowId={rendered?.flow.flow_id ?? null}
+                    settled={settled}
+                    onSelect={(flowId) => {
+                      setManualFlowId(flowId);
+                      closePicker();
+                    }}
+                    onAuto={() => {
+                      setManualFlowId(null);
+                      closePicker();
+                    }}
+                    onClose={closePicker}
+                  />
+                ) : null}
+              </div>
             ) : null}
           </div>
-        ) : null}
-      </div>
+        </div>
+      </header>
       {effectiveMode === "conversation" ? (
         <div className="session-conversation">
           {!settled ? (
-            <p className="packet-empty">loading conversation…</p>
+            <p className="session-conv-empty">loading conversation…</p>
           ) : rendered === null ? (
-            <>
-              <p className="packet-empty">no main-thread conversation in this session — auxiliary calls only</p>
-              <Collapse
-                className="session-aux"
-                label={`auxiliary calls (${auxiliary.length})`}
-                meta={<span className="conv-section-meta">suggestion + utility side-calls</span>}
-                defaultOpen
-              >
-                <PacketList flows={auxiliary} sourceEpoch={sourceEpoch} showSearch={false} loadFlowDetail={loadFlowDetail} />
-              </Collapse>
-            </>
+            <p className="session-conv-empty">no conversation captured for this session</p>
           ) : (
-            <>
-              <PacketDetail key={rendered.flow.flow_id} metadata={rendered.flow} detail={rendered.detail} />
-              {auxiliary.length > 0 ? (
-                <Collapse
-                  className="session-aux"
-                  label={`auxiliary calls (${auxiliary.length})`}
-                  meta={<span className="conv-section-meta">suggestion + utility side-calls</span>}
-                >
-                  <PacketList flows={auxiliary} sourceEpoch={sourceEpoch} showSearch={false} loadFlowDetail={loadFlowDetail} />
-                </Collapse>
-              ) : null}
-            </>
+            <PacketDetail key={rendered.flow.flow_id} metadata={rendered.flow} detail={rendered.detail} />
           )}
         </div>
       ) : (
