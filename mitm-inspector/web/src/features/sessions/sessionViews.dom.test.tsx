@@ -244,6 +244,79 @@ describe("Workspace session-first navigation", () => {
     expect(container.querySelectorAll(".session-aux .packet-row").length).toBe(2);
   });
 
+  it("lists canonical request first, then newest candidates, and manually renders a utility flow", async () => {
+    const utilityRequest = JSON.stringify({
+      model: "claude-haiku-4",
+      messages: [
+        { role: "user", content: "fix the bug" },
+        { role: "assistant", content: "checking quota" },
+      ],
+    });
+    const utilityResponse = JSON.stringify({
+      model: "claude-haiku-4",
+      role: "assistant",
+      content: [{ type: "text", text: "utility answer" }],
+      stop_reason: "end_turn",
+    });
+    const utility = sessionFlow("utility-flow", {
+      started_at: "2026-01-01T00:00:30Z",
+      ended_at: "2026-01-01T00:00:40Z",
+      summary: {
+        kind: "anthropic_messages",
+        model: "claude-haiku-4",
+        message_count: "2",
+        preview: { source: "user_text", text: "checking quota" },
+      },
+    });
+    const { container } = await mountWorkspace(
+      stateOf([FLOWS[0], FLOWS[1], utility]),
+      { ...DETAIL_BODIES, "utility-flow": { request: utilityRequest, response: utilityResponse } },
+    );
+    await click(sessionRows(container)[0]);
+    await settle();
+
+    const source = container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']");
+    expect(source?.textContent).toContain("rendered from request main-flo");
+    expect(source?.textContent).toContain("auto");
+    await click(source);
+    const options = Array.from(container.querySelectorAll<HTMLButtonElement>("[data-testid='session-source-option']"));
+    expect(options.map((option) => option.dataset.flowId)).toEqual(["main-flow", "aux-suggestion", "utility-flow"]);
+    expect(options[0].textContent).toContain("3m ·");
+    expect(options[0].textContent).toContain("opus-4");
+    expect(options[1].textContent).toContain("suggestion");
+    expect(options[2].textContent).toContain("2m ·");
+    expect(options[2].textContent).toContain("haiku-4");
+    expect(options[2].textContent).toContain("utility");
+
+    await click(options[2]);
+    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("utility-");
+    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("manual");
+    expect(container.querySelector("[data-testid='conversation-view']")?.textContent).toContain("utility answer");
+    const raw = Array.from(container.querySelectorAll<HTMLButtonElement>(".packet-detail-modes .packet-mode"))
+      .find((button) => button.textContent === "raw");
+    await click(raw);
+    expect(container.querySelector(".packet-detail .json-tree")).not.toBeNull();
+  });
+
+  it("resets manual source choice when switching sessions", async () => {
+    const { container } = await mountWorkspace(stateOf(FLOWS));
+    await click(sessionRows(container)[0]);
+    await settle();
+    await click(container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']"));
+    const options = Array.from(container.querySelectorAll<HTMLButtonElement>("[data-testid='session-source-option']"));
+    await click(options[1]);
+    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("manual");
+
+    await click(container.querySelector<HTMLButtonElement>(".session-back"));
+    await click(sessionRows(container)[1]);
+    await click(container.querySelector<HTMLButtonElement>(".session-back"));
+    await click(sessionRows(container)[0]);
+    await settle();
+    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("main-flo");
+    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("auto");
+    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).not.toContain("manual");
+  });
+
   it("keeps the per-session flow grid one toggle away and navigates back home", async () => {
     const { container } = await mountWorkspace(stateOf(FLOWS));
     await click(sessionRows(container)[0]);

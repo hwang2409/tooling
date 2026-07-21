@@ -1,9 +1,9 @@
 /* eslint-disable no-unused-vars */
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { PacketDetail, PacketList } from "../flows/PacketList";
-import { PLACEHOLDER, durationBetween, shortModel } from "../flows/rowSummary";
+import { PLACEHOLDER, deriveRowCells, durationBetween, shortModel } from "../flows/rowSummary";
 import { parseAnthropicRequest } from "../inspector/anthropic";
 import type { AnthropicRequest } from "../inspector/anthropic";
 import { Collapse } from "../inspector/ConversationView";
@@ -14,9 +14,9 @@ import { safeParseJson } from "../inspector/jsonTree";
 import type { JsonValue } from "../inspector/jsonTree";
 import type { ImmutableFlowMetadata } from "../../state/browserState";
 import { createCanonicalIndex, requestContextKey } from "./canonical";
-import type { CanonicalIndex } from "./canonical";
+import type { CanonicalIndex, CanonicalSelection } from "./canonical";
 import { sessionLabel } from "./SessionList";
-import { conversationCandidates, isSuggestionRequest } from "./sessionSummary";
+import { conversationCandidates, isSuggestionRequest, looksLikeSuggestionFlow } from "./sessionSummary";
 import type { SessionSummary } from "./sessionSummary";
 
 export interface SessionDetailProps {
@@ -133,6 +133,65 @@ export function createCandidateParser(): CandidateParser {
   };
 }
 
+function sourceMarker(
+  flow: ImmutableFlowMetadata,
+  candidate: ParsedCandidate | undefined,
+  selection: CanonicalSelection | null,
+): "suggestion" | "utility" | null {
+  if (candidate?.suggestion || looksLikeSuggestionFlow(flow)) return "suggestion";
+  if (selection === null || !selection.chainIds.includes(flow.flow_id)) return "utility";
+  return null;
+}
+
+function sourceSummary(flow: ImmutableFlowMetadata): string {
+  const cells = deriveRowCells(flow);
+  return `${cells.messages} · ${cells.time} · ${cells.model}`;
+}
+
+interface SourcePickerProps {
+  readonly flows: readonly ImmutableFlowMetadata[];
+  readonly parsed: readonly ParsedCandidate[];
+  readonly selection: CanonicalSelection | null;
+  readonly renderedFlowId: string | null;
+  readonly settled: boolean;
+  readonly onSelect: (flowId: string) => void;
+  readonly onAuto: () => void;
+}
+
+function SourcePicker({ flows, parsed, selection, renderedFlowId, settled, onSelect, onAuto }: SourcePickerProps) {
+  const parsedById = new Map(parsed.map((candidate) => [candidate.flow.flow_id, candidate]));
+  return (
+    <div className="session-source-picker" id="session-source-picker" role="listbox" aria-label="Choose rendered request">
+      <div className="session-source-picker-head">
+        <span>render request</span>
+        <button type="button" className="session-source-auto" onClick={onAuto}>auto-pick</button>
+      </div>
+      {flows.map((flow, index) => {
+        const candidate = parsedById.get(flow.flow_id);
+        const marker = sourceMarker(flow, candidate, selection);
+        const disabled = !settled || candidate?.detail === null || candidate?.request === null;
+        return (
+          <button
+            key={flow.flow_id}
+            type="button"
+            role="option"
+            aria-selected={renderedFlowId === flow.flow_id}
+            disabled={disabled}
+            className="session-source-option"
+            data-testid="session-source-option"
+            data-flow-id={flow.flow_id}
+            onClick={() => onSelect(flow.flow_id)}
+          >
+            <span className="session-source-option-id">{index + 1}. {flow.flow_id.slice(0, 8)}</span>
+            <span className="session-source-option-summary">{sourceSummary(flow)}</span>
+            {marker !== null ? <span className="session-source-option-marker">{marker}</span> : null}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 /**
  * One session's drill-in view. Conversation mode fetches every
  * conversation-shaped flow in the session (drill-in detail fetches are
@@ -147,7 +206,16 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
   const candidates = useMemo(() => conversationCandidates(summary.flows), [summary.flows]);
   // The unassigned bucket keeps the grid experience as its default drill-in.
   const [mode, setMode] = useState<SessionMode>(summary.key === null ? "flows" : "conversation");
+  const [manualFlowId, setManualFlowId] = useState<string | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
   const effectiveMode: SessionMode = candidates.length === 0 ? "flows" : mode;
+
+  // Manual choice belongs only to this session incarnation. A source reset can
+  // reuse flow ids, so sourceEpoch is part of the reset boundary.
+  useEffect(() => {
+    setManualFlowId(null);
+    setPickerOpen(false);
+  }, [summary.key, sourceEpoch]);
 
   const details = useFlowDetails(effectiveMode === "conversation" ? candidates : NO_FLOWS, loadFlowDetail, sourceEpoch);
   // Created order for the tip-recency policy is the GRID position of the
@@ -175,7 +243,7 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
   // Body-verified selection only. When nothing verifiable and non-suggestion
   // remains, canonical stays null and the drill-in shows the auxiliary/flow
   // view instead of promoting a rejected flow into a fake chat.
-  const canonical = useMemo(() => {
+  const selection = useMemo<CanonicalSelection | null>(() => {
     if (!settled) return null;
     const usable = parsed
       .filter((candidate) => candidate.request !== null && candidate.rawMessages !== null)
@@ -186,13 +254,34 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
         order: candidate.order,
         ...(candidate.contextKey !== undefined ? { contextKey: candidate.contextKey } : {}),
       }));
-    const selected = indexRef.current!.update(usable).canonicalId;
-    return selected === null ? null : parsed.find((candidate) => candidate.flow.flow_id === selected) ?? null;
+    return indexRef.current!.update(usable);
   }, [settled, parsed]);
 
+  const canonical = useMemo(() => {
+    const selected = selection?.canonicalId;
+    return selected === null || selected === undefined
+      ? null
+      : parsed.find((candidate) => candidate.flow.flow_id === selected) ?? null;
+  }, [parsed, selection]);
+
+  const manual = useMemo(
+    () => manualFlowId === null ? null : parsed.find((candidate) => candidate.flow.flow_id === manualFlowId) ?? null,
+    [manualFlowId, parsed],
+  );
+  useEffect(() => {
+    if (manualFlowId !== null && !candidates.some((flow) => flow.flow_id === manualFlowId)) setManualFlowId(null);
+  }, [candidates, manualFlowId]);
+  const rendered = manual ?? canonical;
+  const pickerFlows = useMemo(() => {
+    const candidateIds = new Set(candidates.map((flow) => flow.flow_id));
+    const available = summary.flows.filter((flow) => candidateIds.has(flow.flow_id));
+    if (canonical === null) return available;
+    return [canonical.flow, ...available.filter((flow) => flow.flow_id !== canonical.flow.flow_id)];
+  }, [candidates, canonical, summary.flows]);
+
   const auxiliary = useMemo(
-    () => (canonical === null ? summary.flows : summary.flows.filter((flow) => flow.flow_id !== canonical.flow.flow_id)),
-    [summary.flows, canonical],
+    () => (rendered === null ? summary.flows : summary.flows.filter((flow) => flow.flow_id !== rendered.flow.flow_id)),
+    [summary.flows, rendered],
   );
   const models = summary.models.map(shortModel).join(" · ");
   const duration = durationBetween(summary.startedAt, summary.lastActivity);
@@ -224,12 +313,45 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
             onClick={() => setMode("flows")}
           >flows</button>
         </div>
+        {effectiveMode === "conversation" && (rendered !== null || candidates.length > 0) ? (
+          <div className="session-source-control">
+            <button
+              type="button"
+              className={`session-render-source${manual !== null ? " session-render-source-manual" : ""}`}
+              aria-expanded={pickerOpen}
+              aria-controls="session-source-picker"
+              data-testid="rendered-source"
+              onClick={() => setPickerOpen((open) => !open)}
+            >
+              <span>{rendered === null ? "choose request to render" : `rendered from request ${rendered.flow.flow_id.slice(0, 8)}`}</span>
+              <span aria-hidden="true">·</span>
+              <span className="session-render-source-state">{manual !== null ? "manual" : "auto"}</span>
+            </button>
+            {pickerOpen ? (
+              <SourcePicker
+                flows={pickerFlows}
+                parsed={parsed}
+                selection={selection}
+                renderedFlowId={rendered?.flow.flow_id ?? null}
+                settled={settled}
+                onSelect={(flowId) => {
+                  setManualFlowId(flowId);
+                  setPickerOpen(false);
+                }}
+                onAuto={() => {
+                  setManualFlowId(null);
+                  setPickerOpen(false);
+                }}
+              />
+            ) : null}
+          </div>
+        ) : null}
       </div>
       {effectiveMode === "conversation" ? (
         <div className="session-conversation">
           {!settled ? (
             <p className="packet-empty">loading conversation…</p>
-          ) : canonical === null ? (
+          ) : rendered === null ? (
             <>
               <p className="packet-empty">no main-thread conversation in this session — auxiliary calls only</p>
               <Collapse
@@ -243,7 +365,7 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
             </>
           ) : (
             <>
-              <PacketDetail metadata={canonical.flow} detail={canonical.detail} />
+              <PacketDetail key={rendered.flow.flow_id} metadata={rendered.flow} detail={rendered.detail} />
               {auxiliary.length > 0 ? (
                 <Collapse
                   className="session-aux"
