@@ -232,6 +232,29 @@ describe("selectCanonicalFlow", () => {
     expect(selectCanonicalFlow([retransmit, main2, main1, root]).canonicalId).toBe("retransmit");
   });
 
+  it("context regression: pruning to one stage keeps a newer equal-history clone auxiliary", () => {
+    const mainKey = requestContextKey({ model: "claude-opus-4", system: "main" } as JsonValue);
+    const cloneKey = requestContextKey({ model: "claude-haiku-4", system: "side call" } as JsonValue);
+    const main = candidate("main", [u1, a1], 1, false, mainKey);
+    const clone = candidate("clone", [u1, a1], 0, false, cloneKey);
+    const selection = selectCanonicalFlow([clone, main]);
+    expect(selection.canonicalId).toBe("main");
+    expect(selection.chainIds).toEqual(["main"]);
+  });
+
+  it("context regression: growing lineage survives A/B/C context evolution", () => {
+    const keyA = requestContextKey({ model: "claude-opus-4", system: "A" } as JsonValue);
+    const keyB = requestContextKey({ model: "claude-opus-4", system: "B" } as JsonValue);
+    const keyC = requestContextKey({ model: "claude-opus-4", system: "C" } as JsonValue);
+    const mainA = candidate("main-a", [u1], 5, false, keyA);
+    const mainB = candidate("main-b", [u1, a1], 3, false, keyB);
+    const mainC = candidate("main-c", [u1, a1, chainEnd], 2, false, keyC);
+    const side = candidate("side", [u1, assistant("shorter side branch")], 0, false, keyC);
+    const selection = selectCanonicalFlow([side, mainC, mainB, mainA]);
+    expect(selection.canonicalId).toBe("main-c");
+    expect(selection.chainIds).toEqual(["main-a", "main-b", "main-c"]);
+  });
+
   it("breaks tie between divergent tips toward the newest and returns null with no candidates", () => {
     const older = candidate("older", [user("a")], 1);
     const newer = candidate("newer", [user("b")], 0);
@@ -331,6 +354,32 @@ describe("createCanonicalIndex", () => {
       const scratch = selectCanonicalFlow(state);
       expect(incremental.canonicalId).toBe(scratch.canonicalId);
       expect(incremental.chainIds).toEqual(scratch.chainIds);
+    }
+  });
+
+  it("groups disjoint sessions with linear component work on one-candidate delta", () => {
+    const size = 256;
+    const index = createCanonicalIndex();
+    const base = Array.from({ length: size }, (_, index) =>
+      candidate(`session-${index}`, [user(`independent ${index}`)], size - index + 1));
+    index.update(base);
+    const before = index.stats().componentVisits;
+    index.update([...base.map((entry) => ({ ...entry, order: entry.order + 1 })), candidate("new", [user("new")], 0)]);
+    const delta = index.stats().componentVisits - before;
+    expect(delta).toBeGreaterThan(0);
+    expect(delta).toBeLessThanOrEqual(2 * (size + 1));
+  });
+
+  it("releases empty history-length stamp buckets through prune and source reset", () => {
+    const index = createCanonicalIndex();
+    const makeState = (prefix: string) => Array.from({ length: 12 }, (_, length) =>
+      candidate(`${prefix}-${length}`, history(length + 1), 12 - length));
+    const baseline = index.stats().stampBuckets;
+    for (const prefix of ["first", "second", "third"]) {
+      index.update(makeState(prefix));
+      expect(index.stats().stampBuckets).toBe(12);
+      index.update([]);
+      expect(index.stats().stampBuckets).toBe(baseline);
     }
   });
 });

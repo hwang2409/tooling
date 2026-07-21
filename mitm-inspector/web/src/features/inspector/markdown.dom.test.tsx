@@ -100,10 +100,26 @@ describe("MarkdownProse", () => {
     expect((globalThis as unknown as Record<string, unknown>).__markdown_pwned).toBeUndefined();
   });
 
-  it("keeps reference-style and html-ish image payloads inert too", async () => {
-    const container = await mountMarkdown('![x](javascript:window.__markdown_pwned=true) <img src="https://attacker.example/p2">');
+  it("keeps reference-definition and nested images inert with safe link attributes", async () => {
+    const container = await mountMarkdown([
+      "![tracking][pixel]",
+      "",
+      "[![nested][nested-pixel]](https://safe.example/docs \"reference link\")",
+      "",
+      "[nested-pixel]: https://attacker.example/nested.png \"nested title\"",
+      "[pixel]: https://attacker.example/pixel.png \"captured title\"",
+    ].join("\n"));
     expect(container.querySelector("img")).toBeNull();
     expect(container.querySelectorAll("[src]")).toHaveLength(0);
-    expect((globalThis as unknown as Record<string, unknown>).__markdown_pwned).toBeUndefined();
+    const inert = container.querySelectorAll("code.md-img");
+    expect(inert).toHaveLength(2);
+    expect(inert[0].textContent).toContain("https://attacker.example/pixel.png");
+    expect(inert[0].textContent).toContain("captured title");
+    expect(inert[1].textContent).toContain("https://attacker.example/nested.png");
+    expect(inert[1].textContent).toContain("nested title");
+    const link = container.querySelector("a");
+    expect(link?.getAttribute("href")).toBe("https://safe.example/docs");
+    expect(link?.getAttribute("target")).toBe("_blank");
+    expect(link?.getAttribute("rel")).toBe("noopener noreferrer");
   });
 });

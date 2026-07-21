@@ -74,6 +74,8 @@ function parseCandidate(
 export interface CandidateParserStats {
   /** parseCandidate executions — cache misses only. */
   readonly parses: number;
+  /** Flow projections retained for currently retained flows only. */
+  readonly retainedEntries: number;
 }
 
 export interface CandidateParser {
@@ -127,7 +129,7 @@ export function createCandidateParser(): CandidateParser {
       }
       return result;
     },
-    stats: () => ({ parses }),
+    stats: () => ({ parses, retainedEntries: cache.size }),
   };
 }
 

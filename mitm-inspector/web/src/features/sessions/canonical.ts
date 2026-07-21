@@ -216,7 +216,8 @@ interface IndexEntry {
  * newer retransmit UNDER THE SAME REQUEST CONTEXT. A different-context call
  * (other model/system/tools) resending an identical history is a borrowing
  * side-call, not a continuation — it must never displace the thread it
- * copied purely by being newer.
+ * copied purely by being newer. Strictly growing histories remain one
+ * lineage even when request context evolves between stages.
  */
 function supersedes(earlier: IndexEntry, later: IndexEntry, earlierPrefixOfLater: boolean): boolean {
   if (!earlierPrefixOfLater) return false;
@@ -236,6 +237,10 @@ export interface CanonicalIndexStats {
   /** Whole-history deep-equality evaluations for stage interning. */
   readonly historyEquals: number;
   readonly selections: number;
+  /** Union-find lookups and rebuild edges used to group related chains. */
+  readonly componentVisits: number;
+  /** Non-empty history-length buckets retained by stage interning. */
+  readonly stampBuckets: number;
 }
 
 export interface CanonicalIndex {
@@ -271,6 +276,9 @@ export function createCanonicalIndex(): CanonicalIndex {
   const supersededBy = new Map<string, number>();
   /** Ids whose normalized messages are a prefix of this entry's (excl. self). */
   const prefixesInto = new Map<string, Set<string>>();
+  /** Dynamic connectivity over related entries. Removals trigger lazy rebuild. */
+  const componentParent = new Map<string, string>();
+  let componentsDirty = false;
   interface StampGroup { readonly stamp: number; readonly history: readonly JsonValue[]; holders: number }
   const stampsByLength = new Map<number, StampGroup[]>();
   let nextStamp = 0;
@@ -278,7 +286,36 @@ export function createCanonicalIndex(): CanonicalIndex {
   let prefixEvaluations = 0;
   let historyEquals = 0;
   let selections = 0;
+  let componentVisits = 0;
   let lastSelection: CanonicalSelection | null = null;
+
+  const makeComponent = (id: string): void => {
+    componentParent.set(id, id);
+  };
+
+  const findComponent = (id: string): string => {
+    componentVisits += 1;
+    const parent = componentParent.get(id);
+    if (parent === undefined || parent === id) return parent ?? id;
+    const root = findComponent(parent);
+    componentParent.set(id, root);
+    return root;
+  };
+
+  const unionComponents = (left: string, right: string): void => {
+    const leftRoot = findComponent(left);
+    const rightRoot = findComponent(right);
+    if (leftRoot !== rightRoot) componentParent.set(rightRoot, leftRoot);
+  };
+
+  const rebuildComponents = (): void => {
+    componentParent.clear();
+    for (const id of entries.keys()) makeComponent(id);
+    for (const [id, neighbors] of rel) {
+      for (const neighbor of neighbors.keys()) unionComponents(id, neighbor);
+    }
+    componentsDirty = false;
+  };
 
   const intern = (normalized: readonly JsonValue[]): number => {
     const groups = stampsByLength.get(normalized.length) ?? [];
@@ -301,7 +338,10 @@ export function createCanonicalIndex(): CanonicalIndex {
     const position = groups.findIndex((group) => group.stamp === entry.stamp);
     if (position === -1) return;
     groups[position].holders -= 1;
-    if (groups[position].holders === 0) groups.splice(position, 1);
+    if (groups[position].holders === 0) {
+      groups.splice(position, 1);
+      if (groups.length === 0) stampsByLength.delete(entry.normalized.length);
+    }
   };
 
   const applyPair = (a: IndexEntry, b: IndexEntry, view: PairView, sign: 1 | -1): void => {
@@ -329,6 +369,7 @@ export function createCanonicalIndex(): CanonicalIndex {
     prefixesInto.delete(entry.id);
     supersededBy.delete(entry.id);
     entries.delete(entry.id);
+    componentsDirty = true;
     releaseStamp(entry);
   };
 
@@ -340,6 +381,7 @@ export function createCanonicalIndex(): CanonicalIndex {
     rel.set(entry.id, pairs);
     prefixesInto.set(entry.id, new Set());
     supersededBy.set(entry.id, 0);
+    makeComponent(entry.id);
     for (const other of entries.values()) {
       prefixEvaluations += 2;
       const out = messagesArePrefix(normalized, other.normalized);
@@ -349,6 +391,7 @@ export function createCanonicalIndex(): CanonicalIndex {
       pairs.set(other.id, view);
       rel.get(other.id)!.set(entry.id, { out: into, into: out });
       applyPair(entry, other, view, 1);
+      unionComponents(entry.id, other.id);
     }
     entries.set(entry.id, entry);
   };
@@ -386,37 +429,35 @@ export function createCanonicalIndex(): CanonicalIndex {
       chains.push({ tip: entry, members });
     }
 
-    // Group chains that share any member into components (transitively).
-    const components: Chain[][] = [];
+    // Group chains by dynamic connectivity. Adding an entry unions only its
+    // related members; removals rebuild lazily once, rather than rescanning
+    // every prior component for every chain on every selection.
+    if (componentsDirty) rebuildComponents();
+    const componentsByRoot = new Map<string, Chain[]>();
     for (const chain of chains) {
-      const memberIds = new Set(chain.members.map((member) => member.id));
-      const overlapping = components.filter((component) =>
-        component.some((other) => other.members.some((member) => memberIds.has(member.id))));
-      if (overlapping.length === 0) {
-        components.push([chain]);
-        continue;
-      }
-      const merged = overlapping[0];
-      merged.push(chain);
-      for (const extra of overlapping.slice(1)) {
-        merged.push(...extra);
-        components.splice(components.indexOf(extra), 1);
-      }
+      const root = findComponent(chain.tip.id);
+      const component = componentsByRoot.get(root) ?? [];
+      component.push(chain);
+      componentsByRoot.set(root, component);
     }
+    const components = [...componentsByRoot.values()];
 
     // Chain evidence = DISTINCT history stages (interned stamps: deep
     // equality of the complete normalized history — duplicate retransmits
     // never inflate a branch, while reminder-only evolution still counts)
-    // among members sharing the TIP'S REQUEST CONTEXT. A different-context
-    // member merely borrowed the history; counting it would let a one-off
-    // side-call inherit the main thread's evidence.
+    // among lineage members. A shorter history remains part of the lineage
+    // even when its request context differs: context may evolve while a
+    // conversation grows. Equal-length different-context members are
+    // borrowing side-calls and stay out of evidence and rendered chain ids.
     const stageCounts = new Map<Chain, number>();
+    const lineageMembers = (chain: Chain): readonly IndexEntry[] => chain.members.filter((member) =>
+      member.normalized.length < chain.tip.normalized.length
+      || member.candidate.contextKey === chain.tip.candidate.contextKey);
     const distinctStages = (chain: Chain): number => {
       const cached = stageCounts.get(chain);
       if (cached !== undefined) return cached;
       const stamps = new Set<number>();
-      for (const member of chain.members) {
-        if (member.candidate.contextKey !== chain.tip.candidate.contextKey) continue;
+      for (const member of lineageMembers(chain)) {
         stamps.add(member.stamp);
       }
       stageCounts.set(chain, stamps.size);
@@ -429,6 +470,13 @@ export function createCanonicalIndex(): CanonicalIndex {
         const stages = distinctStages(chain);
         const bestStages = distinctStages(best);
         if (stages !== bestStages) return stages > bestStages ? chain : best;
+        if (chain.tip.stamp === best.tip.stamp
+          && chain.tip.candidate.contextKey !== best.tip.candidate.contextKey) {
+          // Equal-history different-context calls are not continuations. If
+          // pruning leaves one established stage, retain older thread rather
+          // than letting a newer borrowing clone win the tie.
+          return chain.tip.candidate.order > best.tip.candidate.order ? chain : best;
+        }
         return chain.tip.candidate.order < best.tip.candidate.order ? chain : best;
       });
 
@@ -439,10 +487,9 @@ export function createCanonicalIndex(): CanonicalIndex {
       if (contender.tip.candidate.order < selected.tip.candidate.order) selected = contender;
     }
 
-    // The rendered thread is the tip-context members only: a borrowed-history
-    // different-context member stays auxiliary.
-    const members = selected.members
-      .filter((member) => member.candidate.contextKey === selected.tip.candidate.contextKey)
+    // Render all growing lineage stages, including context evolution. A
+    // borrowed equal-history different-context member stays auxiliary.
+    const members = [...lineageMembers(selected)]
       .sort((left, right) =>
         left.normalized.length - right.normalized.length || right.candidate.order - left.candidate.order);
     return {
@@ -480,7 +527,14 @@ export function createCanonicalIndex(): CanonicalIndex {
       lastSelection = select();
       return lastSelection;
     },
-    stats: () => ({ normalizations, prefixEvaluations, historyEquals, selections }),
+    stats: () => ({
+      normalizations,
+      prefixEvaluations,
+      historyEquals,
+      selections,
+      componentVisits,
+      stampBuckets: stampsByLength.size,
+    }),
   };
 }
 

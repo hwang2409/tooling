@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { Workspace } from "../../App";
 import { parseProtocolMessage } from "../../protocol";
 import { browserReducer, initialBrowserState } from "../../state/browserState";
-import type { BrowserState } from "../../state/browserState";
+import type { BrowserState, ImmutableFlowMetadata } from "../../state/browserState";
 import type { FlowDetailLoader } from "../inspector/flowDetail";
 import { createCanonicalIndex } from "./canonical";
 import type { CanonicalIndex } from "./canonical";
@@ -582,6 +582,27 @@ describe("Workspace session-first navigation", () => {
     const prefixDelta = index.stats().prefixEvaluations - basePrefix;
     expect(prefixDelta).toBeGreaterThanOrEqual(1);
     expect(prefixDelta).toBeLessThanOrEqual(2 * (initialLengths.length + 1));
+  });
+
+  it("pins parser-cache retention across add, prune, and source reset", () => {
+    const parser = createCandidateParser();
+    const flowA = FLOWS[0] as unknown as ImmutableFlowMetadata;
+    const flowB = FLOWS[1] as unknown as ImmutableFlowMetadata;
+    const order = (flows: readonly ImmutableFlowMetadata[]) =>
+      new Map(flows.map((flow, index) => [flow.flow_id, index]));
+
+    parser.parseAll([flowA], order([flowA]), new Map(), 1);
+    expect(parser.stats().retainedEntries).toBe(1);
+    parser.parseAll([flowA, flowB], order([flowA, flowB]), new Map(), 1);
+    expect(parser.stats().retainedEntries).toBe(2);
+
+    parser.parseAll([flowB], order([flowB]), new Map(), 1);
+    expect(parser.stats().retainedEntries).toBe(1);
+    // New source epoch replaces old identity instead of retaining stale cache.
+    parser.parseAll([flowB], order([flowB]), new Map(), 2);
+    expect(parser.stats().retainedEntries).toBe(1);
+    parser.parseAll([], new Map(), new Map(), 2);
+    expect(parser.stats().retainedEntries).toBe(0);
   });
 
   it("keeps one incremental session index across deltas (guards against fresh-index-per-render)", async () => {
