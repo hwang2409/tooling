@@ -1,20 +1,43 @@
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { Components, UrlTransform } from "react-markdown";
+import remarkGfm from "remark-gfm";
+import type { Root, RootContent } from "mdast";
 
 /**
  * Markdown rendering for message prose. Safety model: react-markdown emits
  * React elements only — no innerHTML anywhere. Raw HTML in the source is NOT
- * parsed as HTML (no rehype-raw), and links keep the library's default
- * urlTransform (javascript: etc. stripped). Images are never rendered at
- * all: captured traffic is attacker-controlled, and an <img> would fire an
- * automatic outbound request — an exfiltration channel in a local-only
- * tool. Image markdown renders as inert code instead, and BECAUSE it is
- * text-only, the image src bypasses the default URL transform so the
- * captured URL and title stay visible as evidence (no information loss,
- * still zero network fetch; the CSP in index.html backstops this). The
- * plain-text and raw-JSON views stay one toggle away in the conversation
- * UI, so rendering is presentation only, never a reduction.
+ * parsed as HTML (no rehype-raw). Instead, a remark plugin visits the mdast
+ * tree and rewrites every `html` node into a `text` node, so captured tag
+ * content like <system-reminder> renders as literal visible text rather than
+ * being silently dropped. Fenced/inline code is untouched (those are `code`
+ * nodes, not `html`). Links keep the library's default urlTransform
+ * (javascript: etc. stripped). Images are never rendered at all: captured
+ * traffic is attacker-controlled, and an <img> would fire an automatic
+ * outbound request — an exfiltration channel in a local-only tool. Image
+ * markdown renders as inert code instead, and BECAUSE it is text-only, the
+ * image src bypasses the default URL transform so the captured URL and title
+ * stay visible as evidence (no information loss, still zero network fetch;
+ * the CSP in index.html backstops this). GFM (tables, strikethrough, task
+ * lists, autolinks) is enabled so captured chat markdown renders faithfully.
  */
+function remarkEscapeHtml() {
+  return (tree: Root) => {
+    const walk = (node: Root | RootContent) => {
+      if (!("children" in node) || node.children === undefined) return;
+      for (let index = 0; index < node.children.length; index += 1) {
+        const child = node.children[index];
+        if (child.type === "html") {
+          node.children[index] = { type: "text", value: child.value };
+          continue;
+        }
+        walk(child);
+      }
+    };
+    walk(tree);
+  };
+}
+
+const remarkPlugins = [remarkGfm, remarkEscapeHtml];
 const urlTransform: UrlTransform = (url, key) => {
   // Images render as inert text, never as an element with a src — keep the
   // captured URL intact for display. Everything else gets the default
@@ -43,12 +66,21 @@ const components: Components = {
     ].filter((part): part is string => part !== null);
     return <code className="md-img">image: {parts.join(" — ")}</code>;
   },
+  table(props) {
+    const { node, children, ...rest } = props;
+    void node;
+    return (
+      <div className="md-table-wrap" tabIndex={0} role="group" aria-label="table">
+        <table {...rest}>{children}</table>
+      </div>
+    );
+  },
 };
 
 export function MarkdownProse({ text }: { text: string }) {
   return (
     <div className="md" data-testid="markdown-prose">
-      <ReactMarkdown components={components} urlTransform={urlTransform}>{text}</ReactMarkdown>
+      <ReactMarkdown components={components} urlTransform={urlTransform} remarkPlugins={remarkPlugins}>{text}</ReactMarkdown>
     </div>
   );
 }

@@ -100,6 +100,52 @@ describe("MarkdownProse", () => {
     expect((globalThis as unknown as Record<string, unknown>).__markdown_pwned).toBeUndefined();
   });
 
+  it("renders GFM pipe tables as an HTML table with header + body rows, wrapped for scroll", async () => {
+    const container = await mountMarkdown(
+      [
+        "| Thought | Reality |",
+        "|---------|---------|",
+        "| A       | B       |",
+        "| C       | D       |",
+      ].join("\n"),
+    );
+    const wrap = container.querySelector(".md-table-wrap");
+    expect(wrap).not.toBeNull();
+    const table = container.querySelector("table");
+    expect(table).not.toBeNull();
+    const headers = container.querySelectorAll("thead th");
+    expect(headers.length).toBe(2);
+    expect(headers[0].textContent).toBe("Thought");
+    expect(headers[1].textContent).toBe("Reality");
+    const rows = container.querySelectorAll("tbody tr");
+    expect(rows.length).toBe(2);
+  });
+
+  it("renders GFM strikethrough and task-list checkboxes", async () => {
+    const container = await mountMarkdown(
+      ["~~gone~~", "", "- [x] done", "- [ ] pending"].join("\n"),
+    );
+    expect(container.querySelector("del")?.textContent).toBe("gone");
+    const boxes = container.querySelectorAll<HTMLInputElement>("input[type='checkbox']");
+    expect(boxes.length).toBe(2);
+    expect(boxes[0].checked).toBe(true);
+    expect(boxes[1].checked).toBe(false);
+  });
+
+  it("renders captured XML/HTML-y tags as literal visible text instead of dropping them", async () => {
+    const container = await mountMarkdown(
+      "<system-reminder>hook fired</system-reminder> and <persisted-output>x</persisted-output>",
+    );
+    // Tags must NOT create real DOM elements.
+    expect(container.querySelector("system-reminder")).toBeNull();
+    expect(container.querySelector("persisted-output")).toBeNull();
+    // The literal tag text is visible, angle brackets intact.
+    expect(container.textContent).toContain("<system-reminder>");
+    expect(container.textContent).toContain("</system-reminder>");
+    expect(container.textContent).toContain("<persisted-output>");
+    expect(container.textContent).toContain("hook fired");
+  });
+
   it("keeps reference-definition and nested images inert with safe link attributes", async () => {
     const container = await mountMarkdown([
       "![tracking][pixel]",
