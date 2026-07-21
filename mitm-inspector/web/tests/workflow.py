@@ -274,7 +274,9 @@ def run_workflow(page: Page) -> None:
     conversation = page.locator("[data-testid='conversation-view']")
     expect(conversation).to_be_visible()
     expect(conversation).to_contain_text("answer")
-    expect(conversation).to_contain_text("end_turn")
+    # Chrome-free surface: the model/stop/tokens meta strip is behind the
+    # kebab, not on the default transcript.
+    expect(conversation.locator(".conv-header")).to_have_count(0)
     assert len(detail_requests) == 1, detail_requests
     assert detail_requests[0].endswith(f"/api/v1/flows/{FLOW_ID}"), detail_requests
 
@@ -287,14 +289,19 @@ def run_workflow(page: Page) -> None:
     page.locator(".conv-text-modes .packet-mode").filter(has_text="md").click()
     expect(conversation.locator(".conv-message strong").filter(has_text="world")).to_be_visible()
 
-    # Raw JSON stays one toggle away from the rendered conversation.
-    expect(page.locator(".packet-detail .packet-mode").filter(has_text="raw")).to_be_visible()
-    page.locator(".packet-detail .packet-mode").filter(has_text="raw").click()
+    # Raw JSON stays one toggle away — hidden by default so the transcript
+    # is chat-only chrome, exposed behind the session-drill kebab menu.
+    kebab = page.locator("[data-testid='rendered-source']")
+    kebab.click()
+    picker = page.locator("#session-source-picker")
+    expect(picker).to_be_visible()
+    picker.locator("[data-testid='session-view-mode'][data-view-mode='raw']").click()
     raw_tree = page.locator(".packet-detail .json-tree")
     expect(raw_tree).to_be_visible()
     raw_tree.locator(".json-toggle").first.click()
     expect(raw_tree).to_contain_text("messages")
-    page.locator(".packet-detail .packet-mode").filter(has_text="conversation").click()
+    kebab.click()
+    page.locator("#session-source-picker [data-testid='session-view-mode'][data-view-mode='conversation']").click()
     raw_frames = conversation.locator(".conv-collapse-head").filter(has_text="raw frames")
     raw_frames.click()
     expect(conversation).to_contain_text("truncated frame")

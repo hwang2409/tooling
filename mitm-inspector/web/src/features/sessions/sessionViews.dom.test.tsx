@@ -236,12 +236,13 @@ describe("Workspace session-first navigation", () => {
     // Raw JSON stays one toggle away.
     expect(container.querySelector(".packet-detail-modes")).not.toBeNull();
 
-    // Auxiliary side-calls are grouped, not dropped.
-    const aux = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-aux .conv-collapse-head"))
-      .find((button) => button.textContent?.includes("auxiliary calls (2)"));
-    expect(aux).toBeDefined();
-    await click(aux);
-    expect(container.querySelectorAll(".session-aux .packet-row").length).toBe(2);
+    // Off-chain siblings are reachable via the flows toggle; nothing bleeds
+    // into the conversation surface.
+    expect(container.querySelector(".session-aux")).toBeNull();
+    const flowsToggle = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-detail-modes .packet-mode"))
+      .find((button) => button.textContent === "flows");
+    await click(flowsToggle);
+    expect(container.querySelectorAll(".packet-row").length).toBe(3);
   });
 
   it("lists canonical request first, then newest candidates, and manually renders a utility flow", async () => {
@@ -276,8 +277,8 @@ describe("Workspace session-first navigation", () => {
     await settle();
 
     const source = container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']");
-    expect(source?.textContent).toContain("rendered from request main-flo");
-    expect(source?.textContent).toContain("auto");
+    expect(source?.getAttribute("data-source-label")).toContain("rendered from request main-flo");
+    expect(source?.getAttribute("data-source-state")).toBe("auto");
     await click(source);
     const options = Array.from(container.querySelectorAll<HTMLButtonElement>("[data-testid='session-source-option']"));
     expect(options.map((option) => option.dataset.flowId)).toEqual(["main-flow", "aux-suggestion", "utility-flow"]);
@@ -289,13 +290,19 @@ describe("Workspace session-first navigation", () => {
     expect(options[2].textContent).toContain("utility");
 
     await click(options[2]);
-    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("utility-");
-    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("manual");
+    const sourceAfter = container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']");
+    expect(sourceAfter?.getAttribute("data-source-label")).toContain("utility-");
+    expect(sourceAfter?.getAttribute("data-source-state")).toBe("manual");
     expect(container.querySelector("[data-testid='conversation-view']")?.textContent).toContain("utility answer");
-    const raw = Array.from(container.querySelectorAll<HTMLButtonElement>(".packet-detail-modes .packet-mode"))
-      .find((button) => button.textContent === "raw");
+    // The chat surface is chrome-free by default; the raw JSON view lives
+    // behind the kebab dropdown alongside the source picker.
+    expect(container.querySelector(".session-conversation .packet-detail-modes")).toBeNull();
+    expect(container.querySelector(".session-conversation .conv-header")).toBeNull();
+    await click(container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']"));
+    const raw = container.querySelector<HTMLButtonElement>("[data-testid='session-view-mode'][data-view-mode='raw']");
     await click(raw);
     expect(container.querySelector(".packet-detail .json-tree")).not.toBeNull();
+    expect(container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']")?.getAttribute("data-view-mode")).toBe("raw");
   });
 
   it("manually renders a settled unparseable candidate in the raw inspector", async () => {
@@ -319,7 +326,7 @@ describe("Workspace session-first navigation", () => {
     const option = container.querySelector<HTMLButtonElement>("[data-flow-id='malformed-flow']");
     expect(option?.disabled).toBe(false);
     await click(option);
-    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("manual");
+    expect(container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']")?.getAttribute("data-source-state")).toBe("manual");
     expect(container.querySelector(".packet-detail .packet-text")?.textContent).toContain("{malformed");
     expect(container.querySelector("[data-testid='conversation-view']")).toBeNull();
   });
@@ -332,14 +339,14 @@ describe("Workspace session-first navigation", () => {
     await click(container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']"));
     const options = Array.from(container.querySelectorAll<HTMLButtonElement>("[data-testid='session-source-option']"));
     await click(options[1]);
-    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("manual");
+    expect(container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']")?.getAttribute("data-source-state")).toBe("manual");
 
     // Same workspace view and same session key; only source incarnation changes.
     await render({ ...initial, sourceEpoch: initial.sourceEpoch + 1 });
     await settle();
-    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("main-flo");
-    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("auto");
-    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).not.toContain("manual");
+    const reset = container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']");
+    expect(reset?.getAttribute("data-source-label")).toContain("main-flo");
+    expect(reset?.getAttribute("data-source-state")).toBe("auto");
   });
 
   it("does not restore a picked flow after prune and reinsert", async () => {
@@ -350,15 +357,15 @@ describe("Workspace session-first navigation", () => {
     await click(container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']"));
     const options = Array.from(container.querySelectorAll<HTMLButtonElement>("[data-testid='session-source-option']"));
     await click(options[1]);
-    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("manual");
+    expect(container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']")?.getAttribute("data-source-state")).toBe("manual");
 
     await render(stateOf([FLOWS[1]]));
     await settle();
     await render(initial);
     await settle();
-    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("main-flo");
-    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).toContain("auto");
-    expect(container.querySelector("[data-testid='rendered-source']")?.textContent).not.toContain("manual");
+    const reset = container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']");
+    expect(reset?.getAttribute("data-source-label")).toContain("main-flo");
+    expect(reset?.getAttribute("data-source-state")).toBe("auto");
   });
 
   it("uses a labeled native-button dialog with Escape and focus return", async () => {
@@ -371,12 +378,46 @@ describe("Workspace session-first navigation", () => {
     expect(picker?.getAttribute("role")).toBe("dialog");
     expect(picker?.getAttribute("aria-labelledby")).toBe("session-source-picker-label");
     expect(container.querySelector("[role='listbox']")).toBeNull();
-    const firstOption = container.querySelector<HTMLButtonElement>("[data-testid='session-source-option']");
-    expect(document.activeElement).toBe(firstOption);
+    // The dropdown starts focus on the first actionable item — the view
+    // toggle when the session has a canonical thread rendered.
+    const firstItem = container.querySelector<HTMLButtonElement>("[data-testid='session-view-mode'][data-view-mode='conversation']");
+    expect(document.activeElement).toBe(firstItem);
 
     await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
     expect(container.querySelector("#session-source-picker")).toBeNull();
     expect(document.activeElement).toBe(source);
+  });
+
+  it("kebab button declares aria-haspopup and toggles aria-expanded on open/close", async () => {
+    const { container } = await mountWorkspace(stateOf(FLOWS));
+    await click(sessionRows(container)[0]);
+    await settle();
+    const source = container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']");
+    expect(source?.getAttribute("aria-haspopup")).toBe("dialog");
+    expect(source?.getAttribute("aria-expanded")).toBe("false");
+    await click(source);
+    expect(source?.getAttribute("aria-expanded")).toBe("true");
+    await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(source?.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("closes the kebab popup on outside pointerdown but keeps it open on inside interaction", async () => {
+    const { container } = await mountWorkspace(stateOf(FLOWS));
+    await click(sessionRows(container)[0]);
+    await settle();
+    const source = container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']");
+    await click(source);
+    expect(container.querySelector("#session-source-picker")).not.toBeNull();
+
+    // pointerdown INSIDE the popup must not close it.
+    const insideTarget = container.querySelector<HTMLButtonElement>("#session-source-picker [data-testid='session-view-mode']");
+    await act(async () => insideTarget?.dispatchEvent(new Event("pointerdown", { bubbles: true })));
+    expect(container.querySelector("#session-source-picker")).not.toBeNull();
+
+    // pointerdown OUTSIDE the control closes it.
+    await act(async () => document.body.dispatchEvent(new Event("pointerdown", { bubbles: true })));
+    expect(container.querySelector("#session-source-picker")).toBeNull();
+    expect(source?.getAttribute("aria-expanded")).toBe("false");
   });
 
   it("keeps the per-session flow grid one toggle away and navigates back home", async () => {
@@ -475,10 +516,13 @@ describe("Workspace session-first navigation", () => {
     expect(conversation?.textContent).toContain("tests pass");
     expect(conversation?.textContent).toContain("final assistant turn");
     expect(conversation?.textContent).not.toContain("quota");
-    // The off-chain branch stays reachable in the auxiliary group.
-    const aux = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-aux .conv-collapse-head"))
-      .find((button) => button.textContent?.includes("auxiliary calls (2)"));
-    expect(aux).toBeDefined();
+    // Off-chain branches stay reachable via the flows toggle; no aux collapse
+    // pollutes the conversation surface.
+    expect(container.querySelector(".session-aux")).toBeNull();
+    const flowsToggle = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-detail-modes .packet-mode"))
+      .find((button) => button.textContent === "flows");
+    await click(flowsToggle);
+    expect(container.querySelectorAll(".packet-row").length).toBe(3);
   });
 
   it("refetches the same flow when it transitions incomplete-to-complete and shows the final turn", async () => {
@@ -599,11 +643,18 @@ describe("Workspace session-first navigation", () => {
     await click(sessionRows(container)[0]);
     await settle();
     // No verifiable main thread: never promote a rejected suggestion call
-    // into a fake conversation.
+    // into a fake conversation. The default surface is chat-only chrome, so
+    // the empty case renders nothing at all — no placeholder card, no aux
+    // collapse, no packet dump. Off-chain flows stay reachable via the
+    // flows toggle in the header.
     expect(container.querySelector("[data-testid='conversation-view']")).toBeNull();
-    expect(container.textContent).toContain("auxiliary calls (2)");
-    // The auxiliary group arrives expanded so the flows are immediately visible.
-    expect(container.querySelectorAll(".session-aux .packet-row")).toHaveLength(2);
+    expect(container.querySelector(".session-aux")).toBeNull();
+    expect(container.querySelector(".session-conv-empty")).toBeNull();
+    expect(container.querySelector(".session-conversation")).toBeNull();
+    const flowsToggle = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-detail-modes .packet-mode"))
+      .find((button) => button.textContent === "flows");
+    await click(flowsToggle);
+    expect(container.querySelectorAll(".packet-row")).toHaveLength(2);
   });
 
   it("degrades to the auxiliary/flow view instead of crashing when candidate parsing throws", async () => {
@@ -634,8 +685,15 @@ describe("Workspace session-first navigation", () => {
       );
       await click(sessionRows(container)[0]);
       await settle();
-      // No crash, no fake conversation; the session's flows stay reachable.
+      // No crash, no fake conversation; the default surface stays chat-only
+      // (nothing at all when no canonical thread) and the flows toggle keeps
+      // the session's raw flows reachable.
       expect(container.querySelector("[data-testid='conversation-view']")).toBeNull();
+      expect(container.querySelector(".session-conv-empty")).toBeNull();
+      expect(container.querySelector(".session-conversation")).toBeNull();
+      const flowsToggle = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-detail-modes .packet-mode"))
+        .find((button) => button.textContent === "flows");
+      await click(flowsToggle);
       expect(container.querySelectorAll(".packet-row").length).toBeGreaterThan(0);
       expect(errors.length).toBeGreaterThan(0);
     } finally {
@@ -691,7 +749,12 @@ describe("Workspace session-first navigation", () => {
     // with an equal history must not win purely by being newer.
     expect(conversation?.textContent).toContain("final assistant turn");
     expect(conversation?.textContent).not.toContain("borrowed-history side answer");
-    expect(container.textContent).toContain("auxiliary calls (2)");
+    // No aux collapse; siblings live behind the flows toggle.
+    expect(container.querySelector(".session-aux")).toBeNull();
+    const flowsToggle = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-detail-modes .packet-mode"))
+      .find((button) => button.textContent === "flows");
+    await click(flowsToggle);
+    expect(container.querySelectorAll(".packet-row").length).toBe(3);
   });
 
   it("work pin: a delta touching the open session reparses and re-relates only the changed candidate", async () => {

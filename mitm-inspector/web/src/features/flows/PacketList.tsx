@@ -205,7 +205,24 @@ function responseContentType(metadata: ImmutableFlowMetadata): string | undefine
   return header?.value;
 }
 
-export function PacketDetail({ metadata, detail }: { metadata: ImmutableFlowMetadata; detail: FlowDetailResult | null }) {
+export interface PacketDetailProps {
+  metadata: ImmutableFlowMetadata;
+  detail: FlowDetailResult | null;
+  /**
+   * When true, suppress the conversation/raw toggle and the meta strip so
+   * the caller (e.g. the session drill-in) can own that chrome and expose
+   * it elsewhere (typically a kebab menu).
+   */
+  chromeless?: boolean;
+  /**
+   * Optional controlled view mode. When set, the caller drives
+   * conversation/raw and the internal toggle is bypassed. Only meaningful
+   * for anthropic-shaped flows.
+   */
+  viewMode?: "conversation" | "raw";
+}
+
+export function PacketDetail({ metadata, detail, chromeless = false, viewMode }: PacketDetailProps) {
   const overrides = detail?.status === "loaded" ? detail.overrides : undefined;
   const requestBody = overrides?.request_body ?? metadata.request_body;
   const responseBody = overrides?.response_body ?? metadata.response_body;
@@ -219,11 +236,12 @@ export function PacketDetail({ metadata, detail }: { metadata: ImmutableFlowMeta
     return parseAnthropicRequest(parsed.value);
   }, [requestDecoded]);
   const [rawOverride, setRawOverride] = useState(false);
-  const conversation = anthropic !== null && !rawOverride;
+  const controlled = viewMode !== undefined;
+  const conversation = anthropic !== null && (controlled ? viewMode === "conversation" : !rawOverride);
 
   return (
-    <div className="packet-detail">
-      {anthropic !== null ? (
+    <div className={`packet-detail${chromeless ? " packet-detail-chromeless" : ""}`}>
+      {anthropic !== null && !chromeless && !controlled ? (
         <div className="packet-detail-modes">
           <button
             type="button"
@@ -245,6 +263,7 @@ export function PacketDetail({ metadata, detail }: { metadata: ImmutableFlowMeta
           extras={extras}
           responseText={responseDecoded.kind === "text" ? responseDecoded.text : undefined}
           responseContentType={responseContentType(metadata) ?? extras.response_content_type}
+          chromeless={chromeless}
         />
       ) : (
         <>
