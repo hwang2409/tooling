@@ -10,7 +10,6 @@ import pytest
 
 from mitm_inspector.api.bodies import (
     MAX_DECODED_BODY_BYTES,
-    body_content_encoding,
     decoded_body_bytes,
     decoded_body_descriptor,
 )
@@ -126,11 +125,12 @@ def test_messages_summary_strips_reminders_and_reads_gzip_sse_usage() -> None:
 def test_unsupported_content_encoding_logs_visible_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    encoded = b"retained brotli bytes"
     with caplog.at_level(logging.WARNING, logger="mitm_inspector.api.bodies"):
-        assert body_content_encoding(
-            {"response_headers": [{"name": "content-encoding", "value": "br"}]},
-            "response",
-        ) is None
+        projected = enriched_flow(
+            anthropic_metadata({}, encoded, response_encoding="br")
+        )
+    assert projected["response_body"] == descriptor(encoded)
     assert "unsupported content-encoding 'br'" in caplog.text
 
 

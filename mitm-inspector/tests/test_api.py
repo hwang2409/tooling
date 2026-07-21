@@ -108,10 +108,19 @@ def test_http_session_list_and_detail_are_sqlite_backed(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
-def test_session_list_cap_is_by_session_count(tmp_path: Path) -> None:
+def test_session_list_cap_is_by_session_count(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("mitm_inspector.store.sqlite.SESSION_FLOW_LIMIT", 50)
     storage = SQLiteFlowStorage(tmp_path / "flows.sqlite")
     try:
-        for index in range(200):
+        storage.offer(metadata("singleton-old-a", "session-old-a", "old-a"))
+        storage.offer(
+            lifecycle("singleton-old-a", "1", "request_started", "2026-01-01T00:00:00Z")
+        )
+        storage.offer(metadata("singleton-old-b", "session-old-b", "old-b"))
+        storage.offer(
+            lifecycle("singleton-old-b", "1", "request_started", "2026-01-01T00:00:01Z")
+        )
+        for index in range(201):
             flow_id = f"dominant-{index}"
             storage.offer(metadata(flow_id, "session-dominant", f"prompt-{index}"))
             minute, second = divmod(index, 60)
@@ -120,24 +129,22 @@ def test_session_list_cap_is_by_session_count(tmp_path: Path) -> None:
                     flow_id,
                     "1",
                     "request_started",
-                    f"2026-01-01T00:{minute:02d}:{second:02d}Z",
+                    f"2026-01-02T00:{minute:02d}:{second:02d}Z",
                 )
             )
-        storage.offer(metadata("singleton-old", "session-old", "old"))
-        storage.offer(
-            lifecycle("singleton-old", "1", "request_started", "2026-01-02T00:00:00Z")
-        )
-        storage.offer(metadata("singleton-new", "session-new", "new"))
-        storage.offer(
-            lifecycle("singleton-new", "1", "request_started", "2026-01-03T00:00:00Z")
-        )
         storage.flush()
 
         summaries = storage.session_summaries(limit=3)
         assert [summary["session_id"] for summary in summaries] == [
-            "session-new",
-            "session-old",
             "session-dominant",
+            "session-old-b",
+            "session-old-a",
+        ]
+        assert summaries[0]["flow_count"] == 201
+        assert [summary["flow_count"] for summary in summaries] == [
+            201,
+            1,
+            1,
         ]
     finally:
         storage.close()

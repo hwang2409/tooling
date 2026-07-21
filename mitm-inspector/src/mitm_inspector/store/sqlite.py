@@ -283,18 +283,18 @@ class SQLiteFlowStorage:
                 before=_timestamp_sort_key(before) if before is not None else None,
                 limit=limit,
             )
-        groups: dict[str | None, list[PlainJsonObject]] = {}
-        for row in rows:
-            metadata = self._metadata_from_session_row(row)["metadata"]
-            if not isinstance(metadata, Mapping):
-                continue
-            projected = self._redacted_grid_flow(metadata)
-            session_id = metadata.get("session_id")
-            key = session_id if isinstance(session_id, str) else None
-            groups.setdefault(key, []).append(projected)
-        summaries = [self._session_summary(key, flows) for key, flows in groups.items()]
-        summaries.sort(key=self._session_sort_key, reverse=True)
-        return summaries[:limit]
+        return [
+            {
+                "session_id": row[0],
+                "first_query": None,
+                "flow_count": int(row[1]),
+                "started_at": row[2],
+                "last_activity": row[3],
+                "models": [],
+                "has_error": bool(row[4]),
+            }
+            for row in rows
+        ]
 
     def session_detail(self, session_id: str) -> PlainJsonObject | None:
         """Return one session's redacted flows in chronological order."""
@@ -336,7 +336,7 @@ class SQLiteFlowStorage:
         before: str | None,
         limit: int,
     ) -> list[tuple[object, ...]]:
-        """Select rows belonging to the newest bounded set of sessions."""
+        """Return one aggregate row for each of the newest sessions."""
 
         before_filter = "AND started_at_sort < ?" if before is not None else ""
         parameters: tuple[object, ...]
@@ -354,19 +354,27 @@ class SQLiteFlowStorage:
                 ORDER BY CASE WHEN latest IS NULL THEN 1 ELSE 0 END,
                          latest DESC
                 LIMIT ?
+            ), session_aggregates AS (
+                SELECT flows.session_id,
+                       COUNT(*) AS flow_count,
+                       MIN(flows.started_at) AS started_at,
+                       MAX(COALESCE(flows.ended_at, flows.started_at)) AS last_activity,
+                       MAX(
+                           CASE
+                               WHEN CAST(flows.response_status AS INTEGER) >= 400 THEN 1
+                               ELSE 0
+                           END
+                       ) AS has_error,
+                       selected_sessions.latest AS latest
+                FROM flows
+                JOIN selected_sessions
+                  ON flows.session_id IS selected_sessions.session_id
+                WHERE flows.method <> '' {before_filter}
+                GROUP BY flows.session_id
             )
-            SELECT flows.flow_id, flows.source_id, flows.method, flows.scheme,
-                   flows.host, flows.port, flows.path, flows.response_status,
-                   flows.request_content_type, flows.response_content_type,
-                   flows.started_at, flows.ended_at, flows.request_body_state,
-                   flows.response_body_state, flows.request_body_size,
-                   flows.response_body_size, flows.session_id
-            FROM flows
-            JOIN selected_sessions
-              ON flows.session_id IS selected_sessions.session_id
-            WHERE flows.method <> '' {before_filter}
-            ORDER BY CASE WHEN flows.started_at_sort IS NULL THEN 1 ELSE 0 END,
-                     flows.started_at_sort DESC, flows.created_order DESC
+            SELECT session_id, flow_count, started_at, last_activity, has_error
+            FROM session_aggregates
+            ORDER BY CASE WHEN latest IS NULL THEN 1 ELSE 0 END, latest DESC
             """,
             parameters,
         ).fetchall()
@@ -444,54 +452,6 @@ class SQLiteFlowStorage:
         from mitm_inspector.api.projection import grid_flow
 
         return grid_flow(metadata)
-
-    @classmethod
-    def _session_summary(
-        cls, session_id: str | None, flows: list[PlainJsonObject]
-    ) -> PlainJsonObject:
-        chronological = list(reversed(flows))
-        models: list[str] = []
-        first_query: str | None = None
-        started: str | None = None
-        last_activity: str | None = None
-        has_error = False
-        for flow in chronological:
-            value = flow.get("started_at")
-            if started is None and isinstance(value, str):
-                started = value
-            ended = flow.get("ended_at")
-            candidate_activity = ended if isinstance(ended, str) else value
-            if isinstance(candidate_activity, str):
-                last_activity = candidate_activity
-            status = flow.get("response_status")
-            if isinstance(status, str) and status.isdigit() and int(status) >= 400:
-                has_error = True
-            summary = flow.get("summary")
-            if not isinstance(summary, Mapping):
-                continue
-            model = summary.get("model")
-            if isinstance(model, str) and model not in models:
-                models.append(model)
-            if first_query is None:
-                preview = summary.get("preview")
-                if isinstance(preview, Mapping) and preview.get("source") == "user_text":
-                    text = preview.get("text")
-                    if isinstance(text, str):
-                        first_query = text
-        return {
-            "session_id": session_id,
-            "first_query": first_query,
-            "flow_count": len(flows),
-            "started_at": started,
-            "last_activity": last_activity,
-            "models": models,
-            "has_error": has_error,
-        }
-
-    @staticmethod
-    def _session_sort_key(summary: PlainJsonObject) -> tuple[int, str]:
-        value = summary.get("last_activity")
-        return (1 if isinstance(value, str) else 0, value if isinstance(value, str) else "")
 
     def _messages_from_rows(
         self,
