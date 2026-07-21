@@ -146,6 +146,52 @@ describe("MarkdownProse", () => {
     expect(container.textContent).toContain("hook fired");
   });
 
+  it("keeps inner markdown live when a multi-line captured tag wraps prose (tags escape at string level, not mdast)", async () => {
+    // The captured shape that broke on real traffic: block-level opening
+    // tag, inner markdown on subsequent lines, then closing tag. Pre-parse
+    // escaping must let the inner **markdown** parse normally instead of
+    // being swallowed into an opaque HTML block.
+    const container = await mountMarkdown(
+      [
+        "<system-reminder>",
+        "",
+        "Some **bold** and `code` here.",
+        "",
+        "- one",
+        "- two",
+        "",
+        "</system-reminder>",
+      ].join("\n"),
+    );
+    // Angle brackets stay visible as literal text.
+    expect(container.textContent).toContain("<system-reminder>");
+    expect(container.textContent).toContain("</system-reminder>");
+    expect(container.querySelector("system-reminder")).toBeNull();
+    // Inner markdown renders — not swallowed by the surrounding tag.
+    expect(container.querySelector("strong")?.textContent).toBe("bold");
+    expect(container.querySelector("code")?.textContent).toBe("code");
+    expect(container.querySelectorAll("li")).toHaveLength(2);
+  });
+
+  it("does not escape angle-bracket text inside fenced code blocks", async () => {
+    // Fenced code preserves the literal captured text — pre-escape must
+    // skip it or code samples get double-escaped and lose fidelity.
+    const container = await mountMarkdown(
+      ["```", "<system-reminder>", "raw content", "</system-reminder>", "```"].join("\n"),
+    );
+    const code = container.querySelector("pre code");
+    expect(code).not.toBeNull();
+    expect(code?.textContent).toContain("<system-reminder>");
+    expect(code?.textContent).not.toContain("&lt;");
+    expect(code?.textContent).toContain("raw content");
+  });
+
+  it("does not escape angle-bracket text inside inline code spans", async () => {
+    const container = await mountMarkdown("inline `<foo>` tag");
+    const inline = container.querySelector("p > code");
+    expect(inline?.textContent).toBe("<foo>");
+  });
+
   it("keeps reference-definition and nested images inert with safe link attributes", async () => {
     const container = await mountMarkdown([
       "![tracking][pixel]",

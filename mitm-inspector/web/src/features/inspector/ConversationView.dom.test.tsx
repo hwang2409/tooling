@@ -119,6 +119,69 @@ describe("ConversationView", () => {
     expect(container.textContent).toContain("# Heading\n\nwith **bold** text");
   });
 
+  it("renders tool_use as a labeled <pre><code> code block with pretty-printed JSON", async () => {
+    const request = parseAnthropicRequest({
+      model: "claude",
+      messages: [{
+        role: "assistant",
+        content: [{ type: "tool_use", id: "toolu_A1", name: "bash", input: { command: "echo hi", timeout: 5 } }],
+      }],
+    } as JsonValue);
+    if (request === null) throw new Error("request fixture did not parse");
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    mounts.push({ root, container });
+    await act(async () => root.render(<ConversationView request={request} extras={{}} />));
+
+    const card = container.querySelector(".conv-card-tool-use");
+    expect(card).not.toBeNull();
+    // Caption line: kind + tool name.
+    expect(card?.querySelector(".conv-card-kind")?.textContent).toBe("tool_use");
+    expect(card?.querySelector(".conv-card-name")?.textContent).toBe("bash");
+    // Body is a real <pre><code>, not a JsonTree.
+    const pre = card?.querySelector("pre.conv-pre");
+    expect(pre).not.toBeNull();
+    expect(pre?.querySelector("code")).not.toBeNull();
+    expect(card?.querySelector(".json-tree")).toBeNull();
+    // Pretty-printed JSON: 2-space indent, one key per line.
+    const body = pre?.textContent ?? "";
+    expect(body).toContain('"command": "echo hi"');
+    expect(body).toContain('"timeout": 5');
+    expect(body).toMatch(/\n {2}"command"/);
+  });
+
+  it("renders tool_result payload as a labeled <pre><code> code block", async () => {
+    const request = parseAnthropicRequest({
+      model: "claude",
+      messages: [{
+        role: "user",
+        content: [{ type: "tool_use", id: "toolu_B2", name: "bash", input: { command: "ls" } }, {
+          type: "tool_result",
+          tool_use_id: "toolu_B2",
+          content: [{ type: "text", text: "line one\nline two" }],
+        }],
+      }],
+    } as JsonValue);
+    if (request === null) throw new Error("request fixture did not parse");
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    mounts.push({ root, container });
+    await act(async () => root.render(<ConversationView request={request} extras={{}} />));
+
+    const card = container.querySelector(".conv-card-tool-result");
+    expect(card).not.toBeNull();
+    // Caption line: kind + linked tool name.
+    expect(card?.querySelector(".conv-card-kind")?.textContent).toBe("↳ tool_result");
+    expect(card?.querySelector(".conv-card-name")?.textContent).toBe("bash");
+    // Payload is a real <pre><code> preserving whitespace, not prose.
+    const pre = card?.querySelector("pre.conv-pre");
+    expect(pre).not.toBeNull();
+    expect(pre?.querySelector("code")?.textContent).toBe("line one\nline two");
+    expect(card?.querySelector(".conv-prose")).toBeNull();
+  });
+
   it("keeps lifted, malformed, and future conversation values visible", async () => {
     const request = parseAnthropicRequest({
       model: "request-model",

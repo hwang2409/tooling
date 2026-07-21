@@ -120,6 +120,11 @@ function BlockView({ block, toolNames, markdown }: { block: ContentBlock; toolNa
     );
   }
   if (block.kind === "tool_use") {
+    // Payload always renders as a labeled code block: use the captured raw
+    // string when present so the wire representation is preserved verbatim;
+    // otherwise pretty-print the parsed input with a stable 2-space indent
+    // (never as a JsonTree — the kickoff wants a real <pre><code>).
+    const body = block.inputRaw ?? JSON.stringify(block.input, null, 2);
     return (
       <div className="conv-block conv-card conv-card-tool-use">
         <div className="conv-card-head">
@@ -128,9 +133,7 @@ function BlockView({ block, toolNames, markdown }: { block: ContentBlock; toolNa
           {block.id !== undefined ? <span className="conv-card-id">{block.id}</span> : null}
           <CacheBadge value={block.cacheControl} />
         </div>
-        {block.inputRaw !== undefined
-          ? <pre className="conv-pre">{block.inputRaw}</pre>
-          : <JsonTree value={block.input} startCollapsed />}
+        <pre className="conv-pre"><code>{body}</code></pre>
         <MoreFields extra={block.extra} />
       </div>
     );
@@ -145,10 +148,19 @@ function BlockView({ block, toolNames, markdown }: { block: ContentBlock; toolNa
           {block.isError === true ? <span className="conv-card-error">error</span> : null}
           <CacheBadge value={block.cacheControl} />
         </div>
-        {/* Tool output is data, not prose — keep it literal even in markdown mode. */}
-        {block.content.map((child, index) => (
-          <BlockView key={index} block={child} toolNames={toolNames} markdown={false} />
-        ))}
+        {/* Tool output is data, not prose — every child renders as a labeled
+            code block. Text/thinking children go straight into <pre>; nested
+            tool_use payloads pretty-print; images / unknown blocks fall
+            through to their normal card renderer with markdown disabled. */}
+        {block.content.map((child, index) => {
+          if (child.kind === "text") {
+            return <pre key={index} className="conv-pre"><code>{child.text}</code></pre>;
+          }
+          if (child.kind === "thinking") {
+            return <pre key={index} className="conv-pre"><code>{child.thinking}</code></pre>;
+          }
+          return <BlockView key={index} block={child} toolNames={toolNames} markdown={false} />;
+        })}
         <MoreFields extra={block.extra} />
       </div>
     );

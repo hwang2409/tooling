@@ -751,6 +751,7 @@
 .conv-more .conv-collapse-head { min-height: 22px; padding: 3px 8px; color: var(--muted); background: var(--paper); font-size: 10px; font-weight: 400; }
 .conv-more .conv-collapse-label { font-size: 10px; font-weight: 400; letter-spacing: normal; text-transform: none; }
 .conv-pre { max-width: 100%; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.6; }
+.conv-pre code { display: block; padding: 0; color: inherit; background: transparent; border: 0; font-family: var(--font-mono); font-size: inherit; }
 .conv-usage { margin-top: 14px; padding-top: 10px; color: var(--muted); border-top: 1px solid var(--line); font-size: 10px; font-variant-numeric: tabular-nums; }
 .conv-frames { margin: 0; padding-left: 20px; }
 .conv-frame + .conv-frame { margin-top: 10px; }
