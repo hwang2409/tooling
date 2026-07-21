@@ -80,11 +80,23 @@ export interface SessionIndexStats {
   /** summarise() invocations — one per session actually recomputed. */
   readonly sessionsRecomputed: number;
   /**
-   * Session-order work on the incremental path: one visit per binary-search
-   * comparison or dirty-key reposition. Stays O(dirty x log sessions) per
-   * delta — never a scan of all sessions.
+   * Ordering DECISIONS on the incremental path: one visit per binary-search
+   * comparison or dirty-key reposition — O(dirty x log sessions) per delta.
    */
   readonly orderVisits: number;
+  /**
+   * Pointer shifts performed by the ordered-array splices when repositioning
+   * dirty keys. HONEST accounting: each reposition shifts up to O(sessions)
+   * array slots (memmove-scale pointer moves, no per-session recomputation).
+   */
+  readonly orderShifts: number;
+  /**
+   * Summary pointers copied into the returned result array. HONEST
+   * accounting: every materialization copies O(sessions) pointers so the
+   * returned array identity is fresh for React; no summaries are recomputed
+   * by the copy.
+   */
+  readonly resultCopies: number;
 }
 
 export interface SessionIndex {
@@ -117,9 +129,12 @@ export function createSessionIndex(): SessionIndex {
   const maxSeqOf = new Map<SessionKey, number>();
   const summaries = new Map<SessionKey, SessionSummary>();
   // Result ordering, maintained sorted by maxSeq descending. On the
-  // incremental path only dirty keys are repositioned (binary search), so
-  // per-delta order work is O(dirty x log sessions), not a full scan; the
-  // returned array is a pointer copy with no per-session recomputation.
+  // incremental path only dirty keys are repositioned via binary search
+  // (O(dirty x log sessions) DECISION work). The array splices behind those
+  // repositions shift up to O(sessions) pointers and each materialization
+  // copies O(sessions) summary pointers — linear pointer traffic, counted
+  // honestly in orderShifts/resultCopies, with zero per-session
+  // recomputation. Fine at the 2,000-flow retention ceiling.
   const orderedKeys: SessionKey[] = [];
   const orderedSummaries: SessionSummary[] = [];
   let seqCounter = 0;
@@ -127,6 +142,8 @@ export function createSessionIndex(): SessionIndex {
   let incrementalUpdates = 0;
   let sessionsRecomputed = 0;
   let orderVisits = 0;
+  let orderShifts = 0;
+  let resultCopies = 0;
 
   const summariseSession = (key: SessionKey, sessionFlows: readonly ImmutableFlowMetadata[]): SessionSummary => {
     sessionsRecomputed += 1;
@@ -156,6 +173,7 @@ export function createSessionIndex(): SessionIndex {
       index = orderedKeys.indexOf(key);
     }
     if (index === -1) return;
+    orderShifts += orderedKeys.length - index - 1;
     orderedKeys.splice(index, 1);
     orderedSummaries.splice(index, 1);
   };
@@ -163,6 +181,7 @@ export function createSessionIndex(): SessionIndex {
   const insertOrdered = (key: SessionKey, summary: SessionSummary, max: number): void => {
     orderVisits += 1;
     const index = locate(max);
+    orderShifts += orderedKeys.length - index;
     orderedKeys.splice(index, 0, key);
     orderedSummaries.splice(index, 0, summary);
   };
@@ -185,6 +204,7 @@ export function createSessionIndex(): SessionIndex {
       summaries.set(key, summary);
       insertOrdered(key, summary, newMax);
     }
+    resultCopies += orderedSummaries.length;
     result = [...orderedSummaries];
   };
 
@@ -221,6 +241,7 @@ export function createSessionIndex(): SessionIndex {
       summaries.set(key, summary);
       orderedSummaries.push(summary);
     }
+    resultCopies += orderedSummaries.length;
     result = [...orderedSummaries];
   };
 
@@ -296,7 +317,7 @@ export function createSessionIndex(): SessionIndex {
       lastEntries = flows.entries;
       return result;
     },
-    stats: () => ({ fullRebuilds, incrementalUpdates, sessionsRecomputed, orderVisits }),
+    stats: () => ({ fullRebuilds, incrementalUpdates, sessionsRecomputed, orderVisits, orderShifts, resultCopies }),
   };
 }
 

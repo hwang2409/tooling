@@ -20,6 +20,8 @@ export interface SessionDetailProps {
   summary: SessionSummary;
   onBack: () => void;
   loadFlowDetail?: FlowDetailLoader;
+  /** Capture incarnation — part of detail-cache identity across reconnects. */
+  sourceEpoch?: number;
 }
 
 type SessionMode = "conversation" | "flows";
@@ -63,13 +65,13 @@ function parseCandidate(
  * off-chain utility side-calls stay reachable in a collapsed auxiliary
  * group, and the full flow grid is one toggle away.
  */
-export function SessionDetail({ summary, onBack, loadFlowDetail }: SessionDetailProps) {
+export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch }: SessionDetailProps) {
   const candidates = useMemo(() => conversationCandidates(summary.flows), [summary.flows]);
   // The unassigned bucket keeps the grid experience as its default drill-in.
   const [mode, setMode] = useState<SessionMode>(summary.key === null ? "flows" : "conversation");
   const effectiveMode: SessionMode = candidates.length === 0 ? "flows" : mode;
 
-  const details = useFlowDetails(effectiveMode === "conversation" ? candidates : NO_FLOWS, loadFlowDetail);
+  const details = useFlowDetails(effectiveMode === "conversation" ? candidates : NO_FLOWS, loadFlowDetail, sourceEpoch);
   // Created order for the tip-recency policy is the GRID position of the
   // flow (0 = newest), not the metadata-ranking position of the candidate.
   const gridOrder = useMemo(
@@ -147,7 +149,7 @@ export function SessionDetail({ summary, onBack, loadFlowDetail }: SessionDetail
                 meta={<span className="conv-section-meta">suggestion + utility side-calls</span>}
                 defaultOpen
               >
-                <PacketList flows={auxiliary} showSearch={false} loadFlowDetail={loadFlowDetail} />
+                <PacketList flows={auxiliary} sourceEpoch={sourceEpoch} showSearch={false} loadFlowDetail={loadFlowDetail} />
               </Collapse>
             </>
           ) : (
@@ -159,14 +161,14 @@ export function SessionDetail({ summary, onBack, loadFlowDetail }: SessionDetail
                   label={`auxiliary calls (${auxiliary.length})`}
                   meta={<span className="conv-section-meta">suggestion + utility side-calls</span>}
                 >
-                  <PacketList flows={auxiliary} showSearch={false} loadFlowDetail={loadFlowDetail} />
+                  <PacketList flows={auxiliary} sourceEpoch={sourceEpoch} showSearch={false} loadFlowDetail={loadFlowDetail} />
                 </Collapse>
               ) : null}
             </>
           )}
         </div>
       ) : (
-        <PacketList flows={summary.flows} showSearch={false} loadFlowDetail={loadFlowDetail} />
+        <PacketList flows={summary.flows} sourceEpoch={sourceEpoch} showSearch={false} loadFlowDetail={loadFlowDetail} />
       )}
     </section>
   );

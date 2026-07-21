@@ -224,11 +224,21 @@ export function selectCanonicalFlow(candidates: readonly CanonicalCandidate[]): 
     }
   }
 
-  // Chain evidence = DISTINCT history stages, not raw member count: all
-  // members are prefixes of the tip, so equal-length members are the same
-  // stage and duplicate retransmits must not inflate a branch's weight.
-  const distinctStages = (chain: Chain): number =>
-    new Set(chain.members.map((member) => member.normalized.length)).size;
+  // Chain evidence = DISTINCT history stages, deduplicated by DEEP EQUALITY
+  // of the complete normalized history — not by raw member count (duplicate
+  // retransmits must not inflate a branch) and not by length alone
+  // (reminder-only evolution yields distinct histories of equal length that
+  // are real evidence of activity).
+  const distinctStages = (chain: Chain): number => {
+    const seen: Array<readonly JsonValue[]> = [];
+    for (const member of chain.members) {
+      const duplicate = seen.some((history) =>
+        history.length === member.normalized.length
+        && history.every((message, index) => deepEqual(message, member.normalized[index])));
+      if (!duplicate) seen.push(member.normalized);
+    }
+    return seen.length;
+  };
 
   // (a) prefix dominance within a component, newer tip on ties.
   const representative = (component: readonly Chain[]): Chain =>

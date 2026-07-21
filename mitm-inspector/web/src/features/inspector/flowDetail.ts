@@ -103,11 +103,18 @@ export function flowDetailVersion(metadata: DeepReadonly<FlowMetadata>): string 
   ].join("|");
 }
 
-/** Load body detail for the selected flow; falls back to grid metadata on failure. */
+/**
+ * Load body detail for the selected flow; falls back to grid metadata on
+ * failure. `sourceEpoch` MUST identify the capture incarnation: a new source
+ * can legally reuse a flow id (and even its body descriptors), and serving
+ * the previous source's cached body would present another capture session's
+ * data as current.
+ */
 export function useFlowDetail(
   flowId: string | null,
   loader: FlowDetailLoader = fetchFlowDetail,
   version?: string,
+  sourceEpoch?: number,
 ): FlowDetailResult | null {
   const [result, setResult] = useState<FlowDetailResult | null>(null);
   const [loadedFor, setLoadedFor] = useState<string | null>(null);
@@ -136,7 +143,7 @@ export function useFlowDetail(
       active = false;
       controller.abort();
     };
-  }, [flowId, loader, version]);
+  }, [flowId, loader, version, sourceEpoch]);
   return flowId !== null && loadedFor === flowId ? result : null;
 }
 
@@ -154,8 +161,14 @@ interface VersionedResult {
 export function useFlowDetails(
   flows: readonly DeepReadonly<FlowMetadata>[],
   loader: FlowDetailLoader = fetchFlowDetail,
+  sourceEpoch?: number,
 ): ReadonlyMap<string, FlowDetailResult> {
-  const requests = flows.map((flow) => ({ flowId: flow.flow_id, version: flowDetailVersion(flow) }));
+  // The epoch is part of every cached entry's identity: a reconnected source
+  // reusing a flow id/version must never surface the old source's body.
+  const requests = flows.map((flow) => ({
+    flowId: flow.flow_id,
+    version: `${sourceEpoch ?? 0}:${flowDetailVersion(flow)}`,
+  }));
   const key = requests.map((request) => `${request.flowId}@${request.version}`).join("\u0000");
   const requestsRef = useRef(requests);
   requestsRef.current = requests;

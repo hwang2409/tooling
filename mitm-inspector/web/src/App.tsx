@@ -69,6 +69,7 @@ export function Workspace({ browser, loadFlowDetail, searchFetcher, onSearchActi
         summary={summary}
         onBack={() => setView({ kind: "sessions" })}
         loadFlowDetail={loadFlowDetail}
+        sourceEpoch={browser.sourceEpoch}
       />
     );
   } else {

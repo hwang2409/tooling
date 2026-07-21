@@ -20,6 +20,8 @@ export interface PacketListProps {
   browser?: BrowserState;
   /** Explicit flow subset (e.g. one session); overrides the browser grid. */
   flows?: readonly ImmutableFlowMetadata[];
+  /** Capture incarnation for detail-cache identity when no browser is given. */
+  sourceEpoch?: number;
   showSearch?: boolean;
   loadFlowDetail?: FlowDetailLoader;
   searchFetcher?: SearchFetcher;
@@ -85,7 +87,7 @@ function snippetLabel(matches: readonly SearchMatch[]): string {
   return `${prefix}: ${first.snippet}${suffix}`;
 }
 
-export function PacketList({ browser, flows: flowsOverride, showSearch = true, loadFlowDetail, searchFetcher, onSearchActiveChange }: PacketListProps) {
+export function PacketList({ browser, flows: flowsOverride, sourceEpoch, showSearch = true, loadFlowDetail, searchFetcher, onSearchActiveChange }: PacketListProps) {
   const [openFlowId, setOpenFlowId] = useState<string | null>(null);
   const search = useSearch(searchFetcher);
   const searchActive = search.state.status !== "idle";
@@ -118,6 +120,7 @@ export function PacketList({ browser, flows: flowsOverride, showSearch = true, l
     openFlow?.flow_id ?? null,
     loadFlowDetail,
     openFlow === undefined ? undefined : flowDetailVersion(openFlow),
+    browser?.sourceEpoch ?? sourceEpoch,
   );
 
   return (

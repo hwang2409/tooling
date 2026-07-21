@@ -379,6 +379,54 @@ describe("Workspace session-first navigation", () => {
     expect(container.querySelector("[data-testid='conversation-view']")?.textContent).toContain("late final answer");
   });
 
+  it("refetches detail when a reconnected source reuses a flow id (epoch is part of cache identity)", async () => {
+    const session = "ffff6666-0000-1111-2222-333333333333";
+    const reused = sessionFlow("reused-flow", {
+      session_id: session,
+      started_at: "2026-01-01T00:00:00Z",
+      ended_at: "2026-01-01T00:00:05Z",
+      summary: { kind: "anthropic_messages", model: "claude-opus-4", message_count: "1", preview: { source: "user_text", text: "hello" } },
+    });
+    const state1 = stateOf([reused]);
+    // A NEW source reuses the exact same flow id and body descriptors, so
+    // flow id + detail version alone cannot distinguish the captures.
+    const state2 = [
+      {
+        protocol_version: "1", type: "source.hello", source_id: "source-b",
+        occurred_at: "2026-01-01T01:00:00Z",
+        capabilities: { body_chunks: true, redaction: "headers-and-query" },
+        limits: { max_body_prefix_bytes: "1048576", max_in_memory_bytes: "134217728" },
+      },
+      { protocol_version: "1", type: "browser.snapshot", snapshot_id: "snap-2", cursor: "1", flows: [reused] },
+    ].reduce(
+      (current, message) => browserReducer(current, { type: "protocol", envelope: parseProtocolMessage(message) }),
+      state1,
+    );
+    const requestFor = (marker: string) => JSON.stringify({
+      model: "claude-opus-4",
+      messages: [{ role: "user", content: `hello from ${marker}` }],
+    });
+    let source = "source A";
+    const { container, requested, render } = await mountWorkspace(
+      state1,
+      () => ({ "reused-flow": { request: requestFor(source) } }),
+    );
+    await click(sessionRows(container)[0]);
+    await settle();
+    expect(requested).toEqual(["reused-flow"]);
+    expect(container.querySelector("[data-testid='conversation-view']")?.textContent).toContain("hello from source A");
+
+    source = "source B";
+    await render(state2);
+    await settle();
+    // Same id, same version — but a different capture incarnation MUST load
+    // fresh, never serve the previous source's body as current.
+    expect(requested).toEqual(["reused-flow", "reused-flow"]);
+    const conversation = container.querySelector("[data-testid='conversation-view']");
+    expect(conversation?.textContent).toContain("hello from source B");
+    expect(conversation?.textContent).not.toContain("hello from source A");
+  });
+
   it("renders the auxiliary/flow view, not a fake chat, when every candidate is suggestion-mode", async () => {
     const session = "eeee7777-0000-1111-2222-333333333333";
     const flows = [

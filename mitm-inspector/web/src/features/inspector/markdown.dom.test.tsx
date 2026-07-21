@@ -86,6 +86,20 @@ describe("MarkdownProse", () => {
     expect(container.querySelector("code.md-img")?.textContent).toContain("tracking pixel");
   });
 
+  it("keeps the captured image URL and title visible as inert text — even for unsafe URLs", async () => {
+    // NO-INFORMATION-LOSS: the unsafe URL and the title are captured
+    // evidence. They must be SHOWN (as text) while never producing an
+    // element that could fetch or execute anything.
+    const container = await mountMarkdown('![tracking](javascript:alert%281%29 "captured title")');
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelectorAll("[src]")).toHaveLength(0);
+    const inert = container.querySelector("code.md-img");
+    expect(inert?.textContent).toContain("tracking");
+    expect(inert?.textContent).toContain("javascript:alert%281%29");
+    expect(inert?.textContent).toContain("captured title");
+    expect((globalThis as unknown as Record<string, unknown>).__markdown_pwned).toBeUndefined();
+  });
+
   it("keeps reference-style and html-ish image payloads inert too", async () => {
     const container = await mountMarkdown('![x](javascript:window.__markdown_pwned=true) <img src="https://attacker.example/p2">');
     expect(container.querySelector("img")).toBeNull();

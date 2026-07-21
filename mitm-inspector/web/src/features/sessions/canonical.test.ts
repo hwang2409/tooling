@@ -171,6 +171,23 @@ describe("selectCanonicalFlow", () => {
     expect(selection.canonicalId).toBe("main-2");
   });
 
+  it("equal-length distinct-content stages are separate evidence: reminder evolution keeps main dominant", () => {
+    // The main thread's opening message later gains a reminder injection:
+    // two histories of length 1 with DISTINCT content. Length-based stage
+    // dedupe collapsed them to one stage, tying main with the auxiliary
+    // branch and losing to its newer tip; deep-equality dedupe keeps all
+    // three main stages.
+    const u1r = {
+      role: "user",
+      content: [{ type: "text", text: "fix the bug" }, { type: "text", text: "<system-reminder>ctx</system-reminder>" }],
+    } as JsonValue;
+    const main1 = candidate("main-1", [u1], 5);
+    const main1r = candidate("main-1r", [u1r], 4);
+    const main2 = candidate("main-2", [u1r, a1], 2);
+    const aux = candidate("aux", [u1, assistant("side quest")], 0);
+    expect(selectCanonicalFlow([main1, main1r, main2, aux]).canonicalId).toBe("main-2");
+  });
+
   it("never selects a suggestion-mode request even when it is the newest and longest", () => {
     const suggestion = candidate("suggestion", [u1, a1, chainEnd, user("[SUGGESTION MODE: propose]")], 0, true);
     const main = candidate("main", [u1, a1, chainEnd], 1);

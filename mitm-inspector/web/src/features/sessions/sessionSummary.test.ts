@@ -147,10 +147,18 @@ describe("createSessionIndex", () => {
     // Order maintenance is two binary searches repositioning ONE key. The
     // POSITIVE lower bound proves the instrumented incremental path actually
     // ran (a full-sort revert records zero visits and fails it); the upper
-    // bound proves it stays O(log sessions), never a 20-session scan.
+    // bound proves the DECISION work stays O(log sessions).
     const orderWork = afterDelta.orderVisits - afterRebuild.orderVisits;
     expect(orderWork).toBeGreaterThanOrEqual(2 + 2 * Math.floor(Math.log2(sessionCount)));
     expect(orderWork).toBeLessThanOrEqual(2 * (Math.ceil(Math.log2(sessionCount)) + 2));
+    // Honest linear accounting: the splices behind ONE reposition shift up
+    // to O(sessions) pointers, and materializing the fresh result array
+    // copies exactly one pointer per session — measured, bounded, and free
+    // of per-session recomputation.
+    const shiftWork = afterDelta.orderShifts - afterRebuild.orderShifts;
+    expect(shiftWork).toBeGreaterThanOrEqual(1);
+    expect(shiftWork).toBeLessThanOrEqual(2 * sessionCount);
+    expect(afterDelta.resultCopies - afterRebuild.resultCopies).toBe(sessionCount);
     expect(second[0].key).toBe("sess-7");
     expect(second[0].flowCount).toBe(2);
     expect(second).toHaveLength(sessionCount);
