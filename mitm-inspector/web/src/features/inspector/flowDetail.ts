@@ -118,8 +118,9 @@ export function useFlowDetail(
 ): FlowDetailResult | null {
   const [result, setResult] = useState<FlowDetailResult | null>(null);
   const [loadedFor, setLoadedFor] = useState<string | null>(null);
+  const requestKey = flowId === null ? null : `${flowId}\u0000${version ?? ""}\u0000${sourceEpoch ?? ""}`;
   useEffect(() => {
-    if (flowId === null) {
+    if (requestKey === null || flowId === null) {
       setResult(null);
       setLoadedFor(null);
       return;
@@ -132,19 +133,19 @@ export function useFlowDetail(
       .then((value) => {
         if (!active) return;
         setResult(value);
-        setLoadedFor(flowId);
+        setLoadedFor(requestKey);
       })
       .catch((error: unknown) => {
         if (!active || controller.signal.aborted) return;
         setResult({ status: "error", error: error instanceof Error ? error.message : "Flow detail request failed." });
-        setLoadedFor(flowId);
+        setLoadedFor(requestKey);
       });
     return () => {
       active = false;
       controller.abort();
     };
-  }, [flowId, loader, version, sourceEpoch]);
-  return flowId !== null && loadedFor === flowId ? result : null;
+  }, [flowId, loader, requestKey]);
+  return requestKey !== null && loadedFor === requestKey ? result : null;
 }
 
 interface VersionedResult {

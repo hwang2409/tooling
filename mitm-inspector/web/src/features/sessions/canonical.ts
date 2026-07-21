@@ -400,6 +400,24 @@ export function createCanonicalIndex(): CanonicalIndex {
     }
   };
 
+  const refreshGroupAggregates = (group: HistoryGroup): void => {
+    group.contextCounts.clear();
+    group.newestByContext.clear();
+    for (const id of group.members) {
+      const entry = entries.get(id);
+      if (entry === undefined) continue;
+      const context = entry.candidate.contextKey ?? "";
+      const current = group.contextCounts.get(context);
+      group.contextCounts.set(context, {
+        count: (current?.count ?? 0) + 1,
+        oldestOrder: Math.max(current?.oldestOrder ?? Number.NEGATIVE_INFINITY, entry.candidate.order),
+      });
+      const newestId = group.newestByContext.get(context);
+      const newest = newestId === undefined ? undefined : entries.get(newestId);
+      if (newest === undefined || entry.candidate.order < newest.candidate.order) group.newestByContext.set(context, entry.id);
+    }
+  };
+
   const addGroupMember = (group: HistoryGroup, entry: IndexEntry): void => {
     const context = entry.candidate.contextKey ?? "";
     group.members.add(entry.id);
@@ -682,6 +700,25 @@ export function createCanonicalIndex(): CanonicalIndex {
       let structural = false;
       let orderChanged = false;
       const seen = new Set<string>();
+      const incoming = new Map(candidates.filter((candidate) => !candidate.suggestion).map((candidate) => [candidate.flowId, candidate]));
+      const touchedGroups = new Set<number>();
+
+      // Refresh all existing order-derived aggregates before processing the
+      // newest-first batch. Otherwise an added tip can be compared against an
+      // old order snapshot and incremental selection diverges from fresh.
+      for (const entry of entries.values()) {
+        const candidate = incoming.get(entry.id);
+        if (candidate === undefined
+          || candidate.messages !== entry.candidate.messages
+          || candidate.contextKey !== entry.candidate.contextKey) continue;
+        if (candidate.order !== entry.candidate.order) {
+          entry.candidate = candidate;
+          touchedGroups.add(entry.stamp);
+          orderChanged = true;
+        }
+      }
+      for (const stamp of touchedGroups) refreshGroupAggregates(historyGroups.get(stamp)!);
+
       for (const candidate of candidates) {
         if (candidate.suggestion) continue;
         seen.add(candidate.flowId);

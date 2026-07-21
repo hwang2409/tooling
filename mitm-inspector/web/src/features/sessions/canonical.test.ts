@@ -445,6 +445,53 @@ describe("createCanonicalIndex", () => {
     expect(delta.ownershipVisits - before.ownershipVisits).toBeLessThanOrEqual(2);
   });
 
+  it("refreshes order aggregates before newest-first additions and matches fresh selection", () => {
+    const historyValue = history(3);
+    const mainKey = requestContextKey({ model: "claude-opus-4", system: "main" } as JsonValue);
+    const sideKey = requestContextKey({ model: "claude-haiku-4", system: "side" } as JsonValue);
+
+    const oldRetransmit = candidate("old-retransmit", historyValue, 0, false, mainKey);
+    const newRetransmit = candidate("new-retransmit", historyValue, 1, false, mainKey);
+    const retransmitFinal = [
+      newRetransmit,
+      { ...oldRetransmit, order: 2 },
+    ];
+    const retransmitIndex = createCanonicalIndex();
+    retransmitIndex.update([oldRetransmit]);
+    expect(retransmitIndex.update(retransmitFinal)).toEqual(selectCanonicalFlow(retransmitFinal));
+    expect(retransmitIndex.update(retransmitFinal).canonicalId).toBe("new-retransmit");
+
+    const oldMain = candidate("old-main", historyValue, 0, false, mainKey);
+    const sideClone = candidate("side-clone", historyValue, 1, false, sideKey);
+    const cloneFinal = [
+      sideClone,
+      { ...oldMain, order: 2 },
+    ];
+    const cloneIndex = createCanonicalIndex();
+    cloneIndex.update([oldMain]);
+    expect(cloneIndex.update(cloneFinal)).toEqual(selectCanonicalFlow(cloneFinal));
+    expect(cloneIndex.update(cloneFinal).canonicalId).toBe("old-main");
+
+    const pool = Array.from({ length: 10 }, (_, index) => ({
+      flowId: `order-${index}`,
+      messages: historyValue,
+      contextKey: index % 3 === 0 ? sideKey : mainKey,
+    }));
+    const incremental = createCanonicalIndex();
+    let seed = 17;
+    const random = () => {
+      seed = (seed * 31 + 7) % 997;
+      return seed;
+    };
+    for (let round = 0; round < 24; round += 1) {
+      const next = pool
+        .filter(() => random() % 4 !== 0)
+        .map((entry, index) => candidate(entry.flowId, entry.messages, index, false, entry.contextKey));
+      const newestFirst = [...next].sort((left, right) => left.order - right.order);
+      expect(incremental.update(newestFirst)).toEqual(selectCanonicalFlow(newestFirst));
+    }
+  });
+
   it("groups disjoint sessions with linear component work on one-candidate delta", () => {
     const size = 256;
     const index = createCanonicalIndex();
