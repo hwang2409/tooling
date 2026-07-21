@@ -253,12 +253,16 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
   if (parserRef.current === null) parserRef.current = candidateParser ?? createCandidateParser();
   const indexRef = useRef<CanonicalIndex | null>(null);
   if (indexRef.current === null) indexRef.current = canonicalIndex ?? createCanonicalIndex();
-  const parsed = useMemo(
-    () => (effectiveMode === "conversation"
-      ? parserRef.current!.parseAll(candidates, gridOrder, details, sourceEpoch)
-      : NO_PARSED),
-    [effectiveMode, candidates, gridOrder, details, sourceEpoch],
-  );
+  const parsed = useMemo(() => {
+    if (effectiveMode !== "conversation") return NO_PARSED;
+    // Captured bodies are arbitrary: a pathological payload must degrade the
+    // drill-in to the flow view, never crash session rendering.
+    try {
+      return parserRef.current!.parseAll(candidates, gridOrder, details, sourceEpoch);
+    } catch {
+      return NO_PARSED;
+    }
+  }, [effectiveMode, candidates, gridOrder, details, sourceEpoch]);
   const settled = effectiveMode === "conversation" && parsed.every((candidate) => candidate.detail !== null);
 
   // Body-verified selection only. When nothing verifiable and non-suggestion
@@ -275,7 +279,13 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
         order: candidate.order,
         ...(candidate.contextKey !== undefined ? { contextKey: candidate.contextKey } : {}),
       }));
-    return indexRef.current!.update(usable);
+    try {
+      return indexRef.current!.update(usable);
+    } catch {
+      // Same degradation contract as parsing: selection failure renders the
+      // flow view instead of crashing the drill-in.
+      return null;
+    }
   }, [settled, parsed]);
 
   const canonical = useMemo(() => {

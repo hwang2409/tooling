@@ -1,3 +1,4 @@
+import { performance } from "node:perf_hooks";
 import { describe, expect, it } from "vitest";
 
 import type { JsonValue } from "../inspector/jsonTree";
@@ -516,5 +517,51 @@ describe("createCanonicalIndex", () => {
       index.update([]);
       expect(index.stats().stampBuckets).toBe(baseline);
     }
+  });
+});
+
+describe("robustness on pathological captured input", () => {
+  it("validates large reminder markup in linear time", () => {
+    // The retired slice-per-element scan was quadratic: ~360 KB of repeated
+    // reminder elements took multiple seconds per comparison. The linear
+    // token scan must stay comfortably under a second including JSDOM
+    // overhead; the generous bound still fails the quadratic implementation.
+    const markup = "<system-reminder>captured note</system-reminder>\n".repeat(8000);
+    const earlier = user("hello");
+    const later = { role: "user", content: [{ type: "text", text: "hello" }, { type: "text", text: markup }] } as JsonValue;
+    const started = performance.now();
+    expect(messageMatches(earlier, later)).toBe(true);
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it("validates deeply nested reminder markup in linear time", () => {
+    // Nesting is the quadratic hot spot of the retired scanner: every inner
+    // iteration re-scanned forward to the first close tag, so depth-20000
+    // balanced markup cost hundreds of millions of character comparisons.
+    const nested = "<system-reminder>".repeat(20000) + "</system-reminder>".repeat(20000);
+    const earlier = user("hello");
+    const later = { role: "user", content: [{ type: "text", text: "hello" }, { type: "text", text: nested }] } as JsonValue;
+    const started = performance.now();
+    expect(messageMatches(earlier, later)).toBe(true);
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it("normalizes deeply nested captured JSON without overflowing the stack", () => {
+    // Real captured tool schemas nest thousands of levels deep; recursive
+    // stableStringify/deepEqual crashed with RangeError on valid input.
+    const deepValue = (depth: number): JsonValue => {
+      let value: JsonValue = "leaf";
+      for (let index = 0; index < depth; index += 1) value = { nested: value };
+      return value;
+    };
+    const contextA = requestContextKey({ model: "m", tools: [{ name: "t", input_schema: deepValue(10000) }] } as JsonValue);
+    const contextB = requestContextKey({ model: "m", tools: [{ name: "t", input_schema: deepValue(10000) }] } as JsonValue);
+    expect(contextA).toBe(contextB);
+    const deepMessage = { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: deepValue(10000) }] } as JsonValue;
+    const deepMessageClone = { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: deepValue(10000) }] } as JsonValue;
+    expect(messageMatches(deepMessage, deepMessageClone)).toBe(true);
+    const index = createCanonicalIndex();
+    const selection = index.update([candidate("deep", [deepMessage], 0, false, contextA)]);
+    expect(selection.canonicalId).toBe("deep");
   });
 });

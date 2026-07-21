@@ -78,13 +78,50 @@ export function normalizeMessage(message: JsonValue): JsonValue {
   return object;
 }
 
-/** Key-order-independent serialization so contexts compare structurally. */
-function stableStringify(value: JsonValue): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-  const object = value as JsonObject;
-  const keys = Object.keys(object).sort();
-  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(object[key])}`).join(",")}}`;
+/** Emitted verbatim by the iterative stableStringify traversal. */
+class Literal {
+  constructor(readonly text: string) {}
+}
+
+/**
+ * Key-order-independent serialization so contexts compare structurally.
+ * Iterative (explicit stack): captured JSON can nest thousands of levels
+ * deep (real tool schemas hit depth 10,000+), and a recursive traversal
+ * overflows the call stack on valid input.
+ */
+function stableStringify(root: JsonValue): string {
+  const out: string[] = [];
+  const stack: Array<JsonValue | Literal> = [root];
+  while (stack.length > 0) {
+    const item = stack.pop() as JsonValue | Literal;
+    if (item instanceof Literal) {
+      out.push(item.text);
+      continue;
+    }
+    if (item === null || typeof item !== "object") {
+      out.push(JSON.stringify(item));
+      continue;
+    }
+    if (Array.isArray(item)) {
+      out.push("[");
+      stack.push(new Literal("]"));
+      for (let index = item.length - 1; index >= 0; index -= 1) {
+        stack.push(item[index]);
+        if (index > 0) stack.push(new Literal(","));
+      }
+      continue;
+    }
+    const object = item as JsonObject;
+    const keys = Object.keys(object).sort();
+    out.push("{");
+    stack.push(new Literal("}"));
+    for (let index = keys.length - 1; index >= 0; index -= 1) {
+      stack.push(object[keys[index]]);
+      stack.push(new Literal(`${JSON.stringify(keys[index])}:`));
+      if (index > 0) stack.push(new Literal(","));
+    }
+  }
+  return out.join("");
 }
 
 /**
@@ -109,20 +146,32 @@ export function requestContextKey(body: JsonValue): string {
   return stableStringify(context);
 }
 
+/** Iterative for the same reason as stableStringify: deep captured JSON must not overflow the stack. */
 function deepEqual(left: JsonValue, right: JsonValue): boolean {
-  if (left === right) return true;
-  if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
-  const leftArray = Array.isArray(left);
-  if (leftArray !== Array.isArray(right)) return false;
-  if (leftArray) {
-    const rightArray = right as readonly JsonValue[];
-    if ((left as readonly JsonValue[]).length !== rightArray.length) return false;
-    return (left as readonly JsonValue[]).every((item, index) => deepEqual(item, rightArray[index]));
+  const stack: Array<readonly [JsonValue, JsonValue]> = [[left, right]];
+  while (stack.length > 0) {
+    const [l, r] = stack.pop()!;
+    if (l === r) continue;
+    if (l === null || r === null || typeof l !== "object" || typeof r !== "object") return false;
+    const leftArray = Array.isArray(l);
+    if (leftArray !== Array.isArray(r)) return false;
+    if (leftArray) {
+      const leftItems = l as readonly JsonValue[];
+      const rightItems = r as readonly JsonValue[];
+      if (leftItems.length !== rightItems.length) return false;
+      for (let index = 0; index < leftItems.length; index += 1) stack.push([leftItems[index], rightItems[index]]);
+      continue;
+    }
+    const leftObject = l as JsonObject;
+    const rightObject = r as JsonObject;
+    const leftKeys = Object.keys(leftObject);
+    if (leftKeys.length !== Object.keys(rightObject).length) return false;
+    for (const key of leftKeys) {
+      if (!(key in rightObject)) return false;
+      stack.push([leftObject[key], rightObject[key]]);
+    }
   }
-  const leftKeys = Object.keys(left);
-  const rightObject = right as JsonObject;
-  if (leftKeys.length !== Object.keys(rightObject).length) return false;
-  return leftKeys.every((key) => key in rightObject && deepEqual((left as JsonObject)[key], rightObject[key]));
+  return true;
 }
 
 const REMINDER_OPEN = "<system-reminder>";
@@ -135,31 +184,51 @@ const REMINDER_CLOSE = "</system-reminder>";
  * text disqualify the block — otherwise arbitrary user text could fabricate
  * a prefix match.
  */
-function isReminderMarkup(text: string): boolean {
-  let rest = text.trim();
-  if (rest.length === 0) return false;
-  while (rest.length > 0) {
-    if (!rest.startsWith(REMINDER_OPEN)) return false;
-    // Balanced scan: every nested open tag must close before the element
-    // ends, otherwise "<system-reminder>outer <system-reminder>inner
-    // </system-reminder>" would count as complete despite the unclosed outer.
-    let depth = 1;
-    let position = REMINDER_OPEN.length;
-    while (depth > 0) {
-      const nextOpen = rest.indexOf(REMINDER_OPEN, position);
-      const nextClose = rest.indexOf(REMINDER_CLOSE, position);
-      if (nextClose === -1) return false;
-      if (nextOpen !== -1 && nextOpen < nextClose) {
-        depth += 1;
-        position = nextOpen + REMINDER_OPEN.length;
-      } else {
-        depth -= 1;
-        position = nextClose + REMINDER_CLOSE.length;
-      }
-    }
-    rest = rest.slice(position).trimStart();
+function isWhitespaceOnly(text: string, from: number, to: number): boolean {
+  for (let index = from; index < to; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code !== 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d && code !== 0x0b && code !== 0x0c) return false;
   }
   return true;
+}
+
+function isReminderMarkup(text: string): boolean {
+  // Single linear pass: collect every tag occurrence once (each indexOf
+  // resumes past the previous match), then walk the token stream with a
+  // depth counter. The previous per-element slice+trim implementation was
+  // quadratic — a 560 KB reminder block took ~750 ms per comparison.
+  const tokens: Array<readonly [start: number, open: boolean]> = [];
+  for (let at = text.indexOf(REMINDER_OPEN); at !== -1; at = text.indexOf(REMINDER_OPEN, at + REMINDER_OPEN.length)) {
+    tokens.push([at, true]);
+  }
+  for (let at = text.indexOf(REMINDER_CLOSE); at !== -1; at = text.indexOf(REMINDER_CLOSE, at + REMINDER_CLOSE.length)) {
+    tokens.push([at, false]);
+  }
+  if (tokens.length === 0) return false;
+  tokens.sort((a, b) => a[0] - b[0]);
+  // The open tag is a prefix of no other token and the close tag contains no
+  // open tag, so sorted occurrences cannot overlap.
+  let depth = 0;
+  let cursor = 0;
+  let sawElement = false;
+  for (const [start, open] of tokens) {
+    if (depth === 0) {
+      // Between top-level elements (and before the first) only whitespace
+      // may appear; a close tag here is malformed markup.
+      if (!open || !isWhitespaceOnly(text, cursor, start)) return false;
+      depth = 1;
+      cursor = start + REMINDER_OPEN.length;
+      continue;
+    }
+    depth += open ? 1 : -1;
+    cursor = start + (open ? REMINDER_OPEN.length : REMINDER_CLOSE.length);
+    if (depth === 0) sawElement = true;
+  }
+  // Every nested open tag must close before the element ends, otherwise
+  // "<system-reminder>outer <system-reminder>inner </system-reminder>"
+  // would count as complete despite the unclosed outer.
+  if (depth !== 0) return false;
+  return sawElement && isWhitespaceOnly(text, cursor, text.length);
 }
 
 /** Exact shape of a harness-injected reminder: a text block of pure reminder markup. */
