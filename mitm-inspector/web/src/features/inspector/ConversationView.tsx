@@ -11,6 +11,7 @@ import type {
   ToolView,
 } from "./anthropic";
 import { assembleSse, looksLikeSse, parseAnthropicResponse } from "./anthropic";
+import { MarkdownProse } from "./Markdown";
 import { JsonTree, safeParseJson } from "./jsonTree";
 import type { JsonValue } from "./jsonTree";
 import { durationBetween, formatBytes } from "../flows/rowSummary";
@@ -42,7 +43,7 @@ function firstLine(text: string): string {
   return line.length > 160 ? `${line.slice(0, 160)}…` : line;
 }
 
-function Collapse({ label, meta, children, defaultOpen = false, className }: {
+export function Collapse({ label, meta, children, defaultOpen = false, className }: {
   label: string;
   meta?: ReactNode;
   children: ReactNode;
@@ -80,11 +81,11 @@ function MoreFields({ extra }: { extra: ExtraFields }) {
   );
 }
 
-function BlockView({ block, toolNames }: { block: ContentBlock; toolNames: ReadonlyMap<string, string> }) {
+function BlockView({ block, toolNames, markdown }: { block: ContentBlock; toolNames: ReadonlyMap<string, string>; markdown: boolean }) {
   if (block.kind === "text") {
     return (
       <div className="conv-block conv-block-text">
-        <span className="conv-prose">{block.text}</span>
+        {markdown ? <MarkdownProse text={block.text} /> : <span className="conv-prose">{block.text}</span>}
         <CacheBadge value={block.cacheControl} />
         <MoreFields extra={block.extra} />
       </div>
@@ -144,8 +145,9 @@ function BlockView({ block, toolNames }: { block: ContentBlock; toolNames: Reado
           {block.isError === true ? <span className="conv-card-error">error</span> : null}
           <CacheBadge value={block.cacheControl} />
         </div>
+        {/* Tool output is data, not prose — keep it literal even in markdown mode. */}
         {block.content.map((child, index) => (
-          <BlockView key={index} block={child} toolNames={toolNames} />
+          <BlockView key={index} block={child} toolNames={toolNames} markdown={false} />
         ))}
         <MoreFields extra={block.extra} />
       </div>
@@ -254,7 +256,7 @@ function HeaderStrip({ request, extras, response }: { request: AnthropicRequest;
   );
 }
 
-function SystemSection({ blocks }: { blocks: readonly ContentBlock[] }) {
+function SystemSection({ blocks, markdown }: { blocks: readonly ContentBlock[]; markdown: boolean }) {
   if (blocks.length === 0) return null;
   return (
     <section className="conv-section">
@@ -269,7 +271,7 @@ function SystemSection({ blocks }: { blocks: readonly ContentBlock[] }) {
         }
       >
         {blocks.map((block, index) => {
-          if (block.kind !== "text") return <BlockView key={index} block={block} toolNames={new Map()} />;
+          if (block.kind !== "text") return <BlockView key={index} block={block} toolNames={new Map()} markdown={markdown} />;
           return (
             <Collapse
               key={index}
@@ -282,7 +284,7 @@ function SystemSection({ blocks }: { blocks: readonly ContentBlock[] }) {
                 </span>
               }
             >
-              <span className="conv-prose">{block.text}</span>
+              {markdown ? <MarkdownProse text={block.text} /> : <span className="conv-prose">{block.text}</span>}
               <MoreFields extra={block.extra} />
             </Collapse>
           );
@@ -342,7 +344,7 @@ function ResponseMeta({ model, role }: { model?: string; role?: string }) {
   );
 }
 
-function ResponseSection({ response, toolNames }: { response: ResponseView; toolNames: ReadonlyMap<string, string> }) {
+function ResponseSection({ response, toolNames, markdown }: { response: ResponseView; toolNames: ReadonlyMap<string, string>; markdown: boolean }) {
   if (response.kind === "absent") return null;
   return (
     <section className="conv-section conv-response">
@@ -352,7 +354,7 @@ function ResponseSection({ response, toolNames }: { response: ResponseView; tool
       {response.kind === "sse" ? (
         <>
           {response.assembled.blocks.map((block, index) => (
-            <BlockView key={index} block={block} toolNames={toolNames} />
+            <BlockView key={index} block={block} toolNames={toolNames} markdown={markdown} />
           ))}
           {response.assembled.undecodedFrames > 0
             ? <span className="conv-muted">({response.assembled.undecodedFrames} undecoded frames)</span>
@@ -364,7 +366,7 @@ function ResponseSection({ response, toolNames }: { response: ResponseView; tool
       {response.kind === "json" ? (
         <>
           {response.parsed.blocks.map((block, index) => (
-            <BlockView key={index} block={block} toolNames={toolNames} />
+            <BlockView key={index} block={block} toolNames={toolNames} markdown={markdown} />
           ))}
           <UsageLine usage={response.parsed.usage} />
           <MoreFields extra={response.parsed.extra} />
@@ -384,6 +386,8 @@ export interface ConversationViewProps {
 }
 
 export function ConversationView({ request, extras, responseText, responseContentType }: ConversationViewProps) {
+  const [plainText, setPlainText] = useState(false);
+  const markdown = !plainText;
   const response = useMemo(
     () => deriveResponseView(responseText, responseContentType ?? extras.response_content_type),
     [responseText, responseContentType, extras],
@@ -391,21 +395,25 @@ export function ConversationView({ request, extras, responseText, responseConten
   const toolNames = useMemo(() => collectToolNames(request, response), [request, response]);
   return (
     <div className="conv" data-testid="conversation-view">
+      <div className="conv-text-modes">
+        <button type="button" className="packet-mode" aria-pressed={markdown} onClick={() => setPlainText(false)}>md</button>
+        <button type="button" className="packet-mode" aria-pressed={plainText} onClick={() => setPlainText(true)}>plain</button>
+      </div>
       <HeaderStrip request={request} extras={extras} response={response} />
-      <SystemSection blocks={request.system} />
+      <SystemSection blocks={request.system} markdown={markdown} />
       <ToolsSection tools={request.tools} />
       <section className="conv-section conv-transcript">
         {request.messages.map((message, index) => (
           <div key={index} className={`conv-message conv-message-${message.role}`}>
             <div className="conv-role">{message.role}</div>
             {message.blocks.map((block, blockIndex) => (
-              <BlockView key={blockIndex} block={block} toolNames={toolNames} />
+              <BlockView key={blockIndex} block={block} toolNames={toolNames} markdown={markdown} />
             ))}
             <MoreFields extra={message.extra} />
           </div>
         ))}
       </section>
-      <ResponseSection response={response} toolNames={toolNames} />
+      <ResponseSection response={response} toolNames={toolNames} markdown={markdown} />
     </div>
   );
 }

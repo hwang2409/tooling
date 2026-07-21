@@ -12,6 +12,7 @@ export default [
       globals: {
         AbortController: "readonly",
         atob: "readonly",
+        console: "readonly",
         btoa: "readonly",
         document: "readonly",
         fetch: "readonly",

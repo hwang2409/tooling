@@ -30,7 +30,7 @@ REQUEST_PAYLOAD.update(
         "max_tokens": 64,
         "system": [{"type": "text", "text": "be concise"}],
         "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
-        "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hello **world**"}]}],
     }
 )
 REQUEST_BODY = json.dumps(REQUEST_PAYLOAD).encode("utf-8")
@@ -104,6 +104,14 @@ FLOW = {
     "request_body": STRIPPED_REQUEST_BODY,
     "response_body": STRIPPED_RESPONSE_BODY,
     "response_status": "500",
+    "started_at": "2026-01-01T00:00:00Z",
+    "ended_at": "2026-01-01T00:00:02Z",
+    "summary": {
+        "kind": "anthropic_messages",
+        "model": "claude-example",
+        "message_count": "1",
+        "preview": {"source": "user_text", "text": "hello **world**"},
+    },
 }
 
 DURABLE_FLOW = {
@@ -246,24 +254,40 @@ def run_workflow(page: Page) -> None:
     )
 
     page.goto(BASE_URL)
-    row = page.locator(".packet-row")
-    expect(row).to_have_count(1)
-    expect(row).to_contain_text("POST")
-    expect(row).to_contain_text("api.example.test")
-    expect(row).to_contain_text("/v1/messages")
-    expect(row).to_contain_text("500")
-    assert page.locator(".packet-status-error").evaluate(
+
+    # Home is the session list: one metadata-only row per session.
+    session_row = page.locator(".session-row")
+    expect(session_row).to_have_count(1)
+    expect(session_row).to_contain_text("client-s")
+    expect(session_row).to_contain_text("1f")
+    expect(session_row).to_contain_text("hello **world**")
+    expect(session_row).to_contain_text("err")
+    assert session_row.locator(".session-status-error").evaluate(
         "el => getComputedStyle(el).color"
     ) == "rgb(180, 35, 24)"
-    # The snapshot carries no body bytes, so nothing may render before the
-    # click-triggered detail fetch.
+    # The list renders from the grid projection only — no detail fetches yet.
     assert detail_requests == [], detail_requests
 
-    row.click()
+    # Drill into the session: the canonical flow's conversation, fetched on
+    # demand, with the response as the final assistant turn.
+    session_row.click()
     conversation = page.locator("[data-testid='conversation-view']")
     expect(conversation).to_be_visible()
     expect(conversation).to_contain_text("answer")
     expect(conversation).to_contain_text("end_turn")
+    assert len(detail_requests) == 1, detail_requests
+    assert detail_requests[0].endswith(f"/api/v1/flows/{FLOW_ID}"), detail_requests
+
+    # Markdown rendering with the plain source one toggle away.
+    markdown_strong = conversation.locator(".conv-message strong").filter(has_text="world")
+    expect(markdown_strong).to_be_visible()
+    page.locator(".conv-text-modes .packet-mode").filter(has_text="plain").click()
+    expect(conversation.locator(".conv-message strong")).to_have_count(0)
+    expect(conversation).to_contain_text("hello **world**")
+    page.locator(".conv-text-modes .packet-mode").filter(has_text="md").click()
+    expect(conversation.locator(".conv-message strong").filter(has_text="world")).to_be_visible()
+
+    # Raw JSON stays one toggle away from the rendered conversation.
     expect(page.locator(".packet-detail .packet-mode").filter(has_text="raw")).to_be_visible()
     page.locator(".packet-detail .packet-mode").filter(has_text="raw").click()
     raw_tree = page.locator(".packet-detail .json-tree")
@@ -274,8 +298,25 @@ def run_workflow(page: Page) -> None:
     raw_frames = conversation.locator(".conv-collapse-head").filter(has_text="raw frames")
     raw_frames.click()
     expect(conversation).to_contain_text("truncated frame")
-    assert len(detail_requests) == 1, detail_requests
-    assert detail_requests[0].endswith(f"/api/v1/flows/{FLOW_ID}"), detail_requests
+
+    # The per-session flow grid is one toggle away, then back home.
+    page.locator(".session-detail-modes .packet-mode").filter(has_text="flows").click()
+    expect(page.locator(".packet-row")).to_have_count(1)
+    page.locator(".session-back").click()
+    expect(page.locator(".session-row")).to_have_count(1)
+
+    # Global flow grid keeps the full packet experience and search.
+    page.locator(".app-nav .packet-mode").filter(has_text="flows").click()
+    row = page.locator(".packet-row")
+    expect(row).to_have_count(1)
+    # Summary-enriched anthropic flows render the dense msg badge shape.
+    expect(row).to_contain_text("msg")
+    expect(row).to_contain_text("example")
+    expect(row).to_contain_text("hello **world**")
+    expect(row).to_contain_text("500")
+    assert page.locator(".packet-status-error").evaluate(
+        "el => getComputedStyle(el).color"
+    ) == "rgb(180, 35, 24)"
 
     search = page.locator(".search-input")
     search.fill("durable")
@@ -284,7 +325,7 @@ def run_workflow(page: Page) -> None:
     expect(page.locator(".packet-row")).to_contain_text("retained.example.test")
     search.press("Escape")
     expect(page.locator(".packet-row")).to_have_count(1)
-    expect(page.locator(".packet-row")).to_contain_text("api.example.test")
+    expect(page.locator(".packet-row")).to_contain_text("hello **world**")
 
     for width in (600, 800):
         page.set_viewport_size({"width": width, "height": 700})
@@ -317,6 +358,16 @@ def run_workflow(page: Page) -> None:
         assert geometry["statusLeft"] >= geometry["previewRight"] - 1, (width, geometry)
         assert geometry["sizes"] == "none", (width, geometry)
         assert geometry["duration"] == "none", (width, geometry)
+
+    # The session list must also fit narrow viewports without overflow.
+    page.locator(".app-nav .packet-mode").filter(has_text="sessions").click()
+    expect(page.locator(".session-row")).to_have_count(1)
+    for width in (600, 800):
+        page.set_viewport_size({"width": width, "height": 700})
+        document_width = page.evaluate(
+            "Math.max(document.body.scrollWidth, document.documentElement.scrollWidth)"
+        )
+        assert document_width <= width, (width, document_width)
 
 
 def main() -> None:
