@@ -385,6 +385,66 @@ describe("createCanonicalIndex", () => {
     }
   });
 
+  it("keeps incremental ownership equal to fresh selection after a C-context clone", () => {
+    const keyB = requestContextKey({ model: "claude-opus-4", system: "B" } as JsonValue);
+    const keyC = requestContextKey({ model: "claude-opus-4", system: "C" } as JsonValue);
+    const terminal = history(3);
+    const bNew = candidate("b-new", terminal, 0, false, keyB);
+    const bMiddle = candidate("b-middle", terminal, 1, false, keyB);
+    const bOld = candidate("b-old", terminal, 2, false, keyB);
+    const cOld = candidate("c-old", terminal, 3, false, keyC);
+    const initial = [bNew, bMiddle, bOld, cOld];
+    const final = [
+      { ...bNew, order: 1 },
+      { ...bMiddle, order: 2 },
+      { ...bOld, order: 3 },
+      { ...cOld, order: 4 },
+      candidate("c-new", terminal, 0, false, keyC),
+    ];
+    const incremental = createCanonicalIndex();
+    incremental.update(initial);
+    const incrementalSelection = incremental.update(final);
+    const freshSelection = selectCanonicalFlow(final);
+    expect(incrementalSelection).toEqual(freshSelection);
+    expect(freshSelection.canonicalId).toBe("b-new");
+
+    const permutations = [
+      [final[4], final[0], final[3], final[2], final[1]],
+      [final[2], final[4], final[1], final[3], final[0]],
+      [final[1], final[3], final[0], final[4], final[2]],
+    ];
+    for (const permutation of permutations) {
+      expect(selectCanonicalFlow(permutation).canonicalId).toBe(freshSelection.canonicalId);
+      expect(selectCanonicalFlow(permutation).chainIds).toEqual(freshSelection.chainIds);
+    }
+  });
+
+  it("aggregates shared-history evidence linearly and retains no per-tip member arrays", () => {
+    const size = 2000;
+    const keyB = requestContextKey({ model: "claude-opus-4", system: "B" } as JsonValue);
+    const keyC = requestContextKey({ model: "claude-opus-4", system: "C" } as JsonValue);
+    const terminal = history(3);
+    const base = Array.from({ length: size }, (_, index) => candidate(
+      `shared-${index}`,
+      terminal,
+      size - index,
+      false,
+      index % 3 === 0 ? keyC : keyB,
+    ));
+    const index = createCanonicalIndex();
+    index.update(base);
+    const before = index.stats();
+    const shifted = base.map((entry) => ({ ...entry, order: entry.order + 1 }));
+    index.update([...shifted, candidate("shared-new", terminal, 0, false, keyB)]);
+    const delta = index.stats();
+    expect(delta.retainedMemberArrays).toBe(0);
+    expect(delta.normalizations - before.normalizations).toBe(1);
+    expect(delta.prefixEvaluations - before.prefixEvaluations).toBe(0);
+    expect(delta.memberVisits - before.memberVisits).toBeLessThanOrEqual(size + 1);
+    expect(delta.evidenceVisits - before.evidenceVisits).toBeLessThanOrEqual(2);
+    expect(delta.ownershipVisits - before.ownershipVisits).toBeLessThanOrEqual(2);
+  });
+
   it("groups disjoint sessions with linear component work on one-candidate delta", () => {
     const size = 256;
     const index = createCanonicalIndex();

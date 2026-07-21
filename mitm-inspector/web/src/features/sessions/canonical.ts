@@ -214,6 +214,18 @@ function historiesAreEquivalent(left: readonly JsonValue[], right: readonly Json
     messageMatches(message, right[index]) || messageMatches(right[index], message));
 }
 
+/** Canonical key for terminal groups, removing only tolerated reminder suffixes. */
+function historyGroupKey(history: readonly JsonValue[]): string {
+  const stripReminderSuffix = (message: JsonValue): JsonValue => {
+    const object = asObject(message);
+    if (object === null || !Array.isArray(object.content)) return message;
+    let end = object.content.length;
+    while (end > 0 && isReminderInjection(object.content[end - 1])) end -= 1;
+    return end === object.content.length ? message : { ...object, content: object.content.slice(0, end) };
+  };
+  return stableStringify(history.map(stripReminderSuffix));
+}
+
 interface IndexEntry {
   readonly id: string;
   /** Refreshed on every update — the grid order shifts as flows prepend. */
@@ -223,19 +235,15 @@ interface IndexEntry {
   readonly stamp: number;
 }
 
-/**
- * Whether `later` extends `earlier`: strictly longer, or an equal-length
- * newer retransmit UNDER THE SAME REQUEST CONTEXT. A different-context call
- * (other model/system/tools) resending an identical history is a borrowing
- * side-call, not a continuation — it must never displace the thread it
- * copied purely by being newer. Strictly growing histories remain one
- * lineage even when request context evolves between stages.
- */
-function supersedes(earlier: IndexEntry, later: IndexEntry, earlierPrefixOfLater: boolean): boolean {
-  if (!earlierPrefixOfLater) return false;
-  if (later.normalized.length > earlier.normalized.length) return true;
-  return later.candidate.contextKey === earlier.candidate.contextKey
-    && later.candidate.order < earlier.candidate.order;
+interface HistoryGroup {
+  readonly stamp: number;
+  readonly history: readonly JsonValue[];
+  readonly members: Set<string>;
+  readonly contextCounts: Map<string, { count: number; oldestOrder: number }>;
+  readonly newestByContext: Map<string, string>;
+  readonly prefixGroupsInto: Set<number>;
+  readonly equivalentGroups: Set<number>;
+  representativeId: string;
 }
 
 export interface CanonicalIndexStats {
@@ -253,6 +261,14 @@ export interface CanonicalIndexStats {
   readonly componentVisits: number;
   /** Non-empty history-length buckets retained by stage interning. */
   readonly stampBuckets: number;
+  /** Entries visited only while materializing the winning lineage. */
+  readonly memberVisits: number;
+  /** Group-level stage evidence visits. */
+  readonly evidenceVisits: number;
+  /** Group-level ownership aggregate visits. */
+  readonly ownershipVisits: number;
+  /** Per-tip prefix-member arrays retained; lineage is materialized lazily. */
+  readonly retainedMemberArrays: number;
 }
 
 export interface CanonicalIndex {
@@ -260,19 +276,12 @@ export interface CanonicalIndex {
   readonly stats: () => CanonicalIndexStats;
 }
 
-/** Prefix directions of a related pair, from the owning entry's perspective. */
-interface PairView {
-  readonly out: boolean;
-  readonly into: boolean;
-}
-
 /**
  * Incremental canonical selection. Candidates are diffed by messages
  * reference + context key: unchanged candidates keep their normalized
- * history, stage stamp, and pairwise prefix relations, so a delta touching
- * an open session costs O(changed x candidates) prefix evaluations instead
- * of renormalizing and rescanning the whole session (the shipped-and-reviewed
- * O(n^2) regression).
+ * history, stage stamp, and group-level prefix relations, so a delta touching
+ * an open session costs O(changed x history-groups) prefix evaluations instead
+ * of renormalizing and rescanning shared terminal members.
  *
  * ORDER INVARIANT: supersede contributions for a pair are applied when the
  * pair is (re)computed and reversed on removal using CURRENT orders. That is
@@ -282,12 +291,12 @@ interface PairView {
  */
 export function createCanonicalIndex(): CanonicalIndex {
   const entries = new Map<string, IndexEntry>();
-  /** Sparse symmetric relation over related pairs only (some prefix holds). */
-  const rel = new Map<string, Map<string, PairView>>();
-  /** How many other entries supersede this one; tips have count 0. */
-  const supersededBy = new Map<string, number>();
-  /** Ids whose normalized messages are a prefix of this entry's (excl. self). */
-  const prefixesInto = new Map<string, Set<string>>();
+  /** One aggregate per exact normalized history, never one prefix array per tip. */
+  const historyGroups = new Map<number, HistoryGroup>();
+  /** Reverse strict-prefix edges, used to update group supersession counts. */
+  const longerGroupsByPrefix = new Map<number, Set<number>>();
+  /** Number of members in longer groups that supersede each history group. */
+  const strictSuperseders = new Map<number, number>();
   /** Dynamic connectivity over related entries. Removals trigger lazy rebuild. */
   const componentParent = new Map<string, string>();
   let componentsDirty = false;
@@ -299,6 +308,9 @@ export function createCanonicalIndex(): CanonicalIndex {
   let historyEquals = 0;
   let selections = 0;
   let componentVisits = 0;
+  let memberVisits = 0;
+  let evidenceVisits = 0;
+  let ownershipVisits = 0;
   let lastSelection: CanonicalSelection | null = null;
 
   const makeComponent = (id: string): void => {
@@ -323,8 +335,16 @@ export function createCanonicalIndex(): CanonicalIndex {
   const rebuildComponents = (): void => {
     componentParent.clear();
     for (const id of entries.keys()) makeComponent(id);
-    for (const [id, neighbors] of rel) {
-      for (const neighbor of neighbors.keys()) unionComponents(id, neighbor);
+    for (const group of historyGroups.values()) {
+      for (const member of group.members) unionComponents(group.representativeId, member);
+      for (const shorter of group.prefixGroupsInto) {
+        const shorterGroup = historyGroups.get(shorter);
+        if (shorterGroup !== undefined) unionComponents(group.representativeId, shorterGroup.representativeId);
+      }
+      for (const equivalent of group.equivalentGroups) {
+        const equivalentGroup = historyGroups.get(equivalent);
+        if (equivalentGroup !== undefined) unionComponents(group.representativeId, equivalentGroup.representativeId);
+      }
     }
     componentsDirty = false;
   };
@@ -356,32 +376,107 @@ export function createCanonicalIndex(): CanonicalIndex {
     }
   };
 
-  const applyPair = (a: IndexEntry, b: IndexEntry, view: PairView, sign: 1 | -1): void => {
-    const bump = (id: string) => supersededBy.set(id, (supersededBy.get(id) ?? 0) + sign);
-    if (view.out) {
-      const set = prefixesInto.get(b.id)!;
-      if (sign === 1) set.add(a.id);
-      else set.delete(a.id);
-      if (supersedes(a, b, true)) bump(a.id);
+  const refreshContextAggregate = (group: HistoryGroup, context: string): void => {
+    let count = 0;
+    let oldestOrder = Number.NEGATIVE_INFINITY;
+    let newestId: string | undefined;
+    let newestOrder = Number.POSITIVE_INFINITY;
+    for (const id of group.members) {
+      const member = entries.get(id);
+      if (member === undefined || (member.candidate.contextKey ?? "") !== context) continue;
+      count += 1;
+      oldestOrder = Math.max(oldestOrder, member.candidate.order);
+      if (member.candidate.order < newestOrder) {
+        newestOrder = member.candidate.order;
+        newestId = id;
+      }
     }
-    if (view.into) {
-      const set = prefixesInto.get(a.id)!;
-      if (sign === 1) set.add(b.id);
-      else set.delete(b.id);
-      if (supersedes(b, a, true)) bump(b.id);
+    if (count === 0) {
+      group.contextCounts.delete(context);
+      group.newestByContext.delete(context);
+    } else {
+      group.contextCounts.set(context, { count, oldestOrder });
+      group.newestByContext.set(context, newestId!);
     }
   };
 
-  const removeEntry = (entry: IndexEntry): void => {
-    for (const [otherId, view] of rel.get(entry.id)!) {
-      applyPair(entry, entries.get(otherId)!, view, -1);
-      rel.get(otherId)!.delete(entry.id);
+  const addGroupMember = (group: HistoryGroup, entry: IndexEntry): void => {
+    const context = entry.candidate.contextKey ?? "";
+    group.members.add(entry.id);
+    for (const shorter of group.prefixGroupsInto) {
+      strictSuperseders.set(shorter, (strictSuperseders.get(shorter) ?? 0) + 1);
     }
-    rel.delete(entry.id);
-    prefixesInto.delete(entry.id);
-    supersededBy.delete(entry.id);
+    const current = group.contextCounts.get(context);
+    group.contextCounts.set(context, {
+      count: (current?.count ?? 0) + 1,
+      oldestOrder: Math.max(current?.oldestOrder ?? Number.NEGATIVE_INFINITY, entry.candidate.order),
+    });
+    const newestId = group.newestByContext.get(context);
+    const newest = newestId === undefined ? undefined : entries.get(newestId);
+    if (newest === undefined || entry.candidate.order < newest.candidate.order) group.newestByContext.set(context, entry.id);
+    unionComponents(group.representativeId, entry.id);
+  };
+
+  const removeGroupMember = (group: HistoryGroup, entry: IndexEntry): void => {
+    const context = entry.candidate.contextKey ?? "";
+    for (const shorter of group.prefixGroupsInto) {
+      strictSuperseders.set(shorter, (strictSuperseders.get(shorter) ?? 0) - 1);
+    }
+    const aggregate = group.contextCounts.get(context)!;
+    const wasOldest = aggregate.oldestOrder === entry.candidate.order;
+    const wasNewest = group.newestByContext.get(context) === entry.id;
+    group.members.delete(entry.id);
+    if (aggregate.count <= 1) {
+      group.contextCounts.delete(context);
+      group.newestByContext.delete(context);
+    } else if (wasOldest || wasNewest) {
+      refreshContextAggregate(group, context);
+    } else {
+      group.contextCounts.set(context, { ...aggregate, count: aggregate.count - 1 });
+    }
+  };
+
+  const linkStrictGroups = (shorter: HistoryGroup, longer: HistoryGroup): void => {
+    if (longer.prefixGroupsInto.has(shorter.stamp)) return;
+    // The edge is stored on the longer group; its members supersede every
+    // member of the shorter group, while the reverse index supports removal.
+    longer.prefixGroupsInto.add(shorter.stamp);
+    const longerGroups = longerGroupsByPrefix.get(shorter.stamp) ?? new Set<number>();
+    longerGroups.add(longer.stamp);
+    longerGroupsByPrefix.set(shorter.stamp, longerGroups);
+    strictSuperseders.set(shorter.stamp, (strictSuperseders.get(shorter.stamp) ?? 0) + longer.members.size);
+    unionComponents(shorter.representativeId, longer.representativeId);
+  };
+
+  const linkEquivalentGroups = (left: HistoryGroup, right: HistoryGroup): void => {
+    left.equivalentGroups.add(right.stamp);
+    right.equivalentGroups.add(left.stamp);
+    unionComponents(left.representativeId, right.representativeId);
+  };
+
+  const removeEntry = (entry: IndexEntry): void => {
+    const group = historyGroups.get(entry.stamp)!;
+    removeGroupMember(group, entry);
     entries.delete(entry.id);
     componentsDirty = true;
+    if (group.members.size === 0) {
+      for (const shorter of group.prefixGroupsInto) {
+        const longerGroups = longerGroupsByPrefix.get(shorter);
+        longerGroups?.delete(group.stamp);
+        if (longerGroups?.size === 0) longerGroupsByPrefix.delete(shorter);
+      }
+      for (const longer of longerGroupsByPrefix.get(group.stamp) ?? []) {
+        const longerGroup = historyGroups.get(longer);
+        longerGroup?.prefixGroupsInto.delete(group.stamp);
+        strictSuperseders.set(group.stamp, (strictSuperseders.get(group.stamp) ?? 0) - (longerGroup?.members.size ?? 0));
+      }
+      longerGroupsByPrefix.delete(group.stamp);
+      for (const equivalent of group.equivalentGroups) historyGroups.get(equivalent)?.equivalentGroups.delete(group.stamp);
+      strictSuperseders.delete(group.stamp);
+      historyGroups.delete(group.stamp);
+    } else if (group.representativeId === entry.id) {
+      group.representativeId = group.members.values().next().value as string;
+    }
     releaseStamp(entry);
   };
 
@@ -389,28 +484,40 @@ export function createCanonicalIndex(): CanonicalIndex {
     normalizations += 1;
     const normalized = candidate.messages.map(normalizeMessage);
     const entry: IndexEntry = { id: candidate.flowId, candidate, normalized, stamp: intern(normalized) };
-    const pairs = new Map<string, PairView>();
-    rel.set(entry.id, pairs);
-    prefixesInto.set(entry.id, new Set());
-    supersededBy.set(entry.id, 0);
-    makeComponent(entry.id);
-    for (const other of entries.values()) {
-      prefixEvaluations += 2;
-      const out = messagesArePrefix(normalized, other.normalized);
-      const into = messagesArePrefix(other.normalized, normalized);
-      if (!out && !into) continue;
-      const view: PairView = { out, into };
-      pairs.set(other.id, view);
-      rel.get(other.id)!.set(entry.id, { out: into, into: out });
-      applyPair(entry, other, view, 1);
-      unionComponents(entry.id, other.id);
-    }
     entries.set(entry.id, entry);
+    makeComponent(entry.id);
+    const existingGroup = historyGroups.get(entry.stamp);
+    if (existingGroup !== undefined) {
+      addGroupMember(existingGroup, entry);
+      return;
+    }
+    const group: HistoryGroup = {
+      stamp: entry.stamp,
+      history: normalized,
+      members: new Set([entry.id]),
+      contextCounts: new Map(),
+      newestByContext: new Map(),
+      prefixGroupsInto: new Set(),
+      equivalentGroups: new Set(),
+      representativeId: entry.id,
+    };
+    historyGroups.set(group.stamp, group);
+    strictSuperseders.set(group.stamp, 0);
+    refreshContextAggregate(group, candidate.contextKey ?? "");
+    for (const other of [...historyGroups.values()]) {
+      if (other.stamp === group.stamp) continue;
+      prefixEvaluations += 2;
+      const out = messagesArePrefix(group.history, other.history);
+      const into = messagesArePrefix(other.history, group.history);
+      if (out && group.history.length < other.history.length) linkStrictGroups(group, other);
+      else if (into && other.history.length < group.history.length) linkStrictGroups(other, group);
+      else if ((out && into) || (group.history.length === other.history.length
+        && historiesAreEquivalent(group.history, other.history))) linkEquivalentGroups(group, other);
+    }
   };
 
   interface Chain {
     readonly tip: IndexEntry;
-    readonly members: readonly IndexEntry[];
   }
 
   /**
@@ -431,19 +538,20 @@ export function createCanonicalIndex(): CanonicalIndex {
     selections += 1;
     if (entries.size === 0) return { canonicalId: null, chainIds: [] };
 
-    // Maximal tips: requests that no other request extends. Non-consuming — a
-    // shared root is simply not a tip; it belongs to every branch's chain.
+    // Maximal tips: requests that no other request extends. Equal-history
+    // retransmits are collapsed by their group's newest-per-context aggregate;
+    // no tip retains a prefix-member array.
+    const isTip = (entry: IndexEntry): boolean => {
+      const group = historyGroups.get(entry.stamp)!;
+      return (strictSuperseders.get(entry.stamp) ?? 0) === 0
+        && group.newestByContext.get(entry.candidate.contextKey ?? "") === entry.id;
+    };
     const chains: Chain[] = [];
-    for (const entry of entries.values()) {
-      if ((supersededBy.get(entry.id) ?? 0) !== 0) continue;
-      const members = [...prefixesInto.get(entry.id)!].map((id) => entries.get(id)!);
-      members.push(entry);
-      chains.push({ tip: entry, members });
-    }
+    for (const entry of entries.values()) if (isTip(entry)) chains.push({ tip: entry });
 
     // Group chains by dynamic connectivity. Adding an entry unions only its
-    // related members; removals rebuild lazily once, rather than rescanning
-    // every prior component for every chain on every selection.
+    // history groups; removals rebuild lazily once, rather than rescanning
+    // every tip.
     if (componentsDirty) rebuildComponents();
     const componentsByRoot = new Map<string, Chain[]>();
     for (const chain of chains) {
@@ -454,78 +562,83 @@ export function createCanonicalIndex(): CanonicalIndex {
     }
     const components = [...componentsByRoot.values()];
 
-    // Chain evidence = DISTINCT history stages (interned stamps: deep
-    // equality of the complete normalized history — duplicate retransmits
-    // never inflate a branch, while reminder-only evolution still counts)
-    // among lineage members. A shorter history remains part of the lineage
-    // even when its request context differs: context may evolve while a
-    // conversation grows. Equal-length different-context members are
-    // borrowing side-calls and stay out of evidence and rendered chain ids.
-    const stageCounts = new Map<Chain, number>();
-    const lineageMembers = (chain: Chain): readonly IndexEntry[] => chain.members.filter((member) =>
-      member.normalized.length < chain.tip.normalized.length
-      || member.candidate.contextKey === chain.tip.candidate.contextKey);
+    // Chain evidence is aggregated once per exact history group. A shorter
+    // history remains part of the lineage even when its request context
+    // differs; equal-length different-context members are borrowing calls and
+    // stay out of evidence and rendered chain ids.
+    const stageCounts = new Map<number, number>();
     const distinctStages = (chain: Chain): number => {
-      const cached = stageCounts.get(chain);
+      const cached = stageCounts.get(chain.tip.stamp);
       if (cached !== undefined) return cached;
-      const stamps = new Set<number>();
-      for (const member of lineageMembers(chain)) {
-        stamps.add(member.stamp);
-      }
-      stageCounts.set(chain, stamps.size);
-      return stamps.size;
+      const group = historyGroups.get(chain.tip.stamp)!;
+      const count = group.prefixGroupsInto.size + 1;
+      evidenceVisits += count;
+      stageCounts.set(chain.tip.stamp, count);
+      return count;
     };
+
+    const compareChains = (left: Chain, right: Chain): number => {
+      const stageDelta = distinctStages(left) - distinctStages(right);
+      if (stageDelta !== 0) return stageDelta;
+      if (left.tip.candidate.order !== right.tip.candidate.order) {
+        return right.tip.candidate.order - left.tip.candidate.order;
+      }
+      return left.tip.candidate.flowId < right.tip.candidate.flowId ? 1 : -1;
+    };
+
+    interface TerminalGroup {
+      readonly chains: Chain[];
+    }
 
     /**
-     * The terminal history stage owns an equal-history component. Repeated
-     * retransmits are evidence of that context's ownership; when contexts
-     * tie, the context that was established first wins the protection tie.
-     * This keeps a later A retransmit in an A/B/A sequence eligible to win,
-     * while a newer one-off B clone remains auxiliary.
+     * Two-phase representative selection. First aggregate terminal ownership
+     * for each reminder-equivalent history group, then compare those owning
+     * representatives as branches. Stable history and flow keys make ties
+     * independent of insertion order.
      */
-    const owningContext = (left: Chain, right: Chain): string => {
-      const terminalLength = left.tip.normalized.length;
-      const terminal = new Map<string, { count: number; oldestOrder: number }>();
-      const seen = new Set<string>();
-      for (const member of [...left.members, ...right.members]) {
-        if (member.normalized.length !== terminalLength || seen.has(member.id)) continue;
-        seen.add(member.id);
-        const context = member.candidate.contextKey ?? "";
-        const current = terminal.get(context);
-        if (current === undefined) terminal.set(context, { count: 1, oldestOrder: member.candidate.order });
-        else terminal.set(context, {
-          count: current.count + 1,
-          oldestOrder: Math.max(current.oldestOrder, member.candidate.order),
-        });
-      }
-      return [...terminal.entries()].reduce((best, entry) => {
-        if (entry[1].count !== best[1].count) return entry[1].count > best[1].count ? entry : best;
-        return entry[1].oldestOrder > best[1].oldestOrder ? entry : best;
-      })[0];
-    };
-
-    // (a) prefix dominance within a component, newer tip on ties.
-    const representative = (component: readonly Chain[]): Chain =>
-      component.reduce((best, chain) => {
-        const stages = distinctStages(chain);
-        const bestStages = distinctStages(best);
-        if (stages !== bestStages) return stages > bestStages ? chain : best;
-        if ((chain.tip.stamp === best.tip.stamp
-          || historiesAreEquivalent(chain.tip.normalized, best.tip.normalized))
-          && chain.tip.candidate.contextKey !== best.tip.candidate.contextKey) {
-          // Equal-history different-context calls are not continuations. The
-          // terminal stage's owning context wins; recency then chooses the
-          // newest tip within that context instead of freezing the oldest tip.
-          const owner = owningContext(chain, best);
-          const chainOwns = (chain.tip.candidate.contextKey ?? "") === owner;
-          const bestOwns = (best.tip.candidate.contextKey ?? "") === owner;
-          if (chainOwns !== bestOwns) return chainOwns ? chain : best;
-          // If both tips are in the owner context, ordinary recency below
-          // selects the newest owning retransmit.
-          return chain.tip.candidate.order > best.tip.candidate.order ? chain : best;
-        }
-        return chain.tip.candidate.order < best.tip.candidate.order ? chain : best;
+    const representative = (component: readonly Chain[]): Chain => {
+      const terminalGroups = new Map<string, TerminalGroup>();
+      const ordered = [...component].sort((left, right) => {
+        const leftKey = historyGroupKey(left.tip.normalized);
+        const rightKey = historyGroupKey(right.tip.normalized);
+        return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : left.tip.candidate.flowId.localeCompare(right.tip.candidate.flowId);
       });
+      for (const chain of ordered) {
+        const key = historyGroupKey(chain.tip.normalized);
+        const group = terminalGroups.get(key);
+        if (group === undefined) terminalGroups.set(key, { chains: [chain] });
+        else group.chains.push(chain);
+      }
+
+      const representatives = [...terminalGroups.values()].map((terminal) => {
+        for (const chain of terminal.chains) distinctStages(chain);
+        const ownership = new Map<string, { count: number; oldestOrder: number }>();
+        const seenStamps = new Set<number>();
+        for (const chain of terminal.chains) {
+          const group = historyGroups.get(chain.tip.stamp)!;
+          if (seenStamps.has(group.stamp)) continue;
+          seenStamps.add(group.stamp);
+          for (const [context, aggregate] of group.contextCounts) {
+            ownershipVisits += 1;
+            const current = ownership.get(context);
+            if (current === undefined) ownership.set(context, { ...aggregate });
+            else ownership.set(context, {
+              count: current.count + aggregate.count,
+              oldestOrder: Math.max(current.oldestOrder, aggregate.oldestOrder),
+            });
+          }
+        }
+        const owner = [...ownership.entries()].sort((left, right) =>
+          right[1].count - left[1].count
+          || right[1].oldestOrder - left[1].oldestOrder
+          || (left[0] < right[0] ? -1 : 1))[0]?.[0];
+        const owningChains = owner === undefined
+          ? terminal.chains
+          : terminal.chains.filter((chain) => (chain.tip.candidate.contextKey ?? "") === owner);
+        return owningChains.reduce((best, chain) => compareChains(chain, best) > 0 ? chain : best);
+      });
+      return representatives.reduce((best, chain) => compareChains(chain, best) > 0 ? chain : best);
+    };
 
     // (b) newest tip across disjoint components.
     let selected = representative(components[0]);
@@ -534,9 +647,28 @@ export function createCanonicalIndex(): CanonicalIndex {
       if (contender.tip.candidate.order < selected.tip.candidate.order) selected = contender;
     }
 
-    // Render all growing lineage stages, including context evolution. A
-    // borrowed equal-history different-context member stays auxiliary.
-    const members = [...lineageMembers(selected)]
+    // Materialize members only after the winning chain is known. Prefix and
+    // terminal-equivalent groups are aggregates; a borrowed equal-history
+    // different-context member stays auxiliary.
+    const selectedGroup = historyGroups.get(selected.tip.stamp)!;
+    const selectedLength = selected.tip.normalized.length;
+    const selectedKey = historyGroupKey(selected.tip.normalized);
+    const lineageGroups = new Set<number>(selectedGroup.prefixGroupsInto);
+    lineageGroups.add(selected.tip.stamp);
+    for (const group of historyGroups.values()) {
+      if (group.history.length === selectedLength && historyGroupKey(group.history) === selectedKey) lineageGroups.add(group.stamp);
+    }
+    const members = [...lineageGroups].flatMap((stamp) => {
+      const group = historyGroups.get(stamp);
+      if (group === undefined) return [];
+      return [...group.members].flatMap((id) => {
+        memberVisits += 1;
+        const member = entries.get(id)!;
+        if (member.normalized.length === selectedLength
+          && (member.candidate.contextKey ?? "") !== (selected.tip.candidate.contextKey ?? "")) return [];
+        return [member];
+      });
+    })
       .sort((left, right) =>
         left.normalized.length - right.normalized.length || right.candidate.order - left.candidate.order);
     return {
@@ -581,6 +713,10 @@ export function createCanonicalIndex(): CanonicalIndex {
       selections,
       componentVisits,
       stampBuckets: stampsByLength.size,
+      memberVisits,
+      evidenceVisits,
+      ownershipVisits,
+      retainedMemberArrays: 0,
     }),
   };
 }
