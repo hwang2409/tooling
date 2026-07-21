@@ -154,16 +154,31 @@ interface SourcePickerProps {
   readonly selection: CanonicalSelection | null;
   readonly renderedFlowId: string | null;
   readonly settled: boolean;
+  readonly viewMode: "conversation" | "raw";
+  readonly canPickSource: boolean;
   readonly onSelect: (flowId: string) => void;
   readonly onAuto: () => void;
+  readonly onViewMode: (mode: "conversation" | "raw") => void;
   readonly onClose: () => void;
 }
 
-function SourcePicker({ flows, parsed, selection, renderedFlowId, settled, onSelect, onAuto, onClose }: SourcePickerProps) {
+function SourcePicker({
+  flows,
+  parsed,
+  selection,
+  renderedFlowId,
+  settled,
+  viewMode,
+  canPickSource,
+  onSelect,
+  onAuto,
+  onViewMode,
+  onClose,
+}: SourcePickerProps) {
   const parsedById = new Map(parsed.map((candidate) => [candidate.flow.flow_id, candidate]));
-  const firstOptionRef = useRef<HTMLButtonElement | null>(null);
+  const firstItemRef = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
-    firstOptionRef.current?.focus();
+    firstItemRef.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       event.preventDefault();
@@ -179,35 +194,62 @@ function SourcePicker({ flows, parsed, selection, renderedFlowId, settled, onSel
       role="dialog"
       aria-labelledby="session-source-picker-label"
     >
-      <div className="session-source-picker-head">
-        <span id="session-source-picker-label">render request</span>
-        <button type="button" className="session-source-auto" onClick={onAuto}>auto-pick</button>
-      </div>
-      {flows.map((flow, index) => {
-        const candidate = parsedById.get(flow.flow_id);
-        const marker = sourceMarker(flow, candidate, selection);
-        // Settled malformed, unavailable, or error details remain selectable
-        // so PacketDetail can expose their raw inspector view. Only pending
-        // detail loads are temporarily unavailable as picker targets.
-        const disabled = !settled || candidate === undefined || candidate.detail === null;
-        return (
+      <div className="session-source-picker-section">
+        <div className="session-source-picker-head">
+          <span id="session-source-picker-label">view</span>
+        </div>
+        <div className="packet-detail-modes session-source-view-modes">
           <button
-            key={flow.flow_id}
+            ref={firstItemRef}
             type="button"
-            ref={index === 0 ? firstOptionRef : undefined}
-            aria-pressed={renderedFlowId === flow.flow_id}
-            disabled={disabled}
-            className="session-source-option"
-            data-testid="session-source-option"
-            data-flow-id={flow.flow_id}
-            onClick={() => onSelect(flow.flow_id)}
-          >
-            <span className="session-source-option-id">{index + 1}. {flow.flow_id.slice(0, 8)}</span>
-            <span className="session-source-option-summary">{sourceSummary(flow)}</span>
-            {marker !== null ? <span className="session-source-option-marker">{marker}</span> : null}
-          </button>
-        );
-      })}
+            className="packet-mode"
+            aria-pressed={viewMode === "conversation"}
+            data-testid="session-view-mode"
+            data-view-mode="conversation"
+            onClick={() => onViewMode("conversation")}
+          >conversation</button>
+          <button
+            type="button"
+            className="packet-mode"
+            aria-pressed={viewMode === "raw"}
+            data-testid="session-view-mode"
+            data-view-mode="raw"
+            onClick={() => onViewMode("raw")}
+          >raw</button>
+        </div>
+      </div>
+      {canPickSource ? (
+        <div className="session-source-picker-section">
+          <div className="session-source-picker-head">
+            <span>render request</span>
+            <button type="button" className="session-source-auto" onClick={onAuto}>auto-pick</button>
+          </div>
+          {flows.map((flow, index) => {
+            const candidate = parsedById.get(flow.flow_id);
+            const marker = sourceMarker(flow, candidate, selection);
+            // Settled malformed, unavailable, or error details remain selectable
+            // so PacketDetail can expose their raw inspector view. Only pending
+            // detail loads are temporarily unavailable as picker targets.
+            const disabled = !settled || candidate === undefined || candidate.detail === null;
+            return (
+              <button
+                key={flow.flow_id}
+                type="button"
+                aria-pressed={renderedFlowId === flow.flow_id}
+                disabled={disabled}
+                className="session-source-option"
+                data-testid="session-source-option"
+                data-flow-id={flow.flow_id}
+                onClick={() => onSelect(flow.flow_id)}
+              >
+                <span className="session-source-option-id">{index + 1}. {flow.flow_id.slice(0, 8)}</span>
+                <span className="session-source-option-summary">{sourceSummary(flow)}</span>
+                {marker !== null ? <span className="session-source-option-marker">{marker}</span> : null}
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -228,6 +270,7 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
   const [mode, setMode] = useState<SessionMode>(summary.key === null ? "flows" : "conversation");
   const [manualFlowId, setManualFlowId] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [viewMode, setViewMode] = useState<"conversation" | "raw">("conversation");
   const sourceButtonRef = useRef<HTMLButtonElement | null>(null);
   const effectiveMode: SessionMode = candidates.length === 0 ? "flows" : mode;
 
@@ -236,6 +279,7 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
   useEffect(() => {
     setManualFlowId(null);
     setPickerOpen(false);
+    setViewMode("conversation");
   }, [summary.key, sourceEpoch]);
 
   const details = useFlowDetails(effectiveMode === "conversation" ? candidates : NO_FLOWS, loadFlowDetail, sourceEpoch);
@@ -322,7 +366,11 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
 
   const models = summary.models.map(shortModel).join(" · ");
   const duration = durationBetween(summary.startedAt, summary.lastActivity);
-  const showSourcePicker = effectiveMode === "conversation" && candidates.length > 1;
+  const canPickSource = candidates.length > 1;
+  // Kebab holds the view toggle (conversation/raw) and — when useful — the
+  // source picker. It appears whenever there's a rendered flow to switch
+  // between chat and raw, or when there are multiple candidates to pick.
+  const showKebab = effectiveMode === "conversation" && (rendered !== null || canPickSource);
   const closePicker = () => {
     setPickerOpen(false);
     sourceButtonRef.current?.focus();
@@ -365,7 +413,7 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
                 onClick={() => setMode("flows")}
               >flows</button>
             </div>
-            {showSourcePicker ? (
+            {showKebab ? (
               <div className="session-source-control">
                 <button
                   type="button"
@@ -373,12 +421,19 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
                   className="session-source-toggle"
                   aria-expanded={pickerOpen}
                   aria-controls="session-source-picker"
-                  aria-label={rendered === null ? "choose request to render" : `rendered from request ${rendered.flow.flow_id.slice(0, 8)} (${manual !== null ? "manual" : "auto"})`}
+                  aria-label={
+                    rendered === null
+                      ? "session options"
+                      : `session options — rendered from request ${rendered.flow.flow_id.slice(0, 8)} (${manual !== null ? "manual" : "auto"})`
+                  }
                   data-testid="rendered-source"
-                  data-source-label={rendered === null ? "choose request to render" : `rendered from request ${rendered.flow.flow_id.slice(0, 8)}`}
+                  data-source-label={rendered === null ? "session options" : `rendered from request ${rendered.flow.flow_id.slice(0, 8)}`}
                   data-source-state={manual !== null ? "manual" : "auto"}
+                  data-view-mode={viewMode}
                   onClick={() => setPickerOpen((open) => !open)}
-                >···</button>
+                >
+                  <span className="session-source-toggle-dots" aria-hidden="true">···</span>
+                </button>
                 {pickerOpen ? (
                   <SourcePicker
                     flows={pickerFlows}
@@ -386,12 +441,18 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
                     selection={selection}
                     renderedFlowId={rendered?.flow.flow_id ?? null}
                     settled={settled}
+                    viewMode={viewMode}
+                    canPickSource={canPickSource}
                     onSelect={(flowId) => {
                       setManualFlowId(flowId);
                       closePicker();
                     }}
                     onAuto={() => {
                       setManualFlowId(null);
+                      closePicker();
+                    }}
+                    onViewMode={(mode) => {
+                      setViewMode(mode);
                       closePicker();
                     }}
                     onClose={closePicker}
@@ -403,15 +464,17 @@ export function SessionDetail({ summary, onBack, loadFlowDetail, sourceEpoch, ca
         </div>
       </header>
       {effectiveMode === "conversation" ? (
-        <div className="session-conversation">
-          {!settled ? (
-            <p className="session-conv-empty">loading conversation…</p>
-          ) : rendered === null ? (
-            <p className="session-conv-empty">no conversation captured for this session</p>
-          ) : (
-            <PacketDetail key={rendered.flow.flow_id} metadata={rendered.flow} detail={rendered.detail} />
-          )}
-        </div>
+        rendered === null ? null : (
+          <div className="session-conversation">
+            <PacketDetail
+              key={rendered.flow.flow_id}
+              metadata={rendered.flow}
+              detail={rendered.detail}
+              chromeless
+              viewMode={viewMode}
+            />
+          </div>
+        )
       ) : (
         <PacketList flows={summary.flows} sourceEpoch={sourceEpoch} showSearch={false} loadFlowDetail={loadFlowDetail} />
       )}

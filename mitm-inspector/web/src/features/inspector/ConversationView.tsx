@@ -383,9 +383,15 @@ export interface ConversationViewProps {
   extras: FlowExtras;
   responseText?: string;
   responseContentType?: string;
+  /**
+   * When true, suppress the request/response header meta strip
+   * (model/stop/tokens). The chat surface owns the meta rendering itself
+   * so the transcript stays as chat-only chrome.
+   */
+  chromeless?: boolean;
 }
 
-export function ConversationView({ request, extras, responseText, responseContentType }: ConversationViewProps) {
+export function ConversationView({ request, extras, responseText, responseContentType, chromeless = false }: ConversationViewProps) {
   const [plainText, setPlainText] = useState(false);
   const markdown = !plainText;
   const response = useMemo(
@@ -394,12 +400,12 @@ export function ConversationView({ request, extras, responseText, responseConten
   );
   const toolNames = useMemo(() => collectToolNames(request, response), [request, response]);
   return (
-    <div className="conv" data-testid="conversation-view">
+    <div className={`conv${chromeless ? " conv-chromeless" : ""}`} data-testid="conversation-view">
       <div className="conv-text-modes">
         <button type="button" className="packet-mode" aria-pressed={markdown} onClick={() => setPlainText(false)}>md</button>
         <button type="button" className="packet-mode" aria-pressed={plainText} onClick={() => setPlainText(true)}>plain</button>
       </div>
-      <HeaderStrip request={request} extras={extras} response={response} />
+      {chromeless ? null : <HeaderStrip request={request} extras={extras} response={response} />}
       <SystemSection blocks={request.system} markdown={markdown} />
       <ToolsSection tools={request.tools} />
       <section className="conv-section conv-transcript">

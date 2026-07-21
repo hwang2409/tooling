@@ -294,10 +294,15 @@ describe("Workspace session-first navigation", () => {
     expect(sourceAfter?.getAttribute("data-source-label")).toContain("utility-");
     expect(sourceAfter?.getAttribute("data-source-state")).toBe("manual");
     expect(container.querySelector("[data-testid='conversation-view']")?.textContent).toContain("utility answer");
-    const raw = Array.from(container.querySelectorAll<HTMLButtonElement>(".packet-detail-modes .packet-mode"))
-      .find((button) => button.textContent === "raw");
+    // The chat surface is chrome-free by default; the raw JSON view lives
+    // behind the kebab dropdown alongside the source picker.
+    expect(container.querySelector(".session-conversation .packet-detail-modes")).toBeNull();
+    expect(container.querySelector(".session-conversation .conv-header")).toBeNull();
+    await click(container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']"));
+    const raw = container.querySelector<HTMLButtonElement>("[data-testid='session-view-mode'][data-view-mode='raw']");
     await click(raw);
     expect(container.querySelector(".packet-detail .json-tree")).not.toBeNull();
+    expect(container.querySelector<HTMLButtonElement>("[data-testid='rendered-source']")?.getAttribute("data-view-mode")).toBe("raw");
   });
 
   it("manually renders a settled unparseable candidate in the raw inspector", async () => {
@@ -373,8 +378,10 @@ describe("Workspace session-first navigation", () => {
     expect(picker?.getAttribute("role")).toBe("dialog");
     expect(picker?.getAttribute("aria-labelledby")).toBe("session-source-picker-label");
     expect(container.querySelector("[role='listbox']")).toBeNull();
-    const firstOption = container.querySelector<HTMLButtonElement>("[data-testid='session-source-option']");
-    expect(document.activeElement).toBe(firstOption);
+    // The dropdown starts focus on the first actionable item — the view
+    // toggle when the session has a canonical thread rendered.
+    const firstItem = container.querySelector<HTMLButtonElement>("[data-testid='session-view-mode'][data-view-mode='conversation']");
+    expect(document.activeElement).toBe(firstItem);
 
     await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
     expect(container.querySelector("#session-source-picker")).toBeNull();
@@ -604,12 +611,14 @@ describe("Workspace session-first navigation", () => {
     await click(sessionRows(container)[0]);
     await settle();
     // No verifiable main thread: never promote a rejected suggestion call
-    // into a fake conversation. The empty state is a single muted line and
-    // the flows toggle keeps every side-call reachable — no aux collapse,
-    // no packet-detail dump on the conversation surface.
+    // into a fake conversation. The default surface is chat-only chrome, so
+    // the empty case renders nothing at all — no placeholder card, no aux
+    // collapse, no packet dump. Off-chain flows stay reachable via the
+    // flows toggle in the header.
     expect(container.querySelector("[data-testid='conversation-view']")).toBeNull();
     expect(container.querySelector(".session-aux")).toBeNull();
-    expect(container.querySelector(".session-conv-empty")?.textContent).toContain("no conversation captured");
+    expect(container.querySelector(".session-conv-empty")).toBeNull();
+    expect(container.querySelector(".session-conversation")).toBeNull();
     const flowsToggle = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-detail-modes .packet-mode"))
       .find((button) => button.textContent === "flows");
     await click(flowsToggle);
@@ -644,10 +653,12 @@ describe("Workspace session-first navigation", () => {
       );
       await click(sessionRows(container)[0]);
       await settle();
-      // No crash, no fake conversation; the empty state is a plain muted
-      // line and the flows toggle keeps the session's raw flows reachable.
+      // No crash, no fake conversation; the default surface stays chat-only
+      // (nothing at all when no canonical thread) and the flows toggle keeps
+      // the session's raw flows reachable.
       expect(container.querySelector("[data-testid='conversation-view']")).toBeNull();
-      expect(container.querySelector(".session-conv-empty")?.textContent).toContain("no conversation captured");
+      expect(container.querySelector(".session-conv-empty")).toBeNull();
+      expect(container.querySelector(".session-conversation")).toBeNull();
       const flowsToggle = Array.from(container.querySelectorAll<HTMLButtonElement>(".session-detail-modes .packet-mode"))
         .find((button) => button.textContent === "flows");
       await click(flowsToggle);

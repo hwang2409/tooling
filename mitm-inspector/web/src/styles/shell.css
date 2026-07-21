@@ -140,18 +140,21 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  margin: 0 0 14px;
-  padding: 4px 6px 4px 0;
+  margin: 0 0 14px -10px;
+  padding: 10px 14px 10px 10px;
+  min-height: 40px;
   color: var(--muted);
   background: transparent;
   border: 0;
+  border-radius: 4px;
   font: inherit;
   font-size: 11px;
   letter-spacing: .12em;
   text-transform: uppercase;
-  transition-property: color;
+  transition-property: color, background-color;
   transition-duration: 120ms;
 }
+.session-back:hover { background: var(--paper-alt); }
 .session-back:hover { color: var(--ink); }
 .session-back:focus-visible {
   outline: none;
@@ -202,19 +205,22 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 32px;
-  min-height: 28px;
-  padding: 0 8px;
+  min-width: 40px;
+  min-height: 40px;
+  padding: 8px 12px;
   color: var(--muted);
   background: transparent;
   border: 1px solid transparent;
   border-radius: 4px;
   font: inherit;
+  transition-property: color, background-color, border-color;
+  transition-duration: 120ms;
+}
+.session-source-toggle-dots {
+  display: inline-block;
   font-size: 14px;
   line-height: 1;
   letter-spacing: .2em;
-  transition-property: color, background-color, border-color;
-  transition-duration: 120ms;
 }
 .session-source-toggle:hover { color: var(--ink); background: var(--paper-alt); border-color: var(--line); }
 .session-source-toggle[aria-expanded="true"] { color: var(--ink); background: var(--paper-deep); border-color: var(--line-dark); }
@@ -239,17 +245,22 @@
     0 1px 2px color-mix(in srgb, var(--ink) 4%, transparent),
     0 8px 24px color-mix(in srgb, var(--ink) 8%, transparent);
 }
+.session-source-picker-section + .session-source-picker-section {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
 .session-source-picker-head {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  padding: 4px 6px 6px;
+  padding: 4px 6px 8px;
   color: var(--muted);
-  border-bottom: 1px solid var(--line);
   font-size: 10px;
   letter-spacing: .1em;
   text-transform: uppercase;
 }
+.session-source-view-modes { margin: 0 4px 4px; }
 .session-source-auto {
   padding: 0 3px;
   color: var(--ink);
@@ -304,10 +315,9 @@
   overflow: visible;
 }
 .session-conversation .conv { margin-inline: auto; }
-.session-conversation > .packet-detail > .packet-detail-modes {
-  max-width: var(--prose-max);
-  margin: 0 auto 20px;
-}
+.packet-detail-chromeless { padding: 0; border-top: 0; overflow: visible; }
+.packet-detail-chromeless > .packet-detail-modes { display: none; }
+.conv-chromeless > .conv-header { display: none; }
 
 .conv-text-modes { display: flex; gap: 4px; margin-bottom: 12px; }
 
