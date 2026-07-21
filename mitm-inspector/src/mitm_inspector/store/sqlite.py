@@ -278,12 +278,10 @@ class SQLiteFlowStorage:
             raise ValueError("session before must be a non-empty timestamp")
         self.flush()
         with sqlite3.connect(self.path) as connection:
-            rows = self._session_rows(
+            rows = self._session_summary_rows(
                 connection,
-                where=("AND started_at_sort < ?" if before is not None else ""),
-                parameters=(_timestamp_sort_key(before),) if before is not None else (),
-                limit=limit * SESSION_FLOW_LIMIT,
-                order="DESC",
+                before=_timestamp_sort_key(before) if before is not None else None,
+                limit=limit,
             )
         groups: dict[str | None, list[PlainJsonObject]] = {}
         for row in rows:
@@ -330,6 +328,48 @@ class SQLiteFlowStorage:
             "flow_count": len(flows),
             "flows": flows,
         }
+
+    @staticmethod
+    def _session_summary_rows(
+        connection: sqlite3.Connection,
+        *,
+        before: str | None,
+        limit: int,
+    ) -> list[tuple[object, ...]]:
+        """Select rows belonging to the newest bounded set of sessions."""
+
+        before_filter = "AND started_at_sort < ?" if before is not None else ""
+        parameters: tuple[object, ...]
+        if before is None:
+            parameters = (limit,)
+        else:
+            parameters = (before, limit, before)
+        return connection.execute(
+            f"""
+            WITH selected_sessions AS (
+                SELECT session_id, MAX(started_at_sort) AS latest
+                FROM flows
+                WHERE method <> '' {before_filter}
+                GROUP BY session_id
+                ORDER BY CASE WHEN latest IS NULL THEN 1 ELSE 0 END,
+                         latest DESC
+                LIMIT ?
+            )
+            SELECT flows.flow_id, flows.source_id, flows.method, flows.scheme,
+                   flows.host, flows.port, flows.path, flows.response_status,
+                   flows.request_content_type, flows.response_content_type,
+                   flows.started_at, flows.ended_at, flows.request_body_state,
+                   flows.response_body_state, flows.request_body_size,
+                   flows.response_body_size, flows.session_id
+            FROM flows
+            JOIN selected_sessions
+              ON flows.session_id IS selected_sessions.session_id
+            WHERE flows.method <> '' {before_filter}
+            ORDER BY CASE WHEN flows.started_at_sort IS NULL THEN 1 ELSE 0 END,
+                     flows.started_at_sort DESC, flows.created_order DESC
+            """,
+            parameters,
+        ).fetchall()
 
     @staticmethod
     def _session_rows(
@@ -450,7 +490,7 @@ class SQLiteFlowStorage:
 
     @staticmethod
     def _session_sort_key(summary: PlainJsonObject) -> tuple[int, str]:
-        value = summary.get("started_at")
+        value = summary.get("last_activity")
         return (1 if isinstance(value, str) else 0, value if isinstance(value, str) else "")
 
     def _messages_from_rows(

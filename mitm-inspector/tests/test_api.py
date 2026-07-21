@@ -4,9 +4,8 @@ import gzip
 import json
 from pathlib import Path
 
-from mitm_inspector.api.app import ApiApplication
 from mitm_inspector.api.server import ApiServer, ApiServerConfig
-from mitm_inspector.store.memory import MemoryStore
+from mitm_inspector.store.sqlite import SQLiteFlowStorage
 
 
 def metadata(flow_id: str, session_id: str | None, prompt: str) -> dict[str, object]:
@@ -109,7 +108,42 @@ def test_http_session_list_and_detail_are_sqlite_backed(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
-def test_flow_detail_decodes_gzip_response_body() -> None:
+def test_session_list_cap_is_by_session_count(tmp_path: Path) -> None:
+    storage = SQLiteFlowStorage(tmp_path / "flows.sqlite")
+    try:
+        for index in range(200):
+            flow_id = f"dominant-{index}"
+            storage.offer(metadata(flow_id, "session-dominant", f"prompt-{index}"))
+            minute, second = divmod(index, 60)
+            storage.offer(
+                lifecycle(
+                    flow_id,
+                    "1",
+                    "request_started",
+                    f"2026-01-01T00:{minute:02d}:{second:02d}Z",
+                )
+            )
+        storage.offer(metadata("singleton-old", "session-old", "old"))
+        storage.offer(
+            lifecycle("singleton-old", "1", "request_started", "2026-01-02T00:00:00Z")
+        )
+        storage.offer(metadata("singleton-new", "session-new", "new"))
+        storage.offer(
+            lifecycle("singleton-new", "1", "request_started", "2026-01-03T00:00:00Z")
+        )
+        storage.flush()
+
+        summaries = storage.session_summaries(limit=3)
+        assert [summary["session_id"] for summary in summaries] == [
+            "session-new",
+            "session-old",
+            "session-dominant",
+        ]
+    finally:
+        storage.close()
+
+
+def test_flow_detail_decodes_gzip_response_body(tmp_path: Path) -> None:
     compressed = gzip.compress(b'{"ok":true}')
     descriptor = {
         "state": "captured",
@@ -118,41 +152,50 @@ def test_flow_detail_decodes_gzip_response_body() -> None:
         "data": base64.b64encode(compressed).decode("ascii"),
         "content_type": "application/json",
     }
-    application = ApiApplication(MemoryStore())
-    application.ingest(
-        {
-            "protocol_version": "1",
-            "type": "flow.metadata",
-            "metadata": {
+    async def scenario() -> None:
+        server = ApiServer(ApiServerConfig(port=0, storage_path=tmp_path / "flows.sqlite"))
+        server.application.ingest(
+            {
+                "protocol_version": "1",
+                "type": "flow.metadata",
+                "metadata": {
+                    "flow_id": "flow-gzip",
+                    "method": "GET",
+                    "scheme": "https",
+                    "host": "example.test",
+                    "port": "443",
+                    "path": "/gzip",
+                    "request_headers": [],
+                    "response_headers": [{"name": "content-encoding", "value": "gzip"}],
+                    "response_status": "200",
+                    "request_body": {"state": "empty", "size_bytes": "0"},
+                    "response_body": descriptor,
+                },
+            }
+        )
+        server.application.ingest(
+            {
+                "protocol_version": "1",
+                "type": "body.end",
                 "flow_id": "flow-gzip",
-                "method": "GET",
-                "scheme": "https",
-                "host": "example.test",
-                "port": "443",
-                "path": "/gzip",
-                "request_headers": [],
-                "response_headers": [{"name": "content-encoding", "value": "gzip"}],
-                "response_status": "200",
-                "request_body": {"state": "empty", "size_bytes": "0"},
-                "response_body": descriptor,
-            },
-        }
-    )
-    application.ingest(
-        {
-            "protocol_version": "1",
-            "type": "body.end",
-            "flow_id": "flow-gzip",
-            "body_side": "response",
-            "total_bytes": str(len(compressed)),
-            "body": descriptor,
-        }
-    )
+                "body_side": "response",
+                "total_bytes": str(len(compressed)),
+                "body": descriptor,
+            }
+        )
+        assert server.application.storage is not None
+        server.application.storage.flush()
+        await server.start()
+        try:
+            head, body = await request(server.bound_port, "/api/v1/flows/flow-gzip")
+            assert head.startswith(b"HTTP/1.1 200 ")
+            assert b"\x1f\x8b" not in body
+            messages = json.loads(body)["messages"]
+            body_end = next(message for message in messages if message["type"] == "body.end")
+            assert base64.b64decode(body_end["body"]["data"]) == b'{"ok":true}'
+            assert body_end["body"]["size_bytes"] == str(len(b'{"ok":true}'))
+            assert body_end["total_bytes"] == str(len(b'{"ok":true}'))
+        finally:
+            await server.close()
 
-    detail = application.flow_detail_text("flow-gzip")
-    assert detail is not None
-    messages = json.loads(detail)["messages"]
-    body_end = next(message for message in messages if message["type"] == "body.end")
-    assert body_end["body"]["data"] == base64.b64encode(b'{"ok":true}').decode("ascii")
-    assert body_end["body"]["size_bytes"] == str(len(b'{"ok":true}'))
-    assert body_end["total_bytes"] == str(len(b'{"ok":true}'))
+    asyncio.run(scenario())

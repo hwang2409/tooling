@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import logging
 import zlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ _SUPPORTED_ENCODINGS = frozenset({"gzip", "x-gzip", "deflate"})
 _DECOMPRESS_INPUT_CHUNK_BYTES = 64 * 1024
 _MAX_CONCATENATED_MEMBERS = 256
 MAX_DECODED_BODY_BYTES = MAX_INGEST_BODY_PREFIX_BYTES
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +67,14 @@ def body_content_encoding(metadata: Mapping[str, object], side: str) -> str | No
     if value is None:
         return None
     normalized = value.strip().casefold()
-    return normalized if normalized in _SUPPORTED_ENCODINGS else None
+    if normalized not in _SUPPORTED_ENCODINGS:
+        _LOGGER.warning(
+            "unsupported content-encoding %r for %s body; retained bytes will be served unchanged",
+            normalized,
+            side,
+        )
+        return None
+    return normalized
 
 
 def decoded_body_bytes(descriptor: object, encoding: str | None) -> tuple[bytes | None, bool]:

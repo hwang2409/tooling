@@ -3,12 +3,14 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
 from mitm_inspector.api.bodies import (
     MAX_DECODED_BODY_BYTES,
+    body_content_encoding,
     decoded_body_bytes,
     decoded_body_descriptor,
 )
@@ -119,6 +121,17 @@ def test_messages_summary_strips_reminders_and_reads_gzip_sse_usage() -> None:
         "output_tokens": "7",
         "thinking_tokens": "2",
     }
+
+
+def test_unsupported_content_encoding_logs_visible_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="mitm_inspector.api.bodies"):
+        assert body_content_encoding(
+            {"response_headers": [{"name": "content-encoding", "value": "br"}]},
+            "response",
+        ) is None
+    assert "unsupported content-encoding 'br'" in caplog.text
 
 
 def test_messages_summary_resolves_tool_result_only_turn_and_degrades_malformed() -> None:
