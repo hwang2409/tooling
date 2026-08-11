@@ -6,6 +6,7 @@ pub mod image;
 pub mod math;
 pub mod mesh;
 pub mod pipeline;
+pub mod postfx;
 pub mod present;
 pub mod raster;
 pub mod shaders;
