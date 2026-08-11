@@ -4,12 +4,14 @@ use chimy2::image::{Texture, WrapMode};
 use chimy2::math::{Mat4, Quat, Vec3, Vec4};
 use chimy2::mesh::Mesh;
 use chimy2::pipeline::{ColorVarying, Pipeline, VertexOutput, vertex_stage};
+use chimy2::raster::set_simd_for_tests;
 use chimy2::shaders::{
     BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, FlatColorShader, FlatColorUniforms,
     MeshShader, MeshUniforms, PointLight, TextureFilter, TexturedBlinnPhongShader,
     TexturedBlinnPhongUniforms, TexturedShader, TexturedUniforms,
 };
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 const FLAT_WIDTH: usize = 8;
 const FLAT_HEIGHT: usize = 8;
@@ -19,6 +21,24 @@ type Scene = (&'static str, fn(usize) -> Framebuffer);
 
 fn assert_identical(name: &str, serial: Framebuffer, parallel: Framebuffer) {
     assert_eq!(serial, parallel, "serial and parallel differ for {name}");
+}
+
+fn render_with_simd_mode(
+    render: fn(usize) -> Framebuffer,
+    threads: usize,
+    enabled: bool,
+) -> Framebuffer {
+    set_simd_for_tests(Some(enabled));
+    let framebuffer = render(threads);
+    set_simd_for_tests(None);
+    framebuffer
+}
+
+fn simd_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
 }
 
 fn draw_flat(
@@ -582,6 +602,7 @@ fn nonlinear_fragment_scene(thread_count: usize) -> Framebuffer {
 
 #[test]
 fn every_golden_scene_is_byte_identical_with_multiple_thread_counts() {
+    let _lock = simd_test_lock();
     let scenes: &[Scene] = &[
         ("single-triangle", flat_single),
         ("shared-edge", flat_shared_edge),
@@ -598,31 +619,43 @@ fn every_golden_scene_is_byte_identical_with_multiple_thread_counts() {
         ("m5-bilinear-textured-quad", m5_bilinear_gradient),
         ("m5-textured-lit-mesh", m5_lit),
     ];
-    let thread_counts = [2, 3, 15];
+    let thread_counts = [1, 2, 3, 15];
     for &(name, render) in scenes {
-        let serial = render(1);
+        let scalar = render_with_simd_mode(render, 1, false);
+        let simd_serial = render_with_simd_mode(render, 1, true);
+        assert_identical(name, scalar.clone(), simd_serial);
         for &thread_count in &thread_counts {
-            assert_identical(name, serial.clone(), render(thread_count));
+            assert_identical(
+                name,
+                scalar.clone(),
+                render_with_simd_mode(render, thread_count, true),
+            );
         }
     }
-    let serial = tile_boundary_scene(1);
+    let serial = render_with_simd_mode(tile_boundary_scene, 1, false);
+    assert_identical(
+        "tile-boundary-overlap",
+        serial.clone(),
+        render_with_simd_mode(tile_boundary_scene, 1, true),
+    );
     for &thread_count in &thread_counts {
         assert_identical(
             "tile-boundary-overlap",
             serial.clone(),
-            tile_boundary_scene(thread_count),
+            render_with_simd_mode(tile_boundary_scene, thread_count, true),
         );
     }
 }
 
 #[test]
 fn nonlinear_fragment_is_byte_identical_with_multiple_thread_counts() {
-    let serial = nonlinear_fragment_scene(1);
-    for thread_count in [2, 3, 15] {
+    let _lock = simd_test_lock();
+    let serial = render_with_simd_mode(nonlinear_fragment_scene, 1, false);
+    for thread_count in [1, 2, 3, 15] {
         assert_identical(
             "nonlinear-fragment",
             serial.clone(),
-            nonlinear_fragment_scene(thread_count),
+            render_with_simd_mode(nonlinear_fragment_scene, thread_count, true),
         );
     }
 }

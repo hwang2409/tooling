@@ -3,6 +3,7 @@ use chimy2::fb::Framebuffer;
 use chimy2::math::{Mat4, Quat, Vec3};
 use chimy2::mesh::{Mesh, MeshVertex};
 use chimy2::pipeline::Pipeline;
+use chimy2::raster::set_simd_for_tests;
 use chimy2::shaders::{BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, PointLight};
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::path::Path;
@@ -42,12 +43,14 @@ fn uniforms() -> BlinnPhongUniforms {
     )
 }
 
-fn render(mesh: &Mesh, thread_count: usize) {
+fn render(mesh: &Mesh, thread_count: usize, simd: bool) {
+    set_simd_for_tests(Some(simd));
     let mut framebuffer = Framebuffer::new(WIDTH, HEIGHT);
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
     pipeline.set_thread_count(thread_count);
     pipeline.draw_mesh(&mut framebuffer, mesh, &uniforms());
     black_box(framebuffer.color);
+    set_simd_for_tests(None);
 }
 
 fn subdivided_icosahedron(levels: usize) -> Mesh {
@@ -114,24 +117,20 @@ fn bench_raster(c: &mut Criterion) {
         .map(usize::from)
         .unwrap_or(1);
 
-    c.bench_function("asset icosahedron serial", |b| {
-        b.iter(|| render(black_box(&asset), 1))
-    });
-    c.bench_function("asset icosahedron parallel", |b| {
-        b.iter(|| render(black_box(&asset), parallel_threads))
-    });
-    c.bench_function("81920 triangle icosahedron serial", |b| {
-        b.iter(|| render(black_box(&subdivided), 1))
-    });
-    c.bench_function("81920 triangle icosahedron parallel", |b| {
-        b.iter(|| render(black_box(&subdivided), parallel_threads))
-    });
-    c.bench_function("100000 triangle scene serial", |b| {
-        b.iter(|| render(black_box(&exact_100k), 1))
-    });
-    c.bench_function("100000 triangle scene parallel", |b| {
-        b.iter(|| render(black_box(&exact_100k), parallel_threads))
-    });
+    for (name, mesh) in [
+        ("asset icosahedron", &asset),
+        ("81920 triangle icosahedron", &subdivided),
+        ("100000 triangle scene", &exact_100k),
+    ] {
+        for (mode, simd) in [("scalar", false), ("simd", true)] {
+            c.bench_function(&format!("{name} {mode} serial"), |b| {
+                b.iter(|| render(black_box(mesh), 1, simd))
+            });
+            c.bench_function(&format!("{name} {mode} parallel"), |b| {
+                b.iter(|| render(black_box(mesh), parallel_threads, simd))
+            });
+        }
+    }
 }
 
 criterion_group!(benches, bench_raster);
