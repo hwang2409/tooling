@@ -4,7 +4,9 @@ use chimy2::math::{Mat4, Vec3};
 use chimy2::pipeline::Pipeline;
 use chimy2::present::InputState;
 use chimy2::shaders::{BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, PointLight};
-use chimy2::shadow::{ShadowDepthShader, ShadowDepthUniforms, ShadowMap};
+use chimy2::shadow::{
+    ShadowDepthShader, ShadowDepthUniforms, ShadowMap, ShadowState, directional_light_view,
+};
 use std::f32::consts::PI;
 
 const WIDTH: u32 = 800;
@@ -27,9 +29,8 @@ fn draw(framebuffer: &mut Framebuffer, elapsed: f32, _: &InputState) {
         (elapsed * 0.7).sin() * 0.75,
     )
     .normalize();
-    let light_position = target - direction * 8.0;
     let light_view_projection = Mat4::orthographic(-6.0, 6.0, -6.0, 6.0, 1.0, 20.0)
-        * Mat4::look_at(light_position, target, Vec3::new(0.0, 1.0, 0.0));
+        * directional_light_view(direction, target, 8.0, Vec3::new(0.0, 1.0, 0.0));
 
     let mut shadow_target = Framebuffer::new(SHADOW_SIZE, SHADOW_SIZE);
     shadow_target.clear(0);
@@ -38,7 +39,7 @@ fn draw(framebuffer: &mut Framebuffer, elapsed: f32, _: &InputState) {
     depth_pipeline.draw_mesh_depth(&mut shadow_target, &ground, &ground_depth);
     let caster_depth = ShadowDepthUniforms::new(caster_model, light_view_projection);
     depth_pipeline.draw_mesh_depth(&mut shadow_target, &caster, &caster_depth);
-    let shadow_map = ShadowMap::from_framebuffer(&shadow_target);
+    let shadow_map = ShadowMap::from_framebuffer(&shadow_target).expect("shadow target has size");
 
     framebuffer.clear(argb8888(255, 14, 19, 30));
     let camera_position = Vec3::new(6.5, 4.5, 7.0);
@@ -64,9 +65,9 @@ fn draw(framebuffer: &mut Framebuffer, elapsed: f32, _: &InputState) {
         directional,
         point,
     );
-    ground_uniforms.set_light_view_projection(light_view_projection);
-    ground_uniforms.set_shadow_map(Some(shadow_map.clone()));
-    ground_uniforms.set_shadow_bias(0.002, 0.025);
+    let mut ground_shadow = ShadowState::new(light_view_projection, shadow_map.clone());
+    ground_shadow.set_bias(0.002, 0.025);
+    ground_uniforms.set_directional_shadow(directional, Some(ground_shadow));
 
     let mut caster_uniforms = BlinnPhongUniforms::new(
         caster_model,
@@ -80,9 +81,9 @@ fn draw(framebuffer: &mut Framebuffer, elapsed: f32, _: &InputState) {
         directional,
         point,
     );
-    caster_uniforms.set_light_view_projection(light_view_projection);
-    caster_uniforms.set_shadow_map(Some(shadow_map));
-    caster_uniforms.set_shadow_bias(0.002, 0.025);
+    let mut caster_shadow = ShadowState::new(light_view_projection, shadow_map);
+    caster_shadow.set_bias(0.002, 0.025);
+    caster_uniforms.set_directional_shadow(directional, Some(caster_shadow));
 
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
     pipeline.draw_mesh(framebuffer, &ground, &ground_uniforms);

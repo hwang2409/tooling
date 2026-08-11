@@ -3,7 +3,9 @@ use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3};
 use chimy2::pipeline::Pipeline;
 use chimy2::shaders::{BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, PointLight};
-use chimy2::shadow::{ShadowDepthShader, ShadowDepthUniforms, ShadowMap};
+use chimy2::shadow::{
+    ShadowDepthShader, ShadowDepthUniforms, ShadowMap, ShadowState, directional_light_view,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -44,9 +46,8 @@ fn render_shadow_scene(light_direction: Vec3, constant_bias: f32, slope_bias: f3
     let caster_model = Mat4::translate(Vec3::new(0.0, 0.8, 0.0));
     let target = Vec3::new(0.0, 0.7, 0.0);
     let light_direction = light_direction.normalize();
-    let light_position = target - light_direction * 8.0;
     let light_view_projection = Mat4::orthographic(-5.0, 5.0, -5.0, 5.0, 1.0, 20.0)
-        * Mat4::look_at(light_position, target, Vec3::new(0.0, 1.0, 0.0));
+        * directional_light_view(light_direction, target, 8.0, Vec3::new(0.0, 1.0, 0.0));
 
     let mut shadow_target = Framebuffer::new(128, 128);
     shadow_target.clear(0);
@@ -61,7 +62,7 @@ fn render_shadow_scene(light_direction: Vec3, constant_bias: f32, slope_bias: f3
         &caster,
         &ShadowDepthUniforms::new(caster_model, light_view_projection),
     );
-    let shadow_map = ShadowMap::from_framebuffer(&shadow_target);
+    let shadow_map = ShadowMap::from_framebuffer(&shadow_target).expect("shadow target has size");
 
     let camera_position = Vec3::new(5.2, 3.6, 6.0);
     let view = Mat4::look_at(camera_position, target, Vec3::new(0.0, 1.0, 0.0));
@@ -81,9 +82,9 @@ fn render_shadow_scene(light_direction: Vec3, constant_bias: f32, slope_bias: f3
             directional,
             point,
         );
-        uniforms.set_light_view_projection(light_view_projection);
-        uniforms.set_shadow_map(Some(shadow_map.clone()));
-        uniforms.set_shadow_bias(constant_bias, slope_bias);
+        let mut shadow_state = ShadowState::new(light_view_projection, shadow_map.clone());
+        shadow_state.set_bias(constant_bias, slope_bias);
+        uniforms.set_directional_shadow(directional, Some(shadow_state));
         uniforms
     };
 
