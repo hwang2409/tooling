@@ -679,6 +679,7 @@ fn linearize_color(color: Vec3) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fb::{Framebuffer, argb8888};
     use crate::math::Vec2;
 
     fn uniforms() -> BlinnPhongUniforms {
@@ -908,6 +909,64 @@ mod tests {
             old_pixel_x, 17,
             "reverting to the old varying must fail this gate"
         );
+    }
+
+    fn render_dither_scene_at_depth(camera_depth: f32, clip_ws: [f32; 3]) -> Framebuffer {
+        let camera = crate::camera::Camera::new(
+            Vec3::new(0.0, 0.0, camera_depth),
+            crate::math::Quat::IDENTITY,
+            1.0,
+            64.0 / 48.0,
+            0.1,
+            100.0,
+        );
+        let projection = camera.projection_matrix();
+        let ndc = [
+            Vec2::new(-0.84375, -0.55),
+            Vec2::new(0.0, -0.55),
+            Vec2::new(0.09375, 0.75),
+        ];
+        let vertices: [ShaderPackVertex; 3] = std::array::from_fn(|index| {
+            let ndc = ndc[index];
+            let clip_w = clip_ws[index];
+            ShaderPackVertex::new(
+                MeshVertex {
+                    position: Vec3::new(
+                        ndc.x * clip_w / projection.get(0, 0),
+                        ndc.y * clip_w / projection.get(1, 1),
+                        -clip_w,
+                    ),
+                    texcoord: None,
+                    normal: Some(Vec3::new(0.0, 0.0, 1.0)),
+                },
+                match index {
+                    0 => Vec3::new(1.0, 0.0, 0.0),
+                    1 => Vec3::new(0.0, 1.0, 0.0),
+                    _ => Vec3::new(0.0, 0.0, 1.0),
+                },
+            )
+        });
+        let uniforms = DitherUniforms::new(
+            Mat4::translate(Vec3::new(0.0, 0.0, camera_depth)),
+            camera.view_matrix(),
+            projection,
+            Vec3::new(0.5, 0.5, 0.5),
+            (64, 48),
+        );
+        let mut framebuffer = Framebuffer::new(64, 48);
+        framebuffer.clear(argb8888(255, 8, 10, 16));
+        let mut pipeline = crate::pipeline::Pipeline::new(DitherShader, DitherShader);
+        pipeline.set_thread_count(1);
+        pipeline.draw(&mut framebuffer, &vertices, &[[0, 1, 2]], &uniforms);
+        framebuffer
+    }
+
+    #[test]
+    fn shader_pack_dither_depth_skew_is_screen_stationary_through_pipeline() {
+        let near = render_dither_scene_at_depth(4.0, [1.0, 2.0, 4.0]);
+        let far = render_dither_scene_at_depth(8.0, [2.0, 3.0, 8.0]);
+        assert!(near.color.iter().any(|&pixel| pixel != 0xff080a10));
+        assert_eq!(near.color, far.color);
     }
 
     #[test]
