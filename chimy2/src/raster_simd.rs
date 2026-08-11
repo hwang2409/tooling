@@ -21,35 +21,31 @@ struct RasterSpan {
     top_left: [bool; 3],
 }
 
-pub(super) fn rasterize_prepared<V, F>(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn rasterize_prepared<V, Input, Interpolate, Fragment>(
     framebuffer: &mut Framebuffer,
     vertices: [ScreenVertex<V>; 3],
     area: f32,
     bounds: PixelRect,
-    rect: PixelRect,
-    mut fragment: F,
+    top_left: [bool; 3],
+    ddx_weights: Vec3,
+    ddy_weights: Vec3,
+    inverse_w: Vec3,
+    mut interpolate: Interpolate,
+    mut fragment: Fragment,
 ) where
     V: Varyings,
-    F: FnMut(V) -> u32,
+    Interpolate: FnMut(&[ScreenVertex<V>; 3], Vec3, Vec3, Vec3, Vec3) -> Input,
+    Fragment: FnMut(Input) -> u32,
 {
-    let min_x = bounds.min_x.max(rect.min_x);
-    let max_x = bounds.max_x.min(rect.max_x);
-    let min_y = bounds.min_y.max(rect.min_y);
-    let max_y = bounds.max_y.min(rect.max_y);
-    let top_left = [
-        super::is_top_left(vertices[1].position, vertices[2].position),
-        super::is_top_left(vertices[2].position, vertices[0].position),
-        super::is_top_left(vertices[0].position, vertices[1].position),
-    ];
-
-    for y in min_y..=max_y {
-        let mut x = min_x;
-        while max_x - x + 1 >= 4 {
+    for y in bounds.min_y..=bounds.max_y {
+        let mut x = bounds.min_x;
+        while bounds.max_x - x + 1 >= 4 {
             let span = RasterSpan {
                 area,
                 x,
                 y,
-                max_x,
+                max_x: bounds.max_x,
                 top_left,
             };
             let depth_ptr = (y as usize)
@@ -64,24 +60,49 @@ pub(super) fn rasterize_prepared<V, F>(
             if let Some(depth_ptr) = depth_ptr {
                 unsafe {
                     // SAFETY: depth_ptr comes from a checked four-element
-                    // depth slice. The prepared rectangle also bounds lanes.
-                    rasterize_quad(framebuffer, &vertices, span, depth_ptr, &mut fragment);
+                    // depth slice. The prepared bounds contain every lane.
+                    rasterize_quad(
+                        framebuffer,
+                        &vertices,
+                        span,
+                        depth_ptr,
+                        inverse_w,
+                        ddx_weights,
+                        ddy_weights,
+                        &mut interpolate,
+                        &mut fragment,
+                    );
                 }
             } else {
                 #[cfg(test)]
                 DEPTH_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-                rasterize_scalar_quad(framebuffer, &vertices, span, &mut fragment);
+                rasterize_scalar_quad(
+                    framebuffer,
+                    &vertices,
+                    span,
+                    inverse_w,
+                    ddx_weights,
+                    ddy_weights,
+                    &mut interpolate,
+                    &mut fragment,
+                );
             }
             x = x.saturating_add(4);
         }
-        while x <= max_x {
-            let Some((depth, weights)) =
-                rasterize_pixel(framebuffer, &vertices, area, x, y, top_left)
-            else {
-                x = x.saturating_add(1);
-                continue;
-            };
-            write_pixel(framebuffer, &vertices, x, y, depth, weights, &mut fragment);
+        while x <= bounds.max_x {
+            rasterize_pixel(
+                framebuffer,
+                &vertices,
+                area,
+                x,
+                y,
+                top_left,
+                inverse_w,
+                ddx_weights,
+                ddy_weights,
+                &mut interpolate,
+                &mut fragment,
+            );
             x = x.saturating_add(1);
         }
     }
@@ -97,34 +118,34 @@ pub(super) fn depth_fallbacks() -> usize {
     DEPTH_FALLBACKS.load(Ordering::Relaxed)
 }
 
-fn rasterize_scalar_quad<V, F>(
+#[allow(clippy::too_many_arguments)]
+fn rasterize_scalar_quad<V, Input, Interpolate, Fragment>(
     framebuffer: &mut Framebuffer,
     vertices: &[ScreenVertex<V>; 3],
     span: RasterSpan,
-    fragment: &mut F,
+    inverse_w: Vec3,
+    ddx_weights: Vec3,
+    ddy_weights: Vec3,
+    interpolate: &mut Interpolate,
+    fragment: &mut Fragment,
 ) where
     V: Varyings,
-    F: FnMut(V) -> u32,
+    Interpolate: FnMut(&[ScreenVertex<V>; 3], Vec3, Vec3, Vec3, Vec3) -> Input,
+    Fragment: FnMut(Input) -> u32,
 {
     let scalar_end = span.x.saturating_add(3).min(span.max_x);
     for scalar_x in span.x..=scalar_end {
-        let Some((depth, weights)) = rasterize_pixel(
+        rasterize_pixel(
             framebuffer,
             vertices,
             span.area,
             scalar_x,
             span.y,
             span.top_left,
-        ) else {
-            continue;
-        };
-        write_pixel(
-            framebuffer,
-            vertices,
-            scalar_x,
-            span.y,
-            depth,
-            weights,
+            inverse_w,
+            ddx_weights,
+            ddy_weights,
+            interpolate,
             fragment,
         );
     }
@@ -133,15 +154,21 @@ fn rasterize_scalar_quad<V, F>(
 /// # Safety
 /// `depth_ptr` must point to four initialized f32 values for this span.
 #[target_feature(enable = "neon")]
-unsafe fn rasterize_quad<V, F>(
+#[allow(clippy::too_many_arguments)]
+unsafe fn rasterize_quad<V, Input, Interpolate, Fragment>(
     framebuffer: &mut Framebuffer,
     vertices: &[ScreenVertex<V>; 3],
     span: RasterSpan,
     depth_ptr: *const f32,
-    fragment: &mut F,
+    inverse_w: Vec3,
+    ddx_weights: Vec3,
+    ddy_weights: Vec3,
+    interpolate: &mut Interpolate,
+    fragment: &mut Fragment,
 ) where
     V: Varyings,
-    F: FnMut(V) -> u32,
+    Interpolate: FnMut(&[ScreenVertex<V>; 3], Vec3, Vec3, Vec3, Vec3) -> Input,
+    Fragment: FnMut(Input) -> u32,
 {
     let xs = [
         span.x as f32 + 0.5,
@@ -222,17 +249,26 @@ unsafe fn rasterize_quad<V, F>(
     }
     for lane in 0..4 {
         if passing_lanes[lane] != 0 {
+            let Some(index) = (span.y as usize)
+                .checked_mul(framebuffer.width)
+                .and_then(|row| row.checked_add((span.x + lane as i32) as usize))
+            else {
+                continue;
+            };
             write_pixel(
                 framebuffer,
                 vertices,
-                span.x + lane as i32,
-                span.y,
+                index,
                 depth_lanes[lane],
                 Vec3::new(
                     weights_x_lanes[lane],
                     weights_y_lanes[lane],
                     weights_z_lanes[lane],
                 ),
+                inverse_w,
+                ddx_weights,
+                ddy_weights,
+                interpolate,
                 fragment,
             );
         }

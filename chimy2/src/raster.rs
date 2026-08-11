@@ -6,6 +6,33 @@
 use crate::fb::Framebuffer;
 use crate::math::{Vec3, Vec4};
 use crate::pipeline::{SampleDerivatives, SamplingVaryings, Varyings};
+use std::sync::atomic::{AtomicU8, Ordering};
+
+#[cfg(target_arch = "aarch64")]
+#[path = "raster_simd.rs"]
+mod simd;
+
+static SIMD_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(target_arch = "aarch64")]
+fn simd_enabled() -> bool {
+    match SIMD_OVERRIDE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => std::env::var_os("CHIMY_NO_SIMD").as_deref() != Some("1".as_ref()),
+    }
+}
+
+/// Selects the raster backend for identity tests.
+#[doc(hidden)]
+pub fn set_simd_for_tests(enabled: Option<bool>) {
+    let value = match enabled {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    SIMD_OVERRIDE.store(value, Ordering::Relaxed);
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScreenVertex<V> {
@@ -289,50 +316,145 @@ fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment>(
         return;
     }
 
-    let top_left_0 = is_top_left(vertices[1].position, vertices[2].position);
-    let top_left_1 = is_top_left(vertices[2].position, vertices[0].position);
-    let top_left_2 = is_top_left(vertices[0].position, vertices[1].position);
+    let top_left = [
+        is_top_left(vertices[1].position, vertices[2].position),
+        is_top_left(vertices[2].position, vertices[0].position),
+        is_top_left(vertices[0].position, vertices[1].position),
+    ];
+    let ddx_weights = Vec3::new(
+        -(vertices[2].position.y - vertices[1].position.y) / area,
+        -(vertices[0].position.y - vertices[2].position.y) / area,
+        -(vertices[1].position.y - vertices[0].position.y) / area,
+    );
+    let ddy_weights = Vec3::new(
+        (vertices[2].position.x - vertices[1].position.x) / area,
+        (vertices[0].position.x - vertices[2].position.x) / area,
+        (vertices[1].position.x - vertices[0].position.x) / area,
+    );
+    let inverse_w = inverse_w(&vertices);
+
+    #[cfg(target_arch = "aarch64")]
+    if simd_enabled() {
+        simd::rasterize_prepared(
+            framebuffer,
+            vertices,
+            area,
+            PixelRect {
+                min_x,
+                max_x,
+                min_y,
+                max_y,
+            },
+            top_left,
+            ddx_weights,
+            ddy_weights,
+            inverse_w,
+            &mut interpolate,
+            &mut fragment,
+        );
+        return;
+    }
 
     for y in min_y..=max_y {
         for x in min_x..=max_x {
-            let point = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, 0.0);
-            let weights = barycentric_weights(&vertices, point, area);
-            if !covered(weights, area, top_left_0, top_left_1, top_left_2) {
-                continue;
-            }
-
-            let depth = interpolated_depth(&vertices, weights);
-            let Ok(x) = usize::try_from(x) else { continue };
-            let Ok(y) = usize::try_from(y) else { continue };
-            let Some(index) = y
-                .checked_mul(framebuffer.width)
-                .and_then(|row| row.checked_add(x))
-            else {
-                continue;
-            };
-            let Some(buffer_depth) = framebuffer.depth.get_mut(index) else {
-                continue;
-            };
-            if depth >= *buffer_depth {
-                continue;
-            }
-            let ddx_weights = Vec3::new(
-                -(vertices[2].position.y - vertices[1].position.y) / area,
-                -(vertices[0].position.y - vertices[2].position.y) / area,
-                -(vertices[1].position.y - vertices[0].position.y) / area,
+            rasterize_pixel(
+                framebuffer,
+                &vertices,
+                area,
+                x,
+                y,
+                top_left,
+                inverse_w,
+                ddx_weights,
+                ddy_weights,
+                &mut interpolate,
+                &mut fragment,
             );
-            let ddy_weights = Vec3::new(
-                (vertices[2].position.x - vertices[1].position.x) / area,
-                (vertices[0].position.x - vertices[2].position.x) / area,
-                (vertices[1].position.x - vertices[0].position.x) / area,
-            );
-            let inverse_w = inverse_w(&vertices);
-            let input = interpolate(&vertices, weights, inverse_w, ddx_weights, ddy_weights);
-            *buffer_depth = depth;
-            if let Some(color) = framebuffer.color.get_mut(index) {
-                *color = fragment(input);
-            }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rasterize_pixel<V, Input, Interpolate, Fragment>(
+    framebuffer: &mut Framebuffer,
+    vertices: &[ScreenVertex<V>; 3],
+    area: f32,
+    x: i32,
+    y: i32,
+    top_left: [bool; 3],
+    inverse_w: Vec3,
+    ddx_weights: Vec3,
+    ddy_weights: Vec3,
+    interpolate: &mut Interpolate,
+    fragment: &mut Fragment,
+) where
+    V: Varyings,
+    Interpolate: FnMut(&[ScreenVertex<V>; 3], Vec3, Vec3, Vec3, Vec3) -> Input,
+    Fragment: FnMut(Input) -> u32,
+{
+    let point = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, 0.0);
+    let weights = barycentric_weights(vertices, point, area);
+    if !covered(weights, area, top_left[0], top_left[1], top_left[2]) {
+        return;
+    }
+
+    let depth = interpolated_depth(vertices, weights);
+    let Ok(pixel_x) = usize::try_from(x) else {
+        return;
+    };
+    let Ok(pixel_y) = usize::try_from(y) else {
+        return;
+    };
+    let Some(index) = pixel_y
+        .checked_mul(framebuffer.width)
+        .and_then(|row| row.checked_add(pixel_x))
+    else {
+        return;
+    };
+    let Some(&buffer_depth) = framebuffer.depth.get(index) else {
+        return;
+    };
+    if depth >= buffer_depth {
+        return;
+    }
+    write_pixel(
+        framebuffer,
+        vertices,
+        index,
+        depth,
+        weights,
+        inverse_w,
+        ddx_weights,
+        ddy_weights,
+        interpolate,
+        fragment,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_pixel<V, Input, Interpolate, Fragment>(
+    framebuffer: &mut Framebuffer,
+    vertices: &[ScreenVertex<V>; 3],
+    index: usize,
+    depth: f32,
+    weights: Vec3,
+    inverse_w: Vec3,
+    ddx_weights: Vec3,
+    ddy_weights: Vec3,
+    interpolate: &mut Interpolate,
+    fragment: &mut Fragment,
+) where
+    V: Varyings,
+    Interpolate: FnMut(&[ScreenVertex<V>; 3], Vec3, Vec3, Vec3, Vec3) -> Input,
+    Fragment: FnMut(Input) -> u32,
+{
+    let input = interpolate(vertices, weights, inverse_w, ddx_weights, ddy_weights);
+    let Some(buffer_depth) = framebuffer.depth.get_mut(index) else {
+        return;
+    };
+    *buffer_depth = depth;
+    if let Some(color) = framebuffer.color.get_mut(index) {
+        *color = fragment(input);
     }
 }
 
@@ -458,7 +580,9 @@ mod tests {
         ];
         rasterize_triangle(&mut framebuffer, vertices, |_| 0xffff_ffff);
         #[cfg(target_arch = "aarch64")]
-        assert!(simd::depth_fallbacks() > 0);
+        if std::env::var_os("CHIMY_NO_SIMD").as_deref() != Some("1".as_ref()) {
+            assert!(simd::depth_fallbacks() > 0);
+        }
         assert!(
             framebuffer.color[3 * framebuffer.width..3 * framebuffer.width + 3]
                 .iter()
