@@ -73,7 +73,7 @@ fn gltf_arm_animated_pose_golden() {
     assert_golden("gltf-arm-t1.ppm", Some(0), 1.0);
 }
 
-fn render_base_color(factor: Vec4) -> Framebuffer {
+fn render_material(material: Option<GltfMaterial>) -> Framebuffer {
     let mesh = Mesh::new(
         vec![
             MeshVertex::new(Vec3::new(-0.8, -0.8, 0.0), None, None),
@@ -88,22 +88,13 @@ fn render_base_color(factor: Vec4) -> Framebuffer {
         scenes: Vec::new(),
         skins: Vec::new(),
         animations: Vec::new(),
-        materials: vec![GltfMaterial {
-            name: String::new(),
-            base_color_factor: factor,
-            metallic_factor: 0.0,
-            roughness_factor: 0.5,
-            albedo_texture: None,
-            normal_map_texture: None,
-            alpha_mode: GltfAlphaMode::Opaque,
-            alpha_cutoff: 0.5,
-        }],
+        materials: material.into_iter().collect(),
         default_scene: 0,
     };
     let draw = GltfDraw {
         mesh,
         model: Mat4::IDENTITY,
-        material: Some(0),
+        material: (!asset.materials.is_empty()).then_some(0),
     };
     let mut framebuffer = Framebuffer::new(32, 32);
     submit_gltf_draws(
@@ -118,9 +109,58 @@ fn render_base_color(factor: Vec4) -> Framebuffer {
     framebuffer
 }
 
+fn base_color_material(factor: Vec4, alpha_mode: GltfAlphaMode) -> GltfMaterial {
+    GltfMaterial {
+        name: String::new(),
+        base_color_factor: factor,
+        metallic_factor: 0.0,
+        roughness_factor: 0.5,
+        albedo_texture: None,
+        normal_map_texture: None,
+        alpha_mode,
+        alpha_cutoff: 0.5,
+    }
+}
+
 #[test]
 fn gltf_material_base_color_reaches_rendering() {
-    let red = render_base_color(Vec4::new(1.0, 0.0, 0.0, 1.0));
-    let blue = render_base_color(Vec4::new(0.0, 0.0, 1.0, 1.0));
+    let red = render_material(Some(base_color_material(
+        Vec4::new(1.0, 0.0, 0.0, 1.0),
+        GltfAlphaMode::Opaque,
+    )));
+    let blue = render_material(Some(base_color_material(
+        Vec4::new(0.0, 0.0, 1.0, 1.0),
+        GltfAlphaMode::Opaque,
+    )));
     assert_ne!(red.color, blue.color);
+}
+
+#[test]
+fn gltf_opaque_ignores_alpha_and_blend_uses_it() {
+    let opaque_zero = render_material(Some(base_color_material(
+        Vec4::new(1.0, 0.0, 0.0, 0.0),
+        GltfAlphaMode::Opaque,
+    )));
+    let opaque_one = render_material(Some(base_color_material(
+        Vec4::new(1.0, 0.0, 0.0, 1.0),
+        GltfAlphaMode::Opaque,
+    )));
+    assert_eq!(opaque_zero.color, opaque_one.color);
+
+    let blend_zero = render_material(Some(base_color_material(
+        Vec4::new(1.0, 0.0, 0.0, 0.0),
+        GltfAlphaMode::Blend,
+    )));
+    assert_ne!(blend_zero.color, opaque_one.color);
+}
+
+#[test]
+fn gltf_missing_material_matches_explicit_empty_material() {
+    let missing = render_material(None);
+    let mut empty_material =
+        base_color_material(Vec4::new(1.0, 1.0, 1.0, 1.0), GltfAlphaMode::Opaque);
+    empty_material.metallic_factor = 1.0;
+    empty_material.roughness_factor = 1.0;
+    let empty = render_material(Some(empty_material));
+    assert_eq!(missing.color, empty.color);
 }

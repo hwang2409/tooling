@@ -379,42 +379,17 @@ fn parse_nodes(object: &[(String, Value)]) -> Result<Vec<GltfNode>, GltfError> {
         .collect()
 }
 
-fn validate_nodes(nodes: &[GltfNode]) -> Result<(), GltfError> {
-    let mut parents = vec![0usize; nodes.len()];
-    for node in nodes {
+fn validate_nodes(nodes: &[GltfNode]) -> Result<Vec<Option<usize>>, GltfError> {
+    let mut parents = vec![None; nodes.len()];
+    for (parent, node) in nodes.iter().enumerate() {
         for &child in &node.children {
             if child >= nodes.len() {
                 return Err(GltfError::new("node child index is out of range"));
             }
-            parents[child] += 1;
-            if parents[child] > 1 {
+            if parents[child].replace(parent).is_some() {
                 return Err(GltfError::new("node hierarchy has multiple parents"));
             }
         }
     }
-    let mut state = vec![0u8; nodes.len()];
-    for root in 0..nodes.len() {
-        if state[root] != 0 {
-            continue;
-        }
-        let mut stack = vec![(root, false)];
-        while let Some((index, exit)) = stack.pop() {
-            if exit {
-                state[index] = 2;
-                continue;
-            }
-            if state[index] == 1 {
-                return Err(GltfError::new("node hierarchy contains a cycle"));
-            }
-            if state[index] == 2 {
-                continue;
-            }
-            state[index] = 1;
-            stack.push((index, true));
-            for &child in nodes[index].children.iter().rev() {
-                stack.push((child, false));
-            }
-        }
-    }
-    Ok(())
+    Ok(parents)
 }

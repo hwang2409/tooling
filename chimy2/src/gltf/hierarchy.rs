@@ -6,10 +6,10 @@ impl GltfAsset {
     ) -> Result<Vec<Mat4>, GltfError> {
         let locals = self.local_matrices(animation, time)?;
         let mut worlds = vec![Mat4::IDENTITY; self.nodes.len()];
-        validate_nodes(&self.nodes)?;
+        let parents = validate_nodes(&self.nodes)?;
         let mut state = vec![0u8; self.nodes.len()];
-        for root in 0..self.nodes.len() {
-            if state[root] != 0 {
+        for (root, parent) in parents.iter().enumerate() {
+            if parent.is_some() {
                 continue;
             }
             let mut stack = vec![(root, Mat4::IDENTITY, false)];
@@ -31,6 +31,9 @@ impl GltfAsset {
                     stack.push((child, worlds[index], false));
                 }
             }
+        }
+        if state.iter().any(|&value| value != 2) {
+            return Err(GltfError::new("node hierarchy contains a cycle or orphan"));
         }
         Ok(worlds)
     }

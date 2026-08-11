@@ -173,6 +173,23 @@ pub enum GltfAlphaMode {
     Mask,
 }
 
+#[derive(Clone, Copy)]
+struct GltfMaterialParameters {
+    diffuse: Vec3,
+    specular: Vec3,
+    shininess: f32,
+    alpha: f32,
+    force_transparent: bool,
+}
+
+const DEFAULT_GLTF_MATERIAL: GltfMaterialParameters = GltfMaterialParameters {
+    diffuse: Vec3::ZERO,
+    specular: Vec3::new(1.0, 1.0, 1.0),
+    shininess: 1.0,
+    alpha: 1.0,
+    force_transparent: false,
+};
+
 impl GltfMaterial {
     /// Maps the parked metallic and roughness values to the current shader.
     /// Diffuse uses baseColorFactor.rgb. Specular is 4% for dielectrics and
@@ -198,6 +215,20 @@ impl GltfMaterial {
             shininess,
             self.base_color_factor.w.clamp(0.0, 1.0),
         )
+    }
+
+    fn render_parameters(&self) -> GltfMaterialParameters {
+        let (diffuse, specular, shininess, alpha) = self.blinn_phong_parameters();
+        GltfMaterialParameters {
+            diffuse,
+            specular,
+            shininess,
+            alpha: match self.alpha_mode {
+                GltfAlphaMode::Opaque => 1.0,
+                GltfAlphaMode::Blend | GltfAlphaMode::Mask => alpha,
+            },
+            force_transparent: self.alpha_mode == GltfAlphaMode::Blend,
+        }
     }
 }
 
@@ -350,41 +381,24 @@ pub fn submit_gltf_draws(
                     .ok_or_else(|| GltfError::new("draw material index is out of range"))
             })
             .transpose()?;
-        let (diffuse, specular, shininess, alpha, force_transparent, albedo, normal_map) = material
-            .map(|material| {
-                let (diffuse, specular, shininess, alpha) = material.blinn_phong_parameters();
-                (
-                    diffuse,
-                    specular,
-                    shininess,
-                    alpha,
-                    material.alpha_mode == GltfAlphaMode::Blend,
-                    material.albedo_texture.as_ref(),
-                    material.normal_map_texture.as_ref(),
-                )
-            })
-            .unwrap_or((
-                Vec3::new(0.8, 0.8, 0.8),
-                Vec3::new(0.04, 0.04, 0.04),
-                32.0,
-                1.0,
-                false,
-                None,
-                None,
-            ));
-        let mut lighting = BlinnPhongUniforms::new(
+        let parameters = material
+            .map(GltfMaterial::render_parameters)
+            .unwrap_or(DEFAULT_GLTF_MATERIAL);
+        let albedo = material.and_then(|material| material.albedo_texture.as_ref());
+        let normal_map = material.and_then(|material| material.normal_map_texture.as_ref());
+        let mut lighting = BlinnPhongUniforms::new_with_linear_colors(
             draw.model,
             view,
             projection,
-            diffuse * 0.1,
-            diffuse,
-            specular,
-            shininess,
+            parameters.diffuse * 0.1,
+            parameters.diffuse,
+            parameters.specular,
+            parameters.shininess,
             camera_position,
             directional,
             point,
         );
-        lighting.set_alpha(alpha);
+        lighting.set_alpha(parameters.alpha);
         let kind = if let (Some(albedo), Some(normal_map)) = (albedo, normal_map) {
             GltfUniformKind::NormalMapped(
                 NormalMappedBlinnPhongUniforms::new(
@@ -406,7 +420,7 @@ pub fn submit_gltf_draws(
         };
         uniforms.push(GltfUniforms {
             kind,
-            force_transparent,
+            force_transparent: parameters.force_transparent,
         });
     }
     let mut pipeline = Pipeline::new(GltfShader, GltfShader);

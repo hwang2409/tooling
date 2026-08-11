@@ -103,6 +103,57 @@ mod tests {
     }
 
     #[test]
+    fn node_world_transforms_allow_child_before_parent() {
+        let asset = asset_with_nodes(vec![
+            node(Vec::new(), Vec3::new(0.0, 3.0, 0.0)),
+            node(vec![0], Vec3::new(2.0, 0.0, 0.0)),
+        ]);
+        let worlds = asset.node_world_transforms(None, 0.0).unwrap();
+        assert_eq!(worlds[0] * Vec4::new(0.0, 0.0, 0.0, 1.0), Vec4::new(2.0, 3.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn gltf_factors_are_linear_at_the_shader_boundary() {
+        let material = GltfMaterial {
+            name: String::new(),
+            base_color_factor: Vec4::new(0.5, 0.5, 0.5, 1.0),
+            metallic_factor: 0.0,
+            roughness_factor: 1.0,
+            albedo_texture: None,
+            normal_map_texture: None,
+            alpha_mode: GltfAlphaMode::Opaque,
+            alpha_cutoff: 0.5,
+        };
+        let (diffuse, specular, shininess, _) = material.blinn_phong_parameters();
+        let uniforms = BlinnPhongUniforms::new_with_linear_colors(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::ZERO,
+            diffuse,
+            specular,
+            shininess,
+            Vec3::ZERO,
+            DirectionalLight::new(Vec3::ZERO, Vec3::ZERO),
+            PointLight::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0.0, 0.0),
+        );
+        assert_eq!(uniforms.diffuse_color(), Vec3::new(0.5, 0.5, 0.5));
+    }
+
+    #[test]
+    fn alpha_modes_are_parsed_and_mask_is_rejected() {
+        let source = r#"{"asset":{"version":"2.0"},"buffers":[],"bufferViews":[],"accessors":[],"materials":[{"pbrMetallicRoughness":{"baseColorFactor":[1,1,1,0]}},{"alphaMode":"BLEND","pbrMetallicRoughness":{"baseColorFactor":[1,1,1,0.5]}}]}"#;
+        let asset = GltfAsset::from_str(source, ".").unwrap();
+        assert_eq!(asset.materials[0].alpha_mode, GltfAlphaMode::Opaque);
+        assert_eq!(asset.materials[1].alpha_mode, GltfAlphaMode::Blend);
+        let mask = r#"{"asset":{"version":"2.0"},"buffers":[],"bufferViews":[],"accessors":[],"materials":[{"alphaMode":"MASK"}]}"#;
+        assert!(GltfAsset::from_str(mask, ".")
+            .unwrap_err()
+            .message
+            .contains("MASK unsupported"));
+    }
+
+    #[test]
     fn deep_node_hierarchy_is_iterative() {
         let mut nodes = Vec::with_capacity(10_000);
         for index in 0..10_000 {

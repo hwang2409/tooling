@@ -29,9 +29,10 @@ Rotation uses shortest-path quaternion slerp. `CUBICSPLINE` is rejected.
 Animation samples clamp to the first keyframe before the animation starts and
 to the last keyframe after it ends.
 
-`alphaMode` supports `OPAQUE` and `BLEND`. `BLEND` uses the transparent draw
-queue and carries `baseColorFactor` alpha into the uniforms. `MASK` is rejected
-because the current fragment path has no discard seam.
+`alphaMode` supports `OPAQUE` and `BLEND`. `OPAQUE` ignores alpha. `BLEND` uses
+the transparent draw queue and carries `baseColorFactor` alpha into the
+uniforms. `MASK` is rejected because the current fragment path has no discard
+seam.
 
 `baseColorFactor` and `baseColorTexture` provide albedo. Albedo textures use
 sRGB decoding. `normalTexture` uses linear decoding. Metallic and roughness
