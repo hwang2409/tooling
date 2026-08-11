@@ -76,16 +76,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("MTL loader assigns linear color space to normal maps");
                     let mut pipeline =
                         Pipeline::new(NormalMappedBlinnPhongShader, NormalMappedBlinnPhongShader);
-                    pipeline.draw_mesh_with_sampling(framebuffer, group_mesh, &uniforms);
+                    pipeline.draw_with_sampling(
+                        framebuffer,
+                        group_mesh.vertices(),
+                        group_mesh.indices(),
+                        &uniforms,
+                    );
                 } else if let Some(texture) = material.albedo_texture() {
                     let uniforms =
                         TexturedBlinnPhongUniforms::new(lighting, texture, TextureFilter::Bilinear);
                     let mut pipeline =
                         Pipeline::new(TexturedBlinnPhongShader, TexturedBlinnPhongShader);
-                    pipeline.draw_mesh_with_sampling(framebuffer, group_mesh, &uniforms);
+                    pipeline.draw_with_sampling(
+                        framebuffer,
+                        group_mesh.vertices(),
+                        group_mesh.indices(),
+                        &uniforms,
+                    );
                 } else {
                     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
-                    pipeline.draw_mesh(framebuffer, group_mesh, &lighting);
+                    pipeline.draw(
+                        framebuffer,
+                        group_mesh.vertices(),
+                        group_mesh.indices(),
+                        &lighting,
+                    );
                 }
             }
         },
