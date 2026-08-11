@@ -325,6 +325,7 @@ fn sanitize_point_light(mut light: PointLight) -> PointLight {
 /// The arrays keep uniform clones cheap and preserve deterministic submission
 /// order. Directional light zero owns the single optional shadow map. Other
 /// lights are always unshadowed.
+/// Material colors are private and use the same clamp-at-zero boundary policy.
 ///
 /// The source matrices are private. Use the accessors and setters instead:
 ///
@@ -351,9 +352,9 @@ pub struct BlinnPhongUniforms {
     model: Mat4,
     view: Mat4,
     projection: Mat4,
-    pub ambient_color: Vec3,
-    pub diffuse_color: Vec3,
-    pub specular_color: Vec3,
+    ambient_color: Vec3,
+    diffuse_color: Vec3,
+    specular_color: Vec3,
     pub shininess: f32,
     pub camera_position: Vec3,
     directional_lights: [DirectionalLight; MAX_DIRECTIONAL_LIGHTS],
@@ -383,9 +384,9 @@ impl BlinnPhongUniforms {
             model,
             view,
             projection,
-            ambient_color: linearize_color(ambient_color),
-            diffuse_color: linearize_color(diffuse_color),
-            specular_color: linearize_color(specular_color),
+            ambient_color: linearize_color(nonnegative_color(ambient_color)),
+            diffuse_color: linearize_color(nonnegative_color(diffuse_color)),
+            specular_color: linearize_color(nonnegative_color(specular_color)),
             shininess,
             camera_position,
             directional_lights: std::array::from_fn(|index| {
@@ -428,6 +429,36 @@ impl BlinnPhongUniforms {
 
     pub const fn projection(&self) -> Mat4 {
         self.projection
+    }
+
+    /// Returns the material ambient color in linear space.
+    pub const fn ambient_color(&self) -> Vec3 {
+        self.ambient_color
+    }
+
+    /// Returns the material diffuse color in linear space.
+    pub const fn diffuse_color(&self) -> Vec3 {
+        self.diffuse_color
+    }
+
+    /// Returns the material specular color in linear space.
+    pub const fn specular_color(&self) -> Vec3 {
+        self.specular_color
+    }
+
+    /// Sets the authored sRGB ambient color and clamps it to nonnegative values.
+    pub fn set_ambient_color(&mut self, color: Vec3) {
+        self.ambient_color = linearize_color(nonnegative_color(color));
+    }
+
+    /// Sets the authored sRGB diffuse color and clamps it to nonnegative values.
+    pub fn set_diffuse_color(&mut self, color: Vec3) {
+        self.diffuse_color = linearize_color(nonnegative_color(color));
+    }
+
+    /// Sets the authored sRGB specular color and clamps it to nonnegative values.
+    pub fn set_specular_color(&mut self, color: Vec3) {
+        self.specular_color = linearize_color(nonnegative_color(color));
     }
 
     /// Returns the first directional light, or a zero light when the array is empty.
@@ -1433,11 +1464,40 @@ mod tests {
     }
 
     #[test]
+    fn material_uniform_boundary_clamps_negative_colors() {
+        let mut uniforms = BlinnPhongUniforms::new(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::new(-1.0, 0.5, -0.25),
+            Vec3::new(-0.75, 0.4, -0.1),
+            Vec3::new(-0.5, 0.3, -0.05),
+            8.0,
+            Vec3::ZERO,
+            DirectionalLight::default(),
+            PointLight::default(),
+        );
+        assert_eq!(uniforms.ambient_color().x, 0.0);
+        assert_eq!(uniforms.ambient_color().z, 0.0);
+        assert_eq!(uniforms.diffuse_color().x, 0.0);
+        assert_eq!(uniforms.diffuse_color().z, 0.0);
+        assert_eq!(uniforms.specular_color().x, 0.0);
+        assert_eq!(uniforms.specular_color().z, 0.0);
+
+        uniforms.set_ambient_color(Vec3::new(-1.0, 0.2, -1.0));
+        uniforms.set_diffuse_color(Vec3::new(-1.0, 0.3, -1.0));
+        uniforms.set_specular_color(Vec3::new(-1.0, 0.4, -1.0));
+        assert_eq!(uniforms.ambient_color().x, 0.0);
+        assert_eq!(uniforms.diffuse_color().x, 0.0);
+        assert_eq!(uniforms.specular_color().x, 0.0);
+    }
+
+    #[test]
     fn point_light_removal_compacts_order_and_changes_production_shading() {
         let mut base = uniforms();
-        base.ambient_color = Vec3::ZERO;
-        base.diffuse_color = Vec3::new(1.0, 1.0, 1.0);
-        base.specular_color = Vec3::ZERO;
+        base.set_ambient_color(Vec3::ZERO);
+        base.set_diffuse_color(Vec3::new(1.0, 1.0, 1.0));
+        base.set_specular_color(Vec3::ZERO);
         base.clear_directional_lights();
         base.clear_point_lights();
         let first = PointLight::new(
@@ -1527,7 +1587,7 @@ mod tests {
     #[test]
     fn blinn_phong_zero_lights_keep_ambient_only() {
         let mut uniforms = uniforms();
-        uniforms.ambient_color = Vec3::new(0.25, 0.5, 0.75);
+        uniforms.set_ambient_color(Vec3::new(0.25, 0.5, 0.75));
         uniforms.clear_directional_lights();
         uniforms.clear_point_lights();
         let varyings = BlinnPhongVaryings {
@@ -1535,16 +1595,23 @@ mod tests {
             normal: Vec3::new(0.0, 0.0, 1.0),
             light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
         };
-        let expected = argb8888_linear(1.0, [0.25, 0.5, 0.75]);
+        let expected = argb8888_linear(
+            1.0,
+            [
+                srgb_to_linear(0.25),
+                srgb_to_linear(0.5),
+                srgb_to_linear(0.75),
+            ],
+        );
         assert_eq!(BlinnPhongShader::shade(&varyings, &uniforms), expected);
     }
 
     #[test]
     fn blinn_phong_many_lights_clamp_after_accumulation() {
         let mut uniforms = uniforms();
-        uniforms.ambient_color = Vec3::ZERO;
-        uniforms.diffuse_color = Vec3::new(1.0, 1.0, 1.0);
-        uniforms.specular_color = Vec3::ZERO;
+        uniforms.set_ambient_color(Vec3::ZERO);
+        uniforms.set_diffuse_color(Vec3::new(1.0, 1.0, 1.0));
+        uniforms.set_specular_color(Vec3::ZERO);
         uniforms.clear_directional_lights();
         uniforms.clear_point_lights();
         for _ in 0..6 {
