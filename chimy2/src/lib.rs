@@ -6,6 +6,7 @@ pub mod image;
 pub mod material;
 pub mod math;
 pub mod mesh;
+pub mod mtl_render;
 pub mod pipeline;
 pub mod present;
 pub mod raster;

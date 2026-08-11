@@ -4,6 +4,7 @@ use chimy2::image::{ColorSpace, Texture};
 use chimy2::material::{Material, MaterialLibrary};
 use chimy2::math::{Mat4, Quat, Vec3};
 use chimy2::mesh::{Mesh, ObjAsset};
+use chimy2::mtl_render::{MaterialGroup, submit_material_groups};
 use chimy2::pipeline::Pipeline;
 use chimy2::shaders::{
     BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, NormalMappedBlinnPhongShader,
@@ -58,54 +59,34 @@ fn render_material_groups(
         0.1,
         100.0,
     );
-    let fallback_albedo = Texture::new(1, 1, vec![[255, 255, 255, 255]]).unwrap();
-    let fallback_normal =
-        Texture::new_with_color_space(1, 1, vec![[128, 128, 255, 255]], ColorSpace::Linear)
-            .unwrap();
-    let mut uniforms = Vec::with_capacity(groups.len());
-
-    for (_, material) in groups {
-        let mut lighting = BlinnPhongUniforms::new(
-            Mat4::IDENTITY,
-            camera.view_matrix(),
-            camera.projection_matrix(),
-            Vec3::new(0.03, 0.03, 0.03),
-            Vec3::new(0.8, 0.8, 0.8),
-            Vec3::new(0.3, 0.3, 0.3),
-            16.0,
-            camera.position,
-            DirectionalLight::new(
-                Vec3::new(-0.3, 0.4, 1.0).normalize(),
-                Vec3::new(1.0, 0.95, 0.9),
-            ),
-            PointLight::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0.0, 0.0),
-        );
-        material.apply_to(&mut lighting);
-        let texture = match (material.albedo_texture(), wrong_albedo) {
-            (Some(_), Some(texture)) => texture,
-            (Some(texture), None) => texture,
-            (None, _) => &fallback_albedo,
-        };
-        let normal_map = material.normal_map_texture().unwrap_or(&fallback_normal);
-        uniforms.push(
-            NormalMappedBlinnPhongUniforms::new(
-                lighting,
-                texture,
-                normal_map,
-                TextureFilter::Bilinear,
-            )
-            .unwrap(),
-        );
-    }
-
     let mut framebuffer = Framebuffer::new(WIDTH, HEIGHT);
     framebuffer.clear(argb8888(255, 10, 14, 22));
-    let mut pipeline = Pipeline::new(NormalMappedBlinnPhongShader, NormalMappedBlinnPhongShader);
-    pipeline.render(&mut framebuffer, |frame, target| {
-        for ((group_mesh, _), uniforms) in groups.iter().zip(uniforms.iter()) {
-            frame.draw_mesh_with_sampling(target, group_mesh, uniforms);
-        }
-    });
+    let base_lighting = BlinnPhongUniforms::new(
+        Mat4::IDENTITY,
+        camera.view_matrix(),
+        camera.projection_matrix(),
+        Vec3::new(0.03, 0.03, 0.03),
+        Vec3::new(0.8, 0.8, 0.8),
+        Vec3::new(0.3, 0.3, 0.3),
+        16.0,
+        camera.position,
+        DirectionalLight::new(
+            Vec3::new(-0.3, 0.4, 1.0).normalize(),
+            Vec3::new(1.0, 0.95, 0.9),
+        ),
+        PointLight::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0.0, 0.0),
+    );
+    let render_groups = groups
+        .iter()
+        .map(|(group_mesh, material)| {
+            let group = MaterialGroup::new(group_mesh, material);
+            match (material.albedo_texture(), wrong_albedo) {
+                (Some(_), Some(texture)) => group.with_albedo_override(texture),
+                _ => group,
+            }
+        })
+        .collect::<Vec<_>>();
+    submit_material_groups(&mut framebuffer, &render_groups, &base_lighting);
     framebuffer
 }
 
