@@ -453,6 +453,38 @@ impl BlinnPhongUniforms {
         }
     }
 
+    /// Creates uniforms from colors that are already in linear space.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_linear_colors(
+        model: Mat4,
+        view: Mat4,
+        projection: Mat4,
+        ambient_color: Vec3,
+        diffuse_color: Vec3,
+        specular_color: Vec3,
+        shininess: f32,
+        camera_position: Vec3,
+        directional_light: DirectionalLight,
+        point_light: PointLight,
+    ) -> Self {
+        let mut uniforms = Self::new(
+            model,
+            view,
+            projection,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            shininess,
+            camera_position,
+            directional_light,
+            point_light,
+        );
+        uniforms.ambient_color = nonnegative_color(ambient_color);
+        uniforms.diffuse_color = nonnegative_color(diffuse_color);
+        uniforms.specular_color = nonnegative_color(specular_color);
+        uniforms
+    }
+
     pub const fn transform(&self) -> Mat4 {
         self.transform
     }
