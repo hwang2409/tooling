@@ -13,6 +13,15 @@ use crate::pipeline::{
 };
 use crate::shadow::{ShadowMap, ShadowState};
 
+pub mod shader_pack;
+pub use shader_pack::{
+    BAYER4, DepthFogShader, DepthFogUniforms, DitherShader, DitherUniforms, FogShader, FogUniforms,
+    NormalsAsColorShader, NormalsAsColorUniforms, NormalsShader, NormalsUniforms,
+    OrderedDitherShader, OrderedDitherUniforms, PsxShader, PsxUniforms, ShaderPackVaryings,
+    ShaderPackVertex, ToonShader, ToonUniforms, WireframeShader, WireframeUniforms, bayer4_value,
+    expand_mesh_with_barycentrics, linear_fog_factor, ordered_dither_linear, toon_band,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FlatColorUniforms {
     pub transform: Mat4,
@@ -751,6 +760,8 @@ fn linearize_color(color: Vec3) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fb::{Framebuffer, argb8888};
+    use crate::math::Vec2;
 
     fn uniforms() -> BlinnPhongUniforms {
         BlinnPhongUniforms::new(
@@ -876,6 +887,305 @@ mod tests {
             projection * Mat4::IDENTITY * Mat4::IDENTITY
         );
         assert_eq!(uniforms.normal_matrix(), Mat3::IDENTITY);
+    }
+
+    fn pack_varyings(normal: Vec3, barycentric: Vec3, distance: f32) -> ShaderPackVaryings {
+        ShaderPackVaryings {
+            world_position: Vec3::ZERO,
+            normal,
+            barycentric,
+            clip_xy: Vec2::ZERO,
+            clip_w: 1.0,
+            view_distance: distance,
+        }
+    }
+
+    fn pack_vertex(position: Vec3) -> ShaderPackVertex {
+        ShaderPackVertex::new(
+            MeshVertex {
+                position,
+                texcoord: None,
+                normal: Some(Vec3::new(0.0, 0.0, 1.0)),
+            },
+            Vec3::new(1.0, 0.0, 0.0),
+        )
+    }
+
+    #[test]
+    fn shader_pack_toon_bands_and_edge_gate_are_mutation_gates() {
+        assert_eq!(toon_band(0.1), 0.15);
+        assert_eq!(toon_band(0.4), 0.40);
+        assert_eq!(toon_band(0.6), 0.70);
+        assert_eq!(toon_band(0.9), 1.0);
+
+        let uniforms = ToonUniforms::new(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::new(0.8, 0.4, 0.2),
+            Vec3::new(0.0, 0.0, 1.0),
+        );
+        let interior = pack_varyings(Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.33, 0.34, 0.33), 1.0);
+        let edge = pack_varyings(Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.01, 0.49, 0.50), 1.0);
+        assert_ne!(
+            ToonShader::shade(&interior, &uniforms),
+            ToonShader::shade(&edge, &uniforms)
+        );
+        assert_ne!(
+            toon_band(0.6),
+            0.6,
+            "removing quantization must fail this gate"
+        );
+    }
+
+    #[test]
+    fn shader_pack_psx_snap_and_dither_are_mutation_gates() {
+        let vertex = pack_vertex(Vec3::new(0.37, -0.21, 0.0));
+        let mut uniforms = PsxUniforms::new(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::new(0.2, 0.4, 0.8),
+            (4, 4),
+        );
+        uniforms.vertex_snap_grid = 4.0;
+        let snapped = <PsxShader as VertexStage<ShaderPackVertex, PsxUniforms>>::run(
+            &PsxShader, &vertex, &uniforms,
+        );
+        uniforms.vertex_snap_grid = f32::INFINITY;
+        let unsnapped = <PsxShader as VertexStage<ShaderPackVertex, PsxUniforms>>::run(
+            &PsxShader, &vertex, &uniforms,
+        );
+        assert_ne!(snapped.clip_position, unsnapped.clip_position);
+
+        assert_eq!(BAYER4[0], [0, 8, 2, 10]);
+        assert_eq!(bayer4_value(0, 0), 0.5 / 16.0);
+        assert_eq!(bayer4_value(3, 3), 5.5 / 16.0);
+        let color = Vec3::new(0.5, 0.5, 0.5);
+        let first = ordered_dither_linear(color, Vec2::new(-0.75, 0.75), (4, 4), 2);
+        let second = ordered_dither_linear(color, Vec2::new(-0.25, 0.75), (4, 4), 2);
+        assert_ne!(first, second, "identity matrix must fail this dither gate");
+    }
+
+    #[test]
+    fn shader_pack_dither_reconstructs_screen_position_after_interpolation() {
+        let make_vertex = |ndc_x: f32, clip_w: f32| {
+            let mut vertex =
+                pack_varyings(Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.33, 0.34, 0.33), 1.0);
+            vertex.clip_xy = Vec2::new(ndc_x * clip_w, 0.0);
+            vertex.clip_w = clip_w;
+            vertex
+        };
+        let a = make_vertex(-0.84375, 1.0);
+        let b = make_vertex(0.0, 2.0);
+        let c = make_vertex(0.09375, 4.0);
+        // Screen barycentrics are equal here. The core therefore supplies
+        // corrected weights (4/7, 2/7, 1/7) for w=(1, 2, 4).
+        let interpolated =
+            ShaderPackVaryings::lerp3(&a, &b, &c, Vec3::new(4.0 / 7.0, 2.0 / 7.0, 1.0 / 7.0));
+        let reconstructed_ndc = shader_pack::interpolated_screen_ndc(&interpolated);
+        let pixel_x = ((reconstructed_ndc.x * 0.5 + 0.5) * 64.0).floor() as i32;
+        assert!((reconstructed_ndc.x + 0.25).abs() < 1e-6);
+        assert_eq!(pixel_x, 24);
+
+        // The old perspective-correct NDC varying lands on pixel 17.
+        let old_ndc: f32 = (-0.84375 * 4.0 + 0.0 * 2.0 + 0.09375) / 7.0;
+        let old_pixel_x = ((old_ndc * 0.5 + 0.5) * 64.0).floor() as i32;
+        assert_eq!(
+            old_pixel_x, 17,
+            "reverting to the old varying must fail this gate"
+        );
+    }
+
+    fn render_dither_scene_at_depth(camera_depth: f32, clip_ws: [f32; 3]) -> Framebuffer {
+        let camera = crate::camera::Camera::new(
+            Vec3::new(0.0, 0.0, camera_depth),
+            crate::math::Quat::IDENTITY,
+            1.0,
+            64.0 / 48.0,
+            0.1,
+            100.0,
+        );
+        let projection = camera.projection_matrix();
+        let ndc = [
+            Vec2::new(-0.84375, -0.55),
+            Vec2::new(0.0, -0.55),
+            Vec2::new(0.09375, 0.75),
+        ];
+        let vertices: [ShaderPackVertex; 3] = std::array::from_fn(|index| {
+            let ndc = ndc[index];
+            let clip_w = clip_ws[index];
+            ShaderPackVertex::new(
+                MeshVertex {
+                    position: Vec3::new(
+                        ndc.x * clip_w / projection.get(0, 0),
+                        ndc.y * clip_w / projection.get(1, 1),
+                        -clip_w,
+                    ),
+                    texcoord: None,
+                    normal: Some(Vec3::new(0.0, 0.0, 1.0)),
+                },
+                match index {
+                    0 => Vec3::new(1.0, 0.0, 0.0),
+                    1 => Vec3::new(0.0, 1.0, 0.0),
+                    _ => Vec3::new(0.0, 0.0, 1.0),
+                },
+            )
+        });
+        let uniforms = DitherUniforms::new(
+            Mat4::translate(Vec3::new(0.0, 0.0, camera_depth)),
+            camera.view_matrix(),
+            projection,
+            Vec3::new(0.5, 0.5, 0.5),
+            (64, 48),
+        );
+        let mut framebuffer = Framebuffer::new(64, 48);
+        framebuffer.clear(argb8888(255, 8, 10, 16));
+        let mut pipeline = crate::pipeline::Pipeline::new(DitherShader, DitherShader);
+        pipeline.set_thread_count(1);
+        pipeline.draw(&mut framebuffer, &vertices, &[[0, 1, 2]], &uniforms);
+        framebuffer
+    }
+
+    #[test]
+    fn shader_pack_dither_depth_skew_is_screen_stationary_through_pipeline() {
+        // The projected triangle stays fixed while its per-vertex w values change.
+        let near = render_dither_scene_at_depth(4.0, [1.0, 2.0, 4.0]);
+        let far = render_dither_scene_at_depth(8.0, [2.0, 3.0, 8.0]);
+        assert!(near.color.iter().any(|&pixel| pixel != 0xff080a10));
+        assert_eq!(near.color, far.color);
+    }
+
+    #[test]
+    fn shader_pack_fog_falloff_is_hand_computed_and_mutation_gated() {
+        assert_eq!(linear_fog_factor(2.0, 2.0, 6.0), 0.0);
+        assert_eq!(linear_fog_factor(4.0, 2.0, 6.0), 0.5);
+        assert_eq!(linear_fog_factor(8.0, 2.0, 6.0), 1.0);
+        assert_ne!(
+            linear_fog_factor(4.0, 2.0, 6.0),
+            0.0,
+            "zero fog density must fail this gate"
+        );
+    }
+
+    #[test]
+    fn shader_pack_normals_remap_is_mutation_gated() {
+        let varyings = pack_varyings(Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.33, 0.34, 0.33), 1.0);
+        let uniforms = NormalsUniforms::new(Mat4::IDENTITY, Mat4::IDENTITY, Mat4::IDENTITY);
+        let remapped = <NormalsShader as FragmentStage<ShaderPackVaryings, NormalsUniforms>>::run(
+            &NormalsShader,
+            &varyings,
+            &uniforms,
+        );
+        let without_remap = argb8888_linear(1.0, [0.0, 0.0, 1.0]);
+        assert_ne!(
+            remapped, without_remap,
+            "dropping normal remap must fail this gate"
+        );
+    }
+
+    #[test]
+    fn shader_pack_wireframe_threshold_is_mutation_gated() {
+        let uniforms = WireframeUniforms::new(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::new(0.1, 0.1, 0.1),
+            Vec3::new(1.0, 0.8, 0.1),
+        );
+        let edge = pack_varyings(Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.5, 0.5), 1.0);
+        let interior = pack_varyings(Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.3, 0.4, 0.3), 1.0);
+        let edge_color = <WireframeShader as FragmentStage<
+            ShaderPackVaryings,
+            WireframeUniforms,
+        >>::run(&WireframeShader, &edge, &uniforms);
+        let interior_color = <WireframeShader as FragmentStage<
+            ShaderPackVaryings,
+            WireframeUniforms,
+        >>::run(&WireframeShader, &interior, &uniforms);
+        assert_ne!(edge_color, interior_color);
+        let mut disabled = uniforms;
+        disabled.edge_threshold = 0.0;
+        assert_eq!(
+            <WireframeShader as FragmentStage<ShaderPackVaryings, WireframeUniforms>>::run(
+                &WireframeShader,
+                &edge,
+                &disabled,
+            ),
+            interior_color,
+            "zero edge threshold must fail this wireframe gate"
+        );
+    }
+
+    #[test]
+    fn shader_pack_uniform_setters_rebuild_all_caches() {
+        macro_rules! assert_setters {
+            ($uniforms:expr) => {{
+                let mut uniforms = $uniforms;
+                let model = Mat4::translate(Vec3::new(1.0, 2.0, 3.0));
+                uniforms.set_model(model);
+                assert_eq!(
+                    uniforms.transform(),
+                    Mat4::IDENTITY * Mat4::IDENTITY * model
+                );
+
+                let mut uniforms = $uniforms;
+                let view = Mat4::scale(Vec3::new(2.0, 3.0, 4.0));
+                uniforms.set_view(view);
+                assert_eq!(uniforms.transform(), Mat4::IDENTITY * view * Mat4::IDENTITY);
+
+                let mut uniforms = $uniforms;
+                let projection = Mat4::rotate(Vec3::new(0.0, 1.0, 0.0), 0.25);
+                uniforms.set_projection(projection);
+                assert_eq!(
+                    uniforms.transform(),
+                    projection * Mat4::IDENTITY * Mat4::IDENTITY
+                );
+            }};
+        }
+
+        assert_setters!(ToonUniforms::new(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::new(0.8, 0.4, 0.2),
+            Vec3::new(0.0, 0.0, 1.0),
+        ));
+        assert_setters!(PsxUniforms::new(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::new(0.2, 0.4, 0.8),
+            (64, 48),
+        ));
+        assert_setters!(DitherUniforms::new(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::new(0.8, 0.4, 0.2),
+            (64, 48),
+        ));
+        assert_setters!(FogUniforms::new(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::new(0.2, 0.4, 0.8),
+            Vec3::new(0.1, 0.1, 0.1),
+            2.0,
+            6.0,
+        ));
+        assert_setters!(NormalsUniforms::new(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+        ));
+        assert_setters!(WireframeUniforms::new(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::new(0.1, 0.1, 0.1),
+            Vec3::new(1.0, 0.8, 0.1),
+        ));
     }
 
     #[test]
