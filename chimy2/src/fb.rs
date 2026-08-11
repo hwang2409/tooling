@@ -71,9 +71,11 @@ impl Framebuffer {
                         let [source_alpha, red, green, blue] =
                             self.color[source_index].to_be_bytes();
                         let source_alpha = f32::from(source_alpha) / 255.0;
-                        premultiplied_rgb[0] += crate::image::srgb_to_linear_u8(red);
-                        premultiplied_rgb[1] += crate::image::srgb_to_linear_u8(green);
-                        premultiplied_rgb[2] += crate::image::srgb_to_linear_u8(blue);
+                        premultiplied_rgb[0] += crate::image::srgb_to_linear_u8(red) * source_alpha;
+                        premultiplied_rgb[1] +=
+                            crate::image::srgb_to_linear_u8(green) * source_alpha;
+                        premultiplied_rgb[2] +=
+                            crate::image::srgb_to_linear_u8(blue) * source_alpha;
                         alpha += source_alpha;
                     }
                 }
@@ -226,6 +228,20 @@ mod tests {
             argb8888(255, 255, 0, 0),
             argb8888(0, 0, 0, 0),
             argb8888(0, 0, 0, 0),
+        ];
+        let mut destination = Framebuffer::new(1, 1);
+        source.downsample_linear_into(&mut destination);
+        assert_eq!(destination.color[0], argb8888(128, 255, 0, 0));
+    }
+
+    #[test]
+    fn downsample_premultiplies_each_source_alpha() {
+        let mut source = Framebuffer::new(2, 2);
+        source.color = vec![
+            argb8888(0, 255, 255, 255),
+            argb8888(255, 255, 0, 0),
+            argb8888(0, 255, 255, 255),
+            argb8888(255, 255, 0, 0),
         ];
         let mut destination = Framebuffer::new(1, 1);
         source.downsample_linear_into(&mut destination);

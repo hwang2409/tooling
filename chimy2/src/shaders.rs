@@ -58,6 +58,10 @@ impl FragmentStage<(), FlatColorUniforms> for FlatColorShader {
     fn run(&self, _: &(), uniforms: &FlatColorUniforms) -> u32 {
         multiply_alpha(uniforms.color, uniforms.alpha)
     }
+
+    fn is_opaque(&self, uniforms: &FlatColorUniforms) -> bool {
+        uniforms.alpha == 1.0 && color_alpha_is_one(uniforms.color)
+    }
 }
 
 /// Mesh transform uniforms with cache-safe matrix updates.
@@ -156,6 +160,14 @@ impl VertexStage<MeshVertex, MeshUniforms> for MeshShader {
 impl FragmentStage<(), MeshUniforms> for MeshShader {
     fn run(&self, _: &(), uniforms: &MeshUniforms) -> u32 {
         multiply_alpha(uniforms.color, uniforms.alpha)
+    }
+
+    fn is_opaque(&self, uniforms: &MeshUniforms) -> bool {
+        uniforms.alpha == 1.0 && color_alpha_is_one(uniforms.color)
+    }
+
+    fn model_view(&self, uniforms: &MeshUniforms) -> Option<Mat4> {
+        Some(uniforms.view() * uniforms.model())
     }
 }
 
@@ -270,6 +282,10 @@ impl<'a> SampledFragmentStage<TexturedVaryings, TexturedUniforms<'a>> for Textur
             },
         );
         argb8888_linear(pixel[3] * uniforms.alpha, [pixel[0], pixel[1], pixel[2]])
+    }
+
+    fn is_opaque(&self, uniforms: &TexturedUniforms<'a>) -> bool {
+        uniforms.alpha == 1.0 && texture_has_no_alpha(uniforms.texture)
     }
 }
 
@@ -556,6 +572,14 @@ impl FragmentStage<BlinnPhongVaryings, BlinnPhongUniforms> for BlinnPhongShader 
     fn run(&self, varyings: &BlinnPhongVaryings, uniforms: &BlinnPhongUniforms) -> u32 {
         Self::shade(varyings, uniforms)
     }
+
+    fn is_opaque(&self, uniforms: &BlinnPhongUniforms) -> bool {
+        uniforms.alpha == 1.0
+    }
+
+    fn model_view(&self, uniforms: &BlinnPhongUniforms) -> Option<Mat4> {
+        Some(uniforms.view() * uniforms.model())
+    }
 }
 
 impl BlinnPhongShader {
@@ -783,6 +807,16 @@ impl<'a> SampledFragmentStage<TexturedBlinnPhongVaryings, TexturedBlinnPhongUnif
             [lighted.x, lighted.y, lighted.z],
         )
     }
+
+    fn is_opaque(&self, uniforms: &TexturedBlinnPhongUniforms<'a>) -> bool {
+        uniforms.alpha == 1.0
+            && uniforms.lighting.alpha == 1.0
+            && texture_has_no_alpha(uniforms.texture)
+    }
+
+    fn model_view(&self, uniforms: &TexturedBlinnPhongUniforms<'a>) -> Option<Mat4> {
+        Some(uniforms.lighting.view() * uniforms.lighting.model())
+    }
 }
 
 fn sample_texture(
@@ -942,6 +976,14 @@ impl<'a> SampledFragmentStage<NormalMappedBlinnPhongVaryings, NormalMappedBlinnP
         );
         argb8888_linear(albedo_pixel[3], [lighted.x, lighted.y, lighted.z])
     }
+
+    fn is_opaque(&self, uniforms: &NormalMappedBlinnPhongUniforms<'a>) -> bool {
+        texture_has_no_alpha(uniforms.texture)
+    }
+
+    fn model_view(&self, uniforms: &NormalMappedBlinnPhongUniforms<'a>) -> Option<Mat4> {
+        Some(uniforms.lighting.view() * uniforms.lighting.model())
+    }
 }
 
 fn tangent_space_normal(varyings: &NormalMappedBlinnPhongVaryings, pixel: [f32; 4]) -> Vec3 {
@@ -980,6 +1022,14 @@ fn multiply_alpha(color: u32, alpha: f32) -> u32 {
         green,
         blue,
     )
+}
+
+fn color_alpha_is_one(color: u32) -> bool {
+    color.to_be_bytes()[0] == 255
+}
+
+fn texture_has_no_alpha(texture: &Texture) -> bool {
+    texture.pixels().iter().all(|pixel| pixel[3] == 255)
 }
 
 #[cfg(test)]

@@ -1,16 +1,11 @@
 //! Programmable vertex and fragment stages.
 //!
-//! Transparent geometry is rendered in a second pass. Its stable sort key is
-//! the view-space z coordinate of each triangle centroid. Intersecting or
-//! cyclically overlapping triangles are order-approximate by design.
-//!
-//! [`Pipeline::render`] can render into an integer supersampled target. The
-//! default scale is one, so SSAA is off. A 2x target uses four times the color
-//! and depth memory and increases raster work by about four times.
+//! All color draws use one prepare, classify, schedule, and raster path.
+//! Transparent draws are sorted by view-space centroid depth at frame flush.
 
 use crate::clip::{ClipVertex, clip_triangle_near, cull_backface};
 use crate::fb::Framebuffer;
-use crate::math::{Vec3, Vec4};
+use crate::math::{Mat4, Vec3, Vec4};
 use crate::mesh::{Mesh, MeshVertex};
 use crate::raster::{
     PixelRect, RasterState, ScreenVertex, rasterize_triangle_with_sampling_state,
@@ -21,11 +16,6 @@ use std::thread;
 
 pub const TILE_SIZE: usize = 64;
 
-/// Values passed from a vertex stage to a fragment stage.
-///
-/// This trait only interpolates values with core-computed weights. It does not
-/// expose raster gradients, inverse `w`, or any other raster implementation
-/// detail.
 pub trait Varyings: Sized {
     fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self;
 
@@ -34,10 +24,6 @@ pub trait Varyings: Sized {
     }
 }
 
-/// Varying data used by a texture sampler.
-///
-/// This is separate from [`Varyings`]. Implementations expose only texture
-/// coordinates; the raster core computes their screen-space derivatives.
 pub trait SamplingVaryings: Varyings {
     fn texture_coordinates(&self) -> crate::math::Vec2;
 }
@@ -55,6 +41,16 @@ pub trait SampledFragmentStage<V: SamplingVaryings, Uniforms> {
         derivatives: &SampleDerivatives,
         uniforms: &Uniforms,
     ) -> u32;
+
+    /// Returns whether this material has fully opaque coverage.
+    fn is_opaque(&self, _uniforms: &Uniforms) -> bool {
+        true
+    }
+
+    /// Returns the matrix used to compute transparent mesh centroid keys.
+    fn model_view(&self, _uniforms: &Uniforms) -> Option<Mat4> {
+        None
+    }
 }
 
 impl Varyings for () {
@@ -93,31 +89,24 @@ impl<V> VertexOutput<V> {
     }
 }
 
-/// A vertex stage returns homogeneous clip coordinates. After near clipping,
-/// the pipeline contract requires finite `clip_position.w > 0`; perspective
-/// interpolation divides by this post-clip `w` before rasterization.
 pub trait VertexStage<Vertex, Uniforms> {
     type Varyings: Varyings;
 
     fn run(&self, vertex: &Vertex, uniforms: &Uniforms) -> VertexOutput<Self::Varyings>;
 }
 
-/// A pure fragment stage. Its output depends only on the input varying and uniforms.
-///
-/// Stateful closures do not meet this contract because the stage must implement
-/// `Fn`, not `FnMut`:
-///
-/// ```compile_fail
-/// use chimy2::pipeline::fragment_stage;
-///
-/// let mut counter = 0;
-/// let _stage = fragment_stage(move |_: &(), _: &()| {
-///     counter += 1;
-///     0
-/// });
-/// ```
+/// A pure fragment stage. The default material classification is opaque.
+/// Shader implementations override it when alpha or texture coverage exists.
 pub trait FragmentStage<V: Varyings, Uniforms> {
     fn run(&self, varyings: &V, uniforms: &Uniforms) -> u32;
+
+    fn is_opaque(&self, _uniforms: &Uniforms) -> bool {
+        true
+    }
+
+    fn model_view(&self, _uniforms: &Uniforms) -> Option<Mat4> {
+        None
+    }
 }
 
 pub struct VertexFn<F, V> {
@@ -189,12 +178,6 @@ impl<VS, FS> Pipeline<VS, FS> {
         }
     }
 
-    /// Sets the number of tile workers used by later draw calls.
-    ///
-    /// The default is `CHIMY_THREADS` when set to a positive integer. If the
-    /// variable is absent or invalid, the default is
-    /// `std::thread::available_parallelism()`. A value of one selects the
-    /// serial path exactly.
     pub fn set_thread_count(&mut self, count: usize) {
         self.thread_count = count.max(1);
     }
@@ -203,9 +186,6 @@ impl<VS, FS> Pipeline<VS, FS> {
         self.thread_count
     }
 
-    /// Enables integer supersampling for [`Pipeline::render`]. A scale of one
-    /// keeps rendering at the presented size. Two is the usual quality and
-    /// cost tradeoff, using four times the color and depth memory.
     pub fn set_ssaa_scale(&mut self, scale: usize) {
         self.ssaa_scale = scale.max(1);
     }
@@ -214,11 +194,8 @@ impl<VS, FS> Pipeline<VS, FS> {
         self.ssaa_scale
     }
 
-    /// Renders a frame through an optional supersampled internal target.
-    ///
-    /// The callback receives a frame queue. Opaque draws execute on submit;
-    /// transparent draws flush globally, back-to-front, at callback end.
-    /// Downsampling uses a linear-light box filter, then encodes once.
+    /// Renders one frame. The callback submits prepared draws to one queue.
+    /// Flush renders every opaque draw first, then sorted transparent draws.
     pub fn render<'a, F>(&'a mut self, framebuffer: &mut Framebuffer, draw: F)
     where
         F: FnOnce(&mut RenderFrame<'a, VS, FS>, &mut Framebuffer),
@@ -248,30 +225,18 @@ fn default_thread_count() -> usize {
         .unwrap_or(1)
 }
 
-fn sort_triangles_back_to_front(triangles: &[[usize; 3]], sort_keys: &[f32]) -> Vec<[usize; 3]> {
-    let mut indexed = triangles.iter().copied().enumerate().collect::<Vec<_>>();
-    indexed.sort_by(|(left_index, _), (right_index, _)| {
-        let left_key = sort_keys.get(*left_index).copied().unwrap_or(f32::INFINITY);
-        let right_key = sort_keys
-            .get(*right_index)
-            .copied()
-            .unwrap_or(f32::INFINITY);
-        compare_depth_keys(left_key, right_key).then_with(|| left_index.cmp(right_index))
-    });
-    indexed.into_iter().map(|(_, triangle)| triangle).collect()
-}
-
 fn compare_depth_keys(left: f32, right: f32) -> std::cmp::Ordering {
     left.total_cmp(&right)
 }
 
-fn mesh_centroid_depths(mesh: &Mesh, model_view: crate::math::Mat4) -> Vec<f32> {
-    mesh.triangles
+fn mesh_centroid_depths(mesh: &Mesh, model_view: Mat4) -> Vec<f32> {
+    mesh.indices()
         .iter()
         .map(|&[a, b, c]| {
-            let centroid =
-                (mesh.vertices[a].position + mesh.vertices[b].position + mesh.vertices[c].position)
-                    / 3.0;
+            let centroid = (mesh.vertex(a).unwrap().position()
+                + mesh.vertex(b).unwrap().position()
+                + mesh.vertex(c).unwrap().position())
+                / 3.0;
             let position = model_view * Vec4::new(centroid.x, centroid.y, centroid.z, 1.0);
             let z = position.z / position.w;
             if z.is_nan() { f32::INFINITY } else { z }
@@ -279,23 +244,27 @@ fn mesh_centroid_depths(mesh: &Mesh, model_view: crate::math::Mat4) -> Vec<f32> 
         .collect()
 }
 
-type QueuedDraw<'a, FS> = Box<dyn FnOnce(&mut Framebuffer, &FS) + 'a>;
 type RasterFn<V, FS, Uniforms> =
     fn(&mut Framebuffer, [ScreenVertex<V>; 3], &FS, &Uniforms, RasterState);
+type QueuedDraw<'a, FS> = Box<dyn FnOnce(&mut Framebuffer, &FS, usize) + 'a>;
 
-struct QueuedTransparent<'a, FS> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrawClass {
+    Opaque,
+    Transparent,
+}
+
+struct QueuedCommand<'a, FS> {
+    class: DrawClass,
     key: f32,
     submission_order: usize,
     draw: QueuedDraw<'a, FS>,
 }
 
-/// A frame records transparent draws until the callback ends.
-///
-/// Opaque draws execute when submitted. The frame then sorts every queued
-/// transparent triangle by ascending view-space depth and renders them.
+/// A frame queue stores classified, prepared draws until flush.
 pub struct RenderFrame<'a, VS, FS> {
     pipeline: &'a mut Pipeline<VS, FS>,
-    transparent: Vec<QueuedTransparent<'a, FS>>,
+    commands: Vec<QueuedCommand<'a, FS>>,
     next_submission_order: usize,
 }
 
@@ -303,23 +272,269 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
     fn new(pipeline: &'a mut Pipeline<VS, FS>) -> Self {
         Self {
             pipeline,
-            transparent: Vec::new(),
+            commands: Vec::new(),
             next_submission_order: 0,
         }
     }
 
+    fn queue_prepared<V, Uniforms>(
+        &mut self,
+        prepared: Vec<(f32, PreparedTriangle<V>)>,
+        uniforms: &'a Uniforms,
+        class: DrawClass,
+        rasterize: RasterFn<V, FS, Uniforms>,
+    ) where
+        FS: Sync,
+        Uniforms: Sync,
+        V: Varyings + Clone + Send + Sync + 'a,
+    {
+        for (key, triangle) in prepared {
+            let submission_order = self.next_submission_order;
+            self.next_submission_order += 1;
+            let triangle = vec![triangle];
+            let draw = Box::new(
+                move |framebuffer: &mut Framebuffer, fragment: &FS, threads| {
+                    dispatch_prepared(
+                        threads,
+                        framebuffer,
+                        &triangle,
+                        uniforms,
+                        fragment,
+                        class.raster_state(),
+                        rasterize,
+                    );
+                },
+            );
+            self.commands.push(QueuedCommand {
+                class,
+                key,
+                submission_order,
+                draw,
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn queue<Vertex, Uniforms>(
+        &mut self,
+        framebuffer: &Framebuffer,
+        vertices: &[Vertex],
+        triangles: &[[usize; 3]],
+        sort_keys: Option<&[f32]>,
+        uniforms: &'a Uniforms,
+        class: DrawClass,
+        rasterize: RasterFn<VS::Varyings, FS, Uniforms>,
+    ) where
+        VS: VertexStage<Vertex, Uniforms> + Sync,
+        FS: Sync,
+        Vertex: Sync,
+        Uniforms: Sync,
+        VS::Varyings: Clone + Send + Sync + 'a,
+    {
+        let prepared = prepare_triangles(
+            &self.pipeline.vertex,
+            framebuffer,
+            vertices,
+            triangles,
+            sort_keys,
+            uniforms,
+        );
+        self.queue_prepared(prepared, uniforms, class, rasterize);
+    }
+
     fn flush(&mut self, framebuffer: &mut Framebuffer) {
-        self.transparent.sort_by(|left, right| {
-            compare_depth_keys(left.key, right.key)
-                .then_with(|| left.submission_order.cmp(&right.submission_order))
-        });
-        for command in self.transparent.drain(..) {
-            (command.draw)(framebuffer, &self.pipeline.fragment);
+        self.commands
+            .sort_by(|left, right| match (left.class, right.class) {
+                (DrawClass::Opaque, DrawClass::Transparent) => std::cmp::Ordering::Less,
+                (DrawClass::Transparent, DrawClass::Opaque) => std::cmp::Ordering::Greater,
+                (DrawClass::Opaque, DrawClass::Opaque) => {
+                    left.submission_order.cmp(&right.submission_order)
+                }
+                (DrawClass::Transparent, DrawClass::Transparent) => {
+                    compare_depth_keys(left.key, right.key)
+                        .then_with(|| left.submission_order.cmp(&right.submission_order))
+                }
+            });
+        for command in self.commands.drain(..) {
+            (command.draw)(
+                framebuffer,
+                &self.pipeline.fragment,
+                self.pipeline.thread_count,
+            );
         }
     }
 }
 
 impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
+    pub fn draw<Vertex, Uniforms>(
+        &mut self,
+        framebuffer: &Framebuffer,
+        vertices: &[Vertex],
+        triangles: &[[usize; 3]],
+        uniforms: &'a Uniforms,
+    ) where
+        VS: VertexStage<Vertex, Uniforms> + Sync,
+        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
+        Vertex: Sync,
+        Uniforms: Sync,
+        VS::Varyings: Clone + Send + Sync + 'a,
+    {
+        let class = if self.pipeline.fragment.is_opaque(uniforms) {
+            DrawClass::Opaque
+        } else {
+            DrawClass::Transparent
+        };
+        self.queue(
+            framebuffer,
+            vertices,
+            triangles,
+            None,
+            uniforms,
+            class,
+            rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
+        );
+    }
+
+    pub fn draw_with_sampling<Vertex, Uniforms>(
+        &mut self,
+        framebuffer: &Framebuffer,
+        vertices: &[Vertex],
+        triangles: &[[usize; 3]],
+        uniforms: &'a Uniforms,
+    ) where
+        VS: VertexStage<Vertex, Uniforms> + Sync,
+        FS: SampledFragmentStage<VS::Varyings, Uniforms> + Sync,
+        Vertex: Sync,
+        Uniforms: Sync,
+        VS::Varyings: SamplingVaryings + Clone + Send + Sync + 'a,
+    {
+        let class = if self.pipeline.fragment.is_opaque(uniforms) {
+            DrawClass::Opaque
+        } else {
+            DrawClass::Transparent
+        };
+        self.queue(
+            framebuffer,
+            vertices,
+            triangles,
+            None,
+            uniforms,
+            class,
+            rasterize_sampled_triangle::<VS::Varyings, FS, Uniforms>,
+        );
+    }
+
+    pub fn draw_mesh<Uniforms>(
+        &mut self,
+        framebuffer: &Framebuffer,
+        mesh: &Mesh,
+        uniforms: &'a Uniforms,
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
+        Uniforms: Sync,
+        VS::Varyings: Clone + Send + Sync + 'a,
+    {
+        let model_view = self
+            .pipeline
+            .fragment
+            .model_view(uniforms)
+            .unwrap_or(Mat4::IDENTITY);
+        let keys = mesh_centroid_depths(mesh, model_view);
+        let class = if self.pipeline.fragment.is_opaque(uniforms) {
+            DrawClass::Opaque
+        } else {
+            DrawClass::Transparent
+        };
+        self.queue(
+            framebuffer,
+            mesh.vertices(),
+            mesh.indices(),
+            Some(&keys),
+            uniforms,
+            class,
+            rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
+        );
+    }
+
+    pub fn draw_mesh_with_sampling<Uniforms>(
+        &mut self,
+        framebuffer: &Framebuffer,
+        mesh: &Mesh,
+        uniforms: &'a Uniforms,
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: SampledFragmentStage<VS::Varyings, Uniforms> + Sync,
+        Uniforms: Sync,
+        VS::Varyings: SamplingVaryings + Clone + Send + Sync + 'a,
+    {
+        let model_view = self
+            .pipeline
+            .fragment
+            .model_view(uniforms)
+            .unwrap_or(Mat4::IDENTITY);
+        let keys = mesh_centroid_depths(mesh, model_view);
+        let class = if self.pipeline.fragment.is_opaque(uniforms) {
+            DrawClass::Opaque
+        } else {
+            DrawClass::Transparent
+        };
+        self.queue(
+            framebuffer,
+            mesh.vertices(),
+            mesh.indices(),
+            Some(&keys),
+            uniforms,
+            class,
+            rasterize_sampled_triangle::<VS::Varyings, FS, Uniforms>,
+        );
+    }
+}
+
+impl<VS, FS> Pipeline<VS, FS> {
+    #[allow(clippy::too_many_arguments)]
+    fn draw_prepared<Vertex, Uniforms>(
+        &self,
+        framebuffer: &mut Framebuffer,
+        vertices: &[Vertex],
+        triangles: &[[usize; 3]],
+        sort_keys: Option<&[f32]>,
+        uniforms: &Uniforms,
+        class: DrawClass,
+        rasterize: RasterFn<VS::Varyings, FS, Uniforms>,
+    ) where
+        VS: VertexStage<Vertex, Uniforms> + Sync,
+        FS: Sync,
+        Vertex: Sync,
+        Uniforms: Sync,
+        VS::Varyings: Clone + Send + Sync,
+    {
+        let mut prepared = prepare_triangles(
+            &self.vertex,
+            framebuffer,
+            vertices,
+            triangles,
+            sort_keys,
+            uniforms,
+        );
+        if class == DrawClass::Transparent {
+            sort_prepared(&mut prepared);
+        }
+        let prepared = prepared
+            .into_iter()
+            .map(|(_, triangle)| triangle)
+            .collect::<Vec<_>>();
+        dispatch_prepared(
+            self.thread_count,
+            framebuffer,
+            &prepared,
+            uniforms,
+            &self.fragment,
+            class.raster_state(),
+            rasterize,
+        );
+    }
+
     pub fn draw<Vertex, Uniforms>(
         &mut self,
         framebuffer: &mut Framebuffer,
@@ -331,10 +546,22 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
         Vertex: Sync,
         Uniforms: Sync,
-        VS::Varyings: Clone + Send + Sync + 'a,
+        VS::Varyings: Clone + Send + Sync,
     {
-        self.pipeline
-            .draw(framebuffer, vertices, triangles, uniforms);
+        let class = if self.fragment.is_opaque(uniforms) {
+            DrawClass::Opaque
+        } else {
+            DrawClass::Transparent
+        };
+        self.draw_prepared(
+            framebuffer,
+            vertices,
+            triangles,
+            None,
+            uniforms,
+            class,
+            rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
+        );
     }
 
     pub fn draw_with_sampling<Vertex, Uniforms>(
@@ -350,8 +577,20 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         Uniforms: Sync,
         VS::Varyings: SamplingVaryings + Clone + Send + Sync,
     {
-        self.pipeline
-            .draw_with_sampling(framebuffer, vertices, triangles, uniforms);
+        let class = if self.fragment.is_opaque(uniforms) {
+            DrawClass::Opaque
+        } else {
+            DrawClass::Transparent
+        };
+        self.draw_prepared(
+            framebuffer,
+            vertices,
+            triangles,
+            None,
+            uniforms,
+            class,
+            rasterize_sampled_triangle::<VS::Varyings, FS, Uniforms>,
+        );
     }
 
     pub fn draw_mesh<Uniforms>(
@@ -365,7 +604,22 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         Uniforms: Sync,
         VS::Varyings: Clone + Send + Sync,
     {
-        self.pipeline.draw_mesh(framebuffer, mesh, uniforms);
+        let model_view = self.fragment.model_view(uniforms).unwrap_or(Mat4::IDENTITY);
+        let keys = mesh_centroid_depths(mesh, model_view);
+        let class = if self.fragment.is_opaque(uniforms) {
+            DrawClass::Opaque
+        } else {
+            DrawClass::Transparent
+        };
+        self.draw_prepared(
+            framebuffer,
+            mesh.vertices(),
+            mesh.indices(),
+            Some(&keys),
+            uniforms,
+            class,
+            rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
+        );
     }
 
     pub fn draw_mesh_with_sampling<Uniforms>(
@@ -379,248 +633,24 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         Uniforms: Sync,
         VS::Varyings: SamplingVaryings + Clone + Send + Sync,
     {
-        self.pipeline
-            .draw_mesh_with_sampling(framebuffer, mesh, uniforms);
-    }
-
-    fn queue_transparent<Vertex, Uniforms>(
-        &mut self,
-        framebuffer: &Framebuffer,
-        vertices: &[Vertex],
-        triangles: &[[usize; 3]],
-        sort_keys: &[f32],
-        uniforms: &'a Uniforms,
-        rasterize: RasterFn<VS::Varyings, FS, Uniforms>,
-    ) where
-        VS: VertexStage<Vertex, Uniforms> + Sync,
-        FS: Sync,
-        Vertex: Sync,
-        Uniforms: Sync,
-        VS::Varyings: Clone + Send + Sync + 'a,
-    {
-        let prepared = prepare_triangles_with_keys(
-            &self.pipeline.vertex,
+        let model_view = self.fragment.model_view(uniforms).unwrap_or(Mat4::IDENTITY);
+        let keys = mesh_centroid_depths(mesh, model_view);
+        let class = if self.fragment.is_opaque(uniforms) {
+            DrawClass::Opaque
+        } else {
+            DrawClass::Transparent
+        };
+        self.draw_prepared(
             framebuffer,
-            vertices,
-            triangles,
-            sort_keys,
+            mesh.vertices(),
+            mesh.indices(),
+            Some(&keys),
             uniforms,
-        );
-        for (key, triangle) in prepared {
-            let submission_order = self.next_submission_order;
-            self.next_submission_order += 1;
-            let draw = Box::new(move |framebuffer: &mut Framebuffer, fragment: &FS| {
-                rasterize(
-                    framebuffer,
-                    triangle.vertices,
-                    fragment,
-                    uniforms,
-                    RasterState::TRANSPARENT,
-                );
-            });
-            self.transparent.push(QueuedTransparent {
-                key,
-                submission_order,
-                draw,
-            });
-        }
-    }
-
-    pub fn draw_transparent<Vertex, Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        vertices: &[Vertex],
-        triangles: &[[usize; 3]],
-        sort_keys: &[f32],
-        uniforms: &'a Uniforms,
-    ) where
-        VS: VertexStage<Vertex, Uniforms> + Sync,
-        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
-        Vertex: Sync,
-        Uniforms: Sync,
-        VS::Varyings: Clone + Send + Sync + 'a,
-    {
-        self.queue_transparent(
-            framebuffer,
-            vertices,
-            triangles,
-            sort_keys,
-            uniforms,
-            rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
-        );
-    }
-
-    pub fn draw_transparent_with_sampling<Vertex, Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        vertices: &[Vertex],
-        triangles: &[[usize; 3]],
-        sort_keys: &[f32],
-        uniforms: &'a Uniforms,
-    ) where
-        VS: VertexStage<Vertex, Uniforms> + Sync,
-        FS: SampledFragmentStage<VS::Varyings, Uniforms> + Sync,
-        Vertex: Sync,
-        Uniforms: Sync,
-        VS::Varyings: SamplingVaryings + Clone + Send + Sync + 'a,
-    {
-        self.queue_transparent(
-            framebuffer,
-            vertices,
-            triangles,
-            sort_keys,
-            uniforms,
+            class,
             rasterize_sampled_triangle::<VS::Varyings, FS, Uniforms>,
         );
     }
 
-    pub fn draw_mesh_transparent<Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        mesh: &Mesh,
-        model_view: crate::math::Mat4,
-        uniforms: &'a Uniforms,
-    ) where
-        VS: VertexStage<MeshVertex, Uniforms> + Sync,
-        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
-        Uniforms: Sync,
-        VS::Varyings: Clone + Send + Sync + 'a,
-    {
-        let sort_keys = mesh_centroid_depths(mesh, model_view);
-        self.draw_transparent(
-            framebuffer,
-            &mesh.vertices,
-            &mesh.triangles,
-            &sort_keys,
-            uniforms,
-        );
-    }
-
-    pub fn draw_mesh_transparent_with_sampling<Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        mesh: &Mesh,
-        model_view: crate::math::Mat4,
-        uniforms: &'a Uniforms,
-    ) where
-        VS: VertexStage<MeshVertex, Uniforms> + Sync,
-        FS: SampledFragmentStage<VS::Varyings, Uniforms> + Sync,
-        Uniforms: Sync,
-        VS::Varyings: SamplingVaryings + Clone + Send + Sync + 'a,
-    {
-        let sort_keys = mesh_centroid_depths(mesh, model_view);
-        self.draw_transparent_with_sampling(
-            framebuffer,
-            &mesh.vertices,
-            &mesh.triangles,
-            &sort_keys,
-            uniforms,
-        );
-    }
-}
-
-impl<VS, FS> Pipeline<VS, FS> {
-    /// Draws indexed triangles. Vertex outputs are viewport-transformed before
-    /// rasterization, which keeps clipping and interpolation inside the core.
-    pub fn draw<Vertex, Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        vertices: &[Vertex],
-        triangles: &[[usize; 3]],
-        uniforms: &Uniforms,
-    ) where
-        VS: VertexStage<Vertex, Uniforms> + Sync,
-        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
-        Vertex: Sync,
-        Uniforms: Sync,
-        VS::Varyings: Clone + Send + Sync,
-    {
-        let prepared = if self.thread_count <= 1 {
-            prepare_triangles(&self.vertex, framebuffer, vertices, triangles, uniforms)
-        } else {
-            prepare_triangles_parallel(
-                &self.vertex,
-                framebuffer,
-                vertices,
-                triangles,
-                uniforms,
-                self.thread_count,
-            )
-        };
-        self.draw_prepared(
-            framebuffer,
-            prepared,
-            uniforms,
-            RasterState::OPAQUE,
-            rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
-        );
-    }
-
-    /// Draws a back-to-front transparent pass with depth testing enabled and
-    /// depth writes disabled. `sort_keys` contains one view-space centroid z
-    /// value per input triangle. Smaller z values are farther from a camera
-    /// looking down -Z. Stable sorting uses the input index as a total-order
-    /// tie breaker, including for non-finite keys.
-    pub fn draw_transparent<Vertex, Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        vertices: &[Vertex],
-        triangles: &[[usize; 3]],
-        sort_keys: &[f32],
-        uniforms: &Uniforms,
-    ) where
-        VS: VertexStage<Vertex, Uniforms> + Sync,
-        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
-        Vertex: Sync,
-        Uniforms: Sync,
-        VS::Varyings: Clone + Send + Sync,
-    {
-        let sorted = sort_triangles_back_to_front(triangles, sort_keys);
-        let prepared = if self.thread_count <= 1 {
-            prepare_triangles(&self.vertex, framebuffer, vertices, &sorted, uniforms)
-        } else {
-            prepare_triangles_parallel(
-                &self.vertex,
-                framebuffer,
-                vertices,
-                &sorted,
-                uniforms,
-                self.thread_count,
-            )
-        };
-        self.draw_prepared(
-            framebuffer,
-            prepared,
-            uniforms,
-            RasterState::TRANSPARENT,
-            rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
-        );
-    }
-
-    pub fn draw_mesh_transparent<Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        mesh: &Mesh,
-        model_view: crate::math::Mat4,
-        uniforms: &Uniforms,
-    ) where
-        VS: VertexStage<MeshVertex, Uniforms> + Sync,
-        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
-        Uniforms: Sync,
-        VS::Varyings: Clone + Send + Sync,
-    {
-        let sort_keys = mesh_centroid_depths(mesh, model_view);
-        self.draw_transparent(
-            framebuffer,
-            &mesh.vertices,
-            &mesh.triangles,
-            &sort_keys,
-            uniforms,
-        );
-    }
-
-    /// Draws indexed triangles into the depth buffer without changing color.
-    /// The preparation and raster kernel are shared with color draws.
     pub fn draw_depth<Vertex, Uniforms>(
         &mut self,
         framebuffer: &mut Framebuffer,
@@ -634,36 +664,27 @@ impl<VS, FS> Pipeline<VS, FS> {
         Uniforms: Sync,
         VS::Varyings: Clone + Send + Sync,
     {
-        let prepared = if self.thread_count <= 1 {
-            prepare_triangles(&self.vertex, framebuffer, vertices, triangles, uniforms)
-        } else {
-            prepare_triangles_parallel(
-                &self.vertex,
-                framebuffer,
-                vertices,
-                triangles,
-                uniforms,
-                self.thread_count,
-            )
-        };
-        let rasterize = rasterize_depth_triangle::<VS::Varyings, FS, Uniforms>;
-        if self.thread_count <= 1 || prepared.is_empty() {
-            self.draw_serial(
-                framebuffer,
-                prepared,
-                uniforms,
-                RasterState::DEPTH_ONLY,
-                rasterize,
-            );
-        } else {
-            self.draw_parallel(
-                framebuffer,
-                &prepared,
-                uniforms,
-                RasterState::DEPTH_ONLY,
-                rasterize,
-            );
-        }
+        let prepared = prepare_triangles(
+            &self.vertex,
+            framebuffer,
+            vertices,
+            triangles,
+            None,
+            uniforms,
+        );
+        let prepared = prepared
+            .into_iter()
+            .map(|(_, triangle)| triangle)
+            .collect::<Vec<_>>();
+        dispatch_prepared(
+            self.thread_count,
+            framebuffer,
+            &prepared,
+            uniforms,
+            &self.fragment,
+            RasterState::DEPTH_ONLY,
+            rasterize_depth_triangle::<VS::Varyings, FS, Uniforms>,
+        );
     }
 
     pub fn draw_mesh_depth<Uniforms>(
@@ -678,225 +699,6 @@ impl<VS, FS> Pipeline<VS, FS> {
         VS::Varyings: Clone + Send + Sync,
     {
         self.draw_depth(framebuffer, mesh.vertices(), mesh.indices(), uniforms);
-    }
-
-    fn draw_serial<V, Uniforms>(
-        &self,
-        framebuffer: &mut Framebuffer,
-        prepared: Vec<PreparedTriangle<V>>,
-        uniforms: &Uniforms,
-        state: RasterState,
-        rasterize: fn(&mut Framebuffer, [ScreenVertex<V>; 3], &FS, &Uniforms, RasterState),
-    ) where
-        V: Varyings + Clone,
-    {
-        for triangle in prepared {
-            rasterize(
-                framebuffer,
-                triangle.vertices,
-                &self.fragment,
-                uniforms,
-                state,
-            );
-        }
-    }
-
-    fn draw_prepared<V, Uniforms>(
-        &self,
-        framebuffer: &mut Framebuffer,
-        prepared: Vec<PreparedTriangle<V>>,
-        uniforms: &Uniforms,
-        state: RasterState,
-        rasterize: fn(&mut Framebuffer, [ScreenVertex<V>; 3], &FS, &Uniforms, RasterState),
-    ) where
-        FS: Sync,
-        Uniforms: Sync,
-        V: Varyings + Clone + Send + Sync,
-    {
-        if self.thread_count <= 1 || prepared.is_empty() {
-            self.draw_serial(framebuffer, prepared, uniforms, state, rasterize);
-        } else {
-            self.draw_parallel(framebuffer, &prepared, uniforms, state, rasterize);
-        }
-    }
-
-    fn draw_parallel<V, Uniforms>(
-        &self,
-        framebuffer: &mut Framebuffer,
-        prepared: &[PreparedTriangle<V>],
-        uniforms: &Uniforms,
-        state: RasterState,
-        rasterize: fn(&mut Framebuffer, [ScreenVertex<V>; 3], &FS, &Uniforms, RasterState),
-    ) where
-        FS: Sync,
-        Uniforms: Sync,
-        V: Varyings + Clone + Send + Sync,
-    {
-        let tiles = make_tiles(framebuffer.width, framebuffer.height, prepared);
-        if tiles.is_empty() {
-            return;
-        }
-        let worker_count = self.thread_count.min(tiles.len()).max(1);
-        let source = &*framebuffer;
-        let tiles = &tiles;
-        let results = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(worker_count);
-            for worker_index in 0..worker_count {
-                let fragment = &self.fragment;
-                handles.push(scope.spawn(move || {
-                    let mut results = Vec::new();
-                    for tile_index in (worker_index..tiles.len()).step_by(worker_count) {
-                        results.push(rasterize_tile(
-                            &tiles[tile_index],
-                            prepared,
-                            source,
-                            uniforms,
-                            fragment,
-                            state,
-                            rasterize,
-                        ));
-                    }
-                    results
-                }));
-            }
-            handles
-                .into_iter()
-                .flat_map(|handle| handle.join().expect("tile worker panicked"))
-                .collect::<Vec<_>>()
-        });
-
-        for result in results {
-            for row in 0..result.framebuffer.height {
-                let destination_start = (result.y + row) * framebuffer.width + result.x;
-                let destination_end = destination_start + result.framebuffer.width;
-                let source_start = row * result.framebuffer.width;
-                let source_end = source_start + result.framebuffer.width;
-                framebuffer.color[destination_start..destination_end]
-                    .copy_from_slice(&result.framebuffer.color[source_start..source_end]);
-                framebuffer.depth[destination_start..destination_end]
-                    .copy_from_slice(&result.framebuffer.depth[source_start..source_end]);
-            }
-        }
-    }
-
-    pub fn draw_with_sampling<Vertex, Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        vertices: &[Vertex],
-        triangles: &[[usize; 3]],
-        uniforms: &Uniforms,
-    ) where
-        VS: VertexStage<Vertex, Uniforms> + Sync,
-        FS: SampledFragmentStage<VS::Varyings, Uniforms> + Sync,
-        Vertex: Sync,
-        Uniforms: Sync,
-        VS::Varyings: SamplingVaryings + Clone + Send + Sync,
-    {
-        let prepared = if self.thread_count <= 1 || triangles.len() < 2 {
-            prepare_triangles(&self.vertex, framebuffer, vertices, triangles, uniforms)
-        } else {
-            prepare_triangles_parallel(
-                &self.vertex,
-                framebuffer,
-                vertices,
-                triangles,
-                uniforms,
-                self.thread_count,
-            )
-        };
-        self.draw_prepared(
-            framebuffer,
-            prepared,
-            uniforms,
-            RasterState::OPAQUE,
-            rasterize_sampled_triangle::<VS::Varyings, FS, Uniforms>,
-        );
-    }
-
-    pub fn draw_transparent_with_sampling<Vertex, Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        vertices: &[Vertex],
-        triangles: &[[usize; 3]],
-        sort_keys: &[f32],
-        uniforms: &Uniforms,
-    ) where
-        VS: VertexStage<Vertex, Uniforms> + Sync,
-        FS: SampledFragmentStage<VS::Varyings, Uniforms> + Sync,
-        Vertex: Sync,
-        Uniforms: Sync,
-        VS::Varyings: SamplingVaryings + Clone + Send + Sync,
-    {
-        let sorted = sort_triangles_back_to_front(triangles, sort_keys);
-        let prepared = if self.thread_count <= 1 || sorted.len() < 2 {
-            prepare_triangles(&self.vertex, framebuffer, vertices, &sorted, uniforms)
-        } else {
-            prepare_triangles_parallel(
-                &self.vertex,
-                framebuffer,
-                vertices,
-                &sorted,
-                uniforms,
-                self.thread_count,
-            )
-        };
-        self.draw_prepared(
-            framebuffer,
-            prepared,
-            uniforms,
-            RasterState::TRANSPARENT,
-            rasterize_sampled_triangle::<VS::Varyings, FS, Uniforms>,
-        );
-    }
-
-    pub fn draw_mesh<Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        mesh: &Mesh,
-        uniforms: &Uniforms,
-    ) where
-        VS: VertexStage<MeshVertex, Uniforms> + Sync,
-        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
-        Uniforms: Sync,
-        VS::Varyings: Clone + Send + Sync,
-    {
-        self.draw(framebuffer, mesh.vertices(), mesh.indices(), uniforms);
-    }
-
-    pub fn draw_mesh_with_sampling<Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        mesh: &Mesh,
-        uniforms: &Uniforms,
-    ) where
-        VS: VertexStage<MeshVertex, Uniforms> + Sync,
-        FS: SampledFragmentStage<VS::Varyings, Uniforms> + Sync,
-        Uniforms: Sync,
-        VS::Varyings: SamplingVaryings + Clone + Send + Sync,
-    {
-        self.draw_with_sampling(framebuffer, mesh.vertices(), mesh.indices(), uniforms);
-    }
-
-    pub fn draw_mesh_transparent_with_sampling<Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        mesh: &Mesh,
-        model_view: crate::math::Mat4,
-        uniforms: &Uniforms,
-    ) where
-        VS: VertexStage<MeshVertex, Uniforms> + Sync,
-        FS: SampledFragmentStage<VS::Varyings, Uniforms> + Sync,
-        Uniforms: Sync,
-        VS::Varyings: SamplingVaryings + Clone + Send + Sync,
-    {
-        let sort_keys = mesh_centroid_depths(mesh, model_view);
-        self.draw_transparent_with_sampling(
-            framebuffer,
-            &mesh.vertices,
-            &mesh.triangles,
-            &sort_keys,
-            uniforms,
-        );
     }
 }
 
@@ -920,6 +722,81 @@ struct TileResult {
     framebuffer: Framebuffer,
 }
 
+/// The one tile-aware dispatcher used by immediate and queued draws.
+fn dispatch_prepared<V, FS, Uniforms>(
+    thread_count: usize,
+    framebuffer: &mut Framebuffer,
+    prepared: &[PreparedTriangle<V>],
+    uniforms: &Uniforms,
+    fragment: &FS,
+    state: RasterState,
+    rasterize: RasterFn<V, FS, Uniforms>,
+) where
+    V: Varyings + Clone + Send + Sync,
+    FS: Sync,
+    Uniforms: Sync,
+{
+    if prepared.is_empty() {
+        return;
+    }
+    if thread_count <= 1 {
+        for triangle in prepared {
+            rasterize(
+                framebuffer,
+                triangle.vertices.clone(),
+                fragment,
+                uniforms,
+                state,
+            );
+        }
+        return;
+    }
+    let tiles = make_tiles(framebuffer.width, framebuffer.height, prepared);
+    if tiles.is_empty() {
+        return;
+    }
+    let worker_count = thread_count.min(tiles.len()).max(1);
+    let source = &*framebuffer;
+    let tiles = &tiles;
+    let results = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            handles.push(scope.spawn(move || {
+                (worker_index..tiles.len())
+                    .step_by(worker_count)
+                    .map(|tile_index| {
+                        rasterize_tile(
+                            &tiles[tile_index],
+                            prepared,
+                            source,
+                            uniforms,
+                            fragment,
+                            state,
+                            rasterize,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("tile worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    for result in results {
+        for row in 0..result.framebuffer.height {
+            let destination_start = (result.y + row) * framebuffer.width + result.x;
+            let destination_end = destination_start + result.framebuffer.width;
+            let source_start = row * result.framebuffer.width;
+            let source_end = source_start + result.framebuffer.width;
+            framebuffer.color[destination_start..destination_end]
+                .copy_from_slice(&result.framebuffer.color[source_start..source_end]);
+            framebuffer.depth[destination_start..destination_end]
+                .copy_from_slice(&result.framebuffer.depth[source_start..source_end]);
+        }
+    }
+}
+
 fn make_tiles<V>(width: usize, height: usize, prepared: &[PreparedTriangle<V>]) -> Vec<Tile> {
     if width == 0 || height == 0 {
         return Vec::new();
@@ -938,7 +815,6 @@ fn make_tiles<V>(width: usize, height: usize, prepared: &[PreparedTriangle<V>]) 
             }
         }
     }
-
     bins.into_iter()
         .enumerate()
         .filter_map(|(index, triangles)| {
@@ -965,7 +841,7 @@ fn rasterize_tile<V, FS, Uniforms>(
     uniforms: &Uniforms,
     fragment: &FS,
     state: RasterState,
-    rasterize: fn(&mut Framebuffer, [ScreenVertex<V>; 3], &FS, &Uniforms, RasterState),
+    rasterize: RasterFn<V, FS, Uniforms>,
 ) -> TileResult
 where
     V: Varyings + Clone,
@@ -981,7 +857,6 @@ where
         framebuffer.depth[destination_start..destination_end]
             .copy_from_slice(&source.depth[source_start..source_end]);
     }
-
     for &triangle_index in &tile.triangles {
         let mut triangle = prepared[triangle_index].vertices.clone();
         for vertex in &mut triangle {
@@ -990,7 +865,6 @@ where
         }
         rasterize(&mut framebuffer, triangle, fragment, uniforms, state);
     }
-
     TileResult {
         x: tile.x,
         y: tile.y,
@@ -1048,31 +922,7 @@ fn prepare_triangles<Vertex, Uniforms, VS>(
     framebuffer: &Framebuffer,
     vertices: &[Vertex],
     triangles: &[[usize; 3]],
-    uniforms: &Uniforms,
-) -> Vec<PreparedTriangle<VS::Varyings>>
-where
-    VS: VertexStage<Vertex, Uniforms>,
-    VS::Varyings: Clone,
-{
-    prepare_triangles_with_keys(
-        vertex_stage,
-        framebuffer,
-        vertices,
-        triangles,
-        &[],
-        uniforms,
-    )
-    .into_iter()
-    .map(|(_, triangle)| triangle)
-    .collect()
-}
-
-fn prepare_triangles_with_keys<Vertex, Uniforms, VS>(
-    vertex_stage: &VS,
-    framebuffer: &Framebuffer,
-    vertices: &[Vertex],
-    triangles: &[[usize; 3]],
-    sort_keys: &[f32],
+    sort_keys: Option<&[f32]>,
     uniforms: &Uniforms,
 ) -> Vec<(f32, PreparedTriangle<VS::Varyings>)>
 where
@@ -1081,10 +931,6 @@ where
 {
     let mut prepared = Vec::new();
     for (triangle_index, &[a, b, c]) in triangles.iter().enumerate() {
-        let sort_key = sort_keys
-            .get(triangle_index)
-            .copied()
-            .unwrap_or(f32::INFINITY);
         let Some(vertex_a) = vertices.get(a) else {
             continue;
         };
@@ -1097,6 +943,15 @@ where
         let output_a = vertex_stage.run(vertex_a, uniforms);
         let output_b = vertex_stage.run(vertex_b, uniforms);
         let output_c = vertex_stage.run(vertex_c, uniforms);
+        let key = sort_keys
+            .and_then(|keys| keys.get(triangle_index).copied())
+            .unwrap_or_else(|| {
+                centroid_clip_depth([
+                    output_a.clip_position,
+                    output_b.clip_position,
+                    output_c.clip_position,
+                ])
+            });
         let clipped = clip_triangle_near([
             ClipVertex::new(output_a.clip_position, output_a.varyings),
             ClipVertex::new(output_b.clip_position, output_b.varyings),
@@ -1109,8 +964,7 @@ where
             debug_assert!(
                 triangle
                     .iter()
-                    .all(|vertex| { vertex.position.w.is_finite() && vertex.position.w > 0.0 }),
-                "post-clip vertex w must be finite and positive"
+                    .all(|vertex| vertex.position.w.is_finite() && vertex.position.w > 0.0)
             );
             let Some(position_a) =
                 viewport_transform(triangle[0].position, framebuffer.width, framebuffer.height)
@@ -1146,44 +1000,36 @@ where
             ];
             let bounds = triangle_pixel_rect(&vertices, framebuffer.width, framebuffer.height);
             if !bounds.is_empty() {
-                prepared.push((sort_key, PreparedTriangle { vertices, bounds }));
+                prepared.push((key, PreparedTriangle { vertices, bounds }));
             }
         }
     }
     prepared
 }
 
-fn prepare_triangles_parallel<Vertex, Uniforms, VS>(
-    vertex_stage: &VS,
-    framebuffer: &Framebuffer,
-    vertices: &[Vertex],
-    triangles: &[[usize; 3]],
-    uniforms: &Uniforms,
-    thread_count: usize,
-) -> Vec<PreparedTriangle<VS::Varyings>>
-where
-    VS: VertexStage<Vertex, Uniforms> + Sync,
-    Vertex: Sync,
-    Uniforms: Sync,
-    VS::Varyings: Clone + Send,
-{
-    if triangles.is_empty() {
-        return Vec::new();
-    }
-    let chunk_count = thread_count.min(triangles.len()).max(1);
-    let chunk_size = triangles.len().div_ceil(chunk_count);
-    thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(chunk_count);
-        for chunk in triangles.chunks(chunk_size) {
-            handles.push(scope.spawn(move || {
-                prepare_triangles(vertex_stage, framebuffer, vertices, chunk, uniforms)
-            }));
+fn sort_prepared<V>(prepared: &mut Vec<(f32, PreparedTriangle<V>)>) {
+    let mut indexed = prepared.drain(..).enumerate().collect::<Vec<_>>();
+    indexed.sort_by(
+        |(left_index, (left_key, _)), (right_index, (right_key, _))| {
+            compare_depth_keys(*left_key, *right_key).then_with(|| left_index.cmp(right_index))
+        },
+    );
+    prepared.extend(indexed.into_iter().map(|(_, prepared)| prepared));
+}
+
+fn centroid_clip_depth(positions: [Vec4; 3]) -> f32 {
+    let position = (positions[0] + positions[1] + positions[2]) / 3.0;
+    let z = position.z / position.w;
+    if z.is_nan() { f32::INFINITY } else { z }
+}
+
+impl DrawClass {
+    const fn raster_state(self) -> RasterState {
+        match self {
+            Self::Opaque => RasterState::OPAQUE,
+            Self::Transparent => RasterState::TRANSPARENT,
         }
-        handles
-            .into_iter()
-            .flat_map(|handle| handle.join().expect("front-end worker panicked"))
-            .collect()
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1251,33 +1097,18 @@ mod tests {
 
     #[test]
     fn mesh_centroid_depth_uses_model_view() {
-        let mesh = Mesh {
-            vertices: vec![
-                MeshVertex {
-                    position: crate::math::Vec3::new(0.0, 0.0, 0.0),
-                    texcoord: None,
-                    normal: None,
-                },
-                MeshVertex {
-                    position: crate::math::Vec3::new(1.0, 0.0, 0.0),
-                    texcoord: None,
-                    normal: None,
-                },
-                MeshVertex {
-                    position: crate::math::Vec3::new(1.0, 1.0, 0.0),
-                    texcoord: None,
-                    normal: None,
-                },
+        let mesh = Mesh::new(
+            vec![
+                MeshVertex::new(Vec3::new(0.0, 0.0, 0.0), None, None),
+                MeshVertex::new(Vec3::new(1.0, 0.0, 0.0), None, None),
+                MeshVertex::new(Vec3::new(1.0, 1.0, 0.0), None, None),
             ],
-            triangles: vec![[0, 1, 2]],
-        };
-        let identity_key = mesh_centroid_depths(&mesh, crate::math::Mat4::IDENTITY)[0];
+            vec![[0, 1, 2]],
+        );
+        let identity_key = mesh_centroid_depths(&mesh, Mat4::IDENTITY)[0];
         let rotated_key = mesh_centroid_depths(
             &mesh,
-            crate::math::Mat4::rotate(
-                crate::math::Vec3::new(0.0, 1.0, 0.0),
-                std::f32::consts::FRAC_PI_2,
-            ),
+            Mat4::rotate(Vec3::new(0.0, 1.0, 0.0), std::f32::consts::FRAC_PI_2),
         )[0];
         assert_ne!(identity_key, rotated_key);
     }

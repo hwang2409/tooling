@@ -72,21 +72,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pipeline.render(framebuffer, |pipeline, target| {
                 target.clear(argb8888(255, 10, 14, 24));
                 pipeline.draw_mesh(target, &sphere, &sphere_uniforms);
-                pipeline.draw_mesh_transparent(target, &quads, view, &quad_uniforms);
+                pipeline.draw_mesh(target, &quads, &quad_uniforms);
             });
         },
     )
 }
 
 fn orbiting_quads(elapsed: f32) -> Mesh {
-    let mut mesh = Mesh::default();
+    let mut vertices = Vec::new();
+    let mut triangles = Vec::new();
     for (index, center) in [Vec3::new(-1.25, 0.6, 0.45), Vec3::new(1.25, 0.85, -0.15)]
         .into_iter()
         .enumerate()
     {
         let angle = elapsed * (0.65 + index as f32 * 0.2) + index as f32;
         let rotation = Mat4::rotate(Vec3::new(0.0, 1.0, 0.0), angle);
-        let base = mesh.vertices.len();
+        let base = vertices.len();
         for point in [
             Vec3::new(-0.8, -0.7, 0.0),
             Vec3::new(0.8, -0.7, 0.0),
@@ -94,18 +95,18 @@ fn orbiting_quads(elapsed: f32) -> Mesh {
             Vec3::new(-0.8, 0.7, 0.0),
         ] {
             let position = rotation * chimy2::math::Vec4::new(point.x, point.y, point.z, 1.0);
-            mesh.vertices.push(MeshVertex {
-                position: Vec3::new(
+            vertices.push(MeshVertex::new(
+                Vec3::new(
                     position.x + center.x,
                     position.y + center.y,
                     position.z + center.z,
                 ),
-                texcoord: None,
-                normal: Some(Vec3::new(0.0, 0.0, 1.0)),
-            });
+                None,
+                Some(Vec3::new(0.0, 0.0, 1.0)),
+            ));
         }
-        mesh.triangles.push([base, base + 1, base + 2]);
-        mesh.triangles.push([base, base + 2, base + 3]);
+        triangles.push([base, base + 1, base + 2]);
+        triangles.push([base, base + 2, base + 3]);
     }
-    mesh
+    Mesh::new(vertices, triangles)
 }

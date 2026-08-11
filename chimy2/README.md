@@ -84,7 +84,7 @@ same pixels out. That is what makes golden-image tests possible.
 
 ## demos
 
-Four scenes ship as bins under `src/bin/`. Each takes `--frames N` for a
+Five scenes ship as bins under `src/bin/`. Each takes `--frames N` for a
 clean exit and `--screenshot <path.ppm>` to render headless.
 
 ### `hero_orbit`
@@ -133,6 +133,11 @@ light orbits the quad. Load normal maps with `ColorSpace::Linear`.
   <img src="img/stress_100k.png" alt="stress 100k demo" />
 </p>
 
+### `blend_demo`
+
+Alpha blending and 2x supersampling. Pass `--ssaa` to enable the linear-light
+supersampled target.
+
 ## running the demos
 
 ```bash
@@ -141,6 +146,7 @@ cargo run --release --bin depth_interlock
 cargo run --release --bin perspective_floor
 cargo run --release --bin stress_100k
 cargo run --release --bin normalmap_demo
+cargo run --release --bin blend_demo --frames 30 --ssaa
 ```
 
 Add `--frames N` to any demo for a clean exit after N frames. Add

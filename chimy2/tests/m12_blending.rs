@@ -10,31 +10,15 @@ const WIDTH: usize = 130;
 const HEIGHT: usize = 12;
 
 fn quad_mesh(z: f32) -> Mesh {
-    Mesh {
-        vertices: vec![
-            MeshVertex {
-                position: Vec3::new(-0.85, -0.8, z),
-                texcoord: None,
-                normal: None,
-            },
-            MeshVertex {
-                position: Vec3::new(0.85, -0.8, z),
-                texcoord: None,
-                normal: None,
-            },
-            MeshVertex {
-                position: Vec3::new(0.85, 0.8, z),
-                texcoord: None,
-                normal: None,
-            },
-            MeshVertex {
-                position: Vec3::new(-0.85, 0.8, z),
-                texcoord: None,
-                normal: None,
-            },
+    Mesh::new(
+        vec![
+            MeshVertex::new(Vec3::new(-0.85, -0.8, z), None, None),
+            MeshVertex::new(Vec3::new(0.85, -0.8, z), None, None),
+            MeshVertex::new(Vec3::new(0.85, 0.8, z), None, None),
+            MeshVertex::new(Vec3::new(-0.85, 0.8, z), None, None),
         ],
-        triangles: vec![[0, 1, 2], [0, 2, 3]],
-    }
+        vec![[0, 1, 2], [0, 2, 3]],
+    )
 }
 
 fn transparent_scene(thread_count: usize) -> Framebuffer {
@@ -61,8 +45,8 @@ fn transparent_scene(thread_count: usize) -> Framebuffer {
     pipeline.set_thread_count(thread_count);
     pipeline.render(&mut framebuffer, |frame, target| {
         target.clear(argb8888(255, 64, 64, 64));
-        frame.draw_mesh_transparent(target, &far_mesh, Mat4::IDENTITY, &far);
-        frame.draw_mesh_transparent(target, &near_mesh, Mat4::IDENTITY, &near);
+        frame.draw_mesh(target, &near_mesh, &near);
+        frame.draw_mesh(target, &far_mesh, &far);
     });
     framebuffer
 }
@@ -96,8 +80,9 @@ fn assert_golden(name: &str, framebuffer: &Framebuffer) {
 #[test]
 fn transparent_overlap_is_sorted_and_serial_parallel_identical() {
     let serial = transparent_scene(1);
-    let parallel = transparent_scene(4);
-    assert_eq!(serial, parallel);
+    for thread_count in [2, 4, 8] {
+        assert_eq!(serial, transparent_scene(thread_count));
+    }
     let center = serial.color[HEIGHT / 2 * WIDTH + WIDTH / 2];
     let far_over_background =
         blend_argb8888_linear(argb8888(255, 64, 64, 64), argb8888(128, 235, 70, 40));
@@ -109,11 +94,30 @@ fn transparent_overlap_is_sorted_and_serial_parallel_identical() {
     assert_golden("m12-transparent-overlap", &serial);
 }
 
+#[test]
+fn alpha_one_draw_is_opaque_and_writes_depth() {
+    let mesh = quad_mesh(-0.3);
+    let uniforms = MeshUniforms::new(
+        Mat4::IDENTITY,
+        Mat4::IDENTITY,
+        Mat4::IDENTITY,
+        argb8888(255, 235, 70, 40),
+    );
+    let mut framebuffer = Framebuffer::new(WIDTH, HEIGHT);
+    let mut pipeline = Pipeline::new(MeshShader, MeshShader);
+    pipeline.set_thread_count(4);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh(target, &mesh, &uniforms);
+    });
+    assert!(framebuffer.depth.iter().any(|&depth| depth < 1.0));
+}
+
 fn render_edge(scale: usize, thread_count: usize) -> Framebuffer {
     let mut framebuffer = Framebuffer::new(12, 12);
     let mut pipeline = Pipeline::new(FlatColorShader, FlatColorShader);
     pipeline.set_ssaa_scale(scale);
     pipeline.set_thread_count(thread_count);
+    let uniforms = FlatColorUniforms::new(Mat4::IDENTITY, argb8888(255, 240, 240, 240));
     pipeline.render(&mut framebuffer, |pipeline, target| {
         target.clear(argb8888(255, 20, 20, 20));
         pipeline.draw(
@@ -124,7 +128,7 @@ fn render_edge(scale: usize, thread_count: usize) -> Framebuffer {
                 Vec4::new(-1.0, 0.85, 0.0, 1.0),
             ],
             &[[0, 1, 2]],
-            &FlatColorUniforms::new(Mat4::IDENTITY, argb8888(255, 240, 240, 240)),
+            &uniforms,
         );
     });
     framebuffer
