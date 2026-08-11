@@ -11,6 +11,7 @@ use crate::mesh::MeshVertex;
 use crate::pipeline::{
     FragmentStage, SampledFragmentStage, SamplingVaryings, Varyings, VertexOutput, VertexStage,
 };
+use crate::shadow::ShadowMap;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FlatColorUniforms {
@@ -297,7 +298,7 @@ impl PointLight {
 /// );
 /// uniforms.model = Mat4::IDENTITY;
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BlinnPhongUniforms {
     model: Mat4,
     view: Mat4,
@@ -309,6 +310,10 @@ pub struct BlinnPhongUniforms {
     pub camera_position: Vec3,
     pub directional_light: DirectionalLight,
     pub point_light: PointLight,
+    light_view_projection: Mat4,
+    shadow_map: Option<ShadowMap>,
+    shadow_constant_bias: f32,
+    shadow_slope_bias: f32,
     transform: Mat4,
     normal_matrix: Mat3,
 }
@@ -338,16 +343,20 @@ impl BlinnPhongUniforms {
             camera_position,
             directional_light,
             point_light,
+            light_view_projection: Mat4::IDENTITY,
+            shadow_map: None,
+            shadow_constant_bias: 0.002,
+            shadow_slope_bias: 0.02,
             transform: projection * view * model,
             normal_matrix: model.normal_matrix().unwrap_or_default(),
         }
     }
 
-    pub const fn transform(self) -> Mat4 {
+    pub const fn transform(&self) -> Mat4 {
         self.transform
     }
 
-    pub const fn normal_matrix(self) -> Mat3 {
+    pub const fn normal_matrix(&self) -> Mat3 {
         self.normal_matrix
     }
 
@@ -361,6 +370,35 @@ impl BlinnPhongUniforms {
 
     pub const fn projection(&self) -> Mat4 {
         self.projection
+    }
+
+    pub const fn light_view_projection(&self) -> Mat4 {
+        self.light_view_projection
+    }
+
+    pub fn shadow_map(&self) -> Option<&ShadowMap> {
+        self.shadow_map.as_ref()
+    }
+
+    pub const fn shadow_bias(&self) -> (f32, f32) {
+        (self.shadow_constant_bias, self.shadow_slope_bias)
+    }
+
+    pub fn set_light_view_projection(&mut self, light_view_projection: Mat4) {
+        self.light_view_projection = light_view_projection;
+    }
+
+    pub fn set_shadow_map(&mut self, shadow_map: Option<ShadowMap>) {
+        self.shadow_map = shadow_map;
+    }
+
+    /// Sets `(constant, slope)` for the shadow bias.
+    ///
+    /// The default is `(0.002, 0.02)`. The compare uses
+    /// `max(constant, slope * (1 - N dot L))`.
+    pub fn set_shadow_bias(&mut self, constant: f32, slope: f32) {
+        self.shadow_constant_bias = constant.max(0.0);
+        self.shadow_slope_bias = slope.max(0.0);
     }
 
     pub fn set_model(&mut self, model: Mat4) {
@@ -392,6 +430,7 @@ impl BlinnPhongUniforms {
 pub struct BlinnPhongVaryings {
     pub world_position: Vec3,
     pub normal: Vec3,
+    pub light_space_position: Vec4,
 }
 
 impl Varyings for BlinnPhongVaryings {
@@ -401,6 +440,9 @@ impl Varyings for BlinnPhongVaryings {
                 + b.world_position * weights.y
                 + c.world_position * weights.z,
             normal: a.normal * weights.x + b.normal * weights.y + c.normal * weights.z,
+            light_space_position: a.light_space_position * weights.x
+                + b.light_space_position * weights.y
+                + c.light_space_position * weights.z,
         }
     }
 }
@@ -410,6 +452,7 @@ struct PreparedBlinnPhongVertex {
     clip_position: Vec4,
     world_position: Vec3,
     normal: Vec3,
+    light_space_position: Vec4,
 }
 
 fn prepare_blinn_phong_vertex(
@@ -425,10 +468,13 @@ fn prepare_blinn_phong_vertex(
     );
     let normal = vertex.normal.unwrap_or(Vec3::new(0.0, 0.0, 1.0));
     let normal = (uniforms.normal_matrix() * normal).normalize();
+    let light_space_position = uniforms.light_view_projection
+        * Vec4::new(world_position.x, world_position.y, world_position.z, 1.0);
     PreparedBlinnPhongVertex {
         clip_position: uniforms.transform() * local_position,
         world_position,
         normal,
+        light_space_position,
     }
 }
 
@@ -449,6 +495,7 @@ impl VertexStage<MeshVertex, BlinnPhongUniforms> for BlinnPhongShader {
             BlinnPhongVaryings {
                 world_position: prepared.world_position,
                 normal: prepared.normal,
+                light_space_position: prepared.light_space_position,
             },
         )
     }
@@ -467,6 +514,7 @@ impl BlinnPhongShader {
         let lighted = evaluate_lighting(
             varyings.world_position,
             varyings.normal,
+            varyings.light_space_position,
             uniforms,
             Vec3::new(1.0, 1.0, 1.0),
         );
@@ -478,6 +526,7 @@ impl BlinnPhongShader {
 fn evaluate_lighting(
     world_position: Vec3,
     interpolated_normal: Vec3,
+    light_space_position: Vec4,
     uniforms: &BlinnPhongUniforms,
     albedo: Vec3,
 ) -> Vec3 {
@@ -485,13 +534,14 @@ fn evaluate_lighting(
     let view_direction = (uniforms.camera_position - world_position).normalize();
     let mut lighted = uniforms.ambient_color * albedo;
 
+    let directional_visibility = uniforms.shadow_visibility(light_space_position, normal);
     lighted = lighted
         + evaluate_light(
             normal,
             view_direction,
             uniforms.directional_light.direction.normalize(),
             uniforms.directional_light.color,
-            1.0,
+            directional_visibility,
             uniforms,
             albedo,
         );
@@ -521,6 +571,31 @@ fn evaluate_lighting(
     lighted
 }
 
+impl BlinnPhongUniforms {
+    fn shadow_visibility(&self, light_space_position: Vec4, normal: Vec3) -> f32 {
+        let Some(shadow_map) = self.shadow_map.as_ref() else {
+            return 1.0;
+        };
+        if light_space_position.w <= 0.0 || !light_space_position.w.is_finite() {
+            return 1.0;
+        }
+        let ndc = Vec3::new(
+            light_space_position.x / light_space_position.w,
+            light_space_position.y / light_space_position.w,
+            light_space_position.z / light_space_position.w,
+        );
+        let uv = crate::math::Vec2::new((ndc.x + 1.0) * 0.5, (1.0 - ndc.y) * 0.5);
+        let normal_dot_light = normal
+            .normalize()
+            .dot(self.directional_light.direction.normalize())
+            .clamp(0.0, 1.0);
+        let bias = self
+            .shadow_constant_bias
+            .max(self.shadow_slope_bias * (1.0 - normal_dot_light));
+        shadow_map.visibility_3x3(uv, ndc.z, bias)
+    }
+}
+
 fn evaluate_light(
     normal: Vec3,
     view_direction: Vec3,
@@ -545,7 +620,7 @@ fn evaluate_light(
         * attenuation
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TexturedBlinnPhongUniforms<'a> {
     pub lighting: BlinnPhongUniforms,
     pub texture: &'a Texture,
@@ -574,6 +649,7 @@ pub struct TexturedBlinnPhongVaryings {
     pub world_position: Vec3,
     pub normal: Vec3,
     pub texcoord: crate::math::Vec2,
+    pub light_space_position: Vec4,
 }
 
 impl Varyings for TexturedBlinnPhongVaryings {
@@ -584,6 +660,9 @@ impl Varyings for TexturedBlinnPhongVaryings {
                 + c.world_position * weights.z,
             normal: a.normal * weights.x + b.normal * weights.y + c.normal * weights.z,
             texcoord: a.texcoord * weights.x + b.texcoord * weights.y + c.texcoord * weights.z,
+            light_space_position: a.light_space_position * weights.x
+                + b.light_space_position * weights.y
+                + c.light_space_position * weights.z,
         }
     }
 }
@@ -609,6 +688,7 @@ impl<'a> VertexStage<MeshVertex, TexturedBlinnPhongUniforms<'a>> for TexturedBli
                 world_position: prepared.world_position,
                 normal: prepared.normal,
                 texcoord: vertex.texcoord.unwrap_or(crate::math::Vec2::ZERO),
+                light_space_position: prepared.light_space_position,
             },
         )
     }
@@ -636,6 +716,7 @@ impl<'a> SampledFragmentStage<TexturedBlinnPhongVaryings, TexturedBlinnPhongUnif
         let lighted = evaluate_lighting(
             varyings.world_position,
             varyings.normal,
+            varyings.light_space_position,
             &uniforms.lighting,
             albedo,
         );
@@ -694,6 +775,7 @@ mod tests {
         let varyings = BlinnPhongVaryings {
             world_position: Vec3::ZERO,
             normal: Vec3::new(0.0, 0.0, 1.0),
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
         };
         // The hand calculation is H = normalize((0, 1, 1) + (0, 0, 1)),
         // so N dot H = 0.9238795. With shininess 8, specular is 0.53079,
@@ -706,6 +788,7 @@ mod tests {
         let varyings = BlinnPhongVaryings {
             world_position: Vec3::ZERO,
             normal: Vec3::new(0.0, 0.0, 1.0),
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
         };
         let mut uniforms = uniforms();
         uniforms.shininess = 2.0;
@@ -790,5 +873,17 @@ mod tests {
             projection * Mat4::IDENTITY * Mat4::IDENTITY
         );
         assert_eq!(uniforms.normal_matrix(), Mat3::IDENTITY);
+    }
+
+    #[test]
+    fn blinn_phong_shadow_mutators_update_immediately() {
+        let mut uniforms = uniforms();
+        let light_view_projection = Mat4::translate(Vec3::new(2.0, 3.0, 4.0));
+        uniforms.set_light_view_projection(light_view_projection);
+        uniforms.set_shadow_bias(0.01, 0.04);
+
+        assert_eq!(uniforms.light_view_projection(), light_view_projection);
+        assert_eq!(uniforms.shadow_bias(), (0.01, 0.04));
+        assert!(uniforms.shadow_map().is_none());
     }
 }

@@ -6,7 +6,9 @@
 //!
 //! The coordinate system is right-handed. `look_at` maps the camera's forward
 //! direction to -Z. Perspective projection uses OpenGL-style NDC depth in
-//! `[-1, +1]`. Quaternions use Hamilton multiplication and active rotations.
+//! `[-1, +1]`. Orthographic and perspective projections use this same NDC
+//! depth convention. Quaternions use Hamilton multiplication and active
+//! rotations.
 
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
@@ -485,6 +487,33 @@ impl Mat4 {
         ])
     }
 
+    /// Builds a right-handed orthographic projection matrix.
+    ///
+    /// The preconditions are `left < right`, `bottom < top`, and `near < far`.
+    /// View-space `z = -near` maps to NDC `z = -1`, and `z = -far` maps to
+    /// NDC `z = +1`, matching [`Self::perspective`].
+    pub fn orthographic(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> Self {
+        debug_assert!(left < right && bottom < top && near < far);
+        Self::new([
+            2.0 / (right - left),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            2.0 / (top - bottom),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            -2.0 / (far - near),
+            0.0,
+            -(right + left) / (right - left),
+            -(top + bottom) / (top - bottom),
+            -(far + near) / (far - near),
+            1.0,
+        ])
+    }
+
     /// Builds a right-handed view matrix with camera forward along -Z.
     ///
     /// The preconditions are `eye != target` and a non-zero cross product of
@@ -792,6 +821,25 @@ mod tests {
         assert_vec(
             [far_clip.x, far_clip.y, far_clip.z, far_clip.w],
             [0.0, 0.0, 11.0, 11.0],
+        );
+
+        let orthographic = Mat4::orthographic(-2.0, 6.0, -3.0, 5.0, 1.0, 11.0);
+        assert_vec(
+            [
+                orthographic.get(0, 0),
+                orthographic.get(1, 1),
+                orthographic.get(2, 2),
+                orthographic.get(3, 3),
+            ],
+            [0.25, 0.25, -0.2, 1.0],
+        );
+        assert_eq!(
+            orthographic * Vec4::new(-2.0, -3.0, -1.0, 1.0),
+            Vec4::new(-1.0, -1.0, -1.0, 1.0)
+        );
+        assert_eq!(
+            orthographic * Vec4::new(6.0, 5.0, -11.0, 1.0),
+            Vec4::new(1.0, 1.0, 1.0, 1.0)
         );
     }
 

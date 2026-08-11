@@ -168,6 +168,23 @@ pub fn rasterize_triangle<V, F>(
     )
 }
 
+/// Rasterizes one triangle while updating depth without writing color.
+pub fn rasterize_triangle_depth<V>(framebuffer: &mut Framebuffer, vertices: [ScreenVertex<V>; 3])
+where
+    V: Varyings,
+{
+    rasterize_triangle_depth_in_rect(
+        framebuffer,
+        vertices,
+        PixelRect {
+            min_x: 0,
+            max_x: framebuffer.width.saturating_sub(1) as i32,
+            min_y: 0,
+            max_y: framebuffer.height.saturating_sub(1) as i32,
+        },
+    );
+}
+
 /// Rasterizes one triangle and passes sampler-facing derivatives with each
 /// fragment. Only sampling varyings opt into this channel.
 pub fn rasterize_triangle_with_sampling<V, F>(
@@ -211,6 +228,7 @@ pub(crate) fn rasterize_triangle_in_rect<V, F>(
         framebuffer,
         vertices,
         rect,
+        true,
         |vertices, weights, inverse_w, _, _| {
             V::lerp3(
                 &vertices[0].varyings,
@@ -220,6 +238,30 @@ pub(crate) fn rasterize_triangle_in_rect<V, F>(
             )
         },
         fragment,
+    );
+}
+
+pub(crate) fn rasterize_triangle_depth_in_rect<V>(
+    framebuffer: &mut Framebuffer,
+    vertices: [ScreenVertex<V>; 3],
+    rect: PixelRect,
+) where
+    V: Varyings,
+{
+    rasterize_triangle_in_rect_core(
+        framebuffer,
+        vertices,
+        rect,
+        false,
+        |vertices, weights, inverse_w, _, _| {
+            V::lerp3(
+                &vertices[0].varyings,
+                &vertices[1].varyings,
+                &vertices[2].varyings,
+                perspective_correct_weights(weights, inverse_w),
+            )
+        },
+        |_| 0,
     );
 }
 
@@ -236,6 +278,7 @@ pub(crate) fn rasterize_triangle_in_rect_with_sampling<V, F>(
         framebuffer,
         vertices,
         rect,
+        true,
         |vertices, weights, inverse_w, ddx_weights, ddy_weights| {
             let varyings = V::lerp3(
                 &vertices[0].varyings,
@@ -256,6 +299,7 @@ fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment>(
     framebuffer: &mut Framebuffer,
     mut vertices: [ScreenVertex<V>; 3],
     rect: PixelRect,
+    write_color: bool,
     mut interpolate: Interpolate,
     mut fragment: Fragment,
 ) where
@@ -329,7 +373,7 @@ fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment>(
             let inverse_w = inverse_w(&vertices);
             let input = interpolate(&vertices, weights, inverse_w, ddx_weights, ddy_weights);
             *buffer_depth = depth;
-            if let Some(color) = framebuffer.color.get_mut(index) {
+            if write_color && let Some(color) = framebuffer.color.get_mut(index) {
                 *color = fragment(input);
             }
         }
