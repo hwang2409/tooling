@@ -963,6 +963,7 @@ mod tests {
 
     #[test]
     fn shader_pack_dither_depth_skew_is_screen_stationary_through_pipeline() {
+        // The projected triangle stays fixed while its per-vertex w values change.
         let near = render_dither_scene_at_depth(4.0, [1.0, 2.0, 4.0]);
         let far = render_dither_scene_at_depth(8.0, [2.0, 3.0, 8.0]);
         assert!(near.color.iter().any(|&pixel| pixel != 0xff080a10));
