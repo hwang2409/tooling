@@ -116,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let uniforms =
                 TexturedBlinnPhongUniforms::new(lighting, &texture, TextureFilter::Trilinear);
             let mut pipeline = Pipeline::new(TexturedBlinnPhongShader, TexturedBlinnPhongShader);
-            pipeline.draw_mesh(framebuffer, &mesh, &uniforms);
+            pipeline.draw_mesh_with_sampling(framebuffer, &mesh, &uniforms);
         },
     )
 }

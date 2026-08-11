@@ -76,7 +76,7 @@ fn perspective_textured_quad_golden() {
     let uniforms =
         TexturedUniforms::new(camera.view_projection(), &texture, TextureFilter::Nearest);
     let mut pipeline = Pipeline::new(TexturedShader, TexturedShader);
-    pipeline.draw_mesh(&mut framebuffer, &foreshortened_quad(), &uniforms);
+    pipeline.draw_mesh_with_sampling(&mut framebuffer, &foreshortened_quad(), &uniforms);
     assert_golden("m5-perspective-textured-quad", &framebuffer);
 }
 
@@ -90,13 +90,13 @@ fn bilinear_and_nearest_have_distinct_goldens() {
     let mut nearest = background();
     let mut bilinear = background();
     let mut nearest_pipeline = Pipeline::new(TexturedShader, TexturedShader);
-    nearest_pipeline.draw_mesh(
+    nearest_pipeline.draw_mesh_with_sampling(
         &mut nearest,
         &mesh,
         &TexturedUniforms::new(camera.view_projection(), &texture, TextureFilter::Nearest),
     );
     let mut bilinear_pipeline = Pipeline::new(TexturedShader, TexturedShader);
-    bilinear_pipeline.draw_mesh(
+    bilinear_pipeline.draw_mesh_with_sampling(
         &mut bilinear,
         &mesh,
         &TexturedUniforms::new(camera.view_projection(), &texture, TextureFilter::Bilinear),
@@ -136,6 +136,6 @@ fn textured_lit_mesh_golden() {
     let mut framebuffer = background();
     let uniforms = TexturedBlinnPhongUniforms::new(lighting, &texture, TextureFilter::Bilinear);
     let mut pipeline = Pipeline::new(TexturedBlinnPhongShader, TexturedBlinnPhongShader);
-    pipeline.draw_mesh(&mut framebuffer, &foreshortened_quad(), &uniforms);
+    pipeline.draw_mesh_with_sampling(&mut framebuffer, &foreshortened_quad(), &uniforms);
     assert_golden("m5-textured-lit-mesh", &framebuffer);
 }

@@ -5,8 +5,8 @@ use crate::fb::Framebuffer;
 use crate::math::{Vec3, Vec4};
 use crate::mesh::{Mesh, MeshVertex};
 use crate::raster::{
-    PixelRect, ScreenVertex, rasterize_triangle_with_derivatives, triangle_pixel_rect,
-    viewport_transform,
+    PixelRect, ScreenVertex, rasterize_triangle, rasterize_triangle_with_sampling,
+    triangle_pixel_rect, viewport_transform,
 };
 use std::marker::PhantomData;
 use std::thread;
@@ -14,42 +14,42 @@ use std::thread;
 pub const TILE_SIZE: usize = 64;
 
 /// Values passed from a vertex stage to a fragment stage.
+///
+/// This trait only interpolates values with core-computed weights. It does not
+/// expose raster gradients, inverse `w`, or any other raster implementation
+/// detail.
 pub trait Varyings: Sized {
-    type Derivatives: Clone + Default;
-
     fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self;
-
-    /// Computes perspective-correct values and screen-space derivatives.
-    /// The raster core supplies barycentric weights and their gradients;
-    /// concrete varyings decide which derivative data a shader can consume.
-    fn interpolate3(
-        a: &Self,
-        b: &Self,
-        c: &Self,
-        weights: Vec3,
-        inverse_w: Vec3,
-        _ddx_weights: Vec3,
-        _ddy_weights: Vec3,
-    ) -> (Self, Self::Derivatives) {
-        (
-            Self::lerp3(
-                a,
-                b,
-                c,
-                crate::raster::perspective_correct_weights(weights, inverse_w),
-            ),
-            Self::Derivatives::default(),
-        )
-    }
 
     fn lerp(a: &Self, b: &Self, amount: f32) -> Self {
         Self::lerp3(a, b, b, Vec3::new(1.0 - amount, amount, 0.0))
     }
 }
 
-impl Varyings for () {
-    type Derivatives = ();
+/// Varying data used by a texture sampler.
+///
+/// This is separate from [`Varyings`]. Implementations expose only texture
+/// coordinates; the raster core computes their screen-space derivatives.
+pub trait SamplingVaryings: Varyings {
+    fn texture_coordinates(&self) -> crate::math::Vec2;
+}
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SampleDerivatives {
+    pub ddx: crate::math::Vec2,
+    pub ddy: crate::math::Vec2,
+}
+
+pub trait SampledFragmentStage<V: SamplingVaryings, Uniforms> {
+    fn run_with_sampling(
+        &self,
+        varyings: &V,
+        derivatives: &SampleDerivatives,
+        uniforms: &Uniforms,
+    ) -> u32;
+}
+
+impl Varyings for () {
     fn lerp3(_: &Self, _: &Self, _: &Self, _: Vec3) -> Self {}
 }
 
@@ -65,8 +65,6 @@ impl ColorVarying {
 }
 
 impl Varyings for ColorVarying {
-    type Derivatives = ();
-
     fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self {
         Self::new(a.color * weights.x + b.color * weights.y + c.color * weights.z)
     }
@@ -112,10 +110,6 @@ pub trait VertexStage<Vertex, Uniforms> {
 /// ```
 pub trait FragmentStage<V: Varyings, Uniforms> {
     fn run(&self, varyings: &V, uniforms: &Uniforms) -> u32;
-
-    fn run_with_derivatives(&self, varyings: &V, _: &V::Derivatives, uniforms: &Uniforms) -> u32 {
-        self.run(varyings, uniforms)
-    }
 }
 
 pub struct VertexFn<F, V> {
@@ -254,12 +248,28 @@ impl<VS, FS> Pipeline<VS, FS> {
         V: Varyings + Clone,
     {
         for triangle in prepared {
-            rasterize_triangle_with_derivatives(
+            rasterize_triangle(framebuffer, triangle.vertices, |varyings| {
+                self.fragment.run(&varyings, uniforms)
+            });
+        }
+    }
+
+    fn draw_serial_with_sampling<V, Uniforms>(
+        &self,
+        framebuffer: &mut Framebuffer,
+        prepared: Vec<PreparedTriangle<V>>,
+        uniforms: &Uniforms,
+    ) where
+        FS: SampledFragmentStage<V, Uniforms>,
+        V: SamplingVaryings + Clone,
+    {
+        for triangle in prepared {
+            rasterize_triangle_with_sampling(
                 framebuffer,
                 triangle.vertices,
                 |varyings, derivatives| {
                     self.fragment
-                        .run_with_derivatives(&varyings, &derivatives, uniforms)
+                        .run_with_sampling(&varyings, &derivatives, uniforms)
                 },
             );
         }
@@ -320,6 +330,93 @@ impl<VS, FS> Pipeline<VS, FS> {
         }
     }
 
+    fn draw_parallel_with_sampling<V, Uniforms>(
+        &self,
+        framebuffer: &mut Framebuffer,
+        prepared: &[PreparedTriangle<V>],
+        uniforms: &Uniforms,
+    ) where
+        FS: SampledFragmentStage<V, Uniforms> + Sync,
+        Uniforms: Sync,
+        V: SamplingVaryings + Clone + Send + Sync,
+    {
+        let tiles = make_tiles(framebuffer.width, framebuffer.height, prepared);
+        if tiles.is_empty() {
+            return;
+        }
+        let worker_count = self.thread_count.min(tiles.len()).max(1);
+        let source = &*framebuffer;
+        let tiles = &tiles;
+        let results = thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for worker_index in 0..worker_count {
+                let fragment = &self.fragment;
+                handles.push(scope.spawn(move || {
+                    let mut results = Vec::new();
+                    for tile_index in (worker_index..tiles.len()).step_by(worker_count) {
+                        results.push(rasterize_tile_with_sampling(
+                            &tiles[tile_index],
+                            prepared,
+                            source,
+                            uniforms,
+                            fragment,
+                        ));
+                    }
+                    results
+                }));
+            }
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("tile worker panicked"))
+                .collect::<Vec<_>>()
+        });
+
+        for result in results {
+            for row in 0..result.framebuffer.height {
+                let destination_start = (result.y + row) * framebuffer.width + result.x;
+                let destination_end = destination_start + result.framebuffer.width;
+                let source_start = row * result.framebuffer.width;
+                let source_end = source_start + result.framebuffer.width;
+                framebuffer.color[destination_start..destination_end]
+                    .copy_from_slice(&result.framebuffer.color[source_start..source_end]);
+                framebuffer.depth[destination_start..destination_end]
+                    .copy_from_slice(&result.framebuffer.depth[source_start..source_end]);
+            }
+        }
+    }
+
+    pub fn draw_with_sampling<Vertex, Uniforms>(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        vertices: &[Vertex],
+        triangles: &[[usize; 3]],
+        uniforms: &Uniforms,
+    ) where
+        VS: VertexStage<Vertex, Uniforms> + Sync,
+        FS: SampledFragmentStage<VS::Varyings, Uniforms> + Sync,
+        Vertex: Sync,
+        Uniforms: Sync,
+        VS::Varyings: SamplingVaryings + Clone + Send + Sync,
+    {
+        let prepared = if self.thread_count <= 1 || triangles.len() < 2 {
+            prepare_triangles(&self.vertex, framebuffer, vertices, triangles, uniforms)
+        } else {
+            prepare_triangles_parallel(
+                &self.vertex,
+                framebuffer,
+                vertices,
+                triangles,
+                uniforms,
+                self.thread_count,
+            )
+        };
+        if self.thread_count <= 1 || prepared.is_empty() {
+            self.draw_serial_with_sampling(framebuffer, prepared, uniforms);
+        } else {
+            self.draw_parallel_with_sampling(framebuffer, &prepared, uniforms);
+        }
+    }
+
     pub fn draw_mesh<Uniforms>(
         &mut self,
         framebuffer: &mut Framebuffer,
@@ -332,6 +429,20 @@ impl<VS, FS> Pipeline<VS, FS> {
         VS::Varyings: Clone + Send + Sync,
     {
         self.draw(framebuffer, &mesh.vertices, &mesh.triangles, uniforms);
+    }
+
+    pub fn draw_mesh_with_sampling<Uniforms>(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        mesh: &Mesh,
+        uniforms: &Uniforms,
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: SampledFragmentStage<VS::Varyings, Uniforms> + Sync,
+        Uniforms: Sync,
+        VS::Varyings: SamplingVaryings + Clone + Send + Sync,
+    {
+        self.draw_with_sampling(framebuffer, &mesh.vertices, &mesh.triangles, uniforms);
     }
 }
 
@@ -422,8 +533,49 @@ where
             vertex.position.x -= tile.x as f32;
             vertex.position.y -= tile.y as f32;
         }
-        rasterize_triangle_with_derivatives(&mut framebuffer, triangle, |varyings, derivatives| {
-            fragment.run_with_derivatives(&varyings, &derivatives, uniforms)
+        rasterize_triangle(&mut framebuffer, triangle, |varyings| {
+            fragment.run(&varyings, uniforms)
+        });
+    }
+
+    TileResult {
+        x: tile.x,
+        y: tile.y,
+        framebuffer,
+    }
+}
+
+fn rasterize_tile_with_sampling<V, FS, Uniforms>(
+    tile: &Tile,
+    prepared: &[PreparedTriangle<V>],
+    source: &Framebuffer,
+    uniforms: &Uniforms,
+    fragment: &FS,
+) -> TileResult
+where
+    V: SamplingVaryings + Clone,
+    FS: SampledFragmentStage<V, Uniforms>,
+{
+    let mut framebuffer = Framebuffer::new(tile.width, tile.height);
+    for row in 0..tile.height {
+        let source_start = (tile.y + row) * source.width + tile.x;
+        let source_end = source_start + tile.width;
+        let destination_start = row * tile.width;
+        let destination_end = destination_start + tile.width;
+        framebuffer.color[destination_start..destination_end]
+            .copy_from_slice(&source.color[source_start..source_end]);
+        framebuffer.depth[destination_start..destination_end]
+            .copy_from_slice(&source.depth[source_start..source_end]);
+    }
+
+    for &triangle_index in &tile.triangles {
+        let mut triangle = prepared[triangle_index].vertices.clone();
+        for vertex in &mut triangle {
+            vertex.position.x -= tile.x as f32;
+            vertex.position.y -= tile.y as f32;
+        }
+        rasterize_triangle_with_sampling(&mut framebuffer, triangle, |varyings, derivatives| {
+            fragment.run_with_sampling(&varyings, &derivatives, uniforms)
         });
     }
 

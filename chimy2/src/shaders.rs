@@ -8,7 +8,9 @@ use crate::fb::argb8888_linear;
 use crate::image::{Texture, TextureDerivatives, srgb_to_linear};
 use crate::math::{Mat3, Mat4, Vec3, Vec4};
 use crate::mesh::MeshVertex;
-use crate::pipeline::{FragmentStage, Varyings, VertexOutput, VertexStage};
+use crate::pipeline::{
+    FragmentStage, SampledFragmentStage, SamplingVaryings, Varyings, VertexOutput, VertexStage,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FlatColorUniforms {
@@ -157,44 +159,16 @@ pub struct TexturedVaryings {
 }
 
 impl Varyings for TexturedVaryings {
-    type Derivatives = TextureDerivatives;
-
     fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self {
         Self {
             texcoord: a.texcoord * weights.x + b.texcoord * weights.y + c.texcoord * weights.z,
         }
     }
+}
 
-    fn interpolate3(
-        a: &Self,
-        b: &Self,
-        c: &Self,
-        weights: Vec3,
-        inverse_w: Vec3,
-        ddx_weights: Vec3,
-        ddy_weights: Vec3,
-    ) -> (Self, Self::Derivatives) {
-        let corrected = crate::raster::perspective_correct_weights(weights, inverse_w);
-        let uv = Self::lerp3(a, b, c, corrected).texcoord;
-        let q = weights.x * inverse_w.x + weights.y * inverse_w.y + weights.z * inverse_w.z;
-        let q_squared = q * q;
-        let derivative = |gradient: Vec3| {
-            let dq = gradient.x * inverse_w.x + gradient.y * inverse_w.y + gradient.z * inverse_w.z;
-            let numerator = a.texcoord * (weights.x * inverse_w.x)
-                + b.texcoord * (weights.y * inverse_w.y)
-                + c.texcoord * (weights.z * inverse_w.z);
-            let dn = a.texcoord * (gradient.x * inverse_w.x)
-                + b.texcoord * (gradient.y * inverse_w.y)
-                + c.texcoord * (gradient.z * inverse_w.z);
-            (dn * q - numerator * dq) / q_squared
-        };
-        (
-            Self { texcoord: uv },
-            TextureDerivatives {
-                ddx: derivative(ddx_weights),
-                ddy: derivative(ddy_weights),
-            },
-        )
+impl SamplingVaryings for TexturedVaryings {
+    fn texture_coordinates(&self) -> crate::math::Vec2 {
+        self.texcoord
     }
 }
 
@@ -221,20 +195,31 @@ impl<'a> VertexStage<MeshVertex, TexturedUniforms<'a>> for TexturedShader {
 
 impl<'a> FragmentStage<TexturedVaryings, TexturedUniforms<'a>> for TexturedShader {
     fn run(&self, varyings: &TexturedVaryings, uniforms: &TexturedUniforms<'a>) -> u32 {
-        self.run_with_derivatives(varyings, &TextureDerivatives::default(), uniforms)
+        let pixel = sample_texture(
+            uniforms.texture,
+            varyings.texcoord,
+            uniforms.filter,
+            TextureDerivatives::default(),
+        );
+        argb8888_linear(pixel[3], [pixel[0], pixel[1], pixel[2]])
     }
+}
 
-    fn run_with_derivatives(
+impl<'a> SampledFragmentStage<TexturedVaryings, TexturedUniforms<'a>> for TexturedShader {
+    fn run_with_sampling(
         &self,
         varyings: &TexturedVaryings,
-        derivatives: &TextureDerivatives,
+        derivatives: &crate::pipeline::SampleDerivatives,
         uniforms: &TexturedUniforms<'a>,
     ) -> u32 {
         let pixel = sample_texture(
             uniforms.texture,
             varyings.texcoord,
             uniforms.filter,
-            *derivatives,
+            TextureDerivatives {
+                ddx: derivatives.ddx,
+                ddy: derivatives.ddy,
+            },
         );
         argb8888_linear(pixel[3], [pixel[0], pixel[1], pixel[2]])
     }
@@ -403,8 +388,6 @@ pub struct BlinnPhongVaryings {
 }
 
 impl Varyings for BlinnPhongVaryings {
-    type Derivatives = ();
-
     fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self {
         Self {
             world_position: a.world_position * weights.x
@@ -587,8 +570,6 @@ pub struct TexturedBlinnPhongVaryings {
 }
 
 impl Varyings for TexturedBlinnPhongVaryings {
-    type Derivatives = TextureDerivatives;
-
     fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self {
         Self {
             world_position: a.world_position * weights.x
@@ -598,37 +579,11 @@ impl Varyings for TexturedBlinnPhongVaryings {
             texcoord: a.texcoord * weights.x + b.texcoord * weights.y + c.texcoord * weights.z,
         }
     }
+}
 
-    fn interpolate3(
-        a: &Self,
-        b: &Self,
-        c: &Self,
-        weights: Vec3,
-        inverse_w: Vec3,
-        ddx_weights: Vec3,
-        ddy_weights: Vec3,
-    ) -> (Self, Self::Derivatives) {
-        let corrected = crate::raster::perspective_correct_weights(weights, inverse_w);
-        let value = Self::lerp3(a, b, c, corrected);
-        let q = weights.x * inverse_w.x + weights.y * inverse_w.y + weights.z * inverse_w.z;
-        let q_squared = q * q;
-        let derivative = |gradient: Vec3| {
-            let dq = gradient.x * inverse_w.x + gradient.y * inverse_w.y + gradient.z * inverse_w.z;
-            let numerator = a.texcoord * (weights.x * inverse_w.x)
-                + b.texcoord * (weights.y * inverse_w.y)
-                + c.texcoord * (weights.z * inverse_w.z);
-            let dn = a.texcoord * (gradient.x * inverse_w.x)
-                + b.texcoord * (gradient.y * inverse_w.y)
-                + c.texcoord * (gradient.z * inverse_w.z);
-            (dn * q - numerator * dq) / q_squared
-        };
-        (
-            value,
-            TextureDerivatives {
-                ddx: derivative(ddx_weights),
-                ddy: derivative(ddy_weights),
-            },
-        )
+impl SamplingVaryings for TexturedBlinnPhongVaryings {
+    fn texture_coordinates(&self) -> crate::math::Vec2 {
+        self.texcoord
     }
 }
 
@@ -660,20 +615,40 @@ impl<'a> FragmentStage<TexturedBlinnPhongVaryings, TexturedBlinnPhongUniforms<'a
         varyings: &TexturedBlinnPhongVaryings,
         uniforms: &TexturedBlinnPhongUniforms<'a>,
     ) -> u32 {
-        self.run_with_derivatives(varyings, &TextureDerivatives::default(), uniforms)
+        let pixel = sample_texture(
+            uniforms.texture,
+            varyings.texcoord,
+            uniforms.filter,
+            TextureDerivatives::default(),
+        );
+        let albedo = Vec3::new(pixel[0], pixel[1], pixel[2]);
+        let lighted = evaluate_lighting(
+            varyings.world_position,
+            varyings.normal,
+            &uniforms.lighting,
+            albedo,
+        );
+        argb8888_linear(pixel[3], [lighted.x, lighted.y, lighted.z])
     }
+}
 
-    fn run_with_derivatives(
+impl<'a> SampledFragmentStage<TexturedBlinnPhongVaryings, TexturedBlinnPhongUniforms<'a>>
+    for TexturedBlinnPhongShader
+{
+    fn run_with_sampling(
         &self,
         varyings: &TexturedBlinnPhongVaryings,
-        derivatives: &TextureDerivatives,
+        derivatives: &crate::pipeline::SampleDerivatives,
         uniforms: &TexturedBlinnPhongUniforms<'a>,
     ) -> u32 {
         let pixel = sample_texture(
             uniforms.texture,
             varyings.texcoord,
             uniforms.filter,
-            *derivatives,
+            TextureDerivatives {
+                ddx: derivatives.ddx,
+                ddy: derivatives.ddy,
+            },
         );
         let albedo = Vec3::new(pixel[0], pixel[1], pixel[2]);
         let lighted = evaluate_lighting(

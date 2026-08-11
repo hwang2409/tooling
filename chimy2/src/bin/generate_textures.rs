@@ -32,8 +32,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     for (name, texture) in [("checker", checker), ("gradient", gradient)] {
         fs::write(assets.join(format!("{name}.qoi")), encode_qoi(&texture)?)?;
-        let mut ppm = format!("P6\n{} {}\n255\n", texture.width, texture.height).into_bytes();
-        for pixel in texture.pixels {
+        let mut ppm = format!("P6\n{} {}\n255\n", texture.width(), texture.height()).into_bytes();
+        for pixel in texture.pixels() {
             ppm.extend_from_slice(&pixel[..3]);
         }
         fs::write(assets.join(format!("{name}.ppm")), ppm)?;

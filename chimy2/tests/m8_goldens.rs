@@ -87,13 +87,13 @@ fn minified_checkerboard_aliased_and_trilinear_goldens() {
     let mut aliased = background();
     let mut trilinear = background();
     let mut aliased_pipeline = Pipeline::new(TexturedShader, TexturedShader);
-    aliased_pipeline.draw_mesh(
+    aliased_pipeline.draw_mesh_with_sampling(
         &mut aliased,
         &mesh,
         &TexturedUniforms::new(transform, &texture, TextureFilter::Bilinear),
     );
     let mut trilinear_pipeline = Pipeline::new(TexturedShader, TexturedShader);
-    trilinear_pipeline.draw_mesh(
+    trilinear_pipeline.draw_mesh_with_sampling(
         &mut trilinear,
         &mesh,
         &TexturedUniforms::new(transform, &texture, TextureFilter::Trilinear),
@@ -130,6 +130,6 @@ fn srgb_gradient_lighting_golden() {
     let mut framebuffer = background();
     let uniforms = TexturedBlinnPhongUniforms::new(lighting, &texture, TextureFilter::Bilinear);
     let mut pipeline = Pipeline::new(TexturedBlinnPhongShader, TexturedBlinnPhongShader);
-    pipeline.draw_mesh(&mut framebuffer, &foreshortened_quad(), &uniforms);
+    pipeline.draw_mesh_with_sampling(&mut framebuffer, &foreshortened_quad(), &uniforms);
     assert_golden("m8-srgb-gradient-lit", &framebuffer);
 }

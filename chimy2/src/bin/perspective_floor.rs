@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             framebuffer.clear(argb8888(255, 22, 30, 42));
             let mut pipeline = Pipeline::new(TexturedShader, TexturedShader);
-            pipeline.draw_mesh(framebuffer, &floor, &uniforms);
+            pipeline.draw_mesh_with_sampling(framebuffer, &floor, &uniforms);
         },
     )
 }

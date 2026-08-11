@@ -49,9 +49,9 @@ pub enum WrapMode {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Texture {
-    pub width: usize,
-    pub height: usize,
-    pub pixels: Vec<[u8; 4]>,
+    width: usize,
+    height: usize,
+    pixels: Vec<[u8; 4]>,
     pub wrap_mode: WrapMode,
     linear_mips: Vec<MipLevel>,
 }
@@ -131,6 +131,60 @@ impl Texture {
         self.wrap_mode = wrap_mode;
     }
 
+    pub const fn width(&self) -> usize {
+        self.width
+    }
+
+    pub const fn height(&self) -> usize {
+        self.height
+    }
+
+    pub fn pixels(&self) -> &[[u8; 4]] {
+        &self.pixels
+    }
+
+    pub fn set_pixel(&mut self, x: usize, y: usize, pixel: [u8; 4]) {
+        self.pixels[y * self.width + x] = pixel;
+        self.rebuild_mips();
+    }
+
+    pub fn set_pixels(&mut self, pixels: Vec<[u8; 4]>) -> Result<(), ImageError> {
+        let expected = self
+            .width
+            .checked_mul(self.height)
+            .ok_or_else(|| ImageError::new(0, "texture dimensions overflow the pixel count"))?;
+        if pixels.len() != expected {
+            return Err(ImageError::new(
+                0,
+                format!(
+                    "texture has {} pixels, expected {expected} for {}x{}",
+                    pixels.len(),
+                    self.width,
+                    self.height
+                ),
+            ));
+        }
+        self.pixels = pixels;
+        self.rebuild_mips();
+        Ok(())
+    }
+
+    pub fn rebuild_mips(&mut self) {
+        let linear_pixels = self
+            .pixels
+            .iter()
+            .map(|&pixel| {
+                [
+                    srgb_to_linear_u8(pixel[0]),
+                    srgb_to_linear_u8(pixel[1]),
+                    srgb_to_linear_u8(pixel[2]),
+                    f32::from(pixel[3]) / 255.0,
+                ]
+            })
+            .collect::<Vec<_>>();
+        self.linear_mips = build_mip_chain(self.width, self.height, linear_pixels);
+    }
+
     pub fn pixel(&self, x: usize, y: usize) -> [u8; 4] {
         self.pixels[y * self.width + x]
     }
@@ -195,11 +249,7 @@ impl Texture {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct TextureDerivatives {
-    pub ddx: Vec2,
-    pub ddy: Vec2,
-}
+pub type TextureDerivatives = crate::pipeline::SampleDerivatives;
 
 pub fn lod_from_derivatives(width: usize, height: usize, derivatives: TextureDerivatives) -> f32 {
     let dx = Vec2::new(
@@ -663,7 +713,7 @@ mod tests {
         ]);
         let texture = decode_qoi(&with_marker(bytes)).unwrap();
         assert_eq!(
-            texture.pixels,
+            texture.pixels(),
             vec![
                 [1, 2, 3, 255],
                 [0, 0, 0, 0],
@@ -694,7 +744,7 @@ mod tests {
         )
         .unwrap();
         let encoded = encode_qoi(&texture).unwrap();
-        assert_eq!(decode_qoi(&encoded).unwrap().pixels, texture.pixels);
+        assert_eq!(decode_qoi(&encoded).unwrap().pixels(), texture.pixels());
     }
 
     #[test]
@@ -715,7 +765,7 @@ mod tests {
         )
         .unwrap();
         let encoded = encode_qoi(&texture).unwrap();
-        assert_eq!(decode_qoi(&encoded).unwrap().pixels, texture.pixels);
+        assert_eq!(decode_qoi(&encoded).unwrap().pixels(), texture.pixels());
     }
 
     #[test]
@@ -723,7 +773,7 @@ mod tests {
         let mut bytes = qoi_header(2, 1, 4);
         bytes.extend_from_slice(&[0xc0, 0x35]);
         let texture = decode_qoi(&with_marker(bytes)).unwrap();
-        assert_eq!(texture.pixels, vec![[0, 0, 0, 255], [0, 0, 0, 255]]);
+        assert_eq!(texture.pixels(), &[[0, 0, 0, 255], [0, 0, 0, 255]]);
     }
 
     #[test]
@@ -888,6 +938,30 @@ mod tests {
         assert!((final_pixel[0] - (0.5 + midpoint / 2.0) / 2.0).abs() < 1e-6);
         assert!((final_pixel[1] - (0.25 + (1.0 + midpoint) / 2.0) / 2.0).abs() < 1e-6);
         assert!((final_pixel[2] - (0.5 + midpoint / 2.0) / 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn set_pixel_rebuilds_mips_immediately() {
+        let mut texture = Texture::new(2, 1, vec![[0, 0, 0, 255]; 2]).unwrap();
+        texture.set_pixel(0, 0, [255, 0, 0, 255]);
+        assert_eq!(texture.pixel(0, 0), [255, 0, 0, 255]);
+        assert_eq!(
+            texture.mip_level(0).unwrap().pixels[0],
+            [1.0, 0.0, 0.0, 1.0]
+        );
+        assert!((texture.mip_level(1).unwrap().pixels[0][0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn set_pixels_rebuilds_mips_immediately() {
+        let mut texture = Texture::new(2, 1, vec![[0, 0, 0, 255]; 2]).unwrap();
+        texture
+            .set_pixels(vec![[0, 255, 0, 255], [0, 0, 255, 255]])
+            .unwrap();
+        assert_eq!(texture.pixels(), &[[0, 255, 0, 255], [0, 0, 255, 255]]);
+        let mip = texture.mip_level(1).unwrap().pixels[0];
+        assert!((mip[1] - 0.5).abs() < 1e-6);
+        assert!((mip[2] - 0.5).abs() < 1e-6);
     }
 
     #[test]

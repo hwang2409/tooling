@@ -5,7 +5,7 @@
 
 use crate::fb::Framebuffer;
 use crate::math::{Vec3, Vec4};
-use crate::pipeline::Varyings;
+use crate::pipeline::{SampleDerivatives, SamplingVaryings, Varyings};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScreenVertex<V> {
@@ -169,17 +169,16 @@ pub fn rasterize_triangle<V, F>(
 }
 
 /// Rasterizes one triangle and passes sampler-facing derivatives with each
-/// fragment. The raster core computes perspective-correct derivatives, while
-/// each varying type controls which derivative data reaches its shader.
-pub fn rasterize_triangle_with_derivatives<V, F>(
+/// fragment. Only sampling varyings opt into this channel.
+pub fn rasterize_triangle_with_sampling<V, F>(
     framebuffer: &mut Framebuffer,
     vertices: [ScreenVertex<V>; 3],
     fragment: F,
 ) where
-    V: Varyings,
-    F: FnMut(V, V::Derivatives) -> u32,
+    V: SamplingVaryings,
+    F: FnMut(V, SampleDerivatives) -> u32,
 {
-    rasterize_triangle_in_rect_with_derivatives(
+    rasterize_triangle_in_rect_with_sampling(
         framebuffer,
         vertices,
         PixelRect {
@@ -203,24 +202,22 @@ pub(crate) fn rasterize_triangle_in_rect<V, F>(
     framebuffer: &mut Framebuffer,
     vertices: [ScreenVertex<V>; 3],
     rect: PixelRect,
-    mut fragment: F,
+    fragment: F,
 ) where
     V: Varyings,
     F: FnMut(V) -> u32,
 {
-    rasterize_triangle_in_rect_with_derivatives(framebuffer, vertices, rect, |varyings, _| {
-        fragment(varyings)
-    });
+    rasterize_triangle_in_rect_plain(framebuffer, vertices, rect, fragment);
 }
 
-pub(crate) fn rasterize_triangle_in_rect_with_derivatives<V, F>(
+fn rasterize_triangle_in_rect_plain<V, F>(
     framebuffer: &mut Framebuffer,
     mut vertices: [ScreenVertex<V>; 3],
     rect: PixelRect,
     mut fragment: F,
 ) where
     V: Varyings,
-    F: FnMut(V, V::Derivatives) -> u32,
+    F: FnMut(V) -> u32,
 {
     let mut area = edge(
         vertices[0].position,
@@ -255,21 +252,87 @@ pub(crate) fn rasterize_triangle_in_rect_with_derivatives<V, F>(
     for y in min_y..=max_y {
         for x in min_x..=max_x {
             let point = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, 0.0);
-            let weights = Vec3::new(
-                edge(vertices[1].position, vertices[2].position, point) / area,
-                edge(vertices[2].position, vertices[0].position, point) / area,
-                edge(vertices[0].position, vertices[1].position, point) / area,
+            let weights = barycentric_weights(&vertices, point, area);
+            if !covered(weights, area, top_left_0, top_left_1, top_left_2) {
+                continue;
+            }
+            let depth = interpolated_depth(&vertices, weights);
+            let Ok(x) = usize::try_from(x) else { continue };
+            let Ok(y) = usize::try_from(y) else { continue };
+            let Some(index) = y
+                .checked_mul(framebuffer.width)
+                .and_then(|row| row.checked_add(x))
+            else {
+                continue;
+            };
+            let Some(buffer_depth) = framebuffer.depth.get_mut(index) else {
+                continue;
+            };
+            if depth >= *buffer_depth {
+                continue;
+            }
+            let varyings = V::lerp3(
+                &vertices[0].varyings,
+                &vertices[1].varyings,
+                &vertices[2].varyings,
+                perspective_correct_weights(weights, inverse_w(&vertices)),
             );
-            if !inside(weights.x * area, top_left_0)
-                || !inside(weights.y * area, top_left_1)
-                || !inside(weights.z * area, top_left_2)
-            {
+            *buffer_depth = depth;
+            if let Some(color) = framebuffer.color.get_mut(index) {
+                *color = fragment(varyings);
+            }
+        }
+    }
+}
+
+pub(crate) fn rasterize_triangle_in_rect_with_sampling<V, F>(
+    framebuffer: &mut Framebuffer,
+    mut vertices: [ScreenVertex<V>; 3],
+    rect: PixelRect,
+    mut fragment: F,
+) where
+    V: SamplingVaryings,
+    F: FnMut(V, SampleDerivatives) -> u32,
+{
+    let mut area = edge(
+        vertices[0].position,
+        vertices[1].position,
+        vertices[2].position,
+    );
+    if !area.is_finite() || area == 0.0 {
+        return;
+    }
+    if area < 0.0 {
+        vertices.swap(1, 2);
+        area = -area;
+    }
+
+    if framebuffer.width == 0 || framebuffer.height == 0 || rect.is_empty() {
+        return;
+    }
+
+    let bounds = triangle_pixel_rect(&vertices, framebuffer.width, framebuffer.height);
+    let min_x = bounds.min_x.max(rect.min_x);
+    let max_x = bounds.max_x.min(rect.max_x);
+    let min_y = bounds.min_y.max(rect.min_y);
+    let max_y = bounds.max_y.min(rect.max_y);
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
+
+    let top_left_0 = is_top_left(vertices[1].position, vertices[2].position);
+    let top_left_1 = is_top_left(vertices[2].position, vertices[0].position);
+    let top_left_2 = is_top_left(vertices[0].position, vertices[1].position);
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let point = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, 0.0);
+            let weights = barycentric_weights(&vertices, point, area);
+            if !covered(weights, area, top_left_0, top_left_1, top_left_2) {
                 continue;
             }
 
-            let depth = vertices[0].position.z * weights.x
-                + vertices[1].position.z * weights.y
-                + vertices[2].position.z * weights.z;
+            let depth = interpolated_depth(&vertices, weights);
             let Ok(x) = usize::try_from(x) else { continue };
             let Ok(y) = usize::try_from(y) else { continue };
             let Some(index) = y
@@ -294,25 +357,77 @@ pub(crate) fn rasterize_triangle_in_rect_with_derivatives<V, F>(
                 (vertices[0].position.x - vertices[2].position.x) / area,
                 (vertices[1].position.x - vertices[0].position.x) / area,
             );
-            let inverse_w = Vec3::new(
-                vertices[0].inverse_w,
-                vertices[1].inverse_w,
-                vertices[2].inverse_w,
-            );
-            let (varyings, derivatives) = V::interpolate3(
+            let inverse_w = inverse_w(&vertices);
+            let varyings = V::lerp3(
                 &vertices[0].varyings,
                 &vertices[1].varyings,
                 &vertices[2].varyings,
-                weights,
-                inverse_w,
-                ddx_weights,
-                ddy_weights,
+                perspective_correct_weights(weights, inverse_w),
             );
+            let derivatives =
+                texture_derivatives(&vertices, weights, inverse_w, ddx_weights, ddy_weights);
             *buffer_depth = depth;
             if let Some(color) = framebuffer.color.get_mut(index) {
                 *color = fragment(varyings, derivatives);
             }
         }
+    }
+}
+
+fn barycentric_weights<V>(vertices: &[ScreenVertex<V>; 3], point: Vec3, area: f32) -> Vec3 {
+    Vec3::new(
+        edge(vertices[1].position, vertices[2].position, point) / area,
+        edge(vertices[2].position, vertices[0].position, point) / area,
+        edge(vertices[0].position, vertices[1].position, point) / area,
+    )
+}
+
+fn covered(weights: Vec3, area: f32, top_left_0: bool, top_left_1: bool, top_left_2: bool) -> bool {
+    inside(weights.x * area, top_left_0)
+        && inside(weights.y * area, top_left_1)
+        && inside(weights.z * area, top_left_2)
+}
+
+fn interpolated_depth<V>(vertices: &[ScreenVertex<V>; 3], weights: Vec3) -> f32 {
+    vertices[0].position.z * weights.x
+        + vertices[1].position.z * weights.y
+        + vertices[2].position.z * weights.z
+}
+
+fn inverse_w<V>(vertices: &[ScreenVertex<V>; 3]) -> Vec3 {
+    Vec3::new(
+        vertices[0].inverse_w,
+        vertices[1].inverse_w,
+        vertices[2].inverse_w,
+    )
+}
+
+fn texture_derivatives<V: SamplingVaryings>(
+    vertices: &[ScreenVertex<V>; 3],
+    weights: Vec3,
+    inverse_w: Vec3,
+    ddx_weights: Vec3,
+    ddy_weights: Vec3,
+) -> SampleDerivatives {
+    let coordinates = [
+        vertices[0].varyings.texture_coordinates(),
+        vertices[1].varyings.texture_coordinates(),
+        vertices[2].varyings.texture_coordinates(),
+    ];
+    let q = weights.x * inverse_w.x + weights.y * inverse_w.y + weights.z * inverse_w.z;
+    let numerator = coordinates[0] * (weights.x * inverse_w.x)
+        + coordinates[1] * (weights.y * inverse_w.y)
+        + coordinates[2] * (weights.z * inverse_w.z);
+    let derivative = |gradient: Vec3| {
+        let dq = gradient.x * inverse_w.x + gradient.y * inverse_w.y + gradient.z * inverse_w.z;
+        let dn = coordinates[0] * (gradient.x * inverse_w.x)
+            + coordinates[1] * (gradient.y * inverse_w.y)
+            + coordinates[2] * (gradient.z * inverse_w.z);
+        (dn * q - numerator * dq) / (q * q)
+    };
+    SampleDerivatives {
+        ddx: derivative(ddx_weights),
+        ddy: derivative(ddy_weights),
     }
 }
 

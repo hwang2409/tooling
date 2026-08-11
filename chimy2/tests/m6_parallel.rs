@@ -385,7 +385,7 @@ fn m5_perspective(thread_count: usize) -> Framebuffer {
     let mut framebuffer = textured_background();
     let mut pipeline = Pipeline::new(TexturedShader, TexturedShader);
     pipeline.set_thread_count(thread_count);
-    pipeline.draw_mesh(
+    pipeline.draw_mesh_with_sampling(
         &mut framebuffer,
         &textured_quad(),
         &TexturedUniforms::new(camera.view_projection(), &texture, TextureFilter::Nearest),
@@ -408,7 +408,7 @@ fn m5_gradient(thread_count: usize, filter: TextureFilter) -> Framebuffer {
     let mut framebuffer = textured_background();
     let mut pipeline = Pipeline::new(TexturedShader, TexturedShader);
     pipeline.set_thread_count(thread_count);
-    pipeline.draw_mesh(
+    pipeline.draw_mesh_with_sampling(
         &mut framebuffer,
         &textured_quad(),
         &TexturedUniforms::new(camera.view_projection(), &texture, filter),
@@ -460,7 +460,7 @@ fn m5_lit(thread_count: usize) -> Framebuffer {
     let mut framebuffer = textured_background();
     let mut pipeline = Pipeline::new(TexturedBlinnPhongShader, TexturedBlinnPhongShader);
     pipeline.set_thread_count(thread_count);
-    pipeline.draw_mesh(
+    pipeline.draw_mesh_with_sampling(
         &mut framebuffer,
         &textured_quad(),
         &TexturedBlinnPhongUniforms::new(lighting, &texture, TextureFilter::Bilinear),
