@@ -207,92 +207,61 @@ pub(crate) fn rasterize_triangle_in_rect<V, F>(
     V: Varyings,
     F: FnMut(V) -> u32,
 {
-    rasterize_triangle_in_rect_plain(framebuffer, vertices, rect, fragment);
-}
-
-fn rasterize_triangle_in_rect_plain<V, F>(
-    framebuffer: &mut Framebuffer,
-    mut vertices: [ScreenVertex<V>; 3],
-    rect: PixelRect,
-    mut fragment: F,
-) where
-    V: Varyings,
-    F: FnMut(V) -> u32,
-{
-    let mut area = edge(
-        vertices[0].position,
-        vertices[1].position,
-        vertices[2].position,
-    );
-    if !area.is_finite() || area == 0.0 {
-        return;
-    }
-    if area < 0.0 {
-        vertices.swap(1, 2);
-        area = -area;
-    }
-
-    if framebuffer.width == 0 || framebuffer.height == 0 || rect.is_empty() {
-        return;
-    }
-
-    let bounds = triangle_pixel_rect(&vertices, framebuffer.width, framebuffer.height);
-    let min_x = bounds.min_x.max(rect.min_x);
-    let max_x = bounds.max_x.min(rect.max_x);
-    let min_y = bounds.min_y.max(rect.min_y);
-    let max_y = bounds.max_y.min(rect.max_y);
-    if min_x > max_x || min_y > max_y {
-        return;
-    }
-
-    let top_left_0 = is_top_left(vertices[1].position, vertices[2].position);
-    let top_left_1 = is_top_left(vertices[2].position, vertices[0].position);
-    let top_left_2 = is_top_left(vertices[0].position, vertices[1].position);
-
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let point = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, 0.0);
-            let weights = barycentric_weights(&vertices, point, area);
-            if !covered(weights, area, top_left_0, top_left_1, top_left_2) {
-                continue;
-            }
-            let depth = interpolated_depth(&vertices, weights);
-            let Ok(x) = usize::try_from(x) else { continue };
-            let Ok(y) = usize::try_from(y) else { continue };
-            let Some(index) = y
-                .checked_mul(framebuffer.width)
-                .and_then(|row| row.checked_add(x))
-            else {
-                continue;
-            };
-            let Some(buffer_depth) = framebuffer.depth.get_mut(index) else {
-                continue;
-            };
-            if depth >= *buffer_depth {
-                continue;
-            }
-            let varyings = V::lerp3(
+    rasterize_triangle_in_rect_core(
+        framebuffer,
+        vertices,
+        rect,
+        |vertices, weights, inverse_w, _, _| {
+            V::lerp3(
                 &vertices[0].varyings,
                 &vertices[1].varyings,
                 &vertices[2].varyings,
-                perspective_correct_weights(weights, inverse_w(&vertices)),
-            );
-            *buffer_depth = depth;
-            if let Some(color) = framebuffer.color.get_mut(index) {
-                *color = fragment(varyings);
-            }
-        }
-    }
+                perspective_correct_weights(weights, inverse_w),
+            )
+        },
+        fragment,
+    );
 }
 
 pub(crate) fn rasterize_triangle_in_rect_with_sampling<V, F>(
     framebuffer: &mut Framebuffer,
-    mut vertices: [ScreenVertex<V>; 3],
+    vertices: [ScreenVertex<V>; 3],
     rect: PixelRect,
     mut fragment: F,
 ) where
     V: SamplingVaryings,
     F: FnMut(V, SampleDerivatives) -> u32,
+{
+    rasterize_triangle_in_rect_core(
+        framebuffer,
+        vertices,
+        rect,
+        |vertices, weights, inverse_w, ddx_weights, ddy_weights| {
+            let varyings = V::lerp3(
+                &vertices[0].varyings,
+                &vertices[1].varyings,
+                &vertices[2].varyings,
+                perspective_correct_weights(weights, inverse_w),
+            );
+            (
+                varyings,
+                texture_derivatives(vertices, weights, inverse_w, ddx_weights, ddy_weights),
+            )
+        },
+        |(varyings, derivatives)| fragment(varyings, derivatives),
+    );
+}
+
+fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment>(
+    framebuffer: &mut Framebuffer,
+    mut vertices: [ScreenVertex<V>; 3],
+    rect: PixelRect,
+    mut interpolate: Interpolate,
+    mut fragment: Fragment,
+) where
+    V: Varyings,
+    Interpolate: FnMut(&[ScreenVertex<V>; 3], Vec3, Vec3, Vec3, Vec3) -> Input,
+    Fragment: FnMut(Input) -> u32,
 {
     let mut area = edge(
         vertices[0].position,
@@ -358,17 +327,10 @@ pub(crate) fn rasterize_triangle_in_rect_with_sampling<V, F>(
                 (vertices[1].position.x - vertices[0].position.x) / area,
             );
             let inverse_w = inverse_w(&vertices);
-            let varyings = V::lerp3(
-                &vertices[0].varyings,
-                &vertices[1].varyings,
-                &vertices[2].varyings,
-                perspective_correct_weights(weights, inverse_w),
-            );
-            let derivatives =
-                texture_derivatives(&vertices, weights, inverse_w, ddx_weights, ddy_weights);
+            let input = interpolate(&vertices, weights, inverse_w, ddx_weights, ddy_weights);
             *buffer_depth = depth;
             if let Some(color) = framebuffer.color.get_mut(index) {
-                *color = fragment(varyings, derivatives);
+                *color = fragment(input);
             }
         }
     }

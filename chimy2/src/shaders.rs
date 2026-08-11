@@ -172,6 +172,25 @@ impl SamplingVaryings for TexturedVaryings {
     }
 }
 
+/// A textured shader must use [`Pipeline::draw_with_sampling`] or
+/// [`Pipeline::draw_mesh_with_sampling`]. It has no plain fragment-stage
+/// implementation, so a plain draw cannot silently lose its LOD derivatives.
+///
+/// ```compile_fail
+/// use chimy2::fb::Framebuffer;
+/// use chimy2::image::Texture;
+/// use chimy2::math::Mat4;
+/// use chimy2::mesh::Mesh;
+/// use chimy2::pipeline::Pipeline;
+/// use chimy2::shaders::{TextureFilter, TexturedShader, TexturedUniforms};
+///
+/// let texture = Texture::new(1, 1, vec![[255, 255, 255, 255]]).unwrap();
+/// let mesh = Mesh::parse("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
+/// let mut framebuffer = Framebuffer::new(4, 4);
+/// let mut pipeline = Pipeline::new(TexturedShader, TexturedShader);
+/// let uniforms = TexturedUniforms::new(Mat4::IDENTITY, &texture, TextureFilter::Trilinear);
+/// pipeline.draw_mesh(&mut framebuffer, &mesh, &uniforms);
+/// ```
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TexturedShader;
 
@@ -190,18 +209,6 @@ impl<'a> VertexStage<MeshVertex, TexturedUniforms<'a>> for TexturedShader {
                 texcoord: vertex.texcoord.unwrap_or(crate::math::Vec2::ZERO),
             },
         )
-    }
-}
-
-impl<'a> FragmentStage<TexturedVaryings, TexturedUniforms<'a>> for TexturedShader {
-    fn run(&self, varyings: &TexturedVaryings, uniforms: &TexturedUniforms<'a>) -> u32 {
-        let pixel = sample_texture(
-            uniforms.texture,
-            varyings.texcoord,
-            uniforms.filter,
-            TextureDerivatives::default(),
-        );
-        argb8888_linear(pixel[3], [pixel[0], pixel[1], pixel[2]])
     }
 }
 
@@ -604,31 +611,6 @@ impl<'a> VertexStage<MeshVertex, TexturedBlinnPhongUniforms<'a>> for TexturedBli
                 texcoord: vertex.texcoord.unwrap_or(crate::math::Vec2::ZERO),
             },
         )
-    }
-}
-
-impl<'a> FragmentStage<TexturedBlinnPhongVaryings, TexturedBlinnPhongUniforms<'a>>
-    for TexturedBlinnPhongShader
-{
-    fn run(
-        &self,
-        varyings: &TexturedBlinnPhongVaryings,
-        uniforms: &TexturedBlinnPhongUniforms<'a>,
-    ) -> u32 {
-        let pixel = sample_texture(
-            uniforms.texture,
-            varyings.texcoord,
-            uniforms.filter,
-            TextureDerivatives::default(),
-        );
-        let albedo = Vec3::new(pixel[0], pixel[1], pixel[2]);
-        let lighted = evaluate_lighting(
-            varyings.world_position,
-            varyings.normal,
-            &uniforms.lighting,
-            albedo,
-        );
-        argb8888_linear(pixel[3], [lighted.x, lighted.y, lighted.z])
     }
 }
 
