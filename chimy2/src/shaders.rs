@@ -12,6 +12,7 @@ use crate::pipeline::{
     FragmentStage, SampledFragmentStage, SamplingVaryings, Varyings, VertexOutput, VertexStage,
 };
 use crate::shadow::{ShadowMap, ShadowState};
+use crate::skybox::CubeTexture;
 
 pub mod shader_pack;
 pub use shader_pack::{
@@ -796,6 +797,106 @@ impl BlinnPhongShader {
     }
 }
 
+/// Blinn-Phong lighting with a linear-space cube-map reflection mix.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvironmentBlinnPhongUniforms<'a> {
+    pub lighting: BlinnPhongUniforms,
+    pub environment: &'a CubeTexture,
+    reflectivity: f32,
+}
+
+impl<'a> EnvironmentBlinnPhongUniforms<'a> {
+    pub fn new(
+        lighting: BlinnPhongUniforms,
+        environment: &'a CubeTexture,
+        reflectivity: f32,
+    ) -> Self {
+        Self {
+            lighting,
+            environment,
+            reflectivity: sanitize_unit(reflectivity),
+        }
+    }
+
+    pub const fn reflectivity(&self) -> f32 {
+        self.reflectivity
+    }
+
+    pub fn set_reflectivity(&mut self, reflectivity: f32) {
+        self.reflectivity = sanitize_unit(reflectivity);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EnvironmentBlinnPhongShader;
+
+impl<'a> VertexStage<MeshVertex, EnvironmentBlinnPhongUniforms<'a>>
+    for EnvironmentBlinnPhongShader
+{
+    type Varyings = BlinnPhongVaryings;
+
+    fn run(
+        &self,
+        vertex: &MeshVertex,
+        uniforms: &EnvironmentBlinnPhongUniforms<'a>,
+    ) -> VertexOutput<Self::Varyings> {
+        let prepared = prepare_blinn_phong_vertex(vertex, &uniforms.lighting);
+        VertexOutput::new(
+            prepared.clip_position,
+            BlinnPhongVaryings {
+                world_position: prepared.world_position,
+                normal: prepared.normal,
+                light_space_position: prepared.light_space_position,
+            },
+        )
+    }
+}
+
+impl<'a> FragmentStage<BlinnPhongVaryings, EnvironmentBlinnPhongUniforms<'a>>
+    for EnvironmentBlinnPhongShader
+{
+    fn run(
+        &self,
+        varyings: &BlinnPhongVaryings,
+        uniforms: &EnvironmentBlinnPhongUniforms<'a>,
+    ) -> u32 {
+        let lit = evaluate_lighting(
+            varyings.world_position,
+            varyings.normal,
+            varyings.light_space_position,
+            &uniforms.lighting,
+            Vec3::new(1.0, 1.0, 1.0),
+        );
+        let normal = varyings.normal.normalize();
+        let view_direction =
+            (uniforms.lighting.camera_position - varyings.world_position).normalize();
+        let reflected_direction = reflection_vector(view_direction, normal);
+        let environment = uniforms.environment.sample(reflected_direction);
+        let reflectivity = uniforms.reflectivity;
+        let color = lit * (1.0 - reflectivity)
+            + Vec3::new(environment[0], environment[1], environment[2]) * reflectivity;
+        argb8888_linear(uniforms.lighting.alpha, [color.x, color.y, color.z])
+    }
+
+    fn is_opaque(&self, uniforms: &EnvironmentBlinnPhongUniforms<'a>) -> bool {
+        uniforms.lighting.alpha == 1.0
+    }
+
+    fn model_view(&self, uniforms: &EnvironmentBlinnPhongUniforms<'a>) -> Option<Mat4> {
+        Some(uniforms.lighting.view() * uniforms.lighting.model())
+    }
+}
+
+/// Reflects the incoming camera ray around a surface normal.
+///
+/// `view_direction` points from the surface to the camera. The incident ray
+/// is its negation, so the returned direction points toward the environment.
+pub fn reflection_vector(view_direction: Vec3, normal: Vec3) -> Vec3 {
+    let incident = -view_direction.normalize();
+    let normal = normal.normalize();
+    (incident - normal * (2.0 * incident.dot(normal))).normalize()
+}
+
 fn evaluate_lighting(
     world_position: Vec3,
     interpolated_normal: Vec3,
@@ -1225,6 +1326,14 @@ fn linearize_color(color: Vec3) -> Vec3 {
     )
 }
 
+fn sanitize_unit(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 fn multiply_alpha(color: u32, alpha: f32) -> u32 {
     let [source_alpha, red, green, blue] = color.to_be_bytes();
     crate::fb::argb8888(
@@ -1278,6 +1387,24 @@ mod tests {
         // so N dot H = 0.9238795. With shininess 8, specular is 0.53079,
         // which rounds to 135 in each 8-bit channel.
         assert_eq!(BlinnPhongShader::shade(&varyings, &uniforms()), 0xffc1c1c1);
+    }
+
+    #[test]
+    fn reflection_vector_matches_hand_computed_normal_incidence() {
+        let reflected = reflection_vector(Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, 1.0));
+        assert_eq!(reflected, Vec3::new(0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn reflection_parameter_is_sanitized_at_uniform_boundary() {
+        let cube = crate::skybox::CubeTexture::new(std::array::from_fn(|_| {
+            Texture::new(1, 1, vec![[255, 255, 255, 255]]).unwrap()
+        }))
+        .unwrap();
+        let mut uniforms = EnvironmentBlinnPhongUniforms::new(uniforms(), &cube, f32::NAN);
+        assert_eq!(uniforms.reflectivity(), 0.0);
+        uniforms.set_reflectivity(2.0);
+        assert_eq!(uniforms.reflectivity(), 1.0);
     }
 
     #[test]

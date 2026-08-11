@@ -3,6 +3,7 @@
 //! All color draws use one prepare, classify, schedule, and raster path.
 //! Transparent draws are sorted by view-space centroid depth at frame flush.
 
+use crate::camera::Camera;
 use crate::clip::{ClipVertex, clip_triangle_near, cull_backface};
 use crate::fb::Framebuffer;
 use crate::math::{Mat4, Vec3, Vec4};
@@ -12,6 +13,7 @@ use crate::raster::{
     PixelRect, RasterState, ScreenVertex, rasterize_triangle_with_sampling_state,
     rasterize_triangle_with_state, triangle_pixel_rect, viewport_transform,
 };
+use crate::skybox::{CubeTexture, render_skybox};
 use std::marker::PhantomData;
 use std::thread;
 
@@ -298,6 +300,7 @@ pub struct RenderFrame<'a, VS, FS> {
     pipeline: &'a mut Pipeline<VS, FS>,
     commands: Vec<QueuedCommand<'a, FS>>,
     next_submission_order: usize,
+    skybox: Option<(&'a CubeTexture, Camera)>,
 }
 
 impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
@@ -306,6 +309,7 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
             pipeline,
             commands: Vec::new(),
             next_submission_order: 0,
+            skybox: None,
         }
     }
 
@@ -418,6 +422,21 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
                         .then_with(|| left.submission_order.cmp(&right.submission_order))
                 }
             });
+        let transparent_start = self
+            .commands
+            .iter()
+            .position(|command| command.class == DrawClass::Transparent)
+            .unwrap_or(self.commands.len());
+        for command in self.commands.drain(..transparent_start) {
+            (command.draw)(
+                framebuffer,
+                &self.pipeline.fragment,
+                self.pipeline.thread_count,
+            );
+        }
+        if let Some((cube, camera)) = self.skybox {
+            render_skybox(framebuffer, camera, cube);
+        }
         for command in self.commands.drain(..) {
             (command.draw)(
                 framebuffer,
@@ -433,6 +452,11 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
 }
 
 impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
+    /// Queues a view-rotation-only cube-map background for this frame.
+    pub fn draw_skybox(&mut self, _: &Framebuffer, cube: &'a CubeTexture, camera: Camera) {
+        self.skybox = Some((cube, camera));
+    }
+
     pub fn draw<Vertex, Uniforms>(
         &mut self,
         framebuffer: &Framebuffer,

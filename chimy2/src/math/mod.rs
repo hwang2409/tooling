@@ -454,6 +454,56 @@ impl Mat4 {
         self.upper_left3().inverse().map(Mat3::transpose)
     }
 
+    /// Returns the inverse, or `None` for a singular matrix.
+    pub fn inverse(self) -> Option<Self> {
+        let mut augmented = [[0.0_f32; 8]; 4];
+        for (row, values) in augmented.iter_mut().enumerate() {
+            for (column, value) in values[..4].iter_mut().enumerate() {
+                *value = self.get(row, column);
+            }
+            values[row + 4] = 1.0;
+        }
+
+        for column in 0..4 {
+            let pivot = (column..4).max_by(|&left, &right| {
+                augmented[left][column]
+                    .abs()
+                    .total_cmp(&augmented[right][column].abs())
+            })?;
+            if augmented[pivot][column] == 0.0 || !augmented[pivot][column].is_finite() {
+                return None;
+            }
+            augmented.swap(column, pivot);
+
+            let divisor = augmented[column][column];
+            for value in &mut augmented[column] {
+                *value /= divisor;
+            }
+            let pivot_row = augmented[column];
+            for (row, values) in augmented.iter_mut().enumerate() {
+                if row == column {
+                    continue;
+                }
+                let factor = values[column];
+                for (index, value) in values.iter_mut().enumerate() {
+                    *value -= factor * pivot_row[index];
+                }
+            }
+        }
+
+        let mut inverse = [0.0; 16];
+        for row in 0..4 {
+            for column in 0..4 {
+                inverse[column * 4 + row] = augmented[row][column + 4];
+            }
+        }
+        if inverse.iter().all(|value| value.is_finite()) {
+            Some(Self::new(inverse))
+        } else {
+            None
+        }
+    }
+
     pub fn rotate(axis: Vec3, angle: f32) -> Self {
         Quat::from_axis_angle(axis, angle).to_mat4()
     }
