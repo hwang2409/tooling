@@ -593,15 +593,17 @@ mod tests {
             mesh.vertex(0).unwrap().tangent(),
             Some(Vec4::new(1.0, 0.0, 0.0, 1.0))
         );
-        let rotated_uvs = [
-            Vec2::new(0.0, 0.0),
-            Vec2::new(0.0, 1.0),
-            Vec2::new(1.0, 1.0),
-            Vec2::new(1.0, 0.0),
-        ];
-        for (index, uv) in rotated_uvs.into_iter().enumerate() {
-            assert!(mesh.set_vertex_texcoord(index, Some(uv)));
-        }
+        assert!(mesh.set_vertex_texcoord(1, Some(Vec2::new(0.0, 1.0))));
+        assert_eq!(
+            mesh.vertex(0).unwrap().tangent(),
+            Some(Vec4::new(
+                1.0 / 2.0_f32.sqrt(),
+                1.0 / 2.0_f32.sqrt(),
+                0.0,
+                1.0,
+            ))
+        );
+        assert!(mesh.set_vertex_texcoord(3, Some(Vec2::new(1.0, 0.0))));
         assert_eq!(
             mesh.vertex(0).unwrap().tangent(),
             Some(Vec4::new(0.0, 1.0, 0.0, -1.0))
@@ -625,6 +627,37 @@ mod tests {
         let changed_tangent = normal_mesh.vertex(0).unwrap().tangent().unwrap();
         let tangent = Vec3::new(changed_tangent.x, changed_tangent.y, changed_tangent.z);
         assert!(tangent.dot(changed_normal).abs() < 1e-6);
+    }
+
+    #[test]
+    fn set_indices_rebuilds_derived_frame_immediately() {
+        let vertices = vec![
+            MeshVertex::new(Vec3::new(0.0, 0.0, 0.0), Some(Vec2::new(0.0, 0.0)), None),
+            MeshVertex::new(Vec3::new(1.0, 0.0, 0.0), Some(Vec2::new(1.0, 0.0)), None),
+            MeshVertex::new(Vec3::new(0.0, 1.0, 0.0), Some(Vec2::new(0.0, 1.0)), None),
+            MeshVertex::new(Vec3::new(0.0, 0.0, 1.0), Some(Vec2::new(1.0, 0.0)), None),
+        ];
+        let mut mesh = Mesh::new(vertices, vec![[0, 1, 2]]);
+        assert_eq!(
+            mesh.vertex(0).unwrap().normal(),
+            Some(Vec3::new(0.0, 0.0, 1.0))
+        );
+        assert_eq!(
+            mesh.vertex(0).unwrap().tangent(),
+            Some(Vec4::new(1.0, 0.0, 0.0, 1.0))
+        );
+
+        mesh.set_indices(vec![[0, 2, 3]]);
+
+        assert_eq!(mesh.indices(), &[[0, 2, 3]]);
+        assert_eq!(
+            mesh.vertex(0).unwrap().normal(),
+            Some(Vec3::new(1.0, 0.0, 0.0))
+        );
+        assert_eq!(
+            mesh.vertex(0).unwrap().tangent(),
+            Some(Vec4::new(0.0, 0.0, 1.0, -1.0))
+        );
     }
 
     #[test]
