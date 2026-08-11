@@ -296,6 +296,7 @@ mod tests {
                 position: crate::math::Vec3::new(0.0, 0.0, -1.0),
                 texcoord: None,
                 normal: None,
+                tangent: None,
             },
             &uniforms,
         );

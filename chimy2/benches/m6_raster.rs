@@ -86,6 +86,7 @@ fn subdivided_icosahedron(levels: usize) -> Mesh {
                 position,
                 texcoord: None,
                 normal: Some(position.normalize()),
+                tangent: None,
             });
         }
         mesh.triangles.push([first, first + 1, first + 2]);

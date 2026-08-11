@@ -4,8 +4,7 @@
 //! `u * width - 0.5` in texel space before filtering. Nearest sampling then
 //! selects `floor(u * width)` after wrapping. Bilinear sampling uses the four
 //! neighboring texels around that center-space position. Source pixels are
-//! sRGB u8 values. Texture construction decodes RGB through a 256-entry LUT
-//! into linear floats. Filtering and mip generation use those linear values.
+//! sRGB u8 values by default. Linear data can opt out of that decode.
 //! The u8 sampling methods encode their linear result back to sRGB for API
 //! compatibility. Shaders use the linear sampling methods below.
 
@@ -47,11 +46,18 @@ pub enum WrapMode {
     ClampToEdge,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorSpace {
+    Srgb,
+    Linear,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Texture {
     width: usize,
     height: usize,
     pixels: Vec<[u8; 4]>,
+    color_space: ColorSpace,
     pub wrap_mode: WrapMode,
     linear_mips: Vec<MipLevel>,
 }
@@ -65,6 +71,15 @@ pub struct MipLevel {
 
 impl Texture {
     pub fn new(width: usize, height: usize, pixels: Vec<[u8; 4]>) -> Result<Self, ImageError> {
+        Self::new_with_color_space(width, height, pixels, ColorSpace::Srgb)
+    }
+
+    pub fn new_with_color_space(
+        width: usize,
+        height: usize,
+        pixels: Vec<[u8; 4]>,
+        color_space: ColorSpace,
+    ) -> Result<Self, ImageError> {
         let expected = width
             .checked_mul(height)
             .ok_or_else(|| ImageError::new(0, "texture dimensions overflow the pixel count"))?;
@@ -80,41 +95,53 @@ impl Texture {
         if width == 0 || height == 0 {
             return Err(ImageError::new(0, "texture dimensions must be non-zero"));
         }
-        let linear_pixels = pixels
-            .iter()
-            .map(|&pixel| {
-                [
-                    srgb_to_linear_u8(pixel[0]),
-                    srgb_to_linear_u8(pixel[1]),
-                    srgb_to_linear_u8(pixel[2]),
-                    f32::from(pixel[3]) / 255.0,
-                ]
-            })
-            .collect::<Vec<_>>();
+        let linear_pixels = decode_pixels(&pixels, color_space);
         Ok(Self {
             width,
             height,
             pixels,
+            color_space,
             wrap_mode: WrapMode::Repeat,
             linear_mips: build_mip_chain(width, height, linear_pixels),
         })
     }
 
     pub fn from_ppm(bytes: &[u8]) -> Result<Self, ImageError> {
-        decode_ppm(bytes)
+        decode_ppm_with_color_space(bytes, ColorSpace::Srgb)
+    }
+
+    pub fn from_ppm_with_color_space(
+        bytes: &[u8],
+        color_space: ColorSpace,
+    ) -> Result<Self, ImageError> {
+        decode_ppm_with_color_space(bytes, color_space)
     }
 
     pub fn from_qoi(bytes: &[u8]) -> Result<Self, ImageError> {
-        decode_qoi(bytes)
+        decode_qoi_with_color_space(bytes, ColorSpace::Srgb)
+    }
+
+    pub fn from_qoi_with_color_space(
+        bytes: &[u8],
+        color_space: ColorSpace,
+    ) -> Result<Self, ImageError> {
+        decode_qoi_with_color_space(bytes, color_space)
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ImageError> {
+        Self::load_with_color_space(path, ColorSpace::Srgb)
+    }
+
+    pub fn load_with_color_space(
+        path: impl AsRef<Path>,
+        color_space: ColorSpace,
+    ) -> Result<Self, ImageError> {
         let path = path.as_ref();
         let bytes = fs::read(path)
             .map_err(|error| ImageError::new(0, format!("{}: {error}", path.display())))?;
         match path.extension().and_then(|extension| extension.to_str()) {
-            Some("ppm") => Self::from_ppm(&bytes),
-            Some("qoi") => Self::from_qoi(&bytes),
+            Some("ppm") => decode_ppm_with_color_space(&bytes, color_space),
+            Some("qoi") => decode_qoi_with_color_space(&bytes, color_space),
             _ => Err(ImageError::new(
                 0,
                 format!("unsupported image extension: {}", path.display()),
@@ -137,6 +164,10 @@ impl Texture {
 
     pub const fn height(&self) -> usize {
         self.height
+    }
+
+    pub const fn color_space(&self) -> ColorSpace {
+        self.color_space
     }
 
     pub fn pixels(&self) -> &[[u8; 4]] {
@@ -170,18 +201,7 @@ impl Texture {
     }
 
     pub fn rebuild_mips(&mut self) {
-        let linear_pixels = self
-            .pixels
-            .iter()
-            .map(|&pixel| {
-                [
-                    srgb_to_linear_u8(pixel[0]),
-                    srgb_to_linear_u8(pixel[1]),
-                    srgb_to_linear_u8(pixel[2]),
-                    f32::from(pixel[3]) / 255.0,
-                ]
-            })
-            .collect::<Vec<_>>();
+        let linear_pixels = decode_pixels(&self.pixels, self.color_space);
         self.linear_mips = build_mip_chain(self.width, self.height, linear_pixels);
     }
 
@@ -287,6 +307,24 @@ pub fn linear_to_srgb(value: f32) -> u8 {
         1.055 * value.powf(1.0 / 2.4) - 0.055
     };
     (encoded * 255.0).round() as u8
+}
+
+fn decode_pixels(pixels: &[[u8; 4]], color_space: ColorSpace) -> Vec<[f32; 4]> {
+    pixels
+        .iter()
+        .map(|&pixel| {
+            let decode = |value| match color_space {
+                ColorSpace::Srgb => srgb_to_linear_u8(value),
+                ColorSpace::Linear => f32::from(value) / 255.0,
+            };
+            [
+                decode(pixel[0]),
+                decode(pixel[1]),
+                decode(pixel[2]),
+                f32::from(pixel[3]) / 255.0,
+            ]
+        })
+        .collect()
 }
 
 fn build_mip_chain(width: usize, height: usize, pixels: Vec<[f32; 4]>) -> Vec<MipLevel> {
@@ -397,6 +435,13 @@ fn wrap_index(index: isize, size: usize, wrap_mode: WrapMode) -> usize {
 }
 
 pub fn decode_ppm(bytes: &[u8]) -> Result<Texture, ImageError> {
+    decode_ppm_with_color_space(bytes, ColorSpace::Srgb)
+}
+
+pub fn decode_ppm_with_color_space(
+    bytes: &[u8],
+    color_space: ColorSpace,
+) -> Result<Texture, ImageError> {
     let mut cursor = 0;
     let magic = next_ppm_token(bytes, &mut cursor)?;
     if magic != b"P6" {
@@ -438,7 +483,7 @@ pub fn decode_ppm(bytes: &[u8]) -> Result<Texture, ImageError> {
         .chunks_exact(3)
         .map(|rgb| [rgb[0], rgb[1], rgb[2], 255])
         .collect();
-    Texture::new(width, height, pixels)
+    Texture::new_with_color_space(width, height, pixels, color_space)
 }
 
 fn next_ppm_token(bytes: &[u8], cursor: &mut usize) -> Result<Vec<u8>, ImageError> {
@@ -480,6 +525,13 @@ fn parse_ppm_dimension(token: Vec<u8>, offset: usize) -> Result<usize, ImageErro
 }
 
 pub fn decode_qoi(bytes: &[u8]) -> Result<Texture, ImageError> {
+    decode_qoi_with_color_space(bytes, ColorSpace::Srgb)
+}
+
+pub fn decode_qoi_with_color_space(
+    bytes: &[u8],
+    color_space: ColorSpace,
+) -> Result<Texture, ImageError> {
     if bytes.len() < QOI_HEADER_SIZE + QOI_END_MARKER.len() {
         return Err(ImageError::new(0, "truncated QOI header or end marker"));
     }
@@ -598,7 +650,7 @@ pub fn decode_qoi(bytes: &[u8]) -> Result<Texture, ImageError> {
             "trailing bytes after QOI end marker",
         ));
     }
-    Texture::new(width, height, pixels)
+    Texture::new_with_color_space(width, height, pixels, color_space)
 }
 
 pub fn encode_qoi(texture: &Texture) -> Result<Vec<u8>, ImageError> {
@@ -887,6 +939,20 @@ mod tests {
         for value in [0, 1, 10, 128, 255] {
             assert_eq!(linear_to_srgb(srgb_to_linear_u8(value)), value);
         }
+    }
+
+    #[test]
+    fn linear_normal_map_load_keeps_encoded_unit_vector_components() {
+        let bytes = b"P6\n1 1\n255\n\x80\x40\xff";
+        let texture = decode_ppm_with_color_space(bytes, ColorSpace::Linear).unwrap();
+        let pixel = texture.mip_level(0).unwrap().pixels[0];
+        assert!((pixel[0] - 128.0 / 255.0).abs() < 1e-6);
+        assert!((pixel[1] - 64.0 / 255.0).abs() < 1e-6);
+        assert_eq!(pixel[2], 1.0);
+        assert_eq!(texture.color_space(), ColorSpace::Linear);
+
+        let albedo = decode_ppm(bytes).unwrap();
+        assert!((albedo.mip_level(0).unwrap().pixels[0][0] - srgb_to_linear_u8(128)).abs() < 1e-6);
     }
 
     #[test]

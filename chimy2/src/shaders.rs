@@ -6,7 +6,7 @@
 
 use crate::fb::argb8888_linear;
 use crate::image::{Texture, TextureDerivatives, srgb_to_linear};
-use crate::math::{Mat3, Mat4, Vec3, Vec4};
+use crate::math::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use crate::mesh::MeshVertex;
 use crate::pipeline::{
     FragmentStage, SampledFragmentStage, SamplingVaryings, Varyings, VertexOutput, VertexStage,
@@ -749,6 +749,155 @@ fn sample_texture(
     }
 }
 
+/// Uniforms for a tangent-space normal map layered on the textured lighting path.
+/// The normal map must use [`crate::image::ColorSpace::Linear`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct NormalMappedBlinnPhongUniforms<'a> {
+    pub lighting: BlinnPhongUniforms,
+    pub texture: &'a Texture,
+    pub normal_map: &'a Texture,
+    pub filter: TextureFilter,
+}
+
+impl<'a> NormalMappedBlinnPhongUniforms<'a> {
+    pub const fn new(
+        lighting: BlinnPhongUniforms,
+        texture: &'a Texture,
+        normal_map: &'a Texture,
+        filter: TextureFilter,
+    ) -> Self {
+        Self {
+            lighting,
+            texture,
+            normal_map,
+            filter,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NormalMappedBlinnPhongShader;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NormalMappedBlinnPhongVaryings {
+    pub world_position: Vec3,
+    pub normal: Vec3,
+    pub tangent: Vec4,
+    pub texcoord: Vec2,
+    pub light_space_position: Vec4,
+}
+
+impl Varyings for NormalMappedBlinnPhongVaryings {
+    fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self {
+        Self {
+            world_position: a.world_position * weights.x
+                + b.world_position * weights.y
+                + c.world_position * weights.z,
+            normal: a.normal * weights.x + b.normal * weights.y + c.normal * weights.z,
+            tangent: a.tangent * weights.x + b.tangent * weights.y + c.tangent * weights.z,
+            texcoord: a.texcoord * weights.x + b.texcoord * weights.y + c.texcoord * weights.z,
+            light_space_position: a.light_space_position * weights.x
+                + b.light_space_position * weights.y
+                + c.light_space_position * weights.z,
+        }
+    }
+}
+
+impl SamplingVaryings for NormalMappedBlinnPhongVaryings {
+    fn texture_coordinates(&self) -> Vec2 {
+        self.texcoord
+    }
+}
+
+impl<'a> VertexStage<MeshVertex, NormalMappedBlinnPhongUniforms<'a>>
+    for NormalMappedBlinnPhongShader
+{
+    type Varyings = NormalMappedBlinnPhongVaryings;
+
+    fn run(
+        &self,
+        vertex: &MeshVertex,
+        uniforms: &NormalMappedBlinnPhongUniforms<'a>,
+    ) -> VertexOutput<Self::Varyings> {
+        let prepared = prepare_blinn_phong_vertex(vertex, &uniforms.lighting);
+        let tangent = vertex
+            .tangent
+            .map_or(Vec4::new(0.0, 0.0, 0.0, 0.0), |tangent| {
+                let transformed =
+                    uniforms.lighting.model() * Vec4::new(tangent.x, tangent.y, tangent.z, 0.0);
+                Vec4::new(transformed.x, transformed.y, transformed.z, tangent.w)
+            });
+        VertexOutput::new(
+            prepared.clip_position,
+            NormalMappedBlinnPhongVaryings {
+                world_position: prepared.world_position,
+                normal: prepared.normal,
+                tangent,
+                texcoord: vertex.texcoord.unwrap_or(Vec2::ZERO),
+                light_space_position: prepared.light_space_position,
+            },
+        )
+    }
+}
+
+impl<'a> SampledFragmentStage<NormalMappedBlinnPhongVaryings, NormalMappedBlinnPhongUniforms<'a>>
+    for NormalMappedBlinnPhongShader
+{
+    fn run_with_sampling(
+        &self,
+        varyings: &NormalMappedBlinnPhongVaryings,
+        derivatives: &crate::pipeline::SampleDerivatives,
+        uniforms: &NormalMappedBlinnPhongUniforms<'a>,
+    ) -> u32 {
+        let derivatives = TextureDerivatives {
+            ddx: derivatives.ddx,
+            ddy: derivatives.ddy,
+        };
+        let albedo_pixel = sample_texture(
+            uniforms.texture,
+            varyings.texcoord,
+            uniforms.filter,
+            derivatives,
+        );
+        let normal_pixel = sample_texture(
+            uniforms.normal_map,
+            varyings.texcoord,
+            uniforms.filter,
+            derivatives,
+        );
+        let normal = tangent_space_normal(varyings, normal_pixel);
+        let albedo = Vec3::new(albedo_pixel[0], albedo_pixel[1], albedo_pixel[2]);
+        let lighted = evaluate_lighting(
+            varyings.world_position,
+            normal,
+            varyings.light_space_position,
+            &uniforms.lighting,
+            albedo,
+        );
+        argb8888_linear(albedo_pixel[3], [lighted.x, lighted.y, lighted.z])
+    }
+}
+
+fn tangent_space_normal(varyings: &NormalMappedBlinnPhongVaryings, pixel: [f32; 4]) -> Vec3 {
+    let sampled = remap_normal_sample(Vec3::new(pixel[0], pixel[1], pixel[2]));
+    let normal = varyings.normal.normalize();
+    let tangent = Vec3::new(varyings.tangent.x, varyings.tangent.y, varyings.tangent.z);
+    if tangent.length() == 0.0 {
+        return normal;
+    }
+    let tangent = (tangent - normal * normal.dot(tangent)).normalize();
+    if tangent.length() == 0.0 {
+        return normal;
+    }
+    let sign = if varyings.tangent.w < 0.0 { -1.0 } else { 1.0 };
+    let bitangent = normal.cross(tangent) * sign;
+    (tangent * sampled.x + bitangent * sampled.y + normal * sampled.z).normalize()
+}
+
+fn remap_normal_sample(sample: Vec3) -> Vec3 {
+    sample * 2.0 - Vec3::new(1.0, 1.0, 1.0)
+}
+
 fn linearize_color(color: Vec3) -> Vec3 {
     Vec3::new(
         srgb_to_linear(color.x),
@@ -811,6 +960,47 @@ mod tests {
             None,
         );
         assert_eq!(BlinnPhongShader::shade(&varyings, &uniforms), 0xff000000);
+    }
+
+    #[test]
+    fn normal_map_remap_is_hand_computed() {
+        let remapped = remap_normal_sample(Vec3::new(0.75, 0.5, 1.0));
+        assert_eq!(remapped, Vec3::new(0.5, 0.0, 1.0));
+    }
+
+    #[test]
+    fn normal_map_without_tangent_falls_back_to_geometric_normal() {
+        let varyings = NormalMappedBlinnPhongVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 2.0),
+            tangent: Vec4::new(0.0, 0.0, 0.0, 0.0),
+            texcoord: Vec2::ZERO,
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        assert_eq!(
+            tangent_space_normal(&varyings, [1.0, 0.0, 0.0, 1.0]),
+            Vec3::new(0.0, 0.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn interpolated_tbn_is_orthonormal_after_renormalize() {
+        let varyings = NormalMappedBlinnPhongVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            tangent: Vec4::new(1.0, 0.25, 0.0, 1.0),
+            texcoord: Vec2::ZERO,
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        let tangent_space_x = tangent_space_normal(&varyings, [1.0, 0.5, 0.5, 1.0]);
+        let tangent_space_y = tangent_space_normal(&varyings, [0.5, 1.0, 0.5, 1.0]);
+        let tangent_space_z = tangent_space_normal(&varyings, [0.5, 0.5, 1.0, 1.0]);
+        assert!((tangent_space_x.length() - 1.0).abs() < 1e-6);
+        assert!((tangent_space_y.length() - 1.0).abs() < 1e-6);
+        assert!((tangent_space_z.length() - 1.0).abs() < 1e-6);
+        assert!(tangent_space_x.dot(tangent_space_y).abs() < 1e-6);
+        assert!(tangent_space_x.dot(tangent_space_z).abs() < 1e-6);
+        assert!(tangent_space_y.dot(tangent_space_z).abs() < 1e-6);
     }
 
     #[test]
@@ -906,6 +1096,7 @@ mod tests {
                 position,
                 texcoord: None,
                 normal: Some(Vec3::new(0.0, 0.0, 1.0)),
+                tangent: None,
             },
             Vec3::new(1.0, 0.0, 0.0),
         )
@@ -1024,6 +1215,7 @@ mod tests {
                     ),
                     texcoord: None,
                     normal: Some(Vec3::new(0.0, 0.0, 1.0)),
+                    tangent: None,
                 },
                 match index {
                     0 => Vec3::new(1.0, 0.0, 0.0),

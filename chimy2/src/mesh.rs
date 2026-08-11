@@ -4,7 +4,7 @@
 //! stream, so the loader expands each unique (v, vt, vn) tuple into one
 //! renderer vertex.
 
-use crate::math::{Vec2, Vec3};
+use crate::math::{Vec2, Vec3, Vec4};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -15,6 +15,8 @@ pub struct MeshVertex {
     pub position: Vec3,
     pub texcoord: Option<Vec2>,
     pub normal: Option<Vec3>,
+    /// Tangent xyz plus the bitangent reconstruction sign in w.
+    pub tangent: Option<Vec4>,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -86,6 +88,7 @@ impl Mesh {
                                 position: positions[key.0],
                                 texcoord: key.1.map(|index| texcoords[index]),
                                 normal: key.2.map(|index| normals[index]),
+                                tangent: None,
                             });
                             vertex_position_indices.push(key.0);
                             vertex_map.insert(key, index);
@@ -104,6 +107,7 @@ impl Mesh {
         }
 
         generate_missing_normals(&mut mesh, &vertex_position_indices, positions.len());
+        mesh.generate_tangents();
         Ok(mesh)
     }
 
@@ -119,6 +123,98 @@ impl Mesh {
     pub fn indices(&self) -> &[[usize; 3]] {
         &self.triangles
     }
+
+    /// Rebuilds tangents from the mesh's position, UV, and normal streams.
+    /// Vertices without complete tangent inputs keep `tangent == None`.
+    pub fn generate_tangents(&mut self) {
+        let mut tangent_sums = vec![Vec3::ZERO; self.vertices.len()];
+        let mut bitangent_sums = vec![Vec3::ZERO; self.vertices.len()];
+
+        for &[a, b, c] in &self.triangles {
+            let Some(vertex_a) = self.vertices.get(a) else {
+                continue;
+            };
+            let Some(vertex_b) = self.vertices.get(b) else {
+                continue;
+            };
+            let Some(vertex_c) = self.vertices.get(c) else {
+                continue;
+            };
+            let (Some(uv_a), Some(uv_b), Some(uv_c)) =
+                (vertex_a.texcoord, vertex_b.texcoord, vertex_c.texcoord)
+            else {
+                continue;
+            };
+
+            let edge_ab = vertex_b.position - vertex_a.position;
+            let edge_ac = vertex_c.position - vertex_a.position;
+            let uv_ab = uv_b - uv_a;
+            let uv_ac = uv_c - uv_a;
+            let determinant = uv_ab.x * uv_ac.y - uv_ab.y * uv_ac.x;
+            if determinant.abs() <= f32::EPSILON {
+                continue;
+            }
+
+            let tangent = (edge_ab * uv_ac.y - edge_ac * uv_ab.y) / determinant;
+            let bitangent = (edge_ac * uv_ab.x - edge_ab * uv_ac.x) / determinant;
+            let face_area = edge_ab.cross(edge_ac).length() * 0.5;
+            for (index, first, second) in [
+                (
+                    a,
+                    vertex_b.position - vertex_a.position,
+                    vertex_c.position - vertex_a.position,
+                ),
+                (
+                    b,
+                    vertex_a.position - vertex_b.position,
+                    vertex_c.position - vertex_b.position,
+                ),
+                (
+                    c,
+                    vertex_a.position - vertex_c.position,
+                    vertex_b.position - vertex_c.position,
+                ),
+            ] {
+                let weight = face_area * corner_angle(first, second);
+                if let (Some(tangent_sum), Some(bitangent_sum)) =
+                    (tangent_sums.get_mut(index), bitangent_sums.get_mut(index))
+                {
+                    *tangent_sum = *tangent_sum + tangent * weight;
+                    *bitangent_sum = *bitangent_sum + bitangent * weight;
+                }
+            }
+        }
+
+        for (index, vertex) in self.vertices.iter_mut().enumerate() {
+            let Some(normal) = vertex.normal.map(Vec3::normalize) else {
+                vertex.tangent = None;
+                continue;
+            };
+            let sum = tangent_sums[index];
+            let tangent = (sum - normal * normal.dot(sum)).normalize();
+            if tangent.length() == 0.0 {
+                vertex.tangent = None;
+                continue;
+            }
+            let sign = if normal.cross(tangent).dot(bitangent_sums[index]) < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            vertex.tangent = Some(Vec4::new(tangent.x, tangent.y, tangent.z, sign));
+        }
+    }
+}
+
+fn corner_angle(first: Vec3, second: Vec3) -> f32 {
+    let first_length = first.length();
+    let second_length = second.length();
+    if first_length == 0.0 || second_length == 0.0 {
+        return 0.0;
+    }
+    (first.dot(second) / (first_length * second_length))
+        .clamp(-1.0, 1.0)
+        .acos()
 }
 
 /// Generates smooth normals for missing `vn` records.
@@ -362,5 +458,28 @@ mod tests {
         assert!((normal.x - 1.0 / length).abs() < 1e-5);
         assert!(normal.y.abs() < 1e-5);
         assert!((normal.z - 4.0 / length).abs() < 1e-5);
+    }
+
+    #[test]
+    fn generates_known_quad_tangents_with_handedness() {
+        let mesh = Mesh::parse(
+            "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\n\
+             vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\n\
+             f 1/1 2/2 3/3 4/4\n",
+        )
+        .unwrap();
+        for vertex in &mesh.vertices {
+            assert_eq!(
+                vertex.tangent,
+                Some(Vec4::new(1.0, 0.0, 0.0, 1.0)),
+                "tangent should follow +u and reconstruct +bitangent"
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_without_texcoords_has_no_tangents_for_normal_map_fallback() {
+        let mesh = Mesh::parse("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
+        assert!(mesh.vertices.iter().all(|vertex| vertex.tangent.is_none()));
     }
 }

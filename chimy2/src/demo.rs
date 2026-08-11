@@ -165,6 +165,7 @@ pub fn uv_sphere(radius: f32, rings: usize, segments: usize) -> Mesh {
                 position: normal * radius,
                 texcoord: Some(Vec2::new(u, v)),
                 normal: Some(normal),
+                tangent: None,
             });
         }
     }
@@ -206,6 +207,7 @@ pub fn plane_xz(width: f32, depth: f32, subdivisions: usize, uv_repeat: f32) -> 
                 position: Vec3::new(x, 0.0, z),
                 texcoord: Some(Vec2::new(u * uv_repeat, v * uv_repeat)),
                 normal: Some(Vec3::new(0.0, 1.0, 0.0)),
+                tangent: None,
             });
         }
     }
@@ -282,21 +284,25 @@ pub fn cube_with_uvs(half_extent: f32) -> Mesh {
             position: a,
             texcoord: Some(Vec2::new(0.0, 1.0)),
             normal: Some(normal),
+            tangent: None,
         });
         vertices.push(MeshVertex {
             position: b,
             texcoord: Some(Vec2::new(1.0, 1.0)),
             normal: Some(normal),
+            tangent: None,
         });
         vertices.push(MeshVertex {
             position: c,
             texcoord: Some(Vec2::new(1.0, 0.0)),
             normal: Some(normal),
+            tangent: None,
         });
         vertices.push(MeshVertex {
             position: d,
             texcoord: Some(Vec2::new(0.0, 0.0)),
             normal: Some(normal),
+            tangent: None,
         });
         triangles.push([base, base + 1, base + 2]);
         triangles.push([base, base + 2, base + 3]);
