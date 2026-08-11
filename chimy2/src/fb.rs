@@ -42,8 +42,8 @@ impl Framebuffer {
         }
     }
 
-    /// Downsamples an integer supersampled framebuffer with a linear-light
-    /// box filter. The destination dimensions must divide the source.
+    /// Downsamples an integer supersampled framebuffer with a premultiplied,
+    /// linear-light box filter. The destination dimensions must divide source.
     pub fn downsample_linear_into(&self, destination: &mut Self) {
         if destination.width == 0
             || destination.height == 0
@@ -62,7 +62,7 @@ impl Framebuffer {
         let sample_count = (scale_x * scale_y) as f32;
         for y in 0..destination.height {
             for x in 0..destination.width {
-                let mut rgb = [0.0; 3];
+                let mut premultiplied_rgb = [0.0; 3];
                 let mut alpha = 0.0;
                 for sample_y in 0..scale_y {
                     for sample_x in 0..scale_x {
@@ -70,20 +70,22 @@ impl Framebuffer {
                             (y * scale_y + sample_y) * self.width + x * scale_x + sample_x;
                         let [source_alpha, red, green, blue] =
                             self.color[source_index].to_be_bytes();
-                        rgb[0] += crate::image::srgb_to_linear_u8(red);
-                        rgb[1] += crate::image::srgb_to_linear_u8(green);
-                        rgb[2] += crate::image::srgb_to_linear_u8(blue);
-                        alpha += f32::from(source_alpha) / 255.0;
+                        let source_alpha = f32::from(source_alpha) / 255.0;
+                        premultiplied_rgb[0] += crate::image::srgb_to_linear_u8(red);
+                        premultiplied_rgb[1] += crate::image::srgb_to_linear_u8(green);
+                        premultiplied_rgb[2] += crate::image::srgb_to_linear_u8(blue);
+                        alpha += source_alpha;
                     }
                 }
-                destination.color[y * destination.width + x] = argb8888_linear(
-                    alpha / sample_count,
-                    [
-                        rgb[0] / sample_count,
-                        rgb[1] / sample_count,
-                        rgb[2] / sample_count,
-                    ],
-                );
+                let average_alpha = alpha / sample_count;
+                let rgb = if average_alpha == 0.0 {
+                    [0.0; 3]
+                } else {
+                    std::array::from_fn(|channel| {
+                        (premultiplied_rgb[channel] / sample_count) / average_alpha
+                    })
+                };
+                destination.color[y * destination.width + x] = argb8888_linear(average_alpha, rgb);
                 destination.depth[y * destination.width + x] = 1.0;
             }
         }
@@ -214,5 +216,19 @@ mod tests {
         source.downsample_linear_into(&mut destination);
         assert_eq!(destination.color[0], argb8888(255, 188, 188, 188));
         assert_ne!(destination.color[0], argb8888(255, 128, 128, 128));
+    }
+
+    #[test]
+    fn downsample_filters_rgb_premultiplied_by_alpha() {
+        let mut source = Framebuffer::new(2, 2);
+        source.color = vec![
+            argb8888(255, 255, 0, 0),
+            argb8888(255, 255, 0, 0),
+            argb8888(0, 0, 0, 0),
+            argb8888(0, 0, 0, 0),
+        ];
+        let mut destination = Framebuffer::new(1, 1);
+        source.downsample_linear_into(&mut destination);
+        assert_eq!(destination.color[0], argb8888(128, 255, 0, 0));
     }
 }
