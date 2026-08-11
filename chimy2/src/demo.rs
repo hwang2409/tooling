@@ -11,11 +11,13 @@
 //! - `--size WxH` — override the demo's default window size. Screenshot mode
 //!   uses this size directly for the offscreen framebuffer.
 //! - `--ssaa` — enable 2x linear-light supersampling in demos that opt in.
+//! - `--bloom`, `--fxaa`, `--vignette` — enable post-processing passes.
 
 use crate::fb::Framebuffer;
 use crate::image::Texture;
 use crate::math::{Vec2, Vec3};
 use crate::mesh::{Mesh, MeshVertex};
+use crate::postfx::{BloomPass, FxaaPass, PostChain, VignettePass};
 use crate::present::{InputState, run_with_input};
 use std::error::Error;
 use std::f32::consts::{PI, TAU};
@@ -31,6 +33,9 @@ pub struct DemoArgs {
     pub screenshot: Option<PathBuf>,
     pub size: Option<(u32, u32)>,
     pub ssaa: bool,
+    pub bloom: bool,
+    pub fxaa: bool,
+    pub vignette: bool,
 }
 
 impl DemoArgs {
@@ -63,6 +68,9 @@ impl DemoArgs {
                     args.size = Some(parse_size(&value)?);
                 }
                 "--ssaa" => args.ssaa = true,
+                "--bloom" => args.bloom = true,
+                "--fxaa" => args.fxaa = true,
+                "--vignette" => args.vignette = true,
                 other => {
                     return Err(format!("unexpected argument: {other}"));
                 }
@@ -73,6 +81,20 @@ impl DemoArgs {
 
     pub fn from_env() -> Result<Self, String> {
         Self::parse(std::env::args().skip(1))
+    }
+
+    pub fn post_chain(&self) -> PostChain {
+        let mut chain = PostChain::new();
+        if self.bloom {
+            chain.push(BloomPass);
+        }
+        if self.fxaa {
+            chain.push(FxaaPass);
+        }
+        if self.vignette {
+            chain.push(VignettePass);
+        }
+        chain
     }
 }
 
@@ -103,6 +125,7 @@ where
     F: FnMut(&mut Framebuffer, f32, &InputState),
 {
     let (width, height) = args.size.unwrap_or((default_width, default_height));
+    let post_chain = args.post_chain();
     if let Some(path) = args.screenshot.as_ref() {
         let frames = args.frames.unwrap_or(60).max(1);
         let mut framebuffer = Framebuffer::new(width as usize, height as usize);
@@ -110,11 +133,21 @@ where
         for frame in 0..frames {
             let elapsed = frame as f32 / SCREENSHOT_FPS;
             draw(&mut framebuffer, elapsed, &input);
+            post_chain.apply(&mut framebuffer);
         }
         write_ppm(path, &framebuffer)?;
         Ok(())
     } else {
-        run_with_input(title, width, height, args.frames, draw)
+        run_with_input(
+            title,
+            width,
+            height,
+            args.frames,
+            move |framebuffer, elapsed, input| {
+                draw(framebuffer, elapsed, input);
+                post_chain.apply(framebuffer);
+            },
+        )
     }
 }
 
@@ -373,6 +406,18 @@ mod tests {
         assert_eq!(args.frames, Some(12));
         assert_eq!(args.screenshot, Some(PathBuf::from("shot.ppm")));
         assert_eq!(args.size, Some((320, 200)));
+    }
+
+    #[test]
+    fn parses_postfx_flags_in_chain_order() {
+        let args = DemoArgs::parse(
+            ["--bloom", "--fxaa", "--vignette"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert!(args.bloom && args.fxaa && args.vignette);
+        assert_eq!(args.post_chain().len(), 3);
     }
 
     #[test]

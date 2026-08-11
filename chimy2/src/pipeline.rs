@@ -7,6 +7,7 @@ use crate::clip::{ClipVertex, clip_triangle_near, cull_backface};
 use crate::fb::Framebuffer;
 use crate::math::{Mat4, Vec3, Vec4};
 use crate::mesh::{Mesh, MeshVertex};
+use crate::postfx::PostChain;
 use crate::raster::{
     PixelRect, RasterState, ScreenVertex, rasterize_triangle_with_sampling_state,
     rasterize_triangle_with_state, triangle_pixel_rect, viewport_transform,
@@ -176,6 +177,7 @@ pub struct Pipeline<VS, FS> {
     pub fragment: FS,
     thread_count: usize,
     ssaa_scale: usize,
+    post_chain: PostChain,
 }
 
 impl<VS, FS> Pipeline<VS, FS> {
@@ -185,6 +187,7 @@ impl<VS, FS> Pipeline<VS, FS> {
             fragment,
             thread_count: default_thread_count(),
             ssaa_scale: 1,
+            post_chain: PostChain::new(),
         }
     }
 
@@ -204,6 +207,23 @@ impl<VS, FS> Pipeline<VS, FS> {
         self.ssaa_scale
     }
 
+    /// Replaces the optional post chain. The chain runs after SSAA downsample.
+    pub fn set_post_chain(&mut self, post_chain: PostChain) {
+        self.post_chain = post_chain;
+    }
+
+    pub fn post_chain(&self) -> &PostChain {
+        &self.post_chain
+    }
+
+    pub fn post_chain_mut(&mut self) -> &mut PostChain {
+        &mut self.post_chain
+    }
+
+    pub fn clear_post_chain(&mut self) {
+        self.post_chain.clear();
+    }
+
     /// Renders one frame. The callback submits prepared draws to one queue.
     /// Flush renders every opaque draw first, then sorted transparent draws.
     pub fn render<'a, F>(&'a mut self, framebuffer: &mut Framebuffer, draw: F)
@@ -214,6 +234,7 @@ impl<VS, FS> Pipeline<VS, FS> {
             let mut frame = RenderFrame::new(self);
             draw(&mut frame, framebuffer);
             frame.flush(framebuffer);
+            frame.apply_post_chain(framebuffer);
             return;
         }
         let width = framebuffer.width.saturating_mul(self.ssaa_scale);
@@ -223,6 +244,7 @@ impl<VS, FS> Pipeline<VS, FS> {
         draw(&mut frame, &mut internal);
         frame.flush(&mut internal);
         internal.downsample_linear_into(framebuffer);
+        frame.apply_post_chain(framebuffer);
     }
 }
 
@@ -403,6 +425,10 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
                 self.pipeline.thread_count,
             );
         }
+    }
+
+    fn apply_post_chain(&self, framebuffer: &mut Framebuffer) {
+        self.pipeline.post_chain.apply(framebuffer);
     }
 }
 

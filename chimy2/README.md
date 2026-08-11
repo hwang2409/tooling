@@ -148,6 +148,20 @@ A sphere lit by several colored point lights with different attenuation
 values. The lights move on deterministic paths. Use `--frames N` and
 `--screenshot path.ppm` for headless smoke tests.
 
+### `postfx_demo`
+
+A lit sphere demonstrates the deterministic post-processing chain. With no
+post-processing flags, the demo cycles through pass combinations. Add
+`--bloom`, `--fxaa`, and `--vignette` in any combination to select a fixed
+chain.
+
+The fixed order is render -> SSAA downsample -> post chain -> present.
+Bloom and vignette work in linear light. FXAA works on encoded sRGB values by
+design because its luma edge test follows perceptual display values. The
+framework decodes once at chain entry and encodes once at the final framebuffer
+boundary. Passes share float intermediates, so no pass performs a framebuffer
+round trip.
+
 ## running the demos
 
 ```bash
@@ -158,6 +172,7 @@ cargo run --release --bin stress_100k
 cargo run --release --bin normalmap_demo
 cargo run --release --bin blend_demo --frames 30 --ssaa
 cargo run --release --bin lights_demo -- --frames 30
+cargo run --release --bin postfx_demo -- --frames 30 --bloom --fxaa --vignette
 ```
 
 Add `--frames N` to any demo for a clean exit after N frames. Add
