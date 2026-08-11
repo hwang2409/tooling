@@ -1,11 +1,19 @@
 use chimy2::camera::OrbitController;
 use chimy2::fb::{Framebuffer, argb8888};
-use chimy2::gltf::GltfAsset;
+use chimy2::gltf::{GltfAsset, submit_gltf_draws};
 use chimy2::image::Texture;
 use chimy2::math::Vec3;
-use chimy2::pipeline::Pipeline;
-use chimy2::shaders::{MeshShader, MeshUniforms};
+use std::fs;
 use std::path::Path;
+
+fn ppm(framebuffer: &Framebuffer) -> Vec<u8> {
+    let mut bytes = format!("P6\n{} {}\n255\n", framebuffer.width, framebuffer.height).into_bytes();
+    for &pixel in &framebuffer.color {
+        let [_, red, green, blue] = pixel.to_be_bytes();
+        bytes.extend_from_slice(&[red, green, blue]);
+    }
+    bytes
+}
 
 fn render(animation: Option<usize>, time: f32) -> Framebuffer {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/arm.gltf");
@@ -18,23 +26,15 @@ fn render(animation: Option<usize>, time: f32) -> Framebuffer {
     let camera = orbit.camera(1.0, 1.0, 0.1, 100.0);
     let mut framebuffer = Framebuffer::new(64, 64);
     framebuffer.clear(argb8888(255, 12, 16, 24));
-    let uniforms: Vec<_> = draws
-        .iter()
-        .map(|draw| {
-            MeshUniforms::new(
-                draw.model,
-                camera.view_matrix(),
-                camera.projection_matrix(),
-                argb8888(255, 220, 160, 70),
-            )
-        })
-        .collect();
-    let mut pipeline = Pipeline::new(MeshShader, MeshShader);
-    pipeline.render(&mut framebuffer, |frame, target| {
-        for (draw, uniforms) in draws.iter().zip(&uniforms) {
-            frame.draw_mesh(target, &draw.mesh, uniforms);
-        }
-    });
+    submit_gltf_draws(
+        &mut framebuffer,
+        &asset,
+        &draws,
+        camera.view_matrix(),
+        camera.projection_matrix(),
+        camera.position,
+    )
+    .unwrap();
     framebuffer
 }
 
@@ -43,6 +43,11 @@ fn assert_golden(name: &str, animation: Option<usize>, time: f32) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/goldens")
         .join(name);
+    let actual = ppm(&framebuffer);
+    if std::env::var_os("GOLDEN_REGEN").is_some() {
+        fs::write(&path, actual).unwrap();
+        panic!("regenerated {}, rerun without GOLDEN_REGEN", path.display());
+    }
     let bytes = std::fs::read(path).unwrap();
     let golden = Texture::from_ppm(&bytes).unwrap();
     assert_eq!((golden.width(), golden.height()), (64, 64));

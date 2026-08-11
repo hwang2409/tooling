@@ -1,0 +1,161 @@
+fn parse_animations(
+    object: &[(String, Value)],
+    buffers: &[Vec<u8>],
+    views: &[BufferView],
+    accessors: &[Accessor],
+    node_count: usize,
+) -> Result<Vec<GltfAnimation>, GltfError> {
+    get_optional_array(object, "animations")?
+        .unwrap_or(&[])
+        .iter()
+        .map(|value| {
+            let o = as_object(value, "animation")?;
+            let samplers = get_array(o, "samplers")?
+                .iter()
+                .map(|value| {
+                    let s = as_object(value, "animation sampler")?;
+                    let input_accessor = get_usize(s, "input")?;
+                    let input_definition = accessors.get(input_accessor).ok_or_else(|| {
+                        GltfError::new(format!(
+                            "animation input accessor {input_accessor} is out of range"
+                        ))
+                    })?;
+                    if input_definition.kind != "SCALAR"
+                        || input_definition.component_type != 5126
+                        || input_definition.normalized
+                    {
+                        return Err(GltfError::new(format!(
+                            "animation input accessor {input_accessor} must be FLOAT SCALAR"
+                        )));
+                    }
+                    let input = read_accessor::<4>(
+                        buffers,
+                        views,
+                        accessors,
+                        input_accessor,
+                        1,
+                    )?
+                    .into_iter()
+                    .map(|v| v[0])
+                    .collect::<Vec<_>>();
+                    let output_accessor = get_usize(s, "output")?;
+                    let accessor = accessors.get(output_accessor).ok_or_else(|| {
+                        GltfError::new("animation output accessor is out of range")
+                    })?;
+                    let components = component_count(&accessor.kind);
+                    if !matches!(components, 3 | 4) {
+                        return Err(GltfError::new(format!(
+                            "animation output accessor {output_accessor} must be VEC3 or VEC4"
+                        )));
+                    }
+                    if accessor.component_type != 5126 || accessor.normalized {
+                        return Err(GltfError::new(format!(
+                            "animation output accessor {output_accessor} must use FLOAT"
+                        )));
+                    }
+                    let output =
+                        read_accessor::<4>(buffers, views, accessors, output_accessor, components)?;
+                    if input.len() != output.len() {
+                        return Err(GltfError::new("animation input and output counts differ"));
+                    }
+                    let interpolation =
+                        match get_optional_string(s, "interpolation")?.unwrap_or("LINEAR") {
+                            "LINEAR" => Interpolation::Linear,
+                            "STEP" => Interpolation::Step,
+                            "CUBICSPLINE" => {
+                                return Err(GltfError::new("CUBICSPLINE animation is unsupported"));
+                            }
+                            other => {
+                                return Err(GltfError::new(format!(
+                                    "unsupported animation interpolation {other}"
+                                )));
+                            }
+                        };
+                    Ok(GltfAnimationSampler {
+                        input,
+                        output,
+                        output_components: components,
+                        interpolation,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let channels = get_array(o, "channels")?
+                .iter()
+                .map(|value| {
+                    let c = as_object(value, "animation channel")?;
+                    let target = get_object(c, "target")?;
+                    let node = get_usize(target, "node")?;
+                    if node >= node_count {
+                        return Err(GltfError::new("animation target node is out of range"));
+                    }
+                    let path = match get_string(target, "path")? {
+                        "translation" => AnimationPath::Translation,
+                        "rotation" => AnimationPath::Rotation,
+                        "scale" => AnimationPath::Scale,
+                        other => {
+                            return Err(GltfError::new(format!(
+                                "unsupported animation target {other}"
+                            )));
+                        }
+                    };
+                    Ok(GltfAnimationChannel {
+                        sampler: get_usize(c, "sampler")?,
+                        node,
+                        path,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for channel in &channels {
+                let sampler = samplers
+                    .get(channel.sampler)
+                    .ok_or_else(|| GltfError::new("animation channel sampler is out of range"))?;
+                let expected = if channel.path == AnimationPath::Rotation {
+                    4
+                } else {
+                    3
+                };
+                if sampler.output_components != expected {
+                    return Err(GltfError::new(
+                        "animation output type does not match its target path",
+                    ));
+                }
+            }
+            let duration = samplers
+                .iter()
+                .flat_map(|sampler| sampler.input.iter().copied())
+                .fold(0.0, f32::max);
+            Ok(GltfAnimation {
+                name: get_optional_string(o, "name")?
+                    .unwrap_or_default()
+                    .to_string(),
+                samplers,
+                channels,
+                duration,
+            })
+        })
+        .collect()
+}
+
+fn parse_scenes(
+    object: &[(String, Value)],
+    node_count: usize,
+) -> Result<Vec<GltfScene>, GltfError> {
+    get_optional_array(object, "scenes")?
+        .unwrap_or(&[])
+        .iter()
+        .map(|value| {
+            let o = as_object(value, "scene")?;
+            let nodes = get_usize_array(o, "nodes")?;
+            if nodes.iter().any(|&node| node >= node_count) {
+                return Err(GltfError::new("scene node index is out of range"));
+            }
+            Ok(GltfScene {
+                name: get_optional_string(o, "name")?
+                    .unwrap_or_default()
+                    .to_string(),
+                nodes,
+            })
+        })
+        .collect()
+}
+

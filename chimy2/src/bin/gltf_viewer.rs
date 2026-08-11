@@ -1,10 +1,8 @@
 use chimy2::camera::OrbitController;
 use chimy2::demo::{DemoArgs, run_demo};
 use chimy2::fb::{Framebuffer, argb8888};
-use chimy2::gltf::GltfAsset;
+use chimy2::gltf::{GltfAsset, submit_gltf_draws};
 use chimy2::math::Vec3;
-use chimy2::pipeline::Pipeline;
-use chimy2::shaders::{MeshShader, MeshUniforms};
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -38,23 +36,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let draws = asset
                 .scene_draws(asset.default_scene, animation, elapsed)
                 .expect("valid glTF scene");
-            let uniforms: Vec<_> = draws
-                .iter()
-                .map(|draw| {
-                    MeshUniforms::new(
-                        draw.model,
-                        camera.view_matrix(),
-                        camera.projection_matrix(),
-                        argb8888(255, 220, 160, 70),
-                    )
-                })
-                .collect();
-            let mut pipeline = Pipeline::new(MeshShader, MeshShader);
-            pipeline.render(framebuffer, |frame, target| {
-                for (draw, uniforms) in draws.iter().zip(&uniforms) {
-                    frame.draw_mesh(target, &draw.mesh, uniforms);
-                }
-            });
+            submit_gltf_draws(
+                framebuffer,
+                &asset,
+                &draws,
+                camera.view_matrix(),
+                camera.projection_matrix(),
+                camera.position,
+            )
+            .expect("valid glTF material");
         },
     )?;
     Ok(())
