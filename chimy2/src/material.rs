@@ -53,6 +53,7 @@ impl Material {
         uniforms.set_diffuse_color(self.diffuse);
         uniforms.set_specular_color(self.specular);
         uniforms.shininess = self.shininess.max(0.0);
+        uniforms.set_alpha(self.alpha);
     }
 
     pub fn albedo_texture(&self) -> Option<&Texture> {
