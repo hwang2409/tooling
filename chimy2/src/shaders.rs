@@ -26,11 +26,20 @@ pub use shader_pack::{
 pub struct FlatColorUniforms {
     pub transform: Mat4,
     pub color: u32,
+    pub alpha: f32,
 }
 
 impl FlatColorUniforms {
     pub const fn new(transform: Mat4, color: u32) -> Self {
-        Self { transform, color }
+        Self {
+            transform,
+            color,
+            alpha: 1.0,
+        }
+    }
+
+    pub fn set_alpha(&mut self, alpha: f32) {
+        self.alpha = alpha.clamp(0.0, 1.0);
     }
 }
 
@@ -47,7 +56,7 @@ impl VertexStage<Vec4, FlatColorUniforms> for FlatColorShader {
 
 impl FragmentStage<(), FlatColorUniforms> for FlatColorShader {
     fn run(&self, _: &(), uniforms: &FlatColorUniforms) -> u32 {
-        uniforms.color
+        multiply_alpha(uniforms.color, uniforms.alpha)
     }
 }
 
@@ -68,6 +77,7 @@ pub struct MeshUniforms {
     view: Mat4,
     projection: Mat4,
     pub color: u32,
+    pub alpha: f32,
     transform: Mat4,
 }
 
@@ -78,6 +88,7 @@ impl MeshUniforms {
             view,
             projection,
             color,
+            alpha: 1.0,
             transform: projection * view * model,
         }
     }
@@ -113,6 +124,10 @@ impl MeshUniforms {
         self.rebuild_transform();
     }
 
+    pub fn set_alpha(&mut self, alpha: f32) {
+        self.alpha = alpha.clamp(0.0, 1.0);
+    }
+
     fn rebuild_transform(&mut self) {
         self.transform = self.projection * self.view * self.model;
     }
@@ -140,7 +155,7 @@ impl VertexStage<MeshVertex, MeshUniforms> for MeshShader {
 
 impl FragmentStage<(), MeshUniforms> for MeshShader {
     fn run(&self, _: &(), uniforms: &MeshUniforms) -> u32 {
-        uniforms.color
+        multiply_alpha(uniforms.color, uniforms.alpha)
     }
 }
 
@@ -156,6 +171,7 @@ pub struct TexturedUniforms<'a> {
     pub transform: Mat4,
     pub texture: &'a Texture,
     pub filter: TextureFilter,
+    pub alpha: f32,
 }
 
 impl<'a> TexturedUniforms<'a> {
@@ -164,7 +180,12 @@ impl<'a> TexturedUniforms<'a> {
             transform,
             texture,
             filter,
+            alpha: 1.0,
         }
+    }
+
+    pub fn set_alpha(&mut self, alpha: f32) {
+        self.alpha = alpha.clamp(0.0, 1.0);
     }
 }
 
@@ -248,7 +269,7 @@ impl<'a> SampledFragmentStage<TexturedVaryings, TexturedUniforms<'a>> for Textur
                 ddy: derivatives.ddy,
             },
         );
-        argb8888_linear(pixel[3], [pixel[0], pixel[1], pixel[2]])
+        argb8888_linear(pixel[3] * uniforms.alpha, [pixel[0], pixel[1], pixel[2]])
     }
 }
 
@@ -327,6 +348,7 @@ pub struct BlinnPhongUniforms {
     pub specular_color: Vec3,
     pub shininess: f32,
     pub camera_position: Vec3,
+    pub alpha: f32,
     directional_light: DirectionalLight,
     pub point_light: PointLight,
     shadow_state: Option<ShadowState>,
@@ -357,6 +379,7 @@ impl BlinnPhongUniforms {
             specular_color: linearize_color(specular_color),
             shininess,
             camera_position,
+            alpha: 1.0,
             directional_light,
             point_light,
             shadow_state: None,
@@ -433,6 +456,10 @@ impl BlinnPhongUniforms {
     pub fn set_projection(&mut self, projection: Mat4) {
         self.projection = projection;
         self.rebuild_transform();
+    }
+
+    pub fn set_alpha(&mut self, alpha: f32) {
+        self.alpha = alpha.clamp(0.0, 1.0);
     }
 
     fn rebuild_caches(&mut self) {
@@ -543,7 +570,7 @@ impl BlinnPhongShader {
             Vec3::new(1.0, 1.0, 1.0),
         );
 
-        argb8888_linear(1.0, [lighted.x, lighted.y, lighted.z])
+        argb8888_linear(uniforms.alpha, [lighted.x, lighted.y, lighted.z])
     }
 }
 
@@ -649,6 +676,7 @@ pub struct TexturedBlinnPhongUniforms<'a> {
     pub lighting: BlinnPhongUniforms,
     pub texture: &'a Texture,
     pub filter: TextureFilter,
+    pub alpha: f32,
 }
 
 impl<'a> TexturedBlinnPhongUniforms<'a> {
@@ -661,7 +689,12 @@ impl<'a> TexturedBlinnPhongUniforms<'a> {
             lighting,
             texture,
             filter,
+            alpha: 1.0,
         }
+    }
+
+    pub fn set_alpha(&mut self, alpha: f32) {
+        self.alpha = alpha.clamp(0.0, 1.0);
     }
 }
 
@@ -745,7 +778,10 @@ impl<'a> SampledFragmentStage<TexturedBlinnPhongVaryings, TexturedBlinnPhongUnif
             albedo,
         );
 
-        argb8888_linear(pixel[3], [lighted.x, lighted.y, lighted.z])
+        argb8888_linear(
+            pixel[3] * uniforms.alpha * uniforms.lighting.alpha,
+            [lighted.x, lighted.y, lighted.z],
+        )
     }
 }
 
@@ -933,6 +969,16 @@ fn linearize_color(color: Vec3) -> Vec3 {
         srgb_to_linear(color.x),
         srgb_to_linear(color.y),
         srgb_to_linear(color.z),
+    )
+}
+
+fn multiply_alpha(color: u32, alpha: f32) -> u32 {
+    let [source_alpha, red, green, blue] = color.to_be_bytes();
+    crate::fb::argb8888(
+        (f32::from(source_alpha) / 255.0 * alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+        red,
+        green,
+        blue,
     )
 }
 

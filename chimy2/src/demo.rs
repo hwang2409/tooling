@@ -10,6 +10,7 @@
 //!   a binary PPM. Combines with `--frames` to freeze motion at a pose.
 //! - `--size WxH` — override the demo's default window size. Screenshot mode
 //!   uses this size directly for the offscreen framebuffer.
+//! - `--ssaa` — enable 2x linear-light supersampling in demos that opt in.
 
 use crate::fb::Framebuffer;
 use crate::image::Texture;
@@ -29,6 +30,7 @@ pub struct DemoArgs {
     pub frames: Option<usize>,
     pub screenshot: Option<PathBuf>,
     pub size: Option<(u32, u32)>,
+    pub ssaa: bool,
 }
 
 impl DemoArgs {
@@ -60,6 +62,7 @@ impl DemoArgs {
                         .ok_or_else(|| "--size needs WxH".to_string())?;
                     args.size = Some(parse_size(&value)?);
                 }
+                "--ssaa" => args.ssaa = true,
                 other => {
                     return Err(format!("unexpected argument: {other}"));
                 }
