@@ -235,6 +235,8 @@ mod tests {
     }
 
     impl Varyings for f32 {
+        type Derivatives = ();
+
         fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self {
             *a * weights.x + *b * weights.y + *c * weights.z
         }

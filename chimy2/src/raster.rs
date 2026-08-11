@@ -165,6 +165,30 @@ pub fn rasterize_triangle<V, F>(
             max_y: framebuffer.height.saturating_sub(1) as i32,
         },
         fragment,
+    )
+}
+
+/// Rasterizes one triangle and passes sampler-facing derivatives with each
+/// fragment. The raster core computes perspective-correct derivatives, while
+/// each varying type controls which derivative data reaches its shader.
+pub fn rasterize_triangle_with_derivatives<V, F>(
+    framebuffer: &mut Framebuffer,
+    vertices: [ScreenVertex<V>; 3],
+    fragment: F,
+) where
+    V: Varyings,
+    F: FnMut(V, V::Derivatives) -> u32,
+{
+    rasterize_triangle_in_rect_with_derivatives(
+        framebuffer,
+        vertices,
+        PixelRect {
+            min_x: 0,
+            max_x: framebuffer.width.saturating_sub(1) as i32,
+            min_y: 0,
+            max_y: framebuffer.height.saturating_sub(1) as i32,
+        },
+        fragment,
     );
 }
 
@@ -177,12 +201,26 @@ pub fn rasterize_triangle<V, F>(
 /// same color or depth element.
 pub(crate) fn rasterize_triangle_in_rect<V, F>(
     framebuffer: &mut Framebuffer,
-    mut vertices: [ScreenVertex<V>; 3],
+    vertices: [ScreenVertex<V>; 3],
     rect: PixelRect,
     mut fragment: F,
 ) where
     V: Varyings,
     F: FnMut(V) -> u32,
+{
+    rasterize_triangle_in_rect_with_derivatives(framebuffer, vertices, rect, |varyings, _| {
+        fragment(varyings)
+    });
+}
+
+pub(crate) fn rasterize_triangle_in_rect_with_derivatives<V, F>(
+    framebuffer: &mut Framebuffer,
+    mut vertices: [ScreenVertex<V>; 3],
+    rect: PixelRect,
+    mut fragment: F,
+) where
+    V: Varyings,
+    F: FnMut(V, V::Derivatives) -> u32,
 {
     let mut area = edge(
         vertices[0].position,
@@ -246,22 +284,33 @@ pub(crate) fn rasterize_triangle_in_rect<V, F>(
             if depth >= *buffer_depth {
                 continue;
             }
-            let varyings = V::lerp3(
+            let ddx_weights = Vec3::new(
+                -(vertices[2].position.y - vertices[1].position.y) / area,
+                -(vertices[0].position.y - vertices[2].position.y) / area,
+                -(vertices[1].position.y - vertices[0].position.y) / area,
+            );
+            let ddy_weights = Vec3::new(
+                (vertices[2].position.x - vertices[1].position.x) / area,
+                (vertices[0].position.x - vertices[2].position.x) / area,
+                (vertices[1].position.x - vertices[0].position.x) / area,
+            );
+            let inverse_w = Vec3::new(
+                vertices[0].inverse_w,
+                vertices[1].inverse_w,
+                vertices[2].inverse_w,
+            );
+            let (varyings, derivatives) = V::interpolate3(
                 &vertices[0].varyings,
                 &vertices[1].varyings,
                 &vertices[2].varyings,
-                perspective_correct_weights(
-                    weights,
-                    Vec3::new(
-                        vertices[0].inverse_w,
-                        vertices[1].inverse_w,
-                        vertices[2].inverse_w,
-                    ),
-                ),
+                weights,
+                inverse_w,
+                ddx_weights,
+                ddy_weights,
             );
             *buffer_depth = depth;
             if let Some(color) = framebuffer.color.get_mut(index) {
-                *color = fragment(varyings);
+                *color = fragment(varyings, derivatives);
             }
         }
     }

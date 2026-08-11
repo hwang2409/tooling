@@ -4,8 +4,8 @@
 //! positions by `model`, and the fragment stage uses the world-space camera
 //! and lights. Final color clamps to `[0, 1]` before 8-bit conversion.
 
-use crate::fb::argb8888;
-use crate::image::Texture;
+use crate::fb::argb8888_linear;
+use crate::image::{Texture, TextureDerivatives, srgb_to_linear};
 use crate::math::{Mat3, Mat4, Vec3, Vec4};
 use crate::mesh::MeshVertex;
 use crate::pipeline::{FragmentStage, Varyings, VertexOutput, VertexStage};
@@ -131,6 +131,7 @@ impl FragmentStage<(), MeshUniforms> for MeshShader {
 pub enum TextureFilter {
     Nearest,
     Bilinear,
+    Trilinear,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -156,10 +157,44 @@ pub struct TexturedVaryings {
 }
 
 impl Varyings for TexturedVaryings {
+    type Derivatives = TextureDerivatives;
+
     fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self {
         Self {
             texcoord: a.texcoord * weights.x + b.texcoord * weights.y + c.texcoord * weights.z,
         }
+    }
+
+    fn interpolate3(
+        a: &Self,
+        b: &Self,
+        c: &Self,
+        weights: Vec3,
+        inverse_w: Vec3,
+        ddx_weights: Vec3,
+        ddy_weights: Vec3,
+    ) -> (Self, Self::Derivatives) {
+        let corrected = crate::raster::perspective_correct_weights(weights, inverse_w);
+        let uv = Self::lerp3(a, b, c, corrected).texcoord;
+        let q = weights.x * inverse_w.x + weights.y * inverse_w.y + weights.z * inverse_w.z;
+        let q_squared = q * q;
+        let derivative = |gradient: Vec3| {
+            let dq = gradient.x * inverse_w.x + gradient.y * inverse_w.y + gradient.z * inverse_w.z;
+            let numerator = a.texcoord * (weights.x * inverse_w.x)
+                + b.texcoord * (weights.y * inverse_w.y)
+                + c.texcoord * (weights.z * inverse_w.z);
+            let dn = a.texcoord * (gradient.x * inverse_w.x)
+                + b.texcoord * (gradient.y * inverse_w.y)
+                + c.texcoord * (gradient.z * inverse_w.z);
+            (dn * q - numerator * dq) / q_squared
+        };
+        (
+            Self { texcoord: uv },
+            TextureDerivatives {
+                ddx: derivative(ddx_weights),
+                ddy: derivative(ddy_weights),
+            },
+        )
     }
 }
 
@@ -186,11 +221,22 @@ impl<'a> VertexStage<MeshVertex, TexturedUniforms<'a>> for TexturedShader {
 
 impl<'a> FragmentStage<TexturedVaryings, TexturedUniforms<'a>> for TexturedShader {
     fn run(&self, varyings: &TexturedVaryings, uniforms: &TexturedUniforms<'a>) -> u32 {
-        let pixel = match uniforms.filter {
-            TextureFilter::Nearest => uniforms.texture.sample_nearest(varyings.texcoord),
-            TextureFilter::Bilinear => uniforms.texture.sample_bilinear(varyings.texcoord),
-        };
-        argb8888(pixel[3], pixel[0], pixel[1], pixel[2])
+        self.run_with_derivatives(varyings, &TextureDerivatives::default(), uniforms)
+    }
+
+    fn run_with_derivatives(
+        &self,
+        varyings: &TexturedVaryings,
+        derivatives: &TextureDerivatives,
+        uniforms: &TexturedUniforms<'a>,
+    ) -> u32 {
+        let pixel = sample_texture(
+            uniforms.texture,
+            varyings.texcoord,
+            uniforms.filter,
+            *derivatives,
+        );
+        argb8888_linear(pixel[3], [pixel[0], pixel[1], pixel[2]])
     }
 }
 
@@ -202,8 +248,11 @@ pub struct DirectionalLight {
 }
 
 impl DirectionalLight {
-    pub const fn new(direction: Vec3, color: Vec3) -> Self {
-        Self { direction, color }
+    pub fn new(direction: Vec3, color: Vec3) -> Self {
+        Self {
+            direction,
+            color: linearize_color(color),
+        }
     }
 }
 
@@ -217,7 +266,7 @@ pub struct PointLight {
 }
 
 impl PointLight {
-    pub const fn new(
+    pub fn new(
         position: Vec3,
         color: Vec3,
         constant_attenuation: f32,
@@ -226,7 +275,7 @@ impl PointLight {
     ) -> Self {
         Self {
             position,
-            color,
+            color: linearize_color(color),
             constant_attenuation,
             linear_attenuation,
             quadratic_attenuation,
@@ -290,9 +339,9 @@ impl BlinnPhongUniforms {
             model,
             view,
             projection,
-            ambient_color,
-            diffuse_color,
-            specular_color,
+            ambient_color: linearize_color(ambient_color),
+            diffuse_color: linearize_color(diffuse_color),
+            specular_color: linearize_color(specular_color),
             shininess,
             camera_position,
             directional_light,
@@ -354,6 +403,8 @@ pub struct BlinnPhongVaryings {
 }
 
 impl Varyings for BlinnPhongVaryings {
+    type Derivatives = ();
+
     fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self {
         Self {
             world_position: a.world_position * weights.x
@@ -430,12 +481,7 @@ impl BlinnPhongShader {
             Vec3::new(1.0, 1.0, 1.0),
         );
 
-        argb8888(
-            255,
-            channel(lighted.x),
-            channel(lighted.y),
-            channel(lighted.z),
-        )
+        argb8888_linear(1.0, [lighted.x, lighted.y, lighted.z])
     }
 }
 
@@ -541,6 +587,8 @@ pub struct TexturedBlinnPhongVaryings {
 }
 
 impl Varyings for TexturedBlinnPhongVaryings {
+    type Derivatives = TextureDerivatives;
+
     fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self {
         Self {
             world_position: a.world_position * weights.x
@@ -549,6 +597,38 @@ impl Varyings for TexturedBlinnPhongVaryings {
             normal: a.normal * weights.x + b.normal * weights.y + c.normal * weights.z,
             texcoord: a.texcoord * weights.x + b.texcoord * weights.y + c.texcoord * weights.z,
         }
+    }
+
+    fn interpolate3(
+        a: &Self,
+        b: &Self,
+        c: &Self,
+        weights: Vec3,
+        inverse_w: Vec3,
+        ddx_weights: Vec3,
+        ddy_weights: Vec3,
+    ) -> (Self, Self::Derivatives) {
+        let corrected = crate::raster::perspective_correct_weights(weights, inverse_w);
+        let value = Self::lerp3(a, b, c, corrected);
+        let q = weights.x * inverse_w.x + weights.y * inverse_w.y + weights.z * inverse_w.z;
+        let q_squared = q * q;
+        let derivative = |gradient: Vec3| {
+            let dq = gradient.x * inverse_w.x + gradient.y * inverse_w.y + gradient.z * inverse_w.z;
+            let numerator = a.texcoord * (weights.x * inverse_w.x)
+                + b.texcoord * (weights.y * inverse_w.y)
+                + c.texcoord * (weights.z * inverse_w.z);
+            let dn = a.texcoord * (gradient.x * inverse_w.x)
+                + b.texcoord * (gradient.y * inverse_w.y)
+                + c.texcoord * (gradient.z * inverse_w.z);
+            (dn * q - numerator * dq) / q_squared
+        };
+        (
+            value,
+            TextureDerivatives {
+                ddx: derivative(ddx_weights),
+                ddy: derivative(ddy_weights),
+            },
+        )
     }
 }
 
@@ -580,15 +660,22 @@ impl<'a> FragmentStage<TexturedBlinnPhongVaryings, TexturedBlinnPhongUniforms<'a
         varyings: &TexturedBlinnPhongVaryings,
         uniforms: &TexturedBlinnPhongUniforms<'a>,
     ) -> u32 {
-        let pixel = match uniforms.filter {
-            TextureFilter::Nearest => uniforms.texture.sample_nearest(varyings.texcoord),
-            TextureFilter::Bilinear => uniforms.texture.sample_bilinear(varyings.texcoord),
-        };
-        let albedo = Vec3::new(
-            pixel[0] as f32 / 255.0,
-            pixel[1] as f32 / 255.0,
-            pixel[2] as f32 / 255.0,
+        self.run_with_derivatives(varyings, &TextureDerivatives::default(), uniforms)
+    }
+
+    fn run_with_derivatives(
+        &self,
+        varyings: &TexturedBlinnPhongVaryings,
+        derivatives: &TextureDerivatives,
+        uniforms: &TexturedBlinnPhongUniforms<'a>,
+    ) -> u32 {
+        let pixel = sample_texture(
+            uniforms.texture,
+            varyings.texcoord,
+            uniforms.filter,
+            *derivatives,
         );
+        let albedo = Vec3::new(pixel[0], pixel[1], pixel[2]);
         let lighted = evaluate_lighting(
             varyings.world_position,
             varyings.normal,
@@ -596,17 +683,31 @@ impl<'a> FragmentStage<TexturedBlinnPhongVaryings, TexturedBlinnPhongUniforms<'a
             albedo,
         );
 
-        argb8888(
-            pixel[3],
-            channel(lighted.x),
-            channel(lighted.y),
-            channel(lighted.z),
-        )
+        argb8888_linear(pixel[3], [lighted.x, lighted.y, lighted.z])
     }
 }
 
-fn channel(value: f32) -> u8 {
-    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+fn sample_texture(
+    texture: &Texture,
+    uv: crate::math::Vec2,
+    filter: TextureFilter,
+    derivatives: TextureDerivatives,
+) -> [f32; 4] {
+    match filter {
+        TextureFilter::Nearest => texture.sample_linear_nearest(uv),
+        TextureFilter::Bilinear => texture.sample_linear_bilinear(uv),
+        TextureFilter::Trilinear => {
+            texture.sample_linear_trilinear_with_derivatives(uv, derivatives)
+        }
+    }
+}
+
+fn linearize_color(color: Vec3) -> Vec3 {
+    Vec3::new(
+        srgb_to_linear(color.x),
+        srgb_to_linear(color.y),
+        srgb_to_linear(color.z),
+    )
 }
 
 #[cfg(test)]
@@ -640,7 +741,7 @@ mod tests {
         // The hand calculation is H = normalize((0, 1, 1) + (0, 0, 1)),
         // so N dot H = 0.9238795. With shininess 8, specular is 0.53079,
         // which rounds to 135 in each 8-bit channel.
-        assert_eq!(BlinnPhongShader::shade(&varyings, &uniforms()), 0xff878787);
+        assert_eq!(BlinnPhongShader::shade(&varyings, &uniforms()), 0xffc1c1c1);
     }
 
     #[test]

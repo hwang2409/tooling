@@ -66,10 +66,12 @@ see it and can't get it wrong.
 - **mesh**: OBJ parser for positions, texture coords, normals; smooth
   area-weighted normals when the file has none.
 - **image**: hand-written PPM (P6) and QOI decoders + a QOI encoder for the
-  dev-side asset script; nearest and bilinear texture sampling with repeat
-  and clamp-to-edge wrap modes.
+  dev-side asset script; sRGB-to-linear texture decode, full box-filtered mip
+  chains, nearest, bilinear, and trilinear sampling with repeat and
+  clamp-to-edge wrap modes.
 - **camera**: quaternion camera, orbit controller, WASD fly controller.
-- **shaders**: flat, mesh, textured, blinn-phong, textured-blinn-phong.
+- **shaders**: flat, mesh, textured, blinn-phong, textured-blinn-phong, with
+  linear-light lighting and sRGB framebuffer encoding.
 - **fb / present**: framebuffer with depth, softbuffer blit, keyboard input.
 
 Ground rule for the raster core: no clock, no randomness. Same scene in,

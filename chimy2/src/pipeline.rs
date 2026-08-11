@@ -5,7 +5,8 @@ use crate::fb::Framebuffer;
 use crate::math::{Vec3, Vec4};
 use crate::mesh::{Mesh, MeshVertex};
 use crate::raster::{
-    PixelRect, ScreenVertex, rasterize_triangle, triangle_pixel_rect, viewport_transform,
+    PixelRect, ScreenVertex, rasterize_triangle_with_derivatives, triangle_pixel_rect,
+    viewport_transform,
 };
 use std::marker::PhantomData;
 use std::thread;
@@ -14,7 +15,32 @@ pub const TILE_SIZE: usize = 64;
 
 /// Values passed from a vertex stage to a fragment stage.
 pub trait Varyings: Sized {
+    type Derivatives: Clone + Default;
+
     fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self;
+
+    /// Computes perspective-correct values and screen-space derivatives.
+    /// The raster core supplies barycentric weights and their gradients;
+    /// concrete varyings decide which derivative data a shader can consume.
+    fn interpolate3(
+        a: &Self,
+        b: &Self,
+        c: &Self,
+        weights: Vec3,
+        inverse_w: Vec3,
+        _ddx_weights: Vec3,
+        _ddy_weights: Vec3,
+    ) -> (Self, Self::Derivatives) {
+        (
+            Self::lerp3(
+                a,
+                b,
+                c,
+                crate::raster::perspective_correct_weights(weights, inverse_w),
+            ),
+            Self::Derivatives::default(),
+        )
+    }
 
     fn lerp(a: &Self, b: &Self, amount: f32) -> Self {
         Self::lerp3(a, b, b, Vec3::new(1.0 - amount, amount, 0.0))
@@ -22,6 +48,8 @@ pub trait Varyings: Sized {
 }
 
 impl Varyings for () {
+    type Derivatives = ();
+
     fn lerp3(_: &Self, _: &Self, _: &Self, _: Vec3) -> Self {}
 }
 
@@ -37,6 +65,8 @@ impl ColorVarying {
 }
 
 impl Varyings for ColorVarying {
+    type Derivatives = ();
+
     fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self {
         Self::new(a.color * weights.x + b.color * weights.y + c.color * weights.z)
     }
@@ -82,6 +112,10 @@ pub trait VertexStage<Vertex, Uniforms> {
 /// ```
 pub trait FragmentStage<V: Varyings, Uniforms> {
     fn run(&self, varyings: &V, uniforms: &Uniforms) -> u32;
+
+    fn run_with_derivatives(&self, varyings: &V, _: &V::Derivatives, uniforms: &Uniforms) -> u32 {
+        self.run(varyings, uniforms)
+    }
 }
 
 pub struct VertexFn<F, V> {
@@ -220,9 +254,14 @@ impl<VS, FS> Pipeline<VS, FS> {
         V: Varyings + Clone,
     {
         for triangle in prepared {
-            rasterize_triangle(framebuffer, triangle.vertices, |varyings| {
-                self.fragment.run(&varyings, uniforms)
-            });
+            rasterize_triangle_with_derivatives(
+                framebuffer,
+                triangle.vertices,
+                |varyings, derivatives| {
+                    self.fragment
+                        .run_with_derivatives(&varyings, &derivatives, uniforms)
+                },
+            );
         }
     }
 
@@ -383,8 +422,8 @@ where
             vertex.position.x -= tile.x as f32;
             vertex.position.y -= tile.y as f32;
         }
-        rasterize_triangle(&mut framebuffer, triangle, |varyings| {
-            fragment.run(&varyings, uniforms)
+        rasterize_triangle_with_derivatives(&mut framebuffer, triangle, |varyings, derivatives| {
+            fragment.run_with_derivatives(&varyings, &derivatives, uniforms)
         });
     }
 
