@@ -69,3 +69,24 @@ jobs:
             chimy2/target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('chimy2/Cargo.lock') }}
       - run: cargo test
+
+  wasm-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: chimy2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            chimy2/target/
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('chimy2/Cargo.lock') }}
+      - run: cargo check --target wasm32-unknown-unknown --lib
