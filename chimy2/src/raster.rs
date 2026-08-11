@@ -435,9 +435,36 @@ mod tests {
     #[test]
     fn inconsistent_depth_buffer_does_not_panic() {
         let mut framebuffer = Framebuffer::new(6, 6);
-        framebuffer.depth.clear();
+        framebuffer.depth = Vec::new();
         rasterize_triangle(&mut framebuffer, triangle(0.0), |_| 0xffff_ffff);
         assert!(framebuffer.color.iter().all(|&pixel| pixel == 0));
+    }
+
+    #[test]
+    fn short_depth_buffer_renders_valid_last_row_pixels() {
+        let mut framebuffer = Framebuffer::new(4, 4);
+        let sentinel = 0x1234_5678;
+        let mut depth = vec![1.0; 4 * 4];
+        depth.truncate(4 * 4 - 1);
+        depth.shrink_to_fit();
+        framebuffer.depth = depth;
+        framebuffer.color[15] = sentinel;
+        #[cfg(target_arch = "aarch64")]
+        simd::reset_depth_fallbacks();
+        let vertices = [
+            ScreenVertex::new(Vec3::new(0.0, -2.0, -1.0), ()),
+            ScreenVertex::new(Vec3::new(10.0, -2.0, -1.0), ()),
+            ScreenVertex::new(Vec3::new(0.0, 10.0, -1.0), ()),
+        ];
+        rasterize_triangle(&mut framebuffer, vertices, |_| 0xffff_ffff);
+        #[cfg(target_arch = "aarch64")]
+        assert!(simd::depth_fallbacks() > 0);
+        assert!(
+            framebuffer.color[3 * framebuffer.width..3 * framebuffer.width + 3]
+                .iter()
+                .all(|&pixel| pixel == 0xffff_ffff)
+        );
+        assert_eq!(framebuffer.color[3 * framebuffer.width + 3], sentinel);
     }
 
     #[test]

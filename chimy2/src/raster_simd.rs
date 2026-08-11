@@ -6,6 +6,12 @@ use crate::math::Vec3;
 use crate::pipeline::Varyings;
 use core::arch::aarch64::*;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
+static DEPTH_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Clone, Copy)]
 struct RasterSpan {
     area: f32,
@@ -62,6 +68,8 @@ pub(super) fn rasterize_prepared<V, F>(
                     rasterize_quad(framebuffer, &vertices, span, depth_ptr, &mut fragment);
                 }
             } else {
+                #[cfg(test)]
+                DEPTH_FALLBACKS.fetch_add(1, Ordering::Relaxed);
                 rasterize_scalar_quad(framebuffer, &vertices, span, &mut fragment);
             }
             x = x.saturating_add(4);
@@ -77,6 +85,16 @@ pub(super) fn rasterize_prepared<V, F>(
             x = x.saturating_add(1);
         }
     }
+}
+
+#[cfg(test)]
+pub(super) fn reset_depth_fallbacks() {
+    DEPTH_FALLBACKS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(super) fn depth_fallbacks() -> usize {
+    DEPTH_FALLBACKS.load(Ordering::Relaxed)
 }
 
 fn rasterize_scalar_quad<V, F>(
