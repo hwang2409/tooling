@@ -106,17 +106,23 @@ fn render(swap_diffuse: bool, wrong_albedo_space: bool, flatten_groups: bool) ->
                 .unwrap();
                 let mut pipeline =
                     Pipeline::new(NormalMappedBlinnPhongShader, NormalMappedBlinnPhongShader);
-                pipeline.draw_mesh_with_sampling(&mut framebuffer, &group_mesh, &uniforms);
+                pipeline.render(&mut framebuffer, |frame, target| {
+                    frame.draw_mesh_with_sampling(target, &group_mesh, &uniforms);
+                });
             } else {
                 let uniforms =
                     TexturedBlinnPhongUniforms::new(lighting, texture, TextureFilter::Bilinear);
                 let mut pipeline =
                     Pipeline::new(TexturedBlinnPhongShader, TexturedBlinnPhongShader);
-                pipeline.draw_mesh_with_sampling(&mut framebuffer, &group_mesh, &uniforms);
+                pipeline.render(&mut framebuffer, |frame, target| {
+                    frame.draw_mesh_with_sampling(target, &group_mesh, &uniforms);
+                });
             }
         } else {
             let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
-            pipeline.draw_mesh(&mut framebuffer, &group_mesh, &lighting);
+            pipeline.render(&mut framebuffer, |frame, target| {
+                frame.draw_mesh(target, &group_mesh, &lighting);
+            });
         }
     }
     framebuffer
