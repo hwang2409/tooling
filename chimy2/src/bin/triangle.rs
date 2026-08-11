@@ -42,14 +42,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     * Mat4::rotate(Vec3::new(0.0, 0.0, 1.0), angle),
                 argb8888(255, 235, 76, 76),
             );
-            pipeline.draw(framebuffer, &triangle_a, &indices, &first);
-
             let second = FlatColorUniforms::new(
                 Mat4::translate(Vec3::new(0.18, 0.0, -0.18))
                     * Mat4::rotate(Vec3::new(0.0, 0.0, 1.0), -angle * 0.8),
                 argb8888(255, 76, 150, 235),
             );
-            pipeline.draw(framebuffer, &triangle_b, &indices, &second);
+            pipeline.render(framebuffer, |frame, target| {
+                frame.draw(target, &triangle_a, &indices, &first);
+                frame.draw(target, &triangle_b, &indices, &second);
+            });
         },
     )
 }

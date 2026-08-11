@@ -65,7 +65,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             framebuffer.clear(argb8888(255, 8, 10, 16));
             let mut pipeline = Pipeline::new(TexturedBlinnPhongShader, TexturedBlinnPhongShader);
-            pipeline.draw_mesh_with_sampling(framebuffer, &mesh, &uniforms);
+            pipeline.render(framebuffer, |frame, target| {
+                frame.draw_mesh_with_sampling(target, &mesh, &uniforms);
+            });
         },
     )
 }

@@ -77,6 +77,7 @@ impl Varyings for ColorVarying {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VertexOutput<V> {
     pub clip_position: Vec4,
+    pub view_position: Vec4,
     pub varyings: V,
 }
 
@@ -84,6 +85,15 @@ impl<V> VertexOutput<V> {
     pub const fn new(clip_position: Vec4, varyings: V) -> Self {
         Self {
             clip_position,
+            view_position: clip_position,
+            varyings,
+        }
+    }
+
+    pub const fn with_view_position(clip_position: Vec4, view_position: Vec4, varyings: V) -> Self {
+        Self {
+            clip_position,
+            view_position,
             varyings,
         }
     }
@@ -492,165 +502,6 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
 }
 
 impl<VS, FS> Pipeline<VS, FS> {
-    #[allow(clippy::too_many_arguments)]
-    fn draw_prepared<Vertex, Uniforms>(
-        &self,
-        framebuffer: &mut Framebuffer,
-        vertices: &[Vertex],
-        triangles: &[[usize; 3]],
-        sort_keys: Option<&[f32]>,
-        uniforms: &Uniforms,
-        class: DrawClass,
-        rasterize: RasterFn<VS::Varyings, FS, Uniforms>,
-    ) where
-        VS: VertexStage<Vertex, Uniforms> + Sync,
-        FS: Sync,
-        Vertex: Sync,
-        Uniforms: Sync,
-        VS::Varyings: Clone + Send + Sync,
-    {
-        let mut prepared = prepare_triangles(
-            &self.vertex,
-            framebuffer,
-            vertices,
-            triangles,
-            sort_keys,
-            uniforms,
-        );
-        if class == DrawClass::Transparent {
-            sort_prepared(&mut prepared);
-        }
-        let prepared = prepared
-            .into_iter()
-            .map(|(_, triangle)| triangle)
-            .collect::<Vec<_>>();
-        dispatch_prepared(
-            self.thread_count,
-            framebuffer,
-            &prepared,
-            uniforms,
-            &self.fragment,
-            class.raster_state(),
-            rasterize,
-        );
-    }
-
-    pub fn draw<Vertex, Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        vertices: &[Vertex],
-        triangles: &[[usize; 3]],
-        uniforms: &Uniforms,
-    ) where
-        VS: VertexStage<Vertex, Uniforms> + Sync,
-        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
-        Vertex: Sync,
-        Uniforms: Sync,
-        VS::Varyings: Clone + Send + Sync,
-    {
-        let class = if self.fragment.is_opaque(uniforms) {
-            DrawClass::Opaque
-        } else {
-            DrawClass::Transparent
-        };
-        self.draw_prepared(
-            framebuffer,
-            vertices,
-            triangles,
-            None,
-            uniforms,
-            class,
-            rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
-        );
-    }
-
-    pub fn draw_with_sampling<Vertex, Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        vertices: &[Vertex],
-        triangles: &[[usize; 3]],
-        uniforms: &Uniforms,
-    ) where
-        VS: VertexStage<Vertex, Uniforms> + Sync,
-        FS: SampledFragmentStage<VS::Varyings, Uniforms> + Sync,
-        Vertex: Sync,
-        Uniforms: Sync,
-        VS::Varyings: SamplingVaryings + Clone + Send + Sync,
-    {
-        let class = if self.fragment.is_opaque(uniforms) {
-            DrawClass::Opaque
-        } else {
-            DrawClass::Transparent
-        };
-        self.draw_prepared(
-            framebuffer,
-            vertices,
-            triangles,
-            None,
-            uniforms,
-            class,
-            rasterize_sampled_triangle::<VS::Varyings, FS, Uniforms>,
-        );
-    }
-
-    pub fn draw_mesh<Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        mesh: &Mesh,
-        uniforms: &Uniforms,
-    ) where
-        VS: VertexStage<MeshVertex, Uniforms> + Sync,
-        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
-        Uniforms: Sync,
-        VS::Varyings: Clone + Send + Sync,
-    {
-        let model_view = self.fragment.model_view(uniforms).unwrap_or(Mat4::IDENTITY);
-        let keys = mesh_centroid_depths(mesh, model_view);
-        let class = if self.fragment.is_opaque(uniforms) {
-            DrawClass::Opaque
-        } else {
-            DrawClass::Transparent
-        };
-        self.draw_prepared(
-            framebuffer,
-            mesh.vertices(),
-            mesh.indices(),
-            Some(&keys),
-            uniforms,
-            class,
-            rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
-        );
-    }
-
-    pub fn draw_mesh_with_sampling<Uniforms>(
-        &mut self,
-        framebuffer: &mut Framebuffer,
-        mesh: &Mesh,
-        uniforms: &Uniforms,
-    ) where
-        VS: VertexStage<MeshVertex, Uniforms> + Sync,
-        FS: SampledFragmentStage<VS::Varyings, Uniforms> + Sync,
-        Uniforms: Sync,
-        VS::Varyings: SamplingVaryings + Clone + Send + Sync,
-    {
-        let model_view = self.fragment.model_view(uniforms).unwrap_or(Mat4::IDENTITY);
-        let keys = mesh_centroid_depths(mesh, model_view);
-        let class = if self.fragment.is_opaque(uniforms) {
-            DrawClass::Opaque
-        } else {
-            DrawClass::Transparent
-        };
-        self.draw_prepared(
-            framebuffer,
-            mesh.vertices(),
-            mesh.indices(),
-            Some(&keys),
-            uniforms,
-            class,
-            rasterize_sampled_triangle::<VS::Varyings, FS, Uniforms>,
-        );
-    }
-
     pub fn draw_depth<Vertex, Uniforms>(
         &mut self,
         framebuffer: &mut Framebuffer,
@@ -722,7 +573,7 @@ struct TileResult {
     framebuffer: Framebuffer,
 }
 
-/// The one tile-aware dispatcher used by immediate and queued draws.
+/// The one tile-aware dispatcher used by every queued draw.
 fn dispatch_prepared<V, FS, Uniforms>(
     thread_count: usize,
     framebuffer: &mut Framebuffer,
@@ -946,10 +797,10 @@ where
         let key = sort_keys
             .and_then(|keys| keys.get(triangle_index).copied())
             .unwrap_or_else(|| {
-                centroid_clip_depth([
-                    output_a.clip_position,
-                    output_b.clip_position,
-                    output_c.clip_position,
+                centroid_view_depth([
+                    output_a.view_position,
+                    output_b.view_position,
+                    output_c.view_position,
                 ])
             });
         let clipped = clip_triangle_near([
@@ -1007,17 +858,7 @@ where
     prepared
 }
 
-fn sort_prepared<V>(prepared: &mut Vec<(f32, PreparedTriangle<V>)>) {
-    let mut indexed = prepared.drain(..).enumerate().collect::<Vec<_>>();
-    indexed.sort_by(
-        |(left_index, (left_key, _)), (right_index, (right_key, _))| {
-            compare_depth_keys(*left_key, *right_key).then_with(|| left_index.cmp(right_index))
-        },
-    );
-    prepared.extend(indexed.into_iter().map(|(_, prepared)| prepared));
-}
-
-fn centroid_clip_depth(positions: [Vec4; 3]) -> f32 {
+fn centroid_view_depth(positions: [Vec4; 3]) -> f32 {
     let position = (positions[0] + positions[1] + positions[2]) / 3.0;
     let z = position.z / position.w;
     if z.is_nan() { f32::INFINITY } else { z }
@@ -1035,7 +876,32 @@ impl DrawClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fb::argb8888;
+    use crate::fb::{argb8888, blend_argb8888_linear};
+
+    #[derive(Clone, Copy)]
+    struct RawVertex {
+        clip_position: Vec4,
+        view_position: Vec4,
+        color: Vec4,
+    }
+
+    struct TransparentColor;
+
+    impl FragmentStage<ColorVarying, ()> for TransparentColor {
+        fn run(&self, varyings: &ColorVarying, _: &()) -> u32 {
+            let color = varyings.color;
+            argb8888(
+                128,
+                (color.x * 255.0).round() as u8,
+                (color.y * 255.0).round() as u8,
+                (color.z * 255.0).round() as u8,
+            )
+        }
+
+        fn is_opaque(&self, _: &()) -> bool {
+            false
+        }
+    }
 
     #[test]
     fn closure_stages_draw_a_triangle() {
@@ -1044,17 +910,76 @@ mod tests {
             fragment_stage(|_: &(), _: &()| argb8888(255, 20, 40, 60)),
         );
         let mut framebuffer = Framebuffer::new(4, 4);
-        pipeline.draw(
-            &mut framebuffer,
-            &[
-                Vec4::new(-1.0, -1.0, 0.0, 1.0),
-                Vec4::new(1.0, -1.0, 0.0, 1.0),
-                Vec4::new(-1.0, 1.0, 0.0, 1.0),
-            ],
-            &[[0, 1, 2]],
-            &(),
-        );
+        let vertices = [
+            Vec4::new(-1.0, -1.0, 0.0, 1.0),
+            Vec4::new(1.0, -1.0, 0.0, 1.0),
+            Vec4::new(-1.0, 1.0, 0.0, 1.0),
+        ];
+        pipeline.render(&mut framebuffer, |frame, target| {
+            frame.draw(target, &vertices, &[[0, 1, 2]], &());
+        });
         assert!(framebuffer.color.contains(&argb8888(255, 20, 40, 60)));
+    }
+
+    #[test]
+    fn raw_transparent_draws_sort_by_view_space_depth() {
+        let far_color = argb8888(128, 235, 70, 40);
+        let near_color = argb8888(128, 40, 90, 235);
+        let far = [
+            RawVertex {
+                clip_position: Vec4::new(-0.8 * 4.0, -0.8 * 4.0, 3.0, 4.0),
+                view_position: Vec4::new(-0.8, -0.8, -4.0, 1.0),
+                color: Vec4::new(235.0 / 255.0, 70.0 / 255.0, 40.0 / 255.0, 1.0),
+            },
+            RawVertex {
+                clip_position: Vec4::new(0.8 * 4.0, -0.8 * 4.0, 3.0, 4.0),
+                view_position: Vec4::new(0.8, -0.8, -4.0, 1.0),
+                color: Vec4::new(235.0 / 255.0, 70.0 / 255.0, 40.0 / 255.0, 1.0),
+            },
+            RawVertex {
+                clip_position: Vec4::new(0.0, 0.8 * 4.0, 3.0, 4.0),
+                view_position: Vec4::new(0.0, 0.8, -4.0, 1.0),
+                color: Vec4::new(235.0 / 255.0, 70.0 / 255.0, 40.0 / 255.0, 1.0),
+            },
+        ];
+        let near = [
+            RawVertex {
+                clip_position: Vec4::new(-0.8, -0.8, -0.5, 1.0),
+                view_position: Vec4::new(-0.8, -0.8, -1.0, 1.0),
+                color: Vec4::new(40.0 / 255.0, 90.0 / 255.0, 235.0 / 255.0, 1.0),
+            },
+            RawVertex {
+                clip_position: Vec4::new(0.8, -0.8, -0.5, 1.0),
+                view_position: Vec4::new(0.8, -0.8, -1.0, 1.0),
+                color: Vec4::new(40.0 / 255.0, 90.0 / 255.0, 235.0 / 255.0, 1.0),
+            },
+            RawVertex {
+                clip_position: Vec4::new(0.0, 0.8, -0.5, 1.0),
+                view_position: Vec4::new(0.0, 0.8, -1.0, 1.0),
+                color: Vec4::new(40.0 / 255.0, 90.0 / 255.0, 235.0 / 255.0, 1.0),
+            },
+        ];
+        let mut pipeline = Pipeline::new(
+            vertex_stage(|vertex: &RawVertex, _: &()| {
+                VertexOutput::with_view_position(
+                    vertex.clip_position,
+                    vertex.view_position,
+                    ColorVarying::new(vertex.color),
+                )
+            }),
+            TransparentColor,
+        );
+        let mut framebuffer = Framebuffer::new(16, 16);
+        let background = argb8888(255, 12, 16, 24);
+        framebuffer.clear(background);
+        pipeline.render(&mut framebuffer, |frame, target| {
+            frame.draw(target, &near, &[[0, 1, 2]], &());
+            frame.draw(target, &far, &[[0, 1, 2]], &());
+        });
+
+        let far_over_background = blend_argb8888_linear(background, far_color);
+        let expected = blend_argb8888_linear(far_over_background, near_color);
+        assert_eq!(framebuffer.color[8 * 16 + 8], expected);
     }
 
     #[test]

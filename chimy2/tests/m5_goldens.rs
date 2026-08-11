@@ -76,7 +76,10 @@ fn perspective_textured_quad_golden() {
     let uniforms =
         TexturedUniforms::new(camera.view_projection(), &texture, TextureFilter::Nearest);
     let mut pipeline = Pipeline::new(TexturedShader, TexturedShader);
-    pipeline.draw_mesh_with_sampling(&mut framebuffer, &foreshortened_quad(), &uniforms);
+    let mesh = foreshortened_quad();
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh_with_sampling(target, &mesh, &uniforms);
+    });
     assert_golden("m5-perspective-textured-quad", &framebuffer);
 }
 
@@ -90,17 +93,17 @@ fn bilinear_and_nearest_have_distinct_goldens() {
     let mut nearest = background();
     let mut bilinear = background();
     let mut nearest_pipeline = Pipeline::new(TexturedShader, TexturedShader);
-    nearest_pipeline.draw_mesh_with_sampling(
-        &mut nearest,
-        &mesh,
-        &TexturedUniforms::new(camera.view_projection(), &texture, TextureFilter::Nearest),
-    );
+    let nearest_uniforms =
+        TexturedUniforms::new(camera.view_projection(), &texture, TextureFilter::Nearest);
+    nearest_pipeline.render(&mut nearest, |frame, target| {
+        frame.draw_mesh_with_sampling(target, &mesh, &nearest_uniforms);
+    });
     let mut bilinear_pipeline = Pipeline::new(TexturedShader, TexturedShader);
-    bilinear_pipeline.draw_mesh_with_sampling(
-        &mut bilinear,
-        &mesh,
-        &TexturedUniforms::new(camera.view_projection(), &texture, TextureFilter::Bilinear),
-    );
+    let bilinear_uniforms =
+        TexturedUniforms::new(camera.view_projection(), &texture, TextureFilter::Bilinear);
+    bilinear_pipeline.render(&mut bilinear, |frame, target| {
+        frame.draw_mesh_with_sampling(target, &mesh, &bilinear_uniforms);
+    });
     assert_ne!(nearest.color, bilinear.color);
     assert_golden("m5-nearest-textured-quad", &nearest);
     assert_golden("m5-bilinear-textured-quad", &bilinear);
@@ -136,6 +139,9 @@ fn textured_lit_mesh_golden() {
     let mut framebuffer = background();
     let uniforms = TexturedBlinnPhongUniforms::new(lighting, &texture, TextureFilter::Bilinear);
     let mut pipeline = Pipeline::new(TexturedBlinnPhongShader, TexturedBlinnPhongShader);
-    pipeline.draw_mesh_with_sampling(&mut framebuffer, &foreshortened_quad(), &uniforms);
+    let mesh = foreshortened_quad();
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh_with_sampling(target, &mesh, &uniforms);
+    });
     assert_golden("m5-textured-lit-mesh", &framebuffer);
 }

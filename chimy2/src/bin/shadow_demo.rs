@@ -86,6 +86,8 @@ fn draw(framebuffer: &mut Framebuffer, elapsed: f32, _: &InputState) {
     caster_uniforms.set_directional_shadow(directional, Some(caster_shadow));
 
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
-    pipeline.draw_mesh(framebuffer, &ground, &ground_uniforms);
-    pipeline.draw_mesh(framebuffer, &caster, &caster_uniforms);
+    pipeline.render(framebuffer, |frame, target| {
+        frame.draw_mesh(target, &ground, &ground_uniforms);
+        frame.draw_mesh(target, &caster, &caster_uniforms);
+    });
 }

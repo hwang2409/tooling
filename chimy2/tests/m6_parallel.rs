@@ -35,12 +35,10 @@ fn draw_flat(
         .collect();
     let mut pipeline = Pipeline::new(FlatColorShader, FlatColorShader);
     pipeline.set_thread_count(thread_count);
-    pipeline.draw(
-        framebuffer,
-        &transformed,
-        triangles,
-        &FlatColorUniforms::new(Mat4::IDENTITY, color),
-    );
+    let uniforms = FlatColorUniforms::new(Mat4::IDENTITY, color);
+    pipeline.render(framebuffer, |frame, target| {
+        frame.draw(target, &transformed, triangles, &uniforms);
+    });
 }
 
 fn flat_single(thread_count: usize) -> Framebuffer {
@@ -144,7 +142,9 @@ fn m3_cube(thread_count: usize) -> Framebuffer {
     );
     let mut pipeline = Pipeline::new(MeshShader, MeshShader);
     pipeline.set_thread_count(thread_count);
-    pipeline.draw_mesh(&mut framebuffer, &mesh, &uniforms);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh(target, &mesh, &uniforms);
+    });
     framebuffer
 }
 
@@ -167,7 +167,9 @@ fn m3_near_plane(thread_count: usize) -> Framebuffer {
     );
     let mut pipeline = Pipeline::new(MeshShader, MeshShader);
     pipeline.set_thread_count(thread_count);
-    pipeline.draw_mesh(&mut framebuffer, &mesh, &uniforms);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh(target, &mesh, &uniforms);
+    });
     framebuffer
 }
 
@@ -177,26 +179,22 @@ fn m3_backface(thread_count: usize) -> Framebuffer {
     let mut framebuffer = mesh_framebuffer();
     let mut pipeline = Pipeline::new(MeshShader, MeshShader);
     pipeline.set_thread_count(thread_count);
-    pipeline.draw_mesh(
-        &mut framebuffer,
-        &front,
-        &MeshUniforms::new(
-            Mat4::IDENTITY,
-            Mat4::IDENTITY,
-            Mat4::IDENTITY,
-            argb8888(255, 225, 60, 60),
-        ),
+    let front_uniforms = MeshUniforms::new(
+        Mat4::IDENTITY,
+        Mat4::IDENTITY,
+        Mat4::IDENTITY,
+        argb8888(255, 225, 60, 60),
     );
-    pipeline.draw_mesh(
-        &mut framebuffer,
-        &back,
-        &MeshUniforms::new(
-            Mat4::IDENTITY,
-            Mat4::IDENTITY,
-            Mat4::IDENTITY,
-            argb8888(255, 60, 80, 225),
-        ),
+    let back_uniforms = MeshUniforms::new(
+        Mat4::IDENTITY,
+        Mat4::IDENTITY,
+        Mat4::IDENTITY,
+        argb8888(255, 60, 80, 225),
     );
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh(target, &front, &front_uniforms);
+        frame.draw_mesh(target, &back, &back_uniforms);
+    });
     framebuffer
 }
 
@@ -228,7 +226,9 @@ fn draw_blinn(
 ) {
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
     pipeline.set_thread_count(thread_count);
-    pipeline.draw_mesh(framebuffer, mesh, &uniforms);
+    pipeline.render(framebuffer, |frame, target| {
+        frame.draw_mesh(target, mesh, &uniforms);
+    });
 }
 
 fn m4_icosahedron(thread_count: usize) -> Framebuffer {
@@ -333,25 +333,23 @@ fn m4_perspective(thread_count: usize) -> Framebuffer {
         }),
     );
     pipeline.set_thread_count(thread_count);
-    pipeline.draw(
-        &mut framebuffer,
-        &[
-            PerspectiveVertex {
-                clip_position: Vec4::new(-0.9, -0.8, 0.0, 1.0),
-                color: Vec4::new(1.0, 0.0, 0.0, 1.0),
-            },
-            PerspectiveVertex {
-                clip_position: Vec4::new(2.4, -2.4, 0.0, 3.0),
-                color: Vec4::new(0.0, 1.0, 0.0, 1.0),
-            },
-            PerspectiveVertex {
-                clip_position: Vec4::new(-0.9, 0.9, 0.0, 1.0),
-                color: Vec4::new(0.0, 0.0, 1.0, 1.0),
-            },
-        ],
-        &[[0, 1, 2]],
-        &(),
-    );
+    let vertices = [
+        PerspectiveVertex {
+            clip_position: Vec4::new(-0.9, -0.8, 0.0, 1.0),
+            color: Vec4::new(1.0, 0.0, 0.0, 1.0),
+        },
+        PerspectiveVertex {
+            clip_position: Vec4::new(2.4, -2.4, 0.0, 3.0),
+            color: Vec4::new(0.0, 1.0, 0.0, 1.0),
+        },
+        PerspectiveVertex {
+            clip_position: Vec4::new(-0.9, 0.9, 0.0, 1.0),
+            color: Vec4::new(0.0, 0.0, 1.0, 1.0),
+        },
+    ];
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw(target, &vertices, &[[0, 1, 2]], &());
+    });
     framebuffer
 }
 
@@ -385,11 +383,12 @@ fn m5_perspective(thread_count: usize) -> Framebuffer {
     let mut framebuffer = textured_background();
     let mut pipeline = Pipeline::new(TexturedShader, TexturedShader);
     pipeline.set_thread_count(thread_count);
-    pipeline.draw_mesh_with_sampling(
-        &mut framebuffer,
-        &textured_quad(),
-        &TexturedUniforms::new(camera.view_projection(), &texture, TextureFilter::Nearest),
-    );
+    let mesh = textured_quad();
+    let uniforms =
+        TexturedUniforms::new(camera.view_projection(), &texture, TextureFilter::Nearest);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh_with_sampling(target, &mesh, &uniforms);
+    });
     framebuffer
 }
 
@@ -408,11 +407,11 @@ fn m5_gradient(thread_count: usize, filter: TextureFilter) -> Framebuffer {
     let mut framebuffer = textured_background();
     let mut pipeline = Pipeline::new(TexturedShader, TexturedShader);
     pipeline.set_thread_count(thread_count);
-    pipeline.draw_mesh_with_sampling(
-        &mut framebuffer,
-        &textured_quad(),
-        &TexturedUniforms::new(camera.view_projection(), &texture, filter),
-    );
+    let mesh = textured_quad();
+    let uniforms = TexturedUniforms::new(camera.view_projection(), &texture, filter);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh_with_sampling(target, &mesh, &uniforms);
+    });
     framebuffer
 }
 
@@ -460,11 +459,11 @@ fn m5_lit(thread_count: usize) -> Framebuffer {
     let mut framebuffer = textured_background();
     let mut pipeline = Pipeline::new(TexturedBlinnPhongShader, TexturedBlinnPhongShader);
     pipeline.set_thread_count(thread_count);
-    pipeline.draw_mesh_with_sampling(
-        &mut framebuffer,
-        &textured_quad(),
-        &TexturedBlinnPhongUniforms::new(lighting, &texture, TextureFilter::Bilinear),
-    );
+    let mesh = textured_quad();
+    let uniforms = TexturedBlinnPhongUniforms::new(lighting, &texture, TextureFilter::Bilinear);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh_with_sampling(target, &mesh, &uniforms);
+    });
     framebuffer
 }
 
@@ -493,37 +492,35 @@ fn tile_boundary_scene(thread_count: usize) -> Framebuffer {
         }),
     );
     pipeline.set_thread_count(thread_count);
-    pipeline.draw(
-        &mut framebuffer,
-        &[
-            TileVertex {
-                clip_position: Vec4::new(-1.0, -1.0, 0.0, 1.0),
-                color: Vec4::new(1.0, 0.0, 0.0, 1.0),
-            },
-            TileVertex {
-                clip_position: Vec4::new(1.0, -1.0, 0.0, 1.0),
-                color: Vec4::new(1.0, 0.0, 0.0, 1.0),
-            },
-            TileVertex {
-                clip_position: Vec4::new(-1.0, 1.0, 0.0, 1.0),
-                color: Vec4::new(1.0, 0.0, 0.0, 1.0),
-            },
-            TileVertex {
-                clip_position: Vec4::new(-1.0, -1.0, 0.0, 1.0),
-                color: Vec4::new(0.0, 0.0, 1.0, 1.0),
-            },
-            TileVertex {
-                clip_position: Vec4::new(1.0, -1.0, 0.0, 1.0),
-                color: Vec4::new(0.0, 0.0, 1.0, 1.0),
-            },
-            TileVertex {
-                clip_position: Vec4::new(-1.0, 1.0, 0.0, 1.0),
-                color: Vec4::new(0.0, 0.0, 1.0, 1.0),
-            },
-        ],
-        &[[0, 1, 2], [3, 4, 5]],
-        &(),
-    );
+    let vertices = [
+        TileVertex {
+            clip_position: Vec4::new(-1.0, -1.0, 0.0, 1.0),
+            color: Vec4::new(1.0, 0.0, 0.0, 1.0),
+        },
+        TileVertex {
+            clip_position: Vec4::new(1.0, -1.0, 0.0, 1.0),
+            color: Vec4::new(1.0, 0.0, 0.0, 1.0),
+        },
+        TileVertex {
+            clip_position: Vec4::new(-1.0, 1.0, 0.0, 1.0),
+            color: Vec4::new(1.0, 0.0, 0.0, 1.0),
+        },
+        TileVertex {
+            clip_position: Vec4::new(-1.0, -1.0, 0.0, 1.0),
+            color: Vec4::new(0.0, 0.0, 1.0, 1.0),
+        },
+        TileVertex {
+            clip_position: Vec4::new(1.0, -1.0, 0.0, 1.0),
+            color: Vec4::new(0.0, 0.0, 1.0, 1.0),
+        },
+        TileVertex {
+            clip_position: Vec4::new(-1.0, 1.0, 0.0, 1.0),
+            color: Vec4::new(0.0, 0.0, 1.0, 1.0),
+        },
+    ];
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw(target, &vertices, &[[0, 1, 2], [3, 4, 5]], &());
+    });
     framebuffer
 }
 
@@ -554,29 +551,27 @@ fn nonlinear_fragment_scene(thread_count: usize) -> Framebuffer {
         }),
     );
     pipeline.set_thread_count(thread_count);
-    pipeline.draw(
-        &mut framebuffer,
-        &[
-            TileVertex {
-                clip_position: Vec4::new(-1.0, -1.0, 0.0, 1.0),
-                color: Vec4::new(0.13, 0.71, 0.29, 1.0),
-            },
-            TileVertex {
-                clip_position: Vec4::new(1.0, -1.0, 0.0, 1.0),
-                color: Vec4::new(0.83, 0.17, 0.61, 1.0),
-            },
-            TileVertex {
-                clip_position: Vec4::new(-1.0, 1.0, 0.0, 1.0),
-                color: Vec4::new(0.47, 0.43, 0.97, 1.0),
-            },
-            TileVertex {
-                clip_position: Vec4::new(1.0, 1.0, -0.1, 1.0),
-                color: Vec4::new(0.31, 0.89, 0.07, 1.0),
-            },
-        ],
-        &[[0, 1, 2], [1, 3, 2]],
-        &(),
-    );
+    let vertices = [
+        TileVertex {
+            clip_position: Vec4::new(-1.0, -1.0, 0.0, 1.0),
+            color: Vec4::new(0.13, 0.71, 0.29, 1.0),
+        },
+        TileVertex {
+            clip_position: Vec4::new(1.0, -1.0, 0.0, 1.0),
+            color: Vec4::new(0.83, 0.17, 0.61, 1.0),
+        },
+        TileVertex {
+            clip_position: Vec4::new(-1.0, 1.0, 0.0, 1.0),
+            color: Vec4::new(0.47, 0.43, 0.97, 1.0),
+        },
+        TileVertex {
+            clip_position: Vec4::new(1.0, 1.0, -0.1, 1.0),
+            color: Vec4::new(0.31, 0.89, 0.07, 1.0),
+        },
+    ];
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw(target, &vertices, &[[0, 1, 2], [1, 3, 2]], &());
+    });
     framebuffer
 }
 

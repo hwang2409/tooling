@@ -92,7 +92,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         0.02,
                     ),
                 );
-                pipeline.draw_mesh(framebuffer, &body.mesh, &uniforms);
+                pipeline.render(framebuffer, |frame, target| {
+                    frame.draw_mesh(target, &body.mesh, &uniforms);
+                });
             }
         },
     )

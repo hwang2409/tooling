@@ -220,8 +220,8 @@ impl SamplingVaryings for TexturedVaryings {
     }
 }
 
-/// A textured shader must use [`Pipeline::draw_with_sampling`] or
-/// [`Pipeline::draw_mesh_with_sampling`]. It has no plain fragment-stage
+/// A textured shader must use `RenderFrame::draw_with_sampling` or
+/// `RenderFrame::draw_mesh_with_sampling`. It has no plain fragment-stage
 /// implementation, so a plain draw cannot silently lose its LOD derivatives.
 ///
 /// ```compile_fail
@@ -237,7 +237,9 @@ impl SamplingVaryings for TexturedVaryings {
 /// let mut framebuffer = Framebuffer::new(4, 4);
 /// let mut pipeline = Pipeline::new(TexturedShader, TexturedShader);
 /// let uniforms = TexturedUniforms::new(Mat4::IDENTITY, &texture, TextureFilter::Trilinear);
-/// pipeline.draw_mesh(&mut framebuffer, &mesh, &uniforms);
+/// pipeline.render(&mut framebuffer, |frame, target| {
+///     frame.draw_mesh(target, &mesh, &uniforms);
+/// });
 /// ```
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TexturedShader;
@@ -974,11 +976,14 @@ impl<'a> SampledFragmentStage<NormalMappedBlinnPhongVaryings, NormalMappedBlinnP
             &uniforms.lighting,
             albedo,
         );
-        argb8888_linear(albedo_pixel[3], [lighted.x, lighted.y, lighted.z])
+        argb8888_linear(
+            albedo_pixel[3] * uniforms.lighting.alpha,
+            [lighted.x, lighted.y, lighted.z],
+        )
     }
 
     fn is_opaque(&self, uniforms: &NormalMappedBlinnPhongUniforms<'a>) -> bool {
-        texture_has_no_alpha(uniforms.texture)
+        uniforms.lighting.alpha == 1.0 && texture_has_no_alpha(uniforms.texture)
     }
 
     fn model_view(&self, uniforms: &NormalMappedBlinnPhongUniforms<'a>) -> Option<Mat4> {
@@ -1191,6 +1196,37 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn normal_mapped_lighting_alpha_controls_output_and_classification() {
+        let albedo = Texture::new(1, 1, vec![[255, 255, 255, 255]]).unwrap();
+        let normal_map =
+            Texture::new_with_color_space(1, 1, vec![[128, 128, 255, 255]], ColorSpace::Linear)
+                .unwrap();
+        let mut lighting = uniforms();
+        lighting.set_alpha(0.5);
+        let uniforms = NormalMappedBlinnPhongUniforms::new(
+            lighting,
+            &albedo,
+            &normal_map,
+            TextureFilter::Nearest,
+        )
+        .unwrap();
+        let varyings = NormalMappedBlinnPhongVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            tangent: Vec4::new(1.0, 0.0, 0.0, 1.0),
+            texcoord: Vec2::ZERO,
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        let output = NormalMappedBlinnPhongShader.run_with_sampling(
+            &varyings,
+            &crate::pipeline::SampleDerivatives::default(),
+            &uniforms,
+        );
+        assert_eq!(output.to_be_bytes()[0], 128);
+        assert!(!NormalMappedBlinnPhongShader.is_opaque(&uniforms));
     }
 
     #[test]
@@ -1419,7 +1455,9 @@ mod tests {
         framebuffer.clear(argb8888(255, 8, 10, 16));
         let mut pipeline = crate::pipeline::Pipeline::new(DitherShader, DitherShader);
         pipeline.set_thread_count(1);
-        pipeline.draw(&mut framebuffer, &vertices, &[[0, 1, 2]], &uniforms);
+        pipeline.render(&mut framebuffer, |frame, target| {
+            frame.draw(target, &vertices, &[[0, 1, 2]], &uniforms);
+        });
         framebuffer
     }
 

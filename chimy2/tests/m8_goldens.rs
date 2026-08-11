@@ -87,17 +87,15 @@ fn minified_checkerboard_aliased_and_trilinear_goldens() {
     let mut aliased = background();
     let mut trilinear = background();
     let mut aliased_pipeline = Pipeline::new(TexturedShader, TexturedShader);
-    aliased_pipeline.draw_mesh_with_sampling(
-        &mut aliased,
-        &mesh,
-        &TexturedUniforms::new(transform, &texture, TextureFilter::Bilinear),
-    );
+    let aliased_uniforms = TexturedUniforms::new(transform, &texture, TextureFilter::Bilinear);
+    aliased_pipeline.render(&mut aliased, |frame, target| {
+        frame.draw_mesh_with_sampling(target, &mesh, &aliased_uniforms);
+    });
     let mut trilinear_pipeline = Pipeline::new(TexturedShader, TexturedShader);
-    trilinear_pipeline.draw_mesh_with_sampling(
-        &mut trilinear,
-        &mesh,
-        &TexturedUniforms::new(transform, &texture, TextureFilter::Trilinear),
-    );
+    let trilinear_uniforms = TexturedUniforms::new(transform, &texture, TextureFilter::Trilinear);
+    trilinear_pipeline.render(&mut trilinear, |frame, target| {
+        frame.draw_mesh_with_sampling(target, &mesh, &trilinear_uniforms);
+    });
     assert_ne!(aliased.color, trilinear.color);
     assert_golden("m8-checker-aliased", &aliased);
     assert_golden("m8-checker-trilinear", &trilinear);
@@ -130,6 +128,9 @@ fn srgb_gradient_lighting_golden() {
     let mut framebuffer = background();
     let uniforms = TexturedBlinnPhongUniforms::new(lighting, &texture, TextureFilter::Bilinear);
     let mut pipeline = Pipeline::new(TexturedBlinnPhongShader, TexturedBlinnPhongShader);
-    pipeline.draw_mesh_with_sampling(&mut framebuffer, &foreshortened_quad(), &uniforms);
+    let mesh = foreshortened_quad();
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh_with_sampling(target, &mesh, &uniforms);
+    });
     assert_golden("m8-srgb-gradient-lit", &framebuffer);
 }

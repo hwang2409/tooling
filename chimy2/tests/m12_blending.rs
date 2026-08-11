@@ -87,7 +87,10 @@ fn transparent_overlap_is_sorted_and_serial_parallel_identical() {
     let far_over_background =
         blend_argb8888_linear(argb8888(255, 64, 64, 64), argb8888(128, 235, 70, 40));
     let expected = blend_argb8888_linear(far_over_background, argb8888(128, 40, 90, 235));
-    assert_eq!(center, expected);
+    // Hand calculation: 50% far orange over gray, then 50% near blue.
+    // Linear-light source-over encodes this scene as 0xff8450b0.
+    assert_eq!(expected, 0xff8450b0);
+    assert_eq!(center, 0xff8450b0);
     for x in [16, 64, 113] {
         assert_eq!(serial.color[HEIGHT / 2 * WIDTH + x], expected);
     }
@@ -118,9 +121,9 @@ fn render_edge(scale: usize, thread_count: usize) -> Framebuffer {
     pipeline.set_ssaa_scale(scale);
     pipeline.set_thread_count(thread_count);
     let uniforms = FlatColorUniforms::new(Mat4::IDENTITY, argb8888(255, 240, 240, 240));
-    pipeline.render(&mut framebuffer, |pipeline, target| {
+    pipeline.render(&mut framebuffer, |frame, target| {
         target.clear(argb8888(255, 20, 20, 20));
-        pipeline.draw(
+        frame.draw(
             target,
             &[
                 Vec4::new(-1.0, -1.0, 0.0, 1.0),

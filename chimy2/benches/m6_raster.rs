@@ -46,7 +46,10 @@ fn render(mesh: &Mesh, thread_count: usize) {
     let mut framebuffer = Framebuffer::new(WIDTH, HEIGHT);
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
     pipeline.set_thread_count(thread_count);
-    pipeline.draw_mesh(&mut framebuffer, mesh, &uniforms());
+    let draw_uniforms = uniforms();
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh(target, mesh, &draw_uniforms);
+    });
     black_box(framebuffer.color);
 }
 

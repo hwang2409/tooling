@@ -69,10 +69,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             framebuffer.clear(argb8888(255, 10, 14, 24));
             let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
             pipeline.set_ssaa_scale(if ssaa { 2 } else { 1 });
-            pipeline.render(framebuffer, |pipeline, target| {
+            pipeline.render(framebuffer, |frame, target| {
                 target.clear(argb8888(255, 10, 14, 24));
-                pipeline.draw_mesh(target, &sphere, &sphere_uniforms);
-                pipeline.draw_mesh(target, &quads, &quad_uniforms);
+                frame.draw_mesh(target, &sphere, &sphere_uniforms);
+                frame.draw_mesh(target, &quads, &quad_uniforms);
             });
         },
     )

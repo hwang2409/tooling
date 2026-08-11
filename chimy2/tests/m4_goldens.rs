@@ -78,7 +78,9 @@ fn lit_uniforms(
 
 fn draw_mesh(framebuffer: &mut Framebuffer, mesh: &Mesh, uniforms: BlinnPhongUniforms) {
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
-    pipeline.draw_mesh(framebuffer, mesh, &uniforms);
+    pipeline.render(framebuffer, |frame, target| {
+        frame.draw_mesh(target, mesh, &uniforms);
+    });
 }
 
 #[derive(Clone, Copy)]
@@ -104,25 +106,23 @@ fn perspective_correctness_scene_golden() {
             )
         }),
     );
-    pipeline.draw(
-        &mut framebuffer,
-        &[
-            PerspectiveVertex {
-                clip_position: Vec4::new(-0.9, -0.8, 0.0, 1.0),
-                color: Vec4::new(1.0, 0.0, 0.0, 1.0),
-            },
-            PerspectiveVertex {
-                clip_position: Vec4::new(2.4, -2.4, 0.0, 3.0),
-                color: Vec4::new(0.0, 1.0, 0.0, 1.0),
-            },
-            PerspectiveVertex {
-                clip_position: Vec4::new(-0.9, 0.9, 0.0, 1.0),
-                color: Vec4::new(0.0, 0.0, 1.0, 1.0),
-            },
-        ],
-        &[[0, 1, 2]],
-        &(),
-    );
+    let vertices = [
+        PerspectiveVertex {
+            clip_position: Vec4::new(-0.9, -0.8, 0.0, 1.0),
+            color: Vec4::new(1.0, 0.0, 0.0, 1.0),
+        },
+        PerspectiveVertex {
+            clip_position: Vec4::new(2.4, -2.4, 0.0, 3.0),
+            color: Vec4::new(0.0, 1.0, 0.0, 1.0),
+        },
+        PerspectiveVertex {
+            clip_position: Vec4::new(-0.9, 0.9, 0.0, 1.0),
+            color: Vec4::new(0.0, 0.0, 1.0, 1.0),
+        },
+    ];
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw(target, &vertices, &[[0, 1, 2]], &());
+    });
     assert_golden("m4-perspective-correctness", &framebuffer);
 }
 
