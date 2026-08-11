@@ -5,8 +5,8 @@ use crate::fb::Framebuffer;
 use crate::math::{Vec3, Vec4};
 use crate::mesh::{Mesh, MeshVertex};
 use crate::raster::{
-    PixelRect, ScreenVertex, rasterize_triangle, rasterize_triangle_with_sampling,
-    triangle_pixel_rect, viewport_transform,
+    PixelRect, ScreenVertex, rasterize_triangle, rasterize_triangle_depth,
+    rasterize_triangle_with_sampling, triangle_pixel_rect, viewport_transform,
 };
 use std::marker::PhantomData;
 use std::thread;
@@ -237,6 +237,55 @@ impl<VS, FS> Pipeline<VS, FS> {
         } else {
             self.draw_parallel(framebuffer, &prepared, uniforms, rasterize);
         }
+    }
+
+    /// Draws indexed triangles into the depth buffer without changing color.
+    /// The preparation and raster kernel are shared with color draws.
+    pub fn draw_depth<Vertex, Uniforms>(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        vertices: &[Vertex],
+        triangles: &[[usize; 3]],
+        uniforms: &Uniforms,
+    ) where
+        VS: VertexStage<Vertex, Uniforms> + Sync,
+        FS: Sync,
+        Vertex: Sync,
+        Uniforms: Sync,
+        VS::Varyings: Clone + Send + Sync,
+    {
+        let prepared = if self.thread_count <= 1 {
+            prepare_triangles(&self.vertex, framebuffer, vertices, triangles, uniforms)
+        } else {
+            prepare_triangles_parallel(
+                &self.vertex,
+                framebuffer,
+                vertices,
+                triangles,
+                uniforms,
+                self.thread_count,
+            )
+        };
+        let rasterize = rasterize_depth_triangle::<VS::Varyings, FS, Uniforms>;
+        if self.thread_count <= 1 || prepared.is_empty() {
+            self.draw_serial(framebuffer, prepared, uniforms, rasterize);
+        } else {
+            self.draw_parallel(framebuffer, &prepared, uniforms, rasterize);
+        }
+    }
+
+    pub fn draw_mesh_depth<Uniforms>(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        mesh: &Mesh,
+        uniforms: &Uniforms,
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: Sync,
+        Uniforms: Sync,
+        VS::Varyings: Clone + Send + Sync,
+    {
+        self.draw_depth(framebuffer, &mesh.vertices, &mesh.triangles, uniforms);
     }
 
     fn draw_serial<V, Uniforms>(
@@ -483,6 +532,17 @@ fn rasterize_plain_triangle<V, FS, Uniforms>(
     });
 }
 
+fn rasterize_depth_triangle<V, FS, Uniforms>(
+    framebuffer: &mut Framebuffer,
+    vertices: [ScreenVertex<V>; 3],
+    _: &FS,
+    _: &Uniforms,
+) where
+    V: Varyings,
+{
+    rasterize_triangle_depth(framebuffer, vertices);
+}
+
 fn rasterize_sampled_triangle<V, FS, Uniforms>(
     framebuffer: &mut Framebuffer,
     vertices: [ScreenVertex<V>; 3],
@@ -634,6 +694,33 @@ mod tests {
             &(),
         );
         assert!(framebuffer.color.contains(&argb8888(255, 20, 40, 60)));
+    }
+
+    #[test]
+    fn depth_draw_preserves_color() {
+        let mut pipeline = Pipeline::new(
+            vertex_stage(|vertex: &Vec4, _: &()| VertexOutput::new(*vertex, ())),
+            (),
+        );
+        let mut framebuffer = Framebuffer::new(4, 4);
+        framebuffer.clear(argb8888(255, 10, 20, 30));
+        pipeline.draw_depth(
+            &mut framebuffer,
+            &[
+                Vec4::new(-1.0, -1.0, 0.0, 1.0),
+                Vec4::new(1.0, -1.0, 0.0, 1.0),
+                Vec4::new(-1.0, 1.0, 0.0, 1.0),
+            ],
+            &[[0, 1, 2]],
+            &(),
+        );
+        assert!(framebuffer.depth.iter().any(|&depth| depth < 1.0));
+        assert!(
+            framebuffer
+                .color
+                .iter()
+                .all(|&color| color == argb8888(255, 10, 20, 30))
+        );
     }
 
     #[test]
