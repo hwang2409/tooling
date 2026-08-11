@@ -63,15 +63,20 @@ see it and can't get it wrong.
   varyings, OpenGL-style NDC depth.
 - **clip**: near-plane clipping (fan triangulation of the visible polygon),
   backface culling.
-- **mesh**: OBJ parser for positions, texture coords, normals; smooth
-  area-weighted normals when the file has none.
+- **mesh**: OBJ parser for positions, texture coords, normals, and
+  area-weighted tangent frames; smooth area-weighted normals when the
+  file has none. Meshes without UVs have no tangents, so the normal-map shader
+  falls back to geometric normals. Geometry changes go through mesh mutators,
+  which rebuild derived normals and tangents.
 - **image**: hand-written PPM (P6) and QOI decoders + a QOI encoder for the
-  dev-side asset script; sRGB-to-linear texture decode, full box-filtered mip
-  chains, nearest, bilinear, and trilinear sampling with repeat and
-  clamp-to-edge wrap modes.
+  dev-side asset script; selectable sRGB or linear texture decode, full
+  box-filtered mip chains, nearest, bilinear, and trilinear sampling with
+  repeat and clamp-to-edge wrap modes. QOI loads honor the file colorspace
+  header; explicit `*_with_color_space` methods override it.
 - **camera**: quaternion camera, orbit controller, WASD fly controller.
-- **shaders**: flat, mesh, textured, blinn-phong, textured-blinn-phong, with
-  linear-light lighting and sRGB framebuffer encoding.
+- **shaders**: flat, mesh, textured, blinn-phong, textured-blinn-phong, and
+  tangent-space normal mapping, with linear-light lighting and sRGB
+  framebuffer encoding.
 - **fb / present**: framebuffer with depth, softbuffer blit, keyboard input.
 
 Ground rule for the raster core: no clock, no randomness. Same scene in,
@@ -119,6 +124,11 @@ A 100,352-triangle sphere rendered at 1280x720 with blinn-phong lighting and
 a directional plus a point light. Prints fps to stdout on the windowed
 path, one line per second.
 
+### `normalmap_demo`
+
+A UV-mapped quad uses the procedural `normal_bump.qoi` asset. The directional
+light orbits the quad. Load normal maps with `ColorSpace::Linear`.
+
 <p align="center">
   <img src="img/stress_100k.png" alt="stress 100k demo" />
 </p>
@@ -130,6 +140,7 @@ cargo run --release --bin hero_orbit
 cargo run --release --bin depth_interlock
 cargo run --release --bin perspective_floor
 cargo run --release --bin stress_100k
+cargo run --release --bin normalmap_demo
 ```
 
 Add `--frames N` to any demo for a clean exit after N frames. Add

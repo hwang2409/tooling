@@ -285,7 +285,7 @@ impl<VS, FS> Pipeline<VS, FS> {
         Uniforms: Sync,
         VS::Varyings: Clone + Send + Sync,
     {
-        self.draw_depth(framebuffer, &mesh.vertices, &mesh.triangles, uniforms);
+        self.draw_depth(framebuffer, mesh.vertices(), mesh.indices(), uniforms);
     }
 
     fn draw_serial<V, Uniforms>(
@@ -403,7 +403,7 @@ impl<VS, FS> Pipeline<VS, FS> {
         Uniforms: Sync,
         VS::Varyings: Clone + Send + Sync,
     {
-        self.draw(framebuffer, &mesh.vertices, &mesh.triangles, uniforms);
+        self.draw(framebuffer, mesh.vertices(), mesh.indices(), uniforms);
     }
 
     pub fn draw_mesh_with_sampling<Uniforms>(
@@ -417,7 +417,7 @@ impl<VS, FS> Pipeline<VS, FS> {
         Uniforms: Sync,
         VS::Varyings: SamplingVaryings + Clone + Send + Sync,
     {
-        self.draw_with_sampling(framebuffer, &mesh.vertices, &mesh.triangles, uniforms);
+        self.draw_with_sampling(framebuffer, mesh.vertices(), mesh.indices(), uniforms);
     }
 }
 

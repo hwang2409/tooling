@@ -212,7 +212,12 @@ impl VertexStage<MeshVertex, ShadowDepthUniforms> for ShadowDepthShader {
     fn run(&self, vertex: &MeshVertex, uniforms: &ShadowDepthUniforms) -> VertexOutput<()> {
         VertexOutput::new(
             uniforms.transform()
-                * Vec4::new(vertex.position.x, vertex.position.y, vertex.position.z, 1.0),
+                * Vec4::new(
+                    vertex.position().x,
+                    vertex.position().y,
+                    vertex.position().z,
+                    1.0,
+                ),
             (),
         )
     }
@@ -292,11 +297,7 @@ mod tests {
         );
         let shader = ShadowDepthShader;
         let output = shader.run(
-            &MeshVertex {
-                position: crate::math::Vec3::new(0.0, 0.0, -1.0),
-                texcoord: None,
-                normal: None,
-            },
+            &MeshVertex::new(crate::math::Vec3::new(0.0, 0.0, -1.0), None, None),
             &uniforms,
         );
         assert_eq!(output.clip_position, Vec4::new(0.5, 0.0, -1.0, 1.0));

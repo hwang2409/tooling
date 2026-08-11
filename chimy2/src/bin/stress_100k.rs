@@ -126,7 +126,7 @@ impl Drop for FpsReporter {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = DemoArgs::from_env()?;
     let mesh = uv_sphere(1.5, SPHERE_RINGS, SPHERE_SEGMENTS);
-    let triangle_count = mesh.triangles.len();
+    let triangle_count = mesh.indices().len();
     println!("stress_100k: rendering {triangle_count} triangles per frame");
     let mut reporter = FpsReporter::new(triangle_count);
 
