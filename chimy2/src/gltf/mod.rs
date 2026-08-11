@@ -386,19 +386,15 @@ pub fn submit_gltf_draws(
             .unwrap_or(DEFAULT_GLTF_MATERIAL);
         let albedo = material.and_then(|material| material.albedo_texture.as_ref());
         let normal_map = material.and_then(|material| material.normal_map_texture.as_ref());
-        let mut lighting = BlinnPhongUniforms::new_with_linear_colors(
+        let lighting = make_gltf_lighting(
             draw.model,
             view,
             projection,
-            parameters.diffuse * 0.1,
-            parameters.diffuse,
-            parameters.specular,
-            parameters.shininess,
+            parameters,
             camera_position,
             directional,
             point,
         );
-        lighting.set_alpha(parameters.alpha);
         let kind = if let (Some(albedo), Some(normal_map)) = (albedo, normal_map) {
             GltfUniformKind::NormalMapped(
                 NormalMappedBlinnPhongUniforms::new(
@@ -430,6 +426,31 @@ pub fn submit_gltf_draws(
         }
     });
     Ok(())
+}
+
+fn make_gltf_lighting(
+    model: Mat4,
+    view: Mat4,
+    projection: Mat4,
+    parameters: GltfMaterialParameters,
+    camera_position: Vec3,
+    directional: DirectionalLight,
+    point: PointLight,
+) -> BlinnPhongUniforms {
+    let mut lighting = BlinnPhongUniforms::new_with_linear_colors(
+        model,
+        view,
+        projection,
+        parameters.diffuse * 0.1,
+        parameters.diffuse,
+        parameters.specular,
+        parameters.shininess,
+        camera_position,
+        directional,
+        point,
+    );
+    lighting.set_alpha(parameters.alpha);
+    lighting
 }
 
 #[derive(Clone, Debug)]

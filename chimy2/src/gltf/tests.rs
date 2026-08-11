@@ -124,15 +124,11 @@ mod tests {
             alpha_mode: GltfAlphaMode::Opaque,
             alpha_cutoff: 0.5,
         };
-        let (diffuse, specular, shininess, _) = material.blinn_phong_parameters();
-        let uniforms = BlinnPhongUniforms::new_with_linear_colors(
+        let uniforms = make_gltf_lighting(
             Mat4::IDENTITY,
             Mat4::IDENTITY,
             Mat4::IDENTITY,
-            Vec3::ZERO,
-            diffuse,
-            specular,
-            shininess,
+            material.render_parameters(),
             Vec3::ZERO,
             DirectionalLight::new(Vec3::ZERO, Vec3::ZERO),
             PointLight::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0.0, 0.0),
