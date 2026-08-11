@@ -76,7 +76,11 @@ see it and can't get it wrong.
 - **camera**: quaternion camera, orbit controller, WASD fly controller.
 - **shaders**: flat, mesh, textured, blinn-phong, textured-blinn-phong, and
   tangent-space normal mapping, with linear-light lighting and sRGB
-  framebuffer encoding.
+  framebuffer encoding. Blinn-Phong uniforms hold fixed arrays of up to eight
+  directional and eight point lights. Ambient light is added once, then all
+  lights accumulate before the final clamp. Material and light colors, plus
+  attenuation intensities, clamp to zero at the uniform boundary. The one
+  shadow map binds to directional light zero; other lights do not cast shadows.
 - **fb / present**: framebuffer with depth, softbuffer blit, keyboard input.
 
 Ground rule for the raster core: no clock, no randomness. Same scene in,
@@ -133,6 +137,12 @@ light orbits the quad. Load normal maps with `ColorSpace::Linear`.
   <img src="img/stress_100k.png" alt="stress 100k demo" />
 </p>
 
+### `lights_demo`
+
+A sphere lit by several colored point lights with different attenuation
+values. The lights move on deterministic paths. Use `--frames N` and
+`--screenshot path.ppm` for headless smoke tests.
+
 ## running the demos
 
 ```bash
@@ -141,6 +151,7 @@ cargo run --release --bin depth_interlock
 cargo run --release --bin perspective_floor
 cargo run --release --bin stress_100k
 cargo run --release --bin normalmap_demo
+cargo run --release --bin lights_demo -- --frames 30
 ```
 
 Add `--frames N` to any demo for a clean exit after N frames. Add

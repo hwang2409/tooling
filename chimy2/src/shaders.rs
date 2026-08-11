@@ -252,25 +252,33 @@ impl<'a> SampledFragmentStage<TexturedVaryings, TexturedUniforms<'a>> for Textur
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct DirectionalLight {
     /// A normalized direction from a surface point toward the light.
     pub direction: Vec3,
+    /// Linear color. Constructors and uniform mutators clamp it to nonnegative values.
     pub color: Vec3,
 }
+
+/// Maximum number of directional lights stored in one lighting uniform.
+pub const MAX_DIRECTIONAL_LIGHTS: usize = 8;
+
+/// Maximum number of point lights stored in one lighting uniform.
+pub const MAX_POINT_LIGHTS: usize = 8;
 
 impl DirectionalLight {
     pub fn new(direction: Vec3, color: Vec3) -> Self {
         Self {
             direction,
-            color: linearize_color(color),
+            color: linearize_color(nonnegative_color(color)),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct PointLight {
     pub position: Vec3,
+    /// Linear color. Constructors and uniform mutators clamp it to nonnegative values.
     pub color: Vec3,
     pub constant_attenuation: f32,
     pub linear_attenuation: f32,
@@ -287,15 +295,37 @@ impl PointLight {
     ) -> Self {
         Self {
             position,
-            color: linearize_color(color),
-            constant_attenuation,
-            linear_attenuation,
-            quadratic_attenuation,
+            color: linearize_color(nonnegative_color(color)),
+            constant_attenuation: constant_attenuation.max(0.0),
+            linear_attenuation: linear_attenuation.max(0.0),
+            quadratic_attenuation: quadratic_attenuation.max(0.0),
         }
     }
 }
 
-/// Blinn-Phong uniforms with cache-safe matrix updates.
+fn nonnegative_color(color: Vec3) -> Vec3 {
+    Vec3::new(color.x.max(0.0), color.y.max(0.0), color.z.max(0.0))
+}
+
+fn sanitize_directional_light(mut light: DirectionalLight) -> DirectionalLight {
+    light.color = nonnegative_color(light.color);
+    light
+}
+
+fn sanitize_point_light(mut light: PointLight) -> PointLight {
+    light.color = nonnegative_color(light.color);
+    light.constant_attenuation = light.constant_attenuation.max(0.0);
+    light.linear_attenuation = light.linear_attenuation.max(0.0);
+    light.quadratic_attenuation = light.quadratic_attenuation.max(0.0);
+    light
+}
+
+/// Blinn-Phong uniforms with cache-safe matrix updates and fixed light arrays.
+///
+/// The arrays keep uniform clones cheap and preserve deterministic submission
+/// order. Directional light zero owns the single optional shadow map. Other
+/// lights are always unshadowed.
+/// Material colors are private and use the same clamp-at-zero boundary policy.
 ///
 /// The source matrices are private. Use the accessors and setters instead:
 ///
@@ -322,13 +352,15 @@ pub struct BlinnPhongUniforms {
     model: Mat4,
     view: Mat4,
     projection: Mat4,
-    pub ambient_color: Vec3,
-    pub diffuse_color: Vec3,
-    pub specular_color: Vec3,
+    ambient_color: Vec3,
+    diffuse_color: Vec3,
+    specular_color: Vec3,
     pub shininess: f32,
     pub camera_position: Vec3,
-    directional_light: DirectionalLight,
-    pub point_light: PointLight,
+    directional_lights: [DirectionalLight; MAX_DIRECTIONAL_LIGHTS],
+    directional_light_count: usize,
+    point_lights: [PointLight; MAX_POINT_LIGHTS],
+    point_light_count: usize,
     shadow_state: Option<ShadowState>,
     transform: Mat4,
     normal_matrix: Mat3,
@@ -352,13 +384,27 @@ impl BlinnPhongUniforms {
             model,
             view,
             projection,
-            ambient_color: linearize_color(ambient_color),
-            diffuse_color: linearize_color(diffuse_color),
-            specular_color: linearize_color(specular_color),
+            ambient_color: linearize_color(nonnegative_color(ambient_color)),
+            diffuse_color: linearize_color(nonnegative_color(diffuse_color)),
+            specular_color: linearize_color(nonnegative_color(specular_color)),
             shininess,
             camera_position,
-            directional_light,
-            point_light,
+            directional_lights: std::array::from_fn(|index| {
+                if index == 0 {
+                    sanitize_directional_light(directional_light)
+                } else {
+                    DirectionalLight::default()
+                }
+            }),
+            directional_light_count: 1,
+            point_lights: std::array::from_fn(|index| {
+                if index == 0 {
+                    sanitize_point_light(point_light)
+                } else {
+                    PointLight::default()
+                }
+            }),
+            point_light_count: 1,
             shadow_state: None,
             transform: projection * view * model,
             normal_matrix: model.normal_matrix().unwrap_or_default(),
@@ -385,8 +431,153 @@ impl BlinnPhongUniforms {
         self.projection
     }
 
+    /// Returns the material ambient color in linear space.
+    pub const fn ambient_color(&self) -> Vec3 {
+        self.ambient_color
+    }
+
+    /// Returns the material diffuse color in linear space.
+    pub const fn diffuse_color(&self) -> Vec3 {
+        self.diffuse_color
+    }
+
+    /// Returns the material specular color in linear space.
+    pub const fn specular_color(&self) -> Vec3 {
+        self.specular_color
+    }
+
+    /// Sets the authored sRGB ambient color and clamps it to nonnegative values.
+    pub fn set_ambient_color(&mut self, color: Vec3) {
+        self.ambient_color = linearize_color(nonnegative_color(color));
+    }
+
+    /// Sets the authored sRGB diffuse color and clamps it to nonnegative values.
+    pub fn set_diffuse_color(&mut self, color: Vec3) {
+        self.diffuse_color = linearize_color(nonnegative_color(color));
+    }
+
+    /// Sets the authored sRGB specular color and clamps it to nonnegative values.
+    pub fn set_specular_color(&mut self, color: Vec3) {
+        self.specular_color = linearize_color(nonnegative_color(color));
+    }
+
+    /// Returns the first directional light, or a zero light when the array is empty.
     pub const fn directional_light(&self) -> DirectionalLight {
-        self.directional_light
+        self.directional_lights[0]
+    }
+
+    /// Returns the first point light, or a zero light when the array is empty.
+    pub const fn point_light(&self) -> PointLight {
+        self.point_lights[0]
+    }
+
+    /// Returns the active directional lights in array order.
+    pub fn directional_lights(&self) -> &[DirectionalLight] {
+        &self.directional_lights[..self.directional_light_count]
+    }
+
+    /// Returns the active point lights in array order.
+    pub fn point_lights(&self) -> &[PointLight] {
+        &self.point_lights[..self.point_light_count]
+    }
+
+    pub const fn directional_light_count(&self) -> usize {
+        self.directional_light_count
+    }
+
+    pub const fn point_light_count(&self) -> usize {
+        self.point_light_count
+    }
+
+    /// Appends a directional light and returns its array index.
+    pub fn add_directional_light(
+        &mut self,
+        light: DirectionalLight,
+    ) -> Result<usize, &'static str> {
+        if self.directional_light_count == MAX_DIRECTIONAL_LIGHTS {
+            return Err("directional light capacity reached");
+        }
+        let index = self.directional_light_count;
+        self.directional_lights[index] = sanitize_directional_light(light);
+        self.directional_light_count += 1;
+        Ok(index)
+    }
+
+    /// Appends a point light and returns its array index.
+    pub fn add_point_light(&mut self, light: PointLight) -> Result<usize, &'static str> {
+        if self.point_light_count == MAX_POINT_LIGHTS {
+            return Err("point light capacity reached");
+        }
+        let index = self.point_light_count;
+        self.point_lights[index] = sanitize_point_light(light);
+        self.point_light_count += 1;
+        Ok(index)
+    }
+
+    /// Replaces a directional light. Index zero owns the optional shadow map.
+    pub fn set_directional_light(
+        &mut self,
+        index: usize,
+        light: DirectionalLight,
+    ) -> Result<(), &'static str> {
+        let Some(slot) = self.directional_lights.get_mut(index) else {
+            return Err("directional light index out of bounds");
+        };
+        if index >= self.directional_light_count {
+            return Err("directional light index out of bounds");
+        }
+        *slot = sanitize_directional_light(light);
+        if index == 0 {
+            self.shadow_state = None;
+        }
+        Ok(())
+    }
+
+    /// Replaces a point light at an existing array index.
+    pub fn set_point_light(&mut self, index: usize, light: PointLight) -> Result<(), &'static str> {
+        if index >= self.point_light_count {
+            return Err("point light index out of bounds");
+        }
+        self.point_lights[index] = sanitize_point_light(light);
+        Ok(())
+    }
+
+    /// Removes a directional light and compacts later entries.
+    pub fn remove_directional_light(&mut self, index: usize) -> Option<DirectionalLight> {
+        if index >= self.directional_light_count {
+            return None;
+        }
+        let removed = self.directional_lights[index];
+        self.directional_lights[index..self.directional_light_count].rotate_left(1);
+        self.directional_light_count -= 1;
+        self.directional_lights[self.directional_light_count] = DirectionalLight::default();
+        if index == 0 {
+            self.shadow_state = None;
+        }
+        Some(removed)
+    }
+
+    /// Removes a point light and compacts later entries.
+    pub fn remove_point_light(&mut self, index: usize) -> Option<PointLight> {
+        if index >= self.point_light_count {
+            return None;
+        }
+        let removed = self.point_lights[index];
+        self.point_lights[index..self.point_light_count].rotate_left(1);
+        self.point_light_count -= 1;
+        self.point_lights[self.point_light_count] = PointLight::default();
+        Some(removed)
+    }
+
+    pub fn clear_directional_lights(&mut self) {
+        self.directional_lights[..self.directional_light_count].fill(DirectionalLight::default());
+        self.directional_light_count = 0;
+        self.shadow_state = None;
+    }
+
+    pub fn clear_point_lights(&mut self) {
+        self.point_lights[..self.point_light_count].fill(PointLight::default());
+        self.point_light_count = 0;
     }
 
     pub const fn light_view_projection(&self) -> Mat4 {
@@ -407,7 +598,7 @@ impl BlinnPhongUniforms {
         }
     }
 
-    /// Replaces the light and its complete shadow state as one update.
+    /// Replaces directional light zero and its complete shadow state as one update.
     ///
     /// The default bias is `(0.002, 0.02)`. The shadow compare uses
     /// `max(constant, slope * (1 - N dot L))`.
@@ -416,7 +607,12 @@ impl BlinnPhongUniforms {
         directional_light: DirectionalLight,
         shadow_state: Option<ShadowState>,
     ) {
-        self.directional_light = directional_light;
+        if self.directional_light_count == 0 {
+            self.directional_lights[0] = sanitize_directional_light(directional_light);
+            self.directional_light_count = 1;
+        } else {
+            self.directional_lights[0] = sanitize_directional_light(directional_light);
+        }
         self.shadow_state = shadow_state;
     }
 
@@ -559,38 +755,48 @@ fn evaluate_lighting(
     let mut lighted = uniforms.ambient_color * albedo;
 
     let directional_visibility = uniforms.shadow_visibility(light_space_position, normal);
-    lighted = lighted
-        + evaluate_light(
-            normal,
-            view_direction,
-            uniforms.directional_light().direction.normalize(),
-            uniforms.directional_light().color,
-            directional_visibility,
-            uniforms,
-            albedo,
-        );
+    // The renderer has one shadow map, and it belongs to directional light zero.
+    for (index, light) in uniforms.directional_lights().iter().enumerate() {
+        let visibility = if index == 0 {
+            directional_visibility
+        } else {
+            1.0
+        };
+        lighted = lighted
+            + evaluate_light(
+                normal,
+                view_direction,
+                light.direction.normalize(),
+                light.color,
+                visibility,
+                uniforms,
+                albedo,
+            );
+    }
 
-    let to_point = uniforms.point_light.position - world_position;
-    let distance = to_point.length();
-    let point_direction = to_point.normalize();
-    let denominator = uniforms.point_light.constant_attenuation
-        + uniforms.point_light.linear_attenuation * distance
-        + uniforms.point_light.quadratic_attenuation * distance * distance;
-    let attenuation = if denominator > 0.0 {
-        1.0 / denominator
-    } else {
-        0.0
-    };
-    lighted = lighted
-        + evaluate_light(
-            normal,
-            view_direction,
-            point_direction,
-            uniforms.point_light.color,
-            attenuation,
-            uniforms,
-            albedo,
-        );
+    for light in uniforms.point_lights() {
+        let to_point = light.position - world_position;
+        let distance = to_point.length();
+        let point_direction = to_point.normalize();
+        let denominator = light.constant_attenuation
+            + light.linear_attenuation * distance
+            + light.quadratic_attenuation * distance * distance;
+        let attenuation = if denominator > 0.0 {
+            1.0 / denominator
+        } else {
+            0.0
+        };
+        lighted = lighted
+            + evaluate_light(
+                normal,
+                view_direction,
+                point_direction,
+                light.color,
+                attenuation,
+                uniforms,
+                albedo,
+            );
+    }
 
     lighted
 }
@@ -1171,6 +1377,269 @@ mod tests {
             projection * Mat4::IDENTITY * Mat4::IDENTITY
         );
         assert_eq!(uniforms.normal_matrix(), Mat3::IDENTITY);
+    }
+
+    #[test]
+    fn blinn_phong_light_mutators_rebuild_array_state_immediately() {
+        let mut uniforms = uniforms();
+        uniforms.clear_directional_lights();
+        uniforms.clear_point_lights();
+        assert_eq!(uniforms.directional_light_count(), 0);
+        assert_eq!(uniforms.point_light_count(), 0);
+
+        let directional = DirectionalLight::new(Vec3::new(0.0, 0.0, 1.0), Vec3::new(1.0, 1.0, 1.0));
+        let point = PointLight::new(
+            Vec3::new(1.0, 2.0, 3.0),
+            Vec3::new(0.8, 0.4, 0.2),
+            1.0,
+            0.1,
+            0.01,
+        );
+        assert_eq!(uniforms.add_directional_light(directional), Ok(0));
+        assert_eq!(uniforms.add_point_light(point), Ok(0));
+        assert_eq!(uniforms.directional_lights(), &[directional]);
+        assert_eq!(uniforms.point_lights(), &[point]);
+
+        let moved_directional =
+            DirectionalLight::new(Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.2, 0.3, 0.4));
+        let moved_point = PointLight::new(
+            Vec3::new(-1.0, -2.0, -3.0),
+            Vec3::new(0.4, 0.5, 0.6),
+            2.0,
+            0.2,
+            0.02,
+        );
+        assert_eq!(uniforms.set_directional_light(0, moved_directional), Ok(()));
+        assert_eq!(uniforms.set_point_light(0, moved_point), Ok(()));
+        assert_eq!(uniforms.directional_light(), moved_directional);
+        assert_eq!(uniforms.point_light(), moved_point);
+        assert_eq!(
+            uniforms.remove_directional_light(0),
+            Some(moved_directional)
+        );
+        assert_eq!(uniforms.remove_point_light(0), Some(moved_point));
+        assert_eq!(uniforms.directional_light_count(), 0);
+        assert_eq!(uniforms.point_light_count(), 0);
+    }
+
+    #[test]
+    fn light_uniform_boundary_clamps_negative_colors_and_intensities() {
+        let directional =
+            DirectionalLight::new(Vec3::new(0.0, 0.0, 1.0), Vec3::new(-1.0, 0.5, -0.25));
+        assert_eq!(directional.color.x, 0.0);
+        assert_eq!(directional.color.z, 0.0);
+        assert!(directional.color.y > 0.0);
+
+        let point = PointLight::new(Vec3::ZERO, Vec3::new(-1.0, 0.5, -0.25), -1.0, -0.5, -0.25);
+        assert_eq!(point.color.x, 0.0);
+        assert_eq!(point.color.z, 0.0);
+        assert_eq!(point.constant_attenuation, 0.0);
+        assert_eq!(point.linear_attenuation, 0.0);
+        assert_eq!(point.quadratic_attenuation, 0.0);
+
+        let mut uniforms = uniforms();
+        uniforms.clear_directional_lights();
+        uniforms.clear_point_lights();
+        let public_directional = DirectionalLight {
+            color: Vec3::new(-1.0, 2.0, -3.0),
+            ..DirectionalLight::default()
+        };
+        let public_point = PointLight {
+            color: Vec3::new(-1.0, 2.0, -3.0),
+            constant_attenuation: -1.0,
+            linear_attenuation: -2.0,
+            quadratic_attenuation: -3.0,
+            ..PointLight::default()
+        };
+        uniforms.add_directional_light(public_directional).unwrap();
+        uniforms.add_point_light(public_point).unwrap();
+        assert_eq!(
+            uniforms.directional_lights()[0].color,
+            Vec3::new(0.0, 2.0, 0.0)
+        );
+        assert_eq!(uniforms.point_lights()[0].color, Vec3::new(0.0, 2.0, 0.0));
+        assert_eq!(uniforms.point_lights()[0].constant_attenuation, 0.0);
+        assert_eq!(uniforms.point_lights()[0].linear_attenuation, 0.0);
+        assert_eq!(uniforms.point_lights()[0].quadratic_attenuation, 0.0);
+    }
+
+    #[test]
+    fn material_uniform_boundary_clamps_negative_colors() {
+        let mut uniforms = BlinnPhongUniforms::new(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::new(-1.0, 0.5, -0.25),
+            Vec3::new(-0.75, 0.4, -0.1),
+            Vec3::new(-0.5, 0.3, -0.05),
+            8.0,
+            Vec3::ZERO,
+            DirectionalLight::default(),
+            PointLight::default(),
+        );
+        assert_eq!(uniforms.ambient_color().x, 0.0);
+        assert_eq!(uniforms.ambient_color().z, 0.0);
+        assert_eq!(uniforms.diffuse_color().x, 0.0);
+        assert_eq!(uniforms.diffuse_color().z, 0.0);
+        assert_eq!(uniforms.specular_color().x, 0.0);
+        assert_eq!(uniforms.specular_color().z, 0.0);
+
+        uniforms.set_ambient_color(Vec3::new(-1.0, 0.2, -1.0));
+        uniforms.set_diffuse_color(Vec3::new(-1.0, 0.3, -1.0));
+        uniforms.set_specular_color(Vec3::new(-1.0, 0.4, -1.0));
+        assert_eq!(uniforms.ambient_color().x, 0.0);
+        assert_eq!(uniforms.diffuse_color().x, 0.0);
+        assert_eq!(uniforms.specular_color().x, 0.0);
+    }
+
+    #[test]
+    fn point_light_removal_compacts_order_and_changes_production_shading() {
+        let mut base = uniforms();
+        base.set_ambient_color(Vec3::ZERO);
+        base.set_diffuse_color(Vec3::new(1.0, 1.0, 1.0));
+        base.set_specular_color(Vec3::ZERO);
+        base.clear_directional_lights();
+        base.clear_point_lights();
+        let first = PointLight::new(
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            1.0,
+            0.0,
+            0.0,
+        );
+        let middle = PointLight::new(
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            2.0,
+            0.0,
+            0.0,
+        );
+        let last = PointLight::new(
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            4.0,
+            0.0,
+            0.0,
+        );
+        base.add_point_light(first).unwrap();
+        base.add_point_light(middle).unwrap();
+        base.add_point_light(last).unwrap();
+        let varyings = BlinnPhongVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        let original_shading = BlinnPhongShader::shade(&varyings, &base);
+
+        let mut without_first = base.clone();
+        assert_eq!(without_first.remove_point_light(0), Some(first));
+        assert_eq!(without_first.point_lights(), &[middle, last]);
+        let first_removed_shading = BlinnPhongShader::shade(&varyings, &without_first);
+
+        let mut without_middle = base;
+        assert_eq!(without_middle.remove_point_light(1), Some(middle));
+        assert_eq!(without_middle.point_lights(), &[first, last]);
+        let middle_removed_shading = BlinnPhongShader::shade(&varyings, &without_middle);
+
+        assert_ne!(first_removed_shading, original_shading);
+        assert_ne!(middle_removed_shading, original_shading);
+        assert_ne!(first_removed_shading, middle_removed_shading);
+    }
+
+    #[test]
+    fn blinn_phong_two_directional_lights_accumulate_in_linear_space() {
+        let varyings = BlinnPhongVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        let mut uniforms = BlinnPhongUniforms::new(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::ZERO,
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::ZERO,
+            8.0,
+            Vec3::new(0.0, 0.0, 1.0),
+            DirectionalLight::new(Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.5, 0.0, 0.0)),
+            PointLight::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0.0, 0.0),
+        );
+        uniforms.clear_directional_lights();
+        uniforms.clear_point_lights();
+        uniforms
+            .add_directional_light(DirectionalLight::new(
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(0.5, 0.0, 0.0),
+            ))
+            .unwrap();
+        uniforms
+            .add_directional_light(DirectionalLight::new(
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(0.0, 0.5, 0.0),
+            ))
+            .unwrap();
+
+        let expected = argb8888_linear(1.0, [srgb_to_linear(0.5), srgb_to_linear(0.5), 0.0]);
+        assert_eq!(BlinnPhongShader::shade(&varyings, &uniforms), expected);
+    }
+
+    #[test]
+    fn blinn_phong_zero_lights_keep_ambient_only() {
+        let mut uniforms = uniforms();
+        uniforms.set_ambient_color(Vec3::new(0.25, 0.5, 0.75));
+        uniforms.clear_directional_lights();
+        uniforms.clear_point_lights();
+        let varyings = BlinnPhongVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        let expected = argb8888_linear(
+            1.0,
+            [
+                srgb_to_linear(0.25),
+                srgb_to_linear(0.5),
+                srgb_to_linear(0.75),
+            ],
+        );
+        assert_eq!(BlinnPhongShader::shade(&varyings, &uniforms), expected);
+    }
+
+    #[test]
+    fn blinn_phong_many_lights_clamp_after_accumulation() {
+        let mut uniforms = uniforms();
+        uniforms.set_ambient_color(Vec3::ZERO);
+        uniforms.set_diffuse_color(Vec3::new(1.0, 1.0, 1.0));
+        uniforms.set_specular_color(Vec3::ZERO);
+        uniforms.clear_directional_lights();
+        uniforms.clear_point_lights();
+        for _ in 0..6 {
+            uniforms
+                .add_point_light(PointLight::new(
+                    Vec3::new(0.0, 0.0, 1.0),
+                    Vec3::new(1.0, 1.0, 1.0),
+                    6.0,
+                    0.0,
+                    0.0,
+                ))
+                .unwrap();
+        }
+        let varyings = BlinnPhongVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        assert_eq!(BlinnPhongShader::shade(&varyings, &uniforms), 0xffffffff);
+        assert_ne!(
+            BlinnPhongShader::shade(&varyings, &{
+                let mut fewer = uniforms.clone();
+                fewer.remove_point_light(0);
+                fewer
+            },),
+            0xffffffff,
+            "dropping one point light must fail the accumulation gate"
+        );
     }
 
     fn pack_varyings(normal: Vec3, barycentric: Vec3, distance: f32) -> ShaderPackVaryings {
