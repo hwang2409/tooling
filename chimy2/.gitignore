@@ -1,0 +1,5 @@
+/target
+.codex/
+.claude/
+.DS_Store
+/img/*.ppm

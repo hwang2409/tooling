@@ -1,0 +1,18 @@
+[package]
+name = "chimy2"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "A from-scratch software rasterizer"
+
+[dependencies]
+softbuffer = "0.4"
+winit = "0.30"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "m6_raster"
+harness = false
