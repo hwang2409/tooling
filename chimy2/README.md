@@ -78,8 +78,9 @@ see it and can't get it wrong.
   tangent-space normal mapping, with linear-light lighting and sRGB
   framebuffer encoding. Blinn-Phong uniforms hold fixed arrays of up to eight
   directional and eight point lights. Ambient light is added once, then all
-  lights accumulate before the final clamp. The one shadow map binds to
-  directional light zero; other lights do not cast shadows.
+  lights accumulate before the final clamp. Light colors and attenuation
+  intensities clamp to zero at the uniform boundary. The one shadow map binds
+  to directional light zero; other lights do not cast shadows.
 - **fb / present**: framebuffer with depth, softbuffer blit, keyboard input.
 
 Ground rule for the raster core: no clock, no randomness. Same scene in,

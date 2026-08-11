@@ -1,9 +1,12 @@
 use chimy2::camera::Camera;
-use chimy2::demo::uv_sphere;
+use chimy2::demo::{cube_with_uvs, plane_xz, uv_sphere};
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Quat, Vec3};
 use chimy2::pipeline::Pipeline;
 use chimy2::shaders::{BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, PointLight};
+use chimy2::shadow::{
+    ShadowDepthShader, ShadowDepthUniforms, ShadowMap, ShadowState, directional_light_view,
+};
 use std::f32::consts::FRAC_PI_3;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -74,6 +77,74 @@ fn render(uniforms: BlinnPhongUniforms) -> Framebuffer {
     framebuffer.clear(argb8888(255, 8, 10, 16));
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
     pipeline.draw_mesh(&mut framebuffer, &mesh, &uniforms);
+    framebuffer
+}
+
+fn render_multi_directional_shadow_scene() -> Framebuffer {
+    let ground = plane_xz(8.0, 8.0, 8, 1.0);
+    let caster = cube_with_uvs(0.8);
+    let caster_model = Mat4::translate(Vec3::new(0.0, 0.8, 0.0));
+    let target = Vec3::new(0.0, 0.7, 0.0);
+    let shadow_direction = Vec3::new(0.7, 1.0, 0.35).normalize();
+    let light_view_projection = Mat4::orthographic(-5.0, 5.0, -5.0, 5.0, 1.0, 20.0)
+        * directional_light_view(shadow_direction, target, 8.0, Vec3::new(0.0, 1.0, 0.0));
+    let mut shadow_target = Framebuffer::new(128, 128);
+    shadow_target.clear(0);
+    let mut depth_pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
+    depth_pipeline.draw_mesh_depth(
+        &mut shadow_target,
+        &ground,
+        &ShadowDepthUniforms::new(Mat4::IDENTITY, light_view_projection),
+    );
+    depth_pipeline.draw_mesh_depth(
+        &mut shadow_target,
+        &caster,
+        &ShadowDepthUniforms::new(caster_model, light_view_projection),
+    );
+    let shadow_map = ShadowMap::from_framebuffer(&shadow_target).expect("shadow target has size");
+
+    let camera_position = Vec3::new(5.2, 3.6, 6.0);
+    let view = Mat4::look_at(camera_position, target, Vec3::new(0.0, 1.0, 0.0));
+    let projection = Mat4::perspective(0.78, WIDTH as f32 / HEIGHT as f32, 0.1, 30.0);
+    let shadowed = DirectionalLight::new(shadow_direction, Vec3::new(1.0, 0.85, 0.7));
+    let unshadowed = DirectionalLight::new(
+        Vec3::new(-0.8, 0.65, 0.5).normalize(),
+        Vec3::new(0.18, 0.42, 1.0),
+    );
+    let make_uniforms = |model: Mat4, diffuse: Vec3| {
+        let mut uniforms = BlinnPhongUniforms::new(
+            model,
+            view,
+            projection,
+            Vec3::new(0.025, 0.025, 0.025),
+            diffuse,
+            Vec3::new(0.3, 0.3, 0.3),
+            24.0,
+            camera_position,
+            shadowed,
+            PointLight::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0.0, 0.0),
+        );
+        uniforms.add_directional_light(unshadowed).unwrap();
+        uniforms.set_directional_shadow(
+            shadowed,
+            Some(ShadowState::new(light_view_projection, shadow_map.clone())),
+        );
+        uniforms
+    };
+
+    let mut framebuffer = Framebuffer::new(WIDTH, HEIGHT);
+    framebuffer.clear(argb8888(255, 12, 16, 24));
+    let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
+    pipeline.draw_mesh(
+        &mut framebuffer,
+        &ground,
+        &make_uniforms(Mat4::IDENTITY, Vec3::new(0.58, 0.6, 0.62)),
+    );
+    pipeline.draw_mesh(
+        &mut framebuffer,
+        &caster,
+        &make_uniforms(caster_model, Vec3::new(0.78, 0.25, 0.08)),
+    );
     framebuffer
 }
 
@@ -157,4 +228,12 @@ fn many_lights_clamp_after_accumulation_golden() {
             .unwrap();
     }
     assert_golden("m16-many-lights", &render(uniforms));
+}
+
+#[test]
+fn only_directional_light_zero_uses_the_shadow_map_golden() {
+    assert_golden(
+        "m16-multiple-directional-shadow",
+        &render_multi_directional_shadow_scene(),
+    );
 }

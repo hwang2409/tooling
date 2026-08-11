@@ -256,6 +256,7 @@ impl<'a> SampledFragmentStage<TexturedVaryings, TexturedUniforms<'a>> for Textur
 pub struct DirectionalLight {
     /// A normalized direction from a surface point toward the light.
     pub direction: Vec3,
+    /// Linear color. Constructors and uniform mutators clamp it to nonnegative values.
     pub color: Vec3,
 }
 
@@ -269,7 +270,7 @@ impl DirectionalLight {
     pub fn new(direction: Vec3, color: Vec3) -> Self {
         Self {
             direction,
-            color: linearize_color(color),
+            color: linearize_color(nonnegative_color(color)),
         }
     }
 }
@@ -277,6 +278,7 @@ impl DirectionalLight {
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct PointLight {
     pub position: Vec3,
+    /// Linear color. Constructors and uniform mutators clamp it to nonnegative values.
     pub color: Vec3,
     pub constant_attenuation: f32,
     pub linear_attenuation: f32,
@@ -293,12 +295,29 @@ impl PointLight {
     ) -> Self {
         Self {
             position,
-            color: linearize_color(color),
-            constant_attenuation,
-            linear_attenuation,
-            quadratic_attenuation,
+            color: linearize_color(nonnegative_color(color)),
+            constant_attenuation: constant_attenuation.max(0.0),
+            linear_attenuation: linear_attenuation.max(0.0),
+            quadratic_attenuation: quadratic_attenuation.max(0.0),
         }
     }
+}
+
+fn nonnegative_color(color: Vec3) -> Vec3 {
+    Vec3::new(color.x.max(0.0), color.y.max(0.0), color.z.max(0.0))
+}
+
+fn sanitize_directional_light(mut light: DirectionalLight) -> DirectionalLight {
+    light.color = nonnegative_color(light.color);
+    light
+}
+
+fn sanitize_point_light(mut light: PointLight) -> PointLight {
+    light.color = nonnegative_color(light.color);
+    light.constant_attenuation = light.constant_attenuation.max(0.0);
+    light.linear_attenuation = light.linear_attenuation.max(0.0);
+    light.quadratic_attenuation = light.quadratic_attenuation.max(0.0);
+    light
 }
 
 /// Blinn-Phong uniforms with cache-safe matrix updates and fixed light arrays.
@@ -371,7 +390,7 @@ impl BlinnPhongUniforms {
             camera_position,
             directional_lights: std::array::from_fn(|index| {
                 if index == 0 {
-                    directional_light
+                    sanitize_directional_light(directional_light)
                 } else {
                     DirectionalLight::default()
                 }
@@ -379,7 +398,7 @@ impl BlinnPhongUniforms {
             directional_light_count: 1,
             point_lights: std::array::from_fn(|index| {
                 if index == 0 {
-                    point_light
+                    sanitize_point_light(point_light)
                 } else {
                     PointLight::default()
                 }
@@ -448,7 +467,7 @@ impl BlinnPhongUniforms {
             return Err("directional light capacity reached");
         }
         let index = self.directional_light_count;
-        self.directional_lights[index] = light;
+        self.directional_lights[index] = sanitize_directional_light(light);
         self.directional_light_count += 1;
         Ok(index)
     }
@@ -459,7 +478,7 @@ impl BlinnPhongUniforms {
             return Err("point light capacity reached");
         }
         let index = self.point_light_count;
-        self.point_lights[index] = light;
+        self.point_lights[index] = sanitize_point_light(light);
         self.point_light_count += 1;
         Ok(index)
     }
@@ -476,7 +495,7 @@ impl BlinnPhongUniforms {
         if index >= self.directional_light_count {
             return Err("directional light index out of bounds");
         }
-        *slot = light;
+        *slot = sanitize_directional_light(light);
         if index == 0 {
             self.shadow_state = None;
         }
@@ -488,7 +507,7 @@ impl BlinnPhongUniforms {
         if index >= self.point_light_count {
             return Err("point light index out of bounds");
         }
-        self.point_lights[index] = light;
+        self.point_lights[index] = sanitize_point_light(light);
         Ok(())
     }
 
@@ -558,10 +577,10 @@ impl BlinnPhongUniforms {
         shadow_state: Option<ShadowState>,
     ) {
         if self.directional_light_count == 0 {
-            self.directional_lights[0] = directional_light;
+            self.directional_lights[0] = sanitize_directional_light(directional_light);
             self.directional_light_count = 1;
         } else {
-            self.directional_lights[0] = directional_light;
+            self.directional_lights[0] = sanitize_directional_light(directional_light);
         }
         self.shadow_state = shadow_state;
     }
@@ -1370,6 +1389,101 @@ mod tests {
         assert_eq!(uniforms.remove_point_light(0), Some(moved_point));
         assert_eq!(uniforms.directional_light_count(), 0);
         assert_eq!(uniforms.point_light_count(), 0);
+    }
+
+    #[test]
+    fn light_uniform_boundary_clamps_negative_colors_and_intensities() {
+        let directional =
+            DirectionalLight::new(Vec3::new(0.0, 0.0, 1.0), Vec3::new(-1.0, 0.5, -0.25));
+        assert_eq!(directional.color.x, 0.0);
+        assert_eq!(directional.color.z, 0.0);
+        assert!(directional.color.y > 0.0);
+
+        let point = PointLight::new(Vec3::ZERO, Vec3::new(-1.0, 0.5, -0.25), -1.0, -0.5, -0.25);
+        assert_eq!(point.color.x, 0.0);
+        assert_eq!(point.color.z, 0.0);
+        assert_eq!(point.constant_attenuation, 0.0);
+        assert_eq!(point.linear_attenuation, 0.0);
+        assert_eq!(point.quadratic_attenuation, 0.0);
+
+        let mut uniforms = uniforms();
+        uniforms.clear_directional_lights();
+        uniforms.clear_point_lights();
+        let public_directional = DirectionalLight {
+            color: Vec3::new(-1.0, 2.0, -3.0),
+            ..DirectionalLight::default()
+        };
+        let public_point = PointLight {
+            color: Vec3::new(-1.0, 2.0, -3.0),
+            constant_attenuation: -1.0,
+            linear_attenuation: -2.0,
+            quadratic_attenuation: -3.0,
+            ..PointLight::default()
+        };
+        uniforms.add_directional_light(public_directional).unwrap();
+        uniforms.add_point_light(public_point).unwrap();
+        assert_eq!(
+            uniforms.directional_lights()[0].color,
+            Vec3::new(0.0, 2.0, 0.0)
+        );
+        assert_eq!(uniforms.point_lights()[0].color, Vec3::new(0.0, 2.0, 0.0));
+        assert_eq!(uniforms.point_lights()[0].constant_attenuation, 0.0);
+        assert_eq!(uniforms.point_lights()[0].linear_attenuation, 0.0);
+        assert_eq!(uniforms.point_lights()[0].quadratic_attenuation, 0.0);
+    }
+
+    #[test]
+    fn point_light_removal_compacts_order_and_changes_production_shading() {
+        let mut base = uniforms();
+        base.ambient_color = Vec3::ZERO;
+        base.diffuse_color = Vec3::new(1.0, 1.0, 1.0);
+        base.specular_color = Vec3::ZERO;
+        base.clear_directional_lights();
+        base.clear_point_lights();
+        let first = PointLight::new(
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            1.0,
+            0.0,
+            0.0,
+        );
+        let middle = PointLight::new(
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            2.0,
+            0.0,
+            0.0,
+        );
+        let last = PointLight::new(
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            4.0,
+            0.0,
+            0.0,
+        );
+        base.add_point_light(first).unwrap();
+        base.add_point_light(middle).unwrap();
+        base.add_point_light(last).unwrap();
+        let varyings = BlinnPhongVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        let original_shading = BlinnPhongShader::shade(&varyings, &base);
+
+        let mut without_first = base.clone();
+        assert_eq!(without_first.remove_point_light(0), Some(first));
+        assert_eq!(without_first.point_lights(), &[middle, last]);
+        let first_removed_shading = BlinnPhongShader::shade(&varyings, &without_first);
+
+        let mut without_middle = base;
+        assert_eq!(without_middle.remove_point_light(1), Some(middle));
+        assert_eq!(without_middle.point_lights(), &[first, last]);
+        let middle_removed_shading = BlinnPhongShader::shade(&varyings, &without_middle);
+
+        assert_ne!(first_removed_shading, original_shading);
+        assert_ne!(middle_removed_shading, original_shading);
+        assert_ne!(first_removed_shading, middle_removed_shading);
     }
 
     #[test]
