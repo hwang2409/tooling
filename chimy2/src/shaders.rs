@@ -11,6 +11,7 @@ use crate::mesh::MeshVertex;
 use crate::pipeline::{
     FragmentStage, SampledFragmentStage, SamplingVaryings, Varyings, VertexOutput, VertexStage,
 };
+use crate::shadow::{ShadowMap, ShadowState};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FlatColorUniforms {
@@ -297,7 +298,7 @@ impl PointLight {
 /// );
 /// uniforms.model = Mat4::IDENTITY;
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BlinnPhongUniforms {
     model: Mat4,
     view: Mat4,
@@ -307,8 +308,9 @@ pub struct BlinnPhongUniforms {
     pub specular_color: Vec3,
     pub shininess: f32,
     pub camera_position: Vec3,
-    pub directional_light: DirectionalLight,
+    directional_light: DirectionalLight,
     pub point_light: PointLight,
+    shadow_state: Option<ShadowState>,
     transform: Mat4,
     normal_matrix: Mat3,
 }
@@ -338,16 +340,17 @@ impl BlinnPhongUniforms {
             camera_position,
             directional_light,
             point_light,
+            shadow_state: None,
             transform: projection * view * model,
             normal_matrix: model.normal_matrix().unwrap_or_default(),
         }
     }
 
-    pub const fn transform(self) -> Mat4 {
+    pub const fn transform(&self) -> Mat4 {
         self.transform
     }
 
-    pub const fn normal_matrix(self) -> Mat3 {
+    pub const fn normal_matrix(&self) -> Mat3 {
         self.normal_matrix
     }
 
@@ -361,6 +364,41 @@ impl BlinnPhongUniforms {
 
     pub const fn projection(&self) -> Mat4 {
         self.projection
+    }
+
+    pub const fn directional_light(&self) -> DirectionalLight {
+        self.directional_light
+    }
+
+    pub const fn light_view_projection(&self) -> Mat4 {
+        match &self.shadow_state {
+            Some(state) => state.light_view_projection(),
+            None => Mat4::IDENTITY,
+        }
+    }
+
+    pub fn shadow_map(&self) -> Option<&ShadowMap> {
+        self.shadow_state.as_ref().map(ShadowState::shadow_map)
+    }
+
+    pub const fn shadow_bias(&self) -> (f32, f32) {
+        match &self.shadow_state {
+            Some(state) => state.bias(),
+            None => (0.002, 0.02),
+        }
+    }
+
+    /// Replaces the light and its complete shadow state as one update.
+    ///
+    /// The default bias is `(0.002, 0.02)`. The shadow compare uses
+    /// `max(constant, slope * (1 - N dot L))`.
+    pub fn set_directional_shadow(
+        &mut self,
+        directional_light: DirectionalLight,
+        shadow_state: Option<ShadowState>,
+    ) {
+        self.directional_light = directional_light;
+        self.shadow_state = shadow_state;
     }
 
     pub fn set_model(&mut self, model: Mat4) {
@@ -392,6 +430,7 @@ impl BlinnPhongUniforms {
 pub struct BlinnPhongVaryings {
     pub world_position: Vec3,
     pub normal: Vec3,
+    pub light_space_position: Vec4,
 }
 
 impl Varyings for BlinnPhongVaryings {
@@ -401,6 +440,9 @@ impl Varyings for BlinnPhongVaryings {
                 + b.world_position * weights.y
                 + c.world_position * weights.z,
             normal: a.normal * weights.x + b.normal * weights.y + c.normal * weights.z,
+            light_space_position: a.light_space_position * weights.x
+                + b.light_space_position * weights.y
+                + c.light_space_position * weights.z,
         }
     }
 }
@@ -410,6 +452,7 @@ struct PreparedBlinnPhongVertex {
     clip_position: Vec4,
     world_position: Vec3,
     normal: Vec3,
+    light_space_position: Vec4,
 }
 
 fn prepare_blinn_phong_vertex(
@@ -425,10 +468,13 @@ fn prepare_blinn_phong_vertex(
     );
     let normal = vertex.normal.unwrap_or(Vec3::new(0.0, 0.0, 1.0));
     let normal = (uniforms.normal_matrix() * normal).normalize();
+    let light_space_position = uniforms.light_view_projection()
+        * Vec4::new(world_position.x, world_position.y, world_position.z, 1.0);
     PreparedBlinnPhongVertex {
         clip_position: uniforms.transform() * local_position,
         world_position,
         normal,
+        light_space_position,
     }
 }
 
@@ -449,6 +495,7 @@ impl VertexStage<MeshVertex, BlinnPhongUniforms> for BlinnPhongShader {
             BlinnPhongVaryings {
                 world_position: prepared.world_position,
                 normal: prepared.normal,
+                light_space_position: prepared.light_space_position,
             },
         )
     }
@@ -467,6 +514,7 @@ impl BlinnPhongShader {
         let lighted = evaluate_lighting(
             varyings.world_position,
             varyings.normal,
+            varyings.light_space_position,
             uniforms,
             Vec3::new(1.0, 1.0, 1.0),
         );
@@ -478,6 +526,7 @@ impl BlinnPhongShader {
 fn evaluate_lighting(
     world_position: Vec3,
     interpolated_normal: Vec3,
+    light_space_position: Vec4,
     uniforms: &BlinnPhongUniforms,
     albedo: Vec3,
 ) -> Vec3 {
@@ -485,13 +534,14 @@ fn evaluate_lighting(
     let view_direction = (uniforms.camera_position - world_position).normalize();
     let mut lighted = uniforms.ambient_color * albedo;
 
+    let directional_visibility = uniforms.shadow_visibility(light_space_position, normal);
     lighted = lighted
         + evaluate_light(
             normal,
             view_direction,
-            uniforms.directional_light.direction.normalize(),
-            uniforms.directional_light.color,
-            1.0,
+            uniforms.directional_light().direction.normalize(),
+            uniforms.directional_light().color,
+            directional_visibility,
             uniforms,
             albedo,
         );
@@ -521,6 +571,31 @@ fn evaluate_lighting(
     lighted
 }
 
+impl BlinnPhongUniforms {
+    fn shadow_visibility(&self, light_space_position: Vec4, normal: Vec3) -> f32 {
+        let Some(shadow_state) = self.shadow_state.as_ref() else {
+            return 1.0;
+        };
+        let shadow_map = shadow_state.shadow_map();
+        if light_space_position.w <= 0.0 || !light_space_position.w.is_finite() {
+            return 1.0;
+        }
+        let ndc = Vec3::new(
+            light_space_position.x / light_space_position.w,
+            light_space_position.y / light_space_position.w,
+            light_space_position.z / light_space_position.w,
+        );
+        let uv = crate::math::Vec2::new((ndc.x + 1.0) * 0.5, (1.0 - ndc.y) * 0.5);
+        let normal_dot_light = normal
+            .normalize()
+            .dot(self.directional_light().direction.normalize())
+            .clamp(0.0, 1.0);
+        let (constant_bias, slope_bias) = shadow_state.bias();
+        let bias = constant_bias.max(slope_bias * (1.0 - normal_dot_light));
+        shadow_map.visibility_3x3(uv, ndc.z, bias)
+    }
+}
+
 fn evaluate_light(
     normal: Vec3,
     view_direction: Vec3,
@@ -545,7 +620,7 @@ fn evaluate_light(
         * attenuation
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TexturedBlinnPhongUniforms<'a> {
     pub lighting: BlinnPhongUniforms,
     pub texture: &'a Texture,
@@ -574,6 +649,7 @@ pub struct TexturedBlinnPhongVaryings {
     pub world_position: Vec3,
     pub normal: Vec3,
     pub texcoord: crate::math::Vec2,
+    pub light_space_position: Vec4,
 }
 
 impl Varyings for TexturedBlinnPhongVaryings {
@@ -584,6 +660,9 @@ impl Varyings for TexturedBlinnPhongVaryings {
                 + c.world_position * weights.z,
             normal: a.normal * weights.x + b.normal * weights.y + c.normal * weights.z,
             texcoord: a.texcoord * weights.x + b.texcoord * weights.y + c.texcoord * weights.z,
+            light_space_position: a.light_space_position * weights.x
+                + b.light_space_position * weights.y
+                + c.light_space_position * weights.z,
         }
     }
 }
@@ -609,6 +688,7 @@ impl<'a> VertexStage<MeshVertex, TexturedBlinnPhongUniforms<'a>> for TexturedBli
                 world_position: prepared.world_position,
                 normal: prepared.normal,
                 texcoord: vertex.texcoord.unwrap_or(crate::math::Vec2::ZERO),
+                light_space_position: prepared.light_space_position,
             },
         )
     }
@@ -636,6 +716,7 @@ impl<'a> SampledFragmentStage<TexturedBlinnPhongVaryings, TexturedBlinnPhongUnif
         let lighted = evaluate_lighting(
             varyings.world_position,
             varyings.normal,
+            varyings.light_space_position,
             &uniforms.lighting,
             albedo,
         );
@@ -694,6 +775,7 @@ mod tests {
         let varyings = BlinnPhongVaryings {
             world_position: Vec3::ZERO,
             normal: Vec3::new(0.0, 0.0, 1.0),
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
         };
         // The hand calculation is H = normalize((0, 1, 1) + (0, 0, 1)),
         // so N dot H = 0.9238795. With shininess 8, specular is 0.53079,
@@ -706,13 +788,17 @@ mod tests {
         let varyings = BlinnPhongVaryings {
             world_position: Vec3::ZERO,
             normal: Vec3::new(0.0, 0.0, 1.0),
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
         };
         let mut uniforms = uniforms();
         uniforms.shininess = 2.0;
         // L = (0, 4/5, -3/5), V = (0, 0, 1), and N = (0, 0, 1).
         // N dot L = -3/5, but H = normalize(L + V) has N dot H = 1/sqrt(5).
         // The backside gate therefore makes the hand-computed result zero.
-        uniforms.directional_light.direction = Vec3::new(0.0, 0.8, -0.6);
+        uniforms.set_directional_shadow(
+            DirectionalLight::new(Vec3::new(0.0, 0.8, -0.6), Vec3::new(1.0, 1.0, 1.0)),
+            None,
+        );
         assert_eq!(BlinnPhongShader::shade(&varyings, &uniforms), 0xff000000);
     }
 
@@ -790,5 +876,31 @@ mod tests {
             projection * Mat4::IDENTITY * Mat4::IDENTITY
         );
         assert_eq!(uniforms.normal_matrix(), Mat3::IDENTITY);
+    }
+
+    #[test]
+    fn blinn_phong_shadow_state_updates_atomically() {
+        let mut uniforms = uniforms();
+        let shadow_map = ShadowMap::from_depth(1, 1, vec![0.0]).unwrap();
+        let first_matrix = Mat4::translate(Vec3::new(2.0, 3.0, 4.0));
+        let first_state = ShadowState::new(first_matrix, shadow_map.clone());
+        uniforms.set_directional_shadow(
+            DirectionalLight::new(Vec3::new(0.0, 1.0, 0.0), Vec3::new(1.0, 1.0, 1.0)),
+            Some(first_state),
+        );
+
+        let moved_matrix = Mat4::translate(Vec3::new(-2.0, 1.0, 5.0));
+        let mut moved_state = ShadowState::new(moved_matrix, shadow_map);
+        moved_state.set_bias(0.01, 0.04);
+        let moved_light = DirectionalLight::new(
+            Vec3::new(1.0, 1.0, 0.0).normalize(),
+            Vec3::new(1.0, 1.0, 1.0),
+        );
+        uniforms.set_directional_shadow(moved_light, Some(moved_state));
+
+        assert_eq!(uniforms.directional_light(), moved_light);
+        assert_eq!(uniforms.light_view_projection(), moved_matrix);
+        assert_eq!(uniforms.shadow_bias(), (0.01, 0.04));
+        assert!(uniforms.shadow_map().is_some());
     }
 }
