@@ -95,7 +95,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 argb8888(255, 225, 160, 70),
             );
             let mut pipeline = Pipeline::new(MeshShader, MeshShader);
-            pipeline.draw_mesh(framebuffer, &mesh, &uniforms);
+            pipeline.render(framebuffer, |frame, target| {
+                frame.draw_mesh(target, &mesh, &uniforms);
+            });
         },
     )
 }

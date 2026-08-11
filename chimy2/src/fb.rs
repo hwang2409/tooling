@@ -41,6 +41,57 @@ impl Framebuffer {
             *pixel = color;
         }
     }
+
+    /// Downsamples an integer supersampled framebuffer with a premultiplied,
+    /// linear-light box filter. The destination dimensions must divide source.
+    pub fn downsample_linear_into(&self, destination: &mut Self) {
+        if destination.width == 0
+            || destination.height == 0
+            || self.width == 0
+            || self.height == 0
+            || self.width % destination.width != 0
+            || self.height % destination.height != 0
+        {
+            return;
+        }
+        let scale_x = self.width / destination.width;
+        let scale_y = self.height / destination.height;
+        if scale_x == 0 || scale_x != scale_y {
+            return;
+        }
+        let sample_count = (scale_x * scale_y) as f32;
+        for y in 0..destination.height {
+            for x in 0..destination.width {
+                let mut premultiplied_rgb = [0.0; 3];
+                let mut alpha = 0.0;
+                for sample_y in 0..scale_y {
+                    for sample_x in 0..scale_x {
+                        let source_index =
+                            (y * scale_y + sample_y) * self.width + x * scale_x + sample_x;
+                        let [source_alpha, red, green, blue] =
+                            self.color[source_index].to_be_bytes();
+                        let source_alpha = f32::from(source_alpha) / 255.0;
+                        premultiplied_rgb[0] += crate::image::srgb_to_linear_u8(red) * source_alpha;
+                        premultiplied_rgb[1] +=
+                            crate::image::srgb_to_linear_u8(green) * source_alpha;
+                        premultiplied_rgb[2] +=
+                            crate::image::srgb_to_linear_u8(blue) * source_alpha;
+                        alpha += source_alpha;
+                    }
+                }
+                let average_alpha = alpha / sample_count;
+                let rgb = if average_alpha == 0.0 {
+                    [0.0; 3]
+                } else {
+                    std::array::from_fn(|channel| {
+                        (premultiplied_rgb[channel] / sample_count) / average_alpha
+                    })
+                };
+                destination.color[y * destination.width + x] = argb8888_linear(average_alpha, rgb);
+                destination.depth[y * destination.width + x] = 1.0;
+            }
+        }
+    }
 }
 
 pub const fn argb8888(alpha: u8, red: u8, green: u8, blue: u8) -> u32 {
@@ -55,6 +106,42 @@ pub fn argb8888_linear(alpha: f32, rgb: [f32; 3]) -> u32 {
         crate::image::linear_to_srgb(rgb[0]),
         crate::image::linear_to_srgb(rgb[1]),
         crate::image::linear_to_srgb(rgb[2]),
+    )
+}
+
+pub fn blend_argb8888_linear(destination: u32, source: u32) -> u32 {
+    let [source_alpha, source_red, source_green, source_blue] = source.to_be_bytes();
+    let [
+        destination_alpha,
+        destination_red,
+        destination_green,
+        destination_blue,
+    ] = destination.to_be_bytes();
+    let source_alpha = f32::from(source_alpha) / 255.0;
+    let destination_alpha = f32::from(destination_alpha) / 255.0;
+    let inverse_source_alpha = 1.0 - source_alpha;
+    let output_alpha = source_alpha + destination_alpha * inverse_source_alpha;
+    let source_rgb = [
+        crate::image::srgb_to_linear_u8(source_red),
+        crate::image::srgb_to_linear_u8(source_green),
+        crate::image::srgb_to_linear_u8(source_blue),
+    ];
+    let destination_rgb = [
+        crate::image::srgb_to_linear_u8(destination_red),
+        crate::image::srgb_to_linear_u8(destination_green),
+        crate::image::srgb_to_linear_u8(destination_blue),
+    ];
+    argb8888_linear(
+        output_alpha,
+        std::array::from_fn(|channel| {
+            let premultiplied = source_rgb[channel] * source_alpha
+                + destination_rgb[channel] * destination_alpha * inverse_source_alpha;
+            if output_alpha > 0.0 {
+                premultiplied / output_alpha
+            } else {
+                0.0
+            }
+        }),
     )
 }
 
@@ -108,5 +195,56 @@ mod tests {
         let mut framebuffer = Framebuffer::new(2, 2);
         framebuffer.color.clear();
         framebuffer.put_pixel(1, 1, 0xffffffff);
+    }
+
+    #[test]
+    fn alpha_blending_decodes_and_reencodes_rgb() {
+        let result =
+            blend_argb8888_linear(argb8888(255, 128, 128, 128), argb8888(128, 255, 255, 255));
+        assert_eq!(result, argb8888(255, 205, 205, 205));
+        assert_ne!(result, argb8888(255, 192, 192, 192));
+    }
+
+    #[test]
+    fn downsample_uses_linear_box_filter() {
+        let mut source = Framebuffer::new(2, 2);
+        source.color = vec![
+            argb8888(255, 0, 0, 0),
+            argb8888(255, 255, 255, 255),
+            argb8888(255, 0, 0, 0),
+            argb8888(255, 255, 255, 255),
+        ];
+        let mut destination = Framebuffer::new(1, 1);
+        source.downsample_linear_into(&mut destination);
+        assert_eq!(destination.color[0], argb8888(255, 188, 188, 188));
+        assert_ne!(destination.color[0], argb8888(255, 128, 128, 128));
+    }
+
+    #[test]
+    fn downsample_filters_rgb_premultiplied_by_alpha() {
+        let mut source = Framebuffer::new(2, 2);
+        source.color = vec![
+            argb8888(255, 255, 0, 0),
+            argb8888(255, 255, 0, 0),
+            argb8888(0, 0, 0, 0),
+            argb8888(0, 0, 0, 0),
+        ];
+        let mut destination = Framebuffer::new(1, 1);
+        source.downsample_linear_into(&mut destination);
+        assert_eq!(destination.color[0], argb8888(128, 255, 0, 0));
+    }
+
+    #[test]
+    fn downsample_premultiplies_each_source_alpha() {
+        let mut source = Framebuffer::new(2, 2);
+        source.color = vec![
+            argb8888(0, 255, 255, 255),
+            argb8888(255, 255, 0, 0),
+            argb8888(0, 255, 255, 255),
+            argb8888(255, 255, 0, 0),
+        ];
+        let mut destination = Framebuffer::new(1, 1);
+        source.downsample_linear_into(&mut destination);
+        assert_eq!(destination.color[0], argb8888(128, 255, 0, 0));
     }
 }

@@ -110,7 +110,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             );
             let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
-            pipeline.draw_mesh(framebuffer, &mesh, &uniforms);
+            pipeline.render(framebuffer, |frame, target| {
+                frame.draw_mesh(target, &mesh, &uniforms);
+            });
         },
     )
 }

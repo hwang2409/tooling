@@ -88,7 +88,9 @@ fn toon_shader_scene_golden() {
     let mut framebuffer = framebuffer();
     let mut pipeline = Pipeline::new(ToonShader, ToonShader);
     pipeline.set_thread_count(1);
-    pipeline.draw(&mut framebuffer, &vertices, &triangles, &uniforms);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw(target, &vertices, &triangles, &uniforms);
+    });
     assert_golden("m7-shader-toon", &framebuffer);
 }
 
@@ -105,7 +107,9 @@ fn psx_shader_scene_golden() {
     let mut framebuffer = framebuffer();
     let mut pipeline = Pipeline::new(PsxShader, PsxShader);
     pipeline.set_thread_count(1);
-    pipeline.draw(&mut framebuffer, &vertices, &triangles, &uniforms);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw(target, &vertices, &triangles, &uniforms);
+    });
     assert_golden("m7-shader-psx", &framebuffer);
 }
 
@@ -122,7 +126,9 @@ fn dither_shader_scene_golden() {
     let mut framebuffer = framebuffer();
     let mut pipeline = Pipeline::new(DitherShader, DitherShader);
     pipeline.set_thread_count(1);
-    pipeline.draw(&mut framebuffer, &vertices, &triangles, &uniforms);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw(target, &vertices, &triangles, &uniforms);
+    });
     assert_golden("m7-shader-dither", &framebuffer);
 }
 
@@ -141,7 +147,9 @@ fn fog_shader_scene_golden() {
     let mut framebuffer = framebuffer();
     let mut pipeline = Pipeline::new(FogShader, FogShader);
     pipeline.set_thread_count(1);
-    pipeline.draw(&mut framebuffer, &vertices, &triangles, &uniforms);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw(target, &vertices, &triangles, &uniforms);
+    });
     assert_golden("m7-shader-fog", &framebuffer);
 }
 
@@ -152,7 +160,9 @@ fn normals_shader_scene_golden() {
     let mut framebuffer = framebuffer();
     let mut pipeline = Pipeline::new(NormalsShader, NormalsShader);
     pipeline.set_thread_count(1);
-    pipeline.draw(&mut framebuffer, &vertices, &triangles, &uniforms);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw(target, &vertices, &triangles, &uniforms);
+    });
     assert_golden("m7-shader-normals", &framebuffer);
 }
 
@@ -169,6 +179,8 @@ fn wireframe_shader_scene_golden() {
     let mut framebuffer = framebuffer();
     let mut pipeline = Pipeline::new(WireframeShader, WireframeShader);
     pipeline.set_thread_count(1);
-    pipeline.draw(&mut framebuffer, &vertices, &triangles, &uniforms);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw(target, &vertices, &triangles, &uniforms);
+    });
     assert_golden("m7-shader-wireframe", &framebuffer);
 }

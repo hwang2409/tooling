@@ -112,7 +112,10 @@ fn render_quad(light_direction: Vec3, bump: bool) -> Framebuffer {
     let mut framebuffer = Framebuffer::new(WIDTH, HEIGHT);
     framebuffer.clear(argb8888(255, 12, 16, 24));
     let mut pipeline = Pipeline::new(NormalMappedBlinnPhongShader, NormalMappedBlinnPhongShader);
-    pipeline.draw_mesh_with_sampling(&mut framebuffer, &quad(), &uniforms);
+    let mesh = quad();
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh_with_sampling(target, &mesh, &uniforms);
+    });
     framebuffer
 }
 
@@ -198,7 +201,9 @@ fn normal_mapped_mesh_uses_directional_shadows_golden() {
         TextureFilter::Bilinear,
     )
     .unwrap();
-    pipeline.draw_mesh_with_sampling(&mut framebuffer, &ground, &ground_uniforms);
-    pipeline.draw_mesh_with_sampling(&mut framebuffer, &caster, &uniforms);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh_with_sampling(target, &ground, &ground_uniforms);
+        frame.draw_mesh_with_sampling(target, &caster, &uniforms);
+    });
     assert_golden("m12-normal-map-shadow", &framebuffer);
 }

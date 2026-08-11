@@ -7,6 +7,37 @@ use crate::fb::Framebuffer;
 use crate::math::{Vec3, Vec4};
 use crate::pipeline::{SampleDerivatives, SamplingVaryings, Varyings};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RasterState {
+    pub depth_test: bool,
+    pub depth_write: bool,
+    pub color_write: bool,
+    pub blend: bool,
+}
+
+impl RasterState {
+    pub const OPAQUE: Self = Self {
+        depth_test: true,
+        depth_write: true,
+        color_write: true,
+        blend: false,
+    };
+
+    pub const TRANSPARENT: Self = Self {
+        depth_test: true,
+        depth_write: false,
+        color_write: true,
+        blend: true,
+    };
+
+    pub const DEPTH_ONLY: Self = Self {
+        depth_test: true,
+        depth_write: true,
+        color_write: false,
+        blend: false,
+    };
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScreenVertex<V> {
     pub position: Vec3,
@@ -168,6 +199,29 @@ pub fn rasterize_triangle<V, F>(
     )
 }
 
+pub fn rasterize_triangle_with_state<V, F>(
+    framebuffer: &mut Framebuffer,
+    vertices: [ScreenVertex<V>; 3],
+    state: RasterState,
+    fragment: F,
+) where
+    V: Varyings,
+    F: FnMut(V) -> u32,
+{
+    rasterize_triangle_in_rect_with_state(
+        framebuffer,
+        vertices,
+        PixelRect {
+            min_x: 0,
+            max_x: framebuffer.width.saturating_sub(1) as i32,
+            min_y: 0,
+            max_y: framebuffer.height.saturating_sub(1) as i32,
+        },
+        state,
+        fragment,
+    )
+}
+
 /// Rasterizes one triangle while updating depth without writing color.
 pub fn rasterize_triangle_depth<V>(framebuffer: &mut Framebuffer, vertices: [ScreenVertex<V>; 3])
 where
@@ -208,6 +262,29 @@ pub fn rasterize_triangle_with_sampling<V, F>(
     );
 }
 
+pub fn rasterize_triangle_with_sampling_state<V, F>(
+    framebuffer: &mut Framebuffer,
+    vertices: [ScreenVertex<V>; 3],
+    state: RasterState,
+    fragment: F,
+) where
+    V: SamplingVaryings,
+    F: FnMut(V, SampleDerivatives) -> u32,
+{
+    rasterize_triangle_in_rect_with_sampling_state(
+        framebuffer,
+        vertices,
+        PixelRect {
+            min_x: 0,
+            max_x: framebuffer.width.saturating_sub(1) as i32,
+            min_y: 0,
+            max_y: framebuffer.height.saturating_sub(1) as i32,
+        },
+        state,
+        fragment,
+    )
+}
+
 /// Rasterizes one triangle inside a caller-owned pixel rectangle.
 ///
 /// The serial path passes the full framebuffer rectangle. A parallel worker
@@ -228,7 +305,34 @@ pub(crate) fn rasterize_triangle_in_rect<V, F>(
         framebuffer,
         vertices,
         rect,
-        true,
+        RasterState::OPAQUE,
+        |vertices, weights, inverse_w, _, _| {
+            V::lerp3(
+                &vertices[0].varyings,
+                &vertices[1].varyings,
+                &vertices[2].varyings,
+                perspective_correct_weights(weights, inverse_w),
+            )
+        },
+        fragment,
+    );
+}
+
+pub(crate) fn rasterize_triangle_in_rect_with_state<V, F>(
+    framebuffer: &mut Framebuffer,
+    vertices: [ScreenVertex<V>; 3],
+    rect: PixelRect,
+    state: RasterState,
+    fragment: F,
+) where
+    V: Varyings,
+    F: FnMut(V) -> u32,
+{
+    rasterize_triangle_in_rect_core(
+        framebuffer,
+        vertices,
+        rect,
+        state,
         |vertices, weights, inverse_w, _, _| {
             V::lerp3(
                 &vertices[0].varyings,
@@ -252,7 +356,7 @@ pub(crate) fn rasterize_triangle_depth_in_rect<V>(
         framebuffer,
         vertices,
         rect,
-        false,
+        RasterState::DEPTH_ONLY,
         |vertices, weights, inverse_w, _, _| {
             V::lerp3(
                 &vertices[0].varyings,
@@ -278,7 +382,38 @@ pub(crate) fn rasterize_triangle_in_rect_with_sampling<V, F>(
         framebuffer,
         vertices,
         rect,
-        true,
+        RasterState::OPAQUE,
+        |vertices, weights, inverse_w, ddx_weights, ddy_weights| {
+            let varyings = V::lerp3(
+                &vertices[0].varyings,
+                &vertices[1].varyings,
+                &vertices[2].varyings,
+                perspective_correct_weights(weights, inverse_w),
+            );
+            (
+                varyings,
+                texture_derivatives(vertices, weights, inverse_w, ddx_weights, ddy_weights),
+            )
+        },
+        |(varyings, derivatives)| fragment(varyings, derivatives),
+    );
+}
+
+pub(crate) fn rasterize_triangle_in_rect_with_sampling_state<V, F>(
+    framebuffer: &mut Framebuffer,
+    vertices: [ScreenVertex<V>; 3],
+    rect: PixelRect,
+    state: RasterState,
+    mut fragment: F,
+) where
+    V: SamplingVaryings,
+    F: FnMut(V, SampleDerivatives) -> u32,
+{
+    rasterize_triangle_in_rect_core(
+        framebuffer,
+        vertices,
+        rect,
+        state,
         |vertices, weights, inverse_w, ddx_weights, ddy_weights| {
             let varyings = V::lerp3(
                 &vertices[0].varyings,
@@ -299,7 +434,7 @@ fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment>(
     framebuffer: &mut Framebuffer,
     mut vertices: [ScreenVertex<V>; 3],
     rect: PixelRect,
-    write_color: bool,
+    state: RasterState,
     mut interpolate: Interpolate,
     mut fragment: Fragment,
 ) where
@@ -357,7 +492,7 @@ fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment>(
             let Some(buffer_depth) = framebuffer.depth.get_mut(index) else {
                 continue;
             };
-            if depth >= *buffer_depth {
+            if state.depth_test && depth >= *buffer_depth {
                 continue;
             }
             let ddx_weights = Vec3::new(
@@ -372,9 +507,18 @@ fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment>(
             );
             let inverse_w = inverse_w(&vertices);
             let input = interpolate(&vertices, weights, inverse_w, ddx_weights, ddy_weights);
-            *buffer_depth = depth;
-            if write_color && let Some(color) = framebuffer.color.get_mut(index) {
-                *color = fragment(input);
+            if state.depth_write {
+                *buffer_depth = depth;
+            }
+            if state.color_write
+                && let Some(color) = framebuffer.color.get_mut(index)
+            {
+                let source = fragment(input);
+                *color = if state.blend {
+                    crate::fb::blend_argb8888_linear(*color, source)
+                } else {
+                    source
+                };
             }
         }
     }

@@ -91,16 +91,12 @@ fn render_shadow_scene(light_direction: Vec3, constant_bias: f32, slope_bias: f3
     let mut framebuffer = Framebuffer::new(WIDTH, HEIGHT);
     framebuffer.clear(argb8888(255, 12, 16, 24));
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
-    pipeline.draw_mesh(
-        &mut framebuffer,
-        &ground,
-        &make_uniforms(Mat4::IDENTITY, Vec3::new(0.58, 0.6, 0.62)),
-    );
-    pipeline.draw_mesh(
-        &mut framebuffer,
-        &caster,
-        &make_uniforms(caster_model, Vec3::new(0.78, 0.25, 0.08)),
-    );
+    let ground_uniforms = make_uniforms(Mat4::IDENTITY, Vec3::new(0.58, 0.6, 0.62));
+    let caster_uniforms = make_uniforms(caster_model, Vec3::new(0.78, 0.25, 0.08));
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh(target, &ground, &ground_uniforms);
+        frame.draw_mesh(target, &caster, &caster_uniforms);
+    });
     framebuffer
 }
 

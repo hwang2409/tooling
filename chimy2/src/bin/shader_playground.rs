@@ -103,7 +103,9 @@ fn draw_mode(
                 Vec3::new(-0.4, 0.8, 1.0),
             );
             let mut pipeline = Pipeline::new(ToonShader, ToonShader);
-            pipeline.draw(framebuffer, vertices, triangles, &uniforms);
+            pipeline.render(framebuffer, |frame, target| {
+                frame.draw(target, vertices, triangles, &uniforms);
+            });
         }
         ShaderMode::Psx => {
             let uniforms = PsxUniforms::new(
@@ -114,7 +116,9 @@ fn draw_mode(
                 target_size,
             );
             let mut pipeline = Pipeline::new(PsxShader, PsxShader);
-            pipeline.draw(framebuffer, vertices, triangles, &uniforms);
+            pipeline.render(framebuffer, |frame, target| {
+                frame.draw(target, vertices, triangles, &uniforms);
+            });
         }
         ShaderMode::Dither => {
             let uniforms = DitherUniforms::new(
@@ -125,7 +129,9 @@ fn draw_mode(
                 target_size,
             );
             let mut pipeline = Pipeline::new(DitherShader, DitherShader);
-            pipeline.draw(framebuffer, vertices, triangles, &uniforms);
+            pipeline.render(framebuffer, |frame, target| {
+                frame.draw(target, vertices, triangles, &uniforms);
+            });
         }
         ShaderMode::Fog => {
             let uniforms = FogUniforms::new(
@@ -138,12 +144,16 @@ fn draw_mode(
                 6.0,
             );
             let mut pipeline = Pipeline::new(FogShader, FogShader);
-            pipeline.draw(framebuffer, vertices, triangles, &uniforms);
+            pipeline.render(framebuffer, |frame, target| {
+                frame.draw(target, vertices, triangles, &uniforms);
+            });
         }
         ShaderMode::Normals => {
             let uniforms = NormalsUniforms::new(model, view, projection);
             let mut pipeline = Pipeline::new(NormalsShader, NormalsShader);
-            pipeline.draw(framebuffer, vertices, triangles, &uniforms);
+            pipeline.render(framebuffer, |frame, target| {
+                frame.draw(target, vertices, triangles, &uniforms);
+            });
         }
         ShaderMode::Wireframe => {
             let uniforms = WireframeUniforms::new(
@@ -154,7 +164,9 @@ fn draw_mode(
                 Vec3::new(0.95, 0.72, 0.12),
             );
             let mut pipeline = Pipeline::new(WireframeShader, WireframeShader);
-            pipeline.draw(framebuffer, vertices, triangles, &uniforms);
+            pipeline.render(framebuffer, |frame, target| {
+                frame.draw(target, vertices, triangles, &uniforms);
+            });
         }
     }
 }

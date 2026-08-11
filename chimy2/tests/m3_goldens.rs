@@ -55,7 +55,9 @@ fn draw_mesh(mesh: &Mesh, camera: Camera, model: Mat4, color: u32) -> Framebuffe
         color,
     );
     let mut pipeline = Pipeline::new(MeshShader, MeshShader);
-    pipeline.draw_mesh(&mut framebuffer, mesh, &uniforms);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh(target, mesh, &uniforms);
+    });
     framebuffer
 }
 
@@ -64,7 +66,9 @@ fn draw_identity_mesh(mesh: &Mesh, color: u32) -> Framebuffer {
     framebuffer.clear(argb8888(255, 12, 16, 24));
     let uniforms = MeshUniforms::new(Mat4::IDENTITY, Mat4::IDENTITY, Mat4::IDENTITY, color);
     let mut pipeline = Pipeline::new(MeshShader, MeshShader);
-    pipeline.draw_mesh(&mut framebuffer, mesh, &uniforms);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh(target, mesh, &uniforms);
+    });
     framebuffer
 }
 
@@ -116,7 +120,9 @@ fn backface_culling_golden() {
         argb8888(255, 60, 80, 225),
     );
     let mut pipeline = Pipeline::new(MeshShader, MeshShader);
-    pipeline.draw_mesh(&mut framebuffer, &back, &uniforms);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh(target, &back, &uniforms);
+    });
     assert!(framebuffer.color.iter().all(|&pixel| pixel != 0xff3c50e1));
     assert_golden("m3-backface-culling", &framebuffer);
 }
