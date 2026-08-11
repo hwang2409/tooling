@@ -298,6 +298,37 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         Uniforms: Sync,
         V: Varyings + Clone + Send + Sync + 'a,
     {
+        if class == DrawClass::Opaque {
+            if prepared.is_empty() {
+                return;
+            }
+            let prepared = prepared
+                .into_iter()
+                .map(|(_, triangle)| triangle)
+                .collect::<Vec<_>>();
+            let submission_order = self.next_submission_order;
+            self.next_submission_order += 1;
+            let draw = Box::new(
+                move |framebuffer: &mut Framebuffer, fragment: &FS, threads| {
+                    dispatch_prepared(
+                        threads,
+                        framebuffer,
+                        &prepared,
+                        uniforms,
+                        fragment,
+                        class.raster_state(),
+                        rasterize,
+                    );
+                },
+            );
+            self.commands.push(QueuedCommand {
+                class,
+                key: 0.0,
+                submission_order,
+                draw,
+            });
+            return;
+        }
         for (key, triangle) in prepared {
             let submission_order = self.next_submission_order;
             self.next_submission_order += 1;
