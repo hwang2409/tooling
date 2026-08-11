@@ -3,6 +3,7 @@ pub mod clip;
 pub mod demo;
 pub mod fb;
 pub mod image;
+pub mod material;
 pub mod math;
 pub mod mesh;
 pub mod pipeline;

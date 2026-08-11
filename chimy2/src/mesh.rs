@@ -4,10 +4,14 @@
 //! stream, so the loader expands each unique (v, vt, vn) tuple into one
 //! renderer vertex.
 
+pub use crate::material::{
+    Material, MaterialLibrary, Mtl, MtlError, MtlLibrary, MtlMaterial, resolve_asset_path,
+};
 use crate::math::{Vec2, Vec3, Vec4};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::ops::Range;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -68,6 +72,36 @@ pub struct Mesh {
     vertices: Vec<MeshVertex>,
     triangles: Vec<[usize; 3]>,
     position_indices: Vec<usize>,
+    material_groups: Vec<MaterialGroup>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterialGroup {
+    material_name: String,
+    triangle_range: Range<usize>,
+}
+
+impl MaterialGroup {
+    pub fn new(material_name: impl Into<String>, triangle_range: Range<usize>) -> Self {
+        Self {
+            material_name: material_name.into(),
+            triangle_range,
+        }
+    }
+
+    pub fn material_name(&self) -> &str {
+        &self.material_name
+    }
+
+    pub fn triangle_range(&self) -> Range<usize> {
+        self.triangle_range.clone()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjAsset {
+    pub mesh: Mesh,
+    pub materials: MaterialLibrary,
 }
 
 impl Mesh {
@@ -78,6 +112,8 @@ impl Mesh {
         let mut mesh = Self::default();
         let mut vertex_map = HashMap::new();
         let mut vertex_position_indices = Vec::new();
+        let mut active_material: Option<String> = None;
+        let mut active_material_start = 0;
 
         for (line_index, source_line) in source.lines().enumerate() {
             let line_number = line_index + 1;
@@ -145,13 +181,32 @@ impl Mesh {
                         mesh.triangles.push([face[0], window[0], window[1]]);
                     }
                 }
+                "usemtl" => {
+                    if rest_is_empty(words.clone()) {
+                        return Err(ObjError::new(line_number, "usemtl needs a name"));
+                    }
+                    finish_material_group(
+                        &mut mesh.material_groups,
+                        active_material.take(),
+                        active_material_start,
+                        mesh.triangles.len(),
+                    );
+                    active_material = Some(words.collect::<Vec<_>>().join(" "));
+                    active_material_start = mesh.triangles.len();
+                }
                 // These records do not affect the renderer mesh.
-                "o" | "g" | "s" | "usemtl" | "mtllib" => {}
+                "o" | "g" | "s" | "mtllib" => {}
                 _ => {}
             }
         }
 
         mesh.position_indices = vertex_position_indices;
+        finish_material_group(
+            &mut mesh.material_groups,
+            active_material,
+            active_material_start,
+            mesh.triangles.len(),
+        );
         mesh.rebuild_derived_attributes();
         Ok(mesh)
     }
@@ -165,12 +220,89 @@ impl Mesh {
         Self::parse(&source)
     }
 
+    /// Loads an OBJ, its referenced MTL files, and all referenced textures.
+    pub fn load_with_materials(path: impl AsRef<Path>) -> Result<ObjAsset, ObjError> {
+        let path = path.as_ref();
+        let source = fs::read_to_string(path).map_err(|error| ObjError {
+            line: 0,
+            message: format!("{}: {error}", path.display()),
+        })?;
+        let mesh = Self::parse(&source)?;
+        let asset_root = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut materials = MaterialLibrary::default();
+        let mut found_mtl = false;
+        for (line_index, source_line) in source.lines().enumerate() {
+            let line_number = line_index + 1;
+            let line = source_line.split('#').next().unwrap_or_default().trim();
+            let Some(rest) = line.strip_prefix("mtllib") else {
+                continue;
+            };
+            if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+                continue;
+            }
+            let names: Vec<_> = rest.split_whitespace().collect();
+            if names.is_empty() {
+                return Err(ObjError::new(line_number, "mtllib needs a file name"));
+            }
+            for name in names {
+                let mtl_path = safe_obj_asset_path(asset_root, Path::new(name))
+                    .map_err(|error| ObjError::new(line_number, error))?;
+                let library = MaterialLibrary::load_with_root(&mtl_path, asset_root)
+                    .map_err(|error| ObjError::from_mtl(line_number, error))?;
+                for material in library.materials() {
+                    if materials.get(material.name.as_str()).is_some() {
+                        return Err(ObjError::new(
+                            line_number,
+                            format!("duplicate material name {}", material.name),
+                        ));
+                    }
+                    materials.materials_mut_for_loader().push(material.clone());
+                }
+                found_mtl = true;
+            }
+        }
+        if !found_mtl && !mesh.material_groups.is_empty() {
+            return Err(ObjError::new(0, "OBJ uses materials but has no mtllib"));
+        }
+        for group in &mesh.material_groups {
+            if materials.get(group.material_name()).is_none() {
+                return Err(ObjError::new(
+                    0,
+                    format!(
+                        "usemtl references unknown material {}",
+                        group.material_name()
+                    ),
+                ));
+            }
+        }
+        Ok(ObjAsset { mesh, materials })
+    }
+
     pub fn indices(&self) -> &[[usize; 3]] {
         &self.triangles
     }
 
     pub fn vertices(&self) -> &[MeshVertex] {
         &self.vertices
+    }
+
+    pub fn material_groups(&self) -> &[MaterialGroup] {
+        &self.material_groups
+    }
+
+    /// Returns a mesh view represented as an owned mesh for one material group.
+    pub fn submesh(&self, triangle_range: Range<usize>) -> Option<Self> {
+        if triangle_range.start > triangle_range.end || triangle_range.end > self.triangles.len() {
+            return None;
+        }
+        let mut mesh = Self {
+            vertices: self.vertices.clone(),
+            triangles: self.triangles[triangle_range.clone()].to_vec(),
+            position_indices: self.position_indices.clone(),
+            material_groups: Vec::new(),
+        };
+        mesh.rebuild_derived_attributes();
+        Some(mesh)
     }
 
     pub fn vertex(&self, index: usize) -> Option<&MeshVertex> {
@@ -187,6 +319,7 @@ impl Mesh {
             vertices,
             triangles,
             position_indices,
+            material_groups: Vec::new(),
         };
         mesh.rebuild_derived_attributes();
         mesh
@@ -222,6 +355,7 @@ impl Mesh {
 
     pub fn set_indices(&mut self, triangles: Vec<[usize; 3]>) {
         self.triangles = triangles;
+        self.material_groups.clear();
         self.rebuild_derived_attributes();
     }
 
@@ -359,6 +493,13 @@ impl ObjError {
             message: message.into(),
         }
     }
+
+    fn from_mtl(line: usize, error: MtlError) -> Self {
+        Self::new(
+            if error.line == 0 { line } else { error.line },
+            error.message,
+        )
+    }
 }
 
 impl Display for ObjError {
@@ -457,6 +598,44 @@ fn resolve_index(index: isize, length: usize, line: usize, kind: &str) -> Result
         .ok_or_else(|| ObjError::new(line, format!("{kind} index {index} is out of range")))
 }
 
+fn rest_is_empty<'a>(mut words: impl Iterator<Item = &'a str>) -> bool {
+    words.next().is_none()
+}
+
+fn finish_material_group(
+    groups: &mut Vec<MaterialGroup>,
+    material_name: Option<String>,
+    start: usize,
+    end: usize,
+) {
+    if let Some(material_name) = material_name
+        && start < end
+    {
+        groups.push(MaterialGroup::new(material_name, start..end));
+    }
+}
+
+fn safe_obj_asset_path(
+    asset_root: &Path,
+    relative_path: &Path,
+) -> Result<std::path::PathBuf, String> {
+    if relative_path.is_absolute() {
+        return Err("absolute mtllib paths are not allowed".to_string());
+    }
+    let root = fs::canonicalize(asset_root)
+        .map_err(|error| format!("asset root {}: {error}", asset_root.display()))?;
+    let candidate = asset_root.join(relative_path);
+    let canonical = fs::canonicalize(&candidate)
+        .map_err(|error| format!("mtllib {}: {error}", candidate.display()))?;
+    if !canonical.starts_with(&root) {
+        return Err(format!(
+            "mtllib path escapes asset root: {}",
+            relative_path.display()
+        ));
+    }
+    Ok(canonical)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,6 +704,47 @@ mod tests {
         assert!(Mesh::parse("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1/0 2/1 3/1\n").is_err());
         assert!(Mesh::parse("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1/ 2/1 3/1\n").is_err());
         assert!(Mesh::parse("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1// 2//1 3//1\n").is_err());
+    }
+
+    #[test]
+    fn records_contiguous_usemtl_triangle_ranges() {
+        let mesh = Mesh::parse(
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\n\
+             v 0 0 1\nv 1 0 1\nv 0 1 1\n\
+             usemtl first\nf 1 2 3\n\
+             usemtl second\nf 4 5 6\n",
+        )
+        .unwrap();
+        assert_eq!(mesh.material_groups().len(), 2);
+        assert_eq!(mesh.material_groups()[0].material_name(), "first");
+        assert_eq!(mesh.material_groups()[0].triangle_range(), 0..1);
+        assert_eq!(mesh.material_groups()[1].material_name(), "second");
+        assert_eq!(mesh.material_groups()[1].triangle_range(), 1..2);
+    }
+
+    #[test]
+    fn index_mutation_clears_material_ranges() {
+        let mut mesh = Mesh::parse("v 0 0 0\nv 1 0 0\nv 0 1 0\nusemtl first\nf 1 2 3\n").unwrap();
+        assert_eq!(mesh.material_groups().len(), 1);
+        mesh.set_indices(Vec::new());
+        assert!(mesh.material_groups().is_empty());
+    }
+
+    #[test]
+    fn loads_fixture_mtl_and_maps_with_obj() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/multi_material.obj");
+        let asset = Mesh::load_with_materials(path).unwrap();
+        assert_eq!(asset.mesh.material_groups().len(), 2);
+        assert_eq!(
+            asset
+                .materials
+                .get("checker")
+                .unwrap()
+                .albedo_texture()
+                .unwrap()
+                .color_space(),
+            crate::image::ColorSpace::Srgb
+        );
     }
 
     #[test]
