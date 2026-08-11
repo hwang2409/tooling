@@ -4,7 +4,7 @@
 //! features return an error. The loader uses no serialization crate because
 //! glTF is parsed by the local JSON parser.
 
-use crate::fb::Framebuffer;
+use crate::fb::{Framebuffer, argb8888};
 use crate::image::{ColorSpace, Texture};
 use crate::json::{self, Value};
 use crate::math::{Mat4, Vec2, Vec3, Vec4};
@@ -179,7 +179,6 @@ struct GltfMaterialParameters {
     specular: Vec3,
     shininess: f32,
     alpha: f32,
-    force_transparent: bool,
 }
 
 const DEFAULT_GLTF_MATERIAL: GltfMaterialParameters = GltfMaterialParameters {
@@ -187,7 +186,6 @@ const DEFAULT_GLTF_MATERIAL: GltfMaterialParameters = GltfMaterialParameters {
     specular: Vec3::new(1.0, 1.0, 1.0),
     shininess: 1.0,
     alpha: 1.0,
-    force_transparent: false,
 };
 
 impl GltfMaterial {
@@ -227,7 +225,6 @@ impl GltfMaterial {
                 GltfAlphaMode::Opaque => 1.0,
                 GltfAlphaMode::Blend | GltfAlphaMode::Mask => alpha,
             },
-            force_transparent: self.alpha_mode == GltfAlphaMode::Blend,
         }
     }
 }
@@ -240,7 +237,7 @@ enum GltfUniformKind<'a> {
 
 struct GltfUniforms<'a> {
     kind: GltfUniformKind<'a>,
-    force_transparent: bool,
+    alpha_mode: GltfAlphaMode,
 }
 
 #[derive(Clone)]
@@ -316,24 +313,39 @@ impl<'a> SampledFragmentStage<GltfVaryings, GltfUniforms<'a>> for GltfShader {
         &self,
         varyings: &GltfVaryings,
         derivatives: &crate::pipeline::SampleDerivatives,
-        uniforms: &GltfUniforms<'a>,
+        gltf_uniforms: &GltfUniforms<'a>,
     ) -> u32 {
-        match (&uniforms.kind, varyings) {
+        match (&gltf_uniforms.kind, varyings) {
             (GltfUniformKind::Plain(uniforms), GltfVaryings::Plain(varyings)) => {
                 FragmentStage::run(&BlinnPhongShader, varyings, uniforms)
             }
             (GltfUniformKind::Textured(uniforms), GltfVaryings::Textured(varyings)) => {
-                TexturedBlinnPhongShader.run_with_sampling(varyings, derivatives, uniforms)
+                let pixel =
+                    TexturedBlinnPhongShader.run_with_sampling(varyings, derivatives, uniforms);
+                if gltf_uniforms.alpha_mode == GltfAlphaMode::Opaque {
+                    force_opaque_alpha(pixel)
+                } else {
+                    pixel
+                }
             }
             (GltfUniformKind::NormalMapped(uniforms), GltfVaryings::NormalMapped(varyings)) => {
-                NormalMappedBlinnPhongShader.run_with_sampling(varyings, derivatives, uniforms)
+                let pixel =
+                    NormalMappedBlinnPhongShader.run_with_sampling(varyings, derivatives, uniforms);
+                if gltf_uniforms.alpha_mode == GltfAlphaMode::Opaque {
+                    force_opaque_alpha(pixel)
+                } else {
+                    pixel
+                }
             }
             _ => panic!("glTF draws must use matching varying types"),
         }
     }
 
     fn is_opaque(&self, uniforms: &GltfUniforms<'a>) -> bool {
-        if uniforms.force_transparent {
+        if uniforms.alpha_mode == GltfAlphaMode::Opaque {
+            return true;
+        }
+        if uniforms.alpha_mode == GltfAlphaMode::Blend {
             return false;
         }
         match &uniforms.kind {
@@ -354,6 +366,11 @@ impl<'a> SampledFragmentStage<GltfVaryings, GltfUniforms<'a>> for GltfShader {
             }
         }
     }
+}
+
+fn force_opaque_alpha(pixel: u32) -> u32 {
+    let [_, red, green, blue] = pixel.to_be_bytes();
+    argb8888(255, red, green, blue)
 }
 
 /// Submits glTF draws through the shared material-aware renderer.
@@ -416,7 +433,9 @@ pub fn submit_gltf_draws(
         };
         uniforms.push(GltfUniforms {
             kind,
-            force_transparent: parameters.force_transparent,
+            alpha_mode: material
+                .map(|material| material.alpha_mode)
+                .unwrap_or(GltfAlphaMode::Opaque),
         });
     }
     let mut pipeline = Pipeline::new(GltfShader, GltfShader);

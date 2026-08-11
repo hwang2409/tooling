@@ -1,7 +1,7 @@
 use chimy2::camera::OrbitController;
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::gltf::{GltfAlphaMode, GltfAsset, GltfDraw, GltfMaterial, submit_gltf_draws};
-use chimy2::image::Texture;
+use chimy2::image::{ColorSpace, Texture};
 use chimy2::math::{Mat4, Vec3, Vec4};
 use chimy2::mesh::{Mesh, MeshVertex};
 use std::fs;
@@ -122,6 +122,29 @@ fn base_color_material(factor: Vec4, alpha_mode: GltfAlphaMode) -> GltfMaterial 
     }
 }
 
+fn textured_material(
+    texture_alpha: u8,
+    normal_mapped: bool,
+    alpha_mode: GltfAlphaMode,
+) -> GltfMaterial {
+    GltfMaterial {
+        name: String::new(),
+        base_color_factor: Vec4::new(1.0, 1.0, 1.0, 1.0),
+        metallic_factor: 0.0,
+        roughness_factor: 0.5,
+        albedo_texture: Some(
+            Texture::new_with_color_space(1, 1, vec![[255, 0, 0, texture_alpha]], ColorSpace::Srgb)
+                .unwrap(),
+        ),
+        normal_map_texture: normal_mapped.then(|| {
+            Texture::new_with_color_space(1, 1, vec![[128, 128, 255, 255]], ColorSpace::Linear)
+                .unwrap()
+        }),
+        alpha_mode,
+        alpha_cutoff: 0.5,
+    }
+}
+
 #[test]
 fn gltf_material_base_color_reaches_rendering() {
     let red = render_material(Some(base_color_material(
@@ -152,6 +175,30 @@ fn gltf_opaque_ignores_alpha_and_blend_uses_it() {
         GltfAlphaMode::Blend,
     )));
     assert_ne!(blend_zero.color, opaque_one.color);
+}
+
+#[test]
+fn gltf_opaque_ignores_texture_alpha_textured() {
+    let transparent_texel =
+        render_material(Some(textured_material(0, false, GltfAlphaMode::Opaque)));
+    let opaque_texel = render_material(Some(textured_material(255, false, GltfAlphaMode::Opaque)));
+    assert_eq!(transparent_texel.color, opaque_texel.color);
+}
+
+#[test]
+fn gltf_opaque_ignores_texture_alpha_normal_mapped() {
+    let transparent_texel =
+        render_material(Some(textured_material(0, true, GltfAlphaMode::Opaque)));
+    let opaque_texel = render_material(Some(textured_material(255, true, GltfAlphaMode::Opaque)));
+    assert_eq!(transparent_texel.color, opaque_texel.color);
+}
+
+#[test]
+fn gltf_blend_preserves_texture_alpha() {
+    let transparent_texel =
+        render_material(Some(textured_material(0, false, GltfAlphaMode::Blend)));
+    let opaque_texel = render_material(Some(textured_material(255, false, GltfAlphaMode::Blend)));
+    assert_ne!(transparent_texel.color, opaque_texel.color);
 }
 
 #[test]
