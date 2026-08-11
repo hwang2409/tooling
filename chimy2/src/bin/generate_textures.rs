@@ -56,11 +56,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
         ColorSpace::Linear,
     )?;
+    let sky_colors = [
+        [210, 70, 55],
+        [55, 105, 220],
+        [55, 180, 100],
+        [205, 155, 45],
+        [155, 70, 205],
+        [45, 185, 195],
+    ];
+    let sky_faces = sky_colors
+        .into_iter()
+        .enumerate()
+        .map(|(face, horizon)| {
+            let texture = Texture::new(
+                32,
+                32,
+                (0..32 * 32)
+                    .map(|index| {
+                        let x = index % 32;
+                        let y = index / 32;
+                        let vertical = y as f32 / 31.0;
+                        let sun_distance =
+                            ((x as f32 / 31.0 - 0.72).powi(2) + (vertical - 0.24).powi(2)).sqrt();
+                        let sun = (1.0 - sun_distance / 0.16).clamp(0.0, 1.0);
+                        let shade = 1.0 - vertical * 0.38;
+                        [
+                            (horizon[0] as f32 * shade + 255.0 * sun).min(255.0) as u8,
+                            (horizon[1] as f32 * shade + 235.0 * sun).min(255.0) as u8,
+                            (horizon[2] as f32 * shade + 150.0 * sun).min(255.0) as u8,
+                            255,
+                        ]
+                    })
+                    .collect(),
+            )?;
+            let name = ["px", "nx", "py", "ny", "pz", "nz"][face];
+            Ok((format!("skybox_{name}"), texture))
+        })
+        .collect::<Result<Vec<_>, chimy2::image::ImageError>>()?;
     for (name, texture) in [
         ("checker", checker),
         ("gradient", gradient),
         ("normal_bump", normal_bump),
-    ] {
+    ]
+    .into_iter()
+    .map(|(name, texture)| (name.to_string(), texture))
+    .chain(sky_faces)
+    {
         fs::write(assets.join(format!("{name}.qoi")), encode_qoi(&texture)?)?;
         let mut ppm = format!("P6\n{} {}\n255\n", texture.width(), texture.height()).into_bytes();
         for pixel in texture.pixels() {

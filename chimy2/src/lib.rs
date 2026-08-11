@@ -13,3 +13,4 @@ pub mod present;
 pub mod raster;
 pub mod shaders;
 pub mod shadow;
+pub mod skybox;
