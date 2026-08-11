@@ -295,13 +295,12 @@ impl Mesh {
         if triangle_range.start > triangle_range.end || triangle_range.end > self.triangles.len() {
             return None;
         }
-        let mut mesh = Self {
+        let mesh = Self {
             vertices: self.vertices.clone(),
             triangles: self.triangles[triangle_range.clone()].to_vec(),
             position_indices: self.position_indices.clone(),
             material_groups: Vec::new(),
         };
-        mesh.rebuild_derived_attributes();
         Some(mesh)
     }
 
@@ -728,6 +727,25 @@ mod tests {
         assert_eq!(mesh.material_groups().len(), 1);
         mesh.set_indices(Vec::new());
         assert!(mesh.material_groups().is_empty());
+    }
+
+    #[test]
+    fn submesh_preserves_parent_global_normals_and_tangents() {
+        let mesh = Mesh::parse(
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\n\
+             vt 0 0\nvt 1 0\nvt 0 1\nvt 1 1\n\
+             f 1/1 2/2 3/3\nf 1/1 3/3 4/4\n",
+        )
+        .unwrap();
+        let parent_normal = mesh.vertex(0).unwrap().normal().unwrap();
+        assert!((parent_normal.x - 0.70710677).abs() < 1e-5);
+        assert!((parent_normal.z - 0.70710677).abs() < 1e-5);
+        let group = mesh.submesh(0..1).unwrap();
+        assert_eq!(group.vertex(0).unwrap().normal(), Some(parent_normal));
+        assert_eq!(
+            group.vertex(0).unwrap().tangent(),
+            mesh.vertex(0).unwrap().tangent()
+        );
     }
 
     #[test]

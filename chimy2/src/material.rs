@@ -21,8 +21,8 @@ pub struct Material {
     pub specular: Vec3,
     pub shininess: f32,
     pub alpha: f32,
-    pub map_kd: Option<PathBuf>,
-    pub map_bump: Option<PathBuf>,
+    map_kd: Option<PathBuf>,
+    map_bump: Option<PathBuf>,
     map_kd_line: usize,
     map_bump_line: usize,
     albedo_texture: Option<Texture>,
@@ -63,24 +63,39 @@ impl Material {
         self.normal_map_texture.as_ref()
     }
 
-    /// Resolves and loads this material's maps relative to its MTL file.
-    pub fn load_maps(&mut self, mtl_path: &Path, asset_root: &Path) -> Result<(), MtlError> {
-        self.albedo_texture = self
-            .map_kd
+    pub fn map_kd(&self) -> Option<&Path> {
+        self.map_kd.as_deref()
+    }
+
+    pub fn map_bump(&self) -> Option<&Path> {
+        self.map_bump.as_deref()
+    }
+
+    /// Atomically replaces map_Kd and its loaded texture cache.
+    pub fn set_map_kd(
+        &mut self,
+        path: Option<PathBuf>,
+        mtl_path: &Path,
+        asset_root: &Path,
+    ) -> Result<(), MtlError> {
+        let texture = path
             .as_deref()
-            .map(|path| {
-                load_map(
-                    mtl_path,
-                    asset_root,
-                    path,
-                    ColorSpace::Srgb,
-                    "map_Kd",
-                    self.map_kd_line,
-                )
-            })
+            .map(|path| load_map(mtl_path, asset_root, path, ColorSpace::Srgb, "map_Kd", 0))
             .transpose()?;
-        self.normal_map_texture = self
-            .map_bump
+        self.map_kd = path;
+        self.map_kd_line = 0;
+        self.albedo_texture = texture;
+        Ok(())
+    }
+
+    /// Atomically replaces map_bump and its loaded texture cache.
+    pub fn set_map_bump(
+        &mut self,
+        path: Option<PathBuf>,
+        mtl_path: &Path,
+        asset_root: &Path,
+    ) -> Result<(), MtlError> {
+        let texture = path
             .as_deref()
             .map(|path| {
                 load_map(
@@ -89,10 +104,50 @@ impl Material {
                     path,
                     ColorSpace::Linear,
                     "map_bump",
-                    self.map_bump_line,
+                    0,
                 )
             })
             .transpose()?;
+        self.map_bump = path;
+        self.map_bump_line = 0;
+        self.normal_map_texture = texture;
+        Ok(())
+    }
+
+    /// Resolves and loads this material's maps relative to its MTL file.
+    pub fn load_maps(&mut self, mtl_path: &Path, asset_root: &Path) -> Result<(), MtlError> {
+        let map_kd = self.map_kd.clone();
+        let map_bump = self.map_bump.clone();
+        let map_kd_line = self.map_kd_line;
+        let map_bump_line = self.map_bump_line;
+        let albedo_texture = map_kd
+            .as_deref()
+            .map(|path| {
+                load_map(
+                    mtl_path,
+                    asset_root,
+                    path,
+                    ColorSpace::Srgb,
+                    "map_Kd",
+                    map_kd_line,
+                )
+            })
+            .transpose()?;
+        let normal_map_texture = map_bump
+            .as_deref()
+            .map(|path| {
+                load_map(
+                    mtl_path,
+                    asset_root,
+                    path,
+                    ColorSpace::Linear,
+                    "map_bump",
+                    map_bump_line,
+                )
+            })
+            .transpose()?;
+        self.albedo_texture = albedo_texture;
+        self.normal_map_texture = normal_map_texture;
         Ok(())
     }
 }
@@ -120,6 +175,19 @@ impl MaterialLibrary {
                 "newmtl" => {
                     if rest.is_empty() {
                         return Err(MtlError::new(line_number, "newmtl needs a name"));
+                    }
+                    if current
+                        .as_ref()
+                        .is_some_and(|material| material.name == rest)
+                        || library
+                            .materials
+                            .iter()
+                            .any(|material| material.name == rest)
+                    {
+                        return Err(MtlError::new(
+                            line_number,
+                            format!("duplicate material name {rest}"),
+                        ));
                     }
                     if let Some(material) = current.take() {
                         library.materials.push(material);
@@ -269,9 +337,11 @@ fn set_map(
     if albedo {
         material.map_kd = Some(PathBuf::from(path));
         material.map_kd_line = line;
+        material.albedo_texture = None;
     } else {
         material.map_bump = Some(PathBuf::from(path));
         material.map_bump_line = line;
+        material.normal_map_texture = None;
     }
     Ok(())
 }
@@ -279,21 +349,42 @@ fn set_map(
 fn parse_map_path(rest: &str, line: usize, record: &str) -> Result<String, MtlError> {
     let tokens: Vec<_> = rest.split_whitespace().collect();
     let mut index = 0;
-    while index < tokens.len() && tokens[index].starts_with('-') {
+    while index < tokens.len() && is_map_option(tokens[index]) {
         let option = tokens[index];
-        let values = match option {
-            "-blendu" | "-blendv" | "-cc" | "-clamp" | "-texres" => 1,
-            "-mm" => 2,
-            "-o" | "-s" | "-t" => {
-                let mut count = 0;
-                while count < 3
-                    && index + 1 + count < tokens.len()
-                    && !tokens[index + 1 + count].starts_with('-')
-                    && tokens[index + 1 + count].parse::<f32>().is_ok()
-                {
-                    count += 1;
+        index += 1;
+        match option {
+            "-blendu" | "-blendv" | "-cc" | "-clamp" => {
+                let value = tokens.get(index).ok_or_else(|| {
+                    MtlError::new(line, format!("truncated {record} option {option}"))
+                })?;
+                if !matches!(*value, "on" | "off") {
+                    return Err(MtlError::new(
+                        line,
+                        format!("{record} option {option} needs on or off"),
+                    ));
                 }
-                count
+                index += 1;
+            }
+            "-texres" => {
+                let value = tokens.get(index).ok_or_else(|| {
+                    MtlError::new(line, format!("truncated {record} option {option}"))
+                })?;
+                let resolution = value.parse::<usize>().map_err(|_| {
+                    MtlError::new(line, format!("{record} option {option} needs an integer"))
+                })?;
+                if resolution == 0 {
+                    return Err(MtlError::new(
+                        line,
+                        format!("{record} option {option} needs a positive integer"),
+                    ));
+                }
+                index += 1;
+            }
+            "-mm" => {
+                take_numeric_values(&tokens, &mut index, 2, 2, line, record, option)?;
+            }
+            "-o" | "-s" | "-t" => {
+                take_numeric_values(&tokens, &mut index, 1, 3, line, record, option)?;
             }
             _ => {
                 return Err(MtlError::new(
@@ -301,16 +392,37 @@ fn parse_map_path(rest: &str, line: usize, record: &str) -> Result<String, MtlEr
                     format!("unknown {record} option {option}"),
                 ));
             }
-        };
-        index += 1 + values;
-        if index > tokens.len() {
-            return Err(MtlError::new(
-                line,
-                format!("truncated {record} option {option}"),
-            ));
         }
     }
     Ok(tokens[index..].join(" "))
+}
+
+fn is_map_option(token: &str) -> bool {
+    token.starts_with('-') && token.parse::<f32>().is_err()
+}
+
+fn take_numeric_values(
+    tokens: &[&str],
+    index: &mut usize,
+    minimum: usize,
+    maximum: usize,
+    line: usize,
+    record: &str,
+    option: &str,
+) -> Result<(), MtlError> {
+    let start = *index;
+    while *index < tokens.len() && *index - start < maximum && tokens[*index].parse::<f32>().is_ok()
+    {
+        *index += 1;
+    }
+    let count = *index - start;
+    if count < minimum {
+        return Err(MtlError::new(
+            line,
+            format!("{record} option {option} needs {minimum} to {maximum} numeric values"),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_number(value: &str, line: usize, record: &str) -> Result<f32, MtlError> {
@@ -426,8 +538,8 @@ mod tests {
         assert_eq!(material.specular, Vec3::new(0.7, 0.8, 0.9));
         assert_eq!(material.shininess, 32.0);
         assert_eq!(material.alpha, 0.75);
-        assert_eq!(material.map_kd, Some(PathBuf::from("tex.qoi")));
-        assert_eq!(material.map_bump, Some(PathBuf::from("normal.qoi")));
+        assert_eq!(material.map_kd(), Some(Path::new("tex.qoi")));
+        assert_eq!(material.map_bump(), Some(Path::new("normal.qoi")));
     }
 
     #[test]
@@ -437,7 +549,7 @@ mod tests {
                 .unwrap();
         let material = library.get("glass").unwrap();
         assert_eq!(material.alpha, 0.75);
-        assert_eq!(material.map_kd, Some(PathBuf::from("textures/albedo.qoi")));
+        assert_eq!(material.map_kd(), Some(Path::new("textures/albedo.qoi")));
     }
 
     #[test]
@@ -446,6 +558,26 @@ mod tests {
         assert_eq!(error.line, 2);
         assert!(error.to_string().contains("line 2"));
         assert!(MaterialLibrary::parse("garbage\n").is_err());
+    }
+
+    #[test]
+    fn duplicate_material_names_are_rejected_at_the_second_definition() {
+        let error = MaterialLibrary::parse("newmtl same\nKd 1 0 0\nnewmtl same\n").unwrap_err();
+        assert_eq!(error.line, 3);
+        assert!(error.to_string().contains("duplicate material name same"));
+    }
+
+    #[test]
+    fn map_options_validate_arity_and_accept_negative_offsets() {
+        let error = MaterialLibrary::parse("newmtl x\nmap_Kd -s checker.qoi\n").unwrap_err();
+        assert_eq!(error.line, 2);
+        let library = MaterialLibrary::parse(
+            "newmtl x\nmap_Kd -o -1 -0.5 0 checker.qoi\nmap_bump -mm 0.1 2 normal.qoi\n",
+        )
+        .unwrap();
+        let material = library.get("x").unwrap();
+        assert_eq!(material.map_kd(), Some(Path::new("checker.qoi")));
+        assert_eq!(material.map_bump(), Some(Path::new("normal.qoi")));
     }
 
     #[test]
@@ -490,5 +622,33 @@ mod tests {
         assert_eq!(uniforms.diffuse_color().x, 0.0);
         assert_eq!(uniforms.diffuse_color().z, 0.0);
         assert!(uniforms.diffuse_color().y > 0.0);
+    }
+
+    #[test]
+    fn map_mutators_update_paths_and_caches_as_one_state() {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let mtl = assets.join("multi_material.mtl");
+        let mut library = MaterialLibrary::load_with_root(&mtl, &assets).unwrap();
+        let material = library.get_mut("checker").unwrap();
+        assert!(material.albedo_texture().is_some());
+        material.set_map_kd(None, &mtl, &assets).unwrap();
+        assert_eq!(material.map_kd(), None);
+        assert_eq!(material.albedo_texture(), None);
+        material
+            .set_map_kd(Some(PathBuf::from("checker.qoi")), &mtl, &assets)
+            .unwrap();
+        assert_eq!(material.map_kd(), Some(Path::new("checker.qoi")));
+        assert_eq!(
+            material.albedo_texture().unwrap().color_space(),
+            ColorSpace::Srgb
+        );
+        let old_texture = material.albedo_texture().cloned();
+        assert!(
+            material
+                .set_map_kd(Some(PathBuf::from("missing.qoi")), &mtl, &assets)
+                .is_err()
+        );
+        assert_eq!(material.map_kd(), Some(Path::new("checker.qoi")));
+        assert_eq!(material.albedo_texture(), old_texture.as_ref());
     }
 }
