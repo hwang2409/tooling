@@ -14,11 +14,14 @@ screen-space pixel width.
 - `toon`: diffuse bands use thresholds `0.25`, `0.50`, and `0.75`. The four
   band values are `0.15`, `0.40`, `0.70`, and `1.0`. Edge pixels are darkened.
 - `psx`: post-divide vertex positions snap to a coarse NDC grid. The fragment
-  stage applies a 4x4 Bayer matrix at three bits per channel. Affine texture
+  stage applies a 4x4 Bayer matrix with centered thresholds `(n + 0.5) / 16`
+  at three bits per channel. Affine texture
   mapping is not included. The current pipeline has one perspective-correct
   interpolation path, and a second kernel would violate the seam contract.
-- `dither`: applies the same 4x4 Bayer matrix to a flat linear RGB color. The
-  default is three bits per channel.
+- `dither`: carries clip-space x/y and w as varyings, then divides after
+  interpolation to recover true screen coordinates. It applies the same 4x4
+  Bayer matrix to a flat linear RGB color. The default is three bits per
+  channel.
 - `fog`: computes Euclidean view-space distance in the vertex stage. It uses
   linear fog from `fog_start` to `fog_end`. Fog and base colors stay linear;
   `argb8888_linear` performs the only sRGB encode.
