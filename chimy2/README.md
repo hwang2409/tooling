@@ -64,13 +64,15 @@ see it and can't get it wrong.
 - **clip**: near-plane clipping (fan triangulation of the visible polygon),
   backface culling.
 - **mesh**: OBJ parser for positions, texture coords, normals, and
-  area/angle-weighted tangent frames; smooth area-weighted normals when the
+  area-weighted tangent frames; smooth area-weighted normals when the
   file has none. Meshes without UVs have no tangents, so the normal-map shader
-  falls back to geometric normals.
+  falls back to geometric normals. Geometry changes go through mesh mutators,
+  which rebuild derived normals and tangents.
 - **image**: hand-written PPM (P6) and QOI decoders + a QOI encoder for the
   dev-side asset script; selectable sRGB or linear texture decode, full
   box-filtered mip chains, nearest, bilinear, and trilinear sampling with
-  repeat and clamp-to-edge wrap modes.
+  repeat and clamp-to-edge wrap modes. QOI loads honor the file colorspace
+  header; explicit `*_with_color_space` methods override it.
 - **camera**: quaternion camera, orbit controller, WASD fly controller.
 - **shaders**: flat, mesh, textured, blinn-phong, textured-blinn-phong, and
   tangent-space normal mapping, with linear-light lighting and sRGB

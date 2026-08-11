@@ -1,4 +1,4 @@
-use chimy2::image::{Texture, encode_qoi};
+use chimy2::image::{ColorSpace, Texture, encode_qoi};
 use std::fs;
 use std::path::PathBuf;
 
@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect(),
     )?;
-    let normal_bump = Texture::new(
+    let normal_bump = Texture::new_with_color_space(
         64,
         64,
         (0..64 * 64)
@@ -54,6 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ]
             })
             .collect(),
+        ColorSpace::Linear,
     )?;
     for (name, texture) in [
         ("checker", checker),

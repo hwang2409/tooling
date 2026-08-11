@@ -61,7 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &albedo,
                 &normal_map,
                 TextureFilter::Bilinear,
-            );
+            )
+            .expect("normal map asset is linear");
             framebuffer.clear(argb8888(255, 10, 14, 22));
             let mut pipeline =
                 Pipeline::new(NormalMappedBlinnPhongShader, NormalMappedBlinnPhongShader);

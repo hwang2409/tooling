@@ -117,10 +117,12 @@ impl Texture {
         decode_ppm_with_color_space(bytes, color_space)
     }
 
+    /// Decodes QOI using its colorspace header.
     pub fn from_qoi(bytes: &[u8]) -> Result<Self, ImageError> {
-        decode_qoi_with_color_space(bytes, ColorSpace::Srgb)
+        decode_qoi(bytes)
     }
 
+    /// Decodes QOI with an explicit colorspace override.
     pub fn from_qoi_with_color_space(
         bytes: &[u8],
         color_space: ColorSpace,
@@ -129,13 +131,24 @@ impl Texture {
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ImageError> {
-        Self::load_with_color_space(path, ColorSpace::Srgb)
+        let path = path.as_ref();
+        let bytes = fs::read(path)
+            .map_err(|error| ImageError::new(0, format!("{}: {error}", path.display())))?;
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("ppm") => decode_ppm(&bytes),
+            Some("qoi") => decode_qoi(&bytes),
+            _ => Err(ImageError::new(
+                0,
+                format!("unsupported image extension: {}", path.display()),
+            )),
+        }
     }
 
     pub fn load_with_color_space(
         path: impl AsRef<Path>,
         color_space: ColorSpace,
     ) -> Result<Self, ImageError> {
+        // This explicit form overrides a QOI header when a caller knows the asset's true format.
         let path = path.as_ref();
         let bytes = fs::read(path)
             .map_err(|error| ImageError::new(0, format!("{}: {error}", path.display())))?;
@@ -524,13 +537,22 @@ fn parse_ppm_dimension(token: Vec<u8>, offset: usize) -> Result<usize, ImageErro
         .map_err(|_| ImageError::new(offset.saturating_sub(token.len()), "invalid PPM number"))
 }
 
+/// Decodes a QOI image using its colorspace header.
 pub fn decode_qoi(bytes: &[u8]) -> Result<Texture, ImageError> {
-    decode_qoi_with_color_space(bytes, ColorSpace::Srgb)
+    decode_qoi_internal(bytes, None)
 }
 
+/// Decodes a QOI image with an explicit colorspace override.
 pub fn decode_qoi_with_color_space(
     bytes: &[u8],
     color_space: ColorSpace,
+) -> Result<Texture, ImageError> {
+    decode_qoi_internal(bytes, Some(color_space))
+}
+
+fn decode_qoi_internal(
+    bytes: &[u8],
+    color_space_override: Option<ColorSpace>,
 ) -> Result<Texture, ImageError> {
     if bytes.len() < QOI_HEADER_SIZE + QOI_END_MARKER.len() {
         return Err(ImageError::new(0, "truncated QOI header or end marker"));
@@ -550,6 +572,11 @@ pub fn decode_qoi_with_color_space(
     if bytes[13] > 1 {
         return Err(ImageError::new(13, "QOI colorspace must be 0 or 1"));
     }
+    let color_space = color_space_override.unwrap_or(match bytes[13] {
+        0 => ColorSpace::Srgb,
+        1 => ColorSpace::Linear,
+        _ => unreachable!("QOI colorspace was validated above"),
+    });
     let pixel_count = width
         .checked_mul(height)
         .ok_or_else(|| ImageError::new(4, "QOI dimensions overflow the pixel count"))?;
@@ -668,7 +695,10 @@ pub fn encode_qoi(texture: &Texture) -> Result<Vec<u8>, ImageError> {
     output.extend_from_slice(&width.to_be_bytes());
     output.extend_from_slice(&height.to_be_bytes());
     output.push(channels);
-    output.push(0);
+    output.push(match texture.color_space {
+        ColorSpace::Srgb => 0,
+        ColorSpace::Linear => 1,
+    });
 
     let mut index = [[0u8; 4]; 64];
     let mut previous = [0, 0, 0, 255];
@@ -797,6 +827,33 @@ mod tests {
         .unwrap();
         let encoded = encode_qoi(&texture).unwrap();
         assert_eq!(decode_qoi(&encoded).unwrap().pixels(), texture.pixels());
+    }
+
+    #[test]
+    fn qoi_colorspace_header_round_trips_and_explicit_override_wins() {
+        let texture =
+            Texture::new_with_color_space(1, 1, vec![[128, 64, 255, 255]], ColorSpace::Linear)
+                .unwrap();
+        let encoded = encode_qoi(&texture).unwrap();
+        assert_eq!(encoded[13], 1);
+        assert_eq!(
+            decode_qoi(&encoded).unwrap().color_space(),
+            ColorSpace::Linear
+        );
+        let overridden = decode_qoi_with_color_space(&encoded, ColorSpace::Srgb).unwrap();
+        assert_eq!(overridden.color_space(), ColorSpace::Srgb);
+        assert!(
+            (overridden.mip_level(0).unwrap().pixels[0][0] - srgb_to_linear_u8(128)).abs() < 1e-6
+        );
+
+        let path =
+            std::env::temp_dir().join(format!("chimy2_qoi_colorspace_{}.qoi", std::process::id()));
+        fs::write(&path, &encoded).unwrap();
+        assert_eq!(
+            Texture::load(&path).unwrap().color_space(),
+            ColorSpace::Linear
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

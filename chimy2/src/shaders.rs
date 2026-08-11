@@ -5,7 +5,7 @@
 //! and lights. Final color clamps to `[0, 1]` before 8-bit conversion.
 
 use crate::fb::argb8888_linear;
-use crate::image::{Texture, TextureDerivatives, srgb_to_linear};
+use crate::image::{ColorSpace, Texture, TextureDerivatives, srgb_to_linear};
 use crate::math::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use crate::mesh::MeshVertex;
 use crate::pipeline::{
@@ -127,7 +127,12 @@ impl VertexStage<MeshVertex, MeshUniforms> for MeshShader {
     fn run(&self, vertex: &MeshVertex, uniforms: &MeshUniforms) -> VertexOutput<()> {
         VertexOutput::new(
             uniforms.transform()
-                * Vec4::new(vertex.position.x, vertex.position.y, vertex.position.z, 1.0),
+                * Vec4::new(
+                    vertex.position().x,
+                    vertex.position().y,
+                    vertex.position().z,
+                    1.0,
+                ),
             (),
         )
     }
@@ -212,11 +217,16 @@ impl<'a> VertexStage<MeshVertex, TexturedUniforms<'a>> for TexturedShader {
         vertex: &MeshVertex,
         uniforms: &TexturedUniforms<'a>,
     ) -> VertexOutput<Self::Varyings> {
-        let position = Vec4::new(vertex.position.x, vertex.position.y, vertex.position.z, 1.0);
+        let position = Vec4::new(
+            vertex.position().x,
+            vertex.position().y,
+            vertex.position().z,
+            1.0,
+        );
         VertexOutput::new(
             uniforms.transform * position,
             TexturedVaryings {
-                texcoord: vertex.texcoord.unwrap_or(crate::math::Vec2::ZERO),
+                texcoord: vertex.texcoord().unwrap_or(crate::math::Vec2::ZERO),
             },
         )
     }
@@ -468,14 +478,19 @@ fn prepare_blinn_phong_vertex(
     vertex: &MeshVertex,
     uniforms: &BlinnPhongUniforms,
 ) -> PreparedBlinnPhongVertex {
-    let local_position = Vec4::new(vertex.position.x, vertex.position.y, vertex.position.z, 1.0);
+    let local_position = Vec4::new(
+        vertex.position().x,
+        vertex.position().y,
+        vertex.position().z,
+        1.0,
+    );
     let world_position = uniforms.model() * local_position;
     let world_position = Vec3::new(
         world_position.x / world_position.w,
         world_position.y / world_position.w,
         world_position.z / world_position.w,
     );
-    let normal = vertex.normal.unwrap_or(Vec3::new(0.0, 0.0, 1.0));
+    let normal = vertex.normal().unwrap_or(Vec3::new(0.0, 0.0, 1.0));
     let normal = (uniforms.normal_matrix() * normal).normalize();
     let light_space_position = uniforms.light_view_projection()
         * Vec4::new(world_position.x, world_position.y, world_position.z, 1.0);
@@ -696,7 +711,7 @@ impl<'a> VertexStage<MeshVertex, TexturedBlinnPhongUniforms<'a>> for TexturedBli
             TexturedBlinnPhongVaryings {
                 world_position: prepared.world_position,
                 normal: prepared.normal,
-                texcoord: vertex.texcoord.unwrap_or(crate::math::Vec2::ZERO),
+                texcoord: vertex.texcoord().unwrap_or(crate::math::Vec2::ZERO),
                 light_space_position: prepared.light_space_position,
             },
         )
@@ -760,18 +775,21 @@ pub struct NormalMappedBlinnPhongUniforms<'a> {
 }
 
 impl<'a> NormalMappedBlinnPhongUniforms<'a> {
-    pub const fn new(
+    pub fn new(
         lighting: BlinnPhongUniforms,
         texture: &'a Texture,
         normal_map: &'a Texture,
         filter: TextureFilter,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, &'static str> {
+        if normal_map.color_space() != ColorSpace::Linear {
+            return Err("normal maps must use ColorSpace::Linear");
+        }
+        Ok(Self {
             lighting,
             texture,
             normal_map,
             filter,
-        }
+        })
     }
 }
 
@@ -821,11 +839,16 @@ impl<'a> VertexStage<MeshVertex, NormalMappedBlinnPhongUniforms<'a>>
     ) -> VertexOutput<Self::Varyings> {
         let prepared = prepare_blinn_phong_vertex(vertex, &uniforms.lighting);
         let tangent = vertex
-            .tangent
+            .tangent()
             .map_or(Vec4::new(0.0, 0.0, 0.0, 0.0), |tangent| {
                 let transformed =
                     uniforms.lighting.model() * Vec4::new(tangent.x, tangent.y, tangent.z, 0.0);
-                Vec4::new(transformed.x, transformed.y, transformed.z, tangent.w)
+                Vec4::new(
+                    transformed.x,
+                    transformed.y,
+                    transformed.z,
+                    tangent.w * model_handedness(uniforms.lighting.model()),
+                )
             });
         VertexOutput::new(
             prepared.clip_position,
@@ -833,11 +856,18 @@ impl<'a> VertexStage<MeshVertex, NormalMappedBlinnPhongUniforms<'a>>
                 world_position: prepared.world_position,
                 normal: prepared.normal,
                 tangent,
-                texcoord: vertex.texcoord.unwrap_or(Vec2::ZERO),
+                texcoord: vertex.texcoord().unwrap_or(Vec2::ZERO),
                 light_space_position: prepared.light_space_position,
             },
         )
     }
+}
+
+fn model_handedness(model: Mat4) -> f32 {
+    let x = Vec3::new(model.get(0, 0), model.get(1, 0), model.get(2, 0));
+    let y = Vec3::new(model.get(0, 1), model.get(1, 1), model.get(2, 1));
+    let z = Vec3::new(model.get(0, 2), model.get(1, 2), model.get(2, 2));
+    if x.dot(y.cross(z)) < 0.0 { -1.0 } else { 1.0 }
 }
 
 impl<'a> SampledFragmentStage<NormalMappedBlinnPhongVaryings, NormalMappedBlinnPhongUniforms<'a>>
@@ -985,22 +1015,86 @@ mod tests {
 
     #[test]
     fn interpolated_tbn_is_orthonormal_after_renormalize() {
-        let varyings = NormalMappedBlinnPhongVaryings {
+        let a = NormalMappedBlinnPhongVaryings {
             world_position: Vec3::ZERO,
             normal: Vec3::new(0.0, 0.0, 1.0),
-            tangent: Vec4::new(1.0, 0.25, 0.0, 1.0),
+            tangent: Vec4::new(1.0, 0.0, 0.0, 1.0),
             texcoord: Vec2::ZERO,
             light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
         };
-        let tangent_space_x = tangent_space_normal(&varyings, [1.0, 0.5, 0.5, 1.0]);
-        let tangent_space_y = tangent_space_normal(&varyings, [0.5, 1.0, 0.5, 1.0]);
-        let tangent_space_z = tangent_space_normal(&varyings, [0.5, 0.5, 1.0, 1.0]);
-        assert!((tangent_space_x.length() - 1.0).abs() < 1e-6);
-        assert!((tangent_space_y.length() - 1.0).abs() < 1e-6);
-        assert!((tangent_space_z.length() - 1.0).abs() < 1e-6);
-        assert!(tangent_space_x.dot(tangent_space_y).abs() < 1e-6);
-        assert!(tangent_space_x.dot(tangent_space_z).abs() < 1e-6);
-        assert!(tangent_space_y.dot(tangent_space_z).abs() < 1e-6);
+        let b = NormalMappedBlinnPhongVaryings {
+            tangent: Vec4::new(0.0, 1.0, 0.0, 1.0),
+            ..a
+        };
+        let c = NormalMappedBlinnPhongVaryings {
+            tangent: Vec4::new(1.0, 0.0, 0.0, 1.0),
+            ..a
+        };
+        let varyings =
+            NormalMappedBlinnPhongVaryings::lerp3(&a, &b, &c, Vec3::new(0.25, 0.5, 0.25));
+        let transformed = tangent_space_normal(&varyings, [1.0, 1.0, 1.0, 1.0]);
+        let expected_y = (2.0_f32 / 3.0).sqrt();
+        let expected_z = (1.0_f32 / 3.0).sqrt();
+        assert!((transformed.x).abs() < 1e-6);
+        assert!((transformed.y - expected_y).abs() < 1e-6);
+        assert!((transformed.z - expected_z).abs() < 1e-6);
+        assert!((transformed.length() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn negative_determinant_model_flips_tangent_handedness() {
+        let mesh = crate::mesh::Mesh::parse(
+            "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\n\
+             vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\n\
+             f 1/1 2/2 3/3 4/4\n",
+        )
+        .unwrap();
+        let albedo = Texture::new(1, 1, vec![[255, 255, 255, 255]]).unwrap();
+        let normal_map =
+            Texture::new_with_color_space(1, 1, vec![[128, 128, 255, 255]], ColorSpace::Linear)
+                .unwrap();
+        let lighting = BlinnPhongUniforms::new(
+            Mat4::scale(Vec3::new(1.0, 1.0, -1.0)),
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::ZERO,
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(1.0, 1.0, 1.0),
+            8.0,
+            Vec3::new(0.0, 0.0, 1.0),
+            DirectionalLight::new(Vec3::new(0.0, 0.0, 1.0), Vec3::new(1.0, 1.0, 1.0)),
+            PointLight::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0.0, 0.0),
+        );
+        let uniforms = NormalMappedBlinnPhongUniforms::new(
+            lighting,
+            &albedo,
+            &normal_map,
+            TextureFilter::Nearest,
+        )
+        .unwrap();
+        let output = NormalMappedBlinnPhongShader.run(mesh.vertex(0).unwrap(), &uniforms);
+        assert_eq!(output.varyings.tangent.w, -1.0);
+        let reconstructed_bitangent = output.varyings.normal.cross(Vec3::new(
+            output.varyings.tangent.x,
+            output.varyings.tangent.y,
+            output.varyings.tangent.z,
+        )) * output.varyings.tangent.w;
+        assert!((reconstructed_bitangent.y - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normal_map_uniform_rejects_srgb_normal_texture() {
+        let albedo = Texture::new(1, 1, vec![[255, 255, 255, 255]]).unwrap();
+        let normal_map = Texture::new(1, 1, vec![[128, 128, 255, 255]]).unwrap();
+        assert!(
+            NormalMappedBlinnPhongUniforms::new(
+                uniforms(),
+                &albedo,
+                &normal_map,
+                TextureFilter::Nearest,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1092,12 +1186,7 @@ mod tests {
 
     fn pack_vertex(position: Vec3) -> ShaderPackVertex {
         ShaderPackVertex::new(
-            MeshVertex {
-                position,
-                texcoord: None,
-                normal: Some(Vec3::new(0.0, 0.0, 1.0)),
-                tangent: None,
-            },
+            MeshVertex::new(position, None, Some(Vec3::new(0.0, 0.0, 1.0))),
             Vec3::new(1.0, 0.0, 0.0),
         )
     }
@@ -1207,16 +1296,15 @@ mod tests {
             let ndc = ndc[index];
             let clip_w = clip_ws[index];
             ShaderPackVertex::new(
-                MeshVertex {
-                    position: Vec3::new(
+                MeshVertex::new(
+                    Vec3::new(
                         ndc.x * clip_w / projection.get(0, 0),
                         ndc.y * clip_w / projection.get(1, 1),
                         -clip_w,
                     ),
-                    texcoord: None,
-                    normal: Some(Vec3::new(0.0, 0.0, 1.0)),
-                    tangent: None,
-                },
+                    None,
+                    Some(Vec3::new(0.0, 0.0, 1.0)),
+                ),
                 match index {
                     0 => Vec3::new(1.0, 0.0, 0.0),
                     1 => Vec3::new(0.0, 1.0, 0.0),

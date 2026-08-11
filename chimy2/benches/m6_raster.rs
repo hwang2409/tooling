@@ -54,13 +54,13 @@ fn subdivided_icosahedron(levels: usize) -> Mesh {
     let base = Mesh::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icosahedron.obj"))
         .expect("load base icosahedron");
     let mut triangles: Vec<[Vec3; 3]> = base
-        .triangles
+        .indices()
         .iter()
         .map(|&[a, b, c]| {
             [
-                base.vertices[a].position,
-                base.vertices[b].position,
-                base.vertices[c].position,
+                base.vertex(a).unwrap().position(),
+                base.vertex(b).unwrap().position(),
+                base.vertex(c).unwrap().position(),
             ]
         })
         .collect();
@@ -76,33 +76,29 @@ fn subdivided_icosahedron(levels: usize) -> Mesh {
         triangles = next;
     }
 
-    let mut mesh = Mesh::default();
-    mesh.vertices.reserve(triangles.len() * 3);
-    mesh.triangles.reserve(triangles.len());
+    let mut vertices = Vec::with_capacity(triangles.len() * 3);
+    let mut indices = Vec::with_capacity(triangles.len());
     for triangle in triangles {
-        let first = mesh.vertices.len();
+        let first = vertices.len();
         for position in triangle {
-            mesh.vertices.push(MeshVertex {
-                position,
-                texcoord: None,
-                normal: Some(position.normalize()),
-                tangent: None,
-            });
+            vertices.push(MeshVertex::new(position, None, Some(position.normalize())));
         }
-        mesh.triangles.push([first, first + 1, first + 2]);
+        indices.push([first, first + 1, first + 2]);
     }
-    mesh
+    Mesh::new(vertices, indices)
 }
 
 fn exact_triangle_scene(triangle_count: usize) -> Mesh {
     let mut mesh = subdivided_icosahedron(6);
-    let source = mesh.triangles.clone();
-    mesh.triangles.extend(
+    let source = mesh.indices().to_vec();
+    let mut indices = source.clone();
+    indices.extend(
         source
             .into_iter()
             .cycle()
-            .take(triangle_count - mesh.triangles.len()),
+            .take(triangle_count - indices.len()),
     );
+    mesh.set_indices(indices);
     mesh
 }
 

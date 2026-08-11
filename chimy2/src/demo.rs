@@ -161,12 +161,11 @@ pub fn uv_sphere(radius: f32, rings: usize, segments: usize) -> Mesh {
             let theta = u * TAU;
             let (sin_theta, cos_theta) = theta.sin_cos();
             let normal = Vec3::new(sin_phi * cos_theta, cos_phi, sin_phi * sin_theta);
-            vertices.push(MeshVertex {
-                position: normal * radius,
-                texcoord: Some(Vec2::new(u, v)),
-                normal: Some(normal),
-                tangent: None,
-            });
+            vertices.push(MeshVertex::new(
+                normal * radius,
+                Some(Vec2::new(u, v)),
+                Some(normal),
+            ));
         }
     }
     let mut triangles = Vec::with_capacity(rings * segments * 2);
@@ -181,10 +180,7 @@ pub fn uv_sphere(radius: f32, rings: usize, segments: usize) -> Mesh {
             triangles.push([b, d, c]);
         }
     }
-    Mesh {
-        vertices,
-        triangles,
-    }
+    Mesh::new(vertices, triangles)
 }
 
 /// XZ plane centred at the origin with a resolution grid.
@@ -203,12 +199,11 @@ pub fn plane_xz(width: f32, depth: f32, subdivisions: usize, uv_repeat: f32) -> 
         for column in 0..=subdivisions {
             let u = column as f32 / subdivisions as f32;
             let x = -half_width + u * width;
-            vertices.push(MeshVertex {
-                position: Vec3::new(x, 0.0, z),
-                texcoord: Some(Vec2::new(u * uv_repeat, v * uv_repeat)),
-                normal: Some(Vec3::new(0.0, 1.0, 0.0)),
-                tangent: None,
-            });
+            vertices.push(MeshVertex::new(
+                Vec3::new(x, 0.0, z),
+                Some(Vec2::new(u * uv_repeat, v * uv_repeat)),
+                Some(Vec3::new(0.0, 1.0, 0.0)),
+            ));
         }
     }
     let stride = subdivisions + 1;
@@ -223,10 +218,7 @@ pub fn plane_xz(width: f32, depth: f32, subdivisions: usize, uv_repeat: f32) -> 
             triangles.push([b, c, d]);
         }
     }
-    Mesh {
-        vertices,
-        triangles,
-    }
+    Mesh::new(vertices, triangles)
 }
 
 /// Axis-aligned cube with per-face UVs and outward normals.
@@ -280,37 +272,14 @@ pub fn cube_with_uvs(half_extent: f32) -> Mesh {
     ];
     for (normal, a, b, c, d) in faces {
         let base = vertices.len();
-        vertices.push(MeshVertex {
-            position: a,
-            texcoord: Some(Vec2::new(0.0, 1.0)),
-            normal: Some(normal),
-            tangent: None,
-        });
-        vertices.push(MeshVertex {
-            position: b,
-            texcoord: Some(Vec2::new(1.0, 1.0)),
-            normal: Some(normal),
-            tangent: None,
-        });
-        vertices.push(MeshVertex {
-            position: c,
-            texcoord: Some(Vec2::new(1.0, 0.0)),
-            normal: Some(normal),
-            tangent: None,
-        });
-        vertices.push(MeshVertex {
-            position: d,
-            texcoord: Some(Vec2::new(0.0, 0.0)),
-            normal: Some(normal),
-            tangent: None,
-        });
+        vertices.push(MeshVertex::new(a, Some(Vec2::new(0.0, 1.0)), Some(normal)));
+        vertices.push(MeshVertex::new(b, Some(Vec2::new(1.0, 1.0)), Some(normal)));
+        vertices.push(MeshVertex::new(c, Some(Vec2::new(1.0, 0.0)), Some(normal)));
+        vertices.push(MeshVertex::new(d, Some(Vec2::new(0.0, 0.0)), Some(normal)));
         triangles.push([base, base + 1, base + 2]);
         triangles.push([base, base + 2, base + 3]);
     }
-    Mesh {
-        vertices,
-        triangles,
-    }
+    Mesh::new(vertices, triangles)
 }
 
 /// Painterly banded planet texture for the hero scene.

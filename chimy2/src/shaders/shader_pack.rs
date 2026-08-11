@@ -22,9 +22,9 @@ pub struct ShaderPackVertex {
 impl ShaderPackVertex {
     pub const fn new(vertex: MeshVertex, barycentric: Vec3) -> Self {
         Self {
-            position: vertex.position,
-            texcoord: vertex.texcoord,
-            normal: vertex.normal,
+            position: vertex.position(),
+            texcoord: vertex.texcoord(),
+            normal: vertex.normal(),
             barycentric,
         }
     }
@@ -36,16 +36,16 @@ impl ShaderPackVertex {
 /// indices are skipped. The expansion is required for the toon and wireframe
 /// edge tests because the core vertex stage has no triangle-corner argument.
 pub fn expand_mesh_with_barycentrics(mesh: &Mesh) -> (Vec<ShaderPackVertex>, Vec<[usize; 3]>) {
-    let mut vertices = Vec::with_capacity(mesh.triangles.len() * 3);
-    let mut triangles = Vec::with_capacity(mesh.triangles.len());
-    for &[a, b, c] in &mesh.triangles {
-        let Some(vertex_a) = mesh.vertices.get(a).copied() else {
+    let mut vertices = Vec::with_capacity(mesh.indices().len() * 3);
+    let mut triangles = Vec::with_capacity(mesh.indices().len());
+    for &[a, b, c] in mesh.indices() {
+        let Some(vertex_a) = mesh.vertex(a).copied() else {
             continue;
         };
-        let Some(vertex_b) = mesh.vertices.get(b).copied() else {
+        let Some(vertex_b) = mesh.vertex(b).copied() else {
             continue;
         };
-        let Some(vertex_c) = mesh.vertices.get(c).copied() else {
+        let Some(vertex_c) = mesh.vertex(c).copied() else {
             continue;
         };
         let base = vertices.len();
