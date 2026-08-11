@@ -433,6 +433,14 @@ mod tests {
     }
 
     #[test]
+    fn inconsistent_depth_buffer_does_not_panic() {
+        let mut framebuffer = Framebuffer::new(6, 6);
+        framebuffer.depth.clear();
+        rasterize_triangle(&mut framebuffer, triangle(0.0), |_| 0xffff_ffff);
+        assert!(framebuffer.color.iter().all(|&pixel| pixel == 0));
+    }
+
+    #[test]
     fn raster_interpolates_varyings_at_pixel_center() {
         let mut framebuffer = Framebuffer::new(6, 6);
         rasterize_triangle(

@@ -6,6 +6,15 @@ use crate::math::Vec3;
 use crate::pipeline::Varyings;
 use core::arch::aarch64::*;
 
+#[derive(Clone, Copy)]
+struct RasterSpan {
+    area: f32,
+    x: i32,
+    y: i32,
+    max_x: i32,
+    top_left: [bool; 3],
+}
+
 pub(super) fn rasterize_prepared<V, F>(
     framebuffer: &mut Framebuffer,
     vertices: [ScreenVertex<V>; 3],
@@ -30,10 +39,30 @@ pub(super) fn rasterize_prepared<V, F>(
     for y in min_y..=max_y {
         let mut x = min_x;
         while max_x - x + 1 >= 4 {
-            unsafe {
-                // SAFETY: the prepared rectangle guarantees four valid lanes
-                // in both framebuffer dimensions and all SIMD inputs are f32.
-                rasterize_quad(framebuffer, &vertices, area, x, y, top_left, &mut fragment);
+            let span = RasterSpan {
+                area,
+                x,
+                y,
+                max_x,
+                top_left,
+            };
+            let depth_ptr = (y as usize)
+                .checked_mul(framebuffer.width)
+                .and_then(|row| row.checked_add(x as usize))
+                .and_then(|index| {
+                    index
+                        .checked_add(4)
+                        .and_then(|end| framebuffer.depth.get(index..end))
+                        .map(|depth_span| depth_span.as_ptr())
+                });
+            if let Some(depth_ptr) = depth_ptr {
+                unsafe {
+                    // SAFETY: depth_ptr comes from a checked four-element
+                    // depth slice. The prepared rectangle also bounds lanes.
+                    rasterize_quad(framebuffer, &vertices, span, depth_ptr, &mut fragment);
+                }
+            } else {
+                rasterize_scalar_quad(framebuffer, &vertices, span, &mut fragment);
             }
             x = x.saturating_add(4);
         }
@@ -50,38 +79,70 @@ pub(super) fn rasterize_prepared<V, F>(
     }
 }
 
+fn rasterize_scalar_quad<V, F>(
+    framebuffer: &mut Framebuffer,
+    vertices: &[ScreenVertex<V>; 3],
+    span: RasterSpan,
+    fragment: &mut F,
+) where
+    V: Varyings,
+    F: FnMut(V) -> u32,
+{
+    let scalar_end = span.x.saturating_add(3).min(span.max_x);
+    for scalar_x in span.x..=scalar_end {
+        let Some((depth, weights)) = rasterize_pixel(
+            framebuffer,
+            vertices,
+            span.area,
+            scalar_x,
+            span.y,
+            span.top_left,
+        ) else {
+            continue;
+        };
+        write_pixel(
+            framebuffer,
+            vertices,
+            scalar_x,
+            span.y,
+            depth,
+            weights,
+            fragment,
+        );
+    }
+}
+
+/// # Safety
+/// `depth_ptr` must point to four initialized f32 values for this span.
 #[target_feature(enable = "neon")]
 unsafe fn rasterize_quad<V, F>(
     framebuffer: &mut Framebuffer,
     vertices: &[ScreenVertex<V>; 3],
-    area: f32,
-    x: i32,
-    y: i32,
-    top_left: [bool; 3],
+    span: RasterSpan,
+    depth_ptr: *const f32,
     fragment: &mut F,
 ) where
     V: Varyings,
     F: FnMut(V) -> u32,
 {
     let xs = [
-        x as f32 + 0.5,
-        (x + 1) as f32 + 0.5,
-        (x + 2) as f32 + 0.5,
-        (x + 3) as f32 + 0.5,
+        span.x as f32 + 0.5,
+        (span.x + 1) as f32 + 0.5,
+        (span.x + 2) as f32 + 0.5,
+        (span.x + 3) as f32 + 0.5,
     ];
-    let pixel_index = y as usize * framebuffer.width + x as usize;
     let mut passing_lanes = [0_u32; 4];
     let mut depth_lanes = [0.0_f32; 4];
     let mut weights_x_lanes = [0.0_f32; 4];
     let mut weights_y_lanes = [0.0_f32; 4];
     let mut weights_z_lanes = [0.0_f32; 4];
     unsafe {
-        // SAFETY: xs and the framebuffer span contain four valid lanes. The
+        // SAFETY: xs and depth_ptr each contain four valid lanes. The
         // destination arrays contain four writable lanes. NEON uses no fused
         // operations here, matching the scalar multiply-then-add order.
         let px = vld1q_f32(xs.as_ptr());
-        let py = vdupq_n_f32(y as f32 + 0.5);
-        let area_v = vdupq_n_f32(area);
+        let py = vdupq_n_f32(span.y as f32 + 0.5);
+        let area_v = vdupq_n_f32(span.area);
         let a0 = vertices[1].position;
         let b0 = vertices[2].position;
         let edge_0 = vsubq_f32(
@@ -105,21 +166,21 @@ unsafe fn rasterize_quad<V, F>(
         let weights_z = vdivq_f32(edge_2, area_v);
         let scaled_0 = vmulq_f32(weights_x, area_v);
         let positive_0 = vcgtq_f32(scaled_0, vdupq_n_f32(0.0));
-        let inside_0 = if top_left[0] {
+        let inside_0 = if span.top_left[0] {
             vorrq_u32(positive_0, vceqq_f32(scaled_0, vdupq_n_f32(0.0)))
         } else {
             positive_0
         };
         let scaled_1 = vmulq_f32(weights_y, area_v);
         let positive_1 = vcgtq_f32(scaled_1, vdupq_n_f32(0.0));
-        let inside_1 = if top_left[1] {
+        let inside_1 = if span.top_left[1] {
             vorrq_u32(positive_1, vceqq_f32(scaled_1, vdupq_n_f32(0.0)))
         } else {
             positive_1
         };
         let scaled_2 = vmulq_f32(weights_z, area_v);
         let positive_2 = vcgtq_f32(scaled_2, vdupq_n_f32(0.0));
-        let inside_2 = if top_left[2] {
+        let inside_2 = if span.top_left[2] {
             vorrq_u32(positive_2, vceqq_f32(scaled_2, vdupq_n_f32(0.0)))
         } else {
             positive_2
@@ -132,7 +193,7 @@ unsafe fn rasterize_quad<V, F>(
             ),
             vmulq_n_f32(weights_z, vertices[2].position.z),
         );
-        let buffer_depth = vld1q_f32(framebuffer.depth.as_ptr().add(pixel_index));
+        let buffer_depth = vld1q_f32(depth_ptr);
         let passes_depth = vmvnq_u32(vcgeq_f32(depth, buffer_depth));
         let passing = vandq_u32(coverage, passes_depth);
         vst1q_u32(passing_lanes.as_mut_ptr(), passing);
@@ -146,8 +207,8 @@ unsafe fn rasterize_quad<V, F>(
             write_pixel(
                 framebuffer,
                 vertices,
-                x + lane as i32,
-                y,
+                span.x + lane as i32,
+                span.y,
                 depth_lanes[lane],
                 Vec3::new(
                     weights_x_lanes[lane],
