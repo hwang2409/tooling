@@ -1,6 +1,6 @@
 //! 100k-triangle stress scene that logs render-time fps to stdout.
 //!
-//! Two numbers get reported: render-only fps (time inside `Pipeline::draw`)
+//! Two numbers get reported: render-only fps (time inside `Pipeline::render`)
 //! and present-inclusive fps (wall-clock between successive callback starts).
 //! The gap is the event loop plus the softbuffer present, which allocates on
 //! macOS every frame. See PR #6 for the criterion baseline this demo mirrors.
@@ -166,7 +166,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             framebuffer.clear(argb8888(255, 8, 10, 16));
             let render_start = Instant::now();
             let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
-            pipeline.draw_mesh(framebuffer, &mesh, &uniforms);
+            pipeline.render(framebuffer, |frame, target| {
+                frame.draw_mesh(target, &mesh, &uniforms);
+            });
             let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
             reporter.observe(render_ms, framebuffer.width, framebuffer.height);
         },

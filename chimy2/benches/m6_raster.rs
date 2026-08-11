@@ -4,18 +4,19 @@ use chimy2::math::{Mat4, Quat, Vec3};
 use chimy2::mesh::{Mesh, MeshVertex};
 use chimy2::pipeline::Pipeline;
 use chimy2::shaders::{BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, PointLight};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::path::Path;
+use std::time::Instant;
 
 const WIDTH: usize = 1280;
 const HEIGHT: usize = 720;
 
-fn uniforms() -> BlinnPhongUniforms {
+fn uniforms(width: usize, height: usize) -> BlinnPhongUniforms {
     let camera = Camera::new(
         Vec3::new(0.0, 0.0, 5.0),
         Quat::IDENTITY,
         1.0,
-        WIDTH as f32 / HEIGHT as f32,
+        width as f32 / height as f32,
         0.1,
         100.0,
     );
@@ -42,12 +43,19 @@ fn uniforms() -> BlinnPhongUniforms {
     )
 }
 
-fn render(mesh: &Mesh, thread_count: usize) {
-    let mut framebuffer = Framebuffer::new(WIDTH, HEIGHT);
+fn render_at(mesh: &Mesh, thread_count: usize, width: usize, height: usize) {
+    let mut framebuffer = Framebuffer::new(width, height);
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
     pipeline.set_thread_count(thread_count);
-    pipeline.draw_mesh(&mut framebuffer, mesh, &uniforms());
+    let draw_uniforms = uniforms(width, height);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_mesh(target, mesh, &draw_uniforms);
+    });
     black_box(framebuffer.color);
+}
+
+fn render(mesh: &Mesh, thread_count: usize) {
+    render_at(mesh, thread_count, WIDTH, HEIGHT);
 }
 
 fn subdivided_icosahedron(levels: usize) -> Mesh {
@@ -129,6 +137,27 @@ fn bench_raster(c: &mut Criterion) {
     c.bench_function("100000 triangle scene parallel", |b| {
         b.iter(|| render(black_box(&exact_100k), parallel_threads))
     });
+    c.bench_function("opaque 100000 triangles 320x180 serial", |b| {
+        b.iter(|| render_at(black_box(&exact_100k), 1, 320, 180))
+    });
+    let mut opaque_100k = c.benchmark_group("opaque_100k_regression");
+    opaque_100k.throughput(Throughput::Elements(100_000));
+    opaque_100k.bench_function("320x180 parallel", |b| {
+        b.iter_custom(|iterations| {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                render_at(black_box(&exact_100k), parallel_threads, 320, 180);
+            }
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed.as_secs_f64() / (iterations as f64) < 0.25,
+                "opaque 100k render exceeded 250 ms: {:?}",
+                elapsed / iterations as u32
+            );
+            elapsed
+        })
+    });
+    opaque_100k.finish();
 }
 
 criterion_group!(benches, bench_raster);

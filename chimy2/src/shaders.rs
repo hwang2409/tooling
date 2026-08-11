@@ -26,11 +26,20 @@ pub use shader_pack::{
 pub struct FlatColorUniforms {
     pub transform: Mat4,
     pub color: u32,
+    pub alpha: f32,
 }
 
 impl FlatColorUniforms {
     pub const fn new(transform: Mat4, color: u32) -> Self {
-        Self { transform, color }
+        Self {
+            transform,
+            color,
+            alpha: 1.0,
+        }
+    }
+
+    pub fn set_alpha(&mut self, alpha: f32) {
+        self.alpha = alpha.clamp(0.0, 1.0);
     }
 }
 
@@ -47,7 +56,11 @@ impl VertexStage<Vec4, FlatColorUniforms> for FlatColorShader {
 
 impl FragmentStage<(), FlatColorUniforms> for FlatColorShader {
     fn run(&self, _: &(), uniforms: &FlatColorUniforms) -> u32 {
-        uniforms.color
+        multiply_alpha(uniforms.color, uniforms.alpha)
+    }
+
+    fn is_opaque(&self, uniforms: &FlatColorUniforms) -> bool {
+        uniforms.alpha == 1.0 && color_alpha_is_one(uniforms.color)
     }
 }
 
@@ -68,6 +81,7 @@ pub struct MeshUniforms {
     view: Mat4,
     projection: Mat4,
     pub color: u32,
+    pub alpha: f32,
     transform: Mat4,
 }
 
@@ -78,6 +92,7 @@ impl MeshUniforms {
             view,
             projection,
             color,
+            alpha: 1.0,
             transform: projection * view * model,
         }
     }
@@ -113,6 +128,10 @@ impl MeshUniforms {
         self.rebuild_transform();
     }
 
+    pub fn set_alpha(&mut self, alpha: f32) {
+        self.alpha = alpha.clamp(0.0, 1.0);
+    }
+
     fn rebuild_transform(&mut self) {
         self.transform = self.projection * self.view * self.model;
     }
@@ -140,7 +159,15 @@ impl VertexStage<MeshVertex, MeshUniforms> for MeshShader {
 
 impl FragmentStage<(), MeshUniforms> for MeshShader {
     fn run(&self, _: &(), uniforms: &MeshUniforms) -> u32 {
-        uniforms.color
+        multiply_alpha(uniforms.color, uniforms.alpha)
+    }
+
+    fn is_opaque(&self, uniforms: &MeshUniforms) -> bool {
+        uniforms.alpha == 1.0 && color_alpha_is_one(uniforms.color)
+    }
+
+    fn model_view(&self, uniforms: &MeshUniforms) -> Option<Mat4> {
+        Some(uniforms.view() * uniforms.model())
     }
 }
 
@@ -156,6 +183,7 @@ pub struct TexturedUniforms<'a> {
     pub transform: Mat4,
     pub texture: &'a Texture,
     pub filter: TextureFilter,
+    pub alpha: f32,
 }
 
 impl<'a> TexturedUniforms<'a> {
@@ -164,7 +192,12 @@ impl<'a> TexturedUniforms<'a> {
             transform,
             texture,
             filter,
+            alpha: 1.0,
         }
+    }
+
+    pub fn set_alpha(&mut self, alpha: f32) {
+        self.alpha = alpha.clamp(0.0, 1.0);
     }
 }
 
@@ -187,8 +220,8 @@ impl SamplingVaryings for TexturedVaryings {
     }
 }
 
-/// A textured shader must use [`Pipeline::draw_with_sampling`] or
-/// [`Pipeline::draw_mesh_with_sampling`]. It has no plain fragment-stage
+/// A textured shader must use `RenderFrame::draw_with_sampling` or
+/// `RenderFrame::draw_mesh_with_sampling`. It has no plain fragment-stage
 /// implementation, so a plain draw cannot silently lose its LOD derivatives.
 ///
 /// ```compile_fail
@@ -204,7 +237,9 @@ impl SamplingVaryings for TexturedVaryings {
 /// let mut framebuffer = Framebuffer::new(4, 4);
 /// let mut pipeline = Pipeline::new(TexturedShader, TexturedShader);
 /// let uniforms = TexturedUniforms::new(Mat4::IDENTITY, &texture, TextureFilter::Trilinear);
-/// pipeline.draw_mesh(&mut framebuffer, &mesh, &uniforms);
+/// pipeline.render(&mut framebuffer, |frame, target| {
+///     frame.draw_mesh(target, &mesh, &uniforms);
+/// });
 /// ```
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TexturedShader;
@@ -248,7 +283,11 @@ impl<'a> SampledFragmentStage<TexturedVaryings, TexturedUniforms<'a>> for Textur
                 ddy: derivatives.ddy,
             },
         );
-        argb8888_linear(pixel[3], [pixel[0], pixel[1], pixel[2]])
+        argb8888_linear(pixel[3] * uniforms.alpha, [pixel[0], pixel[1], pixel[2]])
+    }
+
+    fn is_opaque(&self, uniforms: &TexturedUniforms<'a>) -> bool {
+        uniforms.alpha == 1.0 && texture_has_no_alpha(uniforms.texture)
     }
 }
 
@@ -357,6 +396,7 @@ pub struct BlinnPhongUniforms {
     specular_color: Vec3,
     pub shininess: f32,
     pub camera_position: Vec3,
+    pub alpha: f32,
     directional_lights: [DirectionalLight; MAX_DIRECTIONAL_LIGHTS],
     directional_light_count: usize,
     point_lights: [PointLight; MAX_POINT_LIGHTS],
@@ -389,6 +429,7 @@ impl BlinnPhongUniforms {
             specular_color: linearize_color(nonnegative_color(specular_color)),
             shininess,
             camera_position,
+            alpha: 1.0,
             directional_lights: std::array::from_fn(|index| {
                 if index == 0 {
                     sanitize_directional_light(directional_light)
@@ -631,6 +672,10 @@ impl BlinnPhongUniforms {
         self.rebuild_transform();
     }
 
+    pub fn set_alpha(&mut self, alpha: f32) {
+        self.alpha = alpha.clamp(0.0, 1.0);
+    }
+
     fn rebuild_caches(&mut self) {
         self.rebuild_transform();
         self.normal_matrix = self.model.normal_matrix().unwrap_or_default();
@@ -725,6 +770,14 @@ impl FragmentStage<BlinnPhongVaryings, BlinnPhongUniforms> for BlinnPhongShader 
     fn run(&self, varyings: &BlinnPhongVaryings, uniforms: &BlinnPhongUniforms) -> u32 {
         Self::shade(varyings, uniforms)
     }
+
+    fn is_opaque(&self, uniforms: &BlinnPhongUniforms) -> bool {
+        uniforms.alpha == 1.0
+    }
+
+    fn model_view(&self, uniforms: &BlinnPhongUniforms) -> Option<Mat4> {
+        Some(uniforms.view() * uniforms.model())
+    }
 }
 
 impl BlinnPhongShader {
@@ -739,7 +792,7 @@ impl BlinnPhongShader {
             Vec3::new(1.0, 1.0, 1.0),
         );
 
-        argb8888_linear(1.0, [lighted.x, lighted.y, lighted.z])
+        argb8888_linear(uniforms.alpha, [lighted.x, lighted.y, lighted.z])
     }
 }
 
@@ -855,6 +908,7 @@ pub struct TexturedBlinnPhongUniforms<'a> {
     pub lighting: BlinnPhongUniforms,
     pub texture: &'a Texture,
     pub filter: TextureFilter,
+    pub alpha: f32,
 }
 
 impl<'a> TexturedBlinnPhongUniforms<'a> {
@@ -867,7 +921,12 @@ impl<'a> TexturedBlinnPhongUniforms<'a> {
             lighting,
             texture,
             filter,
+            alpha: 1.0,
         }
+    }
+
+    pub fn set_alpha(&mut self, alpha: f32) {
+        self.alpha = alpha.clamp(0.0, 1.0);
     }
 }
 
@@ -951,7 +1010,20 @@ impl<'a> SampledFragmentStage<TexturedBlinnPhongVaryings, TexturedBlinnPhongUnif
             albedo,
         );
 
-        argb8888_linear(pixel[3], [lighted.x, lighted.y, lighted.z])
+        argb8888_linear(
+            pixel[3] * uniforms.alpha * uniforms.lighting.alpha,
+            [lighted.x, lighted.y, lighted.z],
+        )
+    }
+
+    fn is_opaque(&self, uniforms: &TexturedBlinnPhongUniforms<'a>) -> bool {
+        uniforms.alpha == 1.0
+            && uniforms.lighting.alpha == 1.0
+            && texture_has_no_alpha(uniforms.texture)
+    }
+
+    fn model_view(&self, uniforms: &TexturedBlinnPhongUniforms<'a>) -> Option<Mat4> {
+        Some(uniforms.lighting.view() * uniforms.lighting.model())
     }
 }
 
@@ -1110,7 +1182,18 @@ impl<'a> SampledFragmentStage<NormalMappedBlinnPhongVaryings, NormalMappedBlinnP
             &uniforms.lighting,
             albedo,
         );
-        argb8888_linear(albedo_pixel[3], [lighted.x, lighted.y, lighted.z])
+        argb8888_linear(
+            albedo_pixel[3] * uniforms.lighting.alpha,
+            [lighted.x, lighted.y, lighted.z],
+        )
+    }
+
+    fn is_opaque(&self, uniforms: &NormalMappedBlinnPhongUniforms<'a>) -> bool {
+        uniforms.lighting.alpha == 1.0 && texture_has_no_alpha(uniforms.texture)
+    }
+
+    fn model_view(&self, uniforms: &NormalMappedBlinnPhongUniforms<'a>) -> Option<Mat4> {
+        Some(uniforms.lighting.view() * uniforms.lighting.model())
     }
 }
 
@@ -1140,6 +1223,24 @@ fn linearize_color(color: Vec3) -> Vec3 {
         srgb_to_linear(color.y),
         srgb_to_linear(color.z),
     )
+}
+
+fn multiply_alpha(color: u32, alpha: f32) -> u32 {
+    let [source_alpha, red, green, blue] = color.to_be_bytes();
+    crate::fb::argb8888(
+        (f32::from(source_alpha) / 255.0 * alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+        red,
+        green,
+        blue,
+    )
+}
+
+fn color_alpha_is_one(color: u32) -> bool {
+    color.to_be_bytes()[0] == 255
+}
+
+fn texture_has_no_alpha(texture: &Texture) -> bool {
+    texture.pixels().iter().all(|pixel| pixel[3] == 255)
 }
 
 #[cfg(test)]
@@ -1301,6 +1402,37 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn normal_mapped_lighting_alpha_controls_output_and_classification() {
+        let albedo = Texture::new(1, 1, vec![[255, 255, 255, 255]]).unwrap();
+        let normal_map =
+            Texture::new_with_color_space(1, 1, vec![[128, 128, 255, 255]], ColorSpace::Linear)
+                .unwrap();
+        let mut lighting = uniforms();
+        lighting.set_alpha(0.5);
+        let uniforms = NormalMappedBlinnPhongUniforms::new(
+            lighting,
+            &albedo,
+            &normal_map,
+            TextureFilter::Nearest,
+        )
+        .unwrap();
+        let varyings = NormalMappedBlinnPhongVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            tangent: Vec4::new(1.0, 0.0, 0.0, 1.0),
+            texcoord: Vec2::ZERO,
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        let output = NormalMappedBlinnPhongShader.run_with_sampling(
+            &varyings,
+            &crate::pipeline::SampleDerivatives::default(),
+            &uniforms,
+        );
+        assert_eq!(output.to_be_bytes()[0], 128);
+        assert!(!NormalMappedBlinnPhongShader.is_opaque(&uniforms));
     }
 
     #[test]
@@ -1792,7 +1924,9 @@ mod tests {
         framebuffer.clear(argb8888(255, 8, 10, 16));
         let mut pipeline = crate::pipeline::Pipeline::new(DitherShader, DitherShader);
         pipeline.set_thread_count(1);
-        pipeline.draw(&mut framebuffer, &vertices, &[[0, 1, 2]], &uniforms);
+        pipeline.render(&mut framebuffer, |frame, target| {
+            frame.draw(target, &vertices, &[[0, 1, 2]], &uniforms);
+        });
         framebuffer
     }
 

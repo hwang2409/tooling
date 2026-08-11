@@ -66,12 +66,10 @@ fn render(vertices: &[Vec4], triangles: &[[usize; 3]], colors_and_z: &[(u32, f32
                 vertex
             })
             .collect();
-        pipeline.draw(
-            &mut framebuffer,
-            &transformed,
-            &[[0, 1, 2]],
-            &FlatColorUniforms::new(Mat4::IDENTITY, color),
-        );
+        let uniforms = FlatColorUniforms::new(Mat4::IDENTITY, color);
+        pipeline.render(&mut framebuffer, |frame, target| {
+            frame.draw(target, &transformed, &[[0, 1, 2]], &uniforms);
+        });
     }
     framebuffer
 }
