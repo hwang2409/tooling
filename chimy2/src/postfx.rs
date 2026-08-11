@@ -7,7 +7,7 @@
 //! The fixed render order is: render -> SSAA downsample -> post chain -> present.
 
 use crate::fb::{Framebuffer, argb8888_linear};
-use crate::image::{linear_to_srgb, srgb_to_linear, srgb_to_linear_u8};
+use crate::image::{srgb_to_linear, srgb_to_linear_u8};
 
 /// The color space used by a post-processing pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,19 +72,11 @@ impl PostBuffer {
                 ],
                 PostColorSpace::EncodedSrgb => [
                     source[0],
-                    source[1].clamp(0.0, 1.0),
-                    source[2].clamp(0.0, 1.0),
-                    source[3].clamp(0.0, 1.0),
+                    linear_to_encoded(source[1]),
+                    linear_to_encoded(source[2]),
+                    linear_to_encoded(source[3]),
                 ],
             };
-        }
-        if self.color_space == PostColorSpace::Linear && color_space == PostColorSpace::EncodedSrgb
-        {
-            for pixel in &mut converted.pixels {
-                pixel[1] = linear_to_srgb(pixel[1]) as f32 / 255.0;
-                pixel[2] = linear_to_srgb(pixel[2]) as f32 / 255.0;
-                pixel[3] = linear_to_srgb(pixel[3]) as f32 / 255.0;
-            }
         }
         converted
     }
@@ -104,6 +96,17 @@ impl PostBuffer {
                 }
             };
         }
+    }
+}
+
+/// Encodes a linear value to normalized sRGB without quantizing to u8.
+/// Quantization is deferred until `write_to_framebuffer`.
+fn linear_to_encoded(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    if value <= 0.0031308 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
     }
 }
 
@@ -176,7 +179,7 @@ pub const BLOOM_STRENGTH: f32 = 0.65;
 /// The center tap is followed by distances one through four. The full
 /// separable kernel is `center + 2 * (tap1 + ... + tap4)` and sums to one.
 pub const BLOOM_GAUSSIAN_KERNEL: [f32; 5] =
-    [0.22702703, 0.19459459, 0.12162162, 0.05405405, 0.01621622];
+    [0.20416369, 0.18017382, 0.12383154, 0.06628225, 0.02763055];
 
 /// Returns the linear threshold extraction for one RGB pixel.
 pub fn bloom_threshold_extract(rgb: [f32; 3], threshold: f32) -> [f32; 3] {
@@ -303,15 +306,15 @@ impl PostPass for FxaaPass {
                 let vertical = (luma(west) + luma(east) - 2.0 * center_luma).abs();
                 let neighbor = if horizontal >= vertical {
                     [
-                        (west[1] + east[1]) * 0.5,
-                        (west[2] + east[2]) * 0.5,
-                        (west[3] + east[3]) * 0.5,
-                    ]
-                } else {
-                    [
                         (north[1] + south[1]) * 0.5,
                         (north[2] + south[2]) * 0.5,
                         (north[3] + south[3]) * 0.5,
+                    ]
+                } else {
+                    [
+                        (west[1] + east[1]) * 0.5,
+                        (west[2] + east[2]) * 0.5,
+                        (west[3] + east[3]) * 0.5,
                     ]
                 };
                 let blend = ((contrast - threshold) / contrast.max(f32::EPSILON)).clamp(0.0, 0.75);
@@ -403,13 +406,45 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct SetLinear(f32);
+
+    impl PostPass for SetLinear {
+        fn color_space(&self) -> PostColorSpace {
+            PostColorSpace::Linear
+        }
+
+        fn apply(&self, input: &PostBuffer, output: &mut PostBuffer) {
+            output.pixels.clone_from(&input.pixels);
+            for pixel in &mut output.pixels {
+                pixel[1] = self.0;
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct AddLinear(f32);
+
+    impl PostPass for AddLinear {
+        fn color_space(&self) -> PostColorSpace {
+            PostColorSpace::Linear
+        }
+
+        fn apply(&self, input: &PostBuffer, output: &mut PostBuffer) {
+            output.pixels.clone_from(&input.pixels);
+            for pixel in &mut output.pixels {
+                pixel[1] += self.0;
+            }
+        }
+    }
+
     #[test]
     fn gaussian_kernel_weights_sum_to_one() {
         let sum = BLOOM_GAUSSIAN_KERNEL[0]
             + 2.0 * BLOOM_GAUSSIAN_KERNEL[1..].iter().copied().sum::<f32>();
         assert!((sum - 1.0).abs() < 1e-5, "kernel sum is {sum}");
-        assert_eq!(BLOOM_GAUSSIAN_KERNEL[0], 0.22702703);
-        assert_eq!(BLOOM_GAUSSIAN_KERNEL[4], 0.01621622);
+        assert_eq!(BLOOM_GAUSSIAN_KERNEL[0], 0.20416369);
+        assert_eq!(BLOOM_GAUSSIAN_KERNEL[4], 0.02763055);
     }
 
     #[test]
@@ -443,6 +478,35 @@ mod tests {
             .with_pass(IdentityPass(PostColorSpace::Linear));
         chain.apply(&mut framebuffer);
         assert_eq!(framebuffer.color, expected);
+    }
+
+    #[test]
+    fn encoded_identity_between_linear_passes_is_byte_transparent() {
+        let mut direct = Framebuffer::new(1, 1);
+        let mut bridged = direct.clone();
+        let direct_chain = PostChain::new()
+            .with_pass(SetLinear(0.0002))
+            .with_pass(AddLinear(0.017));
+        let bridged_chain = PostChain::new()
+            .with_pass(SetLinear(0.0002))
+            .with_pass(IdentityPass(PostColorSpace::EncodedSrgb))
+            .with_pass(AddLinear(0.017));
+        direct_chain.apply(&mut direct);
+        bridged_chain.apply(&mut bridged);
+        assert_eq!(bridged.color, direct.color);
+    }
+
+    #[test]
+    fn fxaa_blends_across_a_vertical_edge() {
+        let mut framebuffer = Framebuffer::new(4, 3);
+        for y in 0..3 {
+            for x in 2..4 {
+                framebuffer.color[y * 4 + x] = 0xffff_ffff;
+            }
+        }
+        let before = framebuffer.color.clone();
+        PostChain::new().with_pass(FxaaPass).apply(&mut framebuffer);
+        assert_ne!(framebuffer.color[5], before[5]);
     }
 
     #[test]
