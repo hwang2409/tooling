@@ -3,13 +3,17 @@
 //! Texture coordinates use texel centers. A coordinate `u` maps to
 //! `u * width - 0.5` in texel space before filtering. Nearest sampling then
 //! selects `floor(u * width)` after wrapping. Bilinear sampling uses the four
-//! neighboring texels around that center-space position. Pixel values are raw
-//! 8-bit values; no sRGB or gamma conversion is applied.
+//! neighboring texels around that center-space position. Source pixels are
+//! sRGB u8 values. Texture construction decodes RGB through a 256-entry LUT
+//! into linear floats. Filtering and mip generation use those linear values.
+//! The u8 sampling methods encode their linear result back to sRGB for API
+//! compatibility. Shaders use the linear sampling methods below.
 
 use crate::math::Vec2;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 
 const QOI_HEADER_SIZE: usize = 14;
 const QOI_END_MARKER: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 1];
@@ -43,12 +47,20 @@ pub enum WrapMode {
     ClampToEdge,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Texture {
+    width: usize,
+    height: usize,
+    pixels: Vec<[u8; 4]>,
+    pub wrap_mode: WrapMode,
+    linear_mips: Vec<MipLevel>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MipLevel {
     pub width: usize,
     pub height: usize,
-    pub pixels: Vec<[u8; 4]>,
-    pub wrap_mode: WrapMode,
+    pub pixels: Vec<[f32; 4]>,
 }
 
 impl Texture {
@@ -68,11 +80,23 @@ impl Texture {
         if width == 0 || height == 0 {
             return Err(ImageError::new(0, "texture dimensions must be non-zero"));
         }
+        let linear_pixels = pixels
+            .iter()
+            .map(|&pixel| {
+                [
+                    srgb_to_linear_u8(pixel[0]),
+                    srgb_to_linear_u8(pixel[1]),
+                    srgb_to_linear_u8(pixel[2]),
+                    f32::from(pixel[3]) / 255.0,
+                ]
+            })
+            .collect::<Vec<_>>();
         Ok(Self {
             width,
             height,
             pixels,
             wrap_mode: WrapMode::Repeat,
+            linear_mips: build_mip_chain(width, height, linear_pixels),
         })
     }
 
@@ -107,8 +131,74 @@ impl Texture {
         self.wrap_mode = wrap_mode;
     }
 
+    pub const fn width(&self) -> usize {
+        self.width
+    }
+
+    pub const fn height(&self) -> usize {
+        self.height
+    }
+
+    pub fn pixels(&self) -> &[[u8; 4]] {
+        &self.pixels
+    }
+
+    pub fn set_pixel(&mut self, x: usize, y: usize, pixel: [u8; 4]) {
+        self.pixels[y * self.width + x] = pixel;
+        self.rebuild_mips();
+    }
+
+    pub fn set_pixels(&mut self, pixels: Vec<[u8; 4]>) -> Result<(), ImageError> {
+        let expected = self
+            .width
+            .checked_mul(self.height)
+            .ok_or_else(|| ImageError::new(0, "texture dimensions overflow the pixel count"))?;
+        if pixels.len() != expected {
+            return Err(ImageError::new(
+                0,
+                format!(
+                    "texture has {} pixels, expected {expected} for {}x{}",
+                    pixels.len(),
+                    self.width,
+                    self.height
+                ),
+            ));
+        }
+        self.pixels = pixels;
+        self.rebuild_mips();
+        Ok(())
+    }
+
+    pub fn rebuild_mips(&mut self) {
+        let linear_pixels = self
+            .pixels
+            .iter()
+            .map(|&pixel| {
+                [
+                    srgb_to_linear_u8(pixel[0]),
+                    srgb_to_linear_u8(pixel[1]),
+                    srgb_to_linear_u8(pixel[2]),
+                    f32::from(pixel[3]) / 255.0,
+                ]
+            })
+            .collect::<Vec<_>>();
+        self.linear_mips = build_mip_chain(self.width, self.height, linear_pixels);
+    }
+
     pub fn pixel(&self, x: usize, y: usize) -> [u8; 4] {
         self.pixels[y * self.width + x]
+    }
+
+    pub fn mip_count(&self) -> usize {
+        self.linear_mips.len()
+    }
+
+    pub fn mip_level(&self, level: usize) -> Option<&MipLevel> {
+        self.linear_mips.get(level)
+    }
+
+    pub fn lod_from_derivatives(&self, derivatives: TextureDerivatives) -> f32 {
+        lod_from_derivatives(self.width, self.height, derivatives)
     }
 
     pub fn sample_nearest(&self, uv: Vec2) -> [u8; 4] {
@@ -116,11 +206,7 @@ impl Texture {
     }
 
     pub fn sample_nearest_with_wrap(&self, uv: Vec2, wrap_mode: WrapMode) -> [u8; 4] {
-        let u = wrap_coordinate(uv.x, wrap_mode);
-        let v = wrap_coordinate(uv.y, wrap_mode);
-        let x = nearest_index(u, self.width);
-        let y = nearest_index(v, self.height);
-        self.pixel(x, y)
+        encode_linear_pixel(sample_nearest_level(&self.linear_mips[0], uv, wrap_mode))
     }
 
     pub fn sample_bilinear(&self, uv: Vec2) -> [u8; 4] {
@@ -128,32 +214,165 @@ impl Texture {
     }
 
     pub fn sample_bilinear_with_wrap(&self, uv: Vec2, wrap_mode: WrapMode) -> [u8; 4] {
-        let u = wrap_coordinate(uv.x, wrap_mode);
-        let v = wrap_coordinate(uv.y, wrap_mode);
-        let x = u * self.width as f32 - 0.5;
-        let y = v * self.height as f32 - 0.5;
-        let x0 = x.floor() as isize;
-        let y0 = y.floor() as isize;
-        let tx = x - x.floor();
-        let ty = y - y.floor();
-        let p00 = self.pixel_wrapped(x0, y0, wrap_mode);
-        let p10 = self.pixel_wrapped(x0 + 1, y0, wrap_mode);
-        let p01 = self.pixel_wrapped(x0, y0 + 1, wrap_mode);
-        let p11 = self.pixel_wrapped(x0 + 1, y0 + 1, wrap_mode);
-        let mut result = [0; 4];
-        for channel in 0..4 {
-            let top = p00[channel] as f32 * (1.0 - tx) + p10[channel] as f32 * tx;
-            let bottom = p01[channel] as f32 * (1.0 - tx) + p11[channel] as f32 * tx;
-            result[channel] = (top * (1.0 - ty) + bottom * ty).round() as u8;
-        }
-        result
+        encode_linear_pixel(sample_bilinear_level(&self.linear_mips[0], uv, wrap_mode))
     }
 
-    fn pixel_wrapped(&self, x: isize, y: isize, wrap_mode: WrapMode) -> [u8; 4] {
-        let x = wrap_index(x, self.width, wrap_mode);
-        let y = wrap_index(y, self.height, wrap_mode);
-        self.pixel(x, y)
+    /// Samples mip zero in linear RGB. Alpha stays linear and is not sRGB encoded.
+    pub fn sample_linear_nearest(&self, uv: Vec2) -> [f32; 4] {
+        sample_nearest_level(&self.linear_mips[0], uv, self.wrap_mode)
     }
+
+    /// Samples mip zero with bilinear filtering in linear RGB.
+    pub fn sample_linear_bilinear(&self, uv: Vec2) -> [f32; 4] {
+        sample_bilinear_level(&self.linear_mips[0], uv, self.wrap_mode)
+    }
+
+    /// Samples with trilinear filtering. NPOT mip levels use ceil-halved
+    /// dimensions and average only source texels that exist at an edge.
+    pub fn sample_linear_trilinear(&self, uv: Vec2, lod: f32) -> [f32; 4] {
+        let max_level = self.linear_mips.len().saturating_sub(1) as f32;
+        let lod = lod.clamp(0.0, max_level);
+        let lower = lod.floor() as usize;
+        let upper = (lower + 1).min(self.linear_mips.len() - 1);
+        let amount = lod - lower as f32;
+        let a = sample_bilinear_level(&self.linear_mips[lower], uv, self.wrap_mode);
+        let b = sample_bilinear_level(&self.linear_mips[upper], uv, self.wrap_mode);
+        std::array::from_fn(|channel| a[channel] * (1.0 - amount) + b[channel] * amount)
+    }
+
+    pub fn sample_linear_trilinear_with_derivatives(
+        &self,
+        uv: Vec2,
+        derivatives: TextureDerivatives,
+    ) -> [f32; 4] {
+        self.sample_linear_trilinear(uv, self.lod_from_derivatives(derivatives))
+    }
+}
+
+pub type TextureDerivatives = crate::pipeline::SampleDerivatives;
+
+pub fn lod_from_derivatives(width: usize, height: usize, derivatives: TextureDerivatives) -> f32 {
+    let dx = Vec2::new(
+        derivatives.ddx.x * width as f32,
+        derivatives.ddx.y * height as f32,
+    )
+    .length();
+    let dy = Vec2::new(
+        derivatives.ddy.x * width as f32,
+        derivatives.ddy.y * height as f32,
+    )
+    .length();
+    dx.max(dy).max(1.0).log2()
+}
+
+pub fn srgb_to_linear(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+pub fn srgb_to_linear_u8(value: u8) -> f32 {
+    static LUT: OnceLock<[f32; 256]> = OnceLock::new();
+    LUT.get_or_init(|| std::array::from_fn(|value| srgb_to_linear(value as f32 / 255.0)))
+        [value as usize]
+}
+
+pub fn linear_to_srgb(value: f32) -> u8 {
+    let value = value.clamp(0.0, 1.0);
+    let encoded = if value <= 0.0031308 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0).round() as u8
+}
+
+fn build_mip_chain(width: usize, height: usize, pixels: Vec<[f32; 4]>) -> Vec<MipLevel> {
+    let mut levels = vec![MipLevel {
+        width,
+        height,
+        pixels,
+    }];
+    while levels
+        .last()
+        .is_some_and(|level| level.width > 1 || level.height > 1)
+    {
+        let source = levels.last().expect("mip chain has a base level");
+        let width = source.width.div_ceil(2);
+        let height = source.height.div_ceil(2);
+        let mut pixels = Vec::with_capacity(width * height);
+        for y in 0..height {
+            for x in 0..width {
+                let x0 = x * 2;
+                let y0 = y * 2;
+                let x1 = (x0 + 1).min(source.width - 1);
+                let y1 = (y0 + 1).min(source.height - 1);
+                let mut sum = [0.0; 4];
+                let mut count = 0.0;
+                for source_y in y0..=y1 {
+                    for source_x in x0..=x1 {
+                        let pixel = source.pixels[source_y * source.width + source_x];
+                        for channel in 0..4 {
+                            sum[channel] += pixel[channel];
+                        }
+                        count += 1.0;
+                    }
+                }
+                pixels.push(std::array::from_fn(|channel| sum[channel] / count));
+            }
+        }
+        levels.push(MipLevel {
+            width,
+            height,
+            pixels,
+        });
+    }
+    levels
+}
+
+fn sample_nearest_level(level: &MipLevel, uv: Vec2, wrap_mode: WrapMode) -> [f32; 4] {
+    let u = wrap_coordinate(uv.x, wrap_mode);
+    let v = wrap_coordinate(uv.y, wrap_mode);
+    let x = nearest_index(u, level.width);
+    let y = nearest_index(v, level.height);
+    level.pixels[y * level.width + x]
+}
+
+fn encode_linear_pixel(pixel: [f32; 4]) -> [u8; 4] {
+    [
+        linear_to_srgb(pixel[0]),
+        linear_to_srgb(pixel[1]),
+        linear_to_srgb(pixel[2]),
+        (pixel[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]
+}
+
+fn sample_bilinear_level(level: &MipLevel, uv: Vec2, wrap_mode: WrapMode) -> [f32; 4] {
+    let u = wrap_coordinate(uv.x, wrap_mode);
+    let v = wrap_coordinate(uv.y, wrap_mode);
+    let x = u * level.width as f32 - 0.5;
+    let y = v * level.height as f32 - 0.5;
+    let x0 = x.floor() as isize;
+    let y0 = y.floor() as isize;
+    let tx = x - x.floor();
+    let ty = y - y.floor();
+    let p00 = linear_pixel_wrapped(level, x0, y0, wrap_mode);
+    let p10 = linear_pixel_wrapped(level, x0 + 1, y0, wrap_mode);
+    let p01 = linear_pixel_wrapped(level, x0, y0 + 1, wrap_mode);
+    let p11 = linear_pixel_wrapped(level, x0 + 1, y0 + 1, wrap_mode);
+    std::array::from_fn(|channel| {
+        let top = p00[channel] * (1.0 - tx) + p10[channel] * tx;
+        let bottom = p01[channel] * (1.0 - tx) + p11[channel] * tx;
+        top * (1.0 - ty) + bottom * ty
+    })
+}
+
+fn linear_pixel_wrapped(level: &MipLevel, x: isize, y: isize, wrap_mode: WrapMode) -> [f32; 4] {
+    let x = wrap_index(x, level.width, wrap_mode);
+    let y = wrap_index(y, level.height, wrap_mode);
+    level.pixels[y * level.width + x]
 }
 
 fn wrap_coordinate(value: f32, wrap_mode: WrapMode) -> f32 {
@@ -494,7 +713,7 @@ mod tests {
         ]);
         let texture = decode_qoi(&with_marker(bytes)).unwrap();
         assert_eq!(
-            texture.pixels,
+            texture.pixels(),
             vec![
                 [1, 2, 3, 255],
                 [0, 0, 0, 0],
@@ -525,7 +744,7 @@ mod tests {
         )
         .unwrap();
         let encoded = encode_qoi(&texture).unwrap();
-        assert_eq!(decode_qoi(&encoded).unwrap().pixels, texture.pixels);
+        assert_eq!(decode_qoi(&encoded).unwrap().pixels(), texture.pixels());
     }
 
     #[test]
@@ -546,7 +765,7 @@ mod tests {
         )
         .unwrap();
         let encoded = encode_qoi(&texture).unwrap();
-        assert_eq!(decode_qoi(&encoded).unwrap().pixels, texture.pixels);
+        assert_eq!(decode_qoi(&encoded).unwrap().pixels(), texture.pixels());
     }
 
     #[test]
@@ -554,7 +773,7 @@ mod tests {
         let mut bytes = qoi_header(2, 1, 4);
         bytes.extend_from_slice(&[0xc0, 0x35]);
         let texture = decode_qoi(&with_marker(bytes)).unwrap();
-        assert_eq!(texture.pixels, vec![[0, 0, 0, 255], [0, 0, 0, 255]]);
+        assert_eq!(texture.pixels(), &[[0, 0, 0, 255], [0, 0, 0, 255]]);
     }
 
     #[test]
@@ -600,11 +819,11 @@ mod tests {
         )
         .unwrap()
         .with_wrap_mode(WrapMode::ClampToEdge);
-        // u=.6, v=.4 maps to x=.7, y=.3. The hand-computed weighted result
-        // is red=70 and green=30.
+        // u=.6, v=.4 maps to x=.7, y=.3. The linear-light weighted result
+        // encodes to red=84 and green=55.
         assert_eq!(
             texture.sample_bilinear(Vec2::new(0.6, 0.4)),
-            [70, 30, 0, 255]
+            [84, 55, 0, 255]
         );
     }
 
@@ -656,5 +875,108 @@ mod tests {
                 vec![[first_byte, 2, 3, 255]]
             );
         }
+    }
+
+    #[test]
+    fn srgb_boundaries_and_known_u8_values_round_trip() {
+        assert_eq!(srgb_to_linear_u8(0), 0.0);
+        assert!((srgb_to_linear_u8(128) - 0.2158605).abs() < 1e-6);
+        assert_eq!(srgb_to_linear_u8(255), 1.0);
+        assert!((srgb_to_linear(0.04045) - 0.003130805).abs() < 1e-7);
+        assert!((linear_to_srgb(0.0031308) as f32 / 255.0 - 0.04045).abs() < 0.002);
+        for value in [0, 1, 10, 128, 255] {
+            assert_eq!(linear_to_srgb(srgb_to_linear_u8(value)), value);
+        }
+    }
+
+    #[test]
+    fn mip_chain_uses_linear_box_filter_and_ceil_halved_npot_dimensions() {
+        let texture = Texture::new(
+            3,
+            2,
+            vec![
+                [0, 0, 0, 255],
+                [255, 0, 0, 255],
+                [0, 255, 0, 255],
+                [0, 0, 255, 255],
+                [255, 255, 255, 255],
+                [128, 128, 128, 255],
+            ],
+        )
+        .unwrap();
+        assert_eq!(texture.mip_count(), 3);
+        assert_eq!(
+            (
+                texture.mip_level(0).unwrap().width,
+                texture.mip_level(0).unwrap().height
+            ),
+            (3, 2)
+        );
+        assert_eq!(
+            (
+                texture.mip_level(1).unwrap().width,
+                texture.mip_level(1).unwrap().height
+            ),
+            (2, 1)
+        );
+        assert_eq!(
+            (
+                texture.mip_level(2).unwrap().width,
+                texture.mip_level(2).unwrap().height
+            ),
+            (1, 1)
+        );
+        let level = texture.mip_level(1).unwrap();
+        assert!((level.pixels[0][0] - 0.5).abs() < 1e-6);
+        assert!((level.pixels[0][1] - 0.25).abs() < 1e-6);
+        assert!((level.pixels[0][2] - 0.5).abs() < 1e-6);
+        let midpoint = srgb_to_linear_u8(128);
+        assert!((level.pixels[1][0] - midpoint / 2.0).abs() < 1e-6);
+        assert!((level.pixels[1][1] - (1.0 + midpoint) / 2.0).abs() < 1e-6);
+        assert!((level.pixels[1][2] - midpoint / 2.0).abs() < 1e-6);
+        let final_pixel = texture.mip_level(2).unwrap().pixels[0];
+        assert!((final_pixel[0] - (0.5 + midpoint / 2.0) / 2.0).abs() < 1e-6);
+        assert!((final_pixel[1] - (0.25 + (1.0 + midpoint) / 2.0) / 2.0).abs() < 1e-6);
+        assert!((final_pixel[2] - (0.5 + midpoint / 2.0) / 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn set_pixel_rebuilds_mips_immediately() {
+        let mut texture = Texture::new(2, 1, vec![[0, 0, 0, 255]; 2]).unwrap();
+        texture.set_pixel(0, 0, [255, 0, 0, 255]);
+        assert_eq!(texture.pixel(0, 0), [255, 0, 0, 255]);
+        assert_eq!(
+            texture.mip_level(0).unwrap().pixels[0],
+            [1.0, 0.0, 0.0, 1.0]
+        );
+        assert!((texture.mip_level(1).unwrap().pixels[0][0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn set_pixels_rebuilds_mips_immediately() {
+        let mut texture = Texture::new(2, 1, vec![[0, 0, 0, 255]; 2]).unwrap();
+        texture
+            .set_pixels(vec![[0, 255, 0, 255], [0, 0, 255, 255]])
+            .unwrap();
+        assert_eq!(texture.pixels(), &[[0, 255, 0, 255], [0, 0, 255, 255]]);
+        let mip = texture.mip_level(1).unwrap().pixels[0];
+        assert!((mip[1] - 0.5).abs() < 1e-6);
+        assert!((mip[2] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lod_and_trilinear_blend_match_hand_computed_values() {
+        let derivatives = TextureDerivatives {
+            ddx: Vec2::new(4.0 / 256.0, 0.0),
+            ddy: Vec2::ZERO,
+        };
+        assert_eq!(lod_from_derivatives(256, 256, derivatives), 2.0);
+        let texture = Texture::new(2, 1, vec![[0, 0, 0, 255], [255, 255, 255, 255]])
+            .unwrap()
+            .with_wrap_mode(WrapMode::ClampToEdge);
+        let sample = texture.sample_linear_trilinear(Vec2::new(0.0, 0.0), 0.5);
+        assert!((sample[0] - 0.25).abs() < 1e-6);
+        assert!((sample[1] - 0.25).abs() < 1e-6);
+        assert!((sample[2] - 0.25).abs() < 1e-6);
     }
 }

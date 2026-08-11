@@ -32,11 +32,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let transform = camera.projection_matrix()
                 * camera.view_matrix()
                 * Mat4::translate(Vec3::new(0.0, -0.6, 0.0));
-            let uniforms = TexturedUniforms::new(transform, &texture, TextureFilter::Bilinear);
+            let uniforms = TexturedUniforms::new(transform, &texture, TextureFilter::Trilinear);
 
             framebuffer.clear(argb8888(255, 22, 30, 42));
             let mut pipeline = Pipeline::new(TexturedShader, TexturedShader);
-            pipeline.draw_mesh(framebuffer, &floor, &uniforms);
+            pipeline.draw_mesh_with_sampling(framebuffer, &floor, &uniforms);
         },
     )
 }

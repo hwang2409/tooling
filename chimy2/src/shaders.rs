@@ -4,11 +4,13 @@
 //! positions by `model`, and the fragment stage uses the world-space camera
 //! and lights. Final color clamps to `[0, 1]` before 8-bit conversion.
 
-use crate::fb::argb8888;
-use crate::image::Texture;
+use crate::fb::argb8888_linear;
+use crate::image::{Texture, TextureDerivatives, srgb_to_linear};
 use crate::math::{Mat3, Mat4, Vec3, Vec4};
 use crate::mesh::MeshVertex;
-use crate::pipeline::{FragmentStage, Varyings, VertexOutput, VertexStage};
+use crate::pipeline::{
+    FragmentStage, SampledFragmentStage, SamplingVaryings, Varyings, VertexOutput, VertexStage,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FlatColorUniforms {
@@ -131,6 +133,7 @@ impl FragmentStage<(), MeshUniforms> for MeshShader {
 pub enum TextureFilter {
     Nearest,
     Bilinear,
+    Trilinear,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -163,6 +166,31 @@ impl Varyings for TexturedVaryings {
     }
 }
 
+impl SamplingVaryings for TexturedVaryings {
+    fn texture_coordinates(&self) -> crate::math::Vec2 {
+        self.texcoord
+    }
+}
+
+/// A textured shader must use [`Pipeline::draw_with_sampling`] or
+/// [`Pipeline::draw_mesh_with_sampling`]. It has no plain fragment-stage
+/// implementation, so a plain draw cannot silently lose its LOD derivatives.
+///
+/// ```compile_fail
+/// use chimy2::fb::Framebuffer;
+/// use chimy2::image::Texture;
+/// use chimy2::math::Mat4;
+/// use chimy2::mesh::Mesh;
+/// use chimy2::pipeline::Pipeline;
+/// use chimy2::shaders::{TextureFilter, TexturedShader, TexturedUniforms};
+///
+/// let texture = Texture::new(1, 1, vec![[255, 255, 255, 255]]).unwrap();
+/// let mesh = Mesh::parse("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
+/// let mut framebuffer = Framebuffer::new(4, 4);
+/// let mut pipeline = Pipeline::new(TexturedShader, TexturedShader);
+/// let uniforms = TexturedUniforms::new(Mat4::IDENTITY, &texture, TextureFilter::Trilinear);
+/// pipeline.draw_mesh(&mut framebuffer, &mesh, &uniforms);
+/// ```
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TexturedShader;
 
@@ -184,13 +212,23 @@ impl<'a> VertexStage<MeshVertex, TexturedUniforms<'a>> for TexturedShader {
     }
 }
 
-impl<'a> FragmentStage<TexturedVaryings, TexturedUniforms<'a>> for TexturedShader {
-    fn run(&self, varyings: &TexturedVaryings, uniforms: &TexturedUniforms<'a>) -> u32 {
-        let pixel = match uniforms.filter {
-            TextureFilter::Nearest => uniforms.texture.sample_nearest(varyings.texcoord),
-            TextureFilter::Bilinear => uniforms.texture.sample_bilinear(varyings.texcoord),
-        };
-        argb8888(pixel[3], pixel[0], pixel[1], pixel[2])
+impl<'a> SampledFragmentStage<TexturedVaryings, TexturedUniforms<'a>> for TexturedShader {
+    fn run_with_sampling(
+        &self,
+        varyings: &TexturedVaryings,
+        derivatives: &crate::pipeline::SampleDerivatives,
+        uniforms: &TexturedUniforms<'a>,
+    ) -> u32 {
+        let pixel = sample_texture(
+            uniforms.texture,
+            varyings.texcoord,
+            uniforms.filter,
+            TextureDerivatives {
+                ddx: derivatives.ddx,
+                ddy: derivatives.ddy,
+            },
+        );
+        argb8888_linear(pixel[3], [pixel[0], pixel[1], pixel[2]])
     }
 }
 
@@ -202,8 +240,11 @@ pub struct DirectionalLight {
 }
 
 impl DirectionalLight {
-    pub const fn new(direction: Vec3, color: Vec3) -> Self {
-        Self { direction, color }
+    pub fn new(direction: Vec3, color: Vec3) -> Self {
+        Self {
+            direction,
+            color: linearize_color(color),
+        }
     }
 }
 
@@ -217,7 +258,7 @@ pub struct PointLight {
 }
 
 impl PointLight {
-    pub const fn new(
+    pub fn new(
         position: Vec3,
         color: Vec3,
         constant_attenuation: f32,
@@ -226,7 +267,7 @@ impl PointLight {
     ) -> Self {
         Self {
             position,
-            color,
+            color: linearize_color(color),
             constant_attenuation,
             linear_attenuation,
             quadratic_attenuation,
@@ -290,9 +331,9 @@ impl BlinnPhongUniforms {
             model,
             view,
             projection,
-            ambient_color,
-            diffuse_color,
-            specular_color,
+            ambient_color: linearize_color(ambient_color),
+            diffuse_color: linearize_color(diffuse_color),
+            specular_color: linearize_color(specular_color),
             shininess,
             camera_position,
             directional_light,
@@ -430,12 +471,7 @@ impl BlinnPhongShader {
             Vec3::new(1.0, 1.0, 1.0),
         );
 
-        argb8888(
-            255,
-            channel(lighted.x),
-            channel(lighted.y),
-            channel(lighted.z),
-        )
+        argb8888_linear(1.0, [lighted.x, lighted.y, lighted.z])
     }
 }
 
@@ -552,6 +588,12 @@ impl Varyings for TexturedBlinnPhongVaryings {
     }
 }
 
+impl SamplingVaryings for TexturedBlinnPhongVaryings {
+    fn texture_coordinates(&self) -> crate::math::Vec2 {
+        self.texcoord
+    }
+}
+
 impl<'a> VertexStage<MeshVertex, TexturedBlinnPhongUniforms<'a>> for TexturedBlinnPhongShader {
     type Varyings = TexturedBlinnPhongVaryings;
 
@@ -572,23 +614,25 @@ impl<'a> VertexStage<MeshVertex, TexturedBlinnPhongUniforms<'a>> for TexturedBli
     }
 }
 
-impl<'a> FragmentStage<TexturedBlinnPhongVaryings, TexturedBlinnPhongUniforms<'a>>
+impl<'a> SampledFragmentStage<TexturedBlinnPhongVaryings, TexturedBlinnPhongUniforms<'a>>
     for TexturedBlinnPhongShader
 {
-    fn run(
+    fn run_with_sampling(
         &self,
         varyings: &TexturedBlinnPhongVaryings,
+        derivatives: &crate::pipeline::SampleDerivatives,
         uniforms: &TexturedBlinnPhongUniforms<'a>,
     ) -> u32 {
-        let pixel = match uniforms.filter {
-            TextureFilter::Nearest => uniforms.texture.sample_nearest(varyings.texcoord),
-            TextureFilter::Bilinear => uniforms.texture.sample_bilinear(varyings.texcoord),
-        };
-        let albedo = Vec3::new(
-            pixel[0] as f32 / 255.0,
-            pixel[1] as f32 / 255.0,
-            pixel[2] as f32 / 255.0,
+        let pixel = sample_texture(
+            uniforms.texture,
+            varyings.texcoord,
+            uniforms.filter,
+            TextureDerivatives {
+                ddx: derivatives.ddx,
+                ddy: derivatives.ddy,
+            },
         );
+        let albedo = Vec3::new(pixel[0], pixel[1], pixel[2]);
         let lighted = evaluate_lighting(
             varyings.world_position,
             varyings.normal,
@@ -596,17 +640,31 @@ impl<'a> FragmentStage<TexturedBlinnPhongVaryings, TexturedBlinnPhongUniforms<'a
             albedo,
         );
 
-        argb8888(
-            pixel[3],
-            channel(lighted.x),
-            channel(lighted.y),
-            channel(lighted.z),
-        )
+        argb8888_linear(pixel[3], [lighted.x, lighted.y, lighted.z])
     }
 }
 
-fn channel(value: f32) -> u8 {
-    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+fn sample_texture(
+    texture: &Texture,
+    uv: crate::math::Vec2,
+    filter: TextureFilter,
+    derivatives: TextureDerivatives,
+) -> [f32; 4] {
+    match filter {
+        TextureFilter::Nearest => texture.sample_linear_nearest(uv),
+        TextureFilter::Bilinear => texture.sample_linear_bilinear(uv),
+        TextureFilter::Trilinear => {
+            texture.sample_linear_trilinear_with_derivatives(uv, derivatives)
+        }
+    }
+}
+
+fn linearize_color(color: Vec3) -> Vec3 {
+    Vec3::new(
+        srgb_to_linear(color.x),
+        srgb_to_linear(color.y),
+        srgb_to_linear(color.z),
+    )
 }
 
 #[cfg(test)]
@@ -640,7 +698,7 @@ mod tests {
         // The hand calculation is H = normalize((0, 1, 1) + (0, 0, 1)),
         // so N dot H = 0.9238795. With shininess 8, specular is 0.53079,
         // which rounds to 135 in each 8-bit channel.
-        assert_eq!(BlinnPhongShader::shade(&varyings, &uniforms()), 0xff878787);
+        assert_eq!(BlinnPhongShader::shade(&varyings, &uniforms()), 0xffc1c1c1);
     }
 
     #[test]

@@ -47,6 +47,17 @@ pub const fn argb8888(alpha: u8, red: u8, green: u8, blue: u8) -> u32 {
     u32::from_be_bytes([alpha, red, green, blue])
 }
 
+/// Encodes a linear-light shader result at the framebuffer boundary.
+/// Alpha is linear; RGB is encoded to the sRGB presentation format.
+pub fn argb8888_linear(alpha: f32, rgb: [f32; 3]) -> u32 {
+    argb8888(
+        (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+        crate::image::linear_to_srgb(rgb[0]),
+        crate::image::linear_to_srgb(rgb[1]),
+        crate::image::linear_to_srgb(rgb[2]),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

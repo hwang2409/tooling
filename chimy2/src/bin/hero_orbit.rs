@@ -61,11 +61,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             );
             let uniforms =
-                TexturedBlinnPhongUniforms::new(lighting, &texture, TextureFilter::Bilinear);
+                TexturedBlinnPhongUniforms::new(lighting, &texture, TextureFilter::Trilinear);
 
             framebuffer.clear(argb8888(255, 8, 10, 16));
             let mut pipeline = Pipeline::new(TexturedBlinnPhongShader, TexturedBlinnPhongShader);
-            pipeline.draw_mesh(framebuffer, &mesh, &uniforms);
+            pipeline.draw_mesh_with_sampling(framebuffer, &mesh, &uniforms);
         },
     )
 }

@@ -425,10 +425,10 @@ mod tests {
         write_ppm(&path, &framebuffer).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let texture = crate::image::Texture::from_ppm(&bytes).unwrap();
-        assert_eq!(texture.width, 2);
-        assert_eq!(texture.height, 2);
+        assert_eq!(texture.width(), 2);
+        assert_eq!(texture.height(), 2);
         assert_eq!(
-            texture.pixels,
+            texture.pixels(),
             vec![
                 [10, 20, 30, 255],
                 [40, 50, 60, 255],

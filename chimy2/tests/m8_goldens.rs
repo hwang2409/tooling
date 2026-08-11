@@ -11,8 +11,8 @@ use chimy2::shaders::{
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const WIDTH: usize = 64;
-const HEIGHT: usize = 48;
+const WIDTH: usize = 96;
+const HEIGHT: usize = 64;
 
 fn ppm(framebuffer: &Framebuffer) -> Vec<u8> {
     let mut bytes = format!("P6\n{} {}\n255\n", framebuffer.width, framebuffer.height).into_bytes();
@@ -66,76 +66,70 @@ fn background() -> Framebuffer {
     framebuffer
 }
 
-#[test]
-fn perspective_textured_quad_golden() {
-    let texture = Texture::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/checker.qoi"))
+fn checkerboard() -> Texture {
+    let mut pixels = Vec::with_capacity(32 * 32);
+    for y in 0..32 {
+        for x in 0..32 {
+            let value = if (x + y) % 2 == 0 { 245 } else { 10 };
+            pixels.push([value, value, value, 255]);
+        }
+    }
+    Texture::new(32, 32, pixels)
         .unwrap()
-        .with_wrap_mode(WrapMode::Repeat);
-    let camera = camera();
-    let mut framebuffer = background();
-    let uniforms =
-        TexturedUniforms::new(camera.view_projection(), &texture, TextureFilter::Nearest);
-    let mut pipeline = Pipeline::new(TexturedShader, TexturedShader);
-    pipeline.draw_mesh_with_sampling(&mut framebuffer, &foreshortened_quad(), &uniforms);
-    assert_golden("m5-perspective-textured-quad", &framebuffer);
+        .with_wrap_mode(WrapMode::Repeat)
 }
 
 #[test]
-fn bilinear_and_nearest_have_distinct_goldens() {
-    let texture = Texture::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/gradient.qoi"))
-        .unwrap()
-        .with_wrap_mode(WrapMode::ClampToEdge);
-    let camera = camera();
+fn minified_checkerboard_aliased_and_trilinear_goldens() {
+    let texture = checkerboard();
+    let transform = camera().view_projection();
     let mesh = foreshortened_quad();
-    let mut nearest = background();
-    let mut bilinear = background();
-    let mut nearest_pipeline = Pipeline::new(TexturedShader, TexturedShader);
-    nearest_pipeline.draw_mesh_with_sampling(
-        &mut nearest,
+    let mut aliased = background();
+    let mut trilinear = background();
+    let mut aliased_pipeline = Pipeline::new(TexturedShader, TexturedShader);
+    aliased_pipeline.draw_mesh_with_sampling(
+        &mut aliased,
         &mesh,
-        &TexturedUniforms::new(camera.view_projection(), &texture, TextureFilter::Nearest),
+        &TexturedUniforms::new(transform, &texture, TextureFilter::Bilinear),
     );
-    let mut bilinear_pipeline = Pipeline::new(TexturedShader, TexturedShader);
-    bilinear_pipeline.draw_mesh_with_sampling(
-        &mut bilinear,
+    let mut trilinear_pipeline = Pipeline::new(TexturedShader, TexturedShader);
+    trilinear_pipeline.draw_mesh_with_sampling(
+        &mut trilinear,
         &mesh,
-        &TexturedUniforms::new(camera.view_projection(), &texture, TextureFilter::Bilinear),
+        &TexturedUniforms::new(transform, &texture, TextureFilter::Trilinear),
     );
-    assert_ne!(nearest.color, bilinear.color);
-    assert_golden("m5-nearest-textured-quad", &nearest);
-    assert_golden("m5-bilinear-textured-quad", &bilinear);
+    assert_ne!(aliased.color, trilinear.color);
+    assert_golden("m8-checker-aliased", &aliased);
+    assert_golden("m8-checker-trilinear", &trilinear);
 }
 
 #[test]
-fn textured_lit_mesh_golden() {
-    let texture = Texture::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/checker.qoi"))
-        .unwrap()
-        .with_wrap_mode(WrapMode::Repeat);
+fn srgb_gradient_lighting_golden() {
+    let texture = Texture::new(
+        4,
+        4,
+        (0..4)
+            .flat_map(|y| (0..4).map(move |x| [(x * 85) as u8, (y * 85) as u8, 128, 255]))
+            .collect(),
+    )
+    .unwrap()
+    .with_wrap_mode(WrapMode::ClampToEdge);
     let camera = camera();
     let lighting = BlinnPhongUniforms::new(
-        Mat4::rotate(Vec3::new(0.0, 1.0, 0.0), 0.25),
+        Mat4::IDENTITY,
         camera.view_matrix(),
         camera.projection_matrix(),
-        Vec3::new(0.04, 0.04, 0.04),
-        Vec3::new(0.9, 0.9, 0.9),
-        Vec3::new(0.7, 0.7, 0.7),
-        24.0,
+        Vec3::new(0.03, 0.03, 0.03),
+        Vec3::new(0.8, 0.8, 0.8),
+        Vec3::ZERO,
+        8.0,
         camera.position,
-        DirectionalLight::new(
-            Vec3::new(-0.4, 0.7, 1.0).normalize(),
-            Vec3::new(1.0, 0.95, 0.9),
-        ),
-        PointLight::new(
-            Vec3::new(1.0, 2.0, 3.0),
-            Vec3::new(1.0, 0.5, 0.3),
-            1.0,
-            0.08,
-            0.02,
-        ),
+        DirectionalLight::new(Vec3::new(0.0, 0.0, 1.0), Vec3::new(1.0, 1.0, 1.0)),
+        PointLight::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0.0, 0.0),
     );
     let mut framebuffer = background();
     let uniforms = TexturedBlinnPhongUniforms::new(lighting, &texture, TextureFilter::Bilinear);
     let mut pipeline = Pipeline::new(TexturedBlinnPhongShader, TexturedBlinnPhongShader);
     pipeline.draw_mesh_with_sampling(&mut framebuffer, &foreshortened_quad(), &uniforms);
-    assert_golden("m5-textured-lit-mesh", &framebuffer);
+    assert_golden("m8-srgb-gradient-lit", &framebuffer);
 }
