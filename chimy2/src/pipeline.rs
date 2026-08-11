@@ -13,7 +13,7 @@ use crate::raster::{
     PixelRect, RasterState, ScreenVertex, rasterize_triangle_with_sampling_state,
     rasterize_triangle_with_state, triangle_pixel_rect, viewport_transform,
 };
-use crate::skybox::{CubeTexture, render_skybox};
+use crate::skybox::{CubeTexture, render_skybox_with_threads};
 use std::marker::PhantomData;
 use std::thread;
 
@@ -435,7 +435,7 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
             );
         }
         if let Some((cube, camera)) = self.skybox {
-            render_skybox(framebuffer, camera, cube);
+            render_skybox_with_threads(framebuffer, camera, cube, self.pipeline.thread_count);
         }
         for command in self.commands.drain(..) {
             (command.draw)(

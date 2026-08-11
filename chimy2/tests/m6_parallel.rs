@@ -9,6 +9,7 @@ use chimy2::shaders::{
     MeshShader, MeshUniforms, PointLight, TextureFilter, TexturedBlinnPhongShader,
     TexturedBlinnPhongUniforms, TexturedShader, TexturedUniforms,
 };
+use chimy2::skybox::CubeTexture;
 use std::path::Path;
 
 const FLAT_WIDTH: usize = 8;
@@ -116,6 +117,35 @@ fn flat_shared_edge(thread_count: usize) -> Framebuffer {
 fn mesh_framebuffer() -> Framebuffer {
     let mut framebuffer = Framebuffer::new(MESH_WIDTH, MESH_HEIGHT);
     framebuffer.clear(argb8888(255, 12, 16, 24));
+    framebuffer
+}
+
+fn skybox() -> CubeTexture {
+    let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let faces = ["px", "nx", "py", "ny", "pz", "nz"]
+        .map(|name| Texture::load(assets.join(format!("skybox_{name}.qoi"))))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    CubeTexture::new(faces.try_into().unwrap()).unwrap()
+}
+
+fn skybox_scene(thread_count: usize) -> Framebuffer {
+    let mut framebuffer = mesh_framebuffer();
+    let camera = camera();
+    let cube = skybox();
+    let vertices = [
+        Vec4::new(-0.7, -0.6, 0.0, 1.0),
+        Vec4::new(0.7, -0.6, 0.0, 1.0),
+        Vec4::new(0.0, 0.7, 0.0, 1.0),
+    ];
+    let uniforms = FlatColorUniforms::new(Mat4::IDENTITY, argb8888(255, 245, 245, 245));
+    let mut pipeline = Pipeline::new(FlatColorShader, FlatColorShader);
+    pipeline.set_thread_count(thread_count);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_skybox(target, &cube, camera);
+        frame.draw(target, &vertices, &[[0, 1, 2]], &uniforms);
+    });
     framebuffer
 }
 
@@ -592,6 +622,7 @@ fn every_golden_scene_is_byte_identical_with_multiple_thread_counts() {
         ("m5-nearest-textured-quad", m5_nearest_gradient),
         ("m5-bilinear-textured-quad", m5_bilinear_gradient),
         ("m5-textured-lit-mesh", m5_lit),
+        ("skybox-background", skybox_scene),
     ];
     let thread_counts = [2, 3, 15];
     for &(name, render) in scenes {

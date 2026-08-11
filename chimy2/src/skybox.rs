@@ -20,8 +20,9 @@
 use crate::camera::Camera;
 use crate::fb::{Framebuffer, argb8888_linear};
 use crate::image::{ColorSpace, Texture, WrapMode};
-use crate::math::{Vec2, Vec3, Vec4};
+use crate::math::{Mat4, Vec2, Vec3, Vec4};
 use std::fmt::{Display, Formatter};
+use std::thread;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CubeFace {
@@ -188,12 +189,21 @@ pub fn skybox_ray(
     if width == 0 || height == 0 {
         return camera.forward();
     }
+    let inverse = inverse_view_projection(camera);
+    skybox_ray_with_inverse(camera, inverse, pixel_x, pixel_y, width, height)
+}
+
+fn skybox_ray_with_inverse(
+    camera: Camera,
+    inverse: Mat4,
+    pixel_x: usize,
+    pixel_y: usize,
+    width: usize,
+    height: usize,
+) -> Vec3 {
     let ndc_x = ((pixel_x as f32 + 0.5) / width as f32) * 2.0 - 1.0;
     let ndc_y = 1.0 - ((pixel_y as f32 + 0.5) / height as f32) * 2.0;
     let clip_far = Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
-    let inverse = (camera.projection_matrix() * camera.view_matrix())
-        .inverse()
-        .unwrap_or(Mat4::IDENTITY);
     let world_far = inverse * clip_far;
     let world_far = if world_far.w == 0.0 {
         Vec3::new(world_far.x, world_far.y, world_far.z)
@@ -207,32 +217,90 @@ pub fn skybox_ray(
     (world_far - camera.position).normalize()
 }
 
+fn inverse_view_projection(camera: Camera) -> Mat4 {
+    (camera.projection_matrix() * camera.view_matrix())
+        .inverse()
+        .unwrap_or(Mat4::IDENTITY)
+}
+
 /// Draws the sky after opaque commands and before transparent commands.
 ///
 /// The pass tests against the cleared far depth and never writes depth. Opaque
 /// geometry therefore remains visible, while transparent geometry can blend
 /// over the sky in the normal queued order.
 pub fn render_skybox(framebuffer: &mut Framebuffer, camera: Camera, cube: &CubeTexture) {
-    for y in 0..framebuffer.height {
-        for x in 0..framebuffer.width {
-            let index = y * framebuffer.width + x;
-            if framebuffer.depth[index] < 1.0 {
+    render_skybox_with_threads(framebuffer, camera, cube, 1);
+}
+
+pub(crate) fn render_skybox_with_threads(
+    framebuffer: &mut Framebuffer,
+    camera: Camera,
+    cube: &CubeTexture,
+    thread_count: usize,
+) {
+    if framebuffer.width == 0 || framebuffer.height == 0 {
+        return;
+    }
+    let inverse = inverse_view_projection(camera);
+    let pass = SkyboxPass {
+        camera,
+        inverse,
+        cube,
+        width: framebuffer.width,
+        height: framebuffer.height,
+    };
+    if thread_count <= 1 {
+        pass.render_rows(&mut framebuffer.color, &framebuffer.depth, 0);
+        return;
+    }
+
+    // The sky is a full-screen pass, not a triangle draw. Use the pipeline's
+    // worker count with disjoint row strips to keep the pass deterministic.
+    let worker_count = thread_count.min(framebuffer.height).max(1);
+    let rows_per_worker = framebuffer.height.div_ceil(worker_count);
+    let depth = &framebuffer.depth;
+    let color = &mut framebuffer.color;
+    thread::scope(|scope| {
+        for (worker_index, color_rows) in color.chunks_mut(rows_per_worker * pass.width).enumerate()
+        {
+            let start_y = worker_index * rows_per_worker;
+            scope.spawn(move || {
+                pass.render_rows(color_rows, depth, start_y);
+            });
+        }
+    });
+}
+
+#[derive(Clone, Copy)]
+struct SkyboxPass<'a> {
+    camera: Camera,
+    inverse: Mat4,
+    cube: &'a CubeTexture,
+    width: usize,
+    height: usize,
+}
+
+impl SkyboxPass<'_> {
+    fn render_rows(self, color_rows: &mut [u32], depth: &[f32], start_y: usize) {
+        for (local_index, color) in color_rows.iter_mut().enumerate() {
+            let y = start_y + local_index / self.width;
+            let x = local_index % self.width;
+            let index = y * self.width + x;
+            if depth[index] < 1.0 {
                 continue;
             }
-            let sample = cube.sample(skybox_ray(
-                camera,
+            let sample = self.cube.sample(skybox_ray_with_inverse(
+                self.camera,
+                self.inverse,
                 x,
                 y,
-                framebuffer.width,
-                framebuffer.height,
+                self.width,
+                self.height,
             ));
-            framebuffer.color[index] =
-                argb8888_linear(sample[3], [sample[0], sample[1], sample[2]]);
+            *color = argb8888_linear(sample[3], [sample[0], sample[1], sample[2]]);
         }
     }
 }
-
-use crate::math::Mat4;
 
 #[cfg(test)]
 mod tests {

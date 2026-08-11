@@ -25,7 +25,9 @@ sorts and renders opaque commands first. It then runs the sky pass, followed by
 transparent commands. The pass computes a far-plane ray with the inverse
 view-projection matrix. It subtracts the camera position before normalization,
 so translation does not move the sky. It tests the cleared far depth and does
-not write depth. Opaque geometry therefore occludes the sky.
+not write depth. Opaque geometry therefore occludes the sky. The pass uses the
+pipeline worker count over disjoint row strips. This keeps output deterministic
+and avoids a serial full-screen bottleneck.
 
 `EnvironmentBlinnPhongShader` uses the existing Blinn-Phong evaluator. It gets
 the surface-to-camera vector in world space, reflects its incident negation

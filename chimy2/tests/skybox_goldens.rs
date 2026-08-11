@@ -3,10 +3,12 @@ use chimy2::demo::uv_sphere;
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::image::Texture;
 use chimy2::math::{Mat4, Quat, Vec3, Vec4};
+use chimy2::mesh::Mesh;
 use chimy2::pipeline::Pipeline;
 use chimy2::shaders::{
     BlinnPhongUniforms, DirectionalLight, EnvironmentBlinnPhongShader,
-    EnvironmentBlinnPhongUniforms, FlatColorShader, FlatColorUniforms, PointLight,
+    EnvironmentBlinnPhongUniforms, FlatColorShader, FlatColorUniforms, MeshShader, MeshUniforms,
+    PointLight,
 };
 use chimy2::skybox::CubeTexture;
 use std::fs;
@@ -99,6 +101,37 @@ fn opaque_mesh_occludes_skybox_golden() {
     });
     assert!(framebuffer.depth.iter().any(|&depth| depth < 1.0));
     assert_golden("skybox-opaque-occlusion", &framebuffer);
+}
+
+#[test]
+fn opaque_sky_transparent_overlap_golden() {
+    let cube = cube();
+    let camera = camera(Quat::IDENTITY);
+    let opaque = Mesh::parse("v -0.55 -0.5 0\nv 0.55 -0.5 0\nv 0 0.6 0\nf 1 2 3\n").unwrap();
+    let transparent =
+        Mesh::parse("v -0.9 -0.8 0.5\nv 0.9 -0.8 0.5\nv 0 0.85 0.5\nf 1 2 3\n").unwrap();
+    let opaque_uniforms = MeshUniforms::new(
+        Mat4::IDENTITY,
+        Mat4::IDENTITY,
+        Mat4::IDENTITY,
+        argb8888(255, 245, 245, 245),
+    );
+    let mut transparent_uniforms = MeshUniforms::new(
+        Mat4::IDENTITY,
+        Mat4::IDENTITY,
+        Mat4::IDENTITY,
+        argb8888(255, 40, 90, 235),
+    );
+    transparent_uniforms.set_alpha(0.5);
+    let mut framebuffer = Framebuffer::new(WIDTH, HEIGHT);
+    framebuffer.clear(argb8888(255, 1, 2, 3));
+    let mut pipeline = Pipeline::new(MeshShader, MeshShader);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        frame.draw_skybox(target, &cube, camera);
+        frame.draw_mesh(target, &opaque, &opaque_uniforms);
+        frame.draw_mesh(target, &transparent, &transparent_uniforms);
+    });
+    assert_golden("skybox-mixed-transparent", &framebuffer);
 }
 
 #[test]
