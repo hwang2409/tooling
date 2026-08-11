@@ -1,8 +1,9 @@
 use chimy2::camera::OrbitController;
 use chimy2::fb::{Framebuffer, argb8888};
-use chimy2::gltf::{GltfAsset, submit_gltf_draws};
+use chimy2::gltf::{GltfAlphaMode, GltfAsset, GltfDraw, GltfMaterial, submit_gltf_draws};
 use chimy2::image::Texture;
-use chimy2::math::Vec3;
+use chimy2::math::{Mat4, Vec3, Vec4};
+use chimy2::mesh::{Mesh, MeshVertex};
 use std::fs;
 use std::path::Path;
 
@@ -70,4 +71,56 @@ fn gltf_arm_bind_pose_golden() {
 #[test]
 fn gltf_arm_animated_pose_golden() {
     assert_golden("gltf-arm-t1.ppm", Some(0), 1.0);
+}
+
+fn render_base_color(factor: Vec4) -> Framebuffer {
+    let mesh = Mesh::new(
+        vec![
+            MeshVertex::new(Vec3::new(-0.8, -0.8, 0.0), None, None),
+            MeshVertex::new(Vec3::new(0.8, -0.8, 0.0), None, None),
+            MeshVertex::new(Vec3::new(0.0, 0.8, 0.0), None, None),
+        ],
+        vec![[0, 1, 2]],
+    );
+    let asset = GltfAsset {
+        meshes: Vec::new(),
+        nodes: Vec::new(),
+        scenes: Vec::new(),
+        skins: Vec::new(),
+        animations: Vec::new(),
+        materials: vec![GltfMaterial {
+            name: String::new(),
+            base_color_factor: factor,
+            metallic_factor: 0.0,
+            roughness_factor: 0.5,
+            albedo_texture: None,
+            normal_map_texture: None,
+            alpha_mode: GltfAlphaMode::Opaque,
+            alpha_cutoff: 0.5,
+        }],
+        default_scene: 0,
+    };
+    let draw = GltfDraw {
+        mesh,
+        model: Mat4::IDENTITY,
+        material: Some(0),
+    };
+    let mut framebuffer = Framebuffer::new(32, 32);
+    submit_gltf_draws(
+        &mut framebuffer,
+        &asset,
+        &[draw],
+        Mat4::IDENTITY,
+        Mat4::IDENTITY,
+        Vec3::new(0.0, 0.0, 1.0),
+    )
+    .unwrap();
+    framebuffer
+}
+
+#[test]
+fn gltf_material_base_color_reaches_rendering() {
+    let red = render_base_color(Vec4::new(1.0, 0.0, 0.0, 1.0));
+    let blue = render_base_color(Vec4::new(0.0, 0.0, 1.0, 1.0));
+    assert_ne!(red.color, blue.color);
 }
