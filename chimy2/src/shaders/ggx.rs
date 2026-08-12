@@ -399,7 +399,8 @@ fn evaluate_direct_ggx_lighting(
     let normal = interpolated_normal.normalize();
     let view_direction = (lighting.camera_position - world_position).normalize();
     let mut lighted = Vec3::ZERO;
-    let directional_visibility = lighting.shadow_visibility(light_space_position, normal);
+    let directional_visibility =
+        lighting.shadow_visibility(world_position, light_space_position, normal);
 
     for (index, light) in lighting.directional_lights().iter().enumerate() {
         let visibility = if index == 0 {

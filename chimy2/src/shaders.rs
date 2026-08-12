@@ -12,7 +12,7 @@ use crate::mesh::MeshVertex;
 use crate::pipeline::{
     FragmentStage, SampledFragmentStage, SamplingVaryings, Varyings, VertexOutput, VertexStage,
 };
-use crate::shadow::{CubeShadowState, ShadowMap, ShadowState};
+use crate::shadow::{CascadeShadowState, CubeShadowState, ShadowMap, ShadowState};
 use crate::skybox::CubeTexture;
 
 mod ggx;
@@ -708,6 +708,10 @@ impl BlinnPhongUniforms {
         self.shadow_state.as_ref().map(ShadowState::shadow_map)
     }
 
+    pub fn cascaded_shadow(&self) -> Option<&CascadeShadowState> {
+        self.shadow_state.as_ref().and_then(ShadowState::cascades)
+    }
+
     pub const fn shadow_bias(&self) -> (f32, f32) {
         match &self.shadow_state {
             Some(state) => state.bias(),
@@ -733,6 +737,18 @@ impl BlinnPhongUniforms {
         self.shadow_state = shadow_state;
     }
 
+    /// Replaces directional light zero with an opt-in cascaded shadow state.
+    pub fn set_directional_cascaded_shadow(
+        &mut self,
+        directional_light: DirectionalLight,
+        cascades: CascadeShadowState,
+    ) {
+        self.set_directional_shadow(
+            directional_light,
+            Some(ShadowState::from_cascades(cascades)),
+        );
+    }
+
     pub fn set_model(&mut self, model: Mat4) {
         self.model = model;
         self.rebuild_caches();
@@ -741,11 +757,25 @@ impl BlinnPhongUniforms {
     pub fn set_view(&mut self, view: Mat4) {
         self.view = view;
         self.rebuild_transform();
+        if self
+            .shadow_state
+            .as_ref()
+            .is_some_and(ShadowState::is_cascaded)
+        {
+            self.shadow_state = None;
+        }
     }
 
     pub fn set_projection(&mut self, projection: Mat4) {
         self.projection = projection;
         self.rebuild_transform();
+        if self
+            .shadow_state
+            .as_ref()
+            .is_some_and(ShadowState::is_cascaded)
+        {
+            self.shadow_state = None;
+        }
     }
 
     pub fn set_alpha(&mut self, alpha: f32) {
@@ -983,7 +1013,8 @@ fn evaluate_lighting(
     let view_direction = (uniforms.camera_position - world_position).normalize();
     let mut lighted = uniforms.ambient_color * albedo;
 
-    let directional_visibility = uniforms.shadow_visibility(light_space_position, normal);
+    let directional_visibility =
+        uniforms.shadow_visibility(world_position, light_space_position, normal);
     // The renderer has one shadow map, and it belongs to directional light zero.
     for (index, light) in uniforms.directional_lights().iter().enumerate() {
         let visibility = if index == 0 {
@@ -1045,10 +1076,29 @@ fn point_light_shadow_visibility(
 }
 
 impl BlinnPhongUniforms {
-    fn shadow_visibility(&self, light_space_position: Vec4, normal: Vec3) -> f32 {
+    pub(crate) fn shadow_visibility(
+        &self,
+        world_position: Vec3,
+        light_space_position: Vec4,
+        normal: Vec3,
+    ) -> f32 {
         let Some(shadow_state) = self.shadow_state.as_ref() else {
             return 1.0;
         };
+        if let Some(cascades) = shadow_state.cascades() {
+            let view_position =
+                self.view * Vec4::new(world_position.x, world_position.y, world_position.z, 1.0);
+            if view_position.w == 0.0 || !view_position.w.is_finite() {
+                return 1.0;
+            }
+            let view_depth = -view_position.z / view_position.w;
+            return cascades.visibility(
+                world_position,
+                view_depth,
+                normal,
+                self.directional_light().direction,
+            );
+        }
         let shadow_map = shadow_state.shadow_map();
         if light_space_position.w <= 0.0 || !light_space_position.w.is_finite() {
             return 1.0;

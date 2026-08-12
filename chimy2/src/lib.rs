@@ -1,5 +1,6 @@
 pub mod camera;
 pub mod clip;
+pub mod csm;
 pub mod fb;
 pub mod gltf;
 pub mod ibl;
@@ -23,6 +24,9 @@ pub mod demo;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod point_shadow_scene;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cascaded_shadow_scene;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod present;
