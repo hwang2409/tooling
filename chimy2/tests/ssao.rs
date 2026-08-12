@@ -193,8 +193,9 @@ fn range_check_rejects_far_background_halo() {
 
 #[test]
 fn edge_aware_blur_rejects_silhouette_bleed() {
-    // Mutation gate: dropping the depth edge guard makes the far pixel receive
-    // 0.24305554 occlusion and fails the assertion below.
+    // Mutation gates: removing the tap-level axis threshold makes the far
+    // pixel receive 0.109375 occlusion. Removing the perpendicular pre-guard
+    // makes it receive 0.24305554. Both mutants fail the assertion below.
     let projection = projection();
     let inverse_projection = projection.inverse().expect("projection is invertible");
     let mut framebuffer = plane_depth(-8.0);

@@ -567,12 +567,21 @@ impl SsaoPass {
         let Some(center_position) = positions[center_index] else {
             return 0.0;
         };
-        for (nx, ny) in [
-            (x.checked_sub(1), Some(y)),
-            (x.checked_add(1).filter(|&value| value < width), Some(y)),
-            (Some(x), y.checked_sub(1)),
-            (Some(x), y.checked_add(1).filter(|&value| value < height)),
-        ] {
+        // The pre-guard protects the cross-axis edge. Axis taps are checked
+        // below so each separable blur direction keeps its own load-bearing
+        // depth threshold.
+        let perpendicular_neighbors = if horizontal {
+            [
+                (Some(x), y.checked_sub(1)),
+                (Some(x), y.checked_add(1).filter(|&value| value < height)),
+            ]
+        } else {
+            [
+                (x.checked_sub(1), Some(y)),
+                (x.checked_add(1).filter(|&value| value < width), Some(y)),
+            ]
+        };
+        for (nx, ny) in perpendicular_neighbors {
             let (Some(nx), Some(ny)) = (nx, ny) else {
                 continue;
             };
