@@ -436,11 +436,13 @@ impl CascadeShadowState {
             .normalize()
             .dot(light_direction.normalize())
             .clamp(0.0, 1.0);
-        let texel_size = 2.0 / map.width().max(1) as f32;
-        let bias = self.constant_bias.max(
-            self.slope_bias * (1.0 - normal_dot_light)
-                + texel_size * (1.0 - normal_dot_light) * 0.5,
-        );
+        // The depth offset scales with this cascade's texel footprint. This
+        // keeps the slope term stable as cascade resolution and extent vary.
+        let texel_depth = 2.0 / map.height().max(1) as f32;
+        let depth_offset = texel_depth * 0.1;
+        let bias = self
+            .constant_bias
+            .max(self.slope_bias * (1.0 - normal_dot_light) + depth_offset);
         map.visibility_3x3(uv, ndc.z, bias)
     }
 }
