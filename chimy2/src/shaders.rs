@@ -14,7 +14,9 @@ use crate::pipeline::{
 use crate::shadow::{ShadowMap, ShadowState};
 use crate::skybox::CubeTexture;
 
+mod ggx;
 pub mod shader_pack;
+pub use ggx::*;
 pub use shader_pack::{
     BAYER4, DepthFogShader, DepthFogUniforms, DitherShader, DitherUniforms, FogShader, FogUniforms,
     NormalsAsColorShader, NormalsAsColorUniforms, NormalsShader, NormalsUniforms,

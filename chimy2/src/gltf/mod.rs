@@ -14,10 +14,10 @@ use crate::pipeline::{
     VertexStage,
 };
 use crate::shaders::{
-    BlinnPhongShader, BlinnPhongUniforms, BlinnPhongVaryings, DirectionalLight,
-    NormalMappedBlinnPhongShader, NormalMappedBlinnPhongUniforms, NormalMappedBlinnPhongVaryings,
-    PointLight, TextureFilter, TexturedBlinnPhongShader, TexturedBlinnPhongUniforms,
-    TexturedBlinnPhongVaryings,
+    BlinnPhongUniforms, CookTorranceShader, CookTorranceUniforms, CookTorranceVaryings,
+    DirectionalLight, NormalMappedBlinnPhongVaryings, NormalMappedCookTorranceShader,
+    NormalMappedCookTorranceUniforms, PointLight, TextureFilter, TexturedBlinnPhongVaryings,
+    TexturedCookTorranceShader, TexturedCookTorranceUniforms,
 };
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -175,64 +175,49 @@ pub enum GltfAlphaMode {
 
 #[derive(Clone, Copy)]
 struct GltfMaterialParameters {
-    diffuse: Vec3,
-    specular: Vec3,
-    shininess: f32,
+    base_color: Vec3,
+    metallic: f32,
+    roughness: f32,
     alpha: f32,
 }
 
 const DEFAULT_GLTF_MATERIAL: GltfMaterialParameters = GltfMaterialParameters {
-    diffuse: Vec3::ZERO,
-    specular: Vec3::new(1.0, 1.0, 1.0),
-    shininess: 1.0,
+    base_color: Vec3::new(1.0, 1.0, 1.0),
+    metallic: 1.0,
+    roughness: 1.0,
     alpha: 1.0,
 };
 
 impl GltfMaterial {
-    /// Maps the parked metallic and roughness values to the current shader.
-    /// Diffuse uses baseColorFactor.rgb. Specular is 4% for dielectrics and
-    /// approaches white for metallic materials. Roughness maps to a
-    /// Blinn-Phong exponent in the range 1..129.
-    pub fn blinn_phong_parameters(&self) -> (Vec3, Vec3, f32, f32) {
-        let metallic = self.metallic_factor.clamp(0.0, 1.0);
-        let roughness = self.roughness_factor.clamp(0.0, 1.0);
-        let diffuse = Vec3::new(
-            self.base_color_factor.x,
-            self.base_color_factor.y,
-            self.base_color_factor.z,
-        ) * (1.0 - metallic);
-        let specular = Vec3::new(
-            0.04 + 0.96 * metallic,
-            0.04 + 0.96 * metallic,
-            0.04 + 0.96 * metallic,
-        );
-        let shininess = 1.0 + (1.0 - roughness) * 128.0;
-        (
-            diffuse,
-            specular,
-            shininess,
-            self.base_color_factor.w.clamp(0.0, 1.0),
-        )
+    /// Returns glTF PBR factors without converting them to Blinn-Phong.
+    /// Base color and scalar factors remain linear at the GGX boundary.
+    fn ggx_parameters(&self) -> GltfMaterialParameters {
+        GltfMaterialParameters {
+            base_color: Vec3::new(
+                self.base_color_factor.x,
+                self.base_color_factor.y,
+                self.base_color_factor.z,
+            ),
+            metallic: self.metallic_factor,
+            roughness: self.roughness_factor,
+            alpha: match self.alpha_mode {
+                GltfAlphaMode::Opaque => 1.0,
+                GltfAlphaMode::Blend | GltfAlphaMode::Mask => {
+                    self.base_color_factor.w.clamp(0.0, 1.0)
+                }
+            },
+        }
     }
 
     fn render_parameters(&self) -> GltfMaterialParameters {
-        let (diffuse, specular, shininess, alpha) = self.blinn_phong_parameters();
-        GltfMaterialParameters {
-            diffuse,
-            specular,
-            shininess,
-            alpha: match self.alpha_mode {
-                GltfAlphaMode::Opaque => 1.0,
-                GltfAlphaMode::Blend | GltfAlphaMode::Mask => alpha,
-            },
-        }
+        self.ggx_parameters()
     }
 }
 
 enum GltfUniformKind<'a> {
-    Plain(BlinnPhongUniforms),
-    Textured(TexturedBlinnPhongUniforms<'a>),
-    NormalMapped(NormalMappedBlinnPhongUniforms<'a>),
+    Plain(CookTorranceUniforms),
+    Textured(TexturedCookTorranceUniforms<'a>),
+    NormalMapped(NormalMappedCookTorranceUniforms<'a>),
 }
 
 struct GltfUniforms<'a> {
@@ -242,7 +227,7 @@ struct GltfUniforms<'a> {
 
 #[derive(Clone)]
 enum GltfVaryings {
-    Plain(BlinnPhongVaryings),
+    Plain(CookTorranceVaryings),
     Textured(TexturedBlinnPhongVaryings),
     NormalMapped(NormalMappedBlinnPhongVaryings),
 }
@@ -254,7 +239,7 @@ impl Varyings for GltfVaryings {
     fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self {
         match (a, b, c) {
             (Self::Plain(a), Self::Plain(b), Self::Plain(c)) => {
-                Self::Plain(BlinnPhongVaryings::lerp3(a, b, c, weights))
+                Self::Plain(CookTorranceVaryings::lerp3(a, b, c, weights))
             }
             (Self::Textured(a), Self::Textured(b), Self::Textured(c)) => {
                 Self::Textured(TexturedBlinnPhongVaryings::lerp3(a, b, c, weights))
@@ -287,18 +272,18 @@ impl<'a> VertexStage<MeshVertex, GltfUniforms<'a>> for GltfShader {
     ) -> VertexOutput<Self::Varyings> {
         match &uniforms.kind {
             GltfUniformKind::Plain(uniforms) => {
-                let output = VertexStage::run(&BlinnPhongShader, vertex, uniforms);
+                let output = VertexStage::run(&CookTorranceShader, vertex, uniforms);
                 VertexOutput::new(output.clip_position, GltfVaryings::Plain(output.varyings))
             }
             GltfUniformKind::Textured(uniforms) => {
-                let output = TexturedBlinnPhongShader.run(vertex, uniforms);
+                let output = TexturedCookTorranceShader.run(vertex, uniforms);
                 VertexOutput::new(
                     output.clip_position,
                     GltfVaryings::Textured(output.varyings),
                 )
             }
             GltfUniformKind::NormalMapped(uniforms) => {
-                let output = NormalMappedBlinnPhongShader.run(vertex, uniforms);
+                let output = NormalMappedCookTorranceShader.run(vertex, uniforms);
                 VertexOutput::new(
                     output.clip_position,
                     GltfVaryings::NormalMapped(output.varyings),
@@ -317,11 +302,11 @@ impl<'a> SampledFragmentStage<GltfVaryings, GltfUniforms<'a>> for GltfShader {
     ) -> u32 {
         match (&gltf_uniforms.kind, varyings) {
             (GltfUniformKind::Plain(uniforms), GltfVaryings::Plain(varyings)) => {
-                FragmentStage::run(&BlinnPhongShader, varyings, uniforms)
+                FragmentStage::run(&CookTorranceShader, varyings, uniforms)
             }
             (GltfUniformKind::Textured(uniforms), GltfVaryings::Textured(varyings)) => {
                 let pixel =
-                    TexturedBlinnPhongShader.run_with_sampling(varyings, derivatives, uniforms);
+                    TexturedCookTorranceShader.run_with_sampling(varyings, derivatives, uniforms);
                 if gltf_uniforms.alpha_mode == GltfAlphaMode::Opaque {
                     force_opaque_alpha(pixel)
                 } else {
@@ -329,8 +314,11 @@ impl<'a> SampledFragmentStage<GltfVaryings, GltfUniforms<'a>> for GltfShader {
                 }
             }
             (GltfUniformKind::NormalMapped(uniforms), GltfVaryings::NormalMapped(varyings)) => {
-                let pixel =
-                    NormalMappedBlinnPhongShader.run_with_sampling(varyings, derivatives, uniforms);
+                let pixel = NormalMappedCookTorranceShader.run_with_sampling(
+                    varyings,
+                    derivatives,
+                    uniforms,
+                );
                 if gltf_uniforms.alpha_mode == GltfAlphaMode::Opaque {
                     force_opaque_alpha(pixel)
                 } else {
@@ -349,20 +337,20 @@ impl<'a> SampledFragmentStage<GltfVaryings, GltfUniforms<'a>> for GltfShader {
             return false;
         }
         match &uniforms.kind {
-            GltfUniformKind::Plain(uniforms) => BlinnPhongShader.is_opaque(uniforms),
-            GltfUniformKind::Textured(uniforms) => TexturedBlinnPhongShader.is_opaque(uniforms),
+            GltfUniformKind::Plain(uniforms) => CookTorranceShader.is_opaque(uniforms),
+            GltfUniformKind::Textured(uniforms) => TexturedCookTorranceShader.is_opaque(uniforms),
             GltfUniformKind::NormalMapped(uniforms) => {
-                NormalMappedBlinnPhongShader.is_opaque(uniforms)
+                NormalMappedCookTorranceShader.is_opaque(uniforms)
             }
         }
     }
 
     fn model_view(&self, uniforms: &GltfUniforms<'a>) -> Option<Mat4> {
         match &uniforms.kind {
-            GltfUniformKind::Plain(uniforms) => BlinnPhongShader.model_view(uniforms),
-            GltfUniformKind::Textured(uniforms) => TexturedBlinnPhongShader.model_view(uniforms),
+            GltfUniformKind::Plain(uniforms) => CookTorranceShader.model_view(uniforms),
+            GltfUniformKind::Textured(uniforms) => TexturedCookTorranceShader.model_view(uniforms),
             GltfUniformKind::NormalMapped(uniforms) => {
-                NormalMappedBlinnPhongShader.model_view(uniforms)
+                NormalMappedCookTorranceShader.model_view(uniforms)
             }
         }
     }
@@ -414,8 +402,13 @@ pub fn submit_gltf_draws(
         );
         let kind = if let (Some(albedo), Some(normal_map)) = (albedo, normal_map) {
             GltfUniformKind::NormalMapped(
-                NormalMappedBlinnPhongUniforms::new(
-                    lighting,
+                NormalMappedCookTorranceUniforms::new(
+                    CookTorranceUniforms::new_with_linear_base_color(
+                        lighting,
+                        parameters.base_color,
+                        parameters.metallic,
+                        parameters.roughness,
+                    ),
                     albedo,
                     normal_map,
                     TextureFilter::Bilinear,
@@ -423,13 +416,23 @@ pub fn submit_gltf_draws(
                 .map_err(GltfError::new)?,
             )
         } else if let Some(albedo) = albedo {
-            GltfUniformKind::Textured(TexturedBlinnPhongUniforms::new(
-                lighting,
+            GltfUniformKind::Textured(TexturedCookTorranceUniforms::new(
+                CookTorranceUniforms::new_with_linear_base_color(
+                    lighting,
+                    parameters.base_color,
+                    parameters.metallic,
+                    parameters.roughness,
+                ),
                 albedo,
                 TextureFilter::Bilinear,
             ))
         } else {
-            GltfUniformKind::Plain(lighting)
+            GltfUniformKind::Plain(CookTorranceUniforms::new_with_linear_base_color(
+                lighting,
+                parameters.base_color,
+                parameters.metallic,
+                parameters.roughness,
+            ))
         };
         uniforms.push(GltfUniforms {
             kind,
@@ -460,10 +463,10 @@ fn make_gltf_lighting(
         model,
         view,
         projection,
-        parameters.diffuse * 0.1,
-        parameters.diffuse,
-        parameters.specular,
-        parameters.shininess,
+        parameters.base_color * 0.1,
+        parameters.base_color,
+        Vec3::ZERO,
+        0.0,
         camera_position,
         directional,
         point,

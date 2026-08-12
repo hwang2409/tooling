@@ -36,9 +36,11 @@ seam.
 
 `baseColorFactor` and `baseColorTexture` provide albedo. Albedo textures use
 sRGB decoding. `normalTexture` uses linear decoding. Metallic and roughness
-are read but parked until the PBR renderer: metallic maps 4% dielectric
-specular toward white, and roughness maps to a Blinn-Phong exponent from 1 to
-129.
+feed the Cook-Torrance GGX shader directly. Base color factors and scalar
+factors stay linear. Roughness uses the Disney `alpha = roughness^2`
+convention, with a 0.045 floor; direct lighting uses Schlick-GGX geometry with
+`k = alpha / 2`. The renderer clamps bright specular values at its single
+sRGB encode until the later HDR milestone.
 
 The committed `assets/arm.gltf` is a two-bone, hand-authored test asset. The
 viewer uses the same scene and mesh submission path as headless tests:
