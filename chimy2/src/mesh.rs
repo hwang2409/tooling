@@ -800,27 +800,16 @@ pub fn simplify_qem(mesh: &Mesh, target_triangles: usize) -> Mesh {
             let quadric = quadrics[a] + quadrics[b];
             // Midpoints avoid unstable nearly-singular quadric solves and
             // keep attribute interpolation deterministic across platforms.
-            let midpoint_position = sphere_radius
+            let position = sphere_radius
                 .filter(|_| midpoint.length() > f32::EPSILON)
                 .map_or(midpoint, |radius| midpoint.normalize() * radius);
-            let options = [
-                (
-                    quadric.evaluate(vertices[a].position()),
-                    vertices[a].position(),
-                ),
-                (
-                    quadric.evaluate(vertices[b].position()),
-                    vertices[b].position(),
-                ),
-                (quadric.evaluate(midpoint_position), midpoint_position),
-            ];
-            let (error, position) = options
-                .into_iter()
-                .filter(|(error, _)| error.is_finite())
-                .min_by(|(left, _), (right, _)| left.total_cmp(right))
-                .unwrap_or((f32::MAX, midpoint_position));
+            let error = quadric.evaluate(position);
             queue.push(CollapseCandidate {
-                error: error.max(0.0),
+                error: if error.is_finite() {
+                    error.max(0.0)
+                } else {
+                    f32::MAX
+                },
                 edge_index: edge_indices[edge_index],
                 a,
                 b,
