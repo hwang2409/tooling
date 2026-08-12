@@ -284,23 +284,28 @@ where
         (0..size * size)
             .map(|index| {
                 let normal = direction_for_texel(face, index % size, index / size, size);
-                let (tangent, bitangent) = basis(normal);
-                let mut sum = Vec3::ZERO;
-                for sample_index in 0..settings.irradiance_samples {
-                    let xi = hammersley(sample_index, settings.irradiance_samples);
-                    let radius = xi.x.sqrt();
-                    let phi = 2.0 * PI * xi.y;
-                    let local =
-                        Vec3::new(radius * phi.cos(), radius * phi.sin(), (1.0 - xi.x).sqrt());
-                    let direction =
-                        (tangent * local.x + bitangent * local.y + normal * local.z).normalize();
-                    sum = sum + sample(direction);
-                }
-                sum / settings.irradiance_samples as f32
+                integrate_irradiance(sample, normal, settings.irradiance_samples)
             })
             .collect()
     });
     FloatCube::new(size, faces)
+}
+
+fn integrate_irradiance<S>(sample: S, normal: Vec3, sample_count: usize) -> Vec3
+where
+    S: Fn(Vec3) -> Vec3 + Copy,
+{
+    let (tangent, bitangent) = basis(normal);
+    let mut sum = Vec3::ZERO;
+    for sample_index in 0..sample_count {
+        let xi = hammersley(sample_index, sample_count);
+        let radius = xi.x.sqrt();
+        let phi = 2.0 * PI * xi.y;
+        let local = Vec3::new(radius * phi.cos(), radius * phi.sin(), (1.0 - xi.x).sqrt());
+        let direction = (tangent * local.x + bitangent * local.y + normal * local.z).normalize();
+        sum = sum + sample(direction);
+    }
+    sum / sample_count as f32
 }
 
 fn bake_prefiltered<S>(sample: S, settings: IblSettings) -> PrefilteredEnvironment
@@ -401,7 +406,9 @@ fn integrate_brdf(n_dot_v: f32, roughness: f32, sample_count: usize) -> Vec2 {
 }
 
 fn smith_visibility(n_dot_l: f32, n_dot_v: f32, roughness: f32) -> f32 {
-    let k = (roughness + 1.0).powi(2) / 8.0;
+    // Karis's IBL remap uses alpha = roughness^2, unlike the direct-light
+    // remap. This keeps grazing-angle split-sum energy from getting too dark.
+    let k = roughness.clamp(0.0, 1.0).powi(2) * 0.5;
     let one = |n_dot: f32| n_dot / (n_dot * (1.0 - k) + k).max(1.0e-6);
     one(n_dot_l) * one(n_dot_v)
 }
@@ -413,7 +420,9 @@ fn importance_sample_ggx(
     tangent: Vec3,
     bitangent: Vec3,
 ) -> Vec3 {
-    let alpha = roughness.max(MIN_ROUGHNESS);
+    // Roughness is perceptual. GGX alpha is roughness squared, then the NDF
+    // formula uses alpha squared again.
+    let alpha = roughness.clamp(0.0, 1.0).max(MIN_ROUGHNESS).powi(2);
     let alpha_squared = alpha * alpha;
     let phi = 2.0 * PI * xi.x;
     let cos_theta = ((1.0 - xi.y) / (1.0 + (alpha_squared - 1.0) * xi.y)).sqrt();
@@ -543,6 +552,42 @@ mod tests {
         let anchor = maps.brdf_lut.sample(1.0, 0.0);
         assert!((anchor.x - 1.0).abs() < 1.0e-5);
         assert!(anchor.y.abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn karis_prefilter_uses_squared_perceptual_roughness() {
+        let half_vector = importance_sample_ggx(
+            Vec2::new(0.5, 0.5),
+            0.5,
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        );
+        assert!((half_vector.z - 0.9701425).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn karis_ibl_visibility_anchor_at_grazing_zero_roughness() {
+        let anchor = integrate_brdf(0.5, 0.0, 64);
+        assert!((anchor.x - 0.96875).abs() < 1.0e-5);
+        assert!((anchor.y - 0.03125).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn two_hemisphere_irradiance_probe_matches_analytic_values() {
+        let top_white = |direction: Vec3| {
+            if direction.z > 0.0 {
+                Vec3::new(1.0, 1.0, 1.0)
+            } else {
+                Vec3::ZERO
+            }
+        };
+        let tilted = Vec3::new(0.57735026, 0.0, 0.8164966);
+        let actual_tilted = integrate_irradiance(top_white, tilted, 1_048_576).x;
+        let expected_tilted = 0.9082483;
+        assert!((actual_tilted - expected_tilted).abs() < 2.0e-5);
+        let actual_up = integrate_irradiance(top_white, Vec3::new(0.0, 0.0, 1.0), 64).x;
+        assert!((actual_up - 1.0).abs() < 1.0e-5);
     }
 
     #[test]

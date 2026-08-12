@@ -26,6 +26,15 @@ LUT. It evaluates as `prefiltered * (F0 * lut.x + lut.y)`. At `N dot V = 1`
 and roughness zero, the LUT anchor is `(1, 0)` within the fixed-sample
 calculation.
 
+The prefilter converts perceptual roughness to GGX `alpha = roughness^2` and
+uses `alpha^2` in the NDF denominator. The IBL Smith-Schlick remap is
+`k = roughness^2 / 2`; the analytic-light remap is not used for this LUT.
+
+The irradiance probe uses a top-white, bottom-black environment. Its fixed
+sample result is `0.9082483` for the tilted normal `(0.57735026, 0, 0.8164966)`
+and `1.0` for the up normal. These values guard normalization and hemisphere
+orientation errors that a constant environment cannot detect.
+
 `IblCookTorranceShader` keeps direct lights unchanged. `pbr_demo --ibl` uses
 this variant. Add `--hdr` to retain bright floating-point environment values
 through ACES tonemapping. If the environment changes, call

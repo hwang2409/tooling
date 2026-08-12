@@ -373,15 +373,35 @@ fn evaluate_ggx_lighting(
     uniforms: &CookTorranceUniforms,
     albedo: Vec3,
 ) -> Vec3 {
-    let normal = interpolated_normal.normalize();
-    let view_direction = (uniforms.lighting.camera_position - world_position).normalize();
     let base_color = sanitize_base_color(uniforms.base_color * albedo);
-    let mut lighted = uniforms.lighting.ambient_color() * base_color;
-    let directional_visibility = uniforms
-        .lighting
-        .shadow_visibility(light_space_position, normal);
+    let ambient = uniforms.lighting.ambient_color() * base_color;
+    ambient
+        + evaluate_direct_ggx_lighting(
+            world_position,
+            interpolated_normal,
+            light_space_position,
+            &uniforms.lighting,
+            base_color,
+            uniforms.metallic,
+            uniforms.roughness,
+        )
+}
 
-    for (index, light) in uniforms.lighting.directional_lights().iter().enumerate() {
+fn evaluate_direct_ggx_lighting(
+    world_position: Vec3,
+    interpolated_normal: Vec3,
+    light_space_position: Vec4,
+    lighting: &BlinnPhongUniforms,
+    base_color: Vec3,
+    metallic: f32,
+    roughness: f32,
+) -> Vec3 {
+    let normal = interpolated_normal.normalize();
+    let view_direction = (lighting.camera_position - world_position).normalize();
+    let mut lighted = Vec3::ZERO;
+    let directional_visibility = lighting.shadow_visibility(light_space_position, normal);
+
+    for (index, light) in lighting.directional_lights().iter().enumerate() {
         let visibility = if index == 0 {
             directional_visibility
         } else {
@@ -392,14 +412,14 @@ fn evaluate_ggx_lighting(
             light.direction,
             view_direction,
             base_color,
-            uniforms.metallic,
-            uniforms.roughness,
+            metallic,
+            roughness,
         );
         lighted = lighted
             + brdf * normal.dot(light.direction.normalize()).max(0.0) * light.color * visibility;
     }
 
-    for light in uniforms.lighting.point_lights() {
+    for light in lighting.point_lights() {
         let to_point = light.position - world_position;
         let distance = to_point.length();
         let point_direction = to_point.normalize();
@@ -416,8 +436,8 @@ fn evaluate_ggx_lighting(
             point_direction,
             view_direction,
             base_color,
-            uniforms.metallic,
-            uniforms.roughness,
+            metallic,
+            roughness,
         );
         lighted = lighted + brdf * normal.dot(point_direction).max(0.0) * light.color * attenuation;
     }
@@ -454,60 +474,17 @@ fn evaluate_ibl_ggx_lighting(
         + base_color * uniforms.lighting.metallic;
     let specular =
         prefiltered * (f0 * environment_brdf.x + Vec3::new(1.0, 1.0, 1.0) * environment_brdf.y);
-    let mut lighted = diffuse + specular;
-
-    let directional_visibility = uniforms
-        .lighting
-        .lighting
-        .shadow_visibility(light_space_position, normal);
-    for (index, light) in uniforms
-        .lighting
-        .lighting
-        .directional_lights()
-        .iter()
-        .enumerate()
-    {
-        let visibility = if index == 0 {
-            directional_visibility
-        } else {
-            1.0
-        };
-        let brdf = cook_torrance_brdf(
-            normal,
-            light.direction,
-            view_direction,
+    diffuse
+        + specular
+        + evaluate_direct_ggx_lighting(
+            world_position,
+            interpolated_normal,
+            light_space_position,
+            &uniforms.lighting.lighting,
             base_color,
             uniforms.lighting.metallic,
             uniforms.lighting.roughness,
-        );
-        lighted = lighted
-            + brdf * normal.dot(light.direction.normalize()).max(0.0) * light.color * visibility;
-    }
-
-    for light in uniforms.lighting.lighting.point_lights() {
-        let to_point = light.position - world_position;
-        let distance = to_point.length();
-        let point_direction = to_point.normalize();
-        let denominator = light.constant_attenuation
-            + light.linear_attenuation * distance
-            + light.quadratic_attenuation * distance * distance;
-        let attenuation = if denominator > 0.0 {
-            1.0 / denominator
-        } else {
-            0.0
-        };
-        let brdf = cook_torrance_brdf(
-            normal,
-            point_direction,
-            view_direction,
-            base_color,
-            uniforms.lighting.metallic,
-            uniforms.lighting.roughness,
-        );
-        lighted = lighted + brdf * normal.dot(point_direction).max(0.0) * light.color * attenuation;
-    }
-
-    lighted
+        )
 }
 
 #[derive(Clone, Debug, PartialEq)]
