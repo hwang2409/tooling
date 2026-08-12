@@ -258,13 +258,7 @@ impl CascadeShadowState {
             let width = self.blend_widths[boundary_index];
             if width > 0.0 && view_depth >= boundary - width && view_depth <= boundary {
                 let lower_edge = boundary - width;
-                let weight = if view_depth <= lower_edge {
-                    0.0
-                } else if view_depth >= boundary {
-                    1.0
-                } else {
-                    ((view_depth - lower_edge) / width).clamp(0.0, 1.0)
-                };
+                let weight = blend_band_weight(view_depth, lower_edge, boundary, width);
                 return (boundary_index, boundary_index + 1, weight);
             }
         }
@@ -297,6 +291,16 @@ impl CascadeShadowState {
         let bias =
             (world_offset * 2.0 / self.cascade_depth_ranges[index].max(0.001)).clamp(0.0, 0.1);
         map.visibility_3x3(uv, ndc.z, bias)
+    }
+}
+
+fn blend_band_weight(view_depth: f32, lower_edge: f32, boundary: f32, width: f32) -> f32 {
+    if view_depth <= lower_edge {
+        0.0
+    } else if view_depth >= boundary {
+        1.0
+    } else {
+        ((view_depth - lower_edge) / width).clamp(0.0, 1.0)
     }
 }
 
@@ -839,6 +843,10 @@ mod tests {
             assert_eq!((lower.0, lower.1, lower.2), (index, index + 1, 0.0));
             assert_eq!((upper.0, upper.1, upper.2), (index, index + 1, 1.0));
         }
+        assert_eq!(
+            blend_band_weight(0.29999542, 0.099998474, 0.29999542, 0.19999696),
+            1.0
+        );
     }
 
     #[test]
