@@ -86,6 +86,11 @@ impl CookTorranceUniforms {
     pub fn set_alpha(&mut self, alpha: f32) {
         self.lighting.set_alpha(alpha);
     }
+
+    /// Tints GGX base color once. Ambient lighting multiplies this result.
+    fn apply_instance_rgb_tint(&mut self, tint: Vec4) {
+        self.set_base_color_linear(tint_linear_color(self.base_color, tint));
+    }
 }
 
 /// The GGX shader reuses the proven world-space varying layout.
@@ -743,8 +748,8 @@ impl InstanceUniforms for CookTorranceUniforms {
     }
 
     fn apply_instance_tint(&mut self, tint: Vec4) {
-        self.lighting.apply_instance_tint(tint);
-        self.set_base_color_linear(tint_linear_color(self.base_color, tint));
+        self.apply_instance_rgb_tint(tint);
+        apply_instance_alpha(&mut self.lighting.alpha, tint);
     }
 }
 
@@ -764,8 +769,8 @@ impl<'a> InstanceUniforms for TexturedCookTorranceUniforms<'a> {
     }
 
     fn apply_instance_tint(&mut self, tint: Vec4) {
-        self.lighting.apply_instance_tint(tint);
-        self.alpha = (self.alpha * tint.w).clamp(0.0, 1.0);
+        self.lighting.apply_instance_rgb_tint(tint);
+        apply_instance_alpha(&mut self.alpha, tint);
     }
 }
 

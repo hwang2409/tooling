@@ -783,6 +783,12 @@ impl BlinnPhongUniforms {
         self.alpha = alpha.clamp(0.0, 1.0);
     }
 
+    fn apply_instance_rgb_tint(&mut self, tint: Vec4) {
+        self.ambient_color = tint_linear_color(self.ambient_color, tint);
+        self.diffuse_color = tint_linear_color(self.diffuse_color, tint);
+        self.specular_color = tint_linear_color(self.specular_color, tint);
+    }
+
     fn rebuild_caches(&mut self) {
         self.rebuild_transform();
         self.normal_matrix = self.model.normal_matrix().unwrap_or_default();
@@ -1496,11 +1502,16 @@ fn tint_linear_color(color: Vec3, tint: Vec4) -> Vec3 {
 fn tint_encoded_color(color: u32, tint: Vec4) -> u32 {
     let [alpha, red, green, blue] = color.to_be_bytes();
     argb8888(
-        (f32::from(alpha) * tint.w).round() as u8,
+        alpha,
         (f32::from(red) * tint.x).round() as u8,
         (f32::from(green) * tint.y).round() as u8,
         (f32::from(blue) * tint.z).round() as u8,
     )
+}
+
+/// Each uniform chain owns instance alpha in exactly one scalar field.
+fn apply_instance_alpha(alpha: &mut f32, tint: Vec4) {
+    *alpha = (*alpha * tint.w).clamp(0.0, 1.0);
 }
 
 impl InstanceUniforms for FlatColorUniforms {
@@ -1510,7 +1521,7 @@ impl InstanceUniforms for FlatColorUniforms {
 
     fn apply_instance_tint(&mut self, tint: Vec4) {
         self.color = tint_encoded_color(self.color, tint);
-        self.alpha = (self.alpha * tint.w).clamp(0.0, 1.0);
+        apply_instance_alpha(&mut self.alpha, tint);
     }
 }
 
@@ -1521,7 +1532,7 @@ impl InstanceUniforms for MeshUniforms {
 
     fn apply_instance_tint(&mut self, tint: Vec4) {
         self.color = tint_encoded_color(self.color, tint);
-        self.alpha = (self.alpha * tint.w).clamp(0.0, 1.0);
+        apply_instance_alpha(&mut self.alpha, tint);
     }
 }
 
@@ -1531,7 +1542,7 @@ impl<'a> InstanceUniforms for TexturedUniforms<'a> {
     }
 
     fn apply_instance_tint(&mut self, tint: Vec4) {
-        self.alpha = (self.alpha * tint.w).clamp(0.0, 1.0);
+        apply_instance_alpha(&mut self.alpha, tint);
     }
 }
 
@@ -1541,10 +1552,8 @@ impl InstanceUniforms for BlinnPhongUniforms {
     }
 
     fn apply_instance_tint(&mut self, tint: Vec4) {
-        self.ambient_color = tint_linear_color(self.ambient_color, tint);
-        self.diffuse_color = tint_linear_color(self.diffuse_color, tint);
-        self.specular_color = tint_linear_color(self.specular_color, tint);
-        self.alpha = (self.alpha * tint.w).clamp(0.0, 1.0);
+        self.apply_instance_rgb_tint(tint);
+        apply_instance_alpha(&mut self.alpha, tint);
     }
 }
 
@@ -1564,8 +1573,8 @@ impl<'a> InstanceUniforms for TexturedBlinnPhongUniforms<'a> {
     }
 
     fn apply_instance_tint(&mut self, tint: Vec4) {
-        self.lighting.apply_instance_tint(tint);
-        self.alpha = (self.alpha * tint.w).clamp(0.0, 1.0);
+        self.lighting.apply_instance_rgb_tint(tint);
+        apply_instance_alpha(&mut self.alpha, tint);
     }
 }
 
@@ -1614,6 +1623,108 @@ mod tests {
         // so N dot H = 0.9238795. With shininess 8, specular is 0.53079,
         // which rounds to 135 in each 8-bit channel.
         assert_eq!(BlinnPhongShader::shade(&varyings, &uniforms()), 0xffc1c1c1);
+    }
+
+    #[test]
+    fn flat_instance_alpha_is_applied_once() {
+        let mut uniforms = FlatColorUniforms::new(Mat4::IDENTITY, 0xff102030);
+        uniforms.apply_instance_tint(Vec4::new(1.0, 1.0, 1.0, 0.5));
+        assert_eq!(
+            FragmentStage::run(&FlatColorShader, &(), &uniforms).to_be_bytes()[0],
+            128
+        );
+    }
+
+    #[test]
+    fn mesh_instance_alpha_is_applied_once() {
+        let mut uniforms =
+            MeshUniforms::new(Mat4::IDENTITY, Mat4::IDENTITY, Mat4::IDENTITY, 0xff102030);
+        uniforms.apply_instance_tint(Vec4::new(1.0, 1.0, 1.0, 0.5));
+        assert_eq!(
+            FragmentStage::run(&MeshShader, &(), &uniforms).to_be_bytes()[0],
+            128
+        );
+    }
+
+    #[test]
+    fn textured_blinn_phong_instance_alpha_is_applied_once() {
+        let texture = Texture::new(1, 1, vec![[255, 255, 255, 255]]).unwrap();
+        let mut uniforms =
+            TexturedBlinnPhongUniforms::new(uniforms(), &texture, TextureFilter::Nearest);
+        uniforms.apply_instance_tint(Vec4::new(1.0, 1.0, 1.0, 0.5));
+        let varyings = TexturedBlinnPhongVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            texcoord: Vec2::ZERO,
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        let output = TexturedBlinnPhongShader.run_with_sampling(
+            &varyings,
+            &crate::pipeline::SampleDerivatives::default(),
+            &uniforms,
+        );
+        assert_eq!(output.to_be_bytes()[0], 128);
+    }
+
+    #[test]
+    fn ggx_instance_alpha_is_applied_once() {
+        let lighting = BlinnPhongUniforms::new_with_linear_colors(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            8.0,
+            Vec3::new(0.0, 0.0, 1.0),
+            DirectionalLight::new(Vec3::ZERO, Vec3::ZERO),
+            PointLight::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0.0, 0.0),
+        );
+        let mut uniforms = CookTorranceUniforms::new_with_linear_base_color(
+            lighting,
+            Vec3::new(1.0, 1.0, 1.0),
+            0.0,
+            0.5,
+        );
+        uniforms.apply_instance_tint(Vec4::new(1.0, 1.0, 1.0, 0.5));
+        let varyings = BlinnPhongVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        assert_eq!(
+            CookTorranceShader::shade(&varyings, &uniforms).to_be_bytes()[0],
+            128
+        );
+    }
+
+    #[test]
+    fn ggx_instance_rgb_tint_is_applied_once() {
+        let lighting = BlinnPhongUniforms::new_with_linear_colors(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            8.0,
+            Vec3::new(0.0, 0.0, 1.0),
+            DirectionalLight::new(Vec3::ZERO, Vec3::ZERO),
+            PointLight::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0.0, 0.0),
+        );
+        let mut uniforms = CookTorranceUniforms::new_with_linear_base_color(
+            lighting,
+            Vec3::new(1.0, 1.0, 1.0),
+            0.0,
+            0.5,
+        );
+        uniforms.apply_instance_tint(Vec4::new(0.5, 0.5, 0.5, 1.0));
+        let varyings = BlinnPhongVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        assert_eq!(CookTorranceShader::shade(&varyings, &uniforms), 0xffbcbcbc);
     }
 
     #[test]
