@@ -11,7 +11,7 @@
 //! - `--size WxH` — override the demo's default window size. Screenshot mode
 //!   uses this size directly for the offscreen framebuffer.
 //! - `--ssaa` — enable 2x linear-light supersampling in demos that opt in.
-//! - `--bloom`, `--fxaa`, `--vignette`, `--ssao` — enable post-processing passes.
+//! - `--bloom`, `--fxaa`, `--vignette`, `--ssao`, `--dof` — enable post-processing passes.
 //! - `--hdr` — keep linear HDR values through the render and bloom stages.
 //! - `--exposure X` — scale linear HDR values before ACES tonemapping.
 //! - `--ibl` — use the load-time image-based lighting GGX variant.
@@ -22,7 +22,9 @@ use crate::math::{Mat4, Vec2, Vec3, Vec4};
 use crate::mesh::{LodMesh, Mesh, MeshVertex, SimplifyOptions, SphereProjection};
 use crate::particles::{ParticleEmitter, ParticleSystem};
 use crate::pipeline::{Instance, InstanceUniforms, Pipeline};
-use crate::postfx::{AcesTonemapPass, BloomPass, FxaaPass, PostChain, SsaoPass, VignettePass};
+use crate::postfx::{
+    AcesTonemapPass, BloomPass, DofPass, FxaaPass, PostChain, SsaoPass, VignettePass,
+};
 use crate::present::{InputState, run_with_input};
 use crate::shaders::{
     BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, PointLight, TextureFilter,
@@ -47,6 +49,7 @@ pub struct DemoArgs {
     pub fxaa: bool,
     pub vignette: bool,
     pub ssao: bool,
+    pub dof: bool,
     pub hdr: bool,
     pub ibl: bool,
     pub exposure: f32,
@@ -63,6 +66,7 @@ impl Default for DemoArgs {
             fxaa: false,
             vignette: false,
             ssao: false,
+            dof: false,
             hdr: false,
             ibl: false,
             exposure: 1.0,
@@ -104,6 +108,7 @@ impl DemoArgs {
                 "--fxaa" => args.fxaa = true,
                 "--vignette" => args.vignette = true,
                 "--ssao" => args.ssao = true,
+                "--dof" => args.dof = true,
                 "--hdr" => args.hdr = true,
                 "--ibl" => args.ibl = true,
                 "--exposure" => {
@@ -158,6 +163,9 @@ impl DemoArgs {
         let mut chain = PostChain::new();
         if self.ssao {
             chain.push(SsaoPass::new(projection));
+        }
+        if self.dof {
+            chain.push(DofPass::new(projection));
         }
         if self.bloom {
             chain.push(BloomPass);
@@ -858,13 +866,15 @@ mod tests {
     #[test]
     fn parses_postfx_flags_in_chain_order() {
         let args = DemoArgs::parse(
-            ["--bloom", "--fxaa", "--vignette"]
+            ["--bloom", "--fxaa", "--vignette", "--dof"]
                 .into_iter()
                 .map(String::from),
         )
         .unwrap();
         assert!(args.bloom && args.fxaa && args.vignette);
+        assert!(args.dof);
         assert_eq!(args.post_chain().len(), 3);
+        assert_eq!(args.post_chain_with_projection(Mat4::IDENTITY).len(), 4);
     }
 
     #[test]

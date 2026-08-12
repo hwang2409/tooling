@@ -2,10 +2,10 @@
 //!
 //! The renderer stores encoded sRGB colors in `Framebuffer`. HDR mode also
 //! stores a linear sidecar. Each pass declares its working color space.
-//! The HDR order is render -> SSAA -> SSAO -> bloom -> vignette -> ACES ->
+//! The HDR order is render -> SSAA -> SSAO -> DoF -> bloom -> vignette -> ACES ->
 //! encode -> FXAA. LDR chains retain their existing pass order and byte output.
-//! SSAO must run before tonemapping and bloom because it reads linear scene
-//! color and depth. It modulates the full color, not only the ambient term.
+//! SSAO and DoF must run before tonemapping and bloom because they read linear
+//! scene color and depth. SSAO modulates the full color, not only the ambient term.
 //! Ambient-only modulation needs a separate ambient buffer and is out of scope.
 
 use crate::fb::{Framebuffer, argb8888_linear};
@@ -161,9 +161,9 @@ pub trait PostPass: Send + Sync {
 
 /// An ordered, opt-in collection of post-processing passes.
 ///
-/// Push [`SsaoPass`] before [`BloomPass`] and [`AcesTonemapPass`]. SSAO needs
-/// the linear HDR scene and depth before those passes change the color space
-/// or add display-space light.
+/// Push [`SsaoPass`] and [`DofPass`] before [`BloomPass`] and
+/// [`AcesTonemapPass`]. These depth passes need the linear scene before later
+/// passes change the color space or add display-space light.
 #[derive(Default)]
 pub struct PostChain {
     passes: Vec<Box<dyn PostPass>>,
@@ -254,6 +254,35 @@ pub struct SsaoPass {
     blur_depth_threshold: f32,
 }
 
+/// Reconstructs one view-space position from one raster depth sample.
+///
+/// This is the shared perspective-depth reconstruction used by both SSAO and
+/// depth of field. Keeping one implementation also keeps their linear depth
+/// interpretation identical.
+pub fn reconstruct_view_position(
+    inverse_projection: Mat4,
+    x: usize,
+    y: usize,
+    depth: f32,
+    width: usize,
+    height: usize,
+) -> Option<Vec3> {
+    if width == 0 || height == 0 || x >= width || y >= height || !depth.is_finite() {
+        return None;
+    }
+    let ndc_x = ((x as f32 + 0.5) / width as f32) * 2.0 - 1.0;
+    let ndc_y = 1.0 - ((y as f32 + 0.5) / height as f32) * 2.0;
+    let clip = inverse_projection * Vec4::new(ndc_x, ndc_y, depth, 1.0);
+    if !clip.w.is_finite() || clip.w.abs() <= f32::EPSILON {
+        return None;
+    }
+    let position = Vec3::new(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
+    if !position.x.is_finite() || !position.y.is_finite() || !position.z.is_finite() {
+        return None;
+    }
+    Some(position)
+}
+
 impl SsaoPass {
     /// Creates a pass from the projection matrix used by the camera.
     ///
@@ -338,20 +367,7 @@ impl SsaoPass {
         width: usize,
         height: usize,
     ) -> Option<Vec3> {
-        if width == 0 || height == 0 || x >= width || y >= height || !depth.is_finite() {
-            return None;
-        }
-        let ndc_x = ((x as f32 + 0.5) / width as f32) * 2.0 - 1.0;
-        let ndc_y = 1.0 - ((y as f32 + 0.5) / height as f32) * 2.0;
-        let clip = self.inverse_projection * Vec4::new(ndc_x, ndc_y, depth, 1.0);
-        if !clip.w.is_finite() || clip.w.abs() <= f32::EPSILON {
-            return None;
-        }
-        let position = Vec3::new(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
-        if !position.x.is_finite() || !position.y.is_finite() || !position.z.is_finite() {
-            return None;
-        }
-        Some(position)
+        reconstruct_view_position(self.inverse_projection, x, y, depth, width, height)
     }
 
     /// Computes the unblurred occlusion buffer from the framebuffer depth.
@@ -412,7 +428,8 @@ impl SsaoPass {
                 if depth >= 1.0 {
                     continue;
                 }
-                positions[index] = self.reconstruct_view_position(
+                positions[index] = reconstruct_view_position(
+                    self.inverse_projection,
                     x,
                     y,
                     depth,
@@ -626,6 +643,377 @@ impl SsaoPass {
             total / weight_total
         }
     }
+}
+
+/// Fixed focal length used by the renderer's view-space thin-lens model.
+/// Aperture is a texel-scaled strength, so the standard CoC equation produces
+/// a pixel radius directly:
+/// `aperture * |focal_length * (focus - depth)| /
+/// (depth * (focus - focal_length))`.
+pub const DOF_FOCAL_LENGTH: f32 = 1.0;
+pub const DOF_DEFAULT_FOCUS_DISTANCE: f32 = 4.0;
+pub const DOF_DEFAULT_APERTURE: f32 = 6.0;
+pub const DOF_DEFAULT_MAX_COC_RADIUS: f32 = 8.0;
+pub const DOF_MAX_COC_RADIUS: f32 = 64.0;
+pub const DOF_SAMPLE_COUNT: usize = 24;
+const DOF_FOCAL_COC_EPSILON: f32 = 1.0e-4;
+const DOF_MAX_GATHER_SAMPLES: usize = DOF_SAMPLE_COUNT * 2 + 1;
+
+struct DofGather<'a> {
+    input: &'a PostBuffer,
+    depths: &'a [Option<f32>],
+    center_depth: f32,
+    center_radius: f32,
+    sampled_indices: [usize; DOF_MAX_GATHER_SAMPLES],
+    sampled_count: usize,
+    total: [f32; 3],
+    weight_total: f32,
+}
+
+impl<'a> DofGather<'a> {
+    fn new(
+        input: &'a PostBuffer,
+        depths: &'a [Option<f32>],
+        index: usize,
+        source: [f32; 4],
+        center_depth: f32,
+        center_radius: f32,
+    ) -> Self {
+        let mut sampled_indices = [0; DOF_MAX_GATHER_SAMPLES];
+        sampled_indices[0] = index;
+        Self {
+            input,
+            depths,
+            center_depth,
+            center_radius,
+            sampled_indices,
+            sampled_count: 1,
+            total: [source[1], source[2], source[3]],
+            weight_total: 1.0,
+        }
+    }
+}
+
+const DOF_DISC_KERNEL: [(f32, f32); DOF_SAMPLE_COUNT] = [
+    (0.125, 0.0),
+    (-0.125, 0.0),
+    (0.0, 0.125),
+    (0.0, -0.125),
+    (0.35, 0.0),
+    (-0.35, 0.0),
+    (0.0, 0.35),
+    (0.0, -0.35),
+    (0.25, 0.25),
+    (-0.25, 0.25),
+    (0.25, -0.25),
+    (-0.25, -0.25),
+    (0.6, 0.0),
+    (-0.6, 0.0),
+    (0.0, 0.6),
+    (0.0, -0.6),
+    (0.42, 0.42),
+    (-0.42, 0.42),
+    (0.42, -0.42),
+    (-0.42, -0.42),
+    (0.9, 0.0),
+    (-0.9, 0.0),
+    (0.0, 0.9),
+    (0.0, -0.9),
+];
+
+/// Thin-lens depth of field in linear color space.
+///
+/// This is a single-pass gather with scatter-as-gather coverage. A tap can
+/// contribute when its own CoC covers the center, so defocused foreground
+/// color can spread over sharp background pixels. Full near-field scatter and
+/// its separate foreground layer are out of scope.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DofPass {
+    projection: Mat4,
+    inverse_projection: Mat4,
+    projection_valid: bool,
+    focus_distance: f32,
+    aperture: f32,
+    max_coc_radius: f32,
+}
+
+impl DofPass {
+    /// Creates a pass from the exact projection matrix used by the camera.
+    pub fn new(projection: Mat4) -> Self {
+        let (projection, inverse_projection, projection_valid) = sanitize_projection(projection);
+        Self {
+            projection,
+            inverse_projection,
+            projection_valid,
+            focus_distance: DOF_DEFAULT_FOCUS_DISTANCE,
+            aperture: DOF_DEFAULT_APERTURE,
+            max_coc_radius: DOF_DEFAULT_MAX_COC_RADIUS,
+        }
+    }
+
+    pub const fn projection(&self) -> Mat4 {
+        self.projection
+    }
+
+    pub fn set_projection(&mut self, projection: Mat4) {
+        let (projection, inverse_projection, projection_valid) = sanitize_projection(projection);
+        self.projection = projection;
+        self.inverse_projection = inverse_projection;
+        self.projection_valid = projection_valid;
+    }
+
+    pub const fn focus_distance(&self) -> f32 {
+        self.focus_distance
+    }
+
+    pub fn set_focus_distance(&mut self, distance: f32) {
+        self.focus_distance = sanitize_positive(distance, DOF_DEFAULT_FOCUS_DISTANCE, 1000.0)
+            .max(DOF_FOCAL_LENGTH + f32::EPSILON);
+    }
+
+    pub const fn aperture(&self) -> f32 {
+        self.aperture
+    }
+
+    pub fn set_aperture(&mut self, aperture: f32) {
+        self.aperture = sanitize_nonnegative(aperture, DOF_DEFAULT_APERTURE, 1000.0);
+    }
+
+    pub const fn max_coc_radius(&self) -> f32 {
+        self.max_coc_radius
+    }
+
+    pub fn set_max_coc_radius(&mut self, radius: f32) {
+        self.max_coc_radius =
+            sanitize_nonnegative(radius, DOF_DEFAULT_MAX_COC_RADIUS, DOF_MAX_COC_RADIUS);
+    }
+
+    /// Returns the clamped CoC radius in texels for positive linear depth.
+    pub fn circle_of_confusion(&self, depth: f32) -> f32 {
+        if !depth.is_finite() || depth <= 0.0 || self.aperture == 0.0 {
+            return 0.0;
+        }
+        let numerator = DOF_FOCAL_LENGTH * (self.focus_distance - depth).abs();
+        let denominator = depth * (self.focus_distance - DOF_FOCAL_LENGTH);
+        if denominator <= 0.0 || !denominator.is_finite() {
+            return 0.0;
+        }
+        (self.aperture * numerator / denominator).clamp(0.0, self.max_coc_radius)
+    }
+
+    pub fn coc_radius(&self, depth: f32) -> f32 {
+        self.circle_of_confusion(depth)
+    }
+
+    fn accumulate_sample(
+        &self,
+        gather: &mut DofGather<'_>,
+        sample_x: usize,
+        sample_y: usize,
+        coverage: f32,
+    ) {
+        if coverage <= 0.0 || !coverage.is_finite() {
+            return;
+        }
+        let sample_index = sample_y * gather.input.width + sample_x;
+        if gather.sampled_indices[..gather.sampled_count].contains(&sample_index) {
+            return;
+        }
+        let Some(sample_depth) = gather.depths[sample_index] else {
+            return;
+        };
+        let sample_radius = self.circle_of_confusion(sample_depth);
+        let depth_delta = sample_depth - gather.center_depth;
+        // A background tap with a larger CoC cannot bleed onto a center
+        // surface with less blur. Foreground taps remain eligible, which
+        // is the useful gather approximation for foreground defocus.
+        if depth_delta > 0.0 && sample_radius > gather.center_radius {
+            return;
+        }
+        let depth_weight = if depth_delta > 0.0 {
+            gather.center_radius / (gather.center_radius + depth_delta).max(f32::EPSILON)
+        } else {
+            1.0
+        };
+        let sample_weight = depth_weight * coverage;
+        if sample_weight <= 0.0 || !sample_weight.is_finite() {
+            return;
+        }
+        gather.sampled_indices[gather.sampled_count] = sample_index;
+        gather.sampled_count += 1;
+        let sample = gather.input.pixels[sample_index];
+        gather.total[0] += sample[1] * sample_weight;
+        gather.total[1] += sample[2] * sample_weight;
+        gather.total[2] += sample[3] * sample_weight;
+        gather.weight_total += sample_weight;
+    }
+
+    /// Applies DoF directly through the same production hook used by
+    /// [`PostChain`].
+    pub fn apply_to_framebuffer(&self, framebuffer: &mut Framebuffer) {
+        if self.is_noop() {
+            return;
+        }
+        let input = PostBuffer::from_framebuffer(framebuffer);
+        let mut output = PostBuffer::new(input.width, input.height, PostColorSpace::Linear);
+        output.hdr = input.hdr;
+        self.apply_with_framebuffer(&input, &mut output, framebuffer);
+        output.write_to_framebuffer(framebuffer);
+    }
+
+    fn reconstructed_depths(&self, framebuffer: &Framebuffer) -> Vec<Option<f32>> {
+        let length = framebuffer.width.saturating_mul(framebuffer.height);
+        let mut depths = vec![None; length];
+        for y in 0..framebuffer.height {
+            for x in 0..framebuffer.width {
+                let index = y * framebuffer.width + x;
+                let Some(&depth) = framebuffer.depth.get(index) else {
+                    continue;
+                };
+                if depth >= 1.0 {
+                    continue;
+                }
+                let Some(position) = reconstruct_view_position(
+                    self.inverse_projection,
+                    x,
+                    y,
+                    depth,
+                    framebuffer.width,
+                    framebuffer.height,
+                ) else {
+                    continue;
+                };
+                let linear_depth = -position.z;
+                if linear_depth.is_finite() && linear_depth > 0.0 {
+                    depths[index] = Some(linear_depth);
+                }
+            }
+        }
+        depths
+    }
+
+    fn gather_pixel(
+        &self,
+        input: &PostBuffer,
+        depths: &[Option<f32>],
+        x: usize,
+        y: usize,
+    ) -> [f32; 4] {
+        let index = y * input.width + x;
+        let source = input.pixels[index];
+        let Some(center_depth) = depths[index] else {
+            return source;
+        };
+        let center_radius = self.circle_of_confusion(center_depth);
+        let mut gather = DofGather::new(input, depths, index, source, center_depth, center_radius);
+        // Fractional CoCs blend with a one-texel gather. This keeps subpixel
+        // blur visible without pretending that a fractional pixel is sampleable.
+        let center_search_radius = if center_radius < 1.0 {
+            1.0
+        } else {
+            center_radius
+        };
+        for &(offset_x, offset_y) in &DOF_DISC_KERNEL {
+            let sample_x = (x as f32 + offset_x * center_search_radius).round() as isize;
+            let sample_y = (y as f32 + offset_y * center_search_radius).round() as isize;
+            let sample_x = sample_x.clamp(0, input.width.saturating_sub(1) as isize) as usize;
+            let sample_y = sample_y.clamp(0, input.height.saturating_sub(1) as isize) as usize;
+            let sample_index = sample_y * input.width + sample_x;
+            let Some(_) = depths[sample_index] else {
+                continue;
+            };
+            let sample_offset_x = sample_x as f32 - x as f32;
+            let sample_offset_y = sample_y as f32 - y as f32;
+            let sample_distance =
+                (sample_offset_x * sample_offset_x + sample_offset_y * sample_offset_y).sqrt();
+            let center_coverage = if center_radius <= DOF_FOCAL_COC_EPSILON {
+                0.0
+            } else if center_radius < 1.0 {
+                1.0
+            } else {
+                f32::from(sample_distance <= center_radius + 0.5)
+            };
+            self.accumulate_sample(&mut gather, sample_x, sample_y, center_coverage);
+        }
+
+        // A sharp center still needs to search far enough to find a
+        // defocused neighbor whose own CoC covers this pixel. This second
+        // phase uses the pass-wide clamped radius, then shares the sample set
+        // with the center gather so a tap contributes only once.
+        let neighbor_search_radius = self.max_coc_radius.max(1.0);
+        for &(offset_x, offset_y) in &DOF_DISC_KERNEL {
+            let sample_x = (x as f32 + offset_x * neighbor_search_radius).round() as isize;
+            let sample_y = (y as f32 + offset_y * neighbor_search_radius).round() as isize;
+            let sample_x = sample_x.clamp(0, input.width.saturating_sub(1) as isize) as usize;
+            let sample_y = sample_y.clamp(0, input.height.saturating_sub(1) as isize) as usize;
+            let sample_index = sample_y * input.width + sample_x;
+            let Some(sample_depth) = depths[sample_index] else {
+                continue;
+            };
+            let sample_radius = self.circle_of_confusion(sample_depth);
+            let sample_offset_x = sample_x as f32 - x as f32;
+            let sample_offset_y = sample_y as f32 - y as f32;
+            let sample_distance =
+                (sample_offset_x * sample_offset_x + sample_offset_y * sample_offset_y).sqrt();
+            let sample_coverage = if sample_radius <= DOF_FOCAL_COC_EPSILON {
+                0.0
+            } else {
+                f32::from(sample_distance <= sample_radius + 0.5)
+            };
+            self.accumulate_sample(&mut gather, sample_x, sample_y, sample_coverage);
+        }
+        let gathered = [
+            gather.total[0] / gather.weight_total,
+            gather.total[1] / gather.weight_total,
+            gather.total[2] / gather.weight_total,
+        ];
+        let blend = if center_radius <= DOF_FOCAL_COC_EPSILON {
+            1.0
+        } else {
+            center_radius.min(1.0)
+        };
+        [
+            source[0],
+            source[1] + (gathered[0] - source[1]) * blend,
+            source[2] + (gathered[1] - source[2]) * blend,
+            source[3] + (gathered[2] - source[3]) * blend,
+        ]
+    }
+}
+
+impl PostPass for DofPass {
+    fn color_space(&self) -> PostColorSpace {
+        PostColorSpace::Linear
+    }
+
+    fn apply(&self, input: &PostBuffer, output: &mut PostBuffer) {
+        output.pixels.clone_from(&input.pixels);
+    }
+
+    fn is_noop(&self) -> bool {
+        !self.projection_valid || self.aperture == 0.0 || self.max_coc_radius == 0.0
+    }
+
+    fn apply_with_framebuffer(
+        &self,
+        input: &PostBuffer,
+        output: &mut PostBuffer,
+        framebuffer: &Framebuffer,
+    ) {
+        debug_assert_eq!(input.color_space, PostColorSpace::Linear);
+        debug_assert_eq!(output.color_space, PostColorSpace::Linear);
+        let depths = self.reconstructed_depths(framebuffer);
+        for y in 0..input.height {
+            for x in 0..input.width {
+                let index = y * input.width + x;
+                output.pixels[index] = self.gather_pixel(input, &depths, x, y);
+            }
+        }
+    }
+}
+
+pub fn dof(projection: Mat4) -> DofPass {
+    DofPass::new(projection)
 }
 
 impl PostPass for SsaoPass {
