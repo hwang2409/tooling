@@ -204,6 +204,54 @@ fn defocused_foreground_spreads_over_sharp_background() {
 }
 
 #[test]
+fn scatter_as_gather_reaches_full_neighbor_coc() {
+    let mut framebuffer = plane(4.0);
+    let center_x = WIDTH / 2;
+    let center_y = HEIGHT / 2;
+    let foreground_depth = depth_for_view_z(-2.0);
+    let foreground = argb8888(255, 245, 25, 25);
+    let background = argb8888(255, 20, 20, 220);
+    framebuffer.depth[center_y * WIDTH + center_x - 3] = foreground_depth;
+    framebuffer.color[center_y * WIDTH + center_x - 3] = foreground;
+    framebuffer.color[center_y * WIDTH + center_x] = background;
+    let mut pass = DofPass::new(projection());
+    pass.set_focus_distance(4.0);
+    pass.set_aperture(24.0);
+    pass.set_max_coc_radius(8.0);
+    apply_dof(&pass, &mut framebuffer);
+    let spread = framebuffer.color[center_y * WIDTH + center_x];
+    let [_, red, _, _] = spread.to_be_bytes();
+    assert!(
+        red > 20,
+        "radius-8 neighbor did not spread at distance 3: {red}"
+    );
+}
+
+#[test]
+fn scatter_as_gather_reaches_full_neighbor_coc_diagonal() {
+    let mut framebuffer = plane(4.0);
+    let center_x = WIDTH / 2;
+    let center_y = HEIGHT / 2;
+    let foreground_depth = depth_for_view_z(-2.0);
+    let foreground = argb8888(255, 245, 25, 25);
+    let background = argb8888(255, 20, 20, 220);
+    framebuffer.depth[(center_y - 3) * WIDTH + center_x - 3] = foreground_depth;
+    framebuffer.color[(center_y - 3) * WIDTH + center_x - 3] = foreground;
+    framebuffer.color[center_y * WIDTH + center_x] = background;
+    let mut pass = DofPass::new(projection());
+    pass.set_focus_distance(4.0);
+    pass.set_aperture(24.0);
+    pass.set_max_coc_radius(8.0);
+    apply_dof(&pass, &mut framebuffer);
+    let spread = framebuffer.color[center_y * WIDTH + center_x];
+    let [_, red, _, _] = spread.to_be_bytes();
+    assert!(
+        red > 20,
+        "radius-8 diagonal neighbor did not spread at offset 3,3: {red}"
+    );
+}
+
+#[test]
 fn edge_clamping_does_not_wrap_corner_taps() {
     let mut framebuffer = plane(2.0);
     framebuffer.color.fill(argb8888(255, 0, 0, 0));

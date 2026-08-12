@@ -657,6 +657,42 @@ pub const DOF_DEFAULT_MAX_COC_RADIUS: f32 = 8.0;
 pub const DOF_MAX_COC_RADIUS: f32 = 64.0;
 pub const DOF_SAMPLE_COUNT: usize = 24;
 const DOF_FOCAL_COC_EPSILON: f32 = 1.0e-4;
+const DOF_MAX_GATHER_SAMPLES: usize = DOF_SAMPLE_COUNT * 2 + 1;
+
+struct DofGather<'a> {
+    input: &'a PostBuffer,
+    depths: &'a [Option<f32>],
+    center_depth: f32,
+    center_radius: f32,
+    sampled_indices: [usize; DOF_MAX_GATHER_SAMPLES],
+    sampled_count: usize,
+    total: [f32; 3],
+    weight_total: f32,
+}
+
+impl<'a> DofGather<'a> {
+    fn new(
+        input: &'a PostBuffer,
+        depths: &'a [Option<f32>],
+        index: usize,
+        source: [f32; 4],
+        center_depth: f32,
+        center_radius: f32,
+    ) -> Self {
+        let mut sampled_indices = [0; DOF_MAX_GATHER_SAMPLES];
+        sampled_indices[0] = index;
+        Self {
+            input,
+            depths,
+            center_depth,
+            center_radius,
+            sampled_indices,
+            sampled_count: 1,
+            total: [source[1], source[2], source[3]],
+            weight_total: 1.0,
+        }
+    }
+}
 
 const DOF_DISC_KERNEL: [(f32, f32); DOF_SAMPLE_COUNT] = [
     (0.125, 0.0),
@@ -769,6 +805,49 @@ impl DofPass {
         self.circle_of_confusion(depth)
     }
 
+    fn accumulate_sample(
+        &self,
+        gather: &mut DofGather<'_>,
+        sample_x: usize,
+        sample_y: usize,
+        coverage: f32,
+    ) {
+        if coverage <= 0.0 || !coverage.is_finite() {
+            return;
+        }
+        let sample_index = sample_y * gather.input.width + sample_x;
+        if gather.sampled_indices[..gather.sampled_count].contains(&sample_index) {
+            return;
+        }
+        let Some(sample_depth) = gather.depths[sample_index] else {
+            return;
+        };
+        let sample_radius = self.circle_of_confusion(sample_depth);
+        let depth_delta = sample_depth - gather.center_depth;
+        // A background tap with a larger CoC cannot bleed onto a center
+        // surface with less blur. Foreground taps remain eligible, which
+        // is the useful gather approximation for foreground defocus.
+        if depth_delta > 0.0 && sample_radius > gather.center_radius {
+            return;
+        }
+        let depth_weight = if depth_delta > 0.0 {
+            gather.center_radius / (gather.center_radius + depth_delta).max(f32::EPSILON)
+        } else {
+            1.0
+        };
+        let sample_weight = depth_weight * coverage;
+        if sample_weight <= 0.0 || !sample_weight.is_finite() {
+            return;
+        }
+        gather.sampled_indices[gather.sampled_count] = sample_index;
+        gather.sampled_count += 1;
+        let sample = gather.input.pixels[sample_index];
+        gather.total[0] += sample[1] * sample_weight;
+        gather.total[1] += sample[2] * sample_weight;
+        gather.total[2] += sample[3] * sample_weight;
+        gather.weight_total += sample_weight;
+    }
+
     /// Applies DoF directly through the same production hook used by
     /// [`PostChain`].
     pub fn apply_to_framebuffer(&self, framebuffer: &mut Framebuffer) {
@@ -826,36 +905,22 @@ impl DofPass {
             return source;
         };
         let center_radius = self.circle_of_confusion(center_depth);
+        let mut gather = DofGather::new(input, depths, index, source, center_depth, center_radius);
         // Fractional CoCs blend with a one-texel gather. This keeps subpixel
         // blur visible without pretending that a fractional pixel is sampleable.
-        let search_radius = if center_radius < 1.0 {
+        let center_search_radius = if center_radius < 1.0 {
             1.0
         } else {
             center_radius
         };
-        let mut total = [source[1], source[2], source[3]];
-        let mut weight_total = 1.0;
         for &(offset_x, offset_y) in &DOF_DISC_KERNEL {
-            let sample_x = (x as f32 + offset_x * search_radius).round() as isize;
-            let sample_y = (y as f32 + offset_y * search_radius).round() as isize;
+            let sample_x = (x as f32 + offset_x * center_search_radius).round() as isize;
+            let sample_y = (y as f32 + offset_y * center_search_radius).round() as isize;
             let sample_x = sample_x.clamp(0, input.width.saturating_sub(1) as isize) as usize;
             let sample_y = sample_y.clamp(0, input.height.saturating_sub(1) as isize) as usize;
             let sample_index = sample_y * input.width + sample_x;
-            let Some(sample_depth) = depths[sample_index] else {
+            let Some(_) = depths[sample_index] else {
                 continue;
-            };
-            let sample_radius = self.circle_of_confusion(sample_depth);
-            let depth_delta = sample_depth - center_depth;
-            // A background tap with a larger CoC cannot bleed onto a center
-            // surface with less blur. Foreground taps remain eligible, which
-            // is the useful gather approximation for foreground defocus.
-            if depth_delta > 0.0 && sample_radius > center_radius {
-                continue;
-            }
-            let depth_weight = if depth_delta > 0.0 {
-                center_radius / (center_radius + depth_delta).max(f32::EPSILON)
-            } else {
-                1.0
             };
             let sample_offset_x = sample_x as f32 - x as f32;
             let sample_offset_y = sample_y as f32 - y as f32;
@@ -868,25 +933,39 @@ impl DofPass {
             } else {
                 f32::from(sample_distance <= center_radius + 0.5)
             };
+            self.accumulate_sample(&mut gather, sample_x, sample_y, center_coverage);
+        }
+
+        // A sharp center still needs to search far enough to find a
+        // defocused neighbor whose own CoC covers this pixel. This second
+        // phase uses the pass-wide clamped radius, then shares the sample set
+        // with the center gather so a tap contributes only once.
+        let neighbor_search_radius = self.max_coc_radius.max(1.0);
+        for &(offset_x, offset_y) in &DOF_DISC_KERNEL {
+            let sample_x = (x as f32 + offset_x * neighbor_search_radius).round() as isize;
+            let sample_y = (y as f32 + offset_y * neighbor_search_radius).round() as isize;
+            let sample_x = sample_x.clamp(0, input.width.saturating_sub(1) as isize) as usize;
+            let sample_y = sample_y.clamp(0, input.height.saturating_sub(1) as isize) as usize;
+            let sample_index = sample_y * input.width + sample_x;
+            let Some(sample_depth) = depths[sample_index] else {
+                continue;
+            };
+            let sample_radius = self.circle_of_confusion(sample_depth);
+            let sample_offset_x = sample_x as f32 - x as f32;
+            let sample_offset_y = sample_y as f32 - y as f32;
+            let sample_distance =
+                (sample_offset_x * sample_offset_x + sample_offset_y * sample_offset_y).sqrt();
             let sample_coverage = if sample_radius <= DOF_FOCAL_COC_EPSILON {
                 0.0
             } else {
                 f32::from(sample_distance <= sample_radius + 0.5)
             };
-            let sample_weight = depth_weight * center_coverage.max(sample_coverage);
-            if sample_weight <= 0.0 || !sample_weight.is_finite() {
-                continue;
-            }
-            let sample = input.pixels[sample_index];
-            total[0] += sample[1] * sample_weight;
-            total[1] += sample[2] * sample_weight;
-            total[2] += sample[3] * sample_weight;
-            weight_total += sample_weight;
+            self.accumulate_sample(&mut gather, sample_x, sample_y, sample_coverage);
         }
         let gathered = [
-            total[0] / weight_total,
-            total[1] / weight_total,
-            total[2] / weight_total,
+            gather.total[0] / gather.weight_total,
+            gather.total[1] / gather.weight_total,
+            gather.total[2] / gather.weight_total,
         ];
         let blend = if center_radius <= DOF_FOCAL_COC_EPSILON {
             1.0
