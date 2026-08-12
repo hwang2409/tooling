@@ -473,12 +473,18 @@ pub struct InstancingScene {
 
 /// Builds a stable field of 300 lit, tinted mesh instances.
 pub fn build_instancing_scene(aspect: f32) -> InstancingScene {
-    build_instancing_scene_with_layout(aspect, 15.0, 20.0, 15.0)
+    build_instancing_scene_with_layout(aspect, 15.0, 20.0, 15.0, None)
 }
 
 /// Builds the large off-frustum field used by the culling demo and golden.
 pub fn build_culling_instancing_scene(aspect: f32) -> InstancingScene {
-    build_instancing_scene_with_layout(aspect, 30.0, 30.0, 10.0)
+    build_instancing_scene_with_layout(
+        aspect,
+        30.0,
+        30.0,
+        10.0,
+        Some(culling_demo_projection(aspect.max(0.01))),
+    )
 }
 
 fn build_instancing_scene_with_layout(
@@ -486,6 +492,7 @@ fn build_instancing_scene_with_layout(
     row_count: f32,
     column_count: f32,
     camera_z: f32,
+    projection: Option<crate::math::Mat4>,
 ) -> InstancingScene {
     let camera = crate::camera::Camera::new(
         Vec3::new(0.0, 0.0, camera_z),
@@ -497,6 +504,7 @@ fn build_instancing_scene_with_layout(
     );
     // Keep the demo inputs platform-independent. The scene is also used by a
     // byte-exact golden test, so do not derive them from libm functions.
+    let projection = projection.unwrap_or_else(|| camera.projection_matrix());
     let mesh = cube_with_uvs(0.28);
     const TINTS: [Vec4; 6] = [
         Vec4::new(0.95, 0.35, 0.35, 1.0),
@@ -521,7 +529,7 @@ fn build_instancing_scene_with_layout(
     let lighting = BlinnPhongUniforms::new_with_linear_colors(
         Mat4::IDENTITY,
         camera.view_matrix(),
-        camera.projection_matrix(),
+        projection,
         Vec3::new(0.02, 0.025, 0.04),
         Vec3::new(0.72, 0.78, 0.9),
         Vec3::new(0.25, 0.25, 0.25),
@@ -542,6 +550,13 @@ fn build_instancing_scene_with_layout(
         camera,
         lighting,
     }
+}
+
+fn culling_demo_projection(aspect: f32) -> crate::math::Mat4 {
+    // tan(PI / 6) is replaced by this fixed f32 focal length for byte-stable
+    // golden inputs across platforms.
+    const FOCAL_Y: f32 = 1.7320508;
+    crate::math::Mat4::perspective_from_focal_length(FOCAL_Y, aspect, 0.1, 40.0)
 }
 
 /// Renders the shared instancing scene through one instanced submission.

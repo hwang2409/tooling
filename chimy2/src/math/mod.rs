@@ -517,6 +517,17 @@ impl Mat4 {
         debug_assert!(aspect > 0.0);
         debug_assert!(near > 0.0 && near < far);
         let focal = 1.0 / (fov_y * 0.5).tan();
+        Self::perspective_from_focal_length(focal, aspect, near, far)
+    }
+
+    /// Builds a perspective projection from a precomputed vertical focal length.
+    ///
+    /// This variant avoids platform math when a deterministic scene supplies a
+    /// fixed focal constant.
+    pub fn perspective_from_focal_length(focal: f32, aspect: f32, near: f32, far: f32) -> Self {
+        debug_assert!(focal > 0.0);
+        debug_assert!(aspect > 0.0);
+        debug_assert!(near > 0.0 && near < far);
         Self::new([
             focal / aspect,
             0.0,

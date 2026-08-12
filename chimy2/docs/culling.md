@@ -22,3 +22,7 @@ all caster bounds for that pass. this keeps casters outside the camera view,
 or outside a tight cascade xy box, when their shadows reach visible receivers.
 directional cascades, point-light cube faces, and the PCSS pass use their own
 light matrices. no shadow pass uses the camera frustum.
+
+the culling demo uses a precomputed `f32` focal length instead of deriving its
+60-degree field of view with `tan()`. this keeps its golden inputs stable across
+platform math libraries.
