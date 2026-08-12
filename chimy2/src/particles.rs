@@ -562,4 +562,42 @@ mod tests {
         assert_eq!(instanced.color, individual.color);
         assert_eq!(instanced.depth, individual.depth);
     }
+
+    #[test]
+    fn rendering_at_a_fixed_step_is_byte_deterministic() {
+        let mut left = ParticleSystem::new(emitter(), 32);
+        let mut right = ParticleSystem::new(emitter(), 32);
+        left.step_n(20);
+        right.step_n(20);
+        let camera = Camera::new(
+            Vec3::new(0.0, 0.0, 4.0),
+            Quat::IDENTITY,
+            1.0,
+            1.0,
+            0.1,
+            10.0,
+        );
+        let quad = billboard_quad();
+        let texture = crate::image::Texture::new(1, 1, vec![[255, 255, 255, 255]]).unwrap();
+        let render = |system: &ParticleSystem| {
+            let mut framebuffer = Framebuffer::new(32, 32);
+            let mut uniforms =
+                TexturedUniforms::new(Mat4::IDENTITY, &texture, TextureFilter::Nearest);
+            let mut pipeline = Pipeline::new(TexturedShader, TexturedShader);
+            pipeline.set_culling_enabled(false);
+            pipeline.render(&mut framebuffer, |frame, target| {
+                system.draw_instanced(
+                    frame,
+                    target,
+                    &quad,
+                    &mut uniforms,
+                    camera,
+                    0.2,
+                    Vec4::new(1.0, 1.0, 1.0, 0.5),
+                );
+            });
+            framebuffer
+        };
+        assert_eq!(render(&left), render(&right));
+    }
 }
