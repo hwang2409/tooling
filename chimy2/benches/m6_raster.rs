@@ -98,10 +98,17 @@ fn render_500_instances(instanced: bool, culling_enabled: bool) {
     black_box(framebuffer.color);
 }
 
-fn render_demo_cubes(scene: &InstancingScene, instanced: bool, culling_enabled: bool) {
-    let mut framebuffer = Framebuffer::new(320, 180);
+fn render_demo_cubes_at(
+    scene: &InstancingScene,
+    thread_count: usize,
+    width: usize,
+    height: usize,
+    instanced: bool,
+    culling_enabled: bool,
+) {
+    let mut framebuffer = Framebuffer::new(width, height);
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
-    pipeline.set_thread_count(1);
+    pipeline.set_thread_count(thread_count);
     pipeline.set_culling_enabled(culling_enabled);
     if instanced {
         pipeline.render(&mut framebuffer, |frame, target| {
@@ -120,6 +127,10 @@ fn render_demo_cubes(scene: &InstancingScene, instanced: bool, culling_enabled: 
         });
     }
     black_box(framebuffer.color);
+}
+
+fn render_demo_cubes(scene: &InstancingScene, instanced: bool, culling_enabled: bool) {
+    render_demo_cubes_at(scene, 1, 320, 180, instanced, culling_enabled);
 }
 
 fn subdivided_icosahedron(levels: usize) -> Mesh {
@@ -213,6 +224,22 @@ fn bench_raster(c: &mut Criterion) {
     });
     c.bench_function("900 demo cube mesh instances culling off", |b| {
         b.iter(|| render_demo_cubes(black_box(&demo_scene), true, false))
+    });
+    let demo_scene_960 = build_culling_instancing_scene(960.0 / 640.0);
+    c.bench_function("960x640 demo cube scene serial", |b| {
+        b.iter(|| render_demo_cubes_at(black_box(&demo_scene_960), 1, 960, 640, true, true))
+    });
+    c.bench_function("960x640 demo cube scene parallel", |b| {
+        b.iter(|| {
+            render_demo_cubes_at(
+                black_box(&demo_scene_960),
+                parallel_threads,
+                960,
+                640,
+                true,
+                true,
+            )
+        })
     });
     c.bench_function("opaque 100000 triangles 320x180 serial", |b| {
         b.iter(|| render_at(black_box(&exact_100k), 1, 320, 180))

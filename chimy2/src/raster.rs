@@ -6,6 +6,10 @@
 use crate::fb::Framebuffer;
 use crate::math::{Vec3, Vec4};
 use crate::pipeline::{SampleDerivatives, SamplingVaryings, Varyings};
+use std::cell::RefCell;
+
+#[path = "raster_simd.rs"]
+mod raster_simd;
 
 #[derive(Clone, Copy, Debug)]
 pub enum FragmentColor {
@@ -168,6 +172,46 @@ impl PixelRect {
 
     pub const fn is_empty(self) -> bool {
         self.min_x > self.max_x || self.min_y > self.max_y
+    }
+}
+
+#[derive(Default)]
+struct RasterRow {
+    // The row keeps each hot scalar in one contiguous lane array. This is
+    // the shared input for scalar fallback and the four-lane depth dispatch.
+    covered: Vec<u8>,
+    indices: Vec<usize>,
+    depth: Vec<f32>,
+    weights_x: Vec<f32>,
+    weights_y: Vec<f32>,
+    weights_z: Vec<f32>,
+}
+
+impl RasterRow {
+    fn resize(&mut self, length: usize) {
+        self.covered.resize(length, 0);
+        self.covered.fill(0);
+        self.indices.resize(length, 0);
+        self.depth.resize(length, 0.0);
+        self.weights_x.resize(length, 0.0);
+        self.weights_y.resize(length, 0.0);
+        self.weights_z.resize(length, 0.0);
+    }
+}
+
+thread_local! {
+    static RASTER_ROW: RefCell<RasterRow> = RefCell::new(RasterRow::default());
+}
+
+#[inline]
+fn simd_enabled() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::env::var_os("CHIMY_NO_SIMD").is_none()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
     }
 }
 
@@ -347,6 +391,7 @@ pub(crate) fn rasterize_triangle_in_rect<V, F, O>(
         vertices,
         rect,
         RasterState::OPAQUE,
+        simd_enabled(),
         |vertices, weights, _| interpolated_depth(vertices, weights),
         |vertices, weights, inverse_w, _, _| {
             V::lerp3(
@@ -376,6 +421,7 @@ pub(crate) fn rasterize_triangle_in_rect_with_state<V, F, O>(
         vertices,
         rect,
         state,
+        simd_enabled(),
         |vertices, weights, _| interpolated_depth(vertices, weights),
         |vertices, weights, inverse_w, _, _| {
             V::lerp3(
@@ -401,6 +447,7 @@ pub(crate) fn rasterize_triangle_depth_in_rect<V>(
         vertices,
         rect,
         RasterState::DEPTH_ONLY,
+        simd_enabled(),
         |vertices, weights, _| interpolated_depth(vertices, weights),
         |vertices, weights, inverse_w, _, _| {
             V::lerp3(
@@ -426,6 +473,7 @@ pub(crate) fn rasterize_triangle_depth_with_varyings_in_rect<V>(
         vertices,
         rect,
         RasterState::DEPTH_ONLY,
+        simd_enabled(),
         V::depth,
         |vertices, weights, inverse_w, _, _| {
             V::lerp3(
@@ -454,6 +502,7 @@ pub(crate) fn rasterize_triangle_in_rect_with_sampling<V, F, O>(
         vertices,
         rect,
         RasterState::OPAQUE,
+        simd_enabled(),
         |vertices, weights, _| interpolated_depth(vertices, weights),
         |vertices, weights, inverse_w, ddx_weights, ddy_weights| {
             let varyings = V::lerp3(
@@ -487,6 +536,7 @@ pub(crate) fn rasterize_triangle_in_rect_with_sampling_state<V, F, O>(
         vertices,
         rect,
         state,
+        simd_enabled(),
         |vertices, weights, _| interpolated_depth(vertices, weights),
         |vertices, weights, inverse_w, ddx_weights, ddy_weights| {
             let varyings = V::lerp3(
@@ -504,11 +554,13 @@ pub(crate) fn rasterize_triangle_in_rect_with_sampling_state<V, F, O>(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment, O, Depth>(
     framebuffer: &mut Framebuffer,
     mut vertices: [ScreenVertex<V>; 3],
     rect: PixelRect,
     state: RasterState,
+    use_simd: bool,
     mut depth_value: Depth,
     mut interpolate: Interpolate,
     mut fragment: Fragment,
@@ -549,49 +601,125 @@ fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment, O, Depth>(
     let top_left_1 = is_top_left(vertices[2].position, vertices[0].position);
     let top_left_2 = is_top_left(vertices[0].position, vertices[1].position);
 
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let point = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, 0.0);
-            let weights = barycentric_weights(&vertices, point, area);
-            if !covered(weights, area, top_left_0, top_left_1, top_left_2) {
-                continue;
+    let inverse_w_vector = inverse_w(&vertices);
+    let ddx_weights = Vec3::new(
+        -(vertices[2].position.y - vertices[1].position.y) / area,
+        -(vertices[0].position.y - vertices[2].position.y) / area,
+        -(vertices[1].position.y - vertices[0].position.y) / area,
+    );
+    let ddy_weights = Vec3::new(
+        (vertices[2].position.x - vertices[1].position.x) / area,
+        (vertices[0].position.x - vertices[2].position.x) / area,
+        (vertices[1].position.x - vertices[0].position.x) / area,
+    );
+    let row_length = (max_x - min_x + 1) as usize;
+    RASTER_ROW.with_borrow_mut(|row| {
+        for y in min_y..=max_y {
+            row.resize(row_length);
+            for x in min_x..=max_x {
+                let row_offset = (x - min_x) as usize;
+                let point = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, 0.0);
+                let weights = barycentric_weights(&vertices, point, area);
+                if !covered(weights, area, top_left_0, top_left_1, top_left_2) {
+                    continue;
+                }
+
+                let depth = depth_value(&vertices, weights, inverse_w_vector);
+                let Ok(x) = usize::try_from(x) else { continue };
+                let Ok(y) = usize::try_from(y) else { continue };
+                let Some(index) = y
+                    .checked_mul(framebuffer.width)
+                    .and_then(|row| row.checked_add(x))
+                else {
+                    continue;
+                };
+                row.covered[row_offset] = 1;
+                row.indices[row_offset] = index;
+                row.depth[row_offset] = depth;
+                row.weights_x[row_offset] = weights.x;
+                row.weights_y[row_offset] = weights.y;
+                row.weights_z[row_offset] = weights.z;
             }
 
-            let inverse_w = inverse_w(&vertices);
-            let depth = depth_value(&vertices, weights, inverse_w);
-            let Ok(x) = usize::try_from(x) else { continue };
-            let Ok(y) = usize::try_from(y) else { continue };
-            let Some(index) = y
-                .checked_mul(framebuffer.width)
-                .and_then(|row| row.checked_add(x))
-            else {
-                continue;
-            };
-            let Some(buffer_depth) = framebuffer.depth.get_mut(index) else {
-                continue;
-            };
-            if state.depth_test && depth >= *buffer_depth {
-                continue;
-            }
-            let ddx_weights = Vec3::new(
-                -(vertices[2].position.y - vertices[1].position.y) / area,
-                -(vertices[0].position.y - vertices[2].position.y) / area,
-                -(vertices[1].position.y - vertices[0].position.y) / area,
-            );
-            let ddy_weights = Vec3::new(
-                (vertices[2].position.x - vertices[1].position.x) / area,
-                (vertices[0].position.x - vertices[2].position.x) / area,
-                (vertices[1].position.x - vertices[0].position.x) / area,
-            );
-            let input = interpolate(&vertices, weights, inverse_w, ddx_weights, ddy_weights);
-            if state.depth_write {
-                *buffer_depth = depth;
-            }
-            if state.color_write {
-                fragment(input).write(framebuffer, index, state.blend);
+            let mut offset = 0;
+            while offset < row_length {
+                let lane_count = (row_length - offset).min(4);
+                let simd_mask = if use_simd && lane_count == 4 {
+                    // Coverage and depth use four-lane NEON. Generic varying
+                    // interpolation and fragment closures remain scalar because
+                    // their types are shader-defined and may sample or blend.
+                    let first_index = row.indices[offset];
+                    let contiguous = (0..4).all(|lane| {
+                        first_index
+                            .checked_add(lane)
+                            .is_some_and(|expected| row.indices[offset + lane] == expected)
+                    });
+                    if contiguous {
+                        raster_simd::depth_mask(
+                            &row.covered,
+                            &row.depth,
+                            &framebuffer.depth,
+                            offset,
+                            first_index,
+                            state.depth_test,
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let mut process_lane = |lane: usize, depth_already_passed: bool| {
+                    if row.covered[lane] == 0 {
+                        return;
+                    }
+                    let index = row.indices[lane];
+                    let depth = row.depth[lane];
+                    let Some(buffer_depth) = framebuffer.depth.get(index) else {
+                        return;
+                    };
+                    if state.depth_test && !depth_already_passed && depth >= *buffer_depth {
+                        return;
+                    }
+                    let weights = Vec3::new(
+                        row.weights_x[lane],
+                        row.weights_y[lane],
+                        row.weights_z[lane],
+                    );
+                    let input = interpolate(
+                        &vertices,
+                        weights,
+                        inverse_w_vector,
+                        ddx_weights,
+                        ddy_weights,
+                    );
+                    if state.depth_write {
+                        let Some(buffer_depth) = framebuffer.depth.get_mut(index) else {
+                            return;
+                        };
+                        *buffer_depth = depth;
+                    }
+                    if state.color_write {
+                        fragment(input).write(framebuffer, index, state.blend);
+                    }
+                };
+
+                if let Some(mask) = simd_mask {
+                    for lane in 0..4 {
+                        if mask & (1 << lane) != 0 {
+                            process_lane(offset + lane, true);
+                        }
+                    }
+                } else {
+                    for lane in offset..offset + lane_count {
+                        process_lane(lane, false);
+                    }
+                }
+                offset += lane_count;
             }
         }
-    }
+    });
 }
 
 fn barycentric_weights<V>(vertices: &[ScreenVertex<V>; 3], point: Vec3, area: f32) -> Vec3 {
@@ -786,5 +914,122 @@ mod tests {
             |_| 0xffff_ffff,
         );
         assert_eq!(framebuffer.color, vec![0; 16]);
+    }
+
+    fn render_gradient(width: usize, height: usize, use_simd: bool) -> Framebuffer {
+        let mut framebuffer = Framebuffer::new(width, height);
+        let vertices = [
+            ScreenVertex::new(
+                Vec3::new(0.0, 0.0, 0.0),
+                ColorVarying::new(Vec4::new(1.0, 0.0, 0.0, 1.0)),
+            ),
+            ScreenVertex::new(
+                Vec3::new(width as f32, 0.0, 0.0),
+                ColorVarying::new(Vec4::new(0.0, 1.0, 0.0, 1.0)),
+            ),
+            ScreenVertex::new(
+                Vec3::new(0.0, height as f32, 0.0),
+                ColorVarying::new(Vec4::new(0.0, 0.0, 1.0, 1.0)),
+            ),
+        ];
+        rasterize_triangle_in_rect_core(
+            &mut framebuffer,
+            vertices,
+            PixelRect {
+                min_x: 0,
+                max_x: width.saturating_sub(1) as i32,
+                min_y: 0,
+                max_y: height.saturating_sub(1) as i32,
+            },
+            RasterState::OPAQUE,
+            use_simd,
+            |vertices, weights, _| interpolated_depth(vertices, weights),
+            |vertices, weights, inverse_w, _, _| {
+                ColorVarying::lerp3(
+                    &vertices[0].varyings,
+                    &vertices[1].varyings,
+                    &vertices[2].varyings,
+                    perspective_correct_weights(weights, inverse_w),
+                )
+            },
+            |varyings| {
+                let color = varyings.color;
+                argb8888(
+                    255,
+                    (color.x * 255.0).round() as u8,
+                    (color.y * 255.0).round() as u8,
+                    (color.z * 255.0).round() as u8,
+                )
+            },
+        );
+        framebuffer
+    }
+
+    #[test]
+    fn simd_and_scalar_modes_match_for_non_multiple_widths() {
+        for width in [1, 63, 65] {
+            assert_eq!(
+                render_gradient(width, 7, false),
+                render_gradient(width, 7, true),
+                "raster modes differ at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_depth_buffer_falls_back_without_writing_color() {
+        raster_simd::reset_depth_fallbacks();
+        let mut framebuffer = Framebuffer::new(8, 4);
+        framebuffer.depth.clear();
+        rasterize_triangle_in_rect_core(
+            &mut framebuffer,
+            [
+                ScreenVertex::new(Vec3::new(-100.0, 1.0, 0.0), ()),
+                ScreenVertex::new(Vec3::new(100.0, 1.0, 0.0), ()),
+                ScreenVertex::new(Vec3::new(0.0, 2.0, 0.0), ()),
+            ],
+            PixelRect {
+                min_x: 0,
+                max_x: 7,
+                min_y: 0,
+                max_y: 3,
+            },
+            RasterState::OPAQUE,
+            true,
+            |vertices, weights, _| interpolated_depth(vertices, weights),
+            |_, _, _, _, _| (),
+            |_| argb8888(255, 255, 255, 255),
+        );
+        assert!(framebuffer.color.iter().all(|&color| color == 0));
+        assert!(raster_simd::depth_fallbacks() > 0);
+    }
+
+    #[test]
+    fn short_last_row_falls_back_and_preserves_missing_pixel() {
+        raster_simd::reset_depth_fallbacks();
+        let mut framebuffer = Framebuffer::new(4, 2);
+        framebuffer.depth.pop();
+        rasterize_triangle_in_rect_core(
+            &mut framebuffer,
+            [
+                ScreenVertex::new(Vec3::new(-100.0, 1.0, 0.0), ()),
+                ScreenVertex::new(Vec3::new(100.0, 1.0, 0.0), ()),
+                ScreenVertex::new(Vec3::new(0.0, 2.0, 0.0), ()),
+            ],
+            PixelRect {
+                min_x: 0,
+                max_x: 3,
+                min_y: 0,
+                max_y: 1,
+            },
+            RasterState::OPAQUE,
+            true,
+            |vertices, weights, _| interpolated_depth(vertices, weights),
+            |_, _, _, _, _| (),
+            |_| argb8888(255, 255, 255, 255),
+        );
+        assert!(framebuffer.color[..7].contains(&0xffff_ffff));
+        assert_eq!(framebuffer.color[7], 0);
+        assert!(raster_simd::depth_fallbacks() > 0);
     }
 }
