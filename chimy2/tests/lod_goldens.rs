@@ -1,5 +1,6 @@
 use chimy2::demo::{build_lod_scene, render_lod_scene};
 use chimy2::fb::Framebuffer;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -26,6 +27,37 @@ fn golden_path() -> PathBuf {
 fn lod_rings_golden() {
     let mut framebuffer = Framebuffer::new(WIDTH, HEIGHT);
     let scene = build_lod_scene(WIDTH as f32 / HEIGHT as f32);
+    let counts = scene
+        .mesh
+        .levels()
+        .iter()
+        .map(|mesh| mesh.indices().len())
+        .collect::<Vec<_>>();
+    assert!(
+        counts.windows(2).all(|window| window[0] > window[1]),
+        "LOD counts: {counts:?}"
+    );
+    let selected_levels = scene
+        .models
+        .iter()
+        .map(|model| {
+            scene
+                .mesh
+                .select(
+                    scene.camera.view_matrix(),
+                    scene.projection,
+                    *model,
+                    WIDTH,
+                    HEIGHT,
+                )
+                .level()
+        })
+        .collect::<Vec<_>>();
+    let selected_set = selected_levels.iter().copied().collect::<BTreeSet<_>>();
+    assert!(
+        selected_set.len() >= 3,
+        "expected at least three selected LOD levels, got {selected_levels:?}"
+    );
     render_lod_scene(&mut framebuffer, &scene);
     let path = golden_path();
     let actual = ppm(&framebuffer);

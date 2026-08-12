@@ -12,14 +12,30 @@ faces by `Mesh::new`.
 
 The implementation rejects a collapse when any affected triangle becomes
 degenerate or reverses its old orientation. For closed, consistently oriented
-meshes, it also rejects a candidate that points inward. Sphere-like meshes
-project replacement points back to their detected source radius. This keeps
-the common subdivided-sphere case within its source surface.
+meshes, it also rejects a candidate that points inward. Sphere reprojection is
+explicit. It is not detected automatically. For a known sphere, pass
+`SphereProjection` through `SimplifyOptions`:
 
-Selection uses the source AABB. It transforms the AABB center, estimates a
-conservative radius, and projects it with the Euclidean norms of projection
-matrix rows zero and one. No trigonometric function is used by the selection
-math. The selected `LodSelection` is reusable by color and depth passes.
+```rust
+let lod = LodMesh::with_ratios_and_options(
+    mesh,
+    &[0.5, 0.25, 0.125],
+    SimplifyOptions {
+        sphere_projection: Some(SphereProjection::new(
+            Vec3::ZERO,
+            1.0,
+            1.0e-5,
+        )),
+    },
+);
+```
+
+This projects replacement points back to the supplied sphere radius.
+
+Selection uses all eight corners of the source AABB. It projects each corner
+through the view and projection matrices, then measures the largest screen
+span. No trigonometric function is used by the selection math. The selected
+`LodSelection` is reusable by color and depth passes.
 
 Plain `Mesh` APIs remain unchanged. Use `RenderFrame::draw_lod_mesh` for an
 opt-in color submission and `Pipeline::draw_lod_mesh_depth` for a shadow

@@ -242,26 +242,28 @@ pub fn projected_screen_extent(
     height: usize,
 ) -> f32 {
     use crate::math::Vec4;
-    let center = (bounds.min() + bounds.max()) * 0.5;
-    let half = (bounds.max() - bounds.min()) * 0.5;
-    let world_center = model * Vec4::new(center.x, center.y, center.z, 1.0);
-    let world_radius = (model.upper_left3() * Vec3::new(half.x, half.y, half.z)).length();
-    let view_center = view * world_center;
-    let depth = -view_center.z;
-    let row_x = matrix_row_norm(projection, 0);
-    let row_y = matrix_row_norm(projection, 1);
-    if !depth.is_finite()
-        || depth <= f32::EPSILON
-        || !world_radius.is_finite()
-        || !row_x.is_finite()
-        || !row_y.is_finite()
-    {
-        return f32::INFINITY;
-    }
     let viewport_x = width as f32;
     let viewport_y = height as f32;
-    let radius = world_radius / depth;
-    (radius * row_x * viewport_x).max(radius * row_y * viewport_y)
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for corner in bounds.corners() {
+        let clip = projection * (view * (model * Vec4::new(corner.x, corner.y, corner.z, 1.0)));
+        if !clip.w.is_finite() || clip.w.abs() <= f32::EPSILON {
+            return f32::INFINITY;
+        }
+        let x = clip.x / clip.w;
+        let y = clip.y / clip.w;
+        if !x.is_finite() || !y.is_finite() {
+            return f32::INFINITY;
+        }
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    ((max_x - min_x) * 0.5 * viewport_x).max((max_y - min_y) * 0.5 * viewport_y)
 }
 
 pub fn projection_row_norms(projection: Mat4) -> (f32, f32) {
@@ -388,9 +390,14 @@ pub fn simplify_qem_with_options(
     let mut triangles = mesh.indices().to_vec();
     let preserve_closed_manifold = is_closed_manifold(&triangles);
     let orientation_center = consistent_orientation_center(mesh);
+    let boundary_segments = boundary_edges(&triangles)
+        .into_iter()
+        .filter_map(|(a, b)| Some((vertices.get(a)?.position(), vertices.get(b)?.position())))
+        .collect::<Vec<_>>();
     while triangles.len() > target_triangles.max(1) {
         let quadrics = vertex_quadrics(&vertices, &triangles);
         let (edges, edge_indices) = unique_edges(&triangles);
+        let boundary_edges = boundary_edges(&triangles);
         let mut queue = std::collections::BinaryHeap::with_capacity(edges.len());
         for (edge_index, &(a, b)) in edges.iter().enumerate() {
             let midpoint = (vertices[a].position() + vertices[b].position()) * 0.5;
@@ -438,7 +445,8 @@ pub fn simplify_qem_with_options(
                 candidate.position,
                 orientation_center,
                 preserve_closed_manifold,
-                options.sphere_projection.is_some(),
+                &boundary_edges,
+                &boundary_segments,
             ) {
                 break Some(candidate);
             }
@@ -532,13 +540,63 @@ fn collapse_is_valid(
     position: Vec3,
     orientation_center: Option<(Vec3, bool)>,
     preserve_closed_manifold: bool,
-    preserve_convex: bool,
+    boundary_edge_set: &std::collections::BTreeSet<(usize, usize)>,
+    boundary_segments: &[(Vec3, Vec3)],
 ) -> bool {
     if preserve_closed_manifold && !collapse_keeps_closed_manifold(triangles, a, b) {
         return false;
     }
     if preserve_closed_manifold && !collapse_has_valid_link(triangles, a, b) {
         return false;
+    }
+    if !boundary_edge_set.is_empty() {
+        let boundary_vertices = boundary_edge_set
+            .iter()
+            .flat_map(|&(left, right)| [left, right])
+            .collect::<std::collections::BTreeSet<_>>();
+        let a_is_boundary = boundary_vertices.contains(&a);
+        let b_is_boundary = boundary_vertices.contains(&b);
+        if a_is_boundary != b_is_boundary
+            || (a_is_boundary
+                && !boundary_segments
+                    .iter()
+                    .any(|&(start, end)| point_is_on_segment(position, start, end)))
+        {
+            return false;
+        }
+        let collapsed_triangles = triangles
+            .iter()
+            .map(|triangle| {
+                let mut triangle = *triangle;
+                for index in &mut triangle {
+                    if *index == b {
+                        *index = a;
+                    }
+                }
+                triangle
+            })
+            .filter(|triangle| {
+                triangle[0] != triangle[1]
+                    && triangle[1] != triangle[2]
+                    && triangle[2] != triangle[0]
+            })
+            .collect::<Vec<_>>();
+        let expected_boundary_edges = boundary_edge_set
+            .iter()
+            .map(|&(left, right)| {
+                let left = if left == b { a } else { left };
+                let right = if right == b { a } else { right };
+                if left < right {
+                    (left, right)
+                } else {
+                    (right, left)
+                }
+            })
+            .filter(|&(left, right)| left != right)
+            .collect::<std::collections::BTreeSet<_>>();
+        if boundary_edges(&collapsed_triangles) != expected_boundary_edges {
+            return false;
+        }
     }
     for &[x, y, z] in triangles {
         if x != a && x != b && y != a && y != b && z != a && z != b {
@@ -571,30 +629,38 @@ fn collapse_is_valid(
                     return false;
                 }
             }
-            if preserve_convex {
-                let centroid = (replacement[0] + replacement[1] + replacement[2]) / 3.0;
-                let components = [
-                    new_normal.x * (centroid.x - center.x),
-                    new_normal.y * (centroid.y - center.y),
-                    new_normal.z * (centroid.z - center.z),
-                ];
-                if components.iter().any(|&component| component < 0.0) {
-                    return false;
-                }
-                let scale = vertices
-                    .iter()
-                    .map(|vertex| vertex.position().length())
-                    .fold(0.0, f32::max);
-                let tolerance = new_normal.length() * scale * 1.0e-5;
-                for vertex in vertices {
-                    if new_normal.dot(vertex.position() - replacement[0]) > tolerance {
-                        return false;
-                    }
-                }
-            }
         }
     }
     true
+}
+
+fn point_is_on_segment(point: Vec3, start: Vec3, end: Vec3) -> bool {
+    let edge = end - start;
+    let length_squared = edge.dot(edge);
+    if !length_squared.is_finite() || length_squared <= f32::EPSILON {
+        return false;
+    }
+    let parameter = (point - start).dot(edge) / length_squared;
+    let distance = (point - (start + edge * parameter)).length();
+    (-1.0e-5..=1.0 + 1.0e-5).contains(&parameter) && distance <= 1.0e-5
+}
+
+fn boundary_edges(triangles: &[[usize; 3]]) -> std::collections::BTreeSet<(usize, usize)> {
+    let mut edge_counts = BTreeMap::new();
+    for &[a, b, c] in triangles {
+        for (left, right) in [(a, b), (b, c), (c, a)] {
+            let edge = if left < right {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            *edge_counts.entry(edge).or_insert(0usize) += 1;
+        }
+    }
+    edge_counts
+        .into_iter()
+        .filter_map(|(edge, count)| (count == 1).then_some(edge))
+        .collect()
 }
 
 fn is_closed_manifold(triangles: &[[usize; 3]]) -> bool {
@@ -896,6 +962,73 @@ mod tests {
     }
 
     #[test]
+    fn projected_extent_spans_all_perspective_aabb_corners() {
+        let bounds = Aabb::new(Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 1.0));
+        let projection = Mat4::perspective_from_focal_length(1.0, 1.0, 0.1, 100.0);
+        let extent = projected_screen_extent(
+            bounds,
+            Mat4::IDENTITY,
+            projection,
+            Mat4::translate(Vec3::new(0.0, 0.0, -2.0)),
+            100,
+            100,
+        );
+        assert_eq!(extent, 100.0);
+    }
+
+    #[test]
+    fn qem_preserves_open_mesh_boundary_polyline() {
+        let cells = 4;
+        let mut vertices = Vec::new();
+        for y in 0..=cells {
+            for x in 0..=cells {
+                vertices.push(MeshVertex::new(
+                    Vec3::new(x as f32 / cells as f32, y as f32 / cells as f32, 0.0),
+                    None,
+                    None,
+                ));
+            }
+        }
+        let mut triangles = Vec::new();
+        for y in 0..cells {
+            for x in 0..cells {
+                let a = y * (cells + 1) + x;
+                let b = a + 1;
+                let d = a + cells + 1;
+                let c = d + 1;
+                triangles.extend_from_slice(&[[a, b, c], [a, c, d]]);
+            }
+        }
+        let simplified = simplify_qem(&Mesh::new(vertices, triangles), 12);
+        let mut edge_counts = BTreeMap::new();
+        for &[a, b, c] in simplified.indices() {
+            for (left, right) in [(a, b), (b, c), (c, a)] {
+                let edge = if left < right {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                *edge_counts.entry(edge).or_insert(0usize) += 1;
+            }
+        }
+        for ((a, b), count) in edge_counts {
+            if count != 1 {
+                continue;
+            }
+            for index in [a, b] {
+                let position = simplified.vertex(index).unwrap().position();
+                assert!(
+                    (position.x - 0.0).abs() <= 1.0e-5
+                        || (position.x - 1.0).abs() <= 1.0e-5
+                        || (position.y - 0.0).abs() <= 1.0e-5
+                        || (position.y - 1.0).abs() <= 1.0e-5,
+                    "boundary vertex moved inward: {position:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn qem_simplifies_sphere_cube_cylinder_and_skinned_inputs() {
         assert_simplified_shape(subdivided_octahedron(2), 32, true);
         assert_simplified_shape(cube_mesh(), 6, true);
@@ -958,6 +1091,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn qem_sphere_projection_simplifies_sphere() {
+        let source = subdivided_octahedron(3);
+        let lod = LodMesh::with_ratios_and_options(
+            source,
+            &[0.5, 0.25, 0.125],
+            SimplifyOptions {
+                sphere_projection: Some(SphereProjection::new(Vec3::ZERO, 1.0, 1.0e-5)),
+            },
+        );
+        let counts = lod
+            .levels()
+            .iter()
+            .map(|mesh| mesh.indices().len())
+            .collect::<Vec<_>>();
+        assert!(
+            counts.windows(2).all(|window| window[0] > window[1]),
+            "{counts:?}"
+        );
     }
 
     #[test]
@@ -1032,7 +1186,8 @@ mod tests {
             Vec3::new(0.0, 2.0, 0.0),
             None,
             false,
-            false,
+            &std::collections::BTreeSet::new(),
+            &[],
         ));
     }
 }

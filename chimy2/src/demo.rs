@@ -24,6 +24,7 @@ use crate::pipeline::{Instance, InstanceUniforms, Pipeline};
 use crate::postfx::{AcesTonemapPass, BloomPass, FxaaPass, PostChain, SsaoPass, VignettePass};
 use crate::present::{InputState, run_with_input};
 use crate::shaders::{BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, PointLight};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::f32::consts::{PI, TAU};
 use std::fs::File;
@@ -504,7 +505,7 @@ pub fn build_lod_scene(aspect: f32) -> LodScene {
             sphere_projection: Some(SphereProjection::new(Vec3::ZERO, 1.0, 1.0e-5)),
         },
     );
-    mesh.set_thresholds(vec![2000.0, 1000.0, 500.0]);
+    mesh.set_thresholds(vec![100.0, 30.0, 10.0]);
     let base = BlinnPhongUniforms::new_with_linear_colors(
         Mat4::IDENTITY,
         camera.view_matrix(),
@@ -531,15 +532,15 @@ pub fn build_lod_scene(aspect: f32) -> LodScene {
     let mut models = Vec::new();
     let mut uniforms = Vec::new();
     for (ring, color) in colors.into_iter().enumerate() {
-        let depth = [5.0, 10.0, 16.0][ring];
         let ring_y = (ring as f32 - 1.0) * 2.0;
-        for position in [
-            Vec3::new(-3.0, ring_y, -depth),
-            Vec3::new(-1.5, ring_y, -depth),
-            Vec3::new(0.0, ring_y, -depth),
-            Vec3::new(1.5, ring_y, -depth),
-            Vec3::new(3.0, ring_y, -depth),
-        ] {
+        let depths = match ring {
+            0 => [3.0; 5],
+            1 => [10.0; 5],
+            _ => [30.0, 50.0, 70.0, 100.0, 150.0],
+        };
+        for (column, depth) in depths.into_iter().enumerate() {
+            let x = column as f32 * 1.5 - 3.0;
+            let position = Vec3::new(x, ring_y, -depth);
             let scale = 0.7;
             let model = Mat4::translate(position) * Mat4::scale(Vec3::new(scale, scale, scale));
             models.push(model);
@@ -594,14 +595,30 @@ fn subdivided_octahedron(levels: usize) -> Mesh {
         [5, 4, 1],
     ];
     for _ in 0..levels {
+        let mut midpoint_cache = BTreeMap::new();
         let mut next = Vec::with_capacity(triangles.len() * 4);
         for [a, b, c] in triangles {
-            let ab = positions.len();
-            positions.push((positions[a] + positions[b]).normalize());
-            let bc = positions.len();
-            positions.push((positions[b] + positions[c]).normalize());
-            let ca = positions.len();
-            positions.push((positions[c] + positions[a]).normalize());
+            let midpoint =
+                |left: usize,
+                 right: usize,
+                 positions: &mut Vec<Vec3>,
+                 cache: &mut BTreeMap<(usize, usize), usize>| {
+                    let edge = if left < right {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    };
+                    if let Some(&index) = cache.get(&edge) {
+                        return index;
+                    }
+                    let index = positions.len();
+                    positions.push((positions[left] + positions[right]).normalize());
+                    cache.insert(edge, index);
+                    index
+                };
+            let ab = midpoint(a, b, &mut positions, &mut midpoint_cache);
+            let bc = midpoint(b, c, &mut positions, &mut midpoint_cache);
+            let ca = midpoint(c, a, &mut positions, &mut midpoint_cache);
             next.extend_from_slice(&[[a, ab, ca], [ab, b, bc], [ca, bc, c], [ab, bc, ca]]);
         }
         triangles = next;
