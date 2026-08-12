@@ -159,6 +159,116 @@ impl CookTorranceShader {
     }
 }
 
+/// GGX uniforms with precomputed diffuse and split-sum image lighting.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IblCookTorranceUniforms<'a> {
+    pub lighting: CookTorranceUniforms,
+    pub ibl: &'a IblMaps,
+}
+
+impl<'a> IblCookTorranceUniforms<'a> {
+    pub fn new(
+        lighting: BlinnPhongUniforms,
+        ibl: &'a IblMaps,
+        base_color: Vec3,
+        metallic: f32,
+        roughness: f32,
+    ) -> Self {
+        Self {
+            lighting: CookTorranceUniforms::new(lighting, base_color, metallic, roughness),
+            ibl,
+        }
+    }
+
+    pub fn new_with_linear_base_color(
+        lighting: BlinnPhongUniforms,
+        ibl: &'a IblMaps,
+        base_color: Vec3,
+        metallic: f32,
+        roughness: f32,
+    ) -> Self {
+        Self {
+            lighting: CookTorranceUniforms::new_with_linear_base_color(
+                lighting, base_color, metallic, roughness,
+            ),
+            ibl,
+        }
+    }
+
+    pub const fn base_color(&self) -> Vec3 {
+        self.lighting.base_color()
+    }
+
+    pub const fn metallic(&self) -> f32 {
+        self.lighting.metallic()
+    }
+
+    pub const fn roughness(&self) -> f32 {
+        self.lighting.roughness()
+    }
+}
+
+/// GGX shader variant that adds irradiance and split-sum specular IBL.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IblCookTorranceShader;
+
+impl<'a> VertexStage<MeshVertex, IblCookTorranceUniforms<'a>> for IblCookTorranceShader {
+    type Varyings = CookTorranceVaryings;
+
+    fn run(
+        &self,
+        vertex: &MeshVertex,
+        uniforms: &IblCookTorranceUniforms<'a>,
+    ) -> VertexOutput<Self::Varyings> {
+        let prepared = prepare_blinn_phong_vertex(vertex, &uniforms.lighting.lighting);
+        VertexOutput::new(
+            prepared.clip_position,
+            BlinnPhongVaryings {
+                world_position: prepared.world_position,
+                normal: prepared.normal,
+                light_space_position: prepared.light_space_position,
+            },
+        )
+    }
+}
+
+impl<'a> FragmentStage<CookTorranceVaryings, IblCookTorranceUniforms<'a>>
+    for IblCookTorranceShader
+{
+    fn run(&self, varyings: &CookTorranceVaryings, uniforms: &IblCookTorranceUniforms<'a>) -> u32 {
+        let linear = self.run_linear(varyings, uniforms);
+        argb8888_linear(linear[0], [linear[1], linear[2], linear[3]])
+    }
+
+    fn run_linear(
+        &self,
+        varyings: &CookTorranceVaryings,
+        uniforms: &IblCookTorranceUniforms<'a>,
+    ) -> [f32; 4] {
+        let lighted = evaluate_ibl_ggx_lighting(
+            varyings.world_position,
+            varyings.normal,
+            varyings.light_space_position,
+            uniforms,
+            Vec3::new(1.0, 1.0, 1.0),
+        );
+        [
+            uniforms.lighting.lighting.alpha,
+            lighted.x,
+            lighted.y,
+            lighted.z,
+        ]
+    }
+
+    fn is_opaque(&self, uniforms: &IblCookTorranceUniforms<'a>) -> bool {
+        uniforms.lighting.lighting.alpha == 1.0
+    }
+
+    fn model_view(&self, uniforms: &IblCookTorranceUniforms<'a>) -> Option<Mat4> {
+        Some(uniforms.lighting.lighting.view() * uniforms.lighting.lighting.model())
+    }
+}
+
 /// GGX / Trowbridge-Reitz normal distribution.
 ///
 /// `alpha = roughness^2`, following the Disney convention.
@@ -308,6 +418,91 @@ fn evaluate_ggx_lighting(
             base_color,
             uniforms.metallic,
             uniforms.roughness,
+        );
+        lighted = lighted + brdf * normal.dot(point_direction).max(0.0) * light.color * attenuation;
+    }
+
+    lighted
+}
+
+fn evaluate_ibl_ggx_lighting(
+    world_position: Vec3,
+    interpolated_normal: Vec3,
+    light_space_position: Vec4,
+    uniforms: &IblCookTorranceUniforms<'_>,
+    albedo: Vec3,
+) -> Vec3 {
+    let normal = interpolated_normal.normalize();
+    let view_direction = (uniforms.lighting.lighting.camera_position - world_position).normalize();
+    let base_color = sanitize_base_color(uniforms.lighting.base_color * albedo);
+    let n_dot_v = normal.dot(view_direction).clamp(0.0, 1.0);
+    let fresnel = schlick_fresnel(n_dot_v, base_color, uniforms.lighting.metallic);
+    let kd = (Vec3::new(1.0, 1.0, 1.0) - fresnel) * (1.0 - uniforms.lighting.metallic);
+    let irradiance = uniforms.ibl.irradiance.sample(normal);
+    let diffuse = irradiance * base_color * kd;
+
+    let reflected = reflection_vector(view_direction, normal);
+    let prefiltered = uniforms
+        .ibl
+        .prefiltered
+        .sample(reflected, uniforms.lighting.roughness);
+    let environment_brdf = uniforms
+        .ibl
+        .brdf_lut
+        .sample(n_dot_v, uniforms.lighting.roughness);
+    let f0 = Vec3::new(0.04, 0.04, 0.04) * (1.0 - uniforms.lighting.metallic)
+        + base_color * uniforms.lighting.metallic;
+    let specular =
+        prefiltered * (f0 * environment_brdf.x + Vec3::new(1.0, 1.0, 1.0) * environment_brdf.y);
+    let mut lighted = diffuse + specular;
+
+    let directional_visibility = uniforms
+        .lighting
+        .lighting
+        .shadow_visibility(light_space_position, normal);
+    for (index, light) in uniforms
+        .lighting
+        .lighting
+        .directional_lights()
+        .iter()
+        .enumerate()
+    {
+        let visibility = if index == 0 {
+            directional_visibility
+        } else {
+            1.0
+        };
+        let brdf = cook_torrance_brdf(
+            normal,
+            light.direction,
+            view_direction,
+            base_color,
+            uniforms.lighting.metallic,
+            uniforms.lighting.roughness,
+        );
+        lighted = lighted
+            + brdf * normal.dot(light.direction.normalize()).max(0.0) * light.color * visibility;
+    }
+
+    for light in uniforms.lighting.lighting.point_lights() {
+        let to_point = light.position - world_position;
+        let distance = to_point.length();
+        let point_direction = to_point.normalize();
+        let denominator = light.constant_attenuation
+            + light.linear_attenuation * distance
+            + light.quadratic_attenuation * distance * distance;
+        let attenuation = if denominator > 0.0 {
+            1.0 / denominator
+        } else {
+            0.0
+        };
+        let brdf = cook_torrance_brdf(
+            normal,
+            point_direction,
+            view_direction,
+            base_color,
+            uniforms.lighting.metallic,
+            uniforms.lighting.roughness,
         );
         lighted = lighted + brdf * normal.dot(point_direction).max(0.0) * light.color * attenuation;
     }
@@ -566,6 +761,8 @@ pub type NormalMappedGgxUniforms<'a> = NormalMappedCookTorranceUniforms<'a>;
 pub type NormalMappedGgxShader = NormalMappedCookTorranceShader;
 pub type CookTorranceGGXUniforms = CookTorranceUniforms;
 pub type CookTorranceGGXShader = CookTorranceShader;
+pub type IblGgxUniforms<'a> = IblCookTorranceUniforms<'a>;
+pub type IblGgxShader = IblCookTorranceShader;
 
 #[cfg(test)]
 mod tests {

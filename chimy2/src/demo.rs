@@ -14,6 +14,7 @@
 //! - `--bloom`, `--fxaa`, `--vignette` — enable post-processing passes.
 //! - `--hdr` — keep linear HDR values through the render and bloom stages.
 //! - `--exposure X` — scale linear HDR values before ACES tonemapping.
+//! - `--ibl` — use the load-time image-based lighting GGX variant.
 
 use crate::fb::Framebuffer;
 use crate::image::Texture;
@@ -39,6 +40,7 @@ pub struct DemoArgs {
     pub fxaa: bool,
     pub vignette: bool,
     pub hdr: bool,
+    pub ibl: bool,
     pub exposure: f32,
 }
 
@@ -53,6 +55,7 @@ impl Default for DemoArgs {
             fxaa: false,
             vignette: false,
             hdr: false,
+            ibl: false,
             exposure: 1.0,
         }
     }
@@ -92,6 +95,7 @@ impl DemoArgs {
                 "--fxaa" => args.fxaa = true,
                 "--vignette" => args.vignette = true,
                 "--hdr" => args.hdr = true,
+                "--ibl" => args.ibl = true,
                 "--exposure" => {
                     let value = source
                         .next()
@@ -466,6 +470,12 @@ mod tests {
         assert!(args.hdr);
         assert_eq!(args.exposure, 2.0);
         assert_eq!(args.post_chain().len(), 1);
+    }
+
+    #[test]
+    fn parses_ibl() {
+        let args = DemoArgs::parse(["--ibl"].into_iter().map(String::from)).unwrap();
+        assert!(args.ibl);
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub mod camera;
 pub mod clip;
 pub mod fb;
 pub mod gltf;
+pub mod ibl;
 pub mod image;
 pub mod json;
 pub mod material;
