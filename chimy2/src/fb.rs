@@ -55,12 +55,14 @@ impl Framebuffer {
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
+        let was_hdr = self.is_hdr();
         let length = width.saturating_mul(height);
         self.width = width;
         self.height = height;
         self.color = vec![0; length];
         self.depth = vec![1.0; length];
         self.linear = None;
+        self.set_hdr(was_hdr);
     }
 
     /// Writes a pixel. Coordinates outside the framebuffer are ignored.

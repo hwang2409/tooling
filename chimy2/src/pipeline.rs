@@ -1103,6 +1103,44 @@ mod tests {
     }
 
     #[test]
+    fn resize_preserves_hdr_for_a_byte_identical_render() {
+        let vertices = [
+            Vec4::new(-1.0, -1.0, 0.0, 1.0),
+            Vec4::new(1.0, -1.0, 0.0, 1.0),
+            Vec4::new(-1.0, 1.0, 0.0, 1.0),
+        ];
+        let mut resized = Framebuffer::new(2, 2);
+        resized.set_hdr(true);
+        resized.resize(4, 3);
+        assert!(resized.is_hdr());
+
+        let mut fresh = Framebuffer::new(4, 3);
+        fresh.set_hdr(true);
+        let mut resized_pipeline = Pipeline::new(
+            vertex_stage(|vertex: &Vec4, _: &()| VertexOutput::new(*vertex, ())),
+            fragment_stage(|_: &(), _: &()| argb8888(255, 20, 40, 60)),
+        );
+        resized_pipeline.set_hdr(true);
+        resized_pipeline.render(&mut resized, |frame, target| {
+            target.clear(argb8888(255, 1, 2, 3));
+            frame.draw(target, &vertices, &[[0, 1, 2]], &());
+        });
+
+        let mut fresh_pipeline = Pipeline::new(
+            vertex_stage(|vertex: &Vec4, _: &()| VertexOutput::new(*vertex, ())),
+            fragment_stage(|_: &(), _: &()| argb8888(255, 20, 40, 60)),
+        );
+        fresh_pipeline.set_hdr(true);
+        fresh_pipeline.render(&mut fresh, |frame, target| {
+            target.clear(argb8888(255, 1, 2, 3));
+            frame.draw(target, &vertices, &[[0, 1, 2]], &());
+        });
+
+        assert!(resized.is_hdr());
+        assert_eq!(resized.color, fresh.color);
+    }
+
+    #[test]
     fn raw_transparent_draws_sort_by_view_space_depth() {
         let far_color = argb8888(128, 235, 70, 40);
         let near_color = argb8888(128, 40, 90, 235);
