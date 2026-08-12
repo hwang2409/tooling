@@ -19,7 +19,7 @@
 use crate::fb::Framebuffer;
 use crate::image::Texture;
 use crate::math::{Mat4, Vec2, Vec3, Vec4};
-use crate::mesh::{LodMesh, Mesh, MeshVertex};
+use crate::mesh::{LodMesh, Mesh, MeshVertex, SimplifyOptions, SphereProjection};
 use crate::pipeline::{Instance, InstanceUniforms, Pipeline};
 use crate::postfx::{AcesTonemapPass, BloomPass, FxaaPass, PostChain, SsaoPass, VignettePass};
 use crate::present::{InputState, run_with_input};
@@ -478,6 +478,7 @@ pub struct LodScene {
     pub models: Vec<Mat4>,
     pub uniforms: Vec<BlinnPhongUniforms>,
     pub camera: crate::camera::Camera,
+    pub projection: Mat4,
 }
 
 /// Builds deterministic rings at increasing distances. The faceted sphere
@@ -496,18 +497,14 @@ pub fn build_lod_scene(aspect: f32) -> LodScene {
     // length avoids libm differences in tan(PI / 6).
     const FOCAL_Y: f32 = 1.7320508;
     let projection = Mat4::perspective_from_focal_length(FOCAL_Y, aspect.max(0.01), 0.1, 80.0);
-    let qem_mesh = LodMesh::new(source.clone());
-    let mesh = LodMesh::from_levels(
-        vec![
-            source,
-            subdivided_octahedron(2),
-            subdivided_octahedron(1),
-            subdivided_octahedron(0),
-        ],
-        vec![400.0, 200.0, 100.0],
-    )
-    .expect("lod demo has deterministic levels");
-    debug_assert_eq!(qem_mesh.level_count(), mesh.level_count());
+    let mut mesh = LodMesh::with_ratios_and_options(
+        source,
+        &[0.9, 0.8, 0.7],
+        SimplifyOptions {
+            sphere_projection: Some(SphereProjection::new(Vec3::ZERO, 1.0, 1.0e-5)),
+        },
+    );
+    mesh.set_thresholds(vec![220.0, 110.0, 55.0]);
     let base = BlinnPhongUniforms::new_with_linear_colors(
         Mat4::IDENTITY,
         camera.view_matrix(),
@@ -551,6 +548,7 @@ pub fn build_lod_scene(aspect: f32) -> LodScene {
         models,
         uniforms,
         camera,
+        projection,
     }
 }
 
@@ -561,7 +559,14 @@ pub fn render_lod_scene(framebuffer: &mut Framebuffer, scene: &LodScene) {
     pipeline.set_thread_count(1);
     pipeline.render(framebuffer, |frame, target| {
         for (model, uniforms) in scene.models.iter().zip(&scene.uniforms) {
-            frame.draw_lod_mesh(target, &scene.mesh, uniforms, scene.camera, *model);
+            frame.draw_lod_mesh(
+                target,
+                &scene.mesh,
+                uniforms,
+                scene.camera,
+                scene.projection,
+                *model,
+            );
         }
     });
 }

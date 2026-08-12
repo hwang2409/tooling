@@ -828,6 +828,7 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         lod_mesh: &LodMesh,
         uniforms: &'a Uniforms,
         camera: Camera,
+        projection: Mat4,
         model: Mat4,
     ) -> LodSelection
     where
@@ -836,7 +837,13 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         Uniforms: Sync,
         VS::Varyings: Clone + Send + Sync + 'a,
     {
-        let selection = lod_mesh.select(camera, model, framebuffer.width, framebuffer.height);
+        let selection = lod_mesh.select(
+            camera.view_matrix(),
+            projection,
+            model,
+            framebuffer.width,
+            framebuffer.height,
+        );
         self.draw_lod_mesh_with_selection(framebuffer, lod_mesh, uniforms, selection);
         selection
     }
@@ -944,6 +951,7 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         lod_mesh: &LodMesh,
         uniforms: &'a Uniforms,
         camera: Camera,
+        projection: Mat4,
         model: Mat4,
     ) -> LodSelection
     where
@@ -952,7 +960,13 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         Uniforms: Sync,
         VS::Varyings: SamplingVaryings + Clone + Send + Sync + 'a,
     {
-        let selection = lod_mesh.select(camera, model, framebuffer.width, framebuffer.height);
+        let selection = lod_mesh.select(
+            camera.view_matrix(),
+            projection,
+            model,
+            framebuffer.width,
+            framebuffer.height,
+        );
         let mesh = lod_mesh.mesh_for(selection);
         if !self.should_submit_mesh(
             mesh.bounds(),
@@ -2012,7 +2026,14 @@ mod tests {
         lod.set_thresholds(vec![10.0]);
         let camera = Camera::new(Vec3::ZERO, crate::math::Quat::IDENTITY, 1.0, 1.0, 0.1, 10.0);
         let model = Mat4::IDENTITY;
-        let selection = lod.select(camera, model, 32, 32);
+        let selection = lod.select(
+            camera.view_matrix(),
+            camera.projection_matrix(),
+            model,
+            32,
+            32,
+        );
+        assert_eq!(selection.level(), 0);
         let uniforms = MeshUniforms::new(
             model,
             camera.view_matrix(),
@@ -2030,15 +2051,22 @@ mod tests {
         depth_pipeline.draw_lod_mesh_depth(&mut shadow_target, &lod, &shadow_uniforms, selection);
         let mut expected_shadow = Framebuffer::new(32, 32);
         let mut expected_pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
-        expected_pipeline.draw_lod_mesh_depth(
+        expected_pipeline.draw_mesh_depth(
             &mut expected_shadow,
-            &lod,
+            lod.mesh_for(selection),
             &shadow_uniforms,
-            selection,
+        );
+        let mut different_shadow = Framebuffer::new(32, 32);
+        let mut different_pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
+        different_pipeline.draw_mesh_depth(
+            &mut different_shadow,
+            lod.mesh_at_level(1),
+            &shadow_uniforms,
         );
         assert!(camera_target.color.iter().any(|&pixel| pixel != 0));
         assert!(shadow_target.depth.iter().any(|&depth| depth < 1.0));
         assert_eq!(shadow_target.depth, expected_shadow.depth);
+        assert_ne!(different_shadow.depth, expected_shadow.depth);
     }
 
     #[test]

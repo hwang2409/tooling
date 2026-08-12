@@ -7,6 +7,7 @@ pub mod gltf;
 pub mod ibl;
 pub mod image;
 pub mod json;
+mod lod;
 pub mod material;
 pub mod math;
 pub mod mesh;
