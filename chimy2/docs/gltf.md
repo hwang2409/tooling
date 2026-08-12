@@ -39,8 +39,8 @@ sRGB decoding. `normalTexture` uses linear decoding. Metallic and roughness
 feed the Cook-Torrance GGX shader directly. Base color factors and scalar
 factors stay linear. Roughness uses the Disney `alpha = roughness^2`
 convention, with a 0.045 floor; direct lighting uses Schlick-GGX geometry with
-`k = alpha / 2`. The renderer clamps bright specular values at its single
-sRGB encode until the later HDR milestone.
+`k = alpha / 2`. HDR keeps bright specular values in the linear target, then
+uses ACES tonemapping before the single final sRGB encode.
 
 The committed `assets/arm.gltf` is a two-bone, hand-authored test asset. The
 viewer uses the same scene and mesh submission path as headless tests:
