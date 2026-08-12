@@ -1021,6 +1021,7 @@ impl DrawClass {
 mod tests {
     use super::*;
     use crate::fb::{argb8888, blend_argb8888_linear};
+    use crate::postfx::{PostChain, SsaoPass};
 
     #[derive(Clone, Copy)]
     struct RawVertex {
@@ -1063,6 +1064,54 @@ mod tests {
             frame.draw(target, &vertices, &[[0, 1, 2]], &());
         });
         assert!(framebuffer.color.contains(&argb8888(255, 20, 40, 60)));
+    }
+
+    #[test]
+    fn ssaa_postfx_receives_downsampled_depth() {
+        // Mutation gate: resetting destination depth during SSAA makes this
+        // production pipeline comparison equal and fails the assertion.
+        fn render_scene(with_ssao: bool) -> Framebuffer {
+            let mut pipeline = Pipeline::new(
+                vertex_stage(|vertex: &Vec4, _: &()| VertexOutput::new(*vertex, ())),
+                fragment_stage(|_: &(), _: &()| argb8888(255, 180, 180, 180)),
+            );
+            pipeline.set_ssaa_scale(2);
+            if with_ssao {
+                let mut ssao = SsaoPass::new(Mat4::IDENTITY);
+                ssao.set_radius(0.9);
+                ssao.set_range(10.0);
+                pipeline.set_post_chain(PostChain::new().with_pass(ssao));
+            }
+            let mut framebuffer = Framebuffer::new(8, 8);
+            let background = [
+                Vec4::new(-1.0, -1.0, 0.5, 1.0),
+                Vec4::new(1.0, -1.0, 0.5, 1.0),
+                Vec4::new(1.0, 1.0, 0.5, 1.0),
+                Vec4::new(-1.0, 1.0, 0.5, 1.0),
+            ];
+            let foreground = [
+                Vec4::new(-0.45, -0.45, -0.5, 1.0),
+                Vec4::new(0.45, -0.45, -0.5, 1.0),
+                Vec4::new(0.45, 0.45, -0.5, 1.0),
+                Vec4::new(-0.45, 0.45, -0.5, 1.0),
+            ];
+            pipeline.render(&mut framebuffer, |frame, target| {
+                frame.draw(target, &background, &[[0, 1, 2], [0, 2, 3]], &());
+                frame.draw(target, &foreground, &[[0, 1, 2], [0, 2, 3]], &());
+            });
+            framebuffer
+        }
+
+        let without_ssao = render_scene(false);
+        let with_ssao = render_scene(true);
+        assert_ne!(with_ssao.color, without_ssao.color);
+        assert!(
+            with_ssao
+                .color
+                .iter()
+                .zip(&without_ssao.color)
+                .any(|(with, without)| with != without)
+        );
     }
 
     #[test]

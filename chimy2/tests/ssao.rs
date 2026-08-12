@@ -1,6 +1,6 @@
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3, Vec4};
-use chimy2::postfx::SsaoPass;
+use chimy2::postfx::{PostChain, SsaoPass};
 use std::fs;
 use std::path::PathBuf;
 
@@ -56,6 +56,10 @@ fn assert_golden(name: &str, framebuffer: &Framebuffer) {
     let actual = ppm(framebuffer);
     if std::env::var_os("GOLDEN_REGEN").is_some() {
         fs::write(&path, &actual).expect("write SSAO golden");
+        panic!(
+            "regenerated golden {}; rerun without GOLDEN_REGEN",
+            path.display()
+        );
     }
     let expected = fs::read(&path).unwrap_or_else(|error| {
         panic!(
@@ -159,11 +163,11 @@ fn crease_has_more_occlusion_than_open_plane() {
         }
     }
     let pass = SsaoPass::new(projection);
-    let occlusion = pass.occlusion_buffer(&framebuffer);
-    let open_floor = occlusion[36 * WIDTH + 20];
-    let crease = occlusion[24 * WIDTH + 32];
+    let raw = pass.raw_occlusion_buffer(&framebuffer);
+    let open_floor = raw[36 * WIDTH + 20];
+    let crease = raw[34 * WIDTH + 41];
     assert!(
-        crease > open_floor + 0.02,
+        crease > open_floor + 0.8,
         "crease={crease}, floor={open_floor}"
     );
 }
@@ -188,6 +192,102 @@ fn range_check_rejects_far_background_halo() {
 }
 
 #[test]
+fn edge_aware_blur_rejects_silhouette_bleed() {
+    // Mutation gate: dropping the depth edge guard makes the far pixel receive
+    // 0.24305554 occlusion and fails the assertion below.
+    let projection = projection();
+    let inverse_projection = projection.inverse().expect("projection is invertible");
+    let mut framebuffer = plane_depth(-8.0);
+    let floor_y = -0.65;
+    let wall_x = 0.65;
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let ndc_x = ((x as f32 + 0.5) / WIDTH as f32) * 2.0 - 1.0;
+            let ndc_y = 1.0 - ((y as f32 + 0.5) / HEIGHT as f32) * 2.0;
+            let near = inverse_projection * Vec4::new(ndc_x, ndc_y, -1.0, 1.0);
+            let far = inverse_projection * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+            let near = Vec3::new(near.x / near.w, near.y / near.w, near.z / near.w);
+            let far = Vec3::new(far.x / far.w, far.y / far.w, far.z / far.w);
+            let ray = (far - near).normalize();
+            let mut hit = None;
+            if ray.y < 0.0 {
+                let t = floor_y / ray.y;
+                let point = ray * t;
+                if t > 0.0 && point.x < wall_x {
+                    hit = Some(point);
+                }
+            }
+            if ray.x > 0.0 {
+                let t = wall_x / ray.x;
+                let point = ray * t;
+                if t > 0.0 && point.y > floor_y && hit.is_none_or(|floor| point.z > floor.z) {
+                    hit = Some(point);
+                }
+            }
+            if let Some(point) = hit {
+                framebuffer.depth[y * WIDTH + x] = depth_for_view_position(projection, point);
+            }
+        }
+    }
+    let mut pass = SsaoPass::new(projection);
+    pass.set_range(1.0);
+    pass.set_blur_depth_threshold(0.1);
+    let raw = pass.raw_occlusion_buffer(&framebuffer);
+    let blurred = pass.occlusion_buffer(&framebuffer);
+    let mut found_silhouette = false;
+    let mut candidate_count = 0;
+    for y in 1..HEIGHT - 1 {
+        for x in 1..WIDTH - 1 {
+            let index = y * WIDTH + x;
+            if raw[index] <= 0.01 {
+                continue;
+            }
+            let Some(center) =
+                pass.reconstruct_view_position(x, y, framebuffer.depth[index], WIDTH, HEIGHT)
+            else {
+                continue;
+            };
+            for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+                let neighbor_index = ny * WIDTH + nx;
+                let Some(neighbor) = pass.reconstruct_view_position(
+                    nx,
+                    ny,
+                    framebuffer.depth[neighbor_index],
+                    WIDTH,
+                    HEIGHT,
+                ) else {
+                    continue;
+                };
+                if (center.z - neighbor.z).abs() > pass.blur_depth_threshold() {
+                    if raw[neighbor_index] >= 1e-6 {
+                        continue;
+                    }
+                    candidate_count += 1;
+                    found_silhouette = true;
+                    assert!(
+                        blurred[neighbor_index] < 1e-6,
+                        "far silhouette pixel ({nx},{ny}) from ({x},{y}) received blur: {}, raw={}, center_raw={}, z=({},{}), side_raws=({}, {}, {}, {})",
+                        blurred[neighbor_index],
+                        raw[neighbor_index],
+                        raw[index],
+                        center.z,
+                        neighbor.z,
+                        raw[ny * WIDTH + nx.saturating_sub(1)],
+                        raw[ny * WIDTH + (nx + 1).min(WIDTH - 1)],
+                        raw[ny.saturating_sub(1) * WIDTH + nx],
+                        raw[(ny + 1).min(HEIGHT - 1) * WIDTH + nx]
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        found_silhouette,
+        "scene did not produce a clean raw silhouette sample; candidates={candidate_count}"
+    );
+}
+
+#[test]
 fn occlusion_is_deterministic_and_strength_zero_is_off() {
     let framebuffer = plane_depth(-3.0);
     let pass = SsaoPass::new(projection());
@@ -201,6 +301,20 @@ fn occlusion_is_deterministic_and_strength_zero_is_off() {
     off_pass.set_strength(0.0);
     ssao_frame(&off_pass, &mut off);
     assert_eq!(off.color, framebuffer.color);
+}
+
+#[test]
+fn invalid_projection_is_a_byte_identical_noop() {
+    let mut framebuffer = Framebuffer::new(5, 3);
+    for (index, pixel) in framebuffer.color.iter_mut().enumerate() {
+        *pixel = 0x8000_0000 | (index as u32 * 0x0001_0101);
+    }
+    framebuffer.depth.fill(0.37);
+    let before = framebuffer.clone();
+    PostChain::new()
+        .with_pass(SsaoPass::new(Mat4::new([0.0; 16])))
+        .apply(&mut framebuffer);
+    assert_eq!(framebuffer, before);
 }
 
 #[test]

@@ -138,6 +138,12 @@ pub trait PostPass: Send + Sync {
 
     fn apply(&self, input: &PostBuffer, output: &mut PostBuffer);
 
+    /// Returns true when this pass has no effect and must be skipped before
+    /// color-space conversion, preserving exact framebuffer bytes.
+    fn is_noop(&self) -> bool {
+        false
+    }
+
     /// Applies a pass with access to the rendered framebuffer.
     ///
     /// Most passes only need the color buffer and use [`Self::apply`]. A pass
@@ -202,6 +208,9 @@ impl PostChain {
         }
         let mut current = PostBuffer::from_framebuffer(framebuffer);
         for pass in &self.passes {
+            if pass.is_noop() {
+                continue;
+            }
             let input = current.convert_to(pass.color_space());
             let mut output = PostBuffer::new(input.width, input.height, pass.color_space());
             output.hdr = input.hdr;
@@ -237,6 +246,7 @@ const SSAO_BLUR_TAPS: [(isize, f32); 3] = [(0, 0.5), (-1, 0.25), (1, 0.25)];
 pub struct SsaoPass {
     projection: Mat4,
     inverse_projection: Mat4,
+    projection_valid: bool,
     radius: f32,
     bias: f32,
     strength: f32,
@@ -251,11 +261,11 @@ impl SsaoPass {
     /// singular matrices fall back to identity, which makes the pass a safe
     /// no-op for an invalid projection rather than producing invalid pixels.
     pub fn new(projection: Mat4) -> Self {
-        let projection = sanitize_projection(projection);
-        let inverse_projection = projection.inverse().unwrap_or(Mat4::IDENTITY);
+        let (projection, inverse_projection, projection_valid) = sanitize_projection(projection);
         Self {
             projection,
             inverse_projection,
+            projection_valid,
             radius: SSAO_DEFAULT_RADIUS,
             bias: SSAO_DEFAULT_BIAS,
             strength: SSAO_DEFAULT_STRENGTH,
@@ -269,9 +279,10 @@ impl SsaoPass {
     }
 
     pub fn set_projection(&mut self, projection: Mat4) {
-        let projection = sanitize_projection(projection);
+        let (projection, inverse_projection, projection_valid) = sanitize_projection(projection);
         self.projection = projection;
-        self.inverse_projection = projection.inverse().unwrap_or(Mat4::IDENTITY);
+        self.inverse_projection = inverse_projection;
+        self.projection_valid = projection_valid;
     }
 
     pub const fn radius(&self) -> f32 {
@@ -343,12 +354,12 @@ impl SsaoPass {
         Some(position)
     }
 
-    /// Computes the blurred occlusion buffer from the framebuffer depth.
-    ///
-    /// This is the same production path used by [`Self::apply_with_framebuffer`].
-    /// A caller can use it to inspect or compare deterministic occlusion data.
-    pub fn occlusion_buffer(&self, framebuffer: &Framebuffer) -> Vec<f32> {
+    /// Computes the unblurred occlusion buffer from the framebuffer depth.
+    pub fn raw_occlusion_buffer(&self, framebuffer: &Framebuffer) -> Vec<f32> {
         let length = framebuffer.width.saturating_mul(framebuffer.height);
+        if !self.projection_valid {
+            return vec![0.0; length];
+        }
         let positions = self.reconstructed_positions(framebuffer);
         let mut raw = vec![0.0; length];
         for y in 0..framebuffer.height {
@@ -361,11 +372,27 @@ impl SsaoPass {
                 raw[index] = self.sample_occlusion(framebuffer, &positions, center, normal);
             }
         }
+        raw
+    }
+
+    /// Computes the blurred occlusion buffer from the framebuffer depth.
+    ///
+    /// This is the same production path used by [`Self::apply_with_framebuffer`].
+    /// A caller can use it to inspect or compare deterministic occlusion data.
+    pub fn occlusion_buffer(&self, framebuffer: &Framebuffer) -> Vec<f32> {
+        let raw = self.raw_occlusion_buffer(framebuffer);
+        if !self.projection_valid {
+            return raw;
+        }
+        let positions = self.reconstructed_positions(framebuffer);
         self.blur_occlusion(&raw, &positions, framebuffer.width, framebuffer.height)
     }
 
     /// Applies SSAO directly to a framebuffer through the production path.
     pub fn apply_to_framebuffer(&self, framebuffer: &mut Framebuffer) {
+        if !self.projection_valid {
+            return;
+        }
         let input = PostBuffer::from_framebuffer(framebuffer);
         let mut output = PostBuffer::new(input.width, input.height, PostColorSpace::Linear);
         output.hdr = input.hdr;
@@ -536,12 +563,29 @@ impl SsaoPass {
         horizontal: bool,
     ) -> f32 {
         let center_index = y * width + x;
+        let height = positions.len().checked_div(width).unwrap_or(0);
         let Some(center_position) = positions[center_index] else {
             return 0.0;
         };
+        for (nx, ny) in [
+            (x.checked_sub(1), Some(y)),
+            (x.checked_add(1).filter(|&value| value < width), Some(y)),
+            (Some(x), y.checked_sub(1)),
+            (Some(x), y.checked_add(1).filter(|&value| value < height)),
+        ] {
+            let (Some(nx), Some(ny)) = (nx, ny) else {
+                continue;
+            };
+            let neighbor_index = ny * width + nx;
+            let Some(neighbor_position) = positions[neighbor_index] else {
+                continue;
+            };
+            if (neighbor_position.z - center_position.z).abs() > self.blur_depth_threshold {
+                return values[center_index];
+            }
+        }
         let mut total = 0.0;
         let mut weight_total = 0.0;
-        let height = positions.len().checked_div(width).unwrap_or(0);
         for (offset, weight) in SSAO_BLUR_TAPS {
             let coordinate = if horizontal {
                 x as isize + offset
@@ -586,6 +630,10 @@ impl PostPass for SsaoPass {
         output.pixels.clone_from(&input.pixels);
     }
 
+    fn is_noop(&self) -> bool {
+        !self.projection_valid
+    }
+
     fn apply_with_framebuffer(
         &self,
         input: &PostBuffer,
@@ -628,12 +676,13 @@ fn choose_delta(center: Vec3, first: Option<Vec3>, second: Option<Vec3>) -> Vec3
     }
 }
 
-fn sanitize_projection(projection: Mat4) -> Mat4 {
-    if projection.data.iter().all(|value| value.is_finite()) && projection.inverse().is_some() {
-        projection
-    } else {
-        Mat4::IDENTITY
+fn sanitize_projection(projection: Mat4) -> (Mat4, Mat4, bool) {
+    if projection.data.iter().all(|value| value.is_finite()) {
+        if let Some(inverse) = projection.inverse() {
+            return (projection, inverse, true);
+        }
     }
+    (Mat4::IDENTITY, Mat4::IDENTITY, false)
 }
 
 fn sanitize_positive(value: f32, fallback: f32, maximum: f32) -> f32 {
