@@ -481,22 +481,25 @@ pub fn build_instancing_scene(aspect: f32) -> InstancingScene {
         0.1,
         40.0,
     );
-    let mesh = uv_sphere(0.28, 8, 12);
+    // Keep the demo inputs platform-independent. The scene is also used by a
+    // byte-exact golden test, so do not derive them from libm functions.
+    let mesh = cube_with_uvs(0.28);
+    const TINTS: [Vec4; 6] = [
+        Vec4::new(0.95, 0.35, 0.35, 1.0),
+        Vec4::new(0.95, 0.75, 0.30, 1.0),
+        Vec4::new(0.45, 0.85, 0.35, 1.0),
+        Vec4::new(0.30, 0.80, 0.90, 1.0),
+        Vec4::new(0.40, 0.50, 0.95, 1.0),
+        Vec4::new(0.80, 0.40, 0.90, 1.0),
+    ];
     let mut instances = Vec::with_capacity(300);
     for row in 0..15 {
         for column in 0..20 {
             let x = (column as f32 - 9.5) * 0.78;
             let y = (row as f32 - 7.0) * 0.62;
             let scale = 0.75 + ((row * 7 + column * 11) % 9) as f32 * 0.035;
-            let hue = (row * 20 + column) as f32 / 300.0;
-            let tint = Vec4::new(
-                0.35 + 0.65 * (hue * TAU).sin().abs(),
-                0.35 + 0.65 * ((hue + 0.33) * TAU).sin().abs(),
-                0.35 + 0.65 * ((hue + 0.66) * TAU).sin().abs(),
-                1.0,
-            );
+            let tint = TINTS[(row * 5 + column * 3) % TINTS.len()];
             let model = Mat4::translate(Vec3::new(x, y, 0.0))
-                * Mat4::rotate(Vec3::new(0.0, 1.0, 0.0), hue * TAU)
                 * Mat4::scale(Vec3::new(scale, 0.8 + scale * 0.2, 1.0));
             instances.push(Instance::with_tint(model, tint));
         }
