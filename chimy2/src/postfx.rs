@@ -655,39 +655,42 @@ pub const DOF_DEFAULT_FOCUS_DISTANCE: f32 = 4.0;
 pub const DOF_DEFAULT_APERTURE: f32 = 6.0;
 pub const DOF_DEFAULT_MAX_COC_RADIUS: f32 = 8.0;
 pub const DOF_MAX_COC_RADIUS: f32 = 64.0;
-pub const DOF_SAMPLE_COUNT: usize = 20;
+pub const DOF_SAMPLE_COUNT: usize = 24;
 const DOF_FOCAL_COC_EPSILON: f32 = 1.0e-4;
 
 const DOF_DISC_KERNEL: [(f32, f32); DOF_SAMPLE_COUNT] = [
-    (1.0, 0.0),
-    (0.951, 0.309),
-    (0.809, 0.588),
-    (0.588, 0.809),
-    (0.309, 0.951),
-    (0.0, 1.0),
-    (-0.309, 0.951),
-    (-0.588, 0.809),
-    (-0.809, 0.588),
-    (-0.951, 0.309),
-    (-1.0, 0.0),
-    (-0.951, -0.309),
-    (-0.809, -0.588),
-    (-0.588, -0.809),
-    (-0.309, -0.951),
-    (0.0, -1.0),
-    (0.309, -0.951),
-    (0.588, -0.809),
-    (0.809, -0.588),
-    (0.951, -0.309),
+    (0.125, 0.0),
+    (-0.125, 0.0),
+    (0.0, 0.125),
+    (0.0, -0.125),
+    (0.35, 0.0),
+    (-0.35, 0.0),
+    (0.0, 0.35),
+    (0.0, -0.35),
+    (0.25, 0.25),
+    (-0.25, 0.25),
+    (0.25, -0.25),
+    (-0.25, -0.25),
+    (0.6, 0.0),
+    (-0.6, 0.0),
+    (0.0, 0.6),
+    (0.0, -0.6),
+    (0.42, 0.42),
+    (-0.42, 0.42),
+    (0.42, -0.42),
+    (-0.42, -0.42),
+    (0.9, 0.0),
+    (-0.9, 0.0),
+    (0.0, 0.9),
+    (0.0, -0.9),
 ];
 
 /// Thin-lens depth of field in linear color space.
 ///
-/// This is a single-pass gather. It can spread a defocused foreground sample
-/// over gathered background color, but it cannot perform true near-field
-/// scatter. Near-field scatter and its separate foreground layer are out of
-/// scope. A depth-aware gather rejects a more-defocused background tap behind
-/// a less-defocused center, which limits the common sharp-foreground halo.
+/// This is a single-pass gather with scatter-as-gather coverage. A tap can
+/// contribute when its own CoC covers the center, so defocused foreground
+/// color can spread over sharp background pixels. Full near-field scatter and
+/// its separate foreground layer are out of scope.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DofPass {
     projection: Mat4,
@@ -823,16 +826,18 @@ impl DofPass {
             return source;
         };
         let center_radius = self.circle_of_confusion(center_depth);
-        if center_radius <= DOF_FOCAL_COC_EPSILON && self.aperture > 0.0 {
-            return source;
-        }
-
-        let gather_radius = center_radius.max(1.0);
+        // Fractional CoCs blend with a one-texel gather. This keeps subpixel
+        // blur visible without pretending that a fractional pixel is sampleable.
+        let search_radius = if center_radius < 1.0 {
+            1.0
+        } else {
+            center_radius
+        };
         let mut total = [source[1], source[2], source[3]];
         let mut weight_total = 1.0;
         for &(offset_x, offset_y) in &DOF_DISC_KERNEL {
-            let sample_x = (x as f32 + offset_x * gather_radius).round() as isize;
-            let sample_y = (y as f32 + offset_y * gather_radius).round() as isize;
+            let sample_x = (x as f32 + offset_x * search_radius).round() as isize;
+            let sample_y = (y as f32 + offset_y * search_radius).round() as isize;
             let sample_x = sample_x.clamp(0, input.width.saturating_sub(1) as isize) as usize;
             let sample_y = sample_y.clamp(0, input.height.saturating_sub(1) as isize) as usize;
             let sample_index = sample_y * input.width + sample_x;
@@ -852,20 +857,47 @@ impl DofPass {
             } else {
                 1.0
             };
-            if depth_weight <= 0.0 || !depth_weight.is_finite() {
+            let sample_offset_x = sample_x as f32 - x as f32;
+            let sample_offset_y = sample_y as f32 - y as f32;
+            let sample_distance =
+                (sample_offset_x * sample_offset_x + sample_offset_y * sample_offset_y).sqrt();
+            let center_coverage = if center_radius <= DOF_FOCAL_COC_EPSILON {
+                0.0
+            } else if center_radius < 1.0 {
+                1.0
+            } else {
+                f32::from(sample_distance <= center_radius + 0.5)
+            };
+            let sample_coverage = if sample_radius <= DOF_FOCAL_COC_EPSILON {
+                0.0
+            } else {
+                f32::from(sample_distance <= sample_radius + 0.5)
+            };
+            let sample_weight = depth_weight * center_coverage.max(sample_coverage);
+            if sample_weight <= 0.0 || !sample_weight.is_finite() {
                 continue;
             }
             let sample = input.pixels[sample_index];
-            total[0] += sample[1] * depth_weight;
-            total[1] += sample[2] * depth_weight;
-            total[2] += sample[3] * depth_weight;
-            weight_total += depth_weight;
+            total[0] += sample[1] * sample_weight;
+            total[1] += sample[2] * sample_weight;
+            total[2] += sample[3] * sample_weight;
+            weight_total += sample_weight;
         }
-        [
-            source[0],
+        let gathered = [
             total[0] / weight_total,
             total[1] / weight_total,
             total[2] / weight_total,
+        ];
+        let blend = if center_radius <= DOF_FOCAL_COC_EPSILON {
+            1.0
+        } else {
+            center_radius.min(1.0)
+        };
+        [
+            source[0],
+            source[1] + (gathered[0] - source[1]) * blend,
+            source[2] + (gathered[1] - source[2]) * blend,
+            source[3] + (gathered[2] - source[3]) * blend,
         ]
     }
 }

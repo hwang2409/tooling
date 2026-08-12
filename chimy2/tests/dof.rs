@@ -38,6 +38,10 @@ fn plane(depth: f32) -> Framebuffer {
     framebuffer
 }
 
+fn apply_dof(pass: &DofPass, framebuffer: &mut Framebuffer) {
+    PostChain::new().with_pass(pass.clone()).apply(framebuffer);
+}
+
 fn ppm(framebuffer: &Framebuffer) -> Vec<u8> {
     let mut bytes = format!("P6\n{} {}\n255\n", framebuffer.width, framebuffer.height).into_bytes();
     for &pixel in &framebuffer.color {
@@ -167,8 +171,36 @@ fn depth_weighting_keeps_less_defocused_foreground_edge_sharp() {
     pass.set_aperture(24.0);
     pass.set_focus_distance(4.0);
     pass.set_max_coc_radius(8.0);
-    pass.apply_to_framebuffer(&mut framebuffer);
+    apply_dof(&pass, &mut framebuffer);
     assert_eq!(framebuffer.color[center_y * WIDTH + center_x], expected);
+}
+
+#[test]
+fn defocused_foreground_spreads_over_sharp_background() {
+    let mut framebuffer = plane(4.0);
+    let center_x = WIDTH / 2;
+    let center_y = HEIGHT / 2;
+    let foreground_depth = depth_for_view_z(-2.0);
+    let foreground = argb8888(255, 245, 25, 25);
+    let background = argb8888(255, 20, 20, 220);
+    framebuffer.depth[center_y * WIDTH + center_x] = foreground_depth;
+    framebuffer.color[center_y * WIDTH + center_x] = foreground;
+    framebuffer.color[center_y * WIDTH + center_x + 1] = background;
+    let mut pass = DofPass::new(projection());
+    pass.set_focus_distance(4.0);
+    pass.set_aperture(6.0);
+    pass.set_max_coc_radius(8.0);
+    apply_dof(&pass, &mut framebuffer);
+    let spread = framebuffer.color[center_y * WIDTH + center_x + 1];
+    assert_ne!(
+        spread, background,
+        "foreground did not spread through PostChain"
+    );
+    let [_, red, _, _] = spread.to_be_bytes();
+    assert!(
+        red > 20,
+        "spread pixel did not receive foreground red: {red}"
+    );
 }
 
 #[test]
@@ -181,7 +213,7 @@ fn edge_clamping_does_not_wrap_corner_taps() {
     pass.set_focus_distance(4.0);
     pass.set_aperture(24.0);
     pass.set_max_coc_radius(8.0);
-    pass.apply_to_framebuffer(&mut framebuffer);
+    apply_dof(&pass, &mut framebuffer);
     let [_, red, _green, blue] = framebuffer.color[0].to_be_bytes();
     assert!(red > blue + 20, "corner wrapped blue: {red}, {blue}");
 }
@@ -192,9 +224,31 @@ fn dof_render_is_deterministic() {
     let pass = DofPass::new(projection());
     let mut first = source.clone();
     let mut second = source;
-    pass.apply_to_framebuffer(&mut first);
-    pass.apply_to_framebuffer(&mut second);
+    apply_dof(&pass, &mut first);
+    apply_dof(&pass, &mut second);
     assert_eq!(first, second);
+}
+
+#[test]
+fn fractional_coc_increases_blur_strictly() {
+    let apertures = [0.0, 0.75, 1.5, 3.0, 6.0];
+    let mut red_values = Vec::new();
+    for aperture in apertures {
+        let mut framebuffer = plane(2.0);
+        framebuffer.color.fill(argb8888(255, 0, 0, 0));
+        let center = (HEIGHT / 2) * WIDTH + WIDTH / 2;
+        framebuffer.color[center] = argb8888(255, 255, 255, 255);
+        let mut pass = DofPass::new(projection());
+        pass.set_focus_distance(4.0);
+        pass.set_aperture(aperture);
+        pass.set_max_coc_radius(8.0);
+        apply_dof(&pass, &mut framebuffer);
+        red_values.push(framebuffer.color[center].to_be_bytes()[1]);
+    }
+    assert!(
+        red_values.windows(2).all(|pair| pair[0] > pair[1]),
+        "blur did not increase for CoC 0/.25/.5/1/2: {red_values:?}"
+    );
 }
 
 #[test]
@@ -222,6 +276,11 @@ fn dof_scene_golden() {
     pass.set_focus_distance(4.0);
     pass.set_aperture(9.0);
     pass.set_max_coc_radius(5.0);
-    pass.apply_to_framebuffer(&mut framebuffer);
+    let without_dof = framebuffer.clone();
+    apply_dof(&pass, &mut framebuffer);
+    assert_ne!(
+        framebuffer.color, without_dof.color,
+        "production PostChain did not apply DoF"
+    );
     assert_golden("m33-postfx-dof", &framebuffer);
 }
