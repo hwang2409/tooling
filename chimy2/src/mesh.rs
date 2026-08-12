@@ -4,6 +4,7 @@
 //! stream, so the loader expands each unique (v, vt, vn) tuple into one
 //! renderer vertex.
 
+use crate::culling::Aabb;
 pub use crate::material::{
     Material, MaterialLibrary, Mtl, MtlError, MtlLibrary, MtlMaterial, resolve_asset_path,
 };
@@ -73,6 +74,7 @@ pub struct Mesh {
     triangles: Vec<[usize; 3]>,
     position_indices: Vec<usize>,
     material_groups: Vec<MaterialGroup>,
+    bounds: Aabb,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -300,6 +302,7 @@ impl Mesh {
             triangles: self.triangles[triangle_range.clone()].to_vec(),
             position_indices: self.position_indices.clone(),
             material_groups: Vec::new(),
+            bounds: self.bounds,
         };
         Some(mesh)
     }
@@ -319,6 +322,7 @@ impl Mesh {
             triangles,
             position_indices,
             material_groups: Vec::new(),
+            bounds: Aabb::EMPTY,
         };
         mesh.rebuild_derived_attributes();
         mesh
@@ -339,6 +343,7 @@ impl Mesh {
         };
         vertex.texcoord = texcoord;
         self.generate_tangents();
+        self.rebuild_bounds();
         true
     }
 
@@ -361,6 +366,15 @@ impl Mesh {
     fn rebuild_derived_attributes(&mut self) {
         generate_missing_normals(self);
         self.generate_tangents();
+        self.rebuild_bounds();
+    }
+
+    pub const fn bounds(&self) -> Aabb {
+        self.bounds
+    }
+
+    fn rebuild_bounds(&mut self) {
+        self.bounds = Aabb::from_positions(self.vertices.iter().map(MeshVertex::position));
     }
 
     /// Rebuilds tangents from the mesh's position, UV, and normal streams.
@@ -865,6 +879,26 @@ mod tests {
         let changed_tangent = normal_mesh.vertex(0).unwrap().tangent().unwrap();
         let tangent = Vec3::new(changed_tangent.x, changed_tangent.y, changed_tangent.z);
         assert!(tangent.dot(changed_normal).abs() < 1e-6);
+    }
+
+    #[test]
+    fn position_and_index_mutators_rebuild_aabb_immediately() {
+        let mut mesh = Mesh::new(
+            vec![
+                MeshVertex::new(Vec3::new(-1.0, 0.0, 0.0), None, None),
+                MeshVertex::new(Vec3::new(1.0, 2.0, 3.0), None, None),
+                MeshVertex::new(Vec3::new(0.0, -2.0, -3.0), None, None),
+            ],
+            vec![[0, 1, 2]],
+        );
+        assert_eq!(mesh.bounds().min(), Vec3::new(-1.0, -2.0, -3.0));
+        assert_eq!(mesh.bounds().max(), Vec3::new(1.0, 2.0, 3.0));
+        assert!(mesh.set_vertex_position(0, Vec3::new(4.0, 5.0, 6.0)));
+        assert_eq!(mesh.bounds().min(), Vec3::new(0.0, -2.0, -3.0));
+        assert_eq!(mesh.bounds().max(), Vec3::new(4.0, 5.0, 6.0));
+        mesh.set_indices(vec![[0, 1, 1]]);
+        assert_eq!(mesh.bounds().min(), Vec3::new(0.0, -2.0, -3.0));
+        assert_eq!(mesh.bounds().max(), Vec3::new(4.0, 5.0, 6.0));
     }
 
     #[test]

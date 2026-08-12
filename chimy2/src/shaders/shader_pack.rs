@@ -282,6 +282,10 @@ impl FragmentStage<ShaderPackVaryings, ToonUniforms> for ToonShader {
     fn run(&self, varyings: &ShaderPackVaryings, uniforms: &ToonUniforms) -> u32 {
         Self::shade(varyings, uniforms)
     }
+
+    fn culling_transform(&self, uniforms: &ToonUniforms) -> Option<Mat4> {
+        Some(uniforms.transform.transform())
+    }
 }
 
 impl ToonShader {
@@ -382,6 +386,10 @@ impl FragmentStage<ShaderPackVaryings, PsxUniforms> for PsxShader {
             uniforms.color_bits,
         );
         argb8888_linear(1.0, [color.x, color.y, color.z])
+    }
+
+    fn culling_transform(&self, uniforms: &PsxUniforms) -> Option<Mat4> {
+        Some(uniforms.transform.transform())
     }
 }
 
@@ -489,6 +497,10 @@ impl FragmentStage<ShaderPackVaryings, DitherUniforms> for DitherShader {
         );
         argb8888_linear(1.0, [color.x, color.y, color.z])
     }
+
+    fn culling_transform(&self, uniforms: &DitherUniforms) -> Option<Mat4> {
+        Some(uniforms.transform.transform())
+    }
 }
 
 /// Returns the linear fog amount for a documented linear start/end falloff.
@@ -562,6 +574,10 @@ impl FragmentStage<ShaderPackVaryings, FogUniforms> for FogShader {
         let color = uniforms.base_color * (1.0 - fog) + uniforms.fog_color * fog;
         argb8888_linear(1.0, [color.x, color.y, color.z])
     }
+
+    fn culling_transform(&self, uniforms: &FogUniforms) -> Option<Mat4> {
+        Some(uniforms.transform.transform())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -609,6 +625,10 @@ impl FragmentStage<ShaderPackVaryings, NormalsUniforms> for NormalsShader {
     fn run(&self, varyings: &ShaderPackVaryings, _: &NormalsUniforms) -> u32 {
         let normal = varyings.normal.normalize() * 0.5 + Vec3::new(0.5, 0.5, 0.5);
         argb8888_linear(1.0, [normal.x, normal.y, normal.z])
+    }
+
+    fn culling_transform(&self, uniforms: &NormalsUniforms) -> Option<Mat4> {
+        Some(uniforms.transform.transform())
     }
 }
 
@@ -679,6 +699,10 @@ impl FragmentStage<ShaderPackVaryings, WireframeUniforms> for WireframeShader {
             uniforms.base_color
         };
         argb8888_linear(1.0, [color.x, color.y, color.z])
+    }
+
+    fn culling_transform(&self, uniforms: &WireframeUniforms) -> Option<Mat4> {
+        Some(uniforms.transform.transform())
     }
 }
 

@@ -473,8 +473,29 @@ pub struct InstancingScene {
 
 /// Builds a stable field of 300 lit, tinted mesh instances.
 pub fn build_instancing_scene(aspect: f32) -> InstancingScene {
+    build_instancing_scene_with_layout(aspect, 15.0, 20.0, 15.0, None)
+}
+
+/// Builds the large off-frustum field used by the culling demo and golden.
+pub fn build_culling_instancing_scene(aspect: f32) -> InstancingScene {
+    build_instancing_scene_with_layout(
+        aspect,
+        30.0,
+        30.0,
+        10.0,
+        Some(culling_demo_projection(aspect.max(0.01))),
+    )
+}
+
+fn build_instancing_scene_with_layout(
+    aspect: f32,
+    row_count: f32,
+    column_count: f32,
+    camera_z: f32,
+    projection: Option<crate::math::Mat4>,
+) -> InstancingScene {
     let camera = crate::camera::Camera::new(
-        Vec3::new(0.0, 0.0, 15.0),
+        Vec3::new(0.0, 0.0, camera_z),
         crate::math::Quat::IDENTITY,
         PI / 3.0,
         aspect.max(0.01),
@@ -483,6 +504,7 @@ pub fn build_instancing_scene(aspect: f32) -> InstancingScene {
     );
     // Keep the demo inputs platform-independent. The scene is also used by a
     // byte-exact golden test, so do not derive them from libm functions.
+    let projection = projection.unwrap_or_else(|| camera.projection_matrix());
     let mesh = cube_with_uvs(0.28);
     const TINTS: [Vec4; 6] = [
         Vec4::new(0.95, 0.35, 0.35, 1.0),
@@ -492,11 +514,11 @@ pub fn build_instancing_scene(aspect: f32) -> InstancingScene {
         Vec4::new(0.40, 0.50, 0.95, 1.0),
         Vec4::new(0.80, 0.40, 0.90, 1.0),
     ];
-    let mut instances = Vec::with_capacity(300);
-    for row in 0..15 {
-        for column in 0..20 {
-            let x = (column as f32 - 9.5) * 0.78;
-            let y = (row as f32 - 7.0) * 0.62;
+    let mut instances = Vec::with_capacity((row_count * column_count) as usize);
+    for row in 0..row_count as usize {
+        for column in 0..column_count as usize {
+            let x = (column as f32 - (column_count - 1.0) * 0.5) * 0.78;
+            let y = (row as f32 - (row_count - 1.0) * 0.5) * 0.62;
             let scale = 0.75 + ((row * 7 + column * 11) % 9) as f32 * 0.035;
             let tint = TINTS[(row * 5 + column * 3) % TINTS.len()];
             let model = Mat4::translate(Vec3::new(x, y, 0.0))
@@ -507,7 +529,7 @@ pub fn build_instancing_scene(aspect: f32) -> InstancingScene {
     let lighting = BlinnPhongUniforms::new_with_linear_colors(
         Mat4::IDENTITY,
         camera.view_matrix(),
-        camera.projection_matrix(),
+        projection,
         Vec3::new(0.02, 0.025, 0.04),
         Vec3::new(0.72, 0.78, 0.9),
         Vec3::new(0.25, 0.25, 0.25),
@@ -530,11 +552,28 @@ pub fn build_instancing_scene(aspect: f32) -> InstancingScene {
     }
 }
 
+fn culling_demo_projection(aspect: f32) -> crate::math::Mat4 {
+    // tan(PI / 6) is replaced by this fixed f32 focal length for byte-stable
+    // golden inputs across platforms.
+    const FOCAL_Y: f32 = 1.7320508;
+    crate::math::Mat4::perspective_from_focal_length(FOCAL_Y, aspect, 0.1, 40.0)
+}
+
 /// Renders the shared instancing scene through one instanced submission.
 pub fn render_instancing_scene(framebuffer: &mut Framebuffer, scene: &InstancingScene) {
+    render_instancing_scene_with_culling(framebuffer, scene, true);
+}
+
+/// Renders the shared instancing scene with an explicit culling mode.
+pub fn render_instancing_scene_with_culling(
+    framebuffer: &mut Framebuffer,
+    scene: &InstancingScene,
+    culling_enabled: bool,
+) {
     framebuffer.clear(crate::fb::argb8888(255, 8, 10, 18));
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
     pipeline.set_thread_count(1);
+    pipeline.set_culling_enabled(culling_enabled);
     pipeline.render(framebuffer, |frame, target| {
         frame.draw_mesh_instanced(target, &scene.mesh, &scene.lighting, &scene.instances);
     });

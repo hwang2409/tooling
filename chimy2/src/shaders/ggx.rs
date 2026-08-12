@@ -147,6 +147,10 @@ impl FragmentStage<CookTorranceVaryings, CookTorranceUniforms> for CookTorranceS
     fn model_view(&self, uniforms: &CookTorranceUniforms) -> Option<Mat4> {
         Some(uniforms.lighting.view() * uniforms.lighting.model())
     }
+
+    fn culling_transform(&self, uniforms: &CookTorranceUniforms) -> Option<Mat4> {
+        Some(uniforms.lighting.transform())
+    }
 }
 
 impl CookTorranceShader {
@@ -271,6 +275,10 @@ impl<'a> FragmentStage<CookTorranceVaryings, IblCookTorranceUniforms<'a>>
 
     fn model_view(&self, uniforms: &IblCookTorranceUniforms<'a>) -> Option<Mat4> {
         Some(uniforms.lighting.lighting.view() * uniforms.lighting.lighting.model())
+    }
+
+    fn culling_transform(&self, uniforms: &IblCookTorranceUniforms<'a>) -> Option<Mat4> {
+        Some(uniforms.lighting.lighting.transform())
     }
 }
 
@@ -602,6 +610,10 @@ impl<'a> SampledFragmentStage<TexturedBlinnPhongVaryings, TexturedCookTorranceUn
     fn model_view(&self, uniforms: &TexturedCookTorranceUniforms<'a>) -> Option<Mat4> {
         Some(uniforms.lighting.lighting.view() * uniforms.lighting.lighting.model())
     }
+
+    fn culling_transform(&self, uniforms: &TexturedCookTorranceUniforms<'a>) -> Option<Mat4> {
+        Some(uniforms.lighting.lighting.transform())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -727,6 +739,10 @@ impl<'a> SampledFragmentStage<NormalMappedBlinnPhongVaryings, NormalMappedCookTo
 
     fn model_view(&self, uniforms: &NormalMappedCookTorranceUniforms<'a>) -> Option<Mat4> {
         Some(uniforms.lighting.lighting.view() * uniforms.lighting.lighting.model())
+    }
+
+    fn culling_transform(&self, uniforms: &NormalMappedCookTorranceUniforms<'a>) -> Option<Mat4> {
+        Some(uniforms.lighting.lighting.transform())
     }
 }
 

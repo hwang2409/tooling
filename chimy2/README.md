@@ -1,5 +1,7 @@
 # chimy2
 
+frustum culling details: [`docs/culling.md`](docs/culling.md).
+
 A 3D software renderer, from scratch, in Rust.
 
 <p align="center">

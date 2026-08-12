@@ -1,6 +1,7 @@
 //! Cascaded directional shadow maps.
 
 use crate::camera::Camera;
+use crate::culling::Frustum;
 use crate::fb::Framebuffer;
 use crate::math::{Mat4, Vec2, Vec3, Vec4};
 use crate::mesh::Mesh;
@@ -671,6 +672,10 @@ pub fn render_cascade_shadow_maps_with_config(
         light_view_projections[index] = matrix;
         let mut target = Framebuffer::new(map_size, map_size);
         target.clear(0);
+        pipeline.set_culling_frustum(Some(Frustum::from_view_projection_including_bounds(
+            matrix,
+            meshes.iter().map(|(mesh, model)| (mesh.bounds(), *model)),
+        )));
         for &(mesh, model) in meshes {
             pipeline.draw_mesh_depth_with_varyings(
                 &mut target,
@@ -752,6 +757,14 @@ pub fn render_cascade_shadow_maps_instanced_with_config(
         light_view_projections[index] = matrix;
         let mut target = Framebuffer::new(map_size, map_size);
         target.clear(0);
+        pipeline.set_culling_frustum(Some(Frustum::from_view_projection_including_bounds(
+            matrix,
+            meshes.iter().flat_map(|(mesh, instances)| {
+                instances
+                    .iter()
+                    .map(move |instance| (mesh.bounds(), instance.model()))
+            }),
+        )));
         for &(mesh, instances) in meshes {
             pipeline.draw_mesh_depth_instanced_with_varyings(
                 &mut target,

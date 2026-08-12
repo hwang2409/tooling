@@ -1,0 +1,29 @@
+# frustum culling
+
+mesh bounds use one local-space axis-aligned bounding box per mesh. the cache
+is private and rebuilds during every public mesh mutation. each submission
+transforms all eight corners through its local-to-clip matrix.
+
+the test rejects a submission only when all eight transformed corners are
+outside one plane. a straddling bound stays submitted. this is conservative
+for affine model transforms, including non-uniform scale and rotation.
+
+planes use the Gribb-Hartmann method: Gil Gribb and Klaus Hartmann, "Fast
+Extraction of Viewing Frustum Planes from the World-View-Projection Matrix."
+`Mat4` stores columns, so extraction reads rows with `data[column * 4 + row]`.
+
+color mesh draws get the camera clip transform from their shader uniforms.
+depth draws get the active light clip transform from `ShadowDepthUniforms`.
+the pipeline defaults to culling enabled; `set_culling_enabled(false)` keeps
+the byte-identical culling-off path for debugging and anchor tests.
+
+shadow passes install a pass-local frustum. they expand only its depth planes
+to include caster bounds for that pass. lateral planes stay exact, so finite
+casters that cannot reach a pass are still rejected. this keeps casters outside
+the camera view, or outside a tight cascade depth range, when their shadows
+reach visible receivers. directional cascades, point-light cube faces, and the
+PCSS pass use their own light matrices. no shadow pass uses the camera frustum.
+
+the culling demo uses a precomputed `f32` focal length instead of deriving its
+60-degree field of view with `tan()`. this keeps its golden inputs stable across
+platform math libraries.

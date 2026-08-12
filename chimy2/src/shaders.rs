@@ -175,6 +175,10 @@ impl FragmentStage<(), MeshUniforms> for MeshShader {
     fn model_view(&self, uniforms: &MeshUniforms) -> Option<Mat4> {
         Some(uniforms.view() * uniforms.model())
     }
+
+    fn culling_transform(&self, uniforms: &MeshUniforms) -> Option<Mat4> {
+        Some(uniforms.transform())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -290,6 +294,10 @@ impl<'a> SampledFragmentStage<TexturedVaryings, TexturedUniforms<'a>> for Textur
             },
         );
         argb8888_linear(pixel[3] * uniforms.alpha, [pixel[0], pixel[1], pixel[2]])
+    }
+
+    fn culling_transform(&self, uniforms: &TexturedUniforms<'a>) -> Option<Mat4> {
+        Some(uniforms.transform)
     }
 
     fn is_opaque(&self, uniforms: &TexturedUniforms<'a>) -> bool {
@@ -921,6 +929,10 @@ impl FragmentStage<BlinnPhongVaryings, BlinnPhongUniforms> for BlinnPhongShader 
     fn model_view(&self, uniforms: &BlinnPhongUniforms) -> Option<Mat4> {
         Some(uniforms.view() * uniforms.model())
     }
+
+    fn culling_transform(&self, uniforms: &BlinnPhongUniforms) -> Option<Mat4> {
+        Some(uniforms.transform())
+    }
 }
 
 impl BlinnPhongShader {
@@ -1026,6 +1038,10 @@ impl<'a> FragmentStage<BlinnPhongVaryings, EnvironmentBlinnPhongUniforms<'a>>
 
     fn model_view(&self, uniforms: &EnvironmentBlinnPhongUniforms<'a>) -> Option<Mat4> {
         Some(uniforms.lighting.view() * uniforms.lighting.model())
+    }
+
+    fn culling_transform(&self, uniforms: &EnvironmentBlinnPhongUniforms<'a>) -> Option<Mat4> {
+        Some(uniforms.lighting.transform())
     }
 }
 
@@ -1299,6 +1315,10 @@ impl<'a> SampledFragmentStage<TexturedBlinnPhongVaryings, TexturedBlinnPhongUnif
     fn model_view(&self, uniforms: &TexturedBlinnPhongUniforms<'a>) -> Option<Mat4> {
         Some(uniforms.lighting.view() * uniforms.lighting.model())
     }
+
+    fn culling_transform(&self, uniforms: &TexturedBlinnPhongUniforms<'a>) -> Option<Mat4> {
+        Some(uniforms.lighting.transform())
+    }
 }
 
 fn sample_texture(
@@ -1468,6 +1488,10 @@ impl<'a> SampledFragmentStage<NormalMappedBlinnPhongVaryings, NormalMappedBlinnP
 
     fn model_view(&self, uniforms: &NormalMappedBlinnPhongUniforms<'a>) -> Option<Mat4> {
         Some(uniforms.lighting.view() * uniforms.lighting.model())
+    }
+
+    fn culling_transform(&self, uniforms: &NormalMappedBlinnPhongUniforms<'a>) -> Option<Mat4> {
+        Some(uniforms.lighting.transform())
     }
 }
 

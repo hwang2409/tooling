@@ -14,6 +14,16 @@ use crate::shaders::{
     NormalMappedBlinnPhongUniforms, NormalMappedBlinnPhongVaryings, TextureFilter,
     TexturedBlinnPhongShader, TexturedBlinnPhongUniforms, TexturedBlinnPhongVaryings,
 };
+#[cfg(test)]
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+
+#[cfg(test)]
+static MATERIAL_VERTEX_RUNS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static MATERIAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// A mesh and its parsed material for one draw in a material-group frame.
 pub struct MaterialGroup<'a> {
@@ -89,6 +99,8 @@ impl<'a> VertexStage<MeshVertex, MaterialUniforms<'a>> for MaterialShader {
         vertex: &MeshVertex,
         uniforms: &MaterialUniforms<'a>,
     ) -> VertexOutput<Self::Varyings> {
+        #[cfg(test)]
+        MATERIAL_VERTEX_RUNS.fetch_add(1, Ordering::Relaxed);
         match uniforms {
             MaterialUniforms::Plain(uniforms) => {
                 let output = VertexStage::run(&BlinnPhongShader, vertex, uniforms);
@@ -156,6 +168,18 @@ impl<'a> SampledFragmentStage<MaterialVaryings, MaterialUniforms<'a>> for Materi
             }
         }
     }
+
+    fn culling_transform(&self, uniforms: &MaterialUniforms<'a>) -> Option<Mat4> {
+        match uniforms {
+            MaterialUniforms::Plain(uniforms) => BlinnPhongShader.culling_transform(uniforms),
+            MaterialUniforms::Textured(uniforms) => {
+                TexturedBlinnPhongShader.culling_transform(uniforms)
+            }
+            MaterialUniforms::NormalMapped(uniforms) => {
+                NormalMappedBlinnPhongShader.culling_transform(uniforms)
+            }
+        }
+    }
 }
 
 /// Queues all material groups, then flushes their opaque and transparent draws once.
@@ -163,6 +187,16 @@ pub fn submit_material_groups(
     framebuffer: &mut Framebuffer,
     groups: &[MaterialGroup<'_>],
     base_lighting: &BlinnPhongUniforms,
+) {
+    submit_material_groups_with_culling(framebuffer, groups, base_lighting, true);
+}
+
+/// Queues material groups with an explicit mesh-culling mode.
+pub fn submit_material_groups_with_culling(
+    framebuffer: &mut Framebuffer,
+    groups: &[MaterialGroup<'_>],
+    base_lighting: &BlinnPhongUniforms,
+    culling_enabled: bool,
 ) {
     let mut uniforms = Vec::with_capacity(groups.len());
     for group in groups {
@@ -193,9 +227,88 @@ pub fn submit_material_groups(
     }
 
     let mut pipeline = Pipeline::new(MaterialShader, MaterialShader);
+    pipeline.set_culling_enabled(culling_enabled);
     pipeline.render(framebuffer, |frame, target| {
         for (group, uniforms) in groups.iter().zip(uniforms.iter()) {
             frame.draw_mesh_with_sampling(target, group.mesh, uniforms);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::material::MaterialLibrary;
+    use crate::shaders::DirectionalLight;
+
+    fn mesh() -> Mesh {
+        Mesh::new(
+            vec![
+                MeshVertex::new(Vec3::new(-0.4, -0.4, 0.0), None, None),
+                MeshVertex::new(Vec3::new(0.4, -0.4, 0.0), None, None),
+                MeshVertex::new(Vec3::new(-0.4, 0.4, 0.0), None, None),
+            ],
+            vec![[0, 1, 2]],
+        )
+    }
+
+    fn material() -> Material {
+        MaterialLibrary::parse("newmtl test\nKd 1 1 1\n")
+            .unwrap()
+            .get("test")
+            .unwrap()
+            .clone()
+    }
+
+    fn lighting(model: Mat4) -> BlinnPhongUniforms {
+        BlinnPhongUniforms::new(
+            model,
+            Mat4::IDENTITY,
+            Mat4::orthographic(-1.0, 1.0, -1.0, 1.0, 1.0, 10.0),
+            Vec3::new(0.02, 0.02, 0.02),
+            Vec3::new(0.8, 0.8, 0.8),
+            Vec3::new(0.2, 0.2, 0.2),
+            16.0,
+            Vec3::new(0.0, 0.0, 5.0),
+            DirectionalLight::new(Vec3::new(0.0, 0.0, 1.0), Vec3::new(1.0, 1.0, 1.0)),
+            crate::shaders::PointLight::default(),
+        )
+    }
+
+    #[test]
+    fn offscreen_mtl_group_is_rejected_before_vertex_stage() {
+        let _lock = MATERIAL_TEST_LOCK.lock().unwrap();
+        let mesh = mesh();
+        let material = material();
+        let group = MaterialGroup::new(&mesh, &material);
+        let groups = [group];
+        let mut framebuffer = Framebuffer::new(32, 32);
+        MATERIAL_VERTEX_RUNS.store(0, Ordering::Relaxed);
+        submit_material_groups_with_culling(
+            &mut framebuffer,
+            &groups,
+            &lighting(Mat4::translate(Vec3::new(3.0, 0.0, -3.0))),
+            true,
+        );
+        assert_eq!(MATERIAL_VERTEX_RUNS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn visible_mtl_group_is_byte_identical_with_culling_on_and_off() {
+        let _lock = MATERIAL_TEST_LOCK.lock().unwrap();
+        let mesh = mesh();
+        let material = material();
+        let group = MaterialGroup::new(&mesh, &material);
+        let groups = [group];
+        let base = lighting(Mat4::translate(Vec3::new(0.0, 0.0, -3.0)));
+        let render = |culling_enabled| {
+            let mut framebuffer = Framebuffer::new(32, 32);
+            submit_material_groups_with_culling(&mut framebuffer, &groups, &base, culling_enabled);
+            framebuffer
+        };
+        let culled = render(true);
+        let unculled = render(false);
+        assert_eq!(culled.color, unculled.color);
+        assert_eq!(culled.depth, unculled.depth);
+    }
 }
