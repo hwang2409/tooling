@@ -69,6 +69,15 @@ jobs:
             chimy2/target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('chimy2/Cargo.lock') }}
       - run: cargo test
+      - name: capture instancing golden on failure
+        if: failure()
+        run: |
+          GOLDEN_REGEN=1 cargo test --test instancing_goldens || true
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: instancing-golden-debug
+          path: chimy2/tests/goldens/instancing-field.ppm
 
   wasm-check:
     runs-on: ubuntu-latest
