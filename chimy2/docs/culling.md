@@ -17,11 +17,12 @@ depth draws get the active light clip transform from `ShadowDepthUniforms`.
 the pipeline defaults to culling enabled; `set_culling_enabled(false)` keeps
 the byte-identical culling-off path for debugging and anchor tests.
 
-shadow passes install a pass-local frustum. they expand its planes to include
-all caster bounds for that pass. this keeps casters outside the camera view,
-or outside a tight cascade xy box, when their shadows reach visible receivers.
-directional cascades, point-light cube faces, and the PCSS pass use their own
-light matrices. no shadow pass uses the camera frustum.
+shadow passes install a pass-local frustum. they expand only its depth planes
+to include caster bounds for that pass. lateral planes stay exact, so finite
+casters that cannot reach a pass are still rejected. this keeps casters outside
+the camera view, or outside a tight cascade depth range, when their shadows
+reach visible receivers. directional cascades, point-light cube faces, and the
+PCSS pass use their own light matrices. no shadow pass uses the camera frustum.
 
 the culling demo uses a precomputed `f32` focal length instead of deriving its
 60-degree field of view with `tan()`. this keeps its golden inputs stable across

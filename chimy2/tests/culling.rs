@@ -2,7 +2,7 @@ use chimy2::csm::fit_cascade_light_projection;
 use chimy2::culling::Frustum;
 use chimy2::demo::{build_culling_instancing_scene, render_instancing_scene_with_culling};
 use chimy2::fb::Framebuffer;
-use chimy2::math::{Mat4, Vec3};
+use chimy2::math::{Mat4, Vec3, Vec4};
 use chimy2::mesh::{Mesh, MeshVertex};
 use chimy2::pipeline::Pipeline;
 use chimy2::shaders::{MeshShader, MeshUniforms};
@@ -142,5 +142,73 @@ fn depth_culling_uses_each_light_pass_frustum() {
         };
         assert_eq!(render(true), render(false));
         assert!(!Frustum::from_view_projection(camera).intersects_aabb(caster.bounds(), model,));
+    }
+}
+
+#[test]
+fn direct_depth_culling_does_not_apply_model_twice() {
+    let mesh = Mesh::new(
+        vec![
+            MeshVertex::new(Vec3::new(-0.5, -0.5, -0.5), None, None),
+            MeshVertex::new(Vec3::new(0.5, -0.5, -0.5), None, None),
+            MeshVertex::new(Vec3::new(-0.5, 0.5, -0.5), None, None),
+        ],
+        vec![[0, 1, 2]],
+    );
+    let model = Mat4::translate(Vec3::new(1.0, 0.0, -2.0));
+    let matrix = Mat4::orthographic(-1.2, 1.2, -1.2, 1.2, 1.0, 10.0);
+    let render = |culling_enabled| {
+        let mut framebuffer = Framebuffer::new(32, 32);
+        let mut pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
+        pipeline.set_culling_enabled(culling_enabled);
+        pipeline.draw_mesh_depth_with_varyings(
+            &mut framebuffer,
+            &mesh,
+            &ShadowDepthUniforms::new(model, matrix),
+        );
+        bytes(&framebuffer)
+    };
+    assert_eq!(render(true), render(false));
+}
+
+#[test]
+fn caster_extension_keeps_lateral_shadow_planes_exact() {
+    let caster = Mesh::new(
+        vec![
+            MeshVertex::new(Vec3::new(-0.05, -0.05, -0.05), None, None),
+            MeshVertex::new(Vec3::new(0.05, -0.05, -0.05), None, None),
+            MeshVertex::new(Vec3::new(-0.05, 0.05, -0.05), None, None),
+        ],
+        vec![[0, 1, 2]],
+    );
+    let matrices = [
+        Mat4::orthographic(-1.0, 1.0, -1.0, 1.0, 1.0, 10.0),
+        fit_cascade_light_projection(
+            chimy2::camera::Camera::new(
+                Vec3::new(0.0, 0.0, 5.0),
+                chimy2::math::Quat::IDENTITY,
+                1.0,
+                1.0,
+                0.1,
+                20.0,
+            ),
+            Vec3::new(0.0, 1.0, 0.0),
+            0.1,
+            10.0,
+            32,
+        ),
+        cube_face_view_projections(Vec3::ZERO, 0.1, 20.0)[0],
+    ];
+    for matrix in matrices {
+        let clip_outside = matrix.inverse().unwrap() * Vec4::new(2.0, 0.0, 0.0, 1.0);
+        let world_outside = Vec3::new(
+            clip_outside.x / clip_outside.w,
+            clip_outside.y / clip_outside.w,
+            clip_outside.z / clip_outside.w,
+        );
+        let model = Mat4::translate(world_outside);
+        let expanded =
+            Frustum::from_view_projection_including_bounds(matrix, [(caster.bounds(), model)]);
+        assert!(!expanded.intersects_aabb(caster.bounds(), model));
     }
 }

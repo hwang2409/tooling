@@ -538,7 +538,7 @@ impl InstanceUniforms for ShadowDepthUniforms {
 
 impl CullingUniforms for ShadowDepthUniforms {
     fn culling_transform(&self) -> Option<Mat4> {
-        Some(self.transform)
+        Some(self.light_view_projection)
     }
 
     fn culling_model(&self) -> Mat4 {

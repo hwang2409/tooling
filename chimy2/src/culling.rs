@@ -171,14 +171,15 @@ impl Frustum {
         })
     }
 
-    /// Expands planes to include known casters without changing the pass.
+    /// Expands only the depth planes to include known casters without changing
+    /// the pass's lateral bounds.
     pub fn from_view_projection_including_bounds(
         matrix: Mat4,
         bounds: impl IntoIterator<Item = (Aabb, Mat4)>,
     ) -> Self {
         let mut frustum = Self::from_view_projection(matrix);
         for (bounds, model) in bounds {
-            for plane in &mut frustum.planes {
+            for plane in &mut frustum.planes[4..] {
                 let minimum = bounds
                     .corners()
                     .iter()
