@@ -775,8 +775,10 @@ pub fn simplify_qem(mesh: &Mesh, target_triangles: usize) -> Mesh {
     }
     let mut vertices = mesh.vertices().to_vec();
     let mut triangles = mesh.indices().to_vec();
-    let orientation_center = consistent_orientation_center(mesh);
     let sphere_radius = sphere_radius(mesh);
+    let orientation_center = sphere_radius
+        .map(|_| (Vec3::ZERO, true))
+        .or_else(|| consistent_orientation_center(mesh));
     while triangles.len() > target_triangles.max(1) {
         let quadrics = vertex_quadrics(&vertices, &triangles);
         let (edges, edge_indices) = unique_edges(&triangles);
@@ -1587,6 +1589,10 @@ mod tests {
     #[test]
     fn qem_builds_identical_levels_and_hits_targets() {
         let source = subdivided_octahedron(3);
+        assert_eq!(
+            consistent_orientation_center(&source).map(|(_, sign)| sign),
+            Some(true)
+        );
         let first = LodMesh::new(source.clone());
         let second = LodMesh::new(source);
         assert_eq!(first.levels(), second.levels());
@@ -1600,6 +1606,22 @@ mod tests {
         assert!((counts[1] as f32 / counts[0] as f32 - 0.5).abs() <= 0.1);
         assert!((counts[2] as f32 / counts[0] as f32 - 0.25).abs() <= 0.1);
         assert!((counts[3] as f32 / counts[0] as f32 - 0.125).abs() <= 0.1);
+        for (level, mesh) in first.levels().iter().enumerate() {
+            for &[a, b, c] in mesh.indices() {
+                let pa = mesh.vertex(a).unwrap().position();
+                let pb = mesh.vertex(b).unwrap().position();
+                let pc = mesh.vertex(c).unwrap().position();
+                let normal = (pb - pa).cross(pc - pa);
+                assert!(
+                    normal.length() > 0.0,
+                    "degenerate triangle at level {level}"
+                );
+                assert!(
+                    normal.dot((pa + pb + pc) / 3.0) > 0.0,
+                    "inward triangle at level {level}: {pa:?} {pb:?} {pc:?} normal {normal:?}"
+                );
+            }
+        }
     }
 
     #[test]

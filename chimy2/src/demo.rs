@@ -496,7 +496,7 @@ pub fn build_lod_scene(aspect: f32) -> LodScene {
         Mat4::IDENTITY,
         camera.view_matrix(),
         camera.projection_matrix(),
-        Vec3::new(0.02, 0.025, 0.04),
+        Vec3::new(0.12, 0.12, 0.12),
         Vec3::new(0.72, 0.78, 0.9),
         Vec3::new(0.25, 0.25, 0.25),
         24.0,
@@ -518,13 +518,14 @@ pub fn build_lod_scene(aspect: f32) -> LodScene {
     let mut models = Vec::new();
     let mut uniforms = Vec::new();
     for (ring, color) in colors.into_iter().enumerate() {
-        let depth = 3.0 + ring as f32 * 5.0;
+        let depth = [5.0, 12.0, 22.0][ring];
+        let ring_y = (ring as f32 - 1.0) * 3.0;
         for position in [
-            Vec3::new(-1.5, 0.0, -depth),
-            Vec3::new(0.0, 0.0, -depth),
-            Vec3::new(1.5, 0.0, -depth),
+            Vec3::new(-2.4, ring_y, -depth),
+            Vec3::new(0.0, ring_y, -depth),
+            Vec3::new(2.4, ring_y, -depth),
         ] {
-            let model = Mat4::translate(position) * Mat4::scale(Vec3::new(1.1, 1.1, 1.1));
+            let model = Mat4::translate(position) * Mat4::scale(Vec3::new(0.7, 0.7, 0.7));
             models.push(model);
             uniforms.push(base.for_instance(&Instance::with_tint(model, color)));
         }
