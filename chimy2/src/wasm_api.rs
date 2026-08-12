@@ -22,8 +22,10 @@ use crate::shaders::{
     ToonUniforms, WireframeShader, WireframeUniforms, expand_mesh_with_barycentrics,
 };
 use crate::skybox::CubeTexture;
-use std::cell::UnsafeCell;
 use std::path::Path;
+
+#[cfg(target_arch = "wasm32")]
+use std::cell::UnsafeCell;
 
 const MAX_DIMENSION: u32 = 2048;
 const CAMERA_DISTANCE: f32 = 4.2;
@@ -336,10 +338,14 @@ impl Showcase {
             .iter()
             .zip(self.rgba.chunks_exact_mut(4))
         {
-            let [alpha, red, green, blue] = pixel.to_be_bytes();
-            bytes.copy_from_slice(&[red, green, blue, alpha]);
+            bytes.copy_from_slice(&argb_to_rgba(*pixel));
         }
     }
+}
+
+fn argb_to_rgba(pixel: u32) -> [u8; 4] {
+    let [alpha, red, green, blue] = pixel.to_be_bytes();
+    [red, green, blue, alpha]
 }
 
 fn finite_or(value: f32, fallback: f32) -> f32 {
@@ -350,12 +356,16 @@ fn clamp_mode(mode: u32) -> u32 {
     if mode <= 7 { mode } else { 0 }
 }
 
+#[cfg(target_arch = "wasm32")]
 struct WasmState(UnsafeCell<Option<Showcase>>);
 
+#[cfg(target_arch = "wasm32")]
 unsafe impl Sync for WasmState {}
 
+#[cfg(target_arch = "wasm32")]
 static STATE: WasmState = WasmState(UnsafeCell::new(None));
 
+#[cfg(target_arch = "wasm32")]
 fn state() -> &'static mut Option<Showcase> {
     // JavaScript calls this API on one thread. The browser contract forbids
     // reentrant calls while a frame is being rendered.
@@ -366,25 +376,27 @@ fn api_error(code: ShowcaseErrorCode) -> i32 {
     code as i32
 }
 
-#[cfg(target_arch = "wasm32")]
-#[unsafe(no_mangle)]
-pub extern "C" fn init(width: u32, height: u32) -> i32 {
+fn init_state(state: &mut Option<Showcase>, width: u32, height: u32) -> i32 {
     match Showcase::new(width, height) {
         Ok(showcase) => {
-            *state() = Some(showcase);
+            *state = Some(showcase);
             0
         }
         Err(_) => {
-            *state() = None;
+            *state = None;
             api_error(ShowcaseErrorCode::InvalidDimensions)
         }
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-#[unsafe(no_mangle)]
-pub extern "C" fn render_frame(time_ms: f64, yaw: f32, pitch: f32, mode: u32) -> i32 {
-    let Some(showcase) = state().as_mut() else {
+fn render_state(
+    state: &mut Option<Showcase>,
+    time_ms: f64,
+    yaw: f32,
+    pitch: f32,
+    mode: u32,
+) -> i32 {
+    let Some(showcase) = state.as_mut() else {
         return api_error(ShowcaseErrorCode::NotInitialized);
     };
     match showcase.render(time_ms, yaw, pitch, mode) {
@@ -393,34 +405,62 @@ pub extern "C" fn render_frame(time_ms: f64, yaw: f32, pitch: f32, mode: u32) ->
     }
 }
 
+fn framebuffer_ptr_state(state: &Option<Showcase>) -> *const u8 {
+    state
+        .as_ref()
+        .map_or(std::ptr::null(), |showcase| showcase.rgba.as_ptr())
+}
+
+fn framebuffer_len_state(state: &Option<Showcase>) -> usize {
+    state.as_ref().map_or(0, |showcase| showcase.rgba.len())
+}
+
+fn framebuffer_width_state(state: &Option<Showcase>) -> u32 {
+    state
+        .as_ref()
+        .map_or(0, |showcase| showcase.framebuffer.width as u32)
+}
+
+fn framebuffer_height_state(state: &Option<Showcase>) -> u32 {
+    state
+        .as_ref()
+        .map_or(0, |showcase| showcase.framebuffer.height as u32)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn init(width: u32, height: u32) -> i32 {
+    init_state(state(), width, height)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn render_frame(time_ms: f64, yaw: f32, pitch: f32, mode: u32) -> i32 {
+    render_state(state(), time_ms, yaw, pitch, mode)
+}
+
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn framebuffer_ptr() -> *const u8 {
-    state()
-        .as_ref()
-        .map_or(std::ptr::null(), |showcase| showcase.rgba.as_ptr())
+    framebuffer_ptr_state(state())
 }
 
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn framebuffer_len() -> usize {
-    state().as_ref().map_or(0, |showcase| showcase.rgba.len())
+    framebuffer_len_state(state())
 }
 
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn framebuffer_width() -> u32 {
-    state()
-        .as_ref()
-        .map_or(0, |showcase| showcase.framebuffer.width as u32)
+    framebuffer_width_state(state())
 }
 
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn framebuffer_height() -> u32 {
-    state()
-        .as_ref()
-        .map_or(0, |showcase| showcase.framebuffer.height as u32)
+    framebuffer_height_state(state())
 }
 
 #[cfg(test)]
@@ -429,20 +469,35 @@ mod tests {
 
     #[test]
     fn rgba_boundary_reorders_argb_bytes() {
-        let pixel = 0x12_34_56_78_u32;
-        assert_eq!(
-            pixel.to_be_bytes(),
-            [0x12, 0x34, 0x56, 0x78],
-            "core framebuffer bytes are ARGB"
-        );
-        let [alpha, red, green, blue] = pixel.to_be_bytes();
-        assert_eq!([red, green, blue, alpha], [0x34, 0x56, 0x78, 0x12]);
+        assert_eq!(argb_to_rgba(0x12_34_56_78), [0x34, 0x56, 0x78, 0x12]);
     }
 
     #[test]
-    fn unknown_modes_clamp_to_blinn_phong() {
-        assert_eq!(clamp_mode(7), 7);
-        assert_eq!(clamp_mode(42), 0);
+    fn unknown_mode_renders_like_blinn_phong() {
+        let mut unknown = Showcase::new(64, 64).expect("embedded showcase assets are valid");
+        let mut default = Showcase::new(64, 64).expect("embedded showcase assets are valid");
+        unknown
+            .render(350.0, 0.25, -0.1, 42)
+            .expect("render succeeds");
+        default
+            .render(350.0, 0.25, -0.1, 0)
+            .expect("render succeeds");
+        assert_eq!(unknown.rgba, default.rgba);
+    }
+
+    #[test]
+    fn state_guards_render_before_init_and_support_double_init() {
+        let mut state = None;
+        assert_eq!(render_state(&mut state, 0.0, 0.0, 0.0, 0), -2);
+        assert_eq!(framebuffer_len_state(&state), 0);
+
+        assert_eq!(init_state(&mut state, 64, 64), 0);
+        assert_eq!(render_state(&mut state, 0.0, 0.0, 0.0, 0), 0);
+        assert_ne!(framebuffer_ptr_state(&state), std::ptr::null());
+
+        assert_eq!(init_state(&mut state, 32, 24), 0);
+        assert_eq!(framebuffer_width_state(&state), 32);
+        assert_eq!(framebuffer_height_state(&state), 24);
     }
 
     #[test]
