@@ -17,6 +17,11 @@ pub trait FragmentOutput {
     fn write(self, framebuffer: &mut Framebuffer, index: usize, blend: bool);
 }
 
+/// Supplies an optional depth value to the shared depth-only raster kernel.
+pub trait DepthVaryings: Varyings {
+    fn depth(vertices: &[ScreenVertex<Self>; 3], weights: Vec3, inverse_w: Vec3) -> f32;
+}
+
 impl FragmentOutput for u32 {
     fn write(self, framebuffer: &mut Framebuffer, index: usize, blend: bool) {
         if let Some(color) = framebuffer.color.get_mut(index) {
@@ -342,6 +347,7 @@ pub(crate) fn rasterize_triangle_in_rect<V, F, O>(
         vertices,
         rect,
         RasterState::OPAQUE,
+        |vertices, weights, _| interpolated_depth(vertices, weights),
         |vertices, weights, inverse_w, _, _| {
             V::lerp3(
                 &vertices[0].varyings,
@@ -370,6 +376,7 @@ pub(crate) fn rasterize_triangle_in_rect_with_state<V, F, O>(
         vertices,
         rect,
         state,
+        |vertices, weights, _| interpolated_depth(vertices, weights),
         |vertices, weights, inverse_w, _, _| {
             V::lerp3(
                 &vertices[0].varyings,
@@ -394,6 +401,32 @@ pub(crate) fn rasterize_triangle_depth_in_rect<V>(
         vertices,
         rect,
         RasterState::DEPTH_ONLY,
+        |vertices, weights, _| interpolated_depth(vertices, weights),
+        |vertices, weights, inverse_w, _, _| {
+            V::lerp3(
+                &vertices[0].varyings,
+                &vertices[1].varyings,
+                &vertices[2].varyings,
+                perspective_correct_weights(weights, inverse_w),
+            )
+        },
+        |_| 0,
+    );
+}
+
+pub(crate) fn rasterize_triangle_depth_with_varyings_in_rect<V>(
+    framebuffer: &mut Framebuffer,
+    vertices: [ScreenVertex<V>; 3],
+    rect: PixelRect,
+) where
+    V: DepthVaryings,
+{
+    rasterize_triangle_in_rect_core(
+        framebuffer,
+        vertices,
+        rect,
+        RasterState::DEPTH_ONLY,
+        V::depth,
         |vertices, weights, inverse_w, _, _| {
             V::lerp3(
                 &vertices[0].varyings,
@@ -421,6 +454,7 @@ pub(crate) fn rasterize_triangle_in_rect_with_sampling<V, F, O>(
         vertices,
         rect,
         RasterState::OPAQUE,
+        |vertices, weights, _| interpolated_depth(vertices, weights),
         |vertices, weights, inverse_w, ddx_weights, ddy_weights| {
             let varyings = V::lerp3(
                 &vertices[0].varyings,
@@ -453,6 +487,7 @@ pub(crate) fn rasterize_triangle_in_rect_with_sampling_state<V, F, O>(
         vertices,
         rect,
         state,
+        |vertices, weights, _| interpolated_depth(vertices, weights),
         |vertices, weights, inverse_w, ddx_weights, ddy_weights| {
             let varyings = V::lerp3(
                 &vertices[0].varyings,
@@ -469,15 +504,17 @@ pub(crate) fn rasterize_triangle_in_rect_with_sampling_state<V, F, O>(
     );
 }
 
-fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment, O>(
+fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment, O, Depth>(
     framebuffer: &mut Framebuffer,
     mut vertices: [ScreenVertex<V>; 3],
     rect: PixelRect,
     state: RasterState,
+    mut depth_value: Depth,
     mut interpolate: Interpolate,
     mut fragment: Fragment,
 ) where
     V: Varyings,
+    Depth: FnMut(&[ScreenVertex<V>; 3], Vec3, Vec3) -> f32,
     Interpolate: FnMut(&[ScreenVertex<V>; 3], Vec3, Vec3, Vec3, Vec3) -> Input,
     Fragment: FnMut(Input) -> O,
     O: FragmentOutput,
@@ -520,7 +557,8 @@ fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment, O>(
                 continue;
             }
 
-            let depth = interpolated_depth(&vertices, weights);
+            let inverse_w = inverse_w(&vertices);
+            let depth = depth_value(&vertices, weights, inverse_w);
             let Ok(x) = usize::try_from(x) else { continue };
             let Ok(y) = usize::try_from(y) else { continue };
             let Some(index) = y
@@ -545,7 +583,6 @@ fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment, O>(
                 (vertices[0].position.x - vertices[2].position.x) / area,
                 (vertices[1].position.x - vertices[0].position.x) / area,
             );
-            let inverse_w = inverse_w(&vertices);
             let input = interpolate(&vertices, weights, inverse_w, ddx_weights, ddy_weights);
             if state.depth_write {
                 *buffer_depth = depth;

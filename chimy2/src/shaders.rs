@@ -662,6 +662,7 @@ impl BlinnPhongUniforms {
         }
         let removed = self.point_lights[index];
         self.point_lights[index..self.point_light_count].rotate_left(1);
+        self.point_shadow_states[index..self.point_light_count].rotate_left(1);
         self.point_light_count -= 1;
         self.point_lights[self.point_light_count] = PointLight::default();
         self.point_shadow_states[self.point_light_count] = None;
@@ -1841,6 +1842,55 @@ mod tests {
         assert!(uniforms.point_light_shadow(0).is_some());
         uniforms.set_point_light(0, point).unwrap();
         assert!(uniforms.point_light_shadow(0).is_none());
+    }
+
+    #[test]
+    fn removing_a_point_light_keeps_its_shadow_slot_paired() {
+        let make_map = |face: crate::shadow::CubeShadowFace| {
+            let mut faces = std::array::from_fn(|_| vec![1.0]);
+            faces[face.index()] = vec![0.1];
+            crate::shadow::CubeShadowMap::from_depth(1, 0.1, 10.0, faces).unwrap()
+        };
+        let positive = PointLight::new(
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 1.0),
+            1.0,
+            0.0,
+            0.0,
+        );
+        let negative = PointLight::new(
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 1.0),
+            1.0,
+            0.0,
+            0.0,
+        );
+        let mut uniforms = uniforms();
+        uniforms.set_point_light(0, positive).unwrap();
+        uniforms.add_point_light(negative).unwrap();
+        uniforms
+            .set_point_light_shadow(
+                0,
+                Some(crate::shadow::CubeShadowState::new(
+                    positive.position,
+                    make_map(crate::shadow::CubeShadowFace::PositiveX),
+                )),
+            )
+            .unwrap();
+        uniforms
+            .set_point_light_shadow(
+                1,
+                Some(crate::shadow::CubeShadowState::new(
+                    negative.position,
+                    make_map(crate::shadow::CubeShadowFace::NegativeX),
+                )),
+            )
+            .unwrap();
+        uniforms.remove_point_light(0).unwrap();
+        assert_eq!(uniforms.point_light(), negative);
+        let survivor = uniforms.point_light_shadow(0).unwrap();
+        assert_eq!(survivor.light_position(), negative.position);
+        assert!(survivor.visibility(Vec3::new(-3.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)) < 0.5);
     }
 
     #[test]

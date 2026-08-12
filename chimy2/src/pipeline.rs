@@ -10,7 +10,8 @@ use crate::math::{Mat4, Vec3, Vec4};
 use crate::mesh::{Mesh, MeshVertex};
 use crate::postfx::PostChain;
 use crate::raster::{
-    FragmentColor, PixelRect, RasterState, ScreenVertex, rasterize_triangle_with_sampling_state,
+    DepthVaryings, FragmentColor, PixelRect, RasterState, ScreenVertex,
+    rasterize_triangle_depth_with_varyings_in_rect, rasterize_triangle_with_sampling_state,
     rasterize_triangle_with_state, triangle_pixel_rect, viewport_transform,
 };
 use crate::skybox::{CubeTexture, render_skybox_with_threads};
@@ -661,6 +662,56 @@ impl<VS, FS> Pipeline<VS, FS> {
     {
         self.draw_depth(framebuffer, mesh.vertices(), mesh.indices(), uniforms);
     }
+
+    pub fn draw_depth_with_varyings<Vertex, Uniforms>(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        vertices: &[Vertex],
+        triangles: &[[usize; 3]],
+        uniforms: &Uniforms,
+    ) where
+        VS: VertexStage<Vertex, Uniforms> + Sync,
+        FS: Sync,
+        Vertex: Sync,
+        Uniforms: Sync,
+        VS::Varyings: DepthVaryings + Clone + Send + Sync,
+    {
+        let prepared = prepare_triangles(
+            &self.vertex,
+            framebuffer,
+            vertices,
+            triangles,
+            None,
+            uniforms,
+        );
+        let prepared = prepared
+            .into_iter()
+            .map(|(_, triangle)| triangle)
+            .collect::<Vec<_>>();
+        dispatch_prepared(
+            self.thread_count,
+            framebuffer,
+            &prepared,
+            uniforms,
+            &self.fragment,
+            RasterState::DEPTH_ONLY,
+            rasterize_depth_triangle_with_varyings::<VS::Varyings, FS, Uniforms>,
+        );
+    }
+
+    pub fn draw_mesh_depth_with_varyings<Uniforms>(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        mesh: &Mesh,
+        uniforms: &Uniforms,
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: Sync,
+        Uniforms: Sync,
+        VS::Varyings: DepthVaryings + Clone + Send + Sync,
+    {
+        self.draw_depth_with_varyings(framebuffer, mesh.vertices(), mesh.indices(), uniforms);
+    }
 }
 
 #[derive(Clone)]
@@ -877,6 +928,27 @@ fn rasterize_depth_triangle<V, FS, Uniforms>(
     V: Varyings,
 {
     rasterize_triangle_with_state(framebuffer, vertices, state, |_| 0);
+}
+
+fn rasterize_depth_triangle_with_varyings<V, FS, Uniforms>(
+    framebuffer: &mut Framebuffer,
+    vertices: [ScreenVertex<V>; 3],
+    _: &FS,
+    _: &Uniforms,
+    _: RasterState,
+) where
+    V: DepthVaryings,
+{
+    rasterize_triangle_depth_with_varyings_in_rect(
+        framebuffer,
+        vertices,
+        PixelRect {
+            min_x: 0,
+            max_x: framebuffer.width.saturating_sub(1) as i32,
+            min_y: 0,
+            max_y: framebuffer.height.saturating_sub(1) as i32,
+        },
+    );
 }
 
 fn rasterize_sampled_triangle<V, FS, Uniforms>(

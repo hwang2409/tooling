@@ -3,7 +3,8 @@
 use crate::fb::Framebuffer;
 use crate::math::{Mat4, Vec2, Vec3, Vec4};
 use crate::mesh::{Mesh, MeshVertex};
-use crate::pipeline::{Pipeline, VertexOutput, VertexStage};
+use crate::pipeline::{Pipeline, Varyings, VertexOutput, VertexStage};
+use crate::raster::{DepthVaryings, ScreenVertex, perspective_correct_weights};
 use std::sync::Arc;
 
 /// Builds a directional-light view from a direction that points toward light.
@@ -165,6 +166,9 @@ pub struct ShadowDepthUniforms {
     model: Mat4,
     light_view_projection: Mat4,
     transform: Mat4,
+    light_position: Vec3,
+    far_plane: f32,
+    linear_depth: bool,
 }
 
 impl ShadowDepthUniforms {
@@ -173,7 +177,23 @@ impl ShadowDepthUniforms {
             model,
             light_view_projection,
             transform: light_view_projection * model,
+            light_position: Vec3::ZERO,
+            far_plane: 1.0,
+            linear_depth: false,
         }
+    }
+
+    pub fn new_cube(
+        model: Mat4,
+        light_view_projection: Mat4,
+        light_position: Vec3,
+        far_plane: f32,
+    ) -> Self {
+        let mut uniforms = Self::new(model, light_view_projection);
+        uniforms.light_position = sanitize_position(light_position);
+        uniforms.far_plane = sanitize_far_plane(far_plane, sanitize_near_plane(0.01));
+        uniforms.linear_depth = true;
+        uniforms
     }
 
     pub const fn model(&self) -> Mat4 {
@@ -206,19 +226,67 @@ impl ShadowDepthUniforms {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ShadowDepthShader;
 
-impl VertexStage<MeshVertex, ShadowDepthUniforms> for ShadowDepthShader {
-    type Varyings = ();
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShadowDepthVaryings {
+    light_vector_over_far: Vec3,
+    linear_depth: bool,
+}
 
-    fn run(&self, vertex: &MeshVertex, uniforms: &ShadowDepthUniforms) -> VertexOutput<()> {
+impl Varyings for ShadowDepthVaryings {
+    fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self {
+        Self {
+            light_vector_over_far: a.light_vector_over_far * weights.x
+                + b.light_vector_over_far * weights.y
+                + c.light_vector_over_far * weights.z,
+            linear_depth: a.linear_depth,
+        }
+    }
+}
+
+impl DepthVaryings for ShadowDepthVaryings {
+    fn depth(vertices: &[ScreenVertex<Self>; 3], weights: Vec3, inverse_w: Vec3) -> f32 {
+        if !vertices[0].varyings.linear_depth {
+            return vertices[0].position.z * weights.x
+                + vertices[1].position.z * weights.y
+                + vertices[2].position.z * weights.z;
+        }
+        let weights = perspective_correct_weights(weights, inverse_w);
+        let vector = vertices[0].varyings.light_vector_over_far * weights.x
+            + vertices[1].varyings.light_vector_over_far * weights.y
+            + vertices[2].varyings.light_vector_over_far * weights.z;
+        normalized_radial_distance(vector)
+    }
+}
+
+impl VertexStage<MeshVertex, ShadowDepthUniforms> for ShadowDepthShader {
+    type Varyings = ShadowDepthVaryings;
+
+    fn run(
+        &self,
+        vertex: &MeshVertex,
+        uniforms: &ShadowDepthUniforms,
+    ) -> VertexOutput<ShadowDepthVaryings> {
+        let local_position = Vec4::new(
+            vertex.position().x,
+            vertex.position().y,
+            vertex.position().z,
+            1.0,
+        );
+        let world_position = uniforms.model * local_position;
         VertexOutput::new(
-            uniforms.transform()
-                * Vec4::new(
-                    vertex.position().x,
-                    vertex.position().y,
-                    vertex.position().z,
-                    1.0,
-                ),
-            (),
+            uniforms.transform() * local_position,
+            ShadowDepthVaryings {
+                light_vector_over_far: if uniforms.linear_depth {
+                    Vec3::new(
+                        (world_position.x - uniforms.light_position.x) / uniforms.far_plane,
+                        (world_position.y - uniforms.light_position.y) / uniforms.far_plane,
+                        (world_position.z - uniforms.light_position.z) / uniforms.far_plane,
+                    )
+                } else {
+                    Vec3::ZERO
+                },
+                linear_depth: uniforms.linear_depth,
+            },
         )
     }
 }
@@ -344,7 +412,7 @@ impl CubeShadowMap {
         })
     }
 
-    /// Converts the existing depth-only pipeline's perspective NDC faces.
+    /// Creates a map from the depth-only pipeline's normalized radial faces.
     pub fn from_framebuffers(
         faces: [Framebuffer; 6],
         near_plane: f32,
@@ -361,11 +429,7 @@ impl CubeShadowMap {
             if face.width != size || face.height != size {
                 return Err("cube shadow faces must have matching dimensions".to_string());
             }
-            converted[index] = face
-                .depth
-                .into_iter()
-                .map(|depth| normalized_linear_distance(depth, near_plane, far_plane))
-                .collect();
+            converted[index] = face.depth.into_iter().map(sanitize_distance).collect();
         }
         Self::from_depth(size, near_plane, far_plane, converted)
     }
@@ -469,12 +533,9 @@ impl CubeShadowState {
         (self.constant_bias, self.slope_bias)
     }
 
-    pub fn set_light_position(&mut self, light_position: Vec3) {
+    /// Replaces the captured light position and all six faces together.
+    pub fn replace_capture(&mut self, light_position: Vec3, shadow_map: CubeShadowMap) {
         self.light_position = sanitize_position(light_position);
-        self.rebuild_face_view_projections();
-    }
-
-    pub fn set_shadow_map(&mut self, shadow_map: CubeShadowMap) {
         self.shadow_map = shadow_map;
         self.rebuild_face_view_projections();
     }
@@ -506,7 +567,7 @@ impl CubeShadowState {
         {
             return 1.0;
         }
-        let light_direction = to_point.normalize();
+        let light_direction = (-to_point).normalize();
         let normal_dot_light = normal.normalize().dot(light_direction).clamp(0.0, 1.0);
         let bias = self
             .constant_bias
@@ -543,10 +604,10 @@ pub fn render_cube_shadow_map(
     for (index, face) in faces.iter_mut().enumerate() {
         face.clear(0);
         for &(mesh, model) in meshes {
-            pipeline.draw_mesh_depth(
+            pipeline.draw_mesh_depth_with_varyings(
                 face,
                 mesh,
-                &ShadowDepthUniforms::new(model, matrices[index]),
+                &ShadowDepthUniforms::new_cube(model, matrices[index], light_position, far_plane),
             );
         }
     }
@@ -574,17 +635,6 @@ fn cube_face_for_direction(direction: Vec3) -> CubeShadowFace {
     }
 }
 
-fn normalized_linear_distance(ndc_depth: f32, near_plane: f32, far_plane: f32) -> f32 {
-    if !ndc_depth.is_finite() {
-        return 1.0;
-    }
-    let denominator = far_plane + near_plane - ndc_depth * (far_plane - near_plane);
-    if denominator <= 0.0 || !denominator.is_finite() {
-        return 1.0;
-    }
-    ((2.0 * far_plane * near_plane / denominator) / far_plane).clamp(0.0, 1.0)
-}
-
 fn sanitize_position(position: Vec3) -> Vec3 {
     Vec3::new(
         finite_or_zero(position.x),
@@ -593,13 +643,21 @@ fn sanitize_position(position: Vec3) -> Vec3 {
     )
 }
 
+fn normalized_radial_distance(light_vector_over_far: Vec3) -> f32 {
+    // The vector is normalized by the far plane. Its length is the ray-length
+    // factor that converts face-axis depth into radial light distance.
+    let ray_length_factor = light_vector_over_far.length();
+    ray_length_factor.clamp(0.0, 1.0)
+}
+
 fn finite_or_zero(value: f32) -> f32 {
     if value.is_finite() { value } else { 0.0 }
 }
 
 fn sanitize_near_plane(value: f32) -> f32 {
+    const MAX_NEAR_PLANE: f32 = 1_000_000.0;
     if value.is_finite() && value > 0.0 {
-        value
+        value.min(MAX_NEAR_PLANE)
     } else {
         0.01
     }
@@ -609,7 +667,7 @@ fn sanitize_far_plane(value: f32, near_plane: f32) -> f32 {
     if value.is_finite() && value > near_plane {
         value
     } else {
-        near_plane + 1.0
+        near_plane + near_plane.max(1.0) * 0.01
     }
 }
 
@@ -674,22 +732,26 @@ mod tests {
     }
 
     #[test]
-    fn cube_map_converts_perspective_depth_to_linear_distance() {
-        let light = Vec3::ZERO;
+    fn cube_map_keeps_linear_depth_at_far_range() {
         let near = 0.1;
-        let far = 10.0;
-        let matrix =
-            cube_face_view_projections(light, near, far)[CubeShadowFace::PositiveZ.index()];
-        let clip = matrix * Vec4::new(0.0, 0.0, 2.0, 1.0);
-        let ndc_depth = clip.z / clip.w;
+        let far = 1000.0;
         let mut framebuffer = Framebuffer::new(1, 1);
-        framebuffer.depth[0] = ndc_depth;
+        framebuffer.depth[0] = 0.999;
         let mut framebuffers = std::array::from_fn(|_| Framebuffer::new(1, 1));
         framebuffers[CubeShadowFace::PositiveZ.index()] = framebuffer;
         let map = CubeShadowMap::from_framebuffers(framebuffers, near, far).unwrap();
         assert_close(
             map.sample_depth(CubeShadowFace::PositiveZ, Vec2::new(0.5, 0.5)),
-            2.0 / far,
+            0.999,
+        );
+        let mut far_framebuffer = Framebuffer::new(1, 1);
+        far_framebuffer.depth[0] = 1.0;
+        let mut far_faces = std::array::from_fn(|_| Framebuffer::new(1, 1));
+        far_faces[CubeShadowFace::PositiveZ.index()] = far_framebuffer;
+        let far_map = CubeShadowMap::from_framebuffers(far_faces, near, far).unwrap();
+        assert_eq!(
+            far_map.sample_depth(CubeShadowFace::PositiveZ, Vec2::new(0.5, 0.5)),
+            1.0
         );
     }
 
@@ -716,7 +778,8 @@ mod tests {
         assert!(map.far_plane() > map.near_plane());
         let mut state = CubeShadowState::new(Vec3::new(f32::NAN, f32::INFINITY, 1.0), map);
         assert_eq!(state.light_position(), Vec3::new(0.0, 0.0, 1.0));
-        state.set_light_position(Vec3::new(f32::NEG_INFINITY, 2.0, f32::NAN));
+        let moved_map = state.shadow_map().clone();
+        state.replace_capture(Vec3::new(f32::NEG_INFINITY, 2.0, f32::NAN), moved_map);
         assert_eq!(state.light_position(), Vec3::new(0.0, 2.0, 0.0));
         assert!(
             state
@@ -724,6 +787,17 @@ mod tests {
                 .iter()
                 .all(|matrix| matrix.data.iter().all(|value| value.is_finite()))
         );
+
+        let extreme = CubeShadowMap::from_depth(
+            1,
+            f32::MAX,
+            f32::NEG_INFINITY,
+            std::array::from_fn(|_| vec![1.0]),
+        )
+        .unwrap();
+        assert!(extreme.near_plane().is_finite());
+        assert!(extreme.far_plane().is_finite());
+        assert!(extreme.far_plane() > extreme.near_plane());
     }
 
     #[test]
@@ -741,6 +815,62 @@ mod tests {
         let state = CubeShadowState::new(light, map);
         assert!(state.visibility(Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0)) < 0.5);
         assert!(state.visibility(Vec3::new(2.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0)) > 0.5);
+    }
+
+    #[test]
+    fn off_axis_capture_uses_radial_distance_for_shadow_sampling() {
+        let occluder = crate::demo::cube_with_uvs(0.35);
+        let light = Vec3::ZERO;
+        let center = Vec3::new(0.8, 0.0, 2.0);
+        let map = render_cube_shadow_map(
+            light,
+            0.1,
+            10.0,
+            64,
+            &[(&occluder, Mat4::translate(center))],
+        )
+        .unwrap();
+        let state = CubeShadowState::new(light, map);
+        let shadowed = center.normalize() * 3.0;
+        let tangent = Vec3::new(-center.z, 0.0, center.x).normalize();
+        let front_surface = center - center.normalize() * 0.35;
+        let front_visibility = state.visibility(front_surface, -front_surface.normalize());
+        assert!(
+            front_visibility > 0.1,
+            "off-axis occluder self-shadowed: {front_visibility}"
+        );
+        assert!(state.visibility(shadowed, -shadowed.normalize()) < 0.5);
+        assert!(state.visibility(shadowed + tangent, -shadowed.normalize()) > 0.5);
+    }
+
+    #[test]
+    fn capture_replacement_rebuilds_position_and_faces_as_one_state() {
+        let occluder = crate::demo::cube_with_uvs(0.5);
+        let first_light = Vec3::new(0.0, 0.0, -2.0);
+        let moved_light = Vec3::new(0.0, 0.0, 2.0);
+        let first_map =
+            render_cube_shadow_map(first_light, 0.1, 10.0, 64, &[(&occluder, Mat4::IDENTITY)])
+                .unwrap();
+        let moved_map =
+            render_cube_shadow_map(moved_light, 0.1, 10.0, 64, &[(&occluder, Mat4::IDENTITY)])
+                .unwrap();
+        let mut moved = CubeShadowState::new(first_light, first_map);
+        moved.replace_capture(moved_light, moved_map.clone());
+        let fresh = CubeShadowState::new(moved_light, moved_map);
+        let receiver = Vec3::new(0.0, 0.0, -3.0);
+        assert_eq!(
+            moved.visibility(receiver, Vec3::new(0.0, 0.0, 1.0)),
+            fresh.visibility(receiver, Vec3::new(0.0, 0.0, 1.0))
+        );
+    }
+
+    #[test]
+    fn front_facing_receiver_does_not_get_full_slope_bias() {
+        let map =
+            CubeShadowMap::from_depth(1, 0.1, 10.0, std::array::from_fn(|_| vec![0.5])).unwrap();
+        let mut state = CubeShadowState::new(Vec3::ZERO, map);
+        state.set_bias(0.0, 0.02);
+        assert!(state.visibility(Vec3::new(0.0, 0.0, 5.1), Vec3::new(0.0, 0.0, -1.0)) < 0.5);
     }
 
     #[test]
