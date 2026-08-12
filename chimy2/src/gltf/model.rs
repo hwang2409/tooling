@@ -11,17 +11,49 @@ fn parse_meshes(
         .iter()
         .map(|value| {
             let mesh_object = as_object(value, "mesh")?;
+            let weights = get_optional_f32_array(mesh_object, "weights")?;
             let primitives = get_array(mesh_object, "primitives")?
                 .iter()
                 .map(|value| {
-                    parse_primitive(as_object(value, "primitive")?, buffers, views, accessors)
+                    parse_primitive(
+                        as_object(value, "primitive")?,
+                        buffers,
+                        views,
+                        accessors,
+                        weights.as_deref(),
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let target_count = primitives
+                .first()
+                .map(|primitive| primitive.morph_targets.len())
+                .unwrap_or(0);
+            if primitives
+                .iter()
+                .any(|primitive| primitive.morph_targets.len() != target_count)
+            {
+                return Err(GltfError::new(
+                    "mesh primitives have different morph target counts",
+                ));
+            }
+            if weights
+                .as_ref()
+                .is_some_and(|weights| weights.len() != target_count)
+            {
+                return Err(GltfError::new(
+                    "mesh weights count does not match morph targets",
+                ));
+            }
             Ok(GltfMesh {
                 name: get_optional_string(mesh_object, "name")?
                     .unwrap_or_default()
                     .to_string(),
                 primitives,
+                weights: weights
+                    .unwrap_or_else(|| vec![0.0; target_count])
+                    .into_iter()
+                    .map(sanitize_morph_weight)
+                    .collect(),
             })
         })
         .collect()
@@ -32,6 +64,7 @@ fn parse_primitive(
     buffers: &[Vec<u8>],
     views: &[BufferView],
     accessors: &[Accessor],
+    mesh_weights: Option<&[f32]>,
 ) -> Result<GltfPrimitive, GltfError> {
     if get_optional_u32(object, "mode")?.unwrap_or(4) != 4 {
         return Err(GltfError::new("only TRIANGLES primitives are supported"));
@@ -100,6 +133,69 @@ fn parse_primitive(
     if indices.len() % 3 != 0 || indices.iter().any(|&index| index >= positions.len()) {
         return Err(GltfError::new("primitive indices are invalid"));
     }
+    let vertex_count = positions.len();
+    let morph_targets = get_optional_array(object, "targets")?
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+        .map(|(target_index, value)| {
+            let target = as_object(value, "morph target")?;
+            let position_accessor = get_optional_u32(target, "POSITION")?.ok_or_else(|| {
+                GltfError::new(format!("morph target {target_index} is missing POSITION"))
+            })? as usize;
+            let target_positions = read_float_accessor(
+                buffers,
+                views,
+                accessors,
+                position_accessor,
+                "morph POSITION",
+                "VEC3",
+            )?;
+            if target_positions.len() != vertex_count {
+                return Err(GltfError::new(format!(
+                    "morph target {target_index} POSITION count does not match mesh"
+                )));
+            }
+            let normals = get_optional_u32(target, "NORMAL")?
+                .map(|index| {
+                    read_float_accessor(
+                        buffers,
+                        views,
+                        accessors,
+                        index as usize,
+                        "morph NORMAL",
+                        "VEC3",
+                    )
+                })
+                .transpose()?;
+            if normals
+                .as_ref()
+                .is_some_and(|normals| normals.len() != vertex_count)
+            {
+                return Err(GltfError::new(format!(
+                    "morph target {target_index} NORMAL count does not match mesh"
+                )));
+            }
+            Ok(MorphTarget {
+                position_deltas: target_positions
+                    .into_iter()
+                    .map(|value| Vec3::new(value[0], value[1], value[2]))
+                    .collect(),
+                normal_deltas: normals.map(|values| {
+                    values
+                        .into_iter()
+                        .map(|value| Vec3::new(value[0], value[1], value[2]))
+                        .collect()
+                }),
+            })
+        })
+        .collect::<Result<Vec<_>, GltfError>>()?;
+    if mesh_weights.is_some_and(|weights| weights.len() != morph_targets.len()) {
+        return Err(GltfError::new(
+            "mesh weights count does not match morph targets",
+        ));
+    }
+    let target_count = morph_targets.len();
     let vertices = positions
         .iter()
         .enumerate()
@@ -124,6 +220,10 @@ fn parse_primitive(
         material: get_optional_u32(object, "material")?.map(|index| index as usize),
         joints,
         weights,
+        morph_targets,
+        morph_weights: mesh_weights
+            .map(|weights| weights.iter().copied().map(sanitize_morph_weight).collect())
+            .unwrap_or_else(|| vec![0.0; target_count]),
     })
 }
 
@@ -328,7 +428,10 @@ fn component_count(kind: &str) -> usize {
     }
 }
 
-fn parse_nodes(object: &[(String, Value)]) -> Result<Vec<GltfNode>, GltfError> {
+fn parse_nodes(
+    object: &[(String, Value)],
+    meshes: &[GltfMesh],
+) -> Result<Vec<GltfNode>, GltfError> {
     let values = get_optional_array(object, "nodes")?.unwrap_or(&[]);
     values
         .iter()
@@ -363,13 +466,29 @@ fn parse_nodes(object: &[(String, Value)]) -> Result<Vec<GltfNode>, GltfError> {
                 get_optional_f32_array(o, "scale")?.unwrap_or_else(|| vec![1.0, 1.0, 1.0]),
                 "scale",
             )?;
+            let mesh = get_optional_usize(o, "mesh")?;
+            let weights = get_optional_f32_array(o, "weights")?
+                .map(|weights| {
+                    let target_count = mesh
+                        .and_then(|index| meshes.get(index))
+                        .map(|mesh| mesh.weights.len())
+                        .ok_or_else(|| GltfError::new("node weights require a valid mesh"))?;
+                    if weights.len() != target_count {
+                        return Err(GltfError::new(
+                            "node weights count does not match morph targets",
+                        ));
+                    }
+                    Ok(weights.into_iter().map(sanitize_morph_weight).collect())
+                })
+                .transpose()?;
             Ok(GltfNode {
                 name: get_optional_string(o, "name")?
                     .unwrap_or_default()
                     .to_string(),
                 children: get_optional_usize_array(o, "children")?.unwrap_or_default(),
-                mesh: get_optional_usize(o, "mesh")?,
+                mesh,
                 skin: get_optional_usize(o, "skin")?,
+                weights,
                 matrix,
                 translation,
                 rotation,

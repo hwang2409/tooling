@@ -32,10 +32,17 @@ impl GltfAsset {
         let textures = parse_textures(object)?;
         let materials = parse_materials(object, &images, &textures)?;
         let meshes = parse_meshes(object, &buffers, &views, &accessors)?;
-        let nodes = parse_nodes(object)?;
+        let nodes = parse_nodes(object, &meshes)?;
         validate_nodes(&nodes)?;
         let skins = parse_skins(object, &buffers, &views, &accessors, nodes.len())?;
-        let animations = parse_animations(object, &buffers, &views, &accessors, nodes.len())?;
+        let animations = parse_animations(
+            object,
+            &buffers,
+            &views,
+            &accessors,
+            &nodes,
+            &meshes,
+        )?;
         let scenes = parse_scenes(object, nodes.len())?;
         let default_scene = get_optional_usize(object, "scene")?.unwrap_or(0);
         if !scenes.is_empty() && default_scene >= scenes.len() {

@@ -37,6 +37,8 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+pub use crate::morph_scene::{MorphScene, build_morph_scene, render_morph_scene};
+
 pub const SCREENSHOT_FPS: f32 = 60.0;
 
 #[derive(Clone, Debug, PartialEq)]
