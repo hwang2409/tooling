@@ -11,16 +11,16 @@
 //! - `--size WxH` — override the demo's default window size. Screenshot mode
 //!   uses this size directly for the offscreen framebuffer.
 //! - `--ssaa` — enable 2x linear-light supersampling in demos that opt in.
-//! - `--bloom`, `--fxaa`, `--vignette` — enable post-processing passes.
+//! - `--bloom`, `--fxaa`, `--vignette`, `--ssao` — enable post-processing passes.
 //! - `--hdr` — keep linear HDR values through the render and bloom stages.
 //! - `--exposure X` — scale linear HDR values before ACES tonemapping.
 //! - `--ibl` — use the load-time image-based lighting GGX variant.
 
 use crate::fb::Framebuffer;
 use crate::image::Texture;
-use crate::math::{Vec2, Vec3};
+use crate::math::{Mat4, Vec2, Vec3};
 use crate::mesh::{Mesh, MeshVertex};
-use crate::postfx::{AcesTonemapPass, BloomPass, FxaaPass, PostChain, VignettePass};
+use crate::postfx::{AcesTonemapPass, BloomPass, FxaaPass, PostChain, SsaoPass, VignettePass};
 use crate::present::{InputState, run_with_input};
 use std::error::Error;
 use std::f32::consts::{PI, TAU};
@@ -39,6 +39,7 @@ pub struct DemoArgs {
     pub bloom: bool,
     pub fxaa: bool,
     pub vignette: bool,
+    pub ssao: bool,
     pub hdr: bool,
     pub ibl: bool,
     pub exposure: f32,
@@ -54,6 +55,7 @@ impl Default for DemoArgs {
             bloom: false,
             fxaa: false,
             vignette: false,
+            ssao: false,
             hdr: false,
             ibl: false,
             exposure: 1.0,
@@ -94,6 +96,7 @@ impl DemoArgs {
                 "--bloom" => args.bloom = true,
                 "--fxaa" => args.fxaa = true,
                 "--vignette" => args.vignette = true,
+                "--ssao" => args.ssao = true,
                 "--hdr" => args.hdr = true,
                 "--ibl" => args.ibl = true,
                 "--exposure" => {
@@ -118,6 +121,37 @@ impl DemoArgs {
 
     pub fn post_chain(&self) -> PostChain {
         let mut chain = PostChain::new();
+        // SSAO needs the frame projection. Demos that render through a
+        // pipeline add it there with `post_chain_with_projection` so it runs
+        // before these color-only passes.
+        if self.bloom {
+            chain.push(BloomPass);
+        }
+        if self.hdr {
+            if self.vignette {
+                chain.push(VignettePass);
+            }
+            chain.push(AcesTonemapPass::new(self.exposure));
+            if self.fxaa {
+                chain.push(FxaaPass);
+            }
+        } else {
+            if self.fxaa {
+                chain.push(FxaaPass);
+            }
+            if self.vignette {
+                chain.push(VignettePass);
+            }
+        }
+        chain
+    }
+
+    /// Builds a chain with SSAO first, using the projection for this frame.
+    pub fn post_chain_with_projection(&self, projection: Mat4) -> PostChain {
+        let mut chain = PostChain::new();
+        if self.ssao {
+            chain.push(SsaoPass::new(projection));
+        }
         if self.bloom {
             chain.push(BloomPass);
         }

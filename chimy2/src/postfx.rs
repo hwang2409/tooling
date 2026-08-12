@@ -2,11 +2,15 @@
 //!
 //! The renderer stores encoded sRGB colors in `Framebuffer`. HDR mode also
 //! stores a linear sidecar. Each pass declares its working color space.
-//! The HDR order is render -> SSAA -> bloom -> vignette -> ACES -> encode ->
-//! FXAA. LDR chains retain their existing pass order and byte output.
+//! The HDR order is render -> SSAA -> SSAO -> bloom -> vignette -> ACES ->
+//! encode -> FXAA. LDR chains retain their existing pass order and byte output.
+//! SSAO must run before tonemapping and bloom because it reads linear scene
+//! color and depth. It modulates the full color, not only the ambient term.
+//! Ambient-only modulation needs a separate ambient buffer and is out of scope.
 
 use crate::fb::{Framebuffer, argb8888_linear};
 use crate::image::{srgb_to_linear, srgb_to_linear_u8};
+use crate::math::{Mat4, Vec3, Vec4};
 
 /// The color space used by a post-processing pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,9 +137,33 @@ pub trait PostPass: Send + Sync {
     fn color_space(&self) -> PostColorSpace;
 
     fn apply(&self, input: &PostBuffer, output: &mut PostBuffer);
+
+    /// Returns true when this pass has no effect and must be skipped before
+    /// color-space conversion, preserving exact framebuffer bytes.
+    fn is_noop(&self) -> bool {
+        false
+    }
+
+    /// Applies a pass with access to the rendered framebuffer.
+    ///
+    /// Most passes only need the color buffer and use [`Self::apply`]. A pass
+    /// such as SSAO can override this hook to read depth without widening the
+    /// raster or shader interfaces.
+    fn apply_with_framebuffer(
+        &self,
+        input: &PostBuffer,
+        output: &mut PostBuffer,
+        _framebuffer: &Framebuffer,
+    ) {
+        self.apply(input, output);
+    }
 }
 
 /// An ordered, opt-in collection of post-processing passes.
+///
+/// Push [`SsaoPass`] before [`BloomPass`] and [`AcesTonemapPass`]. SSAO needs
+/// the linear HDR scene and depth before those passes change the color space
+/// or add display-space light.
 #[derive(Default)]
 pub struct PostChain {
     passes: Vec<Box<dyn PostPass>>,
@@ -180,13 +208,525 @@ impl PostChain {
         }
         let mut current = PostBuffer::from_framebuffer(framebuffer);
         for pass in &self.passes {
+            if pass.is_noop() {
+                continue;
+            }
             let input = current.convert_to(pass.color_space());
             let mut output = PostBuffer::new(input.width, input.height, pass.color_space());
             output.hdr = input.hdr;
-            pass.apply(&input, &mut output);
+            pass.apply_with_framebuffer(&input, &mut output, framebuffer);
             current = output;
         }
         current.write_to_framebuffer(framebuffer);
+    }
+}
+
+/// Number of deterministic hemisphere samples used by [`SsaoPass`].
+pub const SSAO_SAMPLE_COUNT: usize = 16;
+pub const SSAO_DEFAULT_RADIUS: f32 = 0.55;
+pub const SSAO_DEFAULT_BIAS: f32 = 0.025;
+pub const SSAO_DEFAULT_STRENGTH: f32 = 1.0;
+pub const SSAO_DEFAULT_RANGE: f32 = 0.9;
+pub const SSAO_DEFAULT_BLUR_DEPTH_THRESHOLD: f32 = 0.35;
+
+const SSAO_BLUR_TAPS: [(isize, f32); 3] = [(0, 0.5), (-1, 0.25), (1, 0.25)];
+
+/// Screen-space ambient occlusion for a perspective-rendered depth buffer.
+///
+/// The pass reconstructs view-space positions by applying the inverse of the
+/// exact projection matrix used by the renderer. It estimates a normal from
+/// the lower-delta screen-space position neighbors, samples a fixed
+/// deterministic hemisphere, range-checks depth comparisons, and applies an
+/// edge-aware separable blur to occlusion only.
+///
+/// SSAO runs in linear color space and multiplies the complete color. It does
+/// not isolate ambient lighting. That needs a separate ambient buffer and is
+/// out of scope for this pass.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SsaoPass {
+    projection: Mat4,
+    inverse_projection: Mat4,
+    projection_valid: bool,
+    radius: f32,
+    bias: f32,
+    strength: f32,
+    range: f32,
+    blur_depth_threshold: f32,
+}
+
+impl SsaoPass {
+    /// Creates a pass from the projection matrix used by the camera.
+    ///
+    /// The matrix is sanitized at this boundary. Non-finite matrices and
+    /// singular matrices fall back to identity, which makes the pass a safe
+    /// no-op for an invalid projection rather than producing invalid pixels.
+    pub fn new(projection: Mat4) -> Self {
+        let (projection, inverse_projection, projection_valid) = sanitize_projection(projection);
+        Self {
+            projection,
+            inverse_projection,
+            projection_valid,
+            radius: SSAO_DEFAULT_RADIUS,
+            bias: SSAO_DEFAULT_BIAS,
+            strength: SSAO_DEFAULT_STRENGTH,
+            range: SSAO_DEFAULT_RANGE,
+            blur_depth_threshold: SSAO_DEFAULT_BLUR_DEPTH_THRESHOLD,
+        }
+    }
+
+    pub const fn projection(&self) -> Mat4 {
+        self.projection
+    }
+
+    pub fn set_projection(&mut self, projection: Mat4) {
+        let (projection, inverse_projection, projection_valid) = sanitize_projection(projection);
+        self.projection = projection;
+        self.inverse_projection = inverse_projection;
+        self.projection_valid = projection_valid;
+    }
+
+    pub const fn radius(&self) -> f32 {
+        self.radius
+    }
+
+    pub fn set_radius(&mut self, radius: f32) {
+        self.radius = sanitize_positive(radius, SSAO_DEFAULT_RADIUS, 1000.0);
+    }
+
+    pub const fn bias(&self) -> f32 {
+        self.bias
+    }
+
+    pub fn set_bias(&mut self, bias: f32) {
+        self.bias = sanitize_nonnegative(bias, SSAO_DEFAULT_BIAS, 1000.0);
+    }
+
+    pub const fn strength(&self) -> f32 {
+        self.strength
+    }
+
+    pub fn set_strength(&mut self, strength: f32) {
+        self.strength = sanitize_unit(strength, SSAO_DEFAULT_STRENGTH);
+    }
+
+    pub const fn range(&self) -> f32 {
+        self.range
+    }
+
+    pub fn set_range(&mut self, range: f32) {
+        self.range = sanitize_positive(range, SSAO_DEFAULT_RANGE, 1000.0);
+    }
+
+    pub const fn blur_depth_threshold(&self) -> f32 {
+        self.blur_depth_threshold
+    }
+
+    pub fn set_blur_depth_threshold(&mut self, threshold: f32) {
+        self.blur_depth_threshold =
+            sanitize_positive(threshold, SSAO_DEFAULT_BLUR_DEPTH_THRESHOLD, 1000.0);
+    }
+
+    /// Reconstructs one pixel's view-space position from framebuffer depth.
+    ///
+    /// Depth is the post-divide NDC z written by the rasterizer. The inverse
+    /// projection performs the required non-linear perspective linearization.
+    pub fn reconstruct_view_position(
+        &self,
+        x: usize,
+        y: usize,
+        depth: f32,
+        width: usize,
+        height: usize,
+    ) -> Option<Vec3> {
+        if width == 0 || height == 0 || x >= width || y >= height || !depth.is_finite() {
+            return None;
+        }
+        let ndc_x = ((x as f32 + 0.5) / width as f32) * 2.0 - 1.0;
+        let ndc_y = 1.0 - ((y as f32 + 0.5) / height as f32) * 2.0;
+        let clip = self.inverse_projection * Vec4::new(ndc_x, ndc_y, depth, 1.0);
+        if !clip.w.is_finite() || clip.w.abs() <= f32::EPSILON {
+            return None;
+        }
+        let position = Vec3::new(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
+        if !position.x.is_finite() || !position.y.is_finite() || !position.z.is_finite() {
+            return None;
+        }
+        Some(position)
+    }
+
+    /// Computes the unblurred occlusion buffer from the framebuffer depth.
+    pub fn raw_occlusion_buffer(&self, framebuffer: &Framebuffer) -> Vec<f32> {
+        let length = framebuffer.width.saturating_mul(framebuffer.height);
+        if !self.projection_valid {
+            return vec![0.0; length];
+        }
+        let positions = self.reconstructed_positions(framebuffer);
+        let mut raw = vec![0.0; length];
+        for y in 0..framebuffer.height {
+            for x in 0..framebuffer.width {
+                let index = y * framebuffer.width + x;
+                let Some(center) = positions[index] else {
+                    continue;
+                };
+                let normal = self.estimate_normal(&positions, x, y, center, framebuffer.width);
+                raw[index] = self.sample_occlusion(framebuffer, &positions, center, normal);
+            }
+        }
+        raw
+    }
+
+    /// Computes the blurred occlusion buffer from the framebuffer depth.
+    ///
+    /// This is the same production path used by [`Self::apply_with_framebuffer`].
+    /// A caller can use it to inspect or compare deterministic occlusion data.
+    pub fn occlusion_buffer(&self, framebuffer: &Framebuffer) -> Vec<f32> {
+        let raw = self.raw_occlusion_buffer(framebuffer);
+        if !self.projection_valid {
+            return raw;
+        }
+        let positions = self.reconstructed_positions(framebuffer);
+        self.blur_occlusion(&raw, &positions, framebuffer.width, framebuffer.height)
+    }
+
+    /// Applies SSAO directly to a framebuffer through the production path.
+    pub fn apply_to_framebuffer(&self, framebuffer: &mut Framebuffer) {
+        if !self.projection_valid {
+            return;
+        }
+        let input = PostBuffer::from_framebuffer(framebuffer);
+        let mut output = PostBuffer::new(input.width, input.height, PostColorSpace::Linear);
+        output.hdr = input.hdr;
+        self.apply_with_framebuffer(&input, &mut output, framebuffer);
+        output.write_to_framebuffer(framebuffer);
+    }
+
+    fn reconstructed_positions(&self, framebuffer: &Framebuffer) -> Vec<Option<Vec3>> {
+        let length = framebuffer.width.saturating_mul(framebuffer.height);
+        let mut positions = vec![None; length];
+        for y in 0..framebuffer.height {
+            for x in 0..framebuffer.width {
+                let index = y * framebuffer.width + x;
+                let Some(&depth) = framebuffer.depth.get(index) else {
+                    continue;
+                };
+                if depth >= 1.0 {
+                    continue;
+                }
+                positions[index] = self.reconstruct_view_position(
+                    x,
+                    y,
+                    depth,
+                    framebuffer.width,
+                    framebuffer.height,
+                );
+            }
+        }
+        positions
+    }
+
+    fn estimate_normal(
+        &self,
+        positions: &[Option<Vec3>],
+        x: usize,
+        y: usize,
+        center: Vec3,
+        width: usize,
+    ) -> Vec3 {
+        let neighbor = |nx: usize, ny: usize| positions[ny * width + nx];
+        let left = (x > 0).then(|| neighbor(x - 1, y)).flatten();
+        let right = (x + 1 < width).then(|| neighbor(x + 1, y)).flatten();
+        let height = positions.len().checked_div(width).unwrap_or(0);
+        let up = (y > 0).then(|| neighbor(x, y - 1)).flatten();
+        let down = (y + 1 < height).then(|| neighbor(x, y + 1)).flatten();
+        let dx = choose_delta(center, left, right);
+        let dy = choose_delta(center, up, down);
+        let mut normal = dx.cross(dy).normalize();
+        if normal.length() == 0.0 || !normal.x.is_finite() {
+            return Vec3::new(0.0, 0.0, 1.0);
+        }
+        if normal.dot(-center) < 0.0 {
+            normal = -normal;
+        }
+        normal
+    }
+
+    fn sample_occlusion(
+        &self,
+        framebuffer: &Framebuffer,
+        positions: &[Option<Vec3>],
+        center: Vec3,
+        normal: Vec3,
+    ) -> f32 {
+        let tangent_up = if normal.z.abs() < 0.9 {
+            Vec3::new(0.0, 0.0, 1.0)
+        } else {
+            Vec3::new(0.0, 1.0, 0.0)
+        };
+        let tangent = tangent_up.cross(normal).normalize();
+        let bitangent = normal.cross(tangent).normalize();
+        let mut occluded = 0.0;
+        let mut considered = 0.0;
+        for sample_index in 0..SSAO_SAMPLE_COUNT {
+            let fraction = (sample_index as f32 + 0.5) / SSAO_SAMPLE_COUNT as f32;
+            let angle = (sample_index as f32 * 0.618_033_95).fract() * std::f32::consts::TAU;
+            let radial = fraction.sqrt();
+            let local = Vec3::new(
+                angle.cos() * radial,
+                angle.sin() * radial,
+                (1.0 - fraction).sqrt(),
+            );
+            let direction = tangent * local.x + bitangent * local.y + normal * local.z;
+            let sample_position = center + direction * self.radius;
+            let Some((sample_x, sample_y)) =
+                self.project_to_pixel(sample_position, framebuffer.width, framebuffer.height)
+            else {
+                continue;
+            };
+            let sample_index = sample_y * framebuffer.width + sample_x;
+            let Some(sample_surface) = positions.get(sample_index).copied().flatten() else {
+                continue;
+            };
+            let depth_delta = (center.z - sample_surface.z).abs();
+            if depth_delta > self.range {
+                continue;
+            }
+            considered += 1.0;
+            if sample_surface.z > sample_position.z + self.bias {
+                occluded += 1.0;
+            }
+        }
+        if considered == 0.0 {
+            0.0
+        } else {
+            occluded / considered
+        }
+    }
+
+    fn project_to_pixel(
+        &self,
+        position: Vec3,
+        width: usize,
+        height: usize,
+    ) -> Option<(usize, usize)> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let clip = self.projection * Vec4::new(position.x, position.y, position.z, 1.0);
+        if !clip.w.is_finite() || clip.w <= f32::EPSILON {
+            return None;
+        }
+        let ndc_x = clip.x / clip.w;
+        let ndc_y = clip.y / clip.w;
+        if !ndc_x.is_finite() || !ndc_y.is_finite() {
+            return None;
+        }
+        let pixel_x = ((ndc_x + 1.0) * 0.5 * width as f32).floor() as isize;
+        let pixel_y = ((1.0 - ndc_y) * 0.5 * height as f32).floor() as isize;
+        if pixel_x < 0 || pixel_y < 0 || pixel_x >= width as isize || pixel_y >= height as isize {
+            None
+        } else {
+            Some((pixel_x as usize, pixel_y as usize))
+        }
+    }
+
+    fn blur_occlusion(
+        &self,
+        raw: &[f32],
+        positions: &[Option<Vec3>],
+        width: usize,
+        height: usize,
+    ) -> Vec<f32> {
+        let mut horizontal = vec![0.0; raw.len()];
+        for y in 0..height {
+            for x in 0..width {
+                let index = y * width + x;
+                horizontal[index] = self.blur_pixel(raw, positions, x, y, width, true);
+            }
+        }
+        let mut blurred = vec![0.0; raw.len()];
+        for y in 0..height {
+            for x in 0..width {
+                let index = y * width + x;
+                blurred[index] = self.blur_pixel(&horizontal, positions, x, y, width, false);
+            }
+        }
+        blurred
+    }
+
+    fn blur_pixel(
+        &self,
+        values: &[f32],
+        positions: &[Option<Vec3>],
+        x: usize,
+        y: usize,
+        width: usize,
+        horizontal: bool,
+    ) -> f32 {
+        let center_index = y * width + x;
+        let height = positions.len().checked_div(width).unwrap_or(0);
+        let Some(center_position) = positions[center_index] else {
+            return 0.0;
+        };
+        // The pre-guard protects the cross-axis edge. Axis taps are checked
+        // below so each separable blur direction keeps its own load-bearing
+        // depth threshold.
+        let perpendicular_neighbors = if horizontal {
+            [
+                (Some(x), y.checked_sub(1)),
+                (Some(x), y.checked_add(1).filter(|&value| value < height)),
+            ]
+        } else {
+            [
+                (x.checked_sub(1), Some(y)),
+                (x.checked_add(1).filter(|&value| value < width), Some(y)),
+            ]
+        };
+        for (nx, ny) in perpendicular_neighbors {
+            let (Some(nx), Some(ny)) = (nx, ny) else {
+                continue;
+            };
+            let neighbor_index = ny * width + nx;
+            let Some(neighbor_position) = positions[neighbor_index] else {
+                continue;
+            };
+            if (neighbor_position.z - center_position.z).abs() > self.blur_depth_threshold {
+                return values[center_index];
+            }
+        }
+        let mut total = 0.0;
+        let mut weight_total = 0.0;
+        for (offset, weight) in SSAO_BLUR_TAPS {
+            let coordinate = if horizontal {
+                x as isize + offset
+            } else {
+                y as isize + offset
+            };
+            let limit = if horizontal { width } else { height };
+            if coordinate < 0 || coordinate >= limit as isize {
+                continue;
+            }
+            let (nx, ny) = if horizontal {
+                (coordinate as usize, y)
+            } else {
+                (x, coordinate as usize)
+            };
+            let index = ny * width + nx;
+            let Some(neighbor_position) = positions[index] else {
+                continue;
+            };
+            if (neighbor_position.z - center_position.z).abs() > self.blur_depth_threshold {
+                continue;
+            }
+            total += values[index] * weight;
+            weight_total += weight;
+        }
+        if weight_total == 0.0 {
+            0.0
+        } else {
+            total / weight_total
+        }
+    }
+}
+
+impl PostPass for SsaoPass {
+    fn color_space(&self) -> PostColorSpace {
+        PostColorSpace::Linear
+    }
+
+    fn apply(&self, input: &PostBuffer, output: &mut PostBuffer) {
+        // A depth-aware invocation comes through `apply_with_framebuffer`.
+        // Keep the direct color-only trait call safe and unsurprising.
+        output.pixels.clone_from(&input.pixels);
+    }
+
+    fn is_noop(&self) -> bool {
+        !self.projection_valid
+    }
+
+    fn apply_with_framebuffer(
+        &self,
+        input: &PostBuffer,
+        output: &mut PostBuffer,
+        framebuffer: &Framebuffer,
+    ) {
+        debug_assert_eq!(input.color_space, PostColorSpace::Linear);
+        debug_assert_eq!(output.color_space, PostColorSpace::Linear);
+        let occlusion = self.occlusion_buffer(framebuffer);
+        for (index, (destination, &source)) in
+            output.pixels.iter_mut().zip(&input.pixels).enumerate()
+        {
+            let factor = 1.0 - self.strength * occlusion.get(index).copied().unwrap_or(0.0);
+            *destination = [
+                source[0],
+                source[1] * factor,
+                source[2] * factor,
+                source[3] * factor,
+            ];
+        }
+    }
+}
+
+pub fn ssao(projection: Mat4) -> SsaoPass {
+    SsaoPass::new(projection)
+}
+
+fn choose_delta(center: Vec3, first: Option<Vec3>, second: Option<Vec3>) -> Vec3 {
+    match (first, second) {
+        (Some(first), Some(second)) => {
+            if (center - first).length() <= (second - center).length() {
+                center - first
+            } else {
+                second - center
+            }
+        }
+        (Some(first), None) => center - first,
+        (None, Some(second)) => second - center,
+        (None, None) => Vec3::ZERO,
+    }
+}
+
+fn sanitize_projection(projection: Mat4) -> (Mat4, Mat4, bool) {
+    if projection.data.iter().all(|value| value.is_finite()) {
+        if let Some(inverse) = projection.inverse() {
+            return (projection, inverse, true);
+        }
+    }
+    (Mat4::IDENTITY, Mat4::IDENTITY, false)
+}
+
+fn sanitize_positive(value: f32, fallback: f32, maximum: f32) -> f32 {
+    if value.is_nan() {
+        fallback
+    } else if value.is_finite() {
+        value.clamp(f32::EPSILON, maximum)
+    } else if value.is_sign_positive() {
+        maximum
+    } else {
+        fallback
+    }
+}
+
+fn sanitize_nonnegative(value: f32, fallback: f32, maximum: f32) -> f32 {
+    if value.is_nan() {
+        fallback
+    } else if value.is_finite() {
+        value.clamp(0.0, maximum)
+    } else if value.is_sign_positive() {
+        maximum
+    } else {
+        fallback
+    }
+}
+
+fn sanitize_unit(value: f32, fallback: f32) -> f32 {
+    if value.is_nan() {
+        fallback
+    } else if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else if value.is_sign_positive() {
+        1.0
+    } else {
+        0.0
     }
 }
 

@@ -87,6 +87,8 @@ impl Framebuffer {
 
     /// Downsamples an integer supersampled framebuffer with a premultiplied,
     /// linear-light box filter. The destination dimensions must divide source.
+    /// Depth uses the minimum sample in each block because the nearest
+    /// surviving surface must remain available to depth-aware postfx passes.
     pub fn downsample_linear_into(&self, destination: &mut Self) {
         if destination.width == 0
             || destination.height == 0
@@ -136,7 +138,19 @@ impl Framebuffer {
                 } else {
                     destination.color[destination_index] = argb8888_linear(average_alpha, rgb);
                 }
-                destination.depth[y * destination.width + x] = 1.0;
+                let mut minimum_depth: f32 = 1.0;
+                for sample_y in 0..scale_y {
+                    for sample_x in 0..scale_x {
+                        let source_index =
+                            (y * scale_y + sample_y) * self.width + x * scale_x + sample_x;
+                        if let Some(&depth) = self.depth.get(source_index)
+                            && depth.is_finite()
+                        {
+                            minimum_depth = minimum_depth.min(depth);
+                        }
+                    }
+                }
+                destination.depth[y * destination.width + x] = minimum_depth;
             }
         }
     }
@@ -309,6 +323,15 @@ mod tests {
         source.downsample_linear_into(&mut destination);
         assert_eq!(destination.color[0], argb8888(255, 188, 188, 188));
         assert_ne!(destination.color[0], argb8888(255, 128, 128, 128));
+    }
+
+    #[test]
+    fn downsample_keeps_nearest_depth_sample() {
+        let mut source = Framebuffer::new(2, 2);
+        source.depth = vec![0.8, 0.4, 0.6, 0.7];
+        let mut destination = Framebuffer::new(1, 1);
+        source.downsample_linear_into(&mut destination);
+        assert_eq!(destination.depth, vec![0.4]);
     }
 
     #[test]
