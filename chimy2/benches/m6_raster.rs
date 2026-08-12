@@ -76,18 +76,18 @@ fn render_500_instances(instanced: bool) {
             Instance::new(Mat4::translate(Vec3::new(x, y, 0.0)))
         })
         .collect::<Vec<_>>();
-    let individual_uniforms = instances
-        .iter()
-        .map(|instance| base.for_instance(instance))
-        .collect::<Vec<_>>();
     let mut framebuffer = Framebuffer::new(320, 180);
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
     pipeline.set_thread_count(1);
     if instanced {
         pipeline.render(&mut framebuffer, |frame, target| {
-            frame.draw_mesh_instanced_prepared(target, &mesh, individual_uniforms);
+            frame.draw_mesh_instanced(target, &mesh, &base, &instances);
         });
     } else {
+        let individual_uniforms = instances
+            .iter()
+            .map(|instance| base.for_instance(instance))
+            .collect::<Vec<_>>();
         pipeline.render(&mut framebuffer, |frame, target| {
             for uniforms in &individual_uniforms {
                 frame.draw_mesh(target, &mesh, uniforms);
@@ -98,19 +98,19 @@ fn render_500_instances(instanced: bool) {
 }
 
 fn render_300_demo_cubes(scene: &InstancingScene, instanced: bool) {
-    let individual_uniforms = scene
-        .instances
-        .iter()
-        .map(|instance| scene.lighting.for_instance(instance))
-        .collect::<Vec<_>>();
     let mut framebuffer = Framebuffer::new(320, 180);
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
     pipeline.set_thread_count(1);
     if instanced {
         pipeline.render(&mut framebuffer, |frame, target| {
-            frame.draw_mesh_instanced_prepared(target, &scene.mesh, individual_uniforms);
+            frame.draw_mesh_instanced(target, &scene.mesh, &scene.lighting, &scene.instances);
         });
     } else {
+        let individual_uniforms = scene
+            .instances
+            .iter()
+            .map(|instance| scene.lighting.for_instance(instance))
+            .collect::<Vec<_>>();
         pipeline.render(&mut framebuffer, |frame, target| {
             for uniforms in &individual_uniforms {
                 frame.draw_mesh(target, &scene.mesh, uniforms);

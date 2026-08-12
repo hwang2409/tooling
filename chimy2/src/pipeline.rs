@@ -424,92 +424,6 @@ pub struct RenderFrame<'a, VS, FS> {
 }
 
 impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
-    /// Draws instances whose per-instance uniforms were prepared by the caller.
-    /// This keeps setup outside the submission benchmark and render loop.
-    pub fn draw_mesh_instanced_prepared<Uniforms>(
-        &mut self,
-        framebuffer: &Framebuffer,
-        mesh: &Mesh,
-        uniforms: Vec<Uniforms>,
-    ) where
-        VS: VertexStage<MeshVertex, Uniforms> + Sync,
-        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
-        Uniforms: Send + Sync + 'a,
-        VS::Varyings: Clone + Send + Sync + 'a,
-    {
-        if mesh.indices().len() == 1
-            && uniforms
-                .iter()
-                .all(|uniforms| self.pipeline.fragment.is_opaque(uniforms))
-        {
-            let mut draws = Vec::with_capacity(uniforms.len());
-            let opaque_keys = [0.0];
-            for instance_uniforms in uniforms {
-                let prepared = prepare_triangles(
-                    &self.pipeline.vertex,
-                    framebuffer,
-                    mesh.vertices(),
-                    mesh.indices(),
-                    Some(&opaque_keys),
-                    &instance_uniforms,
-                );
-                if let Some((_, triangle)) = prepared.into_iter().next() {
-                    draws.push((triangle, instance_uniforms));
-                }
-            }
-            self.queue_opaque_instanced_single_owned(
-                draws,
-                rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
-            );
-            return;
-        }
-        let mut opaque_draws = Vec::with_capacity(uniforms.len());
-        let opaque_keys = vec![0.0; mesh.indices().len()];
-        for instance_uniforms in uniforms {
-            let class = if self.pipeline.fragment.is_opaque(&instance_uniforms) {
-                DrawClass::Opaque
-            } else {
-                DrawClass::Transparent
-            };
-            let transparent_keys = if class == DrawClass::Transparent {
-                let model_view = self
-                    .pipeline
-                    .fragment
-                    .model_view(&instance_uniforms)
-                    .unwrap_or(Mat4::IDENTITY);
-                Some(mesh_centroid_depths(mesh, model_view))
-            } else {
-                None
-            };
-            let keys = transparent_keys.as_deref().unwrap_or(&opaque_keys);
-            let prepared = prepare_triangles(
-                &self.pipeline.vertex,
-                framebuffer,
-                mesh.vertices(),
-                mesh.indices(),
-                Some(keys),
-                &instance_uniforms,
-            );
-            if class == DrawClass::Opaque {
-                opaque_draws.push((
-                    prepared.into_iter().map(|(_, triangle)| triangle).collect(),
-                    instance_uniforms,
-                ));
-            } else {
-                self.queue_prepared_owned(
-                    prepared,
-                    instance_uniforms,
-                    class,
-                    rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
-                );
-            }
-        }
-        self.queue_opaque_instanced_owned(
-            opaque_draws,
-            rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
-        );
-    }
-
     fn new(pipeline: &'a mut Pipeline<VS, FS>) -> Self {
         Self {
             pipeline,
@@ -681,41 +595,6 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
                     DrawClass::Opaque.raster_state(),
                     rasterize,
                 );
-            },
-        );
-        self.commands.push(QueuedCommand {
-            class: DrawClass::Opaque,
-            key: 0.0,
-            submission_order,
-            draw,
-        });
-    }
-
-    fn queue_opaque_instanced_single_owned<V, Uniforms>(
-        &mut self,
-        draws: Vec<(PreparedTriangle<V>, Uniforms)>,
-        rasterize: RasterFn<V, FS, Uniforms>,
-    ) where
-        FS: Sync,
-        Uniforms: Send + Sync + 'a,
-        V: Varyings + Clone + Send + Sync + 'a,
-    {
-        if draws.is_empty() {
-            return;
-        }
-        let submission_order = self.next_submission_order;
-        self.next_submission_order += 1;
-        let draw = Box::new(
-            move |framebuffer: &mut Framebuffer, fragment: &FS, _threads| {
-                for (triangle, uniforms) in &draws {
-                    rasterize(
-                        framebuffer,
-                        triangle.vertices.clone(),
-                        fragment,
-                        uniforms,
-                        DrawClass::Opaque.raster_state(),
-                    );
-                }
             },
         );
         self.commands.push(QueuedCommand {

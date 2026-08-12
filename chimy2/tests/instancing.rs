@@ -4,6 +4,7 @@ use chimy2::fb::Framebuffer;
 use chimy2::math::{Mat4, Quat, Vec3, Vec4};
 use chimy2::mesh::{Mesh, MeshVertex};
 use chimy2::pipeline::{Instance, InstanceUniforms, Pipeline};
+use chimy2::postfx::{PostChain, SsaoPass};
 use chimy2::shaders::{
     BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, MeshShader, MeshUniforms, PointLight,
 };
@@ -80,12 +81,58 @@ fn render_mixed_scene(instanced: bool) -> Framebuffer {
     framebuffer
 }
 
+fn render_ssaa_ssao_scene(instanced: bool) -> Framebuffer {
+    const WIDTH: usize = 64;
+    const HEIGHT: usize = 48;
+    let mesh = triangle();
+    let camera = Camera::new(
+        Vec3::new(0.0, 0.0, 4.0),
+        Quat::IDENTITY,
+        1.0,
+        WIDTH as f32 / HEIGHT as f32,
+        0.1,
+        20.0,
+    );
+    let projection = camera.projection_matrix();
+    let instances = [
+        Instance::new(Mat4::translate(Vec3::new(-0.55, 0.0, -2.0))),
+        Instance::new(Mat4::translate(Vec3::new(0.55, 0.0, -2.7))),
+    ];
+    let base = MeshUniforms::new(Mat4::IDENTITY, camera.view_matrix(), projection, 0xFF5070A0);
+    let individual_uniforms = instances.map(|instance| base.for_instance(&instance));
+    let mut ssao = SsaoPass::new(projection);
+    ssao.set_radius(0.9);
+    ssao.set_range(10.0);
+    let mut framebuffer = Framebuffer::new(WIDTH, HEIGHT);
+    let mut pipeline = Pipeline::new(MeshShader, MeshShader);
+    pipeline.set_ssaa_scale(2);
+    pipeline.set_post_chain(PostChain::new().with_pass(ssao));
+    pipeline.render(&mut framebuffer, |frame, target| {
+        if instanced {
+            frame.draw_mesh_instanced(target, &mesh, &base, &instances);
+        } else {
+            for uniforms in &individual_uniforms {
+                frame.draw_mesh(target, &mesh, uniforms);
+            }
+        }
+    });
+    framebuffer
+}
+
 #[test]
 fn instanced_submission_matches_interleaved_individual_draws() {
     assert_eq!(
         render_mixed_scene(true).color,
         render_mixed_scene(false).color
     );
+}
+
+#[test]
+fn instanced_submission_matches_individual_draws_with_ssaa_and_ssao() {
+    let instanced = render_ssaa_ssao_scene(true);
+    let individual = render_ssaa_ssao_scene(false);
+    assert_eq!(instanced.color, individual.color);
+    assert_eq!(instanced.depth, individual.depth);
 }
 
 #[test]
