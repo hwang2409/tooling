@@ -3,6 +3,7 @@ pub mod clip;
 pub mod csm;
 pub mod culling;
 pub mod fb;
+pub mod font;
 pub mod gltf;
 pub mod ibl;
 pub mod image;

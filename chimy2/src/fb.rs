@@ -85,6 +85,27 @@ impl Framebuffer {
         }
     }
 
+    pub(crate) fn blend_pixel(&mut self, x: usize, y: usize, source: u32) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let Some(index) = y.checked_mul(self.width).and_then(|row| row.checked_add(x)) else {
+            return;
+        };
+        let Some(destination) = self.color.get(index).copied() else {
+            return;
+        };
+        let blended = blend_argb8888_linear(destination, source);
+        if self.linear.is_some() {
+            write_linear_pixel(self, index, linear_rgba_from_argb8888(source), true);
+            if let Some(&linear) = self.linear.as_ref().and_then(|pixels| pixels.get(index)) {
+                self.color[index] = argb8888_linear(linear[0], [linear[1], linear[2], linear[3]]);
+            }
+        } else {
+            self.color[index] = blended;
+        }
+    }
+
     /// Downsamples an integer supersampled framebuffer with a premultiplied,
     /// linear-light box filter. The destination dimensions must divide source.
     /// Depth uses the minimum sample in each block because the nearest

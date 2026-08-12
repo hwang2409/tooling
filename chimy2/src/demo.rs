@@ -213,10 +213,36 @@ pub fn run_demo<F>(
     default_width: u32,
     default_height: u32,
     args: DemoArgs,
-    mut draw: F,
+    draw: F,
 ) -> Result<(), Box<dyn Error>>
 where
     F: FnMut(&mut Framebuffer, f32, &InputState),
+{
+    run_demo_with_overlay(
+        title,
+        default_width,
+        default_height,
+        args,
+        draw,
+        |_, _, _| {},
+    )
+}
+
+/// Runs a demo and invokes the overlay callback after post-processing.
+///
+/// The overlay is screen-space presentation work. It must run after the
+/// [`PostChain`] so UI text is not bloomed or tonemapped with the scene.
+pub fn run_demo_with_overlay<F, O>(
+    title: &str,
+    default_width: u32,
+    default_height: u32,
+    args: DemoArgs,
+    mut draw: F,
+    mut overlay: O,
+) -> Result<(), Box<dyn Error>>
+where
+    F: FnMut(&mut Framebuffer, f32, &InputState),
+    O: FnMut(&mut Framebuffer, f32, &InputState),
 {
     let (width, height) = args.size.unwrap_or((default_width, default_height));
     let post_chain = args.post_chain();
@@ -228,6 +254,7 @@ where
             let elapsed = frame as f32 / SCREENSHOT_FPS;
             draw(&mut framebuffer, elapsed, &input);
             post_chain.apply(&mut framebuffer);
+            overlay(&mut framebuffer, elapsed, &input);
         }
         write_ppm(path, &framebuffer)?;
         Ok(())
@@ -240,6 +267,7 @@ where
             move |framebuffer, elapsed, input| {
                 draw(framebuffer, elapsed, input);
                 post_chain.apply(framebuffer);
+                overlay(framebuffer, elapsed, input);
             },
         )
     }

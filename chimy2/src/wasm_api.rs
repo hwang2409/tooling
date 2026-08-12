@@ -132,6 +132,20 @@ impl Showcase {
             7 => self.render_gltf(time_seconds, camera, view, projection)?,
             _ => {}
         }
+        self.framebuffer.draw_text(
+            12,
+            12,
+            "CHIMY2 WASM / DRAG TO ORBIT",
+            1,
+            argb8888(255, 240, 244, 255),
+        );
+        self.framebuffer.draw_text(
+            12,
+            22,
+            "BITMAP FONT OVERLAY",
+            1,
+            argb8888(255, 255, 196, 96),
+        );
         self.copy_rgba();
         Ok(())
     }
