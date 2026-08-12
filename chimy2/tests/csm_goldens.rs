@@ -3,7 +3,7 @@ use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3};
 use chimy2::pipeline::Pipeline;
 use chimy2::shaders::{BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, PointLight};
-use chimy2::shadow::render_cascade_shadow_maps;
+use chimy2::shadow::{CascadeShadowConfig, render_cascade_shadow_maps_with_config};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -47,9 +47,14 @@ fn render_csm_scene() -> Framebuffer {
             .iter()
             .map(|&model| (&scene.object, model)),
     );
-    let cascades =
-        render_cascade_shadow_maps(scene.camera, scene.light_direction, 3, 96, &shadow_meshes)
-            .unwrap();
+    let cascades = render_cascade_shadow_maps_with_config(
+        scene.camera,
+        scene.light_direction,
+        CascadeShadowConfig::default(),
+        96,
+        &shadow_meshes,
+    )
+    .unwrap();
     let directional = DirectionalLight::new(scene.light_direction, Vec3::new(1.0, 0.93, 0.82));
     let point = PointLight::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0.0, 0.0);
     let mut ground_uniforms = BlinnPhongUniforms::new(

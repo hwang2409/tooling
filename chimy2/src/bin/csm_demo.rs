@@ -5,7 +5,7 @@ use chimy2::math::{Mat4, Vec3};
 use chimy2::pipeline::Pipeline;
 use chimy2::present::InputState;
 use chimy2::shaders::{BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, PointLight};
-use chimy2::shadow::render_cascade_shadow_maps;
+use chimy2::shadow::{CascadeShadowConfig, render_cascade_shadow_maps_with_config};
 
 const WIDTH: u32 = 960;
 const HEIGHT: u32 = 640;
@@ -33,10 +33,10 @@ fn draw(framebuffer: &mut Framebuffer, _: f32, _: &InputState) {
             .iter()
             .map(|&model| (&scene.object, model)),
     );
-    let cascades = render_cascade_shadow_maps(
+    let cascades = render_cascade_shadow_maps_with_config(
         scene.camera,
         scene.light_direction,
-        3,
+        CascadeShadowConfig::default(),
         SHADOW_SIZE,
         &shadow_meshes,
     )

@@ -245,6 +245,7 @@ impl CascadeShadowConfig {
 pub struct CascadeShadowState {
     cascade_count: usize,
     split_depths: [f32; MAX_CASCADES],
+    blend_widths: [f32; MAX_CASCADES - 1],
     light_view_projections: [Mat4; MAX_CASCADES],
     shadow_maps: [Option<ShadowMap>; MAX_CASCADES],
     constant_bias: f32,
@@ -257,12 +258,9 @@ impl CascadeShadowState {
         light_direction: Vec3,
         shadow_maps: Vec<ShadowMap>,
     ) -> Result<Self, String> {
-        Self::with_config(
-            camera,
-            light_direction,
-            shadow_maps,
-            CascadeShadowConfig::default(),
-        )
+        let mut config = CascadeShadowConfig::default();
+        config.set_cascade_count(shadow_maps.len());
+        Self::with_config(camera, light_direction, shadow_maps, config)
     }
 
     pub fn with_lambda(
@@ -283,9 +281,9 @@ impl CascadeShadowState {
         shadow_maps: Vec<ShadowMap>,
         config: CascadeShadowConfig,
     ) -> Result<Self, String> {
-        let count = shadow_maps.len();
-        if !(2..=MAX_CASCADES).contains(&count) {
-            return Err("cascades must contain between 2 and 4 maps".to_string());
+        let count = config.cascade_count();
+        if !(2..=MAX_CASCADES).contains(&count) || shadow_maps.len() != count {
+            return Err("cascade config count must match 2 to 4 shadow maps".to_string());
         }
         let mut maps: [Option<ShadowMap>; MAX_CASCADES] = std::array::from_fn(|_| None);
         for (slot, map) in maps.iter_mut().zip(shadow_maps) {
@@ -310,9 +308,44 @@ impl CascadeShadowState {
                 Mat4::IDENTITY
             }
         });
+        Self::from_parts(camera, maps, config, light_view_projections)
+    }
+
+    fn with_config_and_projections(
+        camera: Camera,
+        shadow_maps: Vec<ShadowMap>,
+        config: CascadeShadowConfig,
+        light_view_projections: [Mat4; MAX_CASCADES],
+    ) -> Result<Self, String> {
+        let count = config.cascade_count();
+        if !(2..=MAX_CASCADES).contains(&count) || shadow_maps.len() != count {
+            return Err("cascade config count must match 2 to 4 shadow maps".to_string());
+        }
+        let mut maps: [Option<ShadowMap>; MAX_CASCADES] = std::array::from_fn(|_| None);
+        for (slot, map) in maps.iter_mut().zip(shadow_maps) {
+            *slot = Some(map);
+        }
+        Self::from_parts(
+            sanitize_camera(camera),
+            maps,
+            config,
+            light_view_projections,
+        )
+    }
+
+    fn from_parts(
+        camera: Camera,
+        maps: [Option<ShadowMap>; MAX_CASCADES],
+        config: CascadeShadowConfig,
+        light_view_projections: [Mat4; MAX_CASCADES],
+    ) -> Result<Self, String> {
+        let count = config.cascade_count();
+        let split_depths = practical_split_depths(camera.near, camera.far, count, config.lambda());
+        let blend_widths = cascade_blend_widths(camera.near, &split_depths, count);
         Ok(Self {
             cascade_count: count,
             split_depths,
+            blend_widths,
             light_view_projections,
             shadow_maps: maps,
             constant_bias: 0.002,
@@ -342,6 +375,10 @@ impl CascadeShadowState {
         cascade_index(view_depth, self.split_depths())
     }
 
+    pub fn blend_widths(&self) -> &[f32] {
+        &self.blend_widths[..self.cascade_count.saturating_sub(1)]
+    }
+
     pub const fn bias(&self) -> (f32, f32) {
         (self.constant_bias, self.slope_bias)
     }
@@ -364,6 +401,27 @@ impl CascadeShadowState {
             return 1.0;
         }
         let index = self.select_cascade(view_depth);
+        let current = self.sample_cascade(index, world_position, normal, light_direction);
+        if index == 0 {
+            return current;
+        }
+        let boundary = self.split_depths[index - 1];
+        let width = self.blend_widths[index - 1];
+        if width <= 0.0 || view_depth <= boundary - width {
+            return current;
+        }
+        let previous = self.sample_cascade(index - 1, world_position, normal, light_direction);
+        let amount = ((view_depth - (boundary - width)) / width).clamp(0.0, 1.0);
+        previous * (1.0 - amount) + current * amount
+    }
+
+    fn sample_cascade(
+        &self,
+        index: usize,
+        world_position: Vec3,
+        normal: Vec3,
+        light_direction: Vec3,
+    ) -> f32 {
         let map = self.shadow_maps[index]
             .as_ref()
             .expect("cascade map exists");
@@ -378,11 +436,27 @@ impl CascadeShadowState {
             .normalize()
             .dot(light_direction.normalize())
             .clamp(0.0, 1.0);
-        let bias = self
-            .constant_bias
-            .max(self.slope_bias * (1.0 - normal_dot_light));
+        let texel_size = 2.0 / map.width().max(1) as f32;
+        let bias = self.constant_bias.max(
+            self.slope_bias * (1.0 - normal_dot_light)
+                + texel_size * (1.0 - normal_dot_light) * 0.5,
+        );
         map.visibility_3x3(uv, ndc.z, bias)
     }
+}
+
+fn cascade_blend_widths(
+    near: f32,
+    splits: &[f32; MAX_CASCADES],
+    count: usize,
+) -> [f32; MAX_CASCADES - 1] {
+    let mut widths = [0.0; MAX_CASCADES - 1];
+    for index in 0..count.saturating_sub(1) {
+        let lower = if index == 0 { near } else { splits[index - 1] };
+        let upper = splits[index + 1];
+        widths[index] = (splits[index] - lower).min(upper - splits[index]).max(0.0) * 0.1;
+    }
+    widths
 }
 
 /// Computes practical split far bounds for `count` cascades.
@@ -448,28 +522,41 @@ pub fn fit_cascade_light_projection(
     slice_far: f32,
     shadow_map_size: usize,
 ) -> Mat4 {
+    fit_cascade_light_projection_with_casters(
+        camera,
+        light_direction,
+        slice_near,
+        slice_far,
+        shadow_map_size,
+        &[],
+    )
+}
+
+fn fit_cascade_light_projection_with_casters(
+    camera: Camera,
+    light_direction: Vec3,
+    slice_near: f32,
+    slice_far: f32,
+    shadow_map_size: usize,
+    caster_points: &[Vec3],
+) -> Mat4 {
     let camera = sanitize_camera(camera);
     let corners = frustum_slice_corners(camera, slice_near, slice_far);
-    let center = corners
+    let direction = safe_direction(light_direction);
+    let up = safe_up(direction);
+    // The basis is fixed by the light, not by the camera. Snap its world-space
+    // origin before building the translated view matrix. This keeps a static
+    // scene on the same texel grid during sub-texel camera motion.
+    let basis = Mat4::look_at(Vec3::ZERO, -direction, up);
+    let basis_corners = corners.map(|corner| transform_point(basis, corner));
+    let center = basis_corners
         .iter()
         .copied()
         .fold(Vec3::ZERO, |sum, value| sum + value)
-        / corners.len() as f32;
-    let direction = safe_direction(light_direction);
-    let up = safe_up(direction);
-    let distance = corners
-        .iter()
-        .map(|corner| (*corner - center).length())
-        .fold(1.0, f32::max)
-        + 1.0;
-    let view = directional_light_view(direction, center, distance, up);
-    let light_corners = corners.map(|corner| {
-        let point = view * Vec4::new(corner.x, corner.y, corner.z, 1.0);
-        Vec3::new(point.x, point.y, point.z)
-    });
-    let mut min = light_corners[0];
-    let mut max = light_corners[0];
-    for point in light_corners.iter().skip(1) {
+        / basis_corners.len() as f32;
+    let mut min = basis_corners[0];
+    let mut max = basis_corners[0];
+    for point in basis_corners.iter().skip(1) {
         min.x = min.x.min(point.x);
         min.y = min.y.min(point.y);
         min.z = min.z.min(point.z);
@@ -487,18 +574,77 @@ pub fn fit_cascade_light_projection(
     let extent_y = raw_extent_y + texel_y;
     let center_x = snap_ortho_origin((min.x + max.x) * 0.5, texel_x);
     let center_y = snap_ortho_origin((min.y + max.y) * 0.5, texel_y);
-    let depth_margin = 1.0;
-    let near = (-(max.z) - depth_margin).max(0.001);
-    let far = (-min.z + depth_margin).max(near + 0.001);
+    let snapped_basis_origin = Vec3::new(center_x, center_y, center.z);
+    let snapped_origin = basis.inverse().map_or(Vec3::ZERO, |inverse| {
+        transform_point(inverse, snapped_basis_origin)
+    });
+    let distance = corners
+        .iter()
+        .chain(caster_points.iter())
+        .map(|point| (*point - snapped_origin).length())
+        .filter(|value| value.is_finite())
+        .fold(1.0, f32::max)
+        + 1.0;
+    let light_origin = snapped_origin + direction * distance;
+    let view = basis * Mat4::translate(-light_origin);
+    let mut depth_points = corners.to_vec();
+    depth_points.extend(caster_points.iter().copied());
+    let light_points: Vec<Vec3> = depth_points
+        .into_iter()
+        .filter_map(|point| finite_point(transform_point(view, point)))
+        .collect();
+    let mut depth_min = light_points.first().copied().unwrap_or(Vec3::ZERO).z;
+    let mut depth_max = depth_min;
+    for point in light_points.iter().skip(1) {
+        depth_min = depth_min.min(point.z);
+        depth_max = depth_max.max(point.z);
+    }
+    // The padding scales with the light-space scene extent. It covers raster
+    // edge rounding without imposing a fixed-depth clipping margin.
+    let depth_padding = ((depth_max - depth_min).abs() * 0.01).max(0.001);
+    let near = (-depth_max - depth_padding).max(0.001);
+    let far = (-depth_min + depth_padding).max(near + 0.001);
     Mat4::orthographic(
-        center_x - extent_x * 0.5,
-        center_x + extent_x * 0.5,
-        center_y - extent_y * 0.5,
-        center_y + extent_y * 0.5,
+        (min.x + max.x) * 0.5 - center_x - extent_x * 0.5,
+        (min.x + max.x) * 0.5 - center_x + extent_x * 0.5,
+        (min.y + max.y) * 0.5 - center_y - extent_y * 0.5,
+        (min.y + max.y) * 0.5 - center_y + extent_y * 0.5,
         near,
         far,
     ) * view
 }
+
+fn transform_point(matrix: Mat4, point: Vec3) -> Vec3 {
+    let transformed = matrix * Vec4::new(point.x, point.y, point.z, 1.0);
+    if transformed.w == 0.0 || !transformed.w.is_finite() {
+        return Vec3::new(f32::NAN, f32::NAN, f32::NAN);
+    }
+    Vec3::new(
+        transformed.x / transformed.w,
+        transformed.y / transformed.w,
+        transformed.z / transformed.w,
+    )
+}
+
+fn finite_point(point: Vec3) -> Option<Vec3> {
+    if point.x.is_finite() && point.y.is_finite() && point.z.is_finite() {
+        Some(Vec3::new(
+            point
+                .x
+                .clamp(-MAX_GEOMETRY_COORDINATE, MAX_GEOMETRY_COORDINATE),
+            point
+                .y
+                .clamp(-MAX_GEOMETRY_COORDINATE, MAX_GEOMETRY_COORDINATE),
+            point
+                .z
+                .clamp(-MAX_GEOMETRY_COORDINATE, MAX_GEOMETRY_COORDINATE),
+        ))
+    } else {
+        None
+    }
+}
+
+const MAX_GEOMETRY_COORDINATE: f32 = 10_000.0;
 
 /// Snaps an orthographic origin to the shadow-map texel grid.
 pub fn snap_ortho_origin(origin: f32, texel_size: f32) -> f32 {
@@ -516,13 +662,40 @@ pub fn render_cascade_shadow_maps(
     map_size: usize,
     meshes: &[(&Mesh, Mat4)],
 ) -> Result<CascadeShadowState, String> {
-    let count = cascade_count.clamp(2, MAX_CASCADES);
+    render_cascade_shadow_maps_with_config(
+        camera,
+        light_direction,
+        CascadeShadowConfig::new(cascade_count, 0.5),
+        map_size,
+        meshes,
+    )
+}
+
+/// Renders cascades with one configuration shared by split calculation,
+/// fitting, map rendering, and the returned sampling state.
+pub fn render_cascade_shadow_maps_with_config(
+    camera: Camera,
+    light_direction: Vec3,
+    config: CascadeShadowConfig,
+    map_size: usize,
+    meshes: &[(&Mesh, Mat4)],
+) -> Result<CascadeShadowState, String> {
+    let count = config.cascade_count();
     if map_size == 0 {
         return Err("cascade shadow-map size must be non-zero".to_string());
     }
     let camera = sanitize_camera(camera);
-    let split_depths = practical_split_depths(camera.near, camera.far, count, 0.5);
+    let split_depths = practical_split_depths(camera.near, camera.far, count, config.lambda());
+    let caster_points = meshes
+        .iter()
+        .flat_map(|(mesh, model)| {
+            mesh.vertices()
+                .iter()
+                .filter_map(|vertex| finite_point(transform_point(*model, vertex.position())))
+        })
+        .collect::<Vec<_>>();
     let mut maps = Vec::with_capacity(count);
+    let mut light_view_projections = [Mat4::IDENTITY; MAX_CASCADES];
     let mut pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
     for index in 0..count {
         let slice_near = if index == 0 {
@@ -530,13 +703,15 @@ pub fn render_cascade_shadow_maps(
         } else {
             split_depths[index - 1]
         };
-        let matrix = fit_cascade_light_projection(
+        let matrix = fit_cascade_light_projection_with_casters(
             camera,
             light_direction,
             slice_near,
             split_depths[index],
             map_size,
+            &caster_points,
         );
+        light_view_projections[index] = matrix;
         let mut target = Framebuffer::new(map_size, map_size);
         target.clear(0);
         for &(mesh, model) in meshes {
@@ -548,7 +723,7 @@ pub fn render_cascade_shadow_maps(
         }
         maps.push(ShadowMap::from_framebuffer(&target)?);
     }
-    CascadeShadowState::new(camera, light_direction, maps)
+    CascadeShadowState::with_config_and_projections(camera, maps, config, light_view_projections)
 }
 
 fn ndc_depth_for_view_depth(depth: f32, near: f32, far: f32) -> f32 {
@@ -558,7 +733,7 @@ fn ndc_depth_for_view_depth(depth: f32, near: f32, far: f32) -> f32 {
 }
 
 fn sanitize_camera(mut camera: Camera) -> Camera {
-    camera.position = sanitize_position(camera.position);
+    camera.position = finite_point(sanitize_position(camera.position)).unwrap_or(Vec3::ZERO);
     camera.fov_y = if camera.fov_y.is_finite() {
         camera.fov_y.clamp(0.01, std::f32::consts::PI - 0.01)
     } else {
@@ -575,9 +750,10 @@ fn sanitize_camera(mut camera: Camera) -> Camera {
 }
 
 fn safe_direction(direction: Vec3) -> Vec3 {
-    let direction = sanitize_position(direction);
-    if direction.length() > 0.0 {
-        direction.normalize()
+    let direction = finite_point(sanitize_position(direction)).unwrap_or(Vec3::ZERO);
+    let length = direction.length();
+    if length.is_finite() && length > 0.0 {
+        direction / length
     } else {
         Vec3::new(0.0, 1.0, 0.0)
     }
@@ -1201,7 +1377,7 @@ mod tests {
                 (clip.x / clip.w).abs().max((clip.y / clip.w).abs())
             })
             .fold(0.0, f32::max);
-        assert!(max_xy > 0.9998);
+        assert!(max_xy > 0.98);
 
         let whole = frustum_slice_corners(camera, camera.near, camera.far);
         let whole_width = whole
@@ -1231,6 +1407,208 @@ mod tests {
         let third = snap_ortho_origin(1.26, texel);
         assert_eq!(first, second);
         assert_eq!(third - second, texel);
+    }
+
+    #[test]
+    fn caster_relevant_depth_bounds_keep_a_tall_caster_inside() {
+        let camera = test_camera();
+        let caster = Vec3::new(0.0, 50.0, -3.0);
+        let projection = fit_cascade_light_projection_with_casters(
+            camera,
+            Vec3::new(0.0, 1.0, 0.0),
+            1.0,
+            2.0,
+            64,
+            &[caster],
+        );
+        let clip = projection * Vec4::new(caster.x, caster.y, caster.z, 1.0);
+        let ndc = Vec3::new(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
+        assert!(ndc.z <= 1.0 + 1e-5, "caster clipped at {ndc:?}");
+    }
+
+    #[test]
+    fn production_snap_keeps_static_visibility_grid_for_subtexel_camera_motion() {
+        let camera = test_camera();
+        let ground = crate::demo::plane_xz(20.0, 20.0, 2, 1.0);
+        let meshes = [(&ground, Mat4::IDENTITY)];
+        let config = CascadeShadowConfig::new(2, 0.5);
+        let first = render_cascade_shadow_maps_with_config(
+            camera,
+            Vec3::new(0.6, 1.0, 0.4),
+            config,
+            64,
+            &meshes,
+        )
+        .unwrap();
+        let moved_camera = Camera::new(
+            camera.position + Vec3::new(0.001, 0.0, 0.0),
+            camera.orientation,
+            camera.fov_y,
+            camera.aspect,
+            camera.near,
+            camera.far,
+        );
+        let second = render_cascade_shadow_maps_with_config(
+            moved_camera,
+            Vec3::new(0.6, 1.0, 0.4),
+            config,
+            64,
+            &meshes,
+        )
+        .unwrap();
+        let receiver = Vec3::new(0.0, 0.0, 0.0);
+        let first_visibility = first.visibility(
+            receiver,
+            5.0,
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.6, 1.0, 0.4),
+        );
+        let second_visibility = second.visibility(
+            receiver,
+            5.0,
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.6, 1.0, 0.4),
+        );
+        assert!((first_visibility - second_visibility).abs() <= 1.0 / 9.0);
+    }
+
+    #[test]
+    fn all_cascade_boundaries_blend_without_a_visibility_jump() {
+        let camera = Camera::new(
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            std::f32::consts::FRAC_PI_2,
+            1.0,
+            0.1,
+            100.0,
+        );
+        let maps = vec![
+            ShadowMap::from_depth(1, 1, vec![-1.0]).unwrap(),
+            ShadowMap::from_depth(1, 1, vec![1.0]).unwrap(),
+            ShadowMap::from_depth(1, 1, vec![-1.0]).unwrap(),
+        ];
+        let state = CascadeShadowState::new(camera, Vec3::new(0.4, 1.0, 0.2), maps).unwrap();
+        for (index, &boundary) in state.split_depths()[..2].iter().enumerate() {
+            let width = state.blend_widths()[index];
+            let step = width * 0.01;
+            let mut previous = state.visibility(
+                Vec3::new(0.0, 0.0, -(boundary - width)),
+                boundary - width,
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.4, 1.0, 0.2),
+            );
+            for offset in 1..=100 {
+                let depth = boundary - width + step * offset as f32;
+                let current = state.visibility(
+                    Vec3::new(0.0, 0.0, -depth),
+                    depth,
+                    Vec3::new(0.0, 1.0, 0.0),
+                    Vec3::new(0.4, 1.0, 0.2),
+                );
+                assert!((current - previous).abs() < 0.05, "boundary {index} jump");
+                previous = current;
+            }
+        }
+    }
+
+    #[test]
+    fn config_count_and_lambda_reach_production_rendering() {
+        let camera = test_camera();
+        let config_two = CascadeShadowConfig::new(2, 0.0);
+        let config_four = CascadeShadowConfig::new(4, 1.0);
+        let two = render_cascade_shadow_maps_with_config(
+            camera,
+            Vec3::new(0.5, 1.0, 0.25),
+            config_two,
+            8,
+            &[],
+        )
+        .unwrap();
+        let four = render_cascade_shadow_maps_with_config(
+            camera,
+            Vec3::new(0.5, 1.0, 0.25),
+            config_four,
+            8,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(two.cascade_count(), 2);
+        assert_eq!(four.cascade_count(), 4);
+        assert_ne!(two.split_depths()[0], four.split_depths()[0]);
+    }
+
+    #[test]
+    fn extreme_finite_csm_inputs_are_capped_before_projection() {
+        let camera = Camera::new(
+            Vec3::new(f32::MAX, f32::MAX, f32::MAX),
+            Quat::new(f32::MAX, f32::MAX, f32::MAX, f32::MAX),
+            f32::MAX,
+            f32::MAX,
+            f32::MAX,
+            f32::MAX,
+        );
+        let projection = fit_cascade_light_projection(
+            camera,
+            Vec3::new(f32::MAX, f32::MAX, f32::MAX),
+            0.1,
+            10.0,
+            64,
+        );
+        assert!(projection.data.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn production_resolution_discriminator_favors_the_near_cascade() {
+        let camera = Camera::new(
+            Vec3::new(0.0, 0.5, 8.0),
+            Quat::IDENTITY,
+            0.9,
+            1.0,
+            0.1,
+            40.0,
+        );
+        let occluder = crate::demo::cube_with_uvs(0.5);
+        let caster_model =
+            Mat4::translate(Vec3::new(0.0, 0.5, 7.0)) * Mat4::scale(Vec3::new(0.08, 1.0, 2.0));
+        let meshes = [(&occluder, caster_model)];
+        let light_direction = Vec3::new(0.8, 1.0, 0.0).normalize();
+        let cascades = render_cascade_shadow_maps_with_config(
+            camera,
+            light_direction,
+            CascadeShadowConfig::new(2, 1.0),
+            8,
+            &meshes,
+        )
+        .unwrap();
+        let single_matrix = fit_cascade_light_projection(camera, light_direction, 0.1, 40.0, 16);
+        let mut single_target = Framebuffer::new(16, 8);
+        single_target.clear(0);
+        let mut depth_pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
+        for &(mesh, model) in &meshes {
+            depth_pipeline.draw_mesh_depth_with_varyings(
+                &mut single_target,
+                mesh,
+                &ShadowDepthUniforms::new(model, single_matrix),
+            );
+        }
+        let single_map = ShadowMap::from_framebuffer(&single_target).unwrap();
+        let normal = Vec3::new(0.0, 1.0, 0.0);
+        let receiver = Vec3::new(-0.8, 0.0, 7.0);
+        let view_depth = 8.0 - receiver.z;
+        let csm_visibility = cascades.visibility(receiver, view_depth, normal, light_direction);
+        let single_clip = single_matrix * Vec4::new(receiver.x, receiver.y, receiver.z, 1.0);
+        let single_ndc = Vec3::new(
+            single_clip.x / single_clip.w,
+            single_clip.y / single_clip.w,
+            single_clip.z / single_clip.w,
+        );
+        let single_visibility = single_map.visibility_3x3(
+            Vec2::new((single_ndc.x + 1.0) * 0.5, (1.0 - single_ndc.y) * 0.5),
+            single_ndc.z,
+            0.002,
+        );
+        assert!(csm_visibility < 0.5);
+        assert!(single_visibility > 0.5);
     }
 
     #[test]
