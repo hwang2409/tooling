@@ -22,4 +22,7 @@ pub mod wasm_api;
 pub mod demo;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod point_shadow_scene;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod present;

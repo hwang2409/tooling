@@ -79,8 +79,9 @@ see it and can't get it wrong.
   framebuffer encoding. Blinn-Phong uniforms hold fixed arrays of up to eight
   directional and eight point lights. Ambient light is added once, then all
   lights accumulate before the final clamp. Material and light colors, plus
-  attenuation intensities, clamp to zero at the uniform boundary. The one
-  shadow map binds to directional light zero; other lights do not cast shadows.
+  attenuation intensities, clamp to zero at the uniform boundary. Directional
+  lights and opt-in point lights support shadow maps; point lights use six
+  perspective faces with normalized linear distance.
 - **fb / present**: framebuffer with depth, softbuffer blit, keyboard input.
 
 Ground rule for the raster core: no clock, no randomness. Same scene in,
@@ -136,6 +137,11 @@ light orbits the quad. Load normal maps with `ColorSpace::Linear`.
 <p align="center">
   <img src="img/stress_100k.png" alt="stress 100k demo" />
 </p>
+
+### `point_shadow_demo`
+
+A warm point light illuminates a room with walls and three occluders. Six
+cube-shadow faces make shadows visible in every direction around the light.
 
 ### `blend_demo`
 
