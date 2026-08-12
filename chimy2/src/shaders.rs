@@ -12,7 +12,7 @@ use crate::mesh::MeshVertex;
 use crate::pipeline::{
     FragmentStage, SampledFragmentStage, SamplingVaryings, Varyings, VertexOutput, VertexStage,
 };
-use crate::shadow::{ShadowMap, ShadowState};
+use crate::shadow::{CubeShadowState, ShadowMap, ShadowState};
 use crate::skybox::CubeTexture;
 
 mod ggx;
@@ -336,13 +336,13 @@ impl PointLight {
         linear_attenuation: f32,
         quadratic_attenuation: f32,
     ) -> Self {
-        Self {
+        sanitize_point_light(Self {
             position,
             color: linearize_color(nonnegative_color(color)),
-            constant_attenuation: constant_attenuation.max(0.0),
-            linear_attenuation: linear_attenuation.max(0.0),
-            quadratic_attenuation: quadratic_attenuation.max(0.0),
-        }
+            constant_attenuation,
+            linear_attenuation,
+            quadratic_attenuation,
+        })
     }
 }
 
@@ -356,18 +356,35 @@ fn sanitize_directional_light(mut light: DirectionalLight) -> DirectionalLight {
 }
 
 fn sanitize_point_light(mut light: PointLight) -> PointLight {
+    light.position = Vec3::new(
+        finite_or_zero(light.position.x),
+        finite_or_zero(light.position.y),
+        finite_or_zero(light.position.z),
+    );
     light.color = nonnegative_color(light.color);
-    light.constant_attenuation = light.constant_attenuation.max(0.0);
-    light.linear_attenuation = light.linear_attenuation.max(0.0);
-    light.quadratic_attenuation = light.quadratic_attenuation.max(0.0);
+    light.constant_attenuation = finite_nonnegative(light.constant_attenuation);
+    light.linear_attenuation = finite_nonnegative(light.linear_attenuation);
+    light.quadratic_attenuation = finite_nonnegative(light.quadratic_attenuation);
     light
+}
+
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+fn finite_nonnegative(value: f32) -> f32 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
 }
 
 /// Blinn-Phong uniforms with cache-safe matrix updates and fixed light arrays.
 ///
 /// The arrays keep uniform clones cheap and preserve deterministic submission
-/// order. Directional light zero owns the single optional shadow map. Other
-/// lights are always unshadowed.
+/// order. Directional light zero owns the optional directional shadow map.
+/// Point lights can each own one optional cube-shadow state.
 /// Material colors are private and use the same clamp-at-zero boundary policy.
 ///
 /// The source matrices are private. Use the accessors and setters instead:
@@ -405,6 +422,7 @@ pub struct BlinnPhongUniforms {
     directional_light_count: usize,
     point_lights: [PointLight; MAX_POINT_LIGHTS],
     point_light_count: usize,
+    point_shadow_states: [Option<CubeShadowState>; MAX_POINT_LIGHTS],
     shadow_state: Option<ShadowState>,
     transform: Mat4,
     normal_matrix: Mat3,
@@ -450,6 +468,7 @@ impl BlinnPhongUniforms {
                 }
             }),
             point_light_count: 1,
+            point_shadow_states: std::array::from_fn(|_| None),
             shadow_state: None,
             transform: projection * view * model,
             normal_matrix: model.normal_matrix().unwrap_or_default(),
@@ -587,6 +606,7 @@ impl BlinnPhongUniforms {
         }
         let index = self.point_light_count;
         self.point_lights[index] = sanitize_point_light(light);
+        self.point_shadow_states[index] = None;
         self.point_light_count += 1;
         Ok(index)
     }
@@ -616,6 +636,7 @@ impl BlinnPhongUniforms {
             return Err("point light index out of bounds");
         }
         self.point_lights[index] = sanitize_point_light(light);
+        self.point_shadow_states[index] = None;
         Ok(())
     }
 
@@ -643,6 +664,7 @@ impl BlinnPhongUniforms {
         self.point_lights[index..self.point_light_count].rotate_left(1);
         self.point_light_count -= 1;
         self.point_lights[self.point_light_count] = PointLight::default();
+        self.point_shadow_states[self.point_light_count] = None;
         Some(removed)
     }
 
@@ -654,7 +676,24 @@ impl BlinnPhongUniforms {
 
     pub fn clear_point_lights(&mut self) {
         self.point_lights[..self.point_light_count].fill(PointLight::default());
+        self.point_shadow_states[..self.point_light_count].fill(None);
         self.point_light_count = 0;
+    }
+
+    pub fn point_light_shadow(&self, index: usize) -> Option<&CubeShadowState> {
+        self.point_shadow_states.get(index).and_then(Option::as_ref)
+    }
+
+    pub fn set_point_light_shadow(
+        &mut self,
+        index: usize,
+        shadow_state: Option<CubeShadowState>,
+    ) -> Result<(), &'static str> {
+        if index >= self.point_light_count {
+            return Err("point light index out of bounds");
+        }
+        self.point_shadow_states[index] = shadow_state;
+        Ok(())
     }
 
     pub const fn light_view_projection(&self) -> Mat4 {
@@ -963,7 +1002,7 @@ fn evaluate_lighting(
             );
     }
 
-    for light in uniforms.point_lights() {
+    for (index, light) in uniforms.point_lights().iter().enumerate() {
         let to_point = light.position - world_position;
         let distance = to_point.length();
         let point_direction = to_point.normalize();
@@ -975,19 +1014,33 @@ fn evaluate_lighting(
         } else {
             0.0
         };
+        let visibility = point_light_shadow_visibility(
+            world_position,
+            normal,
+            uniforms.point_light_shadow(index),
+        );
         lighted = lighted
             + evaluate_light(
                 normal,
                 view_direction,
                 point_direction,
                 light.color,
-                attenuation,
+                attenuation * visibility,
                 uniforms,
                 albedo,
             );
     }
 
     lighted
+}
+
+/// Evaluates optional point-light shadowing for both direct shader families.
+fn point_light_shadow_visibility(
+    world_position: Vec3,
+    normal: Vec3,
+    shadow_state: Option<&CubeShadowState>,
+) -> f32 {
+    shadow_state.map_or(1.0, |state| state.visibility(world_position, normal))
 }
 
 impl BlinnPhongUniforms {
@@ -1755,6 +1808,39 @@ mod tests {
         assert_eq!(uniforms.point_lights()[0].constant_attenuation, 0.0);
         assert_eq!(uniforms.point_lights()[0].linear_attenuation, 0.0);
         assert_eq!(uniforms.point_lights()[0].quadratic_attenuation, 0.0);
+    }
+
+    #[test]
+    fn point_light_uniform_boundary_sanitizes_nonfinite_position_and_attenuation() {
+        let point = PointLight::new(
+            Vec3::new(f32::NAN, f32::INFINITY, f32::NEG_INFINITY),
+            Vec3::ZERO,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        );
+        assert_eq!(point.position, Vec3::ZERO);
+        assert_eq!(point.constant_attenuation, 0.0);
+        assert_eq!(point.linear_attenuation, 0.0);
+        assert_eq!(point.quadratic_attenuation, 0.0);
+
+        let map = crate::shadow::CubeShadowMap::from_depth(
+            1,
+            0.1,
+            10.0,
+            std::array::from_fn(|_| vec![1.0]),
+        )
+        .unwrap();
+        let mut uniforms = uniforms();
+        uniforms
+            .set_point_light_shadow(
+                0,
+                Some(crate::shadow::CubeShadowState::new(Vec3::ZERO, map)),
+            )
+            .unwrap();
+        assert!(uniforms.point_light_shadow(0).is_some());
+        uniforms.set_point_light(0, point).unwrap();
+        assert!(uniforms.point_light_shadow(0).is_none());
     }
 
     #[test]

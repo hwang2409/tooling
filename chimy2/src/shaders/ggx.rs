@@ -419,7 +419,7 @@ fn evaluate_direct_ggx_lighting(
             + brdf * normal.dot(light.direction.normalize()).max(0.0) * light.color * visibility;
     }
 
-    for light in lighting.point_lights() {
+    for (index, light) in lighting.point_lights().iter().enumerate() {
         let to_point = light.position - world_position;
         let distance = to_point.length();
         let point_direction = to_point.normalize();
@@ -439,7 +439,13 @@ fn evaluate_direct_ggx_lighting(
             metallic,
             roughness,
         );
-        lighted = lighted + brdf * normal.dot(point_direction).max(0.0) * light.color * attenuation;
+        let visibility = super::point_light_shadow_visibility(
+            world_position,
+            normal,
+            lighting.point_light_shadow(index),
+        );
+        lighted = lighted
+            + brdf * normal.dot(point_direction).max(0.0) * light.color * attenuation * visibility;
     }
 
     lighted
