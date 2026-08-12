@@ -491,7 +491,19 @@ pub fn build_lod_scene(aspect: f32) -> LodScene {
         0.1,
         80.0,
     );
-    let mesh = LodMesh::new(subdivided_octahedron(3));
+    let source = subdivided_octahedron(3);
+    let qem_mesh = LodMesh::new(source.clone());
+    let mesh = LodMesh::from_levels(
+        vec![
+            source,
+            subdivided_octahedron(2),
+            subdivided_octahedron(1),
+            subdivided_octahedron(0),
+        ],
+        vec![400.0, 200.0, 100.0],
+    )
+    .expect("lod demo has deterministic levels");
+    debug_assert_eq!(qem_mesh.level_count(), mesh.level_count());
     let base = BlinnPhongUniforms::new_with_linear_colors(
         Mat4::IDENTITY,
         camera.view_matrix(),
@@ -518,8 +530,8 @@ pub fn build_lod_scene(aspect: f32) -> LodScene {
     let mut models = Vec::new();
     let mut uniforms = Vec::new();
     for (ring, color) in colors.into_iter().enumerate() {
-        let depth = [5.0, 12.0, 22.0][ring];
-        let ring_y = (ring as f32 - 1.0) * 3.0;
+        let depth = [5.0, 10.0, 16.0][ring];
+        let ring_y = (ring as f32 - 1.0) * 2.0;
         for position in [
             Vec3::new(-2.4, ring_y, -depth),
             Vec3::new(0.0, ring_y, -depth),

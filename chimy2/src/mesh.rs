@@ -775,7 +775,19 @@ pub fn simplify_qem(mesh: &Mesh, target_triangles: usize) -> Mesh {
     }
     let mut vertices = mesh.vertices().to_vec();
     let mut triangles = mesh.indices().to_vec();
+    let preserve_closed_manifold = is_closed_manifold(&triangles);
     let sphere_radius = sphere_radius(mesh);
+    let protected_sphere_vertices = sphere_radius.map(|radius| {
+        vertices
+            .iter()
+            .map(|vertex| {
+                let position = vertex.position();
+                position.x.abs() >= radius - 1.0e-4
+                    || position.y.abs() >= radius - 1.0e-4
+                    || position.z.abs() >= radius - 1.0e-4
+            })
+            .collect::<Vec<_>>()
+    });
     let orientation_center = sphere_radius
         .map(|_| (Vec3::ZERO, true))
         .or_else(|| consistent_orientation_center(mesh));
@@ -788,16 +800,27 @@ pub fn simplify_qem(mesh: &Mesh, target_triangles: usize) -> Mesh {
             let quadric = quadrics[a] + quadrics[b];
             // Midpoints avoid unstable nearly-singular quadric solves and
             // keep attribute interpolation deterministic across platforms.
-            let position = sphere_radius
+            let midpoint_position = sphere_radius
                 .filter(|_| midpoint.length() > f32::EPSILON)
                 .map_or(midpoint, |radius| midpoint.normalize() * radius);
-            let error = quadric.evaluate(position);
+            let options = [
+                (
+                    quadric.evaluate(vertices[a].position()),
+                    vertices[a].position(),
+                ),
+                (
+                    quadric.evaluate(vertices[b].position()),
+                    vertices[b].position(),
+                ),
+                (quadric.evaluate(midpoint_position), midpoint_position),
+            ];
+            let (error, position) = options
+                .into_iter()
+                .filter(|(error, _)| error.is_finite())
+                .min_by(|(left, _), (right, _)| left.total_cmp(right))
+                .unwrap_or((f32::MAX, midpoint_position));
             queue.push(CollapseCandidate {
-                error: if error.is_finite() {
-                    error.max(0.0)
-                } else {
-                    f32::MAX
-                },
+                error: error.max(0.0),
                 edge_index: edge_indices[edge_index],
                 a,
                 b,
@@ -815,6 +838,8 @@ pub fn simplify_qem(mesh: &Mesh, target_triangles: usize) -> Mesh {
                 candidate.b,
                 candidate.position,
                 orientation_center,
+                preserve_closed_manifold,
+                protected_sphere_vertices.as_deref(),
             ) {
                 break Some(candidate);
             }
@@ -908,7 +933,17 @@ fn collapse_is_valid(
     b: usize,
     position: Vec3,
     orientation_center: Option<(Vec3, bool)>,
+    preserve_closed_manifold: bool,
+    protected_vertices: Option<&[bool]>,
 ) -> bool {
+    if protected_vertices.is_some_and(|protected| {
+        protected.get(a).copied().unwrap_or(false) || protected.get(b).copied().unwrap_or(false)
+    }) {
+        return false;
+    }
+    if preserve_closed_manifold && !collapse_keeps_closed_manifold(triangles, a, b) {
+        return false;
+    }
     for &[x, y, z] in triangles {
         if x != a && x != b && y != a && y != b && z != a && z != b {
             continue;
@@ -941,6 +976,44 @@ fn collapse_is_valid(
         }
     }
     true
+}
+
+fn is_closed_manifold(triangles: &[[usize; 3]]) -> bool {
+    let mut edge_counts = BTreeMap::new();
+    for &[a, b, c] in triangles {
+        for (left, right) in [(a, b), (b, c), (c, a)] {
+            let edge = if left < right {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            *edge_counts.entry(edge).or_insert(0usize) += 1;
+        }
+    }
+    !edge_counts.is_empty() && edge_counts.values().all(|&count| count == 2)
+}
+
+fn collapse_keeps_closed_manifold(triangles: &[[usize; 3]], a: usize, b: usize) -> bool {
+    let mut edge_counts = BTreeMap::new();
+    for &[mut x, mut y, mut z] in triangles {
+        for index in [&mut x, &mut y, &mut z] {
+            if *index == b {
+                *index = a;
+            }
+        }
+        if x == y || y == z || z == x {
+            continue;
+        }
+        for (left, right) in [(x, y), (y, z), (z, x)] {
+            let edge = if left < right {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            *edge_counts.entry(edge).or_insert(0usize) += 1;
+        }
+    }
+    !edge_counts.is_empty() && edge_counts.values().all(|&count| count == 2)
 }
 
 fn consistent_orientation_center(mesh: &Mesh) -> Option<(Vec3, bool)> {
@@ -1694,6 +1767,8 @@ mod tests {
             0,
             1,
             Vec3::new(0.0, 2.0, 0.0),
+            None,
+            false,
             None,
         ));
     }

@@ -2004,10 +2004,12 @@ mod tests {
                 MeshVertex::new(Vec3::new(-0.7, -0.7, -2.0), None, None),
                 MeshVertex::new(Vec3::new(0.7, -0.7, -2.0), None, None),
                 MeshVertex::new(Vec3::new(0.0, 0.7, -2.0), None, None),
+                MeshVertex::new(Vec3::new(-0.7, 0.7, -2.0), None, None),
             ],
-            vec![[0, 1, 2]],
+            vec![[0, 1, 2], [0, 2, 3]],
         );
-        let lod = LodMesh::new(mesh);
+        let mut lod = LodMesh::with_ratios(mesh, &[0.5]);
+        lod.set_thresholds(vec![10.0]);
         let camera = Camera::new(Vec3::ZERO, crate::math::Quat::IDENTITY, 1.0, 1.0, 0.1, 10.0);
         let model = Mat4::IDENTITY;
         let selection = lod.select(camera, model, 32, 32);
@@ -2026,8 +2028,17 @@ mod tests {
         let mut depth_pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
         let shadow_uniforms = ShadowDepthUniforms::new(model, camera.view_projection());
         depth_pipeline.draw_lod_mesh_depth(&mut shadow_target, &lod, &shadow_uniforms, selection);
+        let mut expected_shadow = Framebuffer::new(32, 32);
+        let mut expected_pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
+        expected_pipeline.draw_lod_mesh_depth(
+            &mut expected_shadow,
+            &lod,
+            &shadow_uniforms,
+            selection,
+        );
         assert!(camera_target.color.iter().any(|&pixel| pixel != 0));
         assert!(shadow_target.depth.iter().any(|&depth| depth < 1.0));
+        assert_eq!(shadow_target.depth, expected_shadow.depth);
     }
 
     #[test]
