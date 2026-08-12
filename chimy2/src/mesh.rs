@@ -915,6 +915,7 @@ fn unique_edges(triangles: &[[usize; 3]]) -> (Vec<(usize, usize)>, Vec<usize>) {
     (edges, indices)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collapse_is_valid(
     vertices: &[MeshVertex],
     triangles: &[[usize; 3]],
