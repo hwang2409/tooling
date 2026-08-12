@@ -76,6 +76,28 @@ pub struct FloatCube {
     faces: [Vec<Vec3>; 6],
 }
 
+/// Error returned when floating-point cube faces do not form a valid cube.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FloatCubeError {
+    message: String,
+}
+
+impl FloatCubeError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for FloatCubeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FloatCubeError {}
+
 impl FloatCube {
     /// Decodes a cube into floating-point RGB and applies a linear intensity.
     /// The scale allows an 8-bit sky asset to drive an HDR lighting test.
@@ -100,6 +122,30 @@ impl FloatCube {
                 .collect()
         });
         Self::new(size, faces)
+    }
+
+    /// Builds a floating-point cube from six square RGB face buffers.
+    ///
+    /// Faces use `+X, -X, +Y, -Y, +Z, -Z` order. Values stay unchanged,
+    /// including values above `1.0` from decoded HDR input.
+    pub fn from_faces(size: usize, faces: [Vec<Vec3>; 6]) -> Result<Self, FloatCubeError> {
+        if size == 0 {
+            return Err(FloatCubeError::new(
+                "float cube face dimensions must be non-zero",
+            ));
+        }
+        let expected = size
+            .checked_mul(size)
+            .ok_or_else(|| FloatCubeError::new("float cube face dimensions overflow"))?;
+        for (index, face) in faces.iter().enumerate() {
+            if face.len() != expected {
+                return Err(FloatCubeError::new(format!(
+                    "float cube face {index} has {} pixels, expected {expected} for {size}x{size}",
+                    face.len()
+                )));
+            }
+        }
+        Ok(Self::new(size, faces))
     }
 
     fn new(size: usize, faces: [Vec<Vec3>; 6]) -> Self {
@@ -606,6 +652,32 @@ mod tests {
         assert!((actual.x - 2.0).abs() < 1.0e-5);
         assert!((actual.y - 1.5).abs() < 1.0e-5);
         assert!((actual.z - 4.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn float_cube_from_faces_rejects_invalid_dimensions() {
+        let faces = std::array::from_fn(|index| {
+            if index == 3 {
+                vec![Vec3::ZERO; 3]
+            } else {
+                vec![Vec3::ZERO; 4]
+            }
+        });
+        let error = FloatCube::from_faces(2, faces).unwrap_err();
+        assert!(error.to_string().contains("face 3"));
+        assert!(error.to_string().contains("expected 4 for 2x2"));
+
+        let empty = std::array::from_fn(|_| Vec::new());
+        let error = FloatCube::from_faces(0, empty).unwrap_err();
+        assert!(error.to_string().contains("non-zero"));
+    }
+
+    #[test]
+    fn float_cube_from_faces_preserves_hdr_values() {
+        let expected = Vec3::new(3.5, 7.25, 12.0);
+        let cube = FloatCube::from_faces(2, std::array::from_fn(|_| vec![expected; 4])).unwrap();
+        assert_eq!(cube.pixel(CubeFace::PositiveZ, 1, 1), expected);
+        assert_eq!(cube.sample(Vec3::new(0.0, 0.0, 1.0)), expected);
     }
 
     #[test]

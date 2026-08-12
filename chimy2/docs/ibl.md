@@ -41,3 +41,6 @@ through ACES tonemapping. If the environment changes, call
 `IblMaps::from_environment_with_settings` again; the maps are owned bake
 results and have no stale cache path. Applications with decoded HDR float
 faces can use `IblMaps::from_float_environment`; values above 1.0 stay linear.
+Those faces can be built with the checked `FloatCube::from_faces` constructor.
+It requires six square buffers with one shared size and keeps HDR values above
+`1.0` unchanged.
