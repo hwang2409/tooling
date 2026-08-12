@@ -1,5 +1,6 @@
 //! Shared pole-and-slab scene for the directional PCSS demo and golden.
 
+use crate::culling::Frustum;
 use crate::demo::{cube_with_uvs, plane_xz};
 use crate::fb::Framebuffer;
 use crate::math::{Mat4, Vec3};
@@ -40,6 +41,16 @@ pub fn build_pcss_shadow_scene() -> PcssShadowScene {
     let mut shadow_target = Framebuffer::new(PCSS_SHADOW_SIZE, PCSS_SHADOW_SIZE);
     shadow_target.clear(0);
     let mut depth_pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
+    depth_pipeline.set_culling_frustum(Some(Frustum::from_view_projection_including_bounds(
+        light_view_projection,
+        [
+            (&ground, Mat4::IDENTITY),
+            (&pole, pole_model),
+            (&slab, slab_model),
+        ]
+        .into_iter()
+        .map(|(mesh, model)| (mesh.bounds(), model)),
+    )));
     depth_pipeline.draw_mesh_depth(
         &mut shadow_target,
         &ground,

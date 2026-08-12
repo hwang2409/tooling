@@ -5,6 +5,7 @@
 
 use crate::camera::Camera;
 use crate::clip::{ClipVertex, clip_triangle_near, cull_backface};
+use crate::culling::{Aabb, Frustum};
 use crate::fb::Framebuffer;
 use crate::math::{Mat4, Vec3, Vec4};
 use crate::mesh::{Mesh, MeshVertex};
@@ -158,6 +159,11 @@ pub trait SampledFragmentStage<V: SamplingVaryings, Uniforms> {
     fn model_view(&self, _uniforms: &Uniforms) -> Option<Mat4> {
         None
     }
+
+    /// Returns the local-to-clip transform used for conservative mesh culling.
+    fn culling_transform(&self, _uniforms: &Uniforms) -> Option<Mat4> {
+        None
+    }
 }
 
 impl Varyings for () {
@@ -228,6 +234,22 @@ pub trait FragmentStage<V: Varyings, Uniforms> {
     fn model_view(&self, _uniforms: &Uniforms) -> Option<Mat4> {
         None
     }
+
+    /// Returns the local-to-clip transform used for conservative mesh culling.
+    fn culling_transform(&self, _uniforms: &Uniforms) -> Option<Mat4> {
+        None
+    }
+}
+
+/// Supplies the local-to-clip transform for depth-only mesh submissions.
+pub trait CullingUniforms {
+    fn culling_transform(&self) -> Option<Mat4> {
+        None
+    }
+
+    fn culling_model(&self) -> Mat4 {
+        Mat4::IDENTITY
+    }
 }
 
 pub struct VertexFn<F, V> {
@@ -289,6 +311,8 @@ pub struct Pipeline<VS, FS> {
     ssaa_scale: usize,
     post_chain: PostChain,
     hdr: bool,
+    culling_enabled: bool,
+    culling_frustum: Option<Frustum>,
 }
 
 impl<VS, FS> Pipeline<VS, FS> {
@@ -300,6 +324,8 @@ impl<VS, FS> Pipeline<VS, FS> {
             ssaa_scale: 1,
             post_chain: PostChain::new(),
             hdr: false,
+            culling_enabled: true,
+            culling_frustum: None,
         }
     }
 
@@ -325,6 +351,22 @@ impl<VS, FS> Pipeline<VS, FS> {
 
     pub const fn hdr(&self) -> bool {
         self.hdr
+    }
+
+    pub fn set_culling_enabled(&mut self, enabled: bool) {
+        self.culling_enabled = enabled;
+    }
+
+    pub fn set_culling(&mut self, enabled: bool) {
+        self.set_culling_enabled(enabled);
+    }
+
+    pub const fn culling_enabled(&self) -> bool {
+        self.culling_enabled
+    }
+
+    pub fn set_culling_frustum(&mut self, frustum: Option<Frustum>) {
+        self.culling_frustum = frustum;
     }
 
     /// Replaces the optional post chain. The chain runs after SSAA downsample.
@@ -750,6 +792,12 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         Uniforms: Sync,
         VS::Varyings: Clone + Send + Sync + 'a,
     {
+        if !self.should_submit_mesh(
+            mesh.bounds(),
+            self.pipeline.fragment.culling_transform(uniforms),
+        ) {
+            return;
+        }
         let model_view = self
             .pipeline
             .fragment
@@ -783,6 +831,12 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         Uniforms: Sync,
         VS::Varyings: SamplingVaryings + Clone + Send + Sync + 'a,
     {
+        if !self.should_submit_mesh(
+            mesh.bounds(),
+            self.pipeline.fragment.culling_transform(uniforms),
+        ) {
+            return;
+        }
         let model_view = self
             .pipeline
             .fragment
@@ -820,6 +874,12 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         let mut opaque_draws = Vec::with_capacity(instances.len());
         for instance in instances {
             let instance_uniforms = uniforms.for_instance(instance);
+            if !self.should_submit_mesh(
+                mesh.bounds(),
+                self.pipeline.fragment.culling_transform(&instance_uniforms),
+            ) {
+                continue;
+            }
             let class = if self.pipeline.fragment.is_opaque(&instance_uniforms) {
                 DrawClass::Opaque
             } else {
@@ -873,6 +933,12 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         let mut opaque_draws = Vec::with_capacity(instances.len());
         for instance in instances {
             let instance_uniforms = uniforms.for_instance(instance);
+            if !self.should_submit_mesh(
+                mesh.bounds(),
+                self.pipeline.fragment.culling_transform(&instance_uniforms),
+            ) {
+                continue;
+            }
             let class = if self.pipeline.fragment.is_opaque(&instance_uniforms) {
                 DrawClass::Opaque
             } else {
@@ -909,6 +975,13 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
             opaque_draws,
             rasterize_sampled_triangle::<VS::Varyings, FS, Uniforms>,
         );
+    }
+
+    fn should_submit_mesh(&self, bounds: Aabb, transform: Option<Mat4>) -> bool {
+        !self.pipeline.culling_enabled
+            || transform.is_none_or(|transform| {
+                Frustum::from_view_projection(transform).intersects_aabb(bounds, Mat4::IDENTITY)
+            })
     }
 }
 
@@ -957,9 +1030,12 @@ impl<VS, FS> Pipeline<VS, FS> {
     ) where
         VS: VertexStage<MeshVertex, Uniforms> + Sync,
         FS: Sync,
-        Uniforms: Sync,
+        Uniforms: Sync + CullingUniforms,
         VS::Varyings: Clone + Send + Sync,
     {
+        if self.culling_enabled && self.depth_mesh_is_outside(mesh.bounds(), uniforms) {
+            return;
+        }
         self.draw_depth(framebuffer, mesh.vertices(), mesh.indices(), uniforms);
     }
 
@@ -972,11 +1048,15 @@ impl<VS, FS> Pipeline<VS, FS> {
     ) where
         VS: VertexStage<MeshVertex, Uniforms> + Sync,
         FS: Sync,
-        Uniforms: InstanceUniforms + Send + Sync,
+        Uniforms: InstanceUniforms + CullingUniforms + Send + Sync,
         VS::Varyings: Clone + Send + Sync,
     {
         for instance in instances {
             let instance_uniforms = uniforms.for_instance(instance);
+            if self.culling_enabled && self.depth_mesh_is_outside(mesh.bounds(), &instance_uniforms)
+            {
+                continue;
+            }
             self.draw_depth(
                 framebuffer,
                 mesh.vertices(),
@@ -1030,9 +1110,12 @@ impl<VS, FS> Pipeline<VS, FS> {
     ) where
         VS: VertexStage<MeshVertex, Uniforms> + Sync,
         FS: Sync,
-        Uniforms: Sync,
+        Uniforms: Sync + CullingUniforms,
         VS::Varyings: DepthVaryings + Clone + Send + Sync,
     {
+        if self.culling_enabled && self.depth_mesh_is_outside(mesh.bounds(), uniforms) {
+            return;
+        }
         self.draw_depth_with_varyings(framebuffer, mesh.vertices(), mesh.indices(), uniforms);
     }
 
@@ -1045,11 +1128,15 @@ impl<VS, FS> Pipeline<VS, FS> {
     ) where
         VS: VertexStage<MeshVertex, Uniforms> + Sync,
         FS: Sync,
-        Uniforms: InstanceUniforms + Send + Sync,
+        Uniforms: InstanceUniforms + CullingUniforms + Send + Sync,
         VS::Varyings: DepthVaryings + Clone + Send + Sync,
     {
         for instance in instances {
             let instance_uniforms = uniforms.for_instance(instance);
+            if self.culling_enabled && self.depth_mesh_is_outside(mesh.bounds(), &instance_uniforms)
+            {
+                continue;
+            }
             self.draw_depth_with_varyings(
                 framebuffer,
                 mesh.vertices(),
@@ -1057,6 +1144,20 @@ impl<VS, FS> Pipeline<VS, FS> {
                 &instance_uniforms,
             );
         }
+    }
+
+    fn depth_mesh_is_outside<Uniforms: CullingUniforms>(
+        &self,
+        bounds: Aabb,
+        uniforms: &Uniforms,
+    ) -> bool {
+        let Some(transform) = uniforms.culling_transform() else {
+            return false;
+        };
+        let frustum = self
+            .culling_frustum
+            .unwrap_or_else(|| Frustum::from_view_projection(transform));
+        !frustum.intersects_aabb(bounds, uniforms.culling_model())
     }
 }
 

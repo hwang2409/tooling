@@ -1,5 +1,5 @@
 use chimy2::camera::Camera;
-use chimy2::demo::{InstancingScene, build_instancing_scene};
+use chimy2::demo::{InstancingScene, build_culling_instancing_scene};
 use chimy2::fb::Framebuffer;
 use chimy2::math::{Mat4, Quat, Vec3};
 use chimy2::mesh::{Mesh, MeshVertex};
@@ -59,7 +59,7 @@ fn render(mesh: &Mesh, thread_count: usize) {
     render_at(mesh, thread_count, WIDTH, HEIGHT);
 }
 
-fn render_500_instances(instanced: bool) {
+fn render_500_instances(instanced: bool, culling_enabled: bool) {
     let mesh = Mesh::new(
         vec![
             MeshVertex::new(Vec3::new(-0.03, -0.03, 0.0), None, None),
@@ -79,6 +79,7 @@ fn render_500_instances(instanced: bool) {
     let mut framebuffer = Framebuffer::new(320, 180);
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
     pipeline.set_thread_count(1);
+    pipeline.set_culling_enabled(culling_enabled);
     if instanced {
         pipeline.render(&mut framebuffer, |frame, target| {
             frame.draw_mesh_instanced(target, &mesh, &base, &instances);
@@ -97,10 +98,11 @@ fn render_500_instances(instanced: bool) {
     black_box(framebuffer.color);
 }
 
-fn render_300_demo_cubes(scene: &InstancingScene, instanced: bool) {
+fn render_demo_cubes(scene: &InstancingScene, instanced: bool, culling_enabled: bool) {
     let mut framebuffer = Framebuffer::new(320, 180);
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
     pipeline.set_thread_count(1);
+    pipeline.set_culling_enabled(culling_enabled);
     if instanced {
         pipeline.render(&mut framebuffer, |frame, target| {
             frame.draw_mesh_instanced(target, &scene.mesh, &scene.lighting, &scene.instances);
@@ -199,18 +201,18 @@ fn bench_raster(c: &mut Criterion) {
     c.bench_function("100000 triangle scene parallel", |b| {
         b.iter(|| render(black_box(&exact_100k), parallel_threads))
     });
-    c.bench_function("500 mesh instances instanced", |b| {
-        b.iter(|| render_500_instances(true))
+    c.bench_function("500 fully visible mesh instances culling on", |b| {
+        b.iter(|| render_500_instances(true, true))
     });
-    c.bench_function("500 mesh instances individual draws", |b| {
-        b.iter(|| render_500_instances(false))
+    c.bench_function("500 fully visible mesh instances culling off", |b| {
+        b.iter(|| render_500_instances(true, false))
     });
-    let demo_scene = build_instancing_scene(16.0 / 9.0);
-    c.bench_function("300 demo cube mesh instances instanced", |b| {
-        b.iter(|| render_300_demo_cubes(black_box(&demo_scene), true))
+    let demo_scene = build_culling_instancing_scene(16.0 / 9.0);
+    c.bench_function("900 demo cube mesh instances culling on", |b| {
+        b.iter(|| render_demo_cubes(black_box(&demo_scene), true, true))
     });
-    c.bench_function("300 demo cube mesh instances individual draws", |b| {
-        b.iter(|| render_300_demo_cubes(black_box(&demo_scene), false))
+    c.bench_function("900 demo cube mesh instances culling off", |b| {
+        b.iter(|| render_demo_cubes(black_box(&demo_scene), true, false))
     });
     c.bench_function("opaque 100000 triangles 320x180 serial", |b| {
         b.iter(|| render_at(black_box(&exact_100k), 1, 320, 180))

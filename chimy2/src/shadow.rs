@@ -8,10 +8,13 @@
 //! the light projection's near plane. This is an explicit light-depth origin,
 //! and keeps the denominator translation-invariant for an orthographic light.
 
+use crate::culling::Frustum;
 use crate::fb::Framebuffer;
 use crate::math::{Mat4, Vec2, Vec3, Vec4};
 use crate::mesh::{Mesh, MeshVertex};
-use crate::pipeline::{Instance, InstanceUniforms, Pipeline, Varyings, VertexOutput, VertexStage};
+use crate::pipeline::{
+    CullingUniforms, Instance, InstanceUniforms, Pipeline, Varyings, VertexOutput, VertexStage,
+};
 use crate::raster::{DepthVaryings, ScreenVertex, perspective_correct_weights};
 use std::sync::Arc;
 
@@ -533,6 +536,16 @@ impl InstanceUniforms for ShadowDepthUniforms {
     fn apply_instance_tint(&mut self, _: Vec4) {}
 }
 
+impl CullingUniforms for ShadowDepthUniforms {
+    fn culling_transform(&self) -> Option<Mat4> {
+        Some(self.transform)
+    }
+
+    fn culling_model(&self) -> Mat4 {
+        self.model
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ShadowDepthShader;
 
@@ -913,6 +926,10 @@ pub fn render_cube_shadow_map(
     let mut pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
     for (index, face) in faces.iter_mut().enumerate() {
         face.clear(0);
+        pipeline.set_culling_frustum(Some(Frustum::from_view_projection_including_bounds(
+            matrices[index],
+            meshes.iter().map(|(mesh, model)| (mesh.bounds(), *model)),
+        )));
         for &(mesh, model) in meshes {
             pipeline.draw_mesh_depth_with_varyings(
                 face,
@@ -943,6 +960,14 @@ pub fn render_cube_shadow_map_instanced(
     let mut pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
     for (index, face) in faces.iter_mut().enumerate() {
         face.clear(0);
+        pipeline.set_culling_frustum(Some(Frustum::from_view_projection_including_bounds(
+            matrices[index],
+            meshes.iter().flat_map(|(mesh, instances)| {
+                instances
+                    .iter()
+                    .map(move |instance| (mesh.bounds(), instance.model()))
+            }),
+        )));
         for &(mesh, instances) in meshes {
             pipeline.draw_mesh_depth_instanced_with_varyings(
                 face,

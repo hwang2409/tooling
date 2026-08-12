@@ -354,6 +354,18 @@ impl<'a> SampledFragmentStage<GltfVaryings, GltfUniforms<'a>> for GltfShader {
             }
         }
     }
+
+    fn culling_transform(&self, uniforms: &GltfUniforms<'a>) -> Option<Mat4> {
+        match &uniforms.kind {
+            GltfUniformKind::Plain(uniforms) => CookTorranceShader.culling_transform(uniforms),
+            GltfUniformKind::Textured(uniforms) => {
+                TexturedCookTorranceShader.culling_transform(uniforms)
+            }
+            GltfUniformKind::NormalMapped(uniforms) => {
+                NormalMappedCookTorranceShader.culling_transform(uniforms)
+            }
+        }
+    }
 }
 
 fn force_opaque_alpha(pixel: u32) -> u32 {
