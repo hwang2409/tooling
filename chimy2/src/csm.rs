@@ -105,8 +105,8 @@ impl CascadeShadowState {
         shadow_maps: Vec<ShadowMap>,
         config: CascadeShadowConfig,
     ) -> Result<Self, String> {
-        let count = config.cascade_count();
-        if !(2..=MAX_CASCADES).contains(&count) || shadow_maps.len() != count {
+        let requested = config.cascade_count();
+        if !(2..=MAX_CASCADES).contains(&requested) || shadow_maps.len() != requested {
             return Err("cascade config count must match 2 to 4 shadow maps".to_string());
         }
         let mut maps: [Option<ShadowMap>; MAX_CASCADES] = std::array::from_fn(|_| None);
@@ -114,6 +114,7 @@ impl CascadeShadowState {
             *slot = Some(map);
         }
         let camera = sanitize_camera(camera);
+        let count = effective_cascade_count(camera.near, camera.far, requested);
         let split_depths = practical_split_depths(camera.near, camera.far, count, config.lambda());
         let light_view_projections = std::array::from_fn(|index| {
             if index < count {
@@ -132,7 +133,9 @@ impl CascadeShadowState {
                 Mat4::IDENTITY
             }
         });
-        Self::from_parts(camera, maps, config, light_view_projections)
+        let mut effective_config = config;
+        effective_config.set_cascade_count(count);
+        Self::from_parts(camera, maps, effective_config, light_view_projections)
     }
 
     fn with_config_and_projections(
@@ -187,8 +190,8 @@ impl CascadeShadowState {
             shadow_maps: maps,
             cascade_world_texels,
             cascade_depth_ranges,
-            constant_bias: 0.25,
-            slope_bias: 0.5,
+            constant_bias: 1.0,
+            slope_bias: 2.0,
         })
     }
 
@@ -254,7 +257,14 @@ impl CascadeShadowState {
             let boundary = self.split_depths[boundary_index];
             let width = self.blend_widths[boundary_index];
             if width > 0.0 && view_depth >= boundary - width && view_depth <= boundary {
-                let weight = ((view_depth - (boundary - width)) / width).clamp(0.0, 1.0);
+                let lower_edge = boundary - width;
+                let weight = if view_depth <= lower_edge {
+                    0.0
+                } else if view_depth >= boundary {
+                    1.0
+                } else {
+                    ((view_depth - lower_edge) / width).clamp(0.0, 1.0)
+                };
                 return (boundary_index, boundary_index + 1, weight);
             }
         }
@@ -312,25 +322,64 @@ fn cascade_blend_widths(
 }
 
 fn world_texel_size(matrix: Mat4, map: &ShadowMap) -> f32 {
-    let x_scale = (matrix.data[0] * matrix.data[0]
-        + matrix.data[1] * matrix.data[1]
-        + matrix.data[2] * matrix.data[2])
-        .sqrt();
-    let y_scale = (matrix.data[4] * matrix.data[4]
-        + matrix.data[5] * matrix.data[5]
-        + matrix.data[6] * matrix.data[6])
-        .sqrt();
+    let x_scale = matrix_row_scale(matrix, 0);
+    let y_scale = matrix_row_scale(matrix, 1);
     let extent_x = 2.0 / x_scale.max(0.001);
     let extent_y = 2.0 / y_scale.max(0.001);
     (extent_x / map.width().max(1) as f32).max(extent_y / map.height().max(1) as f32)
 }
 
 fn depth_range(matrix: Mat4) -> f32 {
-    let z_scale = (matrix.data[8] * matrix.data[8]
-        + matrix.data[9] * matrix.data[9]
-        + matrix.data[10] * matrix.data[10])
-        .sqrt();
+    let z_scale = matrix_row_scale(matrix, 2);
     2.0 / z_scale.max(0.001)
+}
+
+fn matrix_row_scale(matrix: Mat4, row: usize) -> f32 {
+    let x = matrix.data[row];
+    let y = matrix.data[row + 4];
+    let z = matrix.data[row + 8];
+    (x * x + y * y + z * z).sqrt()
+}
+
+/// Returns the largest requested cascade count with distinct f32 split bounds.
+/// Close near/far planes can contain only two representable positive depths.
+pub fn effective_cascade_count(near: f32, far: f32, requested: usize) -> usize {
+    let near = sanitize_near_plane(near);
+    let far = sanitize_far_plane(far, near);
+    let requested = requested.clamp(2, MAX_CASCADES);
+    let mut supported = 2;
+    for candidate in 3..=requested {
+        let mut value = near;
+        // Reserve one representable step beyond the last split. This keeps
+        // the final split at the sanitized far plane instead of collapsing.
+        for _ in 0..candidate {
+            value = next_f32(value);
+        }
+        if value <= far {
+            supported = candidate;
+        }
+    }
+    supported
+}
+
+fn next_f32(value: f32) -> f32 {
+    if !value.is_finite() || value == f32::MAX {
+        value
+    } else if value >= 0.0 {
+        f32::from_bits(value.to_bits() + 1)
+    } else {
+        f32::from_bits(value.to_bits() - 1)
+    }
+}
+
+fn previous_f32(value: f32) -> f32 {
+    if !value.is_finite() || value == f32::MIN {
+        value
+    } else if value > 0.0 {
+        f32::from_bits(value.to_bits() - 1)
+    } else {
+        f32::from_bits(value.to_bits() + 1)
+    }
 }
 
 /// Computes practical split far bounds for `count` cascades.
@@ -342,18 +391,31 @@ pub fn practical_split_depths(
 ) -> [f32; MAX_CASCADES] {
     let near = sanitize_near_plane(near);
     let far = sanitize_far_plane(far, near);
-    let count = count.clamp(2, MAX_CASCADES);
+    let count = effective_cascade_count(near, far, count);
     let lambda = if lambda.is_finite() {
         lambda.clamp(0.0, 1.0)
     } else {
         0.5
     };
     let mut splits = [far; MAX_CASCADES];
+    let mut previous = near;
     for index in 1..=count {
         let fraction = index as f32 / count as f32;
         let logarithmic = near * (far / near).powf(fraction);
         let uniform = near + (far - near) * fraction;
-        splits[index - 1] = lambda * logarithmic + (1.0 - lambda) * uniform;
+        let desired = lambda * logarithmic + (1.0 - lambda) * uniform;
+        let minimum = next_f32(previous);
+        let mut maximum = far;
+        for _ in index..count {
+            maximum = previous_f32(maximum);
+        }
+        let split = if index == count {
+            far
+        } else {
+            desired.clamp(minimum, maximum)
+        };
+        splits[index - 1] = split;
+        previous = split;
     }
     splits
 }
@@ -569,11 +631,13 @@ pub fn render_cascade_shadow_maps_with_config(
     map_size: usize,
     meshes: &[(&Mesh, Mat4)],
 ) -> Result<CascadeShadowState, String> {
-    let count = config.cascade_count();
     if map_size == 0 {
         return Err("cascade shadow-map size must be non-zero".to_string());
     }
     let camera = sanitize_camera(camera);
+    let count = effective_cascade_count(camera.near, camera.far, config.cascade_count());
+    let mut effective_config = config;
+    effective_config.set_cascade_count(count);
     let split_depths = practical_split_depths(camera.near, camera.far, count, config.lambda());
     let caster_points = meshes
         .iter()
@@ -612,7 +676,12 @@ pub fn render_cascade_shadow_maps_with_config(
         }
         maps.push(ShadowMap::from_framebuffer(&target)?);
     }
-    CascadeShadowState::with_config_and_projections(camera, maps, config, light_view_projections)
+    CascadeShadowState::with_config_and_projections(
+        camera,
+        maps,
+        effective_config,
+        light_view_projections,
+    )
 }
 
 fn ndc_depth_for_view_depth(depth: f32, near: f32, far: f32) -> f32 {
@@ -737,9 +806,52 @@ mod tests {
 
     #[test]
     fn close_nonzero_split_gaps_get_nonzero_blend_bands() {
-        let splits = [1000.0, 1000.0001, 1000.0002, 1000.0003];
-        let widths = cascade_blend_widths(999.9999, &splits, 4);
-        assert!(widths[..3].iter().all(|width| *width > 0.0));
+        let near = 1000.0;
+        let far = 1000.0001;
+        let count = effective_cascade_count(near, far, 4);
+        let splits = practical_split_depths(near, far, 4, 0.5);
+        let widths = cascade_blend_widths(near, &splits, count);
+        assert_eq!(count, 2);
+        assert!(splits[0] < splits[1]);
+        assert!(widths[0] > 0.0);
+    }
+
+    #[test]
+    fn blend_endpoint_weights_are_exact_for_every_boundary() {
+        let state = CascadeShadowState::new(
+            test_camera(),
+            Vec3::new(0.4, 1.0, 0.2),
+            vec![
+                ShadowMap::from_depth(1, 1, vec![0.0]).unwrap(),
+                ShadowMap::from_depth(1, 1, vec![0.0]).unwrap(),
+                ShadowMap::from_depth(1, 1, vec![0.0]).unwrap(),
+            ],
+        )
+        .unwrap();
+        for (index, boundary) in state.split_depths()[..state.cascade_count - 1]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let width = state.blend_widths()[index];
+            let lower = state.cascade_sample_pair(boundary - width);
+            let upper = state.cascade_sample_pair(boundary);
+            assert_eq!((lower.0, lower.1, lower.2), (index, index + 1, 0.0));
+            assert_eq!((upper.0, upper.1, upper.2), (index, index + 1, 1.0));
+        }
+    }
+
+    #[test]
+    fn texel_and_depth_helpers_use_projection_rows() {
+        let matrix = Mat4::new([
+            3.0, 0.0, 4.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]);
+        let map = ShadowMap::from_depth(4, 2, vec![0.0; 8]).unwrap();
+        assert_eq!(matrix_row_scale(matrix, 0), 3.0);
+        assert_eq!(matrix_row_scale(matrix, 1), 4.0);
+        assert_eq!(matrix_row_scale(matrix, 2), 41.0_f32.sqrt());
+        assert!((world_texel_size(matrix, &map) - 0.25).abs() < 1e-6);
+        assert!((depth_range(matrix) - 2.0 / 41.0_f32.sqrt()).abs() < 1e-6);
     }
 
     #[test]
