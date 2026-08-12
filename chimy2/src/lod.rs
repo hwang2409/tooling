@@ -250,7 +250,7 @@ pub fn projected_screen_extent(
     let mut max_y = f32::NEG_INFINITY;
     for corner in bounds.corners() {
         let clip = projection * (view * (model * Vec4::new(corner.x, corner.y, corner.z, 1.0)));
-        if !clip.w.is_finite() || clip.w.abs() <= f32::EPSILON {
+        if !clip.w.is_finite() || clip.w <= f32::EPSILON {
             return f32::INFINITY;
         }
         let x = clip.x / clip.w;
@@ -974,6 +974,34 @@ mod tests {
             100,
         );
         assert_eq!(extent, 100.0);
+    }
+
+    #[test]
+    fn projected_extent_rejects_aabb_crossing_eye_plane() {
+        let source = Mesh::new(
+            vec![
+                MeshVertex::new(Vec3::new(-1.0, -1.0, -1.0), None, None),
+                MeshVertex::new(Vec3::new(1.0, -1.0, 1.0), None, None),
+                MeshVertex::new(Vec3::new(0.0, 1.0, 0.0), None, None),
+            ],
+            vec![[0, 1, 2]],
+        );
+        let lod = LodMesh::from_levels(vec![source.clone(), source], vec![100.0]).unwrap();
+        let projection = Mat4::perspective_from_focal_length(1.0, 1.0, 0.1, 100.0);
+        let extent = projected_screen_extent(
+            lod.original().bounds(),
+            Mat4::IDENTITY,
+            projection,
+            Mat4::IDENTITY,
+            100,
+            100,
+        );
+        assert_eq!(extent, f32::INFINITY);
+        assert_eq!(
+            lod.select(Mat4::IDENTITY, projection, Mat4::IDENTITY, 100, 100)
+                .level(),
+            0
+        );
     }
 
     #[test]
