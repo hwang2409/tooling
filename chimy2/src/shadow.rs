@@ -1513,10 +1513,18 @@ mod tests {
         let state = CascadeShadowState::new(camera, Vec3::new(0.4, 1.0, 0.2), maps).unwrap();
         for (index, &boundary) in state.split_depths()[..2].iter().enumerate() {
             let width = state.blend_widths()[index];
-            let step = width * 0.01;
+            let lower = if index == 0 {
+                camera.near
+            } else {
+                state.split_depths()[index - 1]
+            };
+            let upper = state.split_depths()[index + 1];
+            let probe_width = (boundary - lower).min(upper - boundary) * 0.1;
+            assert!(width > 0.0);
+            let step = probe_width * 0.01;
             let mut previous = state.visibility(
-                Vec3::new(0.0, 0.0, -(boundary - width)),
-                boundary - width,
+                Vec3::new(0.0, 0.0, -(boundary - probe_width)),
+                boundary - probe_width,
                 Vec3::new(0.0, 1.0, 0.0),
                 Vec3::new(0.4, 1.0, 0.2),
             );
