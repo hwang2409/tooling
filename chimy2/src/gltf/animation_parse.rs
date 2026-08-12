@@ -3,14 +3,15 @@ fn parse_animations(
     buffers: &[Vec<u8>],
     views: &[BufferView],
     accessors: &[Accessor],
-    node_count: usize,
+    nodes: &[GltfNode],
+    meshes: &[GltfMesh],
 ) -> Result<Vec<GltfAnimation>, GltfError> {
     get_optional_array(object, "animations")?
         .unwrap_or(&[])
         .iter()
         .map(|value| {
             let o = as_object(value, "animation")?;
-            let samplers = get_array(o, "samplers")?
+            let mut samplers = get_array(o, "samplers")?
                 .iter()
                 .map(|value| {
                     let s = as_object(value, "animation sampler")?;
@@ -45,7 +46,7 @@ fn parse_animations(
                     let components = component_count(&accessor.kind);
                     if !matches!(components, 1..=4) {
                         return Err(GltfError::new(format!(
-                            "animation output accessor {output_accessor} must be VEC3 or VEC4"
+                            "animation output accessor {output_accessor} must be SCALAR, VEC2, VEC3, or VEC4"
                         )));
                     }
                     if accessor.component_type != 5126 || accessor.normalized {
@@ -55,9 +56,6 @@ fn parse_animations(
                     }
                     let output =
                         read_accessor::<4>(buffers, views, accessors, output_accessor, components)?;
-                    if input.len() != output.len() {
-                        return Err(GltfError::new("animation input and output counts differ"));
-                    }
                     let interpolation =
                         match get_optional_string(s, "interpolation")?.unwrap_or("LINEAR") {
                             "LINEAR" => Interpolation::Linear,
@@ -85,7 +83,7 @@ fn parse_animations(
                     let c = as_object(value, "animation channel")?;
                     let target = get_object(c, "target")?;
                     let node = get_usize(target, "node")?;
-                    if node >= node_count {
+                    if node >= nodes.len() {
                         return Err(GltfError::new("animation target node is out of range"));
                     }
                     // glTF 2.0 section 3.6.3 permits `weights` channels for
@@ -109,17 +107,57 @@ fn parse_animations(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             for channel in &channels {
-                let sampler = samplers
-                    .get(channel.sampler)
-                    .ok_or_else(|| GltfError::new("animation channel sampler is out of range"))?;
                 let valid = match channel.path {
                     AnimationPath::Translation | AnimationPath::Scale => {
-                        sampler.output_components == 3
+                        let sampler = samplers.get(channel.sampler).ok_or_else(|| {
+                            GltfError::new("animation channel sampler is out of range")
+                        })?;
+                        sampler.output_components == 3 && sampler.input.len() == sampler.output.len()
                     }
-                    AnimationPath::Rotation => sampler.output_components == 4,
-                    // The mesh target count is checked when the animation is
-                    // applied, because channels refer to node meshes.
-                    AnimationPath::Weights => (1..=4).contains(&sampler.output_components),
+                    AnimationPath::Rotation => {
+                        let sampler = samplers.get(channel.sampler).ok_or_else(|| {
+                            GltfError::new("animation channel sampler is out of range")
+                        })?;
+                        sampler.output_components == 4 && sampler.input.len() == sampler.output.len()
+                    }
+                    AnimationPath::Weights => {
+                        let target_count = nodes
+                            .get(channel.node)
+                            .and_then(|node| node.mesh)
+                            .and_then(|mesh| meshes.get(mesh))
+                            .map(|mesh| mesh.weights.len())
+                            .unwrap_or(0);
+                        let Some(sampler) = samplers.get_mut(channel.sampler) else {
+                            return Err(GltfError::new(
+                                "animation channel sampler is out of range",
+                            ));
+                        };
+                        if sampler.output_components != 1
+                            || target_count == 0
+                            || target_count > 4
+                            || sampler.output.len() != sampler.input.len() * target_count
+                        {
+                            false
+                        } else {
+                            let flattened = sampler
+                                .output
+                                .iter()
+                                .map(|value| value[0])
+                                .collect::<Vec<_>>();
+                            sampler.output = (0..sampler.input.len())
+                                .map(|frame| {
+                                    let mut value = [0.0; 4];
+                                    let start = frame * target_count;
+                                    value[..target_count].copy_from_slice(
+                                        &flattened[start..start + target_count],
+                                    );
+                                    value
+                                })
+                                .collect();
+                            sampler.output_components = target_count;
+                            true
+                        }
+                    }
                 };
                 if !valid {
                     return Err(GltfError::new(

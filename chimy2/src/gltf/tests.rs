@@ -85,6 +85,7 @@ mod tests {
             children,
             mesh: None,
             skin: None,
+            weights: None,
             matrix: None,
             translation,
             rotation: [0.0, 0.0, 0.0, 1.0],
@@ -313,7 +314,10 @@ mod tests {
             [0.0, 1.0, 0.0],
             [0.0, 1.0, 0.0],
             [0.0, 1.0, 0.0],
-        ] as [[f32; 3]; 9] {
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+        ] as [[f32; 3]; 12] {
             for value in values {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
@@ -321,36 +325,59 @@ mod tests {
         for value in [0.0_f32, 1.0] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
-        for values in [[0.0_f32, 0.0], [1.0, 1.0]] {
+        for values in [[0.0_f32, 0.0, 0.0], [1.0, 1.0, 1.0]] {
             for value in values {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
         }
-        format!(
+        let source = format!(
             r#"{{"asset":{{"version":"2.0"}},"buffers":[{{"uri":"data:application/octet-stream;base64,{}","byteLength":{}}}],"bufferViews":[{{"buffer":0,"byteLength":{}}}],"accessors":[{{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"}},{{"bufferView":0,"byteOffset":36,"componentType":5126,"count":3,"type":"VEC3"}},{{"bufferView":0,"byteOffset":72,"componentType":5126,"count":3,"type":"VEC3"}},{{"bufferView":0,"byteOffset":108,"componentType":5126,"count":2,"type":"SCALAR"}},{{"bufferView":0,"byteOffset":116,"componentType":5126,"count":2,"type":"VEC2"}}],"meshes":[{{"weights":[0.2,0.4],"primitives":[{{"attributes":{{"POSITION":0}},"targets":[{{"POSITION":1}},{{"POSITION":2}}]}}]}}],"nodes":[{{"mesh":0}}],"scenes":[{{"nodes":[0]}}],"scene":0,"animations":[{{"samplers":[{{"input":3,"output":4}}],"channels":[{{"sampler":0,"target":{{"node":0,"path":"weights"}}}}]}}]}}"#,
             base64(&bytes),
             bytes.len(),
             bytes.len(),
-        )
+        );
+        source
+            .replace(
+                "\"byteOffset\":108,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\"},{\"bufferView\":0,\"byteOffset\":116,\"componentType\":5126,\"count\":2,\"type\":\"VEC2\"",
+                "\"byteOffset\":108,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},{\"bufferView\":0,\"byteOffset\":144,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\"},{\"bufferView\":0,\"byteOffset\":152,\"componentType\":5126,\"count\":6,\"type\":\"SCALAR\"",
+            )
+            .replace(
+                "\"weights\":[0.2,0.4],\"primitives\":[{\"attributes\":{\"POSITION\":0},\"targets\":[{\"POSITION\":1},{\"POSITION\":2}]}]",
+                "\"weights\":[0.2,0.4,0.1],\"primitives\":[{\"attributes\":{\"POSITION\":0},\"targets\":[{\"POSITION\":1},{\"POSITION\":2},{\"POSITION\":3}]}]",
+            )
+            .replace("\"input\":3,\"output\":4", "\"input\":4,\"output\":5")
     }
 
     #[test]
     fn gltf_morph_targets_and_weight_animation_follow_spec_layout() {
         let asset = GltfAsset::from_str(&morph_animation_json(), ".").unwrap();
         let primitive = &asset.meshes[0].primitives[0];
-        assert_eq!(primitive.morph_targets.len(), 2);
+        assert_eq!(primitive.morph_targets.len(), 3);
         assert_eq!(primitive.morph_targets[0].position_deltas[0], Vec3::new(1.0, 0.0, 0.0));
         assert_eq!(primitive.morph_targets[1].position_deltas[0], Vec3::new(0.0, 1.0, 0.0));
-        assert_eq!(primitive.morph_weights(), &[0.2, 0.4]);
-        assert_eq!(asset.sample_morph_weights(Some(0), 0.0, 0, 0, 0).unwrap(), [0.0, 0.0]);
-        assert_eq!(asset.sample_morph_weights(Some(0), 0.5, 0, 0, 0).unwrap(), [0.5, 0.5]);
-        assert_eq!(asset.sample_morph_weights(Some(0), 1.0, 0, 0, 0).unwrap(), [1.0, 1.0]);
+        assert_eq!(
+            primitive.morph_targets[2].position_deltas[0],
+            Vec3::new(0.0, 0.0, 1.0)
+        );
+        assert_eq!(primitive.morph_weights(), &[0.2, 0.4, 0.1]);
+        assert_eq!(
+            asset.sample_morph_weights(Some(0), 0.0, 0, 0, 0).unwrap(),
+            [0.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            asset.sample_morph_weights(Some(0), 0.5, 0, 0, 0).unwrap(),
+            [0.5, 0.5, 0.5]
+        );
+        assert_eq!(
+            asset.sample_morph_weights(Some(0), 1.0, 0, 0, 0).unwrap(),
+            [1.0, 1.0, 1.0]
+        );
         let posed = asset
-            .pose_mesh_with_weights(0, 0, 0, Some(0), 0.5, &[0.3, 0.7])
+            .pose_mesh_with_weights(0, 0, 0, Some(0), 0.5, &[0.3, 0.7, 0.2])
             .unwrap();
-        assert_eq!(posed.vertex(0).unwrap().position(), Vec3::new(0.3, 0.7, 0.0));
+        assert_eq!(posed.vertex(0).unwrap().position(), Vec3::new(0.3, 0.7, 0.2));
         let draws = asset.scene_draws(0, Some(0), 0.5).unwrap();
-        assert_eq!(draws[0].mesh.vertex(0).unwrap().position(), Vec3::new(0.5, 0.5, 0.0));
+        assert_eq!(draws[0].mesh.vertex(0).unwrap().position(), Vec3::new(0.5, 0.5, 0.5));
     }
 
     #[test]
@@ -358,19 +385,44 @@ mod tests {
         let mut asset = GltfAsset::from_str(&morph_animation_json(), ".").unwrap();
         let primitive = &mut asset.meshes[0].primitives[0];
         primitive
-            .set_morph_weights(&[f32::NAN, f32::INFINITY])
+            .set_morph_weights(&[f32::NAN, f32::INFINITY, 2.0])
             .unwrap();
-        assert_eq!(primitive.morph_weights(), &[0.0, 0.0]);
+        assert_eq!(primitive.morph_weights(), &[0.0, 0.0, 1.0]);
         primitive.set_morph_weight(1, 2.0).unwrap();
-        assert_eq!(primitive.morph_weights(), &[0.0, 1.0]);
+        assert_eq!(primitive.morph_weights(), &[0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn node_weights_override_mesh_defaults_until_animation_is_active() {
+        let source = morph_animation_json().replace(
+            "\"nodes\":[{\"mesh\":0}]",
+            "\"nodes\":[{\"mesh\":0,\"weights\":[0.9,0.1,0.0]}]",
+        );
+        let asset = GltfAsset::from_str(&source, ".").unwrap();
+        let draws = asset.scene_draws(0, None, 0.0).unwrap();
+        assert_eq!(
+            draws[0].mesh.vertex(0).unwrap().position(),
+            Vec3::new(0.9, 0.1, 0.0)
+        );
+        let animated = asset.scene_draws(0, Some(0), 0.5).unwrap();
+        assert_eq!(
+            animated[0].mesh.vertex(0).unwrap().position(),
+            Vec3::new(0.5, 0.5, 0.5)
+        );
     }
 
     #[test]
     fn malformed_morph_inputs_return_errors_without_panicking() {
         let missing_accessor = morph_animation_json().replace("\"POSITION\":2", "\"POSITION\":99");
         assert!(GltfAsset::from_str(&missing_accessor, ".").is_err());
-        let wrong_target_count = morph_animation_json().replace("\"weights\":[0.2,0.4]", "\"weights\":[0.2]");
+        let wrong_target_count =
+            morph_animation_json().replace("\"weights\":[0.2,0.4,0.1]", "\"weights\":[0.2]");
         assert!(GltfAsset::from_str(&wrong_target_count, ".").is_err());
+        let wrong_node_weights = morph_animation_json().replace(
+            "\"nodes\":[{\"mesh\":0}]",
+            "\"nodes\":[{\"mesh\":0,\"weights\":[0.9,0.1]}]",
+        );
+        assert!(GltfAsset::from_str(&wrong_node_weights, ".").is_err());
         let wrong_delta_count = morph_animation_json().replace(
             "\"byteOffset\":36,\"componentType\":5126,\"count\":3",
             "\"byteOffset\":36,\"componentType\":5126,\"count\":2",

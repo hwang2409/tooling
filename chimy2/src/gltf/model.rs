@@ -428,7 +428,10 @@ fn component_count(kind: &str) -> usize {
     }
 }
 
-fn parse_nodes(object: &[(String, Value)]) -> Result<Vec<GltfNode>, GltfError> {
+fn parse_nodes(
+    object: &[(String, Value)],
+    meshes: &[GltfMesh],
+) -> Result<Vec<GltfNode>, GltfError> {
     let values = get_optional_array(object, "nodes")?.unwrap_or(&[]);
     values
         .iter()
@@ -463,13 +466,29 @@ fn parse_nodes(object: &[(String, Value)]) -> Result<Vec<GltfNode>, GltfError> {
                 get_optional_f32_array(o, "scale")?.unwrap_or_else(|| vec![1.0, 1.0, 1.0]),
                 "scale",
             )?;
+            let mesh = get_optional_usize(o, "mesh")?;
+            let weights = get_optional_f32_array(o, "weights")?
+                .map(|weights| {
+                    let target_count = mesh
+                        .and_then(|index| meshes.get(index))
+                        .map(|mesh| mesh.weights.len())
+                        .ok_or_else(|| GltfError::new("node weights require a valid mesh"))?;
+                    if weights.len() != target_count {
+                        return Err(GltfError::new(
+                            "node weights count does not match morph targets",
+                        ));
+                    }
+                    Ok(weights.into_iter().map(sanitize_morph_weight).collect())
+                })
+                .transpose()?;
             Ok(GltfNode {
                 name: get_optional_string(o, "name")?
                     .unwrap_or_default()
                     .to_string(),
                 children: get_optional_usize_array(o, "children")?.unwrap_or_default(),
-                mesh: get_optional_usize(o, "mesh")?,
+                mesh,
                 skin: get_optional_usize(o, "skin")?,
+                weights,
                 matrix,
                 translation,
                 rotation,

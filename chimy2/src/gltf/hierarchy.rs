@@ -14,7 +14,14 @@ impl GltfAsset {
             .get(mesh_index)
             .and_then(|mesh| mesh.primitives.get(primitive_index))
             .ok_or_else(|| GltfError::new("mesh primitive index is out of range"))?;
-        let mut weights = primitive.morph_weights.clone();
+        let node = self
+            .nodes
+            .get(node_index)
+            .ok_or_else(|| GltfError::new("node index is out of range"))?;
+        let mut weights = node
+            .weights
+            .clone()
+            .unwrap_or_else(|| primitive.morph_weights.clone());
         let Some(animation_index) = animation else {
             return Ok(weights);
         };
@@ -101,18 +108,20 @@ impl GltfAsset {
         animation: Option<usize>,
         time: f32,
     ) -> Result<Mesh, GltfError> {
-        let primitive = self
-            .meshes
-            .get(mesh_index)
-            .and_then(|mesh| mesh.primitives.get(primitive_index))
-            .ok_or_else(|| GltfError::new("mesh primitive index is out of range"))?;
+        let morph_weights = self.sample_morph_weights(
+            animation,
+            time,
+            node_index,
+            mesh_index,
+            primitive_index,
+        )?;
         self.pose_mesh_with_weights(
             mesh_index,
             primitive_index,
             node_index,
             animation,
             time,
-            &primitive.morph_weights,
+            &morph_weights,
         )
     }
 

@@ -115,6 +115,7 @@ pub struct GltfNode {
     pub children: Vec<usize>,
     pub mesh: Option<usize>,
     pub skin: Option<usize>,
+    pub weights: Option<Vec<f32>>,
     pub matrix: Option<Mat4>,
     pub translation: Vec3,
     pub rotation: [f32; 4],
