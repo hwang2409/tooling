@@ -91,6 +91,7 @@ fn sanitize_instance_tint_component(value: f32) -> f32 {
 ///
 /// Implementations must rebuild all derived transform data in
 /// `set_instance_model`. `apply_instance_tint` receives a sanitized tint.
+/// Identity tints are skipped because they cannot change output.
 pub trait InstanceUniforms: Clone {
     fn set_instance_model(&mut self, model: Mat4);
 
@@ -99,7 +100,10 @@ pub trait InstanceUniforms: Clone {
     fn for_instance(&self, instance: &Instance) -> Self {
         let mut uniforms = self.clone();
         uniforms.set_instance_model(instance.model());
-        if let Some(tint) = instance.tint() {
+        if let Some(tint) = instance
+            .tint()
+            .filter(|tint| tint.x != 1.0 || tint.y != 1.0 || tint.z != 1.0 || tint.w != 1.0)
+        {
             uniforms.apply_instance_tint(tint);
         }
         uniforms
@@ -1999,6 +2003,40 @@ mod tests {
             Vec3::new(0.25, 0.5, 0.25),
         );
         assert_eq!(result.color, Vec4::new(0.25, 0.5, 0.25, 1.0));
+    }
+
+    #[derive(Clone, Copy)]
+    struct InstanceTintProbe {
+        model: Mat4,
+        tint_applications: usize,
+    }
+
+    impl InstanceUniforms for InstanceTintProbe {
+        fn set_instance_model(&mut self, model: Mat4) {
+            self.model = model;
+        }
+
+        fn apply_instance_tint(&mut self, _: Vec4) {
+            self.tint_applications += 1;
+        }
+    }
+
+    #[test]
+    fn identity_instance_tint_skips_uniform_rewrite() {
+        let base = InstanceTintProbe {
+            model: Mat4::IDENTITY,
+            tint_applications: 0,
+        };
+        let identity = Instance::with_tint(
+            Mat4::translate(Vec3::new(1.0, 0.0, 0.0)),
+            Vec4::new(1.0, 1.0, 1.0, 1.0),
+        );
+        let tinted = Instance::with_tint(
+            Mat4::translate(Vec3::new(1.0, 0.0, 0.0)),
+            Vec4::new(0.5, 1.0, 1.0, 1.0),
+        );
+        assert_eq!(base.for_instance(&identity).tint_applications, 0);
+        assert_eq!(base.for_instance(&tinted).tint_applications, 1);
     }
 
     #[test]

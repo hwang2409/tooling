@@ -1,4 +1,5 @@
 use chimy2::camera::Camera;
+use chimy2::demo::{InstancingScene, build_instancing_scene};
 use chimy2::fb::Framebuffer;
 use chimy2::math::{Mat4, Quat, Vec3};
 use chimy2::mesh::{Mesh, MeshVertex};
@@ -96,6 +97,29 @@ fn render_500_instances(instanced: bool) {
     black_box(framebuffer.color);
 }
 
+fn render_300_demo_cubes(scene: &InstancingScene, instanced: bool) {
+    let individual_uniforms = scene
+        .instances
+        .iter()
+        .map(|instance| scene.lighting.for_instance(instance))
+        .collect::<Vec<_>>();
+    let mut framebuffer = Framebuffer::new(320, 180);
+    let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
+    pipeline.set_thread_count(1);
+    if instanced {
+        pipeline.render(&mut framebuffer, |frame, target| {
+            frame.draw_mesh_instanced_prepared(target, &scene.mesh, individual_uniforms);
+        });
+    } else {
+        pipeline.render(&mut framebuffer, |frame, target| {
+            for uniforms in &individual_uniforms {
+                frame.draw_mesh(target, &scene.mesh, uniforms);
+            }
+        });
+    }
+    black_box(framebuffer.color);
+}
+
 fn subdivided_icosahedron(levels: usize) -> Mesh {
     let base = Mesh::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icosahedron.obj"))
         .expect("load base icosahedron");
@@ -180,6 +204,13 @@ fn bench_raster(c: &mut Criterion) {
     });
     c.bench_function("500 mesh instances individual draws", |b| {
         b.iter(|| render_500_instances(false))
+    });
+    let demo_scene = build_instancing_scene(16.0 / 9.0);
+    c.bench_function("300 demo cube mesh instances instanced", |b| {
+        b.iter(|| render_300_demo_cubes(black_box(&demo_scene), true))
+    });
+    c.bench_function("300 demo cube mesh instances individual draws", |b| {
+        b.iter(|| render_300_demo_cubes(black_box(&demo_scene), false))
     });
     c.bench_function("opaque 100000 triangles 320x180 serial", |b| {
         b.iter(|| render_at(black_box(&exact_100k), 1, 320, 180))
