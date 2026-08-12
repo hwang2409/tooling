@@ -3,6 +3,10 @@
 //! A particle step uses a fixed one-sixtieth second timestep. Emission
 //! variation comes from an integer hash of the spawn index. No random state or
 //! unordered collection is part of the simulation.
+//!
+//! When the system is at capacity, excess emissions are skipped. Skipped
+//! emissions do not consume spawn indices, so variation stays tied to actual
+//! particles and remains stable across temporary saturation.
 
 use crate::camera::Camera;
 use crate::fb::Framebuffer;
@@ -219,12 +223,12 @@ impl ParticleSystem {
                 continue;
             };
 
-            // Semi-implicit Euler order is intentional and is part of the
+            // Explicit Euler order is intentional and is part of the
             // deterministic physics contract: move, then apply acceleration.
             particle.position = particle.position + particle.velocity * PARTICLE_DT;
             particle.velocity = (particle.velocity + gravity * PARTICLE_DT) * drag;
             particle.age_steps += 1;
-            if particle.age_steps >= lifetime {
+            if particle.age_steps >= particle.lifetime_steps {
                 *slot = None;
             }
         }
@@ -456,6 +460,49 @@ mod tests {
         system.step();
         assert_eq!(system.live_count(), 1);
         assert_eq!(system.particle(0).unwrap().spawn_index, 1);
+    }
+
+    #[test]
+    fn spawned_particle_keeps_its_recorded_lifetime() {
+        let emitter = ParticleEmitter::new(Vec3::ZERO, 1, 4, Vec3::ZERO);
+        let mut system = ParticleSystem::new(emitter, 1);
+        system.step();
+        let mut shorter = system.emitter();
+        shorter.set_lifetime_steps(1);
+        shorter.set_emission_rate(0);
+        system.set_emitter(shorter);
+        system.step();
+        let particle = system.particle(0).unwrap();
+        assert_eq!(particle.age_steps, 1);
+        assert_eq!(particle.lifetime_steps, 4);
+        system.step_n(3);
+        assert_eq!(system.live_count(), 0);
+    }
+
+    #[test]
+    fn capacity_one_saturation_skips_without_consuming_spawn_indices() {
+        let emitter = ParticleEmitter::new(Vec3::ZERO, 3, 1, Vec3::ZERO);
+        let mut system = ParticleSystem::new(emitter, 1);
+        system.step();
+        assert_eq!(system.live_count(), 1);
+        assert_eq!(system.particle(0).unwrap().spawn_index, 0);
+        system.step();
+        assert_eq!(system.live_count(), 1);
+        assert_eq!(system.particle(0).unwrap().spawn_index, 1);
+    }
+
+    #[test]
+    fn over_capacity_emission_stops_at_capacity() {
+        let emitter = ParticleEmitter::new(Vec3::ZERO, 5, 10, Vec3::ZERO);
+        let mut system = ParticleSystem::new(emitter, 2);
+        system.step();
+        assert_eq!(system.live_count(), 2);
+        assert_eq!(system.slots()[0].unwrap().spawn_index, 0);
+        assert_eq!(system.slots()[1].unwrap().spawn_index, 1);
+        system.step();
+        assert_eq!(system.live_count(), 2);
+        assert_eq!(system.slots()[0].unwrap().spawn_index, 0);
+        assert_eq!(system.slots()[1].unwrap().spawn_index, 1);
     }
 
     #[test]
