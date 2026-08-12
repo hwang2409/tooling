@@ -1916,7 +1916,10 @@ impl DrawClass {
 mod tests {
     use super::*;
     use crate::fb::{argb8888, blend_argb8888_linear};
+    use crate::mesh::{LodMesh, Mesh, MeshVertex};
     use crate::postfx::{PostChain, SsaoPass};
+    use crate::shaders::{MeshShader, MeshUniforms};
+    use crate::shadow::{ShadowDepthShader, ShadowDepthUniforms};
 
     #[derive(Clone, Copy)]
     struct RawVertex {
@@ -1959,6 +1962,70 @@ mod tests {
             frame.draw(target, &vertices, &[[0, 1, 2]], &());
         });
         assert!(framebuffer.color.contains(&argb8888(255, 20, 40, 60)));
+    }
+
+    #[test]
+    fn forced_lod_zero_matches_plain_mesh_render() {
+        let mesh = Mesh::new(
+            vec![
+                MeshVertex::new(Vec3::new(-0.7, -0.7, 0.0), None, None),
+                MeshVertex::new(Vec3::new(0.7, -0.7, 0.0), None, None),
+                MeshVertex::new(Vec3::new(0.0, 0.7, 0.0), None, None),
+            ],
+            vec![[0, 1, 2]],
+        );
+        let lod = LodMesh::new(mesh.clone());
+        let uniforms = MeshUniforms::new(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            argb8888(255, 20, 40, 60),
+        );
+        let mut plain = Framebuffer::new(16, 16);
+        let mut forced = Framebuffer::new(16, 16);
+        let mut plain_pipeline = Pipeline::new(MeshShader, MeshShader);
+        plain_pipeline.render(&mut plain, |frame, target| {
+            frame.draw_mesh(target, &mesh, &uniforms);
+        });
+        let mut forced_pipeline = Pipeline::new(MeshShader, MeshShader);
+        forced_pipeline.render(&mut forced, |frame, target| {
+            frame.draw_lod_mesh_level(target, &lod, &uniforms, 0);
+        });
+        assert_eq!(plain.color, forced.color);
+        assert_eq!(plain.depth, forced.depth);
+    }
+
+    #[test]
+    fn one_lod_selection_is_reusable_by_camera_and_depth_passes() {
+        let mesh = Mesh::new(
+            vec![
+                MeshVertex::new(Vec3::new(-0.7, -0.7, -2.0), None, None),
+                MeshVertex::new(Vec3::new(0.7, -0.7, -2.0), None, None),
+                MeshVertex::new(Vec3::new(0.0, 0.7, -2.0), None, None),
+            ],
+            vec![[0, 1, 2]],
+        );
+        let lod = LodMesh::new(mesh);
+        let camera = Camera::new(Vec3::ZERO, crate::math::Quat::IDENTITY, 1.0, 1.0, 0.1, 10.0);
+        let model = Mat4::IDENTITY;
+        let selection = lod.select(camera, model, 32, 32);
+        let uniforms = MeshUniforms::new(
+            model,
+            camera.view_matrix(),
+            camera.projection_matrix(),
+            argb8888(255, 20, 40, 60),
+        );
+        let mut camera_target = Framebuffer::new(32, 32);
+        let mut camera_pipeline = Pipeline::new(MeshShader, MeshShader);
+        camera_pipeline.render(&mut camera_target, |frame, target| {
+            frame.draw_lod_mesh_with_selection(target, &lod, &uniforms, selection);
+        });
+        let mut shadow_target = Framebuffer::new(32, 32);
+        let mut depth_pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
+        let shadow_uniforms = ShadowDepthUniforms::new(model, camera.view_projection());
+        depth_pipeline.draw_lod_mesh_depth(&mut shadow_target, &lod, &shadow_uniforms, selection);
+        assert!(camera_target.color.iter().any(|&pixel| pixel != 0));
+        assert!(shadow_target.depth.iter().any(|&depth| depth < 1.0));
     }
 
     #[test]

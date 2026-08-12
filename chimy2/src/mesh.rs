@@ -1636,4 +1636,24 @@ mod tests {
         assert_eq!(lod.select_level_for_extent(400.0), 0);
         assert_eq!(lod.select_level_for_extent(20.0), 3);
     }
+
+    #[test]
+    fn qem_priority_breaks_equal_errors_by_stable_edge_index() {
+        let lower = CollapseCandidate {
+            error: 1.0,
+            edge_index: 3,
+            a: 0,
+            b: 1,
+            position: Vec3::ZERO,
+        };
+        let higher = CollapseCandidate {
+            error: 1.0,
+            edge_index: 7,
+            a: 0,
+            b: 1,
+            position: Vec3::ZERO,
+        };
+        let mut queue = std::collections::BinaryHeap::from([higher, lower]);
+        assert_eq!(queue.pop().unwrap().edge_index, 3);
+    }
 }
