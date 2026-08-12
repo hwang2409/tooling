@@ -16,9 +16,99 @@ use crate::raster::{
 };
 use crate::skybox::{CubeTexture, render_skybox_with_threads};
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::thread;
 
 pub const TILE_SIZE: usize = 64;
+
+/// Per-draw state for one mesh instance.
+///
+/// Instances are sanitized when they are created or updated. A non-finite
+/// model becomes identity. Tint components become finite values in `[0, 1]`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Instance {
+    model: Mat4,
+    tint: Option<Vec4>,
+}
+
+impl Instance {
+    pub fn new(model: Mat4) -> Self {
+        Self {
+            model: sanitize_instance_model(model),
+            tint: None,
+        }
+    }
+
+    pub fn with_tint(model: Mat4, tint: Vec4) -> Self {
+        let mut instance = Self::new(model);
+        instance.set_tint(Some(tint));
+        instance
+    }
+
+    pub const fn model(&self) -> Mat4 {
+        self.model
+    }
+
+    pub const fn tint(&self) -> Option<Vec4> {
+        self.tint
+    }
+
+    pub fn set_model(&mut self, model: Mat4) {
+        self.model = sanitize_instance_model(model);
+    }
+
+    pub fn set_tint(&mut self, tint: Option<Vec4>) {
+        self.tint = tint.map(sanitize_instance_tint);
+    }
+}
+
+fn sanitize_instance_model(model: Mat4) -> Mat4 {
+    if model.data.iter().all(|value| value.is_finite()) {
+        model
+    } else {
+        Mat4::IDENTITY
+    }
+}
+
+fn sanitize_instance_tint(tint: Vec4) -> Vec4 {
+    Vec4::new(
+        sanitize_instance_tint_component(tint.x),
+        sanitize_instance_tint_component(tint.y),
+        sanitize_instance_tint_component(tint.z),
+        sanitize_instance_tint_component(tint.w),
+    )
+}
+
+fn sanitize_instance_tint_component(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// Supplies per-instance uniform state to the mesh submission path.
+///
+/// Implementations must rebuild all derived transform data in
+/// `set_instance_model`. `apply_instance_tint` receives a sanitized tint.
+/// Identity tints are skipped because they cannot change output.
+pub trait InstanceUniforms: Clone {
+    fn set_instance_model(&mut self, model: Mat4);
+
+    fn apply_instance_tint(&mut self, tint: Vec4);
+
+    fn for_instance(&self, instance: &Instance) -> Self {
+        let mut uniforms = self.clone();
+        uniforms.set_instance_model(instance.model());
+        if let Some(tint) = instance
+            .tint()
+            .filter(|tint| tint.x != 1.0 || tint.y != 1.0 || tint.z != 1.0 || tint.w != 1.0)
+        {
+            uniforms.apply_instance_tint(tint);
+        }
+        uniforms
+    }
+}
 
 pub trait Varyings: Sized {
     fn lerp3(a: &Self, b: &Self, c: &Self, weights: Vec3) -> Self;
@@ -411,6 +501,110 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         }
     }
 
+    fn queue_prepared_owned<V, Uniforms>(
+        &mut self,
+        prepared: Vec<(f32, PreparedTriangle<V>)>,
+        uniforms: Uniforms,
+        class: DrawClass,
+        rasterize: RasterFn<V, FS, Uniforms>,
+    ) where
+        FS: Sync,
+        Uniforms: Send + Sync + 'a,
+        V: Varyings + Clone + Send + Sync + 'a,
+    {
+        let uniforms = Arc::new(uniforms);
+        if class == DrawClass::Opaque {
+            if prepared.is_empty() {
+                return;
+            }
+            let prepared = prepared
+                .into_iter()
+                .map(|(_, triangle)| triangle)
+                .collect::<Vec<_>>();
+            let submission_order = self.next_submission_order;
+            self.next_submission_order += 1;
+            let draw = Box::new(
+                move |framebuffer: &mut Framebuffer, fragment: &FS, threads| {
+                    dispatch_prepared(
+                        threads,
+                        framebuffer,
+                        &prepared,
+                        &*uniforms,
+                        fragment,
+                        class.raster_state(),
+                        rasterize,
+                    );
+                },
+            );
+            self.commands.push(QueuedCommand {
+                class,
+                key: 0.0,
+                submission_order,
+                draw,
+            });
+            return;
+        }
+        for (key, triangle) in prepared {
+            let submission_order = self.next_submission_order;
+            self.next_submission_order += 1;
+            let triangle = vec![triangle];
+            let triangle_uniforms = Arc::clone(&uniforms);
+            let draw = Box::new(
+                move |framebuffer: &mut Framebuffer, fragment: &FS, threads| {
+                    dispatch_prepared(
+                        threads,
+                        framebuffer,
+                        &triangle,
+                        &*triangle_uniforms,
+                        fragment,
+                        class.raster_state(),
+                        rasterize,
+                    );
+                },
+            );
+            self.commands.push(QueuedCommand {
+                class,
+                key,
+                submission_order,
+                draw,
+            });
+        }
+    }
+
+    fn queue_opaque_instanced_owned<V, Uniforms>(
+        &mut self,
+        draws: Vec<(Vec<PreparedTriangle<V>>, Uniforms)>,
+        rasterize: RasterFn<V, FS, Uniforms>,
+    ) where
+        FS: Sync,
+        Uniforms: Send + Sync + 'a,
+        V: Varyings + Clone + Send + Sync + 'a,
+    {
+        if draws.is_empty() {
+            return;
+        }
+        let submission_order = self.next_submission_order;
+        self.next_submission_order += 1;
+        let draw = Box::new(
+            move |framebuffer: &mut Framebuffer, fragment: &FS, threads| {
+                dispatch_prepared_instanced(
+                    threads,
+                    framebuffer,
+                    &draws,
+                    fragment,
+                    DrawClass::Opaque.raster_state(),
+                    rasterize,
+                );
+            },
+        );
+        self.commands.push(QueuedCommand {
+            class: DrawClass::Opaque,
+            key: 0.0,
+            submission_order,
+            draw,
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn queue<Vertex, Uniforms>(
         &mut self,
@@ -610,6 +804,112 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
             rasterize_sampled_triangle::<VS::Varyings, FS, Uniforms>,
         );
     }
+
+    pub fn draw_mesh_instanced<Uniforms>(
+        &mut self,
+        framebuffer: &Framebuffer,
+        mesh: &Mesh,
+        uniforms: &'a Uniforms,
+        instances: &[Instance],
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
+        Uniforms: InstanceUniforms + Send + Sync + 'a,
+        VS::Varyings: Clone + Send + Sync + 'a,
+    {
+        let mut opaque_draws = Vec::with_capacity(instances.len());
+        for instance in instances {
+            let instance_uniforms = uniforms.for_instance(instance);
+            let class = if self.pipeline.fragment.is_opaque(&instance_uniforms) {
+                DrawClass::Opaque
+            } else {
+                DrawClass::Transparent
+            };
+            let model_view = self
+                .pipeline
+                .fragment
+                .model_view(&instance_uniforms)
+                .unwrap_or(Mat4::IDENTITY);
+            let keys =
+                (class == DrawClass::Transparent).then(|| mesh_centroid_depths(mesh, model_view));
+            let prepared = prepare_triangles(
+                &self.pipeline.vertex,
+                framebuffer,
+                mesh.vertices(),
+                mesh.indices(),
+                keys.as_deref(),
+                &instance_uniforms,
+            );
+            if class == DrawClass::Opaque {
+                let prepared = prepared.into_iter().map(|(_, triangle)| triangle).collect();
+                opaque_draws.push((prepared, instance_uniforms));
+            } else {
+                self.queue_prepared_owned(
+                    prepared,
+                    instance_uniforms,
+                    class,
+                    rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
+                );
+            }
+        }
+        self.queue_opaque_instanced_owned(
+            opaque_draws,
+            rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
+        );
+    }
+
+    pub fn draw_mesh_instanced_with_sampling<Uniforms>(
+        &mut self,
+        framebuffer: &Framebuffer,
+        mesh: &Mesh,
+        uniforms: &'a Uniforms,
+        instances: &[Instance],
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: SampledFragmentStage<VS::Varyings, Uniforms> + Sync,
+        Uniforms: InstanceUniforms + Send + Sync + 'a,
+        VS::Varyings: SamplingVaryings + Clone + Send + Sync + 'a,
+    {
+        let mut opaque_draws = Vec::with_capacity(instances.len());
+        for instance in instances {
+            let instance_uniforms = uniforms.for_instance(instance);
+            let class = if self.pipeline.fragment.is_opaque(&instance_uniforms) {
+                DrawClass::Opaque
+            } else {
+                DrawClass::Transparent
+            };
+            let model_view = self
+                .pipeline
+                .fragment
+                .model_view(&instance_uniforms)
+                .unwrap_or(Mat4::IDENTITY);
+            let keys =
+                (class == DrawClass::Transparent).then(|| mesh_centroid_depths(mesh, model_view));
+            let prepared = prepare_triangles(
+                &self.pipeline.vertex,
+                framebuffer,
+                mesh.vertices(),
+                mesh.indices(),
+                keys.as_deref(),
+                &instance_uniforms,
+            );
+            if class == DrawClass::Opaque {
+                let prepared = prepared.into_iter().map(|(_, triangle)| triangle).collect();
+                opaque_draws.push((prepared, instance_uniforms));
+            } else {
+                self.queue_prepared_owned(
+                    prepared,
+                    instance_uniforms,
+                    class,
+                    rasterize_sampled_triangle::<VS::Varyings, FS, Uniforms>,
+                );
+            }
+        }
+        self.queue_opaque_instanced_owned(
+            opaque_draws,
+            rasterize_sampled_triangle::<VS::Varyings, FS, Uniforms>,
+        );
+    }
 }
 
 impl<VS, FS> Pipeline<VS, FS> {
@@ -663,6 +963,29 @@ impl<VS, FS> Pipeline<VS, FS> {
         self.draw_depth(framebuffer, mesh.vertices(), mesh.indices(), uniforms);
     }
 
+    pub fn draw_mesh_depth_instanced<Uniforms>(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        mesh: &Mesh,
+        uniforms: &Uniforms,
+        instances: &[Instance],
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: Sync,
+        Uniforms: InstanceUniforms + Send + Sync,
+        VS::Varyings: Clone + Send + Sync,
+    {
+        for instance in instances {
+            let instance_uniforms = uniforms.for_instance(instance);
+            self.draw_depth(
+                framebuffer,
+                mesh.vertices(),
+                mesh.indices(),
+                &instance_uniforms,
+            );
+        }
+    }
+
     pub fn draw_depth_with_varyings<Vertex, Uniforms>(
         &mut self,
         framebuffer: &mut Framebuffer,
@@ -711,6 +1034,29 @@ impl<VS, FS> Pipeline<VS, FS> {
         VS::Varyings: DepthVaryings + Clone + Send + Sync,
     {
         self.draw_depth_with_varyings(framebuffer, mesh.vertices(), mesh.indices(), uniforms);
+    }
+
+    pub fn draw_mesh_depth_instanced_with_varyings<Uniforms>(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        mesh: &Mesh,
+        uniforms: &Uniforms,
+        instances: &[Instance],
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: Sync,
+        Uniforms: InstanceUniforms + Send + Sync,
+        VS::Varyings: DepthVaryings + Clone + Send + Sync,
+    {
+        for instance in instances {
+            let instance_uniforms = uniforms.for_instance(instance);
+            self.draw_depth_with_varyings(
+                framebuffer,
+                mesh.vertices(),
+                mesh.indices(),
+                &instance_uniforms,
+            );
+        }
     }
 }
 
@@ -816,6 +1162,93 @@ fn dispatch_prepared<V, FS, Uniforms>(
     }
 }
 
+fn dispatch_prepared_instanced<V, FS, Uniforms>(
+    thread_count: usize,
+    framebuffer: &mut Framebuffer,
+    draws: &[(Vec<PreparedTriangle<V>>, Uniforms)],
+    fragment: &FS,
+    state: RasterState,
+    rasterize: RasterFn<V, FS, Uniforms>,
+) where
+    V: Varyings + Clone + Send + Sync,
+    FS: Sync,
+    Uniforms: Sync,
+{
+    if thread_count <= 1 {
+        for (prepared, uniforms) in draws {
+            for triangle in prepared {
+                rasterize(
+                    framebuffer,
+                    triangle.vertices.clone(),
+                    fragment,
+                    uniforms,
+                    state,
+                );
+            }
+        }
+        return;
+    }
+    let indexed = draws
+        .iter()
+        .enumerate()
+        .flat_map(|(draw_index, (prepared, _))| {
+            prepared.iter().map(move |triangle| (triangle, draw_index))
+        })
+        .collect::<Vec<_>>();
+    if indexed.is_empty() || framebuffer.width == 0 || framebuffer.height == 0 {
+        return;
+    }
+    let tiles = make_indexed_tiles(framebuffer.width, framebuffer.height, &indexed);
+    let worker_count = thread_count.min(tiles.len()).max(1);
+    let source = &*framebuffer;
+    let tiles = &tiles;
+    let indexed = &indexed;
+    let results = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            handles.push(scope.spawn(move || {
+                (worker_index..tiles.len())
+                    .step_by(worker_count)
+                    .map(|tile_index| {
+                        rasterize_instanced_tile(
+                            &tiles[tile_index],
+                            indexed,
+                            source,
+                            draws,
+                            fragment,
+                            state,
+                            rasterize,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("tile worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    for result in results {
+        for row in 0..result.framebuffer.height {
+            let destination_start = (result.y + row) * framebuffer.width + result.x;
+            let destination_end = destination_start + result.framebuffer.width;
+            let source_start = row * result.framebuffer.width;
+            let source_end = source_start + result.framebuffer.width;
+            framebuffer.color[destination_start..destination_end]
+                .copy_from_slice(&result.framebuffer.color[source_start..source_end]);
+            if let (Some(destination), Some(source)) = (
+                framebuffer.linear_pixels_mut(),
+                result.framebuffer.linear_pixels(),
+            ) {
+                destination[destination_start..destination_end]
+                    .copy_from_slice(&source[source_start..source_end]);
+            }
+            framebuffer.depth[destination_start..destination_end]
+                .copy_from_slice(&result.framebuffer.depth[source_start..source_end]);
+        }
+    }
+}
+
 fn make_tiles<V>(width: usize, height: usize, prepared: &[PreparedTriangle<V>]) -> Vec<Tile> {
     if width == 0 || height == 0 {
         return Vec::new();
@@ -824,6 +1257,44 @@ fn make_tiles<V>(width: usize, height: usize, prepared: &[PreparedTriangle<V>]) 
     let tiles_y = height.div_ceil(TILE_SIZE);
     let mut bins: Vec<Vec<usize>> = (0..tiles_x * tiles_y).map(|_| Vec::new()).collect();
     for (triangle_index, triangle) in prepared.iter().enumerate() {
+        let min_tile_x = triangle.bounds.min_x as usize / TILE_SIZE;
+        let max_tile_x = triangle.bounds.max_x as usize / TILE_SIZE;
+        let min_tile_y = triangle.bounds.min_y as usize / TILE_SIZE;
+        let max_tile_y = triangle.bounds.max_y as usize / TILE_SIZE;
+        for tile_y in min_tile_y..=max_tile_y {
+            for tile_x in min_tile_x..=max_tile_x {
+                bins[tile_y * tiles_x + tile_x].push(triangle_index);
+            }
+        }
+    }
+    bins.into_iter()
+        .enumerate()
+        .filter_map(|(index, triangles)| {
+            if triangles.is_empty() {
+                return None;
+            }
+            let tile_x = index % tiles_x;
+            let tile_y = index / tiles_x;
+            Some(Tile {
+                x: tile_x * TILE_SIZE,
+                y: tile_y * TILE_SIZE,
+                width: (width - tile_x * TILE_SIZE).min(TILE_SIZE),
+                height: (height - tile_y * TILE_SIZE).min(TILE_SIZE),
+                triangles,
+            })
+        })
+        .collect()
+}
+
+fn make_indexed_tiles<V>(
+    width: usize,
+    height: usize,
+    prepared: &[(&PreparedTriangle<V>, usize)],
+) -> Vec<Tile> {
+    let tiles_x = width.div_ceil(TILE_SIZE);
+    let tiles_y = height.div_ceil(TILE_SIZE);
+    let mut bins: Vec<Vec<usize>> = (0..tiles_x * tiles_y).map(|_| Vec::new()).collect();
+    for (triangle_index, (triangle, _)) in prepared.iter().enumerate() {
         let min_tile_x = triangle.bounds.min_x as usize / TILE_SIZE;
         let max_tile_x = triangle.bounds.max_x as usize / TILE_SIZE;
         let min_tile_y = triangle.bounds.min_y as usize / TILE_SIZE;
@@ -890,6 +1361,59 @@ where
             vertex.position.y -= tile.y as f32;
         }
         rasterize(&mut framebuffer, triangle, fragment, uniforms, state);
+    }
+    TileResult {
+        x: tile.x,
+        y: tile.y,
+        framebuffer,
+    }
+}
+
+fn rasterize_instanced_tile<V, FS, Uniforms>(
+    tile: &Tile,
+    prepared: &[(&PreparedTriangle<V>, usize)],
+    source: &Framebuffer,
+    draws: &[(Vec<PreparedTriangle<V>>, Uniforms)],
+    fragment: &FS,
+    state: RasterState,
+    rasterize: RasterFn<V, FS, Uniforms>,
+) -> TileResult
+where
+    V: Varyings + Clone,
+    Uniforms: Sync,
+{
+    let mut framebuffer = Framebuffer::new(tile.width, tile.height);
+    framebuffer.set_hdr(source.is_hdr());
+    for row in 0..tile.height {
+        let source_start = (tile.y + row) * source.width + tile.x;
+        let source_end = source_start + tile.width;
+        let destination_start = row * tile.width;
+        let destination_end = destination_start + tile.width;
+        framebuffer.color[destination_start..destination_end]
+            .copy_from_slice(&source.color[source_start..source_end]);
+        if let (Some(destination), Some(source_linear)) =
+            (framebuffer.linear_pixels_mut(), source.linear_pixels())
+        {
+            destination[destination_start..destination_end]
+                .copy_from_slice(&source_linear[source_start..source_end]);
+        }
+        framebuffer.depth[destination_start..destination_end]
+            .copy_from_slice(&source.depth[source_start..source_end]);
+    }
+    for &triangle_index in &tile.triangles {
+        let (triangle, draw_index) = prepared[triangle_index];
+        let mut vertices = triangle.vertices.clone();
+        for vertex in &mut vertices {
+            vertex.position.x -= tile.x as f32;
+            vertex.position.y -= tile.y as f32;
+        }
+        rasterize(
+            &mut framebuffer,
+            vertices,
+            fragment,
+            &draws[draw_index].1,
+            state,
+        );
     }
     TileResult {
         x: tile.x,
@@ -1358,6 +1882,40 @@ mod tests {
             Vec3::new(0.25, 0.5, 0.25),
         );
         assert_eq!(result.color, Vec4::new(0.25, 0.5, 0.25, 1.0));
+    }
+
+    #[derive(Clone, Copy)]
+    struct InstanceTintProbe {
+        model: Mat4,
+        tint_applications: usize,
+    }
+
+    impl InstanceUniforms for InstanceTintProbe {
+        fn set_instance_model(&mut self, model: Mat4) {
+            self.model = model;
+        }
+
+        fn apply_instance_tint(&mut self, _: Vec4) {
+            self.tint_applications += 1;
+        }
+    }
+
+    #[test]
+    fn identity_instance_tint_skips_uniform_rewrite() {
+        let base = InstanceTintProbe {
+            model: Mat4::IDENTITY,
+            tint_applications: 0,
+        };
+        let identity = Instance::with_tint(
+            Mat4::translate(Vec3::new(1.0, 0.0, 0.0)),
+            Vec4::new(1.0, 1.0, 1.0, 1.0),
+        );
+        let tinted = Instance::with_tint(
+            Mat4::translate(Vec3::new(1.0, 0.0, 0.0)),
+            Vec4::new(0.5, 1.0, 1.0, 1.0),
+        );
+        assert_eq!(base.for_instance(&identity).tint_applications, 0);
+        assert_eq!(base.for_instance(&tinted).tint_applications, 1);
     }
 
     #[test]

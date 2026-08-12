@@ -4,16 +4,18 @@
 //! positions by `model`, and the fragment stage uses the world-space camera
 //! and lights. Final color clamps to `[0, 1]` before 8-bit conversion.
 
-use crate::fb::argb8888_linear;
+use crate::fb::{argb8888, argb8888_linear};
 use crate::ibl::IblMaps;
 use crate::image::{ColorSpace, Texture, TextureDerivatives, srgb_to_linear};
 use crate::math::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use crate::mesh::MeshVertex;
 use crate::pipeline::{
-    FragmentStage, SampledFragmentStage, SamplingVaryings, Varyings, VertexOutput, VertexStage,
+    FragmentStage, InstanceUniforms, SampledFragmentStage, SamplingVaryings, Varyings,
+    VertexOutput, VertexStage,
 };
 use crate::shadow::{CascadeShadowState, CubeShadowState, ShadowMap, ShadowState};
 use crate::skybox::CubeTexture;
+use std::sync::Arc;
 
 mod ggx;
 pub mod shader_pack;
@@ -380,6 +382,16 @@ fn finite_nonnegative(value: f32) -> f32 {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct BlinnPhongShared {
+    directional_lights: [DirectionalLight; MAX_DIRECTIONAL_LIGHTS],
+    directional_light_count: usize,
+    point_lights: [PointLight; MAX_POINT_LIGHTS],
+    point_light_count: usize,
+    point_shadow_states: [Option<CubeShadowState>; MAX_POINT_LIGHTS],
+    shadow_state: Option<ShadowState>,
+}
+
 /// Blinn-Phong uniforms with cache-safe matrix updates and fixed light arrays.
 ///
 /// The arrays keep uniform clones cheap and preserve deterministic submission
@@ -407,6 +419,7 @@ fn finite_nonnegative(value: f32) -> f32 {
 /// );
 /// uniforms.model = Mat4::IDENTITY;
 /// ```
+/// Blinn-Phong material and per-instance transform state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlinnPhongUniforms {
     model: Mat4,
@@ -418,12 +431,9 @@ pub struct BlinnPhongUniforms {
     pub shininess: f32,
     pub camera_position: Vec3,
     pub alpha: f32,
-    directional_lights: [DirectionalLight; MAX_DIRECTIONAL_LIGHTS],
-    directional_light_count: usize,
-    point_lights: [PointLight; MAX_POINT_LIGHTS],
-    point_light_count: usize,
-    point_shadow_states: [Option<CubeShadowState>; MAX_POINT_LIGHTS],
-    shadow_state: Option<ShadowState>,
+    /// Shared because instance submission changes only model, normal, and tint.
+    /// Shadow and light state is sanitized once for the whole submission.
+    shared: Arc<BlinnPhongShared>,
     transform: Mat4,
     normal_matrix: Mat3,
 }
@@ -452,24 +462,26 @@ impl BlinnPhongUniforms {
             shininess,
             camera_position,
             alpha: 1.0,
-            directional_lights: std::array::from_fn(|index| {
-                if index == 0 {
-                    sanitize_directional_light(directional_light)
-                } else {
-                    DirectionalLight::default()
-                }
+            shared: Arc::new(BlinnPhongShared {
+                directional_lights: std::array::from_fn(|index| {
+                    if index == 0 {
+                        sanitize_directional_light(directional_light)
+                    } else {
+                        DirectionalLight::default()
+                    }
+                }),
+                directional_light_count: 1,
+                point_lights: std::array::from_fn(|index| {
+                    if index == 0 {
+                        sanitize_point_light(point_light)
+                    } else {
+                        PointLight::default()
+                    }
+                }),
+                point_light_count: 1,
+                point_shadow_states: std::array::from_fn(|_| None),
+                shadow_state: None,
             }),
-            directional_light_count: 1,
-            point_lights: std::array::from_fn(|index| {
-                if index == 0 {
-                    sanitize_point_light(point_light)
-                } else {
-                    PointLight::default()
-                }
-            }),
-            point_light_count: 1,
-            point_shadow_states: std::array::from_fn(|_| None),
-            shadow_state: None,
             transform: projection * view * model,
             normal_matrix: model.normal_matrix().unwrap_or_default(),
         }
@@ -558,31 +570,31 @@ impl BlinnPhongUniforms {
     }
 
     /// Returns the first directional light, or a zero light when the array is empty.
-    pub const fn directional_light(&self) -> DirectionalLight {
-        self.directional_lights[0]
+    pub fn directional_light(&self) -> DirectionalLight {
+        self.shared.directional_lights[0]
     }
 
     /// Returns the first point light, or a zero light when the array is empty.
-    pub const fn point_light(&self) -> PointLight {
-        self.point_lights[0]
+    pub fn point_light(&self) -> PointLight {
+        self.shared.point_lights[0]
     }
 
     /// Returns the active directional lights in array order.
     pub fn directional_lights(&self) -> &[DirectionalLight] {
-        &self.directional_lights[..self.directional_light_count]
+        &self.shared.directional_lights[..self.shared.directional_light_count]
     }
 
     /// Returns the active point lights in array order.
     pub fn point_lights(&self) -> &[PointLight] {
-        &self.point_lights[..self.point_light_count]
+        &self.shared.point_lights[..self.shared.point_light_count]
     }
 
-    pub const fn directional_light_count(&self) -> usize {
-        self.directional_light_count
+    pub fn directional_light_count(&self) -> usize {
+        self.shared.directional_light_count
     }
 
-    pub const fn point_light_count(&self) -> usize {
-        self.point_light_count
+    pub fn point_light_count(&self) -> usize {
+        self.shared.point_light_count
     }
 
     /// Appends a directional light and returns its array index.
@@ -590,24 +602,26 @@ impl BlinnPhongUniforms {
         &mut self,
         light: DirectionalLight,
     ) -> Result<usize, &'static str> {
-        if self.directional_light_count == MAX_DIRECTIONAL_LIGHTS {
+        if self.shared.directional_light_count == MAX_DIRECTIONAL_LIGHTS {
             return Err("directional light capacity reached");
         }
-        let index = self.directional_light_count;
-        self.directional_lights[index] = sanitize_directional_light(light);
-        self.directional_light_count += 1;
+        let shared = Arc::make_mut(&mut self.shared);
+        let index = shared.directional_light_count;
+        shared.directional_lights[index] = sanitize_directional_light(light);
+        shared.directional_light_count += 1;
         Ok(index)
     }
 
     /// Appends a point light and returns its array index.
     pub fn add_point_light(&mut self, light: PointLight) -> Result<usize, &'static str> {
-        if self.point_light_count == MAX_POINT_LIGHTS {
+        if self.shared.point_light_count == MAX_POINT_LIGHTS {
             return Err("point light capacity reached");
         }
-        let index = self.point_light_count;
-        self.point_lights[index] = sanitize_point_light(light);
-        self.point_shadow_states[index] = None;
-        self.point_light_count += 1;
+        let shared = Arc::make_mut(&mut self.shared);
+        let index = shared.point_light_count;
+        shared.point_lights[index] = sanitize_point_light(light);
+        shared.point_shadow_states[index] = None;
+        shared.point_light_count += 1;
         Ok(index)
     }
 
@@ -617,72 +631,80 @@ impl BlinnPhongUniforms {
         index: usize,
         light: DirectionalLight,
     ) -> Result<(), &'static str> {
-        let Some(slot) = self.directional_lights.get_mut(index) else {
-            return Err("directional light index out of bounds");
-        };
-        if index >= self.directional_light_count {
+        if index >= self.shared.directional_light_count {
             return Err("directional light index out of bounds");
         }
+        let shared = Arc::make_mut(&mut self.shared);
+        let slot = &mut shared.directional_lights[index];
         *slot = sanitize_directional_light(light);
         if index == 0 {
-            self.shadow_state = None;
+            shared.shadow_state = None;
         }
         Ok(())
     }
 
     /// Replaces a point light at an existing array index.
     pub fn set_point_light(&mut self, index: usize, light: PointLight) -> Result<(), &'static str> {
-        if index >= self.point_light_count {
+        if index >= self.shared.point_light_count {
             return Err("point light index out of bounds");
         }
-        self.point_lights[index] = sanitize_point_light(light);
-        self.point_shadow_states[index] = None;
+        let shared = Arc::make_mut(&mut self.shared);
+        shared.point_lights[index] = sanitize_point_light(light);
+        shared.point_shadow_states[index] = None;
         Ok(())
     }
 
     /// Removes a directional light and compacts later entries.
     pub fn remove_directional_light(&mut self, index: usize) -> Option<DirectionalLight> {
-        if index >= self.directional_light_count {
+        if index >= self.shared.directional_light_count {
             return None;
         }
-        let removed = self.directional_lights[index];
-        self.directional_lights[index..self.directional_light_count].rotate_left(1);
-        self.directional_light_count -= 1;
-        self.directional_lights[self.directional_light_count] = DirectionalLight::default();
+        let shared = Arc::make_mut(&mut self.shared);
+        let removed = shared.directional_lights[index];
+        shared.directional_lights[index..shared.directional_light_count].rotate_left(1);
+        shared.directional_light_count -= 1;
+        shared.directional_lights[shared.directional_light_count] = DirectionalLight::default();
         if index == 0 {
-            self.shadow_state = None;
+            shared.shadow_state = None;
         }
         Some(removed)
     }
 
     /// Removes a point light and compacts later entries.
     pub fn remove_point_light(&mut self, index: usize) -> Option<PointLight> {
-        if index >= self.point_light_count {
+        if index >= self.shared.point_light_count {
             return None;
         }
-        let removed = self.point_lights[index];
-        self.point_lights[index..self.point_light_count].rotate_left(1);
-        self.point_shadow_states[index..self.point_light_count].rotate_left(1);
-        self.point_light_count -= 1;
-        self.point_lights[self.point_light_count] = PointLight::default();
-        self.point_shadow_states[self.point_light_count] = None;
+        let shared = Arc::make_mut(&mut self.shared);
+        let removed = shared.point_lights[index];
+        shared.point_lights[index..shared.point_light_count].rotate_left(1);
+        shared.point_shadow_states[index..shared.point_light_count].rotate_left(1);
+        shared.point_light_count -= 1;
+        shared.point_lights[shared.point_light_count] = PointLight::default();
+        shared.point_shadow_states[shared.point_light_count] = None;
         Some(removed)
     }
 
     pub fn clear_directional_lights(&mut self) {
-        self.directional_lights[..self.directional_light_count].fill(DirectionalLight::default());
-        self.directional_light_count = 0;
-        self.shadow_state = None;
+        let shared = Arc::make_mut(&mut self.shared);
+        shared.directional_lights[..shared.directional_light_count]
+            .fill(DirectionalLight::default());
+        shared.directional_light_count = 0;
+        shared.shadow_state = None;
     }
 
     pub fn clear_point_lights(&mut self) {
-        self.point_lights[..self.point_light_count].fill(PointLight::default());
-        self.point_shadow_states[..self.point_light_count].fill(None);
-        self.point_light_count = 0;
+        let shared = Arc::make_mut(&mut self.shared);
+        shared.point_lights[..shared.point_light_count].fill(PointLight::default());
+        shared.point_shadow_states[..shared.point_light_count].fill(None);
+        shared.point_light_count = 0;
     }
 
     pub fn point_light_shadow(&self, index: usize) -> Option<&CubeShadowState> {
-        self.point_shadow_states.get(index).and_then(Option::as_ref)
+        self.shared
+            .point_shadow_states
+            .get(index)
+            .and_then(Option::as_ref)
     }
 
     pub fn set_point_light_shadow(
@@ -690,30 +712,36 @@ impl BlinnPhongUniforms {
         index: usize,
         shadow_state: Option<CubeShadowState>,
     ) -> Result<(), &'static str> {
-        if index >= self.point_light_count {
+        if index >= self.shared.point_light_count {
             return Err("point light index out of bounds");
         }
-        self.point_shadow_states[index] = shadow_state;
+        Arc::make_mut(&mut self.shared).point_shadow_states[index] = shadow_state;
         Ok(())
     }
 
-    pub const fn light_view_projection(&self) -> Mat4 {
-        match &self.shadow_state {
+    pub fn light_view_projection(&self) -> Mat4 {
+        match &self.shared.shadow_state {
             Some(state) => state.light_view_projection(),
             None => Mat4::IDENTITY,
         }
     }
 
     pub fn shadow_map(&self) -> Option<&ShadowMap> {
-        self.shadow_state.as_ref().map(ShadowState::shadow_map)
+        self.shared
+            .shadow_state
+            .as_ref()
+            .map(ShadowState::shadow_map)
     }
 
     pub fn cascaded_shadow(&self) -> Option<&CascadeShadowState> {
-        self.shadow_state.as_ref().and_then(ShadowState::cascades)
+        self.shared
+            .shadow_state
+            .as_ref()
+            .and_then(ShadowState::cascades)
     }
 
-    pub const fn shadow_bias(&self) -> (f32, f32) {
-        match &self.shadow_state {
+    pub fn shadow_bias(&self) -> (f32, f32) {
+        match &self.shared.shadow_state {
             Some(state) => state.bias(),
             None => (0.002, 0.02),
         }
@@ -728,13 +756,14 @@ impl BlinnPhongUniforms {
         directional_light: DirectionalLight,
         shadow_state: Option<ShadowState>,
     ) {
-        if self.directional_light_count == 0 {
-            self.directional_lights[0] = sanitize_directional_light(directional_light);
-            self.directional_light_count = 1;
+        let shared = Arc::make_mut(&mut self.shared);
+        if shared.directional_light_count == 0 {
+            shared.directional_lights[0] = sanitize_directional_light(directional_light);
+            shared.directional_light_count = 1;
         } else {
-            self.directional_lights[0] = sanitize_directional_light(directional_light);
+            shared.directional_lights[0] = sanitize_directional_light(directional_light);
         }
-        self.shadow_state = shadow_state;
+        shared.shadow_state = shadow_state;
     }
 
     /// Replaces directional light zero with an opt-in cascaded shadow state.
@@ -758,11 +787,12 @@ impl BlinnPhongUniforms {
         self.view = view;
         self.rebuild_transform();
         if self
+            .shared
             .shadow_state
             .as_ref()
             .is_some_and(ShadowState::is_cascaded)
         {
-            self.shadow_state = None;
+            Arc::make_mut(&mut self.shared).shadow_state = None;
         }
     }
 
@@ -770,16 +800,23 @@ impl BlinnPhongUniforms {
         self.projection = projection;
         self.rebuild_transform();
         if self
+            .shared
             .shadow_state
             .as_ref()
             .is_some_and(ShadowState::is_cascaded)
         {
-            self.shadow_state = None;
+            Arc::make_mut(&mut self.shared).shadow_state = None;
         }
     }
 
     pub fn set_alpha(&mut self, alpha: f32) {
         self.alpha = alpha.clamp(0.0, 1.0);
+    }
+
+    fn apply_instance_rgb_tint(&mut self, tint: Vec4) {
+        self.ambient_color = tint_linear_color(self.ambient_color, tint);
+        self.diffuse_color = tint_linear_color(self.diffuse_color, tint);
+        self.specular_color = tint_linear_color(self.specular_color, tint);
     }
 
     fn rebuild_caches(&mut self) {
@@ -1082,7 +1119,7 @@ impl BlinnPhongUniforms {
         light_space_position: Vec4,
         normal: Vec3,
     ) -> f32 {
-        let Some(shadow_state) = self.shadow_state.as_ref() else {
+        let Some(shadow_state) = self.shared.shadow_state.as_ref() else {
             return 1.0;
         };
         if let Some(cascades) = shadow_state.cascades() {
@@ -1488,6 +1525,99 @@ fn texture_has_no_alpha(texture: &Texture) -> bool {
     texture.pixels().iter().all(|pixel| pixel[3] == 255)
 }
 
+fn tint_linear_color(color: Vec3, tint: Vec4) -> Vec3 {
+    color * Vec3::new(tint.x, tint.y, tint.z)
+}
+
+fn tint_encoded_color(color: u32, tint: Vec4) -> u32 {
+    let [alpha, red, green, blue] = color.to_be_bytes();
+    argb8888(
+        alpha,
+        (f32::from(red) * tint.x).round() as u8,
+        (f32::from(green) * tint.y).round() as u8,
+        (f32::from(blue) * tint.z).round() as u8,
+    )
+}
+
+/// Each uniform chain owns instance alpha in exactly one scalar field.
+fn apply_instance_alpha(alpha: &mut f32, tint: Vec4) {
+    *alpha = (*alpha * tint.w).clamp(0.0, 1.0);
+}
+
+impl InstanceUniforms for FlatColorUniforms {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.transform = self.transform * model;
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.color = tint_encoded_color(self.color, tint);
+        apply_instance_alpha(&mut self.alpha, tint);
+    }
+}
+
+impl InstanceUniforms for MeshUniforms {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.set_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.color = tint_encoded_color(self.color, tint);
+        apply_instance_alpha(&mut self.alpha, tint);
+    }
+}
+
+impl<'a> InstanceUniforms for TexturedUniforms<'a> {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.transform = self.transform * model;
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        apply_instance_alpha(&mut self.alpha, tint);
+    }
+}
+
+impl InstanceUniforms for BlinnPhongUniforms {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.set_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.apply_instance_rgb_tint(tint);
+        apply_instance_alpha(&mut self.alpha, tint);
+    }
+}
+
+impl<'a> InstanceUniforms for EnvironmentBlinnPhongUniforms<'a> {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.lighting.set_instance_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.lighting.apply_instance_tint(tint);
+    }
+}
+
+impl<'a> InstanceUniforms for TexturedBlinnPhongUniforms<'a> {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.lighting.set_instance_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.lighting.apply_instance_rgb_tint(tint);
+        apply_instance_alpha(&mut self.alpha, tint);
+    }
+}
+
+impl<'a> InstanceUniforms for NormalMappedBlinnPhongUniforms<'a> {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.lighting.set_instance_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.lighting.apply_instance_tint(tint);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1523,6 +1653,108 @@ mod tests {
         // so N dot H = 0.9238795. With shininess 8, specular is 0.53079,
         // which rounds to 135 in each 8-bit channel.
         assert_eq!(BlinnPhongShader::shade(&varyings, &uniforms()), 0xffc1c1c1);
+    }
+
+    #[test]
+    fn flat_instance_alpha_is_applied_once() {
+        let mut uniforms = FlatColorUniforms::new(Mat4::IDENTITY, 0xff102030);
+        uniforms.apply_instance_tint(Vec4::new(1.0, 1.0, 1.0, 0.5));
+        assert_eq!(
+            FragmentStage::run(&FlatColorShader, &(), &uniforms).to_be_bytes()[0],
+            128
+        );
+    }
+
+    #[test]
+    fn mesh_instance_alpha_is_applied_once() {
+        let mut uniforms =
+            MeshUniforms::new(Mat4::IDENTITY, Mat4::IDENTITY, Mat4::IDENTITY, 0xff102030);
+        uniforms.apply_instance_tint(Vec4::new(1.0, 1.0, 1.0, 0.5));
+        assert_eq!(
+            FragmentStage::run(&MeshShader, &(), &uniforms).to_be_bytes()[0],
+            128
+        );
+    }
+
+    #[test]
+    fn textured_blinn_phong_instance_alpha_is_applied_once() {
+        let texture = Texture::new(1, 1, vec![[255, 255, 255, 255]]).unwrap();
+        let mut uniforms =
+            TexturedBlinnPhongUniforms::new(uniforms(), &texture, TextureFilter::Nearest);
+        uniforms.apply_instance_tint(Vec4::new(1.0, 1.0, 1.0, 0.5));
+        let varyings = TexturedBlinnPhongVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            texcoord: Vec2::ZERO,
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        let output = TexturedBlinnPhongShader.run_with_sampling(
+            &varyings,
+            &crate::pipeline::SampleDerivatives::default(),
+            &uniforms,
+        );
+        assert_eq!(output.to_be_bytes()[0], 128);
+    }
+
+    #[test]
+    fn ggx_instance_alpha_is_applied_once() {
+        let lighting = BlinnPhongUniforms::new_with_linear_colors(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            8.0,
+            Vec3::new(0.0, 0.0, 1.0),
+            DirectionalLight::new(Vec3::ZERO, Vec3::ZERO),
+            PointLight::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0.0, 0.0),
+        );
+        let mut uniforms = CookTorranceUniforms::new_with_linear_base_color(
+            lighting,
+            Vec3::new(1.0, 1.0, 1.0),
+            0.0,
+            0.5,
+        );
+        uniforms.apply_instance_tint(Vec4::new(1.0, 1.0, 1.0, 0.5));
+        let varyings = BlinnPhongVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        assert_eq!(
+            CookTorranceShader::shade(&varyings, &uniforms).to_be_bytes()[0],
+            128
+        );
+    }
+
+    #[test]
+    fn ggx_instance_rgb_tint_is_applied_once() {
+        let lighting = BlinnPhongUniforms::new_with_linear_colors(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::ZERO,
+            Vec3::ZERO,
+            8.0,
+            Vec3::new(0.0, 0.0, 1.0),
+            DirectionalLight::new(Vec3::ZERO, Vec3::ZERO),
+            PointLight::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0.0, 0.0),
+        );
+        let mut uniforms = CookTorranceUniforms::new_with_linear_base_color(
+            lighting,
+            Vec3::new(1.0, 1.0, 1.0),
+            0.0,
+            0.5,
+        );
+        uniforms.apply_instance_tint(Vec4::new(0.5, 0.5, 0.5, 1.0));
+        let varyings = BlinnPhongVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        assert_eq!(CookTorranceShader::shade(&varyings, &uniforms), 0xffbcbcbc);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use super::linearize_color;
 use crate::fb::argb8888_linear;
 use crate::math::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use crate::mesh::{Mesh, MeshVertex};
-use crate::pipeline::{FragmentStage, Varyings, VertexOutput, VertexStage};
+use crate::pipeline::{FragmentStage, InstanceUniforms, Varyings, VertexOutput, VertexStage};
 
 /// A mesh vertex with a per-triangle barycentric coordinate.
 ///
@@ -679,6 +679,68 @@ impl FragmentStage<ShaderPackVaryings, WireframeUniforms> for WireframeShader {
             uniforms.base_color
         };
         argb8888_linear(1.0, [color.x, color.y, color.z])
+    }
+}
+
+impl InstanceUniforms for ToonUniforms {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.set_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.base_color = self.base_color * Vec3::new(tint.x, tint.y, tint.z);
+    }
+}
+
+impl InstanceUniforms for PsxUniforms {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.set_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.base_color = self.base_color * Vec3::new(tint.x, tint.y, tint.z);
+    }
+}
+
+impl InstanceUniforms for DitherUniforms {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.set_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.base_color = self.base_color * Vec3::new(tint.x, tint.y, tint.z);
+    }
+}
+
+impl InstanceUniforms for FogUniforms {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.set_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        let tint = Vec3::new(tint.x, tint.y, tint.z);
+        self.base_color = self.base_color * tint;
+        self.fog_color = self.fog_color * tint;
+    }
+}
+
+impl InstanceUniforms for NormalsUniforms {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.set_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, _: Vec4) {}
+}
+
+impl InstanceUniforms for WireframeUniforms {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.set_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        let tint = Vec3::new(tint.x, tint.y, tint.z);
+        self.base_color = self.base_color * tint;
+        self.edge_color = self.edge_color * tint;
     }
 }
 
