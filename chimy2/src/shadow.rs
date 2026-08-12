@@ -1546,11 +1546,20 @@ mod tests {
     fn config_count_and_lambda_reach_production_rendering() {
         let camera = test_camera();
         let config_two = CascadeShadowConfig::new(2, 0.0);
+        let config_two_logarithmic = CascadeShadowConfig::new(2, 1.0);
         let config_four = CascadeShadowConfig::new(4, 1.0);
         let two = render_cascade_shadow_maps_with_config(
             camera,
             Vec3::new(0.5, 1.0, 0.25),
             config_two,
+            8,
+            &[],
+        )
+        .unwrap();
+        let two_logarithmic = render_cascade_shadow_maps_with_config(
+            camera,
+            Vec3::new(0.5, 1.0, 0.25),
+            config_two_logarithmic,
             8,
             &[],
         )
@@ -1566,6 +1575,10 @@ mod tests {
         assert_eq!(two.cascade_count(), 2);
         assert_eq!(four.cascade_count(), 4);
         assert_ne!(two.split_depths()[0], four.split_depths()[0]);
+        assert_ne!(
+            two.light_view_projections()[0],
+            two_logarithmic.light_view_projections()[0]
+        );
     }
 
     #[test]
