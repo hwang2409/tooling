@@ -1423,7 +1423,7 @@ mod tests {
         );
         let clip = projection * Vec4::new(caster.x, caster.y, caster.z, 1.0);
         let ndc = Vec3::new(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
-        assert!(ndc.z <= 1.0 + 1e-5, "caster clipped at {ndc:?}");
+        assert!(ndc.z.abs() <= 1.0 + 1e-5, "caster clipped at {ndc:?}");
     }
 
     #[test]
