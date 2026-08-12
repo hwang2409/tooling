@@ -655,19 +655,21 @@ fn finite_or_zero(value: f32) -> f32 {
 }
 
 fn sanitize_near_plane(value: f32) -> f32 {
-    const MAX_NEAR_PLANE: f32 = 1_000_000.0;
+    const MIN_NEAR_PLANE: f32 = 0.0001;
+    const MAX_NEAR_PLANE: f32 = 10_000.0;
     if value.is_finite() && value > 0.0 {
-        value.min(MAX_NEAR_PLANE)
+        value.clamp(MIN_NEAR_PLANE, MAX_NEAR_PLANE)
     } else {
-        0.01
+        0.01_f32.clamp(MIN_NEAR_PLANE, MAX_NEAR_PLANE)
     }
 }
 
 fn sanitize_far_plane(value: f32, near_plane: f32) -> f32 {
+    const MAX_FAR_PLANE: f32 = 100_000.0;
     if value.is_finite() && value > near_plane {
-        value
+        value.min(MAX_FAR_PLANE)
     } else {
-        near_plane + near_plane.max(1.0) * 0.01
+        (near_plane + near_plane.max(1.0) * 0.01).min(MAX_FAR_PLANE)
     }
 }
 
@@ -756,6 +758,27 @@ mod tests {
     }
 
     #[test]
+    fn production_capture_keeps_linear_depth_near_and_at_far() {
+        let capture = |distance: f32| {
+            let plane = crate::demo::plane_xz(20.0, 20.0, 1, 1.0);
+            let model = Mat4::translate(Vec3::new(0.0, 0.0, distance))
+                * Mat4::rotate(Vec3::new(1.0, 0.0, 0.0), -std::f32::consts::FRAC_PI_2);
+            render_cube_shadow_map(Vec3::ZERO, 0.1, 1000.0, 1024, &[(&plane, model)]).unwrap()
+        };
+
+        let near_far_map = capture(999.0);
+        assert_close(
+            near_far_map.sample_depth(CubeShadowFace::PositiveZ, Vec2::new(0.5, 0.5)),
+            0.999,
+        );
+        let exact_far_map = capture(1000.0);
+        assert_eq!(
+            exact_far_map.sample_depth(CubeShadowFace::PositiveZ, Vec2::new(0.5, 0.5)),
+            1.0
+        );
+    }
+
+    #[test]
     fn cube_map_pcf_clamps_at_face_edges_without_wrap() {
         let map = CubeShadowMap::from_depth(
             2,
@@ -788,16 +811,22 @@ mod tests {
                 .all(|matrix| matrix.data.iter().all(|value| value.is_finite()))
         );
 
-        let extreme = CubeShadowMap::from_depth(
-            1,
-            f32::MAX,
-            f32::NEG_INFINITY,
-            std::array::from_fn(|_| vec![1.0]),
-        )
-        .unwrap();
+        let extreme =
+            CubeShadowMap::from_depth(1, f32::MAX, f32::MAX, std::array::from_fn(|_| vec![1.0]))
+                .unwrap();
         assert!(extreme.near_plane().is_finite());
         assert!(extreme.far_plane().is_finite());
         assert!(extreme.far_plane() > extreme.near_plane());
+    }
+
+    #[test]
+    fn extreme_cube_face_matrices_are_finite() {
+        let matrices = cube_face_view_projections(Vec3::ZERO, f32::MAX, f32::MAX);
+        assert!(
+            matrices
+                .iter()
+                .all(|matrix| matrix.data.iter().all(|value| value.is_finite()))
+        );
     }
 
     #[test]
