@@ -5,6 +5,7 @@
 //! and lights. Final color clamps to `[0, 1]` before 8-bit conversion.
 
 use crate::fb::argb8888_linear;
+use crate::ibl::IblMaps;
 use crate::image::{ColorSpace, Texture, TextureDerivatives, srgb_to_linear};
 use crate::math::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use crate::mesh::MeshVertex;

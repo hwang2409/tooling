@@ -3,11 +3,15 @@
 use chimy2::camera::OrbitController;
 use chimy2::demo::{DemoArgs, run_demo, uv_sphere};
 use chimy2::fb::{Framebuffer, argb8888};
+use chimy2::ibl::{FloatCube, IblMaps};
 use chimy2::image::Texture;
 use chimy2::math::{Mat4, Vec3};
 use chimy2::pipeline::Pipeline;
 use chimy2::present::InputState;
-use chimy2::shaders::{CookTorranceShader, CookTorranceUniforms, DirectionalLight, PointLight};
+use chimy2::shaders::{
+    CookTorranceShader, CookTorranceUniforms, DirectionalLight, IblCookTorranceShader,
+    IblCookTorranceUniforms, PointLight,
+};
 use chimy2::skybox::CubeTexture;
 use std::path::Path;
 
@@ -23,7 +27,25 @@ fn load_skybox() -> Result<CubeTexture, Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = DemoArgs::from_env()?;
     let hdr = args.hdr;
+    let ibl = args.ibl;
     let skybox = load_skybox()?;
+    // The maps are immutable frame data. An environment swap must repeat this
+    // call so no stale precomputed lighting survives the swap.
+    let ibl_maps = if ibl {
+        if hdr {
+            // The source asset has a bright region. Scale its linear decode so
+            // the HDR path carries values above one into ACES.
+            let hdr_environment = FloatCube::from_cube_texture(&skybox, 3.0);
+            Some(IblMaps::from_float_environment(
+                &hdr_environment,
+                Default::default(),
+            ))
+        } else {
+            Some(IblMaps::from_environment(&skybox))
+        }
+    } else {
+        None
+    };
     let sphere = uv_sphere(0.72, 24, 48);
 
     run_demo(
@@ -75,14 +97,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ));
                 }
             }
-            let mut pipeline = Pipeline::new(CookTorranceShader, CookTorranceShader);
-            pipeline.set_hdr(hdr);
-            pipeline.render(framebuffer, |frame, target| {
-                frame.draw_skybox(target, &skybox, camera);
-                for uniform in &uniforms {
-                    frame.draw_mesh(target, &sphere, uniform);
-                }
-            });
+            if let Some(ibl_maps) = ibl_maps.as_ref() {
+                let ibl_uniforms = uniforms
+                    .iter()
+                    .cloned()
+                    .map(|lighting| IblCookTorranceUniforms {
+                        lighting,
+                        ibl: ibl_maps,
+                    })
+                    .collect::<Vec<_>>();
+                let mut pipeline = Pipeline::new(IblCookTorranceShader, IblCookTorranceShader);
+                pipeline.set_hdr(hdr);
+                pipeline.render(framebuffer, |frame, target| {
+                    frame.draw_skybox(target, &skybox, camera);
+                    for uniform in &ibl_uniforms {
+                        frame.draw_mesh(target, &sphere, uniform);
+                    }
+                });
+            } else {
+                let mut pipeline = Pipeline::new(CookTorranceShader, CookTorranceShader);
+                pipeline.set_hdr(hdr);
+                pipeline.render(framebuffer, |frame, target| {
+                    frame.draw_skybox(target, &skybox, camera);
+                    for uniform in &uniforms {
+                        frame.draw_mesh(target, &sphere, uniform);
+                    }
+                });
+            }
         },
     )
 }
