@@ -19,11 +19,12 @@
 use crate::fb::Framebuffer;
 use crate::image::Texture;
 use crate::math::{Mat4, Vec2, Vec3, Vec4};
-use crate::mesh::{Mesh, MeshVertex};
-use crate::pipeline::{Instance, Pipeline};
+use crate::mesh::{LodMesh, Mesh, MeshVertex, SimplifyOptions, SphereProjection};
+use crate::pipeline::{Instance, InstanceUniforms, Pipeline};
 use crate::postfx::{AcesTonemapPass, BloomPass, FxaaPass, PostChain, SsaoPass, VignettePass};
 use crate::present::{InputState, run_with_input};
 use crate::shaders::{BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, PointLight};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::f32::consts::{PI, TAU};
 use std::fs::File;
@@ -469,6 +470,166 @@ pub struct InstancingScene {
     pub instances: Vec<Instance>,
     pub camera: crate::camera::Camera,
     pub lighting: BlinnPhongUniforms,
+}
+
+/// Shared ring scene for inspecting cached mesh LOD transitions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LodScene {
+    pub mesh: LodMesh,
+    pub models: Vec<Mat4>,
+    pub uniforms: Vec<BlinnPhongUniforms>,
+    pub camera: crate::camera::Camera,
+    pub projection: Mat4,
+}
+
+/// Builds deterministic rings at increasing distances. The faceted sphere
+/// makes silhouette changes visible when the selection crosses thresholds.
+pub fn build_lod_scene(aspect: f32) -> LodScene {
+    let camera = crate::camera::Camera::new(
+        Vec3::new(0.0, 0.0, 0.0),
+        crate::math::Quat::IDENTITY,
+        PI / 3.0,
+        aspect.max(0.01),
+        0.1,
+        80.0,
+    );
+    let source = subdivided_octahedron(3);
+    // Keep the shared golden scene platform-independent. This fixed focal
+    // length avoids libm differences in tan(PI / 6).
+    const FOCAL_Y: f32 = 1.7320508;
+    let projection = Mat4::perspective_from_focal_length(FOCAL_Y, aspect.max(0.01), 0.1, 80.0);
+    let mut mesh = LodMesh::with_ratios_and_options(
+        source,
+        &[0.5, 0.25, 0.125],
+        SimplifyOptions {
+            sphere_projection: Some(SphereProjection::new(Vec3::ZERO, 1.0, 1.0e-5)),
+        },
+    );
+    mesh.set_thresholds(vec![100.0, 30.0, 10.0]);
+    let base = BlinnPhongUniforms::new_with_linear_colors(
+        Mat4::IDENTITY,
+        camera.view_matrix(),
+        projection,
+        Vec3::new(0.12, 0.12, 0.12),
+        Vec3::new(0.72, 0.78, 0.9),
+        Vec3::new(0.25, 0.25, 0.25),
+        24.0,
+        camera.position,
+        DirectionalLight::new(Vec3::new(-0.4, 0.7, 0.6), Vec3::new(1.0, 0.92, 0.8)),
+        PointLight::new(
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.2, 0.3, 0.5),
+            1.0,
+            0.03,
+            0.01,
+        ),
+    );
+    let colors = [
+        Vec4::new(0.95, 0.35, 0.35, 1.0),
+        Vec4::new(0.35, 0.75, 0.95, 1.0),
+        Vec4::new(0.85, 0.70, 0.25, 1.0),
+    ];
+    let mut models = Vec::new();
+    let mut uniforms = Vec::new();
+    for (ring, color) in colors.into_iter().enumerate() {
+        let ring_y = (ring as f32 - 1.0) * 2.0;
+        let depths = match ring {
+            0 => [3.0; 5],
+            1 => [10.0; 5],
+            _ => [30.0, 50.0, 70.0, 100.0, 150.0],
+        };
+        for (column, depth) in depths.into_iter().enumerate() {
+            let x = column as f32 * 1.5 - 3.0;
+            let position = Vec3::new(x, ring_y, -depth);
+            let scale = 0.7;
+            let model = Mat4::translate(position) * Mat4::scale(Vec3::new(scale, scale, scale));
+            models.push(model);
+            uniforms.push(base.for_instance(&Instance::with_tint(model, color)));
+        }
+    }
+    LodScene {
+        mesh,
+        models,
+        uniforms,
+        camera,
+        projection,
+    }
+}
+
+/// Renders the LOD ring scene. Selection happens once for each object.
+pub fn render_lod_scene(framebuffer: &mut Framebuffer, scene: &LodScene) {
+    framebuffer.clear(crate::fb::argb8888(255, 8, 10, 18));
+    let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
+    pipeline.set_thread_count(1);
+    pipeline.render(framebuffer, |frame, target| {
+        for (model, uniforms) in scene.models.iter().zip(&scene.uniforms) {
+            frame.draw_lod_mesh(
+                target,
+                &scene.mesh,
+                uniforms,
+                scene.camera,
+                scene.projection,
+                *model,
+            );
+        }
+    });
+}
+
+fn subdivided_octahedron(levels: usize) -> Mesh {
+    let mut positions = vec![
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+        Vec3::new(-1.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, -1.0),
+        Vec3::new(0.0, -1.0, 0.0),
+    ];
+    let mut triangles = vec![
+        [0, 2, 1],
+        [0, 3, 2],
+        [0, 4, 3],
+        [0, 1, 4],
+        [5, 1, 2],
+        [5, 2, 3],
+        [5, 3, 4],
+        [5, 4, 1],
+    ];
+    for _ in 0..levels {
+        let mut midpoint_cache = BTreeMap::new();
+        let mut next = Vec::with_capacity(triangles.len() * 4);
+        for [a, b, c] in triangles {
+            let midpoint =
+                |left: usize,
+                 right: usize,
+                 positions: &mut Vec<Vec3>,
+                 cache: &mut BTreeMap<(usize, usize), usize>| {
+                    let edge = if left < right {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    };
+                    if let Some(&index) = cache.get(&edge) {
+                        return index;
+                    }
+                    let index = positions.len();
+                    positions.push((positions[left] + positions[right]).normalize());
+                    cache.insert(edge, index);
+                    index
+                };
+            let ab = midpoint(a, b, &mut positions, &mut midpoint_cache);
+            let bc = midpoint(b, c, &mut positions, &mut midpoint_cache);
+            let ca = midpoint(c, a, &mut positions, &mut midpoint_cache);
+            next.extend_from_slice(&[[a, ab, ca], [ab, b, bc], [ca, bc, c], [ab, bc, ca]]);
+        }
+        triangles = next;
+    }
+    Mesh::new(
+        positions
+            .into_iter()
+            .map(|position| MeshVertex::new(position, None, Some(position.normalize())))
+            .collect(),
+        triangles,
+    )
 }
 
 /// Builds a stable field of 300 lit, tinted mesh instances.

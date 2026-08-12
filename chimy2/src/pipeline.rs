@@ -8,7 +8,7 @@ use crate::clip::{ClipVertex, clip_triangle_near, cull_backface};
 use crate::culling::{Aabb, Frustum};
 use crate::fb::Framebuffer;
 use crate::math::{Mat4, Vec3, Vec4};
-use crate::mesh::{Mesh, MeshVertex};
+use crate::mesh::{LodMesh, LodSelection, Mesh, MeshVertex};
 use crate::postfx::PostChain;
 use crate::raster::{
     DepthVaryings, FragmentColor, PixelRect, RasterState, ScreenVertex,
@@ -820,6 +820,92 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         );
     }
 
+    /// Queues one LOD mesh after selecting its level from the projected
+    /// source AABB. The returned selection can be reused by shadow passes.
+    pub fn draw_lod_mesh<Uniforms>(
+        &mut self,
+        framebuffer: &Framebuffer,
+        lod_mesh: &LodMesh,
+        uniforms: &'a Uniforms,
+        camera: Camera,
+        projection: Mat4,
+        model: Mat4,
+    ) -> LodSelection
+    where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
+        Uniforms: Sync,
+        VS::Varyings: Clone + Send + Sync + 'a,
+    {
+        let selection = lod_mesh.select(
+            camera.view_matrix(),
+            projection,
+            model,
+            framebuffer.width,
+            framebuffer.height,
+        );
+        self.draw_lod_mesh_with_selection(framebuffer, lod_mesh, uniforms, selection);
+        selection
+    }
+
+    pub fn draw_lod_mesh_with_selection<Uniforms>(
+        &mut self,
+        framebuffer: &Framebuffer,
+        lod_mesh: &LodMesh,
+        uniforms: &'a Uniforms,
+        selection: LodSelection,
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
+        Uniforms: Sync,
+        VS::Varyings: Clone + Send + Sync + 'a,
+    {
+        let mesh = lod_mesh.mesh_for(selection);
+        if !self.should_submit_mesh(
+            mesh.bounds(),
+            self.pipeline.fragment.culling_transform(uniforms),
+        ) {
+            return;
+        }
+        let model_view = self
+            .pipeline
+            .fragment
+            .model_view(uniforms)
+            .unwrap_or(Mat4::IDENTITY);
+        let keys = mesh_centroid_depths(mesh, model_view);
+        let class = if self.pipeline.fragment.is_opaque(uniforms) {
+            DrawClass::Opaque
+        } else {
+            DrawClass::Transparent
+        };
+        self.queue(
+            framebuffer,
+            mesh.vertices(),
+            mesh.indices(),
+            Some(&keys),
+            uniforms,
+            class,
+            rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
+        );
+    }
+
+    /// Queues level zero through the same production path as a plain mesh.
+    pub fn draw_lod_mesh_level<Uniforms>(
+        &mut self,
+        framebuffer: &Framebuffer,
+        lod_mesh: &LodMesh,
+        uniforms: &'a Uniforms,
+        level: usize,
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
+        Uniforms: Sync,
+        VS::Varyings: Clone + Send + Sync + 'a,
+    {
+        let selection = LodSelection::at_level(level.min(lod_mesh.level_count().saturating_sub(1)));
+        self.draw_lod_mesh_with_selection(framebuffer, lod_mesh, uniforms, selection);
+    }
+
     pub fn draw_mesh_with_sampling<Uniforms>(
         &mut self,
         framebuffer: &Framebuffer,
@@ -857,6 +943,58 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
             class,
             rasterize_sampled_triangle::<VS::Varyings, FS, Uniforms>,
         );
+    }
+
+    pub fn draw_lod_mesh_with_sampling<Uniforms>(
+        &mut self,
+        framebuffer: &Framebuffer,
+        lod_mesh: &LodMesh,
+        uniforms: &'a Uniforms,
+        camera: Camera,
+        projection: Mat4,
+        model: Mat4,
+    ) -> LodSelection
+    where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: SampledFragmentStage<VS::Varyings, Uniforms> + Sync,
+        Uniforms: Sync,
+        VS::Varyings: SamplingVaryings + Clone + Send + Sync + 'a,
+    {
+        let selection = lod_mesh.select(
+            camera.view_matrix(),
+            projection,
+            model,
+            framebuffer.width,
+            framebuffer.height,
+        );
+        let mesh = lod_mesh.mesh_for(selection);
+        if !self.should_submit_mesh(
+            mesh.bounds(),
+            self.pipeline.fragment.culling_transform(uniforms),
+        ) {
+            return selection;
+        }
+        let model_view = self
+            .pipeline
+            .fragment
+            .model_view(uniforms)
+            .unwrap_or(Mat4::IDENTITY);
+        let keys = mesh_centroid_depths(mesh, model_view);
+        let class = if self.pipeline.fragment.is_opaque(uniforms) {
+            DrawClass::Opaque
+        } else {
+            DrawClass::Transparent
+        };
+        self.queue(
+            framebuffer,
+            mesh.vertices(),
+            mesh.indices(),
+            Some(&keys),
+            uniforms,
+            class,
+            rasterize_sampled_triangle::<VS::Varyings, FS, Uniforms>,
+        );
+        selection
     }
 
     pub fn draw_mesh_instanced<Uniforms>(
@@ -1039,6 +1177,61 @@ impl<VS, FS> Pipeline<VS, FS> {
         self.draw_depth(framebuffer, mesh.vertices(), mesh.indices(), uniforms);
     }
 
+    /// Draws one previously selected LOD through the depth path. Callers can
+    /// pass the same [`LodSelection`] used by the camera pass.
+    pub fn draw_lod_mesh_depth<Uniforms>(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        lod_mesh: &LodMesh,
+        uniforms: &Uniforms,
+        selection: LodSelection,
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: Sync,
+        Uniforms: Sync + CullingUniforms,
+        VS::Varyings: Clone + Send + Sync,
+    {
+        let mesh = lod_mesh.mesh_for(selection);
+        if self.culling_enabled && self.depth_mesh_is_outside(mesh.bounds(), uniforms) {
+            return;
+        }
+        self.draw_depth(framebuffer, mesh.vertices(), mesh.indices(), uniforms);
+    }
+
+    pub fn draw_lod_mesh_depth_at_level<Uniforms>(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        lod_mesh: &LodMesh,
+        uniforms: &Uniforms,
+        level: usize,
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: Sync,
+        Uniforms: Sync + CullingUniforms,
+        VS::Varyings: Clone + Send + Sync,
+    {
+        let selection = LodSelection::at_level(level.min(lod_mesh.level_count().saturating_sub(1)));
+        self.draw_lod_mesh_depth(framebuffer, lod_mesh, uniforms, selection);
+    }
+
+    pub fn draw_lod_mesh_depth_instanced<Uniforms>(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        lod_mesh: &LodMesh,
+        uniforms: &Uniforms,
+        selections: &[(Instance, LodSelection)],
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: Sync,
+        Uniforms: InstanceUniforms + CullingUniforms + Sync,
+        VS::Varyings: Clone + Send + Sync,
+    {
+        for &(instance, selection) in selections {
+            let instance_uniforms = uniforms.for_instance(&instance);
+            self.draw_lod_mesh_depth(framebuffer, lod_mesh, &instance_uniforms, selection);
+        }
+    }
+
     pub fn draw_mesh_depth_instanced<Uniforms>(
         &mut self,
         framebuffer: &mut Framebuffer,
@@ -1113,6 +1306,25 @@ impl<VS, FS> Pipeline<VS, FS> {
         Uniforms: Sync + CullingUniforms,
         VS::Varyings: DepthVaryings + Clone + Send + Sync,
     {
+        if self.culling_enabled && self.depth_mesh_is_outside(mesh.bounds(), uniforms) {
+            return;
+        }
+        self.draw_depth_with_varyings(framebuffer, mesh.vertices(), mesh.indices(), uniforms);
+    }
+
+    pub fn draw_lod_mesh_depth_with_varyings<Uniforms>(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        lod_mesh: &LodMesh,
+        uniforms: &Uniforms,
+        selection: LodSelection,
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: Sync,
+        Uniforms: Sync + CullingUniforms,
+        VS::Varyings: DepthVaryings + Clone + Send + Sync,
+    {
+        let mesh = lod_mesh.mesh_for(selection);
         if self.culling_enabled && self.depth_mesh_is_outside(mesh.bounds(), uniforms) {
             return;
         }
@@ -1718,7 +1930,10 @@ impl DrawClass {
 mod tests {
     use super::*;
     use crate::fb::{argb8888, blend_argb8888_linear};
+    use crate::mesh::{LodMesh, Mesh, MeshVertex};
     use crate::postfx::{PostChain, SsaoPass};
+    use crate::shaders::{MeshShader, MeshUniforms};
+    use crate::shadow::{ShadowDepthShader, ShadowDepthUniforms};
 
     #[derive(Clone, Copy)]
     struct RawVertex {
@@ -1761,6 +1976,97 @@ mod tests {
             frame.draw(target, &vertices, &[[0, 1, 2]], &());
         });
         assert!(framebuffer.color.contains(&argb8888(255, 20, 40, 60)));
+    }
+
+    #[test]
+    fn forced_lod_zero_matches_plain_mesh_render() {
+        let mesh = Mesh::new(
+            vec![
+                MeshVertex::new(Vec3::new(-0.7, -0.7, 0.0), None, None),
+                MeshVertex::new(Vec3::new(0.7, -0.7, 0.0), None, None),
+                MeshVertex::new(Vec3::new(0.0, 0.7, 0.0), None, None),
+                MeshVertex::new(Vec3::new(-0.7, 0.7, 0.0), None, None),
+            ],
+            vec![[0, 1, 2], [0, 2, 3]],
+        );
+        let lod = LodMesh::with_ratios(mesh.clone(), &[0.5]);
+        assert!(lod.level(1).unwrap().indices().len() < mesh.indices().len());
+        let uniforms = MeshUniforms::new(
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            Mat4::IDENTITY,
+            argb8888(255, 20, 40, 60),
+        );
+        let mut plain = Framebuffer::new(16, 16);
+        let mut forced = Framebuffer::new(16, 16);
+        let mut plain_pipeline = Pipeline::new(MeshShader, MeshShader);
+        plain_pipeline.render(&mut plain, |frame, target| {
+            frame.draw_mesh(target, &mesh, &uniforms);
+        });
+        let mut forced_pipeline = Pipeline::new(MeshShader, MeshShader);
+        forced_pipeline.render(&mut forced, |frame, target| {
+            frame.draw_lod_mesh_level(target, &lod, &uniforms, 0);
+        });
+        assert_eq!(plain.color, forced.color);
+        assert_eq!(plain.depth, forced.depth);
+    }
+
+    #[test]
+    fn one_lod_selection_is_reusable_by_camera_and_depth_passes() {
+        let mesh = Mesh::new(
+            vec![
+                MeshVertex::new(Vec3::new(-0.7, -0.7, -2.0), None, None),
+                MeshVertex::new(Vec3::new(0.7, -0.7, -2.0), None, None),
+                MeshVertex::new(Vec3::new(0.0, 0.7, -2.0), None, None),
+                MeshVertex::new(Vec3::new(-0.7, 0.7, -2.0), None, None),
+            ],
+            vec![[0, 1, 2], [0, 2, 3]],
+        );
+        let mut lod = LodMesh::with_ratios(mesh, &[0.5]);
+        lod.set_thresholds(vec![10.0]);
+        let camera = Camera::new(Vec3::ZERO, crate::math::Quat::IDENTITY, 1.0, 1.0, 0.1, 10.0);
+        let model = Mat4::IDENTITY;
+        let selection = lod.select(
+            camera.view_matrix(),
+            camera.projection_matrix(),
+            model,
+            32,
+            32,
+        );
+        assert_eq!(selection.level(), 0);
+        let uniforms = MeshUniforms::new(
+            model,
+            camera.view_matrix(),
+            camera.projection_matrix(),
+            argb8888(255, 20, 40, 60),
+        );
+        let mut camera_target = Framebuffer::new(32, 32);
+        let mut camera_pipeline = Pipeline::new(MeshShader, MeshShader);
+        camera_pipeline.render(&mut camera_target, |frame, target| {
+            frame.draw_lod_mesh_with_selection(target, &lod, &uniforms, selection);
+        });
+        let mut shadow_target = Framebuffer::new(32, 32);
+        let mut depth_pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
+        let shadow_uniforms = ShadowDepthUniforms::new(model, camera.view_projection());
+        depth_pipeline.draw_lod_mesh_depth(&mut shadow_target, &lod, &shadow_uniforms, selection);
+        let mut expected_shadow = Framebuffer::new(32, 32);
+        let mut expected_pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
+        expected_pipeline.draw_mesh_depth(
+            &mut expected_shadow,
+            lod.mesh_for(selection),
+            &shadow_uniforms,
+        );
+        let mut different_shadow = Framebuffer::new(32, 32);
+        let mut different_pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
+        different_pipeline.draw_mesh_depth(
+            &mut different_shadow,
+            lod.mesh_at_level(1),
+            &shadow_uniforms,
+        );
+        assert!(camera_target.color.iter().any(|&pixel| pixel != 0));
+        assert!(shadow_target.depth.iter().any(|&depth| depth < 1.0));
+        assert_eq!(shadow_target.depth, expected_shadow.depth);
+        assert_ne!(different_shadow.depth, expected_shadow.depth);
     }
 
     #[test]

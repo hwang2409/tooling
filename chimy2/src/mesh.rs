@@ -15,6 +15,11 @@ use std::fs;
 use std::ops::Range;
 use std::path::Path;
 
+pub use crate::lod::{
+    LodMesh, LodSelection, SimplifyOptions, SphereProjection, projected_screen_extent,
+    projection_row_norms, simplify_qem, simplify_qem_with_options,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeshVertex {
     position: Vec3,
