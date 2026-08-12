@@ -420,6 +420,92 @@ pub struct RenderFrame<'a, VS, FS> {
 }
 
 impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
+    /// Draws instances whose per-instance uniforms were prepared by the caller.
+    /// This keeps setup outside the submission benchmark and render loop.
+    pub fn draw_mesh_instanced_prepared<Uniforms>(
+        &mut self,
+        framebuffer: &Framebuffer,
+        mesh: &Mesh,
+        uniforms: Vec<Uniforms>,
+    ) where
+        VS: VertexStage<MeshVertex, Uniforms> + Sync,
+        FS: FragmentStage<VS::Varyings, Uniforms> + Sync,
+        Uniforms: Send + Sync + 'a,
+        VS::Varyings: Clone + Send + Sync + 'a,
+    {
+        if mesh.indices().len() == 1
+            && uniforms
+                .iter()
+                .all(|uniforms| self.pipeline.fragment.is_opaque(uniforms))
+        {
+            let mut draws = Vec::with_capacity(uniforms.len());
+            let opaque_keys = [0.0];
+            for instance_uniforms in uniforms {
+                let prepared = prepare_triangles(
+                    &self.pipeline.vertex,
+                    framebuffer,
+                    mesh.vertices(),
+                    mesh.indices(),
+                    Some(&opaque_keys),
+                    &instance_uniforms,
+                );
+                if let Some((_, triangle)) = prepared.into_iter().next() {
+                    draws.push((triangle, instance_uniforms));
+                }
+            }
+            self.queue_opaque_instanced_single_owned(
+                draws,
+                rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
+            );
+            return;
+        }
+        let mut opaque_draws = Vec::with_capacity(uniforms.len());
+        let opaque_keys = vec![0.0; mesh.indices().len()];
+        for instance_uniforms in uniforms {
+            let class = if self.pipeline.fragment.is_opaque(&instance_uniforms) {
+                DrawClass::Opaque
+            } else {
+                DrawClass::Transparent
+            };
+            let transparent_keys = if class == DrawClass::Transparent {
+                let model_view = self
+                    .pipeline
+                    .fragment
+                    .model_view(&instance_uniforms)
+                    .unwrap_or(Mat4::IDENTITY);
+                Some(mesh_centroid_depths(mesh, model_view))
+            } else {
+                None
+            };
+            let keys = transparent_keys.as_deref().unwrap_or(&opaque_keys);
+            let prepared = prepare_triangles(
+                &self.pipeline.vertex,
+                framebuffer,
+                mesh.vertices(),
+                mesh.indices(),
+                Some(keys),
+                &instance_uniforms,
+            );
+            if class == DrawClass::Opaque {
+                opaque_draws.push((
+                    prepared.into_iter().map(|(_, triangle)| triangle).collect(),
+                    instance_uniforms,
+                ));
+            } else {
+                self.queue_prepared_owned(
+                    prepared,
+                    instance_uniforms,
+                    class,
+                    rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
+                );
+            }
+        }
+        self.queue_opaque_instanced_owned(
+            opaque_draws,
+            rasterize_plain_triangle::<VS::Varyings, FS, Uniforms>,
+        );
+    }
+
     fn new(pipeline: &'a mut Pipeline<VS, FS>) -> Self {
         Self {
             pipeline,
@@ -583,15 +669,47 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         self.next_submission_order += 1;
         let draw = Box::new(
             move |framebuffer: &mut Framebuffer, fragment: &FS, threads| {
-                for (prepared, uniforms) in &draws {
-                    dispatch_prepared(
-                        threads,
+                dispatch_prepared_instanced(
+                    threads,
+                    framebuffer,
+                    &draws,
+                    fragment,
+                    DrawClass::Opaque.raster_state(),
+                    rasterize,
+                );
+            },
+        );
+        self.commands.push(QueuedCommand {
+            class: DrawClass::Opaque,
+            key: 0.0,
+            submission_order,
+            draw,
+        });
+    }
+
+    fn queue_opaque_instanced_single_owned<V, Uniforms>(
+        &mut self,
+        draws: Vec<(PreparedTriangle<V>, Uniforms)>,
+        rasterize: RasterFn<V, FS, Uniforms>,
+    ) where
+        FS: Sync,
+        Uniforms: Send + Sync + 'a,
+        V: Varyings + Clone + Send + Sync + 'a,
+    {
+        if draws.is_empty() {
+            return;
+        }
+        let submission_order = self.next_submission_order;
+        self.next_submission_order += 1;
+        let draw = Box::new(
+            move |framebuffer: &mut Framebuffer, fragment: &FS, _threads| {
+                for (triangle, uniforms) in &draws {
+                    rasterize(
                         framebuffer,
-                        prepared,
-                        uniforms,
+                        triangle.vertices.clone(),
                         fragment,
+                        uniforms,
                         DrawClass::Opaque.raster_state(),
-                        rasterize,
                     );
                 }
             },
@@ -816,26 +934,27 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         Uniforms: InstanceUniforms + Send + Sync + 'a,
         VS::Varyings: Clone + Send + Sync + 'a,
     {
-        let mut opaque_draws = Vec::new();
+        let mut opaque_draws = Vec::with_capacity(instances.len());
         for instance in instances {
             let instance_uniforms = uniforms.for_instance(instance);
-            let model_view = self
-                .pipeline
-                .fragment
-                .model_view(&instance_uniforms)
-                .unwrap_or(Mat4::IDENTITY);
-            let keys = mesh_centroid_depths(mesh, model_view);
             let class = if self.pipeline.fragment.is_opaque(&instance_uniforms) {
                 DrawClass::Opaque
             } else {
                 DrawClass::Transparent
             };
+            let model_view = self
+                .pipeline
+                .fragment
+                .model_view(&instance_uniforms)
+                .unwrap_or(Mat4::IDENTITY);
+            let keys =
+                (class == DrawClass::Transparent).then(|| mesh_centroid_depths(mesh, model_view));
             let prepared = prepare_triangles(
                 &self.pipeline.vertex,
                 framebuffer,
                 mesh.vertices(),
                 mesh.indices(),
-                Some(&keys),
+                keys.as_deref(),
                 &instance_uniforms,
             );
             if class == DrawClass::Opaque {
@@ -868,26 +987,27 @@ impl<'a, VS, FS> RenderFrame<'a, VS, FS> {
         Uniforms: InstanceUniforms + Send + Sync + 'a,
         VS::Varyings: SamplingVaryings + Clone + Send + Sync + 'a,
     {
-        let mut opaque_draws = Vec::new();
+        let mut opaque_draws = Vec::with_capacity(instances.len());
         for instance in instances {
             let instance_uniforms = uniforms.for_instance(instance);
-            let model_view = self
-                .pipeline
-                .fragment
-                .model_view(&instance_uniforms)
-                .unwrap_or(Mat4::IDENTITY);
-            let keys = mesh_centroid_depths(mesh, model_view);
             let class = if self.pipeline.fragment.is_opaque(&instance_uniforms) {
                 DrawClass::Opaque
             } else {
                 DrawClass::Transparent
             };
+            let model_view = self
+                .pipeline
+                .fragment
+                .model_view(&instance_uniforms)
+                .unwrap_or(Mat4::IDENTITY);
+            let keys =
+                (class == DrawClass::Transparent).then(|| mesh_centroid_depths(mesh, model_view));
             let prepared = prepare_triangles(
                 &self.pipeline.vertex,
                 framebuffer,
                 mesh.vertices(),
                 mesh.indices(),
-                Some(&keys),
+                keys.as_deref(),
                 &instance_uniforms,
             );
             if class == DrawClass::Opaque {
@@ -1159,6 +1279,93 @@ fn dispatch_prepared<V, FS, Uniforms>(
     }
 }
 
+fn dispatch_prepared_instanced<V, FS, Uniforms>(
+    thread_count: usize,
+    framebuffer: &mut Framebuffer,
+    draws: &[(Vec<PreparedTriangle<V>>, Uniforms)],
+    fragment: &FS,
+    state: RasterState,
+    rasterize: RasterFn<V, FS, Uniforms>,
+) where
+    V: Varyings + Clone + Send + Sync,
+    FS: Sync,
+    Uniforms: Sync,
+{
+    if thread_count <= 1 {
+        for (prepared, uniforms) in draws {
+            for triangle in prepared {
+                rasterize(
+                    framebuffer,
+                    triangle.vertices.clone(),
+                    fragment,
+                    uniforms,
+                    state,
+                );
+            }
+        }
+        return;
+    }
+    let indexed = draws
+        .iter()
+        .enumerate()
+        .flat_map(|(draw_index, (prepared, _))| {
+            prepared.iter().map(move |triangle| (triangle, draw_index))
+        })
+        .collect::<Vec<_>>();
+    if indexed.is_empty() || framebuffer.width == 0 || framebuffer.height == 0 {
+        return;
+    }
+    let tiles = make_indexed_tiles(framebuffer.width, framebuffer.height, &indexed);
+    let worker_count = thread_count.min(tiles.len()).max(1);
+    let source = &*framebuffer;
+    let tiles = &tiles;
+    let indexed = &indexed;
+    let results = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            handles.push(scope.spawn(move || {
+                (worker_index..tiles.len())
+                    .step_by(worker_count)
+                    .map(|tile_index| {
+                        rasterize_instanced_tile(
+                            &tiles[tile_index],
+                            indexed,
+                            source,
+                            draws,
+                            fragment,
+                            state,
+                            rasterize,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("tile worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    for result in results {
+        for row in 0..result.framebuffer.height {
+            let destination_start = (result.y + row) * framebuffer.width + result.x;
+            let destination_end = destination_start + result.framebuffer.width;
+            let source_start = row * result.framebuffer.width;
+            let source_end = source_start + result.framebuffer.width;
+            framebuffer.color[destination_start..destination_end]
+                .copy_from_slice(&result.framebuffer.color[source_start..source_end]);
+            if let (Some(destination), Some(source)) = (
+                framebuffer.linear_pixels_mut(),
+                result.framebuffer.linear_pixels(),
+            ) {
+                destination[destination_start..destination_end]
+                    .copy_from_slice(&source[source_start..source_end]);
+            }
+            framebuffer.depth[destination_start..destination_end]
+                .copy_from_slice(&result.framebuffer.depth[source_start..source_end]);
+        }
+    }
+}
+
 fn make_tiles<V>(width: usize, height: usize, prepared: &[PreparedTriangle<V>]) -> Vec<Tile> {
     if width == 0 || height == 0 {
         return Vec::new();
@@ -1167,6 +1374,44 @@ fn make_tiles<V>(width: usize, height: usize, prepared: &[PreparedTriangle<V>]) 
     let tiles_y = height.div_ceil(TILE_SIZE);
     let mut bins: Vec<Vec<usize>> = (0..tiles_x * tiles_y).map(|_| Vec::new()).collect();
     for (triangle_index, triangle) in prepared.iter().enumerate() {
+        let min_tile_x = triangle.bounds.min_x as usize / TILE_SIZE;
+        let max_tile_x = triangle.bounds.max_x as usize / TILE_SIZE;
+        let min_tile_y = triangle.bounds.min_y as usize / TILE_SIZE;
+        let max_tile_y = triangle.bounds.max_y as usize / TILE_SIZE;
+        for tile_y in min_tile_y..=max_tile_y {
+            for tile_x in min_tile_x..=max_tile_x {
+                bins[tile_y * tiles_x + tile_x].push(triangle_index);
+            }
+        }
+    }
+    bins.into_iter()
+        .enumerate()
+        .filter_map(|(index, triangles)| {
+            if triangles.is_empty() {
+                return None;
+            }
+            let tile_x = index % tiles_x;
+            let tile_y = index / tiles_x;
+            Some(Tile {
+                x: tile_x * TILE_SIZE,
+                y: tile_y * TILE_SIZE,
+                width: (width - tile_x * TILE_SIZE).min(TILE_SIZE),
+                height: (height - tile_y * TILE_SIZE).min(TILE_SIZE),
+                triangles,
+            })
+        })
+        .collect()
+}
+
+fn make_indexed_tiles<V>(
+    width: usize,
+    height: usize,
+    prepared: &[(&PreparedTriangle<V>, usize)],
+) -> Vec<Tile> {
+    let tiles_x = width.div_ceil(TILE_SIZE);
+    let tiles_y = height.div_ceil(TILE_SIZE);
+    let mut bins: Vec<Vec<usize>> = (0..tiles_x * tiles_y).map(|_| Vec::new()).collect();
+    for (triangle_index, (triangle, _)) in prepared.iter().enumerate() {
         let min_tile_x = triangle.bounds.min_x as usize / TILE_SIZE;
         let max_tile_x = triangle.bounds.max_x as usize / TILE_SIZE;
         let min_tile_y = triangle.bounds.min_y as usize / TILE_SIZE;
@@ -1233,6 +1478,59 @@ where
             vertex.position.y -= tile.y as f32;
         }
         rasterize(&mut framebuffer, triangle, fragment, uniforms, state);
+    }
+    TileResult {
+        x: tile.x,
+        y: tile.y,
+        framebuffer,
+    }
+}
+
+fn rasterize_instanced_tile<V, FS, Uniforms>(
+    tile: &Tile,
+    prepared: &[(&PreparedTriangle<V>, usize)],
+    source: &Framebuffer,
+    draws: &[(Vec<PreparedTriangle<V>>, Uniforms)],
+    fragment: &FS,
+    state: RasterState,
+    rasterize: RasterFn<V, FS, Uniforms>,
+) -> TileResult
+where
+    V: Varyings + Clone,
+    Uniforms: Sync,
+{
+    let mut framebuffer = Framebuffer::new(tile.width, tile.height);
+    framebuffer.set_hdr(source.is_hdr());
+    for row in 0..tile.height {
+        let source_start = (tile.y + row) * source.width + tile.x;
+        let source_end = source_start + tile.width;
+        let destination_start = row * tile.width;
+        let destination_end = destination_start + tile.width;
+        framebuffer.color[destination_start..destination_end]
+            .copy_from_slice(&source.color[source_start..source_end]);
+        if let (Some(destination), Some(source_linear)) =
+            (framebuffer.linear_pixels_mut(), source.linear_pixels())
+        {
+            destination[destination_start..destination_end]
+                .copy_from_slice(&source_linear[source_start..source_end]);
+        }
+        framebuffer.depth[destination_start..destination_end]
+            .copy_from_slice(&source.depth[source_start..source_end]);
+    }
+    for &triangle_index in &tile.triangles {
+        let (triangle, draw_index) = prepared[triangle_index];
+        let mut vertices = triangle.vertices.clone();
+        for vertex in &mut vertices {
+            vertex.position.x -= tile.x as f32;
+            vertex.position.y -= tile.y as f32;
+        }
+        rasterize(
+            &mut framebuffer,
+            vertices,
+            fragment,
+            &draws[draw_index].1,
+            state,
+        );
     }
     TileResult {
         x: tile.x,

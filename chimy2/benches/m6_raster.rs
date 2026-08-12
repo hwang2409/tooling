@@ -82,15 +82,17 @@ fn render_500_instances(instanced: bool) {
     let mut framebuffer = Framebuffer::new(320, 180);
     let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
     pipeline.set_thread_count(1);
-    pipeline.render(&mut framebuffer, |frame, target| {
-        if instanced {
-            frame.draw_mesh_instanced(target, &mesh, &base, &instances);
-        } else {
+    if instanced {
+        pipeline.render(&mut framebuffer, |frame, target| {
+            frame.draw_mesh_instanced_prepared(target, &mesh, individual_uniforms);
+        });
+    } else {
+        pipeline.render(&mut framebuffer, |frame, target| {
             for uniforms in &individual_uniforms {
                 frame.draw_mesh(target, &mesh, uniforms);
             }
-        }
-    });
+        });
+    }
     black_box(framebuffer.color);
 }
 
