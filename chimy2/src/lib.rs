@@ -12,6 +12,7 @@ pub mod material;
 pub mod math;
 pub mod mesh;
 pub mod mtl_render;
+pub mod particles;
 pub mod pipeline;
 pub mod postfx;
 pub mod raster;

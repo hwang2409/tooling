@@ -20,10 +20,14 @@ use crate::fb::Framebuffer;
 use crate::image::Texture;
 use crate::math::{Mat4, Vec2, Vec3, Vec4};
 use crate::mesh::{LodMesh, Mesh, MeshVertex, SimplifyOptions, SphereProjection};
+use crate::particles::{ParticleEmitter, ParticleSystem};
 use crate::pipeline::{Instance, InstanceUniforms, Pipeline};
 use crate::postfx::{AcesTonemapPass, BloomPass, FxaaPass, PostChain, SsaoPass, VignettePass};
 use crate::present::{InputState, run_with_input};
-use crate::shaders::{BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, PointLight};
+use crate::shaders::{
+    BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, PointLight, TextureFilter,
+    TexturedShader, TexturedUniforms,
+};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::f32::consts::{PI, TAU};
@@ -738,6 +742,92 @@ pub fn render_instancing_scene_with_culling(
     pipeline.render(framebuffer, |frame, target| {
         frame.draw_mesh_instanced(target, &scene.mesh, &scene.lighting, &scene.instances);
     });
+}
+
+pub struct FountainScene {
+    pub system: ParticleSystem,
+    pub quad: Mesh,
+    pub floor: Mesh,
+    pub particle_texture: Texture,
+    pub floor_texture: Texture,
+    pub camera: crate::camera::Camera,
+    pub projection: Mat4,
+}
+
+/// Builds the deterministic fountain used by the particle demo and golden.
+pub fn build_fountain_scene(aspect: f32) -> FountainScene {
+    let emitter = {
+        let mut emitter =
+            ParticleEmitter::new(Vec3::new(0.0, 0.08, 0.0), 4, 100, Vec3::new(0.0, 3.8, 0.0));
+        emitter.set_velocity_variation(Vec3::new(0.9, 0.35, 0.9));
+        emitter.set_gravity(Vec3::new(0.0, -5.0, 0.0));
+        emitter.set_drag(0.01);
+        emitter
+    };
+    let camera = crate::camera::Camera::new(
+        Vec3::new(0.0, 2.2, 7.0),
+        crate::math::Quat::IDENTITY,
+        1.0,
+        aspect.max(0.01),
+        0.1,
+        40.0,
+    );
+    FountainScene {
+        system: ParticleSystem::new(emitter, 320),
+        quad: crate::particles::billboard_quad(),
+        floor: plane_xz(12.0, 12.0, 1, 4.0),
+        particle_texture: fountain_particle_texture(),
+        floor_texture: checkerboard_texture(4, 4),
+        camera,
+        projection: Mat4::perspective_from_focal_length(1.7320508, aspect.max(0.01), 0.1, 40.0),
+    }
+}
+
+/// Advances and renders one fixed-step fountain frame.
+pub fn render_fountain_scene(framebuffer: &mut Framebuffer, scene: &mut FountainScene) {
+    scene.system.step();
+    framebuffer.clear(crate::fb::argb8888(255, 8, 10, 18));
+    let view = scene.camera.view_matrix();
+    let floor_model = Mat4::translate(Vec3::new(0.0, -0.02, 0.0));
+    let floor_transform = scene.projection * view * floor_model;
+    let mut floor_uniforms = TexturedUniforms::new(
+        floor_transform,
+        &scene.floor_texture,
+        TextureFilter::Bilinear,
+    );
+    floor_uniforms.set_model_view(view * floor_model);
+    let mut particle_uniforms = TexturedUniforms::new(
+        scene.projection * view,
+        &scene.particle_texture,
+        TextureFilter::Bilinear,
+    );
+    let mut pipeline = Pipeline::new(TexturedShader, TexturedShader);
+    pipeline.set_thread_count(1);
+    pipeline.render(framebuffer, |frame, target| {
+        frame.draw_mesh_with_sampling(target, &scene.floor, &floor_uniforms);
+        scene.system.draw_instanced(
+            frame,
+            target,
+            &scene.quad,
+            &mut particle_uniforms,
+            scene.camera,
+            0.16,
+            Vec4::new(0.75, 0.9, 1.0, 0.9),
+        );
+    });
+}
+
+fn fountain_particle_texture() -> Texture {
+    let mut pixels = Vec::with_capacity(64);
+    for y in 0..8 {
+        for x in 0..8 {
+            let dx = x - 3;
+            let dy = y - 3;
+            let alpha = if dx * dx + dy * dy <= 13 { 255 } else { 0 };
+            pixels.push([255, 255, 255, alpha]);
+        }
+    }
+    Texture::new(8, 8, pixels).expect("fountain particle texture dimensions")
 }
 
 #[cfg(test)]
