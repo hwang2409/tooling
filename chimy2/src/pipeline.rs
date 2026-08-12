@@ -1971,10 +1971,12 @@ mod tests {
                 MeshVertex::new(Vec3::new(-0.7, -0.7, 0.0), None, None),
                 MeshVertex::new(Vec3::new(0.7, -0.7, 0.0), None, None),
                 MeshVertex::new(Vec3::new(0.0, 0.7, 0.0), None, None),
+                MeshVertex::new(Vec3::new(-0.7, 0.7, 0.0), None, None),
             ],
-            vec![[0, 1, 2]],
+            vec![[0, 1, 2], [0, 2, 3]],
         );
-        let lod = LodMesh::new(mesh.clone());
+        let lod = LodMesh::with_ratios(mesh.clone(), &[0.5]);
+        assert!(lod.level(1).unwrap().indices().len() < mesh.indices().len());
         let uniforms = MeshUniforms::new(
             Mat4::IDENTITY,
             Mat4::IDENTITY,
