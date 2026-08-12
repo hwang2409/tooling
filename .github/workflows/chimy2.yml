@@ -69,3 +69,32 @@ jobs:
             chimy2/target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('chimy2/Cargo.lock') }}
       - run: cargo test
+
+  wasm-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: chimy2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            chimy2/target/
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('chimy2/Cargo.lock') }}
+      - run: cargo build --release --target wasm32-unknown-unknown --lib
+      - name: compare tracked wasm binary
+        run: |
+          generated="target/wasm32-unknown-unknown/release/chimy2.wasm"
+          tracked="web/chimy2.wasm"
+          if ! cmp --silent "$generated" "$tracked"; then
+            echo "tracked wasm is out of date; run ./web/build.sh from the repository root and commit web/chimy2.wasm"
+            exit 1
+          fi

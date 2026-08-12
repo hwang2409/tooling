@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>chimy2 / software rasterizer</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        background: #070a12;
+        color: #d9e2ff;
+      }
+      * { box-sizing: border-box; }
+      body {
+        min-height: 100vh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        background: radial-gradient(circle at 50% 10%, #192544 0, #070a12 58%);
+      }
+      main { width: min(92vw, 960px); }
+      header { display: flex; justify-content: space-between; align-items: end; gap: 1rem; margin-bottom: 1rem; }
+      h1 { margin: 0; font-size: clamp(1.1rem, 2vw, 1.55rem); letter-spacing: .06em; }
+      p { margin: .35rem 0 0; color: #8493b8; font-size: .75rem; }
+      label { color: #8493b8; font-size: .72rem; }
+      select { margin-left: .4rem; padding: .35rem .5rem; border: 1px solid #354468; border-radius: .35rem; background: #10172a; color: #d9e2ff; font: inherit; font-size: .72rem; }
+      .stage { overflow: hidden; border: 1px solid #354468; border-radius: .6rem; background: #05070e; box-shadow: 0 1.5rem 4rem #0008; }
+      canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; cursor: grab; }
+      canvas.dragging { cursor: grabbing; }
+      footer { display: flex; justify-content: space-between; margin-top: .65rem; color: #8493b8; font-size: .7rem; }
+      #error { color: #ff9c9c; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>chimy2 / software rasterizer</h1>
+          <p>cpu pixels, wasm boundary, browser canvas</p>
+        </div>
+        <label for="mode">shader
+          <select id="mode">
+            <option value="0">blinn-phong</option>
+            <option value="1">toon</option>
+            <option value="2">psx</option>
+            <option value="3">dither</option>
+            <option value="4">fog</option>
+            <option value="5">normals</option>
+            <option value="6">wireframe</option>
+            <option value="7">animated arm</option>
+          </select>
+        </label>
+      </header>
+      <div class="stage"><canvas id="canvas" width="640" height="480"></canvas></div>
+      <footer><span>drag to orbit</span><span id="fps">-- fps</span><span id="error"></span></footer>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
