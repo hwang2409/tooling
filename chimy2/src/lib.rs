@@ -1,5 +1,6 @@
 pub mod camera;
 pub mod clip;
+pub mod csm;
 pub mod fb;
 pub mod gltf;
 pub mod ibl;

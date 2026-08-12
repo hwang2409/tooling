@@ -1,9 +1,9 @@
 use chimy2::cascaded_shadow_scene::build_cascaded_shadow_scene;
+use chimy2::csm::{CascadeShadowConfig, render_cascade_shadow_maps_with_config};
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3};
 use chimy2::pipeline::Pipeline;
 use chimy2::shaders::{BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, PointLight};
-use chimy2::shadow::{CascadeShadowConfig, render_cascade_shadow_maps_with_config};
 use std::fs;
 use std::path::{Path, PathBuf};
 
