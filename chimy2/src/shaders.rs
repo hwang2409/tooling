@@ -194,6 +194,7 @@ pub struct TexturedUniforms<'a> {
     pub texture: &'a Texture,
     pub filter: TextureFilter,
     pub alpha: f32,
+    model_view: Mat4,
 }
 
 impl<'a> TexturedUniforms<'a> {
@@ -203,11 +204,21 @@ impl<'a> TexturedUniforms<'a> {
             texture,
             filter,
             alpha: 1.0,
+            model_view: Mat4::IDENTITY,
         }
     }
 
     pub fn set_alpha(&mut self, alpha: f32) {
         self.alpha = alpha.clamp(0.0, 1.0);
+    }
+
+    /// Sets the view-space transform used to sort transparent submissions.
+    pub fn set_model_view(&mut self, model_view: Mat4) {
+        self.model_view = model_view;
+    }
+
+    pub const fn model_view(&self) -> Mat4 {
+        self.model_view
     }
 }
 
@@ -298,6 +309,10 @@ impl<'a> SampledFragmentStage<TexturedVaryings, TexturedUniforms<'a>> for Textur
 
     fn culling_transform(&self, uniforms: &TexturedUniforms<'a>) -> Option<Mat4> {
         Some(uniforms.transform)
+    }
+
+    fn model_view(&self, uniforms: &TexturedUniforms<'a>) -> Option<Mat4> {
+        Some(uniforms.model_view())
     }
 
     fn is_opaque(&self, uniforms: &TexturedUniforms<'a>) -> bool {
@@ -1593,6 +1608,7 @@ impl InstanceUniforms for MeshUniforms {
 impl<'a> InstanceUniforms for TexturedUniforms<'a> {
     fn set_instance_model(&mut self, model: Mat4) {
         self.transform = self.transform * model;
+        self.model_view = self.model_view * model;
     }
 
     fn apply_instance_tint(&mut self, tint: Vec4) {
