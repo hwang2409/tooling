@@ -437,8 +437,8 @@ pub fn simplify_qem_with_options(
                 candidate.b,
                 candidate.position,
                 orientation_center,
-                options.sphere_projection.is_some(),
                 preserve_closed_manifold,
+                options.sphere_projection.is_some(),
             ) {
                 break Some(candidate);
             }

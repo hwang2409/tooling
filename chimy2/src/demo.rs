@@ -499,12 +499,12 @@ pub fn build_lod_scene(aspect: f32) -> LodScene {
     let projection = Mat4::perspective_from_focal_length(FOCAL_Y, aspect.max(0.01), 0.1, 80.0);
     let mut mesh = LodMesh::with_ratios_and_options(
         source,
-        &[0.9, 0.8, 0.7],
+        &[0.5, 0.25, 0.125],
         SimplifyOptions {
             sphere_projection: Some(SphereProjection::new(Vec3::ZERO, 1.0, 1.0e-5)),
         },
     );
-    mesh.set_thresholds(vec![220.0, 110.0, 55.0]);
+    mesh.set_thresholds(vec![2000.0, 1000.0, 500.0]);
     let base = BlinnPhongUniforms::new_with_linear_colors(
         Mat4::IDENTITY,
         camera.view_matrix(),
@@ -534,11 +534,14 @@ pub fn build_lod_scene(aspect: f32) -> LodScene {
         let depth = [5.0, 10.0, 16.0][ring];
         let ring_y = (ring as f32 - 1.0) * 2.0;
         for position in [
-            Vec3::new(-2.4, ring_y, -depth),
+            Vec3::new(-3.0, ring_y, -depth),
+            Vec3::new(-1.5, ring_y, -depth),
             Vec3::new(0.0, ring_y, -depth),
-            Vec3::new(2.4, ring_y, -depth),
+            Vec3::new(1.5, ring_y, -depth),
+            Vec3::new(3.0, ring_y, -depth),
         ] {
-            let model = Mat4::translate(position) * Mat4::scale(Vec3::new(0.7, 0.7, 0.7));
+            let scale = 0.7;
+            let model = Mat4::translate(position) * Mat4::scale(Vec3::new(scale, scale, scale));
             models.push(model);
             uniforms.push(base.for_instance(&Instance::with_tint(model, color)));
         }

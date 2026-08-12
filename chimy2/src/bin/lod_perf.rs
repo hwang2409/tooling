@@ -16,12 +16,28 @@ fn render_forced_level_zero(framebuffer: &mut Framebuffer, scene: &LodScene) {
 }
 
 fn main() {
-    const WIDTH: usize = 960;
-    const HEIGHT: usize = 640;
+    const WIDTH: usize = 320;
+    const HEIGHT: usize = 240;
     const WARMUP: usize = 5;
     const SAMPLES: usize = 20;
     let build_start = Instant::now();
     let scene = build_lod_scene(WIDTH as f32 / HEIGHT as f32);
+    let selected_levels = scene
+        .models
+        .iter()
+        .map(|model| {
+            scene
+                .mesh
+                .select(
+                    scene.camera.view_matrix(),
+                    scene.projection,
+                    *model,
+                    WIDTH,
+                    HEIGHT,
+                )
+                .level()
+        })
+        .collect::<Vec<_>>();
     let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
     let mut lod_target = Framebuffer::new(WIDTH, HEIGHT);
     let mut level_zero_target = Framebuffer::new(WIDTH, HEIGHT);
@@ -40,6 +56,7 @@ fn main() {
     }
     let level_zero_ms = level_zero_start.elapsed().as_secs_f64() * 1000.0 / SAMPLES as f64;
     println!("build_ms={build_ms:.3}");
+    println!("selected_levels={selected_levels:?}");
     println!("lod_on_ms_per_frame={lod_ms:.3}");
     println!("forced_level0_ms_per_frame={level_zero_ms:.3}");
     println!("lod_on_over_level0={:.3}", lod_ms / level_zero_ms);
