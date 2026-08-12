@@ -25,4 +25,7 @@ pub mod demo;
 pub mod point_shadow_scene;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod cascaded_shadow_scene;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod present;

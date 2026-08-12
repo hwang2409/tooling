@@ -19,3 +19,7 @@ criterion = "0.5"
 [[bench]]
 name = "m6_raster"
 harness = false
+
+[[bin]]
+name = "csm_demo"
+path = "src/bin/csm_demo.rs"
