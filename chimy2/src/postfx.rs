@@ -2,10 +2,10 @@
 //!
 //! The renderer stores encoded sRGB colors in `Framebuffer`. HDR mode also
 //! stores a linear sidecar. Each pass declares its working color space.
-//! The HDR order is render -> SSAA -> SSAO -> bloom -> vignette -> ACES ->
+//! The HDR order is render -> SSAA -> SSAO -> DoF -> bloom -> vignette -> ACES ->
 //! encode -> FXAA. LDR chains retain their existing pass order and byte output.
-//! SSAO must run before tonemapping and bloom because it reads linear scene
-//! color and depth. It modulates the full color, not only the ambient term.
+//! SSAO and DoF must run before tonemapping and bloom because they read linear
+//! scene color and depth. SSAO modulates the full color, not only the ambient term.
 //! Ambient-only modulation needs a separate ambient buffer and is out of scope.
 
 use crate::fb::{Framebuffer, argb8888_linear};
@@ -161,9 +161,9 @@ pub trait PostPass: Send + Sync {
 
 /// An ordered, opt-in collection of post-processing passes.
 ///
-/// Push [`SsaoPass`] before [`BloomPass`] and [`AcesTonemapPass`]. SSAO needs
-/// the linear HDR scene and depth before those passes change the color space
-/// or add display-space light.
+/// Push [`SsaoPass`] and [`DofPass`] before [`BloomPass`] and
+/// [`AcesTonemapPass`]. These depth passes need the linear scene before later
+/// passes change the color space or add display-space light.
 #[derive(Default)]
 pub struct PostChain {
     passes: Vec<Box<dyn PostPass>>,
@@ -254,6 +254,35 @@ pub struct SsaoPass {
     blur_depth_threshold: f32,
 }
 
+/// Reconstructs one view-space position from one raster depth sample.
+///
+/// This is the shared perspective-depth reconstruction used by both SSAO and
+/// depth of field. Keeping one implementation also keeps their linear depth
+/// interpretation identical.
+pub fn reconstruct_view_position(
+    inverse_projection: Mat4,
+    x: usize,
+    y: usize,
+    depth: f32,
+    width: usize,
+    height: usize,
+) -> Option<Vec3> {
+    if width == 0 || height == 0 || x >= width || y >= height || !depth.is_finite() {
+        return None;
+    }
+    let ndc_x = ((x as f32 + 0.5) / width as f32) * 2.0 - 1.0;
+    let ndc_y = 1.0 - ((y as f32 + 0.5) / height as f32) * 2.0;
+    let clip = inverse_projection * Vec4::new(ndc_x, ndc_y, depth, 1.0);
+    if !clip.w.is_finite() || clip.w.abs() <= f32::EPSILON {
+        return None;
+    }
+    let position = Vec3::new(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
+    if !position.x.is_finite() || !position.y.is_finite() || !position.z.is_finite() {
+        return None;
+    }
+    Some(position)
+}
+
 impl SsaoPass {
     /// Creates a pass from the projection matrix used by the camera.
     ///
@@ -338,20 +367,7 @@ impl SsaoPass {
         width: usize,
         height: usize,
     ) -> Option<Vec3> {
-        if width == 0 || height == 0 || x >= width || y >= height || !depth.is_finite() {
-            return None;
-        }
-        let ndc_x = ((x as f32 + 0.5) / width as f32) * 2.0 - 1.0;
-        let ndc_y = 1.0 - ((y as f32 + 0.5) / height as f32) * 2.0;
-        let clip = self.inverse_projection * Vec4::new(ndc_x, ndc_y, depth, 1.0);
-        if !clip.w.is_finite() || clip.w.abs() <= f32::EPSILON {
-            return None;
-        }
-        let position = Vec3::new(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
-        if !position.x.is_finite() || !position.y.is_finite() || !position.z.is_finite() {
-            return None;
-        }
-        Some(position)
+        reconstruct_view_position(self.inverse_projection, x, y, depth, width, height)
     }
 
     /// Computes the unblurred occlusion buffer from the framebuffer depth.
@@ -412,7 +428,8 @@ impl SsaoPass {
                 if depth >= 1.0 {
                     continue;
                 }
-                positions[index] = self.reconstruct_view_position(
+                positions[index] = reconstruct_view_position(
+                    self.inverse_projection,
                     x,
                     y,
                     depth,
@@ -626,6 +643,266 @@ impl SsaoPass {
             total / weight_total
         }
     }
+}
+
+/// Fixed focal length used by the renderer's view-space thin-lens model.
+/// Aperture is a texel-scaled strength, so the standard CoC equation produces
+/// a pixel radius directly:
+/// `aperture * |focal_length * (focus - depth)| /
+/// (depth * (focus - focal_length))`.
+pub const DOF_FOCAL_LENGTH: f32 = 1.0;
+pub const DOF_DEFAULT_FOCUS_DISTANCE: f32 = 4.0;
+pub const DOF_DEFAULT_APERTURE: f32 = 6.0;
+pub const DOF_DEFAULT_MAX_COC_RADIUS: f32 = 8.0;
+pub const DOF_MAX_COC_RADIUS: f32 = 64.0;
+pub const DOF_SAMPLE_COUNT: usize = 20;
+const DOF_FOCAL_COC_EPSILON: f32 = 1.0e-4;
+
+const DOF_DISC_KERNEL: [(f32, f32); DOF_SAMPLE_COUNT] = [
+    (1.0, 0.0),
+    (0.951, 0.309),
+    (0.809, 0.588),
+    (0.588, 0.809),
+    (0.309, 0.951),
+    (0.0, 1.0),
+    (-0.309, 0.951),
+    (-0.588, 0.809),
+    (-0.809, 0.588),
+    (-0.951, 0.309),
+    (-1.0, 0.0),
+    (-0.951, -0.309),
+    (-0.809, -0.588),
+    (-0.588, -0.809),
+    (-0.309, -0.951),
+    (0.0, -1.0),
+    (0.309, -0.951),
+    (0.588, -0.809),
+    (0.809, -0.588),
+    (0.951, -0.309),
+];
+
+/// Thin-lens depth of field in linear color space.
+///
+/// This is a single-pass gather. It can spread a defocused foreground sample
+/// over gathered background color, but it cannot perform true near-field
+/// scatter. Near-field scatter and its separate foreground layer are out of
+/// scope. A depth-aware gather rejects a more-defocused background tap behind
+/// a less-defocused center, which limits the common sharp-foreground halo.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DofPass {
+    projection: Mat4,
+    inverse_projection: Mat4,
+    projection_valid: bool,
+    focus_distance: f32,
+    aperture: f32,
+    max_coc_radius: f32,
+}
+
+impl DofPass {
+    /// Creates a pass from the exact projection matrix used by the camera.
+    pub fn new(projection: Mat4) -> Self {
+        let (projection, inverse_projection, projection_valid) = sanitize_projection(projection);
+        Self {
+            projection,
+            inverse_projection,
+            projection_valid,
+            focus_distance: DOF_DEFAULT_FOCUS_DISTANCE,
+            aperture: DOF_DEFAULT_APERTURE,
+            max_coc_radius: DOF_DEFAULT_MAX_COC_RADIUS,
+        }
+    }
+
+    pub const fn projection(&self) -> Mat4 {
+        self.projection
+    }
+
+    pub fn set_projection(&mut self, projection: Mat4) {
+        let (projection, inverse_projection, projection_valid) = sanitize_projection(projection);
+        self.projection = projection;
+        self.inverse_projection = inverse_projection;
+        self.projection_valid = projection_valid;
+    }
+
+    pub const fn focus_distance(&self) -> f32 {
+        self.focus_distance
+    }
+
+    pub fn set_focus_distance(&mut self, distance: f32) {
+        self.focus_distance = sanitize_positive(distance, DOF_DEFAULT_FOCUS_DISTANCE, 1000.0)
+            .max(DOF_FOCAL_LENGTH + f32::EPSILON);
+    }
+
+    pub const fn aperture(&self) -> f32 {
+        self.aperture
+    }
+
+    pub fn set_aperture(&mut self, aperture: f32) {
+        self.aperture = sanitize_nonnegative(aperture, DOF_DEFAULT_APERTURE, 1000.0);
+    }
+
+    pub const fn max_coc_radius(&self) -> f32 {
+        self.max_coc_radius
+    }
+
+    pub fn set_max_coc_radius(&mut self, radius: f32) {
+        self.max_coc_radius =
+            sanitize_nonnegative(radius, DOF_DEFAULT_MAX_COC_RADIUS, DOF_MAX_COC_RADIUS);
+    }
+
+    /// Returns the clamped CoC radius in texels for positive linear depth.
+    pub fn circle_of_confusion(&self, depth: f32) -> f32 {
+        if !depth.is_finite() || depth <= 0.0 || self.aperture == 0.0 {
+            return 0.0;
+        }
+        let numerator = DOF_FOCAL_LENGTH * (self.focus_distance - depth).abs();
+        let denominator = depth * (self.focus_distance - DOF_FOCAL_LENGTH);
+        if denominator <= 0.0 || !denominator.is_finite() {
+            return 0.0;
+        }
+        (self.aperture * numerator / denominator).clamp(0.0, self.max_coc_radius)
+    }
+
+    pub fn coc_radius(&self, depth: f32) -> f32 {
+        self.circle_of_confusion(depth)
+    }
+
+    /// Applies DoF directly through the same production hook used by
+    /// [`PostChain`].
+    pub fn apply_to_framebuffer(&self, framebuffer: &mut Framebuffer) {
+        if self.is_noop() {
+            return;
+        }
+        let input = PostBuffer::from_framebuffer(framebuffer);
+        let mut output = PostBuffer::new(input.width, input.height, PostColorSpace::Linear);
+        output.hdr = input.hdr;
+        self.apply_with_framebuffer(&input, &mut output, framebuffer);
+        output.write_to_framebuffer(framebuffer);
+    }
+
+    fn reconstructed_depths(&self, framebuffer: &Framebuffer) -> Vec<Option<f32>> {
+        let length = framebuffer.width.saturating_mul(framebuffer.height);
+        let mut depths = vec![None; length];
+        for y in 0..framebuffer.height {
+            for x in 0..framebuffer.width {
+                let index = y * framebuffer.width + x;
+                let Some(&depth) = framebuffer.depth.get(index) else {
+                    continue;
+                };
+                if depth >= 1.0 {
+                    continue;
+                }
+                let Some(position) = reconstruct_view_position(
+                    self.inverse_projection,
+                    x,
+                    y,
+                    depth,
+                    framebuffer.width,
+                    framebuffer.height,
+                ) else {
+                    continue;
+                };
+                let linear_depth = -position.z;
+                if linear_depth.is_finite() && linear_depth > 0.0 {
+                    depths[index] = Some(linear_depth);
+                }
+            }
+        }
+        depths
+    }
+
+    fn gather_pixel(
+        &self,
+        input: &PostBuffer,
+        depths: &[Option<f32>],
+        x: usize,
+        y: usize,
+    ) -> [f32; 4] {
+        let index = y * input.width + x;
+        let source = input.pixels[index];
+        let Some(center_depth) = depths[index] else {
+            return source;
+        };
+        let center_radius = self.circle_of_confusion(center_depth);
+        if center_radius <= DOF_FOCAL_COC_EPSILON && self.aperture > 0.0 {
+            return source;
+        }
+
+        let gather_radius = center_radius.max(1.0);
+        let mut total = [source[1], source[2], source[3]];
+        let mut weight_total = 1.0;
+        for &(offset_x, offset_y) in &DOF_DISC_KERNEL {
+            let sample_x = (x as f32 + offset_x * gather_radius).round() as isize;
+            let sample_y = (y as f32 + offset_y * gather_radius).round() as isize;
+            let sample_x = sample_x.clamp(0, input.width.saturating_sub(1) as isize) as usize;
+            let sample_y = sample_y.clamp(0, input.height.saturating_sub(1) as isize) as usize;
+            let sample_index = sample_y * input.width + sample_x;
+            let Some(sample_depth) = depths[sample_index] else {
+                continue;
+            };
+            let sample_radius = self.circle_of_confusion(sample_depth);
+            let depth_delta = sample_depth - center_depth;
+            // A background tap with a larger CoC cannot bleed onto a center
+            // surface with less blur. Foreground taps remain eligible, which
+            // is the useful gather approximation for foreground defocus.
+            if depth_delta > 0.0 && sample_radius > center_radius {
+                continue;
+            }
+            let depth_weight = if depth_delta > 0.0 {
+                center_radius / (center_radius + depth_delta).max(f32::EPSILON)
+            } else {
+                1.0
+            };
+            if depth_weight <= 0.0 || !depth_weight.is_finite() {
+                continue;
+            }
+            let sample = input.pixels[sample_index];
+            total[0] += sample[1] * depth_weight;
+            total[1] += sample[2] * depth_weight;
+            total[2] += sample[3] * depth_weight;
+            weight_total += depth_weight;
+        }
+        [
+            source[0],
+            total[0] / weight_total,
+            total[1] / weight_total,
+            total[2] / weight_total,
+        ]
+    }
+}
+
+impl PostPass for DofPass {
+    fn color_space(&self) -> PostColorSpace {
+        PostColorSpace::Linear
+    }
+
+    fn apply(&self, input: &PostBuffer, output: &mut PostBuffer) {
+        output.pixels.clone_from(&input.pixels);
+    }
+
+    fn is_noop(&self) -> bool {
+        !self.projection_valid || self.aperture == 0.0 || self.max_coc_radius == 0.0
+    }
+
+    fn apply_with_framebuffer(
+        &self,
+        input: &PostBuffer,
+        output: &mut PostBuffer,
+        framebuffer: &Framebuffer,
+    ) {
+        debug_assert_eq!(input.color_space, PostColorSpace::Linear);
+        debug_assert_eq!(output.color_space, PostColorSpace::Linear);
+        let depths = self.reconstructed_depths(framebuffer);
+        for y in 0..input.height {
+            for x in 0..input.width {
+                let index = y * input.width + x;
+                output.pixels[index] = self.gather_pixel(input, &depths, x, y);
+            }
+        }
+    }
+}
+
+pub fn dof(projection: Mat4) -> DofPass {
+    DofPass::new(projection)
 }
 
 impl PostPass for SsaoPass {
