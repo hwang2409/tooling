@@ -1656,4 +1656,23 @@ mod tests {
         let mut queue = std::collections::BinaryHeap::from([higher, lower]);
         assert_eq!(queue.pop().unwrap().edge_index, 3);
     }
+
+    #[test]
+    fn collapse_rejects_a_face_orientation_flip_without_surface_center() {
+        let vertices = vec![
+            MeshVertex::new(Vec3::ZERO, None, None),
+            MeshVertex::new(Vec3::new(1.0, 0.0, 0.0), None, None),
+            MeshVertex::new(Vec3::new(0.0, 1.0, 0.0), None, None),
+            MeshVertex::new(Vec3::new(0.0, 0.0, 1.0), None, None),
+        ];
+        let triangles = vec![[0, 2, 3]];
+        assert!(!collapse_is_valid(
+            &vertices,
+            &triangles,
+            0,
+            1,
+            Vec3::new(0.0, 2.0, 0.0),
+            None,
+        ));
+    }
 }
