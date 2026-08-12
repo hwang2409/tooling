@@ -34,7 +34,7 @@ pub fn build_pcss_shadow_scene() -> PcssShadowScene {
     let slab_model =
         Mat4::translate(Vec3::new(1.4, 0.2, 0.0)) * Mat4::scale(Vec3::new(1.4, 0.2, 1.2));
     let target = Vec3::new(0.0, 1.0, 0.0);
-    let light_direction = Vec3::new(0.65, 1.0, 0.45).normalize();
+    let light_direction = Vec3::new(0.65, 1.0, -0.45).normalize();
     let light_view_projection = Mat4::orthographic(-8.0, 8.0, -8.0, 8.0, 1.0, 24.0)
         * directional_light_view(light_direction, target, 12.0, Vec3::new(0.0, 1.0, 0.0));
     let mut shadow_target = Framebuffer::new(PCSS_SHADOW_SIZE, PCSS_SHADOW_SIZE);

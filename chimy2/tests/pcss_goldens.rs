@@ -64,7 +64,7 @@ fn render_pcss_scene() -> Framebuffer {
         );
         let mut shadow = ShadowState::new(scene.light_view_projection, scene.shadow_map.clone());
         shadow.set_bias(0.002, 0.025);
-        shadow.set_light_size(0.85);
+        shadow.set_light_size(1.4);
         uniforms.set_directional_shadow(directional, Some(shadow));
         uniforms
     };
