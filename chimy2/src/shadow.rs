@@ -1,4 +1,8 @@
 //! Directional shadow-map targets, sampling, and depth-pass shaders.
+//!
+//! Single-map directional shadows support opt-in percentage-closer soft
+//! shadows (PCSS), following Fernando, "Percentage-Closer Soft Shadows",
+//! NVIDIA, 2005. PCSS is not applied to cascaded maps or cube shadows.
 
 use crate::fb::Framebuffer;
 use crate::math::{Mat4, Vec2, Vec3, Vec4};
@@ -30,6 +34,42 @@ pub struct ShadowMap {
 
 impl ShadowMap {
     pub const PCF_WEIGHTS: [f32; 9] = [1.0 / 9.0; 9];
+    const PCSS_BLOCKER_SAMPLES: [Vec2; 16] = [
+        Vec2::new(-0.942, -0.399),
+        Vec2::new(-0.751, 0.271),
+        Vec2::new(-0.527, -0.844),
+        Vec2::new(-0.305, 0.689),
+        Vec2::new(-0.088, -0.176),
+        Vec2::new(0.097, 0.932),
+        Vec2::new(0.244, -0.604),
+        Vec2::new(0.416, 0.153),
+        Vec2::new(0.571, -0.925),
+        Vec2::new(0.694, 0.554),
+        Vec2::new(0.827, -0.196),
+        Vec2::new(0.932, 0.802),
+        Vec2::new(-0.881, 0.735),
+        Vec2::new(-0.637, -0.612),
+        Vec2::new(-0.216, 0.382),
+        Vec2::new(0.011, -0.947),
+    ];
+    const PCSS_FILTER_SAMPLES: [Vec2; 16] = [
+        Vec2::new(-0.942, -0.399),
+        Vec2::new(-0.751, 0.271),
+        Vec2::new(-0.527, -0.844),
+        Vec2::new(-0.305, 0.689),
+        Vec2::new(-0.088, -0.176),
+        Vec2::new(0.097, 0.932),
+        Vec2::new(0.244, -0.604),
+        Vec2::new(0.416, 0.153),
+        Vec2::new(0.571, -0.925),
+        Vec2::new(0.694, 0.554),
+        Vec2::new(0.827, -0.196),
+        Vec2::new(0.932, 0.802),
+        Vec2::new(-0.881, 0.735),
+        Vec2::new(-0.637, -0.612),
+        Vec2::new(-0.216, 0.382),
+        Vec2::new(0.011, -0.947),
+    ];
 
     pub fn from_framebuffer(framebuffer: &Framebuffer) -> Result<Self, String> {
         Self::from_depth(
@@ -122,6 +162,130 @@ impl ShadowMap {
         }
         visibility
     }
+
+    /// Applies PCSS to a single directional map.
+    ///
+    /// The map stores NDC depth, but blocker and receiver distances are
+    /// reconstructed as linear light-space units. For an orthographic light
+    /// matrix, the row-2 scale converts NDC depth to distance from the light.
+    /// The light size is in world units. Row-norm extents convert it to UV;
+    /// this uses matrix rows because [`Mat4`] stores columns.
+    pub fn visibility_pcss(
+        &self,
+        uv: Vec2,
+        receiver_depth: f32,
+        light_view_projection: Mat4,
+        parameters: PcssShadowParameters,
+    ) -> f32 {
+        let PcssShadowParameters {
+            constant_bias,
+            slope_bias,
+            normal_dot_light,
+            light_size,
+        } = parameters;
+        if !(0.0..=1.0).contains(&uv.x)
+            || !(0.0..=1.0).contains(&uv.y)
+            || !receiver_depth.is_finite()
+            || !(-1.0..=1.0).contains(&receiver_depth)
+            || !light_size.is_finite()
+            || light_size <= 0.0
+        {
+            let bias = constant_bias.max(slope_bias * (1.0 - normal_dot_light));
+            return self.visibility_3x3(uv, receiver_depth, bias);
+        }
+        let Some(receiver_linear_depth) = linear_light_depth(light_view_projection, receiver_depth)
+        else {
+            return 1.0;
+        };
+        let row_x = matrix_row_scale(light_view_projection, 0);
+        let row_y = matrix_row_scale(light_view_projection, 1);
+        let row_z = matrix_row_scale(light_view_projection, 2);
+        if !row_x.is_finite()
+            || !row_y.is_finite()
+            || !row_z.is_finite()
+            || row_x <= f32::EPSILON
+            || row_y <= f32::EPSILON
+            || row_z <= f32::EPSILON
+        {
+            return 1.0;
+        }
+
+        // A world-unit light radius projects to half an NDC span, then to UV.
+        // This is the world-units-to-UV conversion used by both search stages.
+        let search_radius_uv = pcss_search_radius_uv(light_size, light_view_projection);
+        let base_bias = constant_bias.max(slope_bias * (1.0 - normal_dot_light));
+        let receiver_bias = base_bias.max(0.0) / row_z;
+        let mut blocker_depth_sum = 0.0;
+        let mut blocker_count = 0_u32;
+        for offset in Self::PCSS_BLOCKER_SAMPLES {
+            let sample_uv = uv + offset * search_radius_uv;
+            let sample_depth = self.sample_depth_clamped(sample_uv);
+            let Some(sample_linear_depth) = linear_light_depth(light_view_projection, sample_depth)
+            else {
+                continue;
+            };
+            if sample_linear_depth < receiver_linear_depth - receiver_bias {
+                blocker_depth_sum += sample_linear_depth;
+                blocker_count += 1;
+            }
+        }
+        // No blocker means no penumbra. This early-out also prevents empty
+        // regions from becoming artificial blockers at depth zero.
+        if blocker_count == 0 {
+            return 1.0;
+        }
+        let average_blocker_depth = blocker_depth_sum / blocker_count as f32;
+        if !average_blocker_depth.is_finite() {
+            return 1.0;
+        }
+
+        // Fernando's PCSS estimate is linear in light-space depth. NDC depth
+        // is nonlinear for perspective projections, so it is not used here.
+        let penumbra_width = if average_blocker_depth > 0.0 {
+            pcss_penumbra_width(receiver_linear_depth, average_blocker_depth, light_size)
+        } else {
+            f32::MAX
+        };
+        let raw_radius_x = (penumbra_width * row_x * self.width as f32 * 0.5).max(1.0);
+        let raw_radius_y = (penumbra_width * row_y * self.height as f32 * 0.5).max(1.0);
+        let center_x = (uv.x * self.width as f32).floor() as isize;
+        let center_y = (uv.y * self.height as f32).floor() as isize;
+        let radius_x =
+            raw_radius_x.min(center_x.min(self.width as isize - 1 - center_x).max(0) as f32);
+        let radius_y =
+            raw_radius_y.min(center_y.min(self.height as isize - 1 - center_y).max(0) as f32);
+        let filter_radius_uv =
+            Vec2::new(radius_x / self.width as f32, radius_y / self.height as f32);
+        // The slope term grows with the filter radius. A wide filter needs a
+        // wider world-space receiver offset to avoid reintroducing acne.
+        let kernel_scale = radius_x.max(radius_y).max(1.0);
+        let scaled_bias =
+            pcss_filter_bias(constant_bias, slope_bias, normal_dot_light, kernel_scale);
+        let mut visibility = 0.0;
+        for offset in Self::PCSS_FILTER_SAMPLES {
+            let sample_uv = uv + offset * filter_radius_uv;
+            let sample_depth = self.sample_depth_clamped(sample_uv);
+            if Self::depth_visible(receiver_depth, sample_depth, scaled_bias) {
+                visibility += 1.0;
+            }
+        }
+        visibility / Self::PCSS_FILTER_SAMPLES.len() as f32
+    }
+
+    fn sample_depth_clamped(&self, uv: Vec2) -> f32 {
+        let x = (uv.x.clamp(0.0, 1.0) * self.width as f32).floor() as usize;
+        let y = (uv.y.clamp(0.0, 1.0) * self.height as f32).floor() as usize;
+        self.depth[y.min(self.height - 1) * self.width + x.min(self.width - 1)]
+    }
+}
+
+/// Runtime parameters for one single-map PCSS visibility query.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PcssShadowParameters {
+    pub constant_bias: f32,
+    pub slope_bias: f32,
+    pub normal_dot_light: f32,
+    pub light_size: f32,
 }
 
 /// Complete directional shadow state used by the lighting shader.
@@ -132,6 +296,7 @@ pub struct ShadowState {
     cascades: Option<CascadeShadowState>,
     constant_bias: f32,
     slope_bias: f32,
+    light_size: f32,
 }
 
 impl ShadowState {
@@ -142,6 +307,7 @@ impl ShadowState {
             cascades: None,
             constant_bias: 0.002,
             slope_bias: 0.02,
+            light_size: 0.0,
         }
     }
 
@@ -155,6 +321,7 @@ impl ShadowState {
             cascades: Some(cascades),
             constant_bias: 0.002,
             slope_bias: 0.02,
+            light_size: 0.0,
         }
     }
 
@@ -178,6 +345,12 @@ impl ShadowState {
         (self.constant_bias, self.slope_bias)
     }
 
+    /// Returns the world-unit directional emitter radius used by PCSS.
+    /// Zero keeps the exact legacy 3x3 PCF path. Cascaded maps ignore it.
+    pub const fn light_size(&self) -> f32 {
+        self.light_size
+    }
+
     pub fn set_bias(&mut self, constant: f32, slope: f32) {
         self.constant_bias = sanitize_bias(constant);
         self.slope_bias = sanitize_bias(slope);
@@ -185,6 +358,66 @@ impl ShadowState {
             cascades.set_bias(constant, slope);
         }
     }
+
+    /// Enables PCSS for a single directional map. Invalid or negative sizes
+    /// sanitize to zero. Cascaded maps retain their existing PCF behavior.
+    pub fn set_light_size(&mut self, light_size: f32) {
+        self.light_size = sanitize_light_size(light_size);
+    }
+
+    pub(crate) fn visibility(&self, uv: Vec2, receiver_depth: f32, normal_dot_light: f32) -> f32 {
+        let (constant_bias, slope_bias) = self.bias();
+        self.shadow_map.visibility_pcss(
+            uv,
+            receiver_depth,
+            self.light_view_projection,
+            PcssShadowParameters {
+                constant_bias,
+                slope_bias,
+                normal_dot_light,
+                light_size: self.light_size,
+            },
+        )
+    }
+}
+
+fn matrix_row_scale(matrix: Mat4, row: usize) -> f32 {
+    let x = matrix.data[row];
+    let y = matrix.data[row + 4];
+    let z = matrix.data[row + 8];
+    (x * x + y * y + z * z).sqrt()
+}
+
+fn linear_light_depth(matrix: Mat4, ndc_depth: f32) -> Option<f32> {
+    let scale = matrix_row_scale(matrix, 2);
+    if !scale.is_finite() || scale <= f32::EPSILON || !ndc_depth.is_finite() {
+        return None;
+    }
+    let depth = (ndc_depth - matrix.data[14]) / scale;
+    depth.is_finite().then_some(depth)
+}
+
+fn pcss_search_radius_uv(light_size: f32, matrix: Mat4) -> Vec2 {
+    let row_x = matrix_row_scale(matrix, 0);
+    let row_y = matrix_row_scale(matrix, 1);
+    Vec2::new(light_size * row_x * 0.5, light_size * row_y * 0.5)
+}
+
+fn pcss_penumbra_width(receiver_depth: f32, blocker_depth: f32, light_size: f32) -> f32 {
+    if !receiver_depth.is_finite() || !blocker_depth.is_finite() || blocker_depth <= 0.0 {
+        return 0.0;
+    }
+    ((receiver_depth - blocker_depth) * light_size / blocker_depth).max(0.0)
+}
+
+fn pcss_filter_bias(
+    constant_bias: f32,
+    slope_bias: f32,
+    normal_dot_light: f32,
+    kernel_scale: f32,
+) -> f32 {
+    constant_bias
+        .max(slope_bias.max(0.0) * (1.0 - normal_dot_light.clamp(0.0, 1.0)) * kernel_scale.max(1.0))
 }
 
 /// CSM implementation is kept in the focused `csm` module.
@@ -717,6 +950,14 @@ fn sanitize_distance(value: f32) -> f32 {
 }
 
 pub(crate) fn sanitize_bias(value: f32) -> f32 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+pub(crate) fn sanitize_light_size(value: f32) -> f32 {
     if value.is_finite() {
         value.max(0.0)
     } else {
@@ -1387,6 +1628,128 @@ mod tests {
         let shadow_map = ShadowMap::from_depth(1, 1, vec![-1.0]).unwrap();
         let visibility = shadow_map.visibility_3x3(Vec2::new(0.5, 0.5), 0.0, 0.0);
         assert!((visibility - 8.0 / 9.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pcss_penumbra_formula_uses_linear_light_depth() {
+        let width = pcss_penumbra_width(6.0, 2.0, 1.5);
+        assert!((width - 3.0).abs() < 1e-6);
+        let ndc_ratio = (0.0 - (-0.8)) * 1.5 / (-0.8);
+        assert!((width - ndc_ratio).abs() > 1.0);
+    }
+
+    #[test]
+    fn pcss_world_light_size_uses_projection_row_norms_for_uv() {
+        let matrix = Mat4::new([
+            2.0, 0.0, 0.0, 0.0, 1.0, 3.0, 0.0, 0.0, 0.0, 4.0, 6.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]);
+        let radius = pcss_search_radius_uv(2.0, matrix);
+        assert!((radius.x - 5.0_f32.sqrt()).abs() < 1e-6);
+        assert!((radius.y - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pcss_zero_light_size_is_exact_legacy_pcf() {
+        let mut depths = vec![0.4; 9];
+        depths[4] = -0.4;
+        let map = ShadowMap::from_depth(3, 3, depths).unwrap();
+        let matrix = Mat4::orthographic(-2.0, 2.0, -2.0, 2.0, 1.0, 10.0);
+        let uv = Vec2::new(0.5, 0.5);
+        let legacy = map.visibility_3x3(uv, 0.0, 0.0);
+        let pcss = map.visibility_pcss(
+            uv,
+            0.0,
+            matrix,
+            PcssShadowParameters {
+                constant_bias: 0.0,
+                slope_bias: 0.0,
+                normal_dot_light: 0.5,
+                light_size: 0.0,
+            },
+        );
+        assert_eq!(legacy, 8.0 / 9.0);
+        assert_eq!(pcss, 8.0 / 9.0);
+    }
+
+    #[test]
+    fn pcss_zero_blockers_is_fully_lit() {
+        let mut depths = vec![1.0; 32 * 4];
+        for y in 0..4 {
+            depths[y * 32 + 4] = -0.9;
+        }
+        let map = ShadowMap::from_depth(32, 4, depths).unwrap();
+        let matrix = Mat4::orthographic(-2.0, 2.0, -2.0, 2.0, 1.0, 10.0);
+        assert_eq!(
+            map.visibility_pcss(
+                Vec2::new(0.9, 0.5),
+                -0.5,
+                matrix,
+                PcssShadowParameters {
+                    constant_bias: 0.0,
+                    slope_bias: 0.0,
+                    normal_dot_light: 1.0,
+                    light_size: 1.0,
+                },
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn pcss_kernel_clamps_at_map_edge_without_wrap() {
+        let mut depths = vec![0.4; 8];
+        depths[0] = -0.8;
+        let map = ShadowMap::from_depth(8, 1, depths).unwrap();
+        let matrix = Mat4::orthographic(-2.0, 2.0, -2.0, 2.0, 1.0, 10.0);
+        let visibility = map.visibility_pcss(
+            Vec2::new(0.01, 0.5),
+            -0.6,
+            matrix,
+            PcssShadowParameters {
+                constant_bias: 0.0,
+                slope_bias: 0.0,
+                normal_dot_light: 1.0,
+                light_size: 3.0,
+            },
+        );
+        assert_eq!(visibility, 0.0);
+    }
+
+    #[test]
+    fn pcss_light_size_sanitizes_immediately() {
+        let map = ShadowMap::from_depth(1, 1, vec![0.0]).unwrap();
+        let mut state = ShadowState::new(Mat4::IDENTITY, map);
+        state.set_light_size(-1.0);
+        assert_eq!(state.light_size(), 0.0);
+        state.set_light_size(f32::NAN);
+        assert_eq!(state.light_size(), 0.0);
+        state.set_light_size(f32::INFINITY);
+        assert_eq!(state.light_size(), 0.0);
+        state.set_light_size(2.0);
+        assert_eq!(state.light_size(), 2.0);
+    }
+
+    #[test]
+    fn pcss_bias_scales_with_wide_kernel_on_a_slope() {
+        let base = pcss_filter_bias(0.0, 0.002, 0.0, 1.0);
+        let wide = pcss_filter_bias(0.0, 0.002, 0.0, 16.0);
+        assert!((base - 0.002).abs() < 1e-6);
+        assert!((wide - 0.032).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pcss_sampling_is_byte_deterministic() {
+        let map = ShadowMap::from_depth(32, 32, vec![-0.5; 1024]).unwrap();
+        let matrix = Mat4::orthographic(-2.0, 2.0, -2.0, 2.0, 1.0, 10.0);
+        let parameters = PcssShadowParameters {
+            constant_bias: 0.0,
+            slope_bias: 0.02,
+            normal_dot_light: 0.3,
+            light_size: 1.0,
+        };
+        let first = map.visibility_pcss(Vec2::new(0.45, 0.6), 0.0, matrix, parameters);
+        let second = map.visibility_pcss(Vec2::new(0.45, 0.6), 0.0, matrix, parameters);
+        assert_eq!(first.to_bits(), second.to_bits());
     }
 
     #[test]

@@ -1099,7 +1099,6 @@ impl BlinnPhongUniforms {
                 self.directional_light().direction,
             );
         }
-        let shadow_map = shadow_state.shadow_map();
         if light_space_position.w <= 0.0 || !light_space_position.w.is_finite() {
             return 1.0;
         }
@@ -1113,9 +1112,7 @@ impl BlinnPhongUniforms {
             .normalize()
             .dot(self.directional_light().direction.normalize())
             .clamp(0.0, 1.0);
-        let (constant_bias, slope_bias) = shadow_state.bias();
-        let bias = constant_bias.max(slope_bias * (1.0 - normal_dot_light));
-        shadow_map.visibility_3x3(uv, ndc.z, bias)
+        shadow_state.visibility(uv, ndc.z, normal_dot_light)
     }
 }
 
@@ -2443,5 +2440,41 @@ mod tests {
         assert_eq!(uniforms.light_view_projection(), moved_matrix);
         assert_eq!(uniforms.shadow_bias(), (0.01, 0.04));
         assert!(uniforms.shadow_map().is_some());
+    }
+
+    #[test]
+    fn production_pcss_contact_hardening_widens_far_transition() {
+        let matrix = Mat4::orthographic(-8.0, 8.0, -8.0, 8.0, 1.0, 11.0);
+        let mut depth = vec![1.0; 64 * 8];
+        for y in 0..8 {
+            for x in 0..32 {
+                depth[y * 64 + x] = -0.9;
+            }
+        }
+        let map = ShadowMap::from_depth(64, 8, depth).unwrap();
+        let mut shadow = ShadowState::new(matrix, map);
+        shadow.set_bias(0.0, 0.0);
+        shadow.set_light_size(1.0);
+        let mut lighting = uniforms();
+        let light = DirectionalLight::new(Vec3::new(0.0, 0.0, 1.0), Vec3::new(1.0, 1.0, 1.0));
+        lighting.set_directional_shadow(light, Some(shadow));
+
+        let transition_width = |receiver_depth: f32| {
+            (0..=128)
+                .map(|index| {
+                    let uv_x = index as f32 / 128.0;
+                    let visibility = lighting.shadow_visibility(
+                        Vec3::ZERO,
+                        Vec4::new(uv_x * 2.0 - 1.0, 0.0, receiver_depth, 1.0),
+                        Vec3::new(0.0, 0.0, 1.0),
+                    );
+                    (0.0..1.0).contains(&visibility)
+                })
+                .filter(|&partial| partial)
+                .count()
+        };
+        let contact = transition_width(-0.8);
+        let far = transition_width(0.0);
+        assert!(far > contact, "contact={contact}, far={far}");
     }
 }
