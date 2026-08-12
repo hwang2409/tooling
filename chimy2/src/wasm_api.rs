@@ -382,10 +382,7 @@ fn init_state(state: &mut Option<Showcase>, width: u32, height: u32) -> i32 {
             *state = Some(showcase);
             0
         }
-        Err(_) => {
-            *state = None;
-            api_error(ShowcaseErrorCode::InvalidDimensions)
-        }
+        Err(_) => api_error(ShowcaseErrorCode::InvalidDimensions),
     }
 }
 
@@ -486,14 +483,35 @@ mod tests {
     }
 
     #[test]
-    fn state_guards_render_before_init_and_support_double_init() {
+    fn state_guards_render_before_init_and_reject_invalid_dimensions() {
         let mut state = None;
         assert_eq!(render_state(&mut state, 0.0, 0.0, 0.0, 0), -2);
         assert_eq!(framebuffer_len_state(&state), 0);
+        assert_eq!(init_state(&mut state, 0, 64), -1);
+        assert!(state.is_none());
+        assert_eq!(init_state(&mut state, 2049, 64), -1);
+        assert!(state.is_none());
 
         assert_eq!(init_state(&mut state, 64, 64), 0);
         assert_eq!(render_state(&mut state, 0.0, 0.0, 0.0, 0), 0);
         assert_ne!(framebuffer_ptr_state(&state), std::ptr::null());
+
+        let state_snapshot = |state: &Option<Showcase>| {
+            state.as_ref().map(|showcase| {
+                (
+                    framebuffer_ptr_state(state),
+                    framebuffer_len_state(state),
+                    framebuffer_width_state(state),
+                    framebuffer_height_state(state),
+                    showcase.rgba.clone(),
+                )
+            })
+        };
+        let snapshot = state_snapshot(&state);
+        assert_eq!(init_state(&mut state, 0, 64), -1);
+        assert_eq!(state_snapshot(&state), snapshot);
+        assert_eq!(init_state(&mut state, 2049, 64), -1);
+        assert_eq!(state_snapshot(&state), snapshot);
 
         assert_eq!(init_state(&mut state, 32, 24), 0);
         assert_eq!(framebuffer_width_state(&state), 32);
