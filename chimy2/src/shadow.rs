@@ -3,6 +3,10 @@
 //! Single-map directional shadows support opt-in percentage-closer soft
 //! shadows (PCSS), following Fernando, "Percentage-Closer Soft Shadows",
 //! NVIDIA, 2005. PCSS is not applied to cascaded maps or cube shadows.
+//!
+//! The directional adaptation measures blocker and receiver distances from
+//! the light projection's near plane. This is an explicit light-depth origin,
+//! and keeps the denominator translation-invariant for an orthographic light.
 
 use crate::fb::Framebuffer;
 use crate::math::{Mat4, Vec2, Vec3, Vec4};
@@ -182,6 +186,7 @@ impl ShadowMap {
             slope_bias,
             normal_dot_light,
             light_size,
+            light_depth_origin,
         } = parameters;
         if !(0.0..=1.0).contains(&uv.x)
             || !(0.0..=1.0).contains(&uv.y)
@@ -193,7 +198,8 @@ impl ShadowMap {
             let bias = constant_bias.max(slope_bias * (1.0 - normal_dot_light));
             return self.visibility_3x3(uv, receiver_depth, bias);
         }
-        let Some(receiver_linear_depth) = linear_light_depth(light_view_projection, receiver_depth)
+        let Some(receiver_linear_depth) =
+            linear_light_depth(light_view_projection, receiver_depth, light_depth_origin)
         else {
             return 1.0;
         };
@@ -220,7 +226,8 @@ impl ShadowMap {
         for offset in Self::PCSS_BLOCKER_SAMPLES {
             let sample_uv = uv + offset * search_radius_uv;
             let sample_depth = self.sample_depth_clamped(sample_uv);
-            let Some(sample_linear_depth) = linear_light_depth(light_view_projection, sample_depth)
+            let Some(sample_linear_depth) =
+                linear_light_depth(light_view_projection, sample_depth, light_depth_origin)
             else {
                 continue;
             };
@@ -246,8 +253,8 @@ impl ShadowMap {
         } else {
             f32::MAX
         };
-        let raw_radius_x = (penumbra_width * row_x * self.width as f32 * 0.5).max(1.0);
-        let raw_radius_y = (penumbra_width * row_y * self.height as f32 * 0.5).max(1.0);
+        let raw_radius_x = (penumbra_width * row_x * self.width as f32 * 0.5).max(2.0);
+        let raw_radius_y = (penumbra_width * row_y * self.height as f32 * 0.5).max(2.0);
         let center_x = (uv.x * self.width as f32).floor() as isize;
         let center_y = (uv.y * self.height as f32).floor() as isize;
         let radius_x =
@@ -286,6 +293,8 @@ pub struct PcssShadowParameters {
     pub slope_bias: f32,
     pub normal_dot_light: f32,
     pub light_size: f32,
+    /// Distance origin in light view units. Zero means the light near plane.
+    pub light_depth_origin: f32,
 }
 
 /// Complete directional shadow state used by the lighting shader.
@@ -297,6 +306,7 @@ pub struct ShadowState {
     constant_bias: f32,
     slope_bias: f32,
     light_size: f32,
+    light_depth_origin: f32,
 }
 
 impl ShadowState {
@@ -308,6 +318,7 @@ impl ShadowState {
             constant_bias: 0.002,
             slope_bias: 0.02,
             light_size: 0.0,
+            light_depth_origin: 0.0,
         }
     }
 
@@ -322,6 +333,7 @@ impl ShadowState {
             constant_bias: 0.002,
             slope_bias: 0.02,
             light_size: 0.0,
+            light_depth_origin: 0.0,
         }
     }
 
@@ -351,6 +363,11 @@ impl ShadowState {
         self.light_size
     }
 
+    /// Returns the explicit light-view distance origin used by PCSS.
+    pub const fn light_depth_origin(&self) -> f32 {
+        self.light_depth_origin
+    }
+
     pub fn set_bias(&mut self, constant: f32, slope: f32) {
         self.constant_bias = sanitize_bias(constant);
         self.slope_bias = sanitize_bias(slope);
@@ -365,6 +382,13 @@ impl ShadowState {
         self.light_size = sanitize_light_size(light_size);
     }
 
+    /// Sets the PCSS distance origin in light-view units. Zero is the light
+    /// projection near plane and is translation-invariant for an orthographic
+    /// directional projection.
+    pub fn set_light_depth_origin(&mut self, origin: f32) {
+        self.light_depth_origin = sanitize_light_depth_origin(origin);
+    }
+
     pub(crate) fn visibility(&self, uv: Vec2, receiver_depth: f32, normal_dot_light: f32) -> f32 {
         let (constant_bias, slope_bias) = self.bias();
         self.shadow_map.visibility_pcss(
@@ -376,6 +400,7 @@ impl ShadowState {
                 slope_bias,
                 normal_dot_light,
                 light_size: self.light_size,
+                light_depth_origin: self.light_depth_origin,
             },
         )
     }
@@ -388,12 +413,19 @@ fn matrix_row_scale(matrix: Mat4, row: usize) -> f32 {
     (x * x + y * y + z * z).sqrt()
 }
 
-fn linear_light_depth(matrix: Mat4, ndc_depth: f32) -> Option<f32> {
+fn linear_light_depth(matrix: Mat4, ndc_depth: f32, light_depth_origin: f32) -> Option<f32> {
     let scale = matrix_row_scale(matrix, 2);
-    if !scale.is_finite() || scale <= f32::EPSILON || !ndc_depth.is_finite() {
+    if !scale.is_finite()
+        || scale <= f32::EPSILON
+        || !ndc_depth.is_finite()
+        || !light_depth_origin.is_finite()
+    {
         return None;
     }
-    let depth = (ndc_depth - matrix.data[14]) / scale;
+    // For an orthographic projection, (ndc + 1) / scale is view-space
+    // distance from the near plane. Do not use the combined matrix
+    // translation: it changes when the scene and light move together.
+    let depth = (ndc_depth + 1.0) / scale + light_depth_origin;
     depth.is_finite().then_some(depth)
 }
 
@@ -963,6 +995,10 @@ pub(crate) fn sanitize_light_size(value: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+pub(crate) fn sanitize_light_depth_origin(value: f32) -> f32 {
+    if value.is_finite() { value } else { 0.0 }
 }
 
 #[cfg(test)]
@@ -1632,10 +1668,17 @@ mod tests {
 
     #[test]
     fn pcss_penumbra_formula_uses_linear_light_depth() {
-        let width = pcss_penumbra_width(6.0, 2.0, 1.5);
-        assert!((width - 3.0).abs() < 1e-6);
-        let ndc_ratio = (0.0 - (-0.8)) * 1.5 / (-0.8);
-        assert!((width - ndc_ratio).abs() > 1.0);
+        let projection = Mat4::orthographic(-2.0, 2.0, -2.0, 2.0, 1.0, 11.0);
+        let blocker = linear_light_depth(projection, -0.6, 0.0).unwrap();
+        let receiver = linear_light_depth(projection, -0.2, 0.0).unwrap();
+        assert!((blocker - 2.0).abs() < 1e-6);
+        assert!((receiver - 4.0).abs() < 1e-6);
+        assert!((pcss_penumbra_width(receiver, blocker, 1.5) - 1.5).abs() < 1e-6);
+        let translated = projection * Mat4::translate(Vec3::new(7.0, -2.0, 5.0));
+        assert_eq!(
+            linear_light_depth(translated, -0.6, 0.0),
+            linear_light_depth(projection, -0.6, 0.0)
+        );
     }
 
     #[test]
@@ -1665,6 +1708,7 @@ mod tests {
                 slope_bias: 0.0,
                 normal_dot_light: 0.5,
                 light_size: 0.0,
+                light_depth_origin: 0.0,
             },
         );
         assert_eq!(legacy, 8.0 / 9.0);
@@ -1689,6 +1733,7 @@ mod tests {
                     slope_bias: 0.0,
                     normal_dot_light: 1.0,
                     light_size: 1.0,
+                    light_depth_origin: 0.0,
                 },
             ),
             1.0
@@ -1710,6 +1755,7 @@ mod tests {
                 slope_bias: 0.0,
                 normal_dot_light: 1.0,
                 light_size: 3.0,
+                light_depth_origin: 0.0,
             },
         );
         assert_eq!(visibility, 0.0);
@@ -1727,6 +1773,10 @@ mod tests {
         assert_eq!(state.light_size(), 0.0);
         state.set_light_size(2.0);
         assert_eq!(state.light_size(), 2.0);
+        state.set_light_depth_origin(f32::NAN);
+        assert_eq!(state.light_depth_origin(), 0.0);
+        state.set_light_depth_origin(3.0);
+        assert_eq!(state.light_depth_origin(), 3.0);
     }
 
     #[test]
@@ -1746,6 +1796,7 @@ mod tests {
             slope_bias: 0.02,
             normal_dot_light: 0.3,
             light_size: 1.0,
+            light_depth_origin: 0.0,
         };
         let first = map.visibility_pcss(Vec2::new(0.45, 0.6), 0.0, matrix, parameters);
         let second = map.visibility_pcss(Vec2::new(0.45, 0.6), 0.0, matrix, parameters);
