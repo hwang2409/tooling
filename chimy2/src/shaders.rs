@@ -1099,7 +1099,6 @@ impl BlinnPhongUniforms {
                 self.directional_light().direction,
             );
         }
-        let shadow_map = shadow_state.shadow_map();
         if light_space_position.w <= 0.0 || !light_space_position.w.is_finite() {
             return 1.0;
         }
@@ -1113,9 +1112,7 @@ impl BlinnPhongUniforms {
             .normalize()
             .dot(self.directional_light().direction.normalize())
             .clamp(0.0, 1.0);
-        let (constant_bias, slope_bias) = shadow_state.bias();
-        let bias = constant_bias.max(slope_bias * (1.0 - normal_dot_light));
-        shadow_map.visibility_3x3(uv, ndc.z, bias)
+        shadow_state.visibility(uv, ndc.z, normal_dot_light)
     }
 }
 
@@ -2443,5 +2440,162 @@ mod tests {
         assert_eq!(uniforms.light_view_projection(), moved_matrix);
         assert_eq!(uniforms.shadow_bias(), (0.01, 0.04));
         assert!(uniforms.shadow_map().is_some());
+    }
+
+    #[test]
+    fn production_pcss_contact_hardening_widens_far_transition() {
+        let matrix = Mat4::orthographic(-8.0, 8.0, -8.0, 8.0, 1.0, 11.0);
+        let mut depth = vec![1.0; 64 * 8];
+        for y in 0..8 {
+            for x in 0..32 {
+                depth[y * 64 + x] = -0.62;
+            }
+        }
+        let map = ShadowMap::from_depth(64, 8, depth).unwrap();
+        let mut shadow = ShadowState::new(matrix, map);
+        shadow.set_bias(0.0, 0.0);
+        shadow.set_light_size(0.5);
+        let mut lighting = uniforms();
+        let light = DirectionalLight::new(Vec3::new(0.0, 0.0, 1.0), Vec3::new(1.0, 1.0, 1.0));
+        lighting.set_directional_shadow(light, Some(shadow));
+
+        let transition_width = |receiver_depth: f32| {
+            let values: Vec<f32> = (0..=128)
+                .map(|index| {
+                    let uv_x = index as f32 / 128.0;
+                    lighting.shadow_visibility(
+                        Vec3::ZERO,
+                        Vec4::new(uv_x * 2.0 - 1.0, 0.0, receiver_depth, 1.0),
+                        Vec3::new(0.0, 0.0, 1.0),
+                    )
+                })
+                .collect();
+            let partial = values
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &value)| (value > 0.0 && value < 1.0).then_some(index))
+                .collect::<Vec<_>>();
+            partial.len()
+        };
+        let contact = transition_width(-0.6);
+        let middle = transition_width(-0.2);
+        let far = transition_width(0.4);
+        let legacy_contact = (0..=128)
+            .map(|index| {
+                let uv_x = index as f32 / 128.0;
+                lighting
+                    .shadow_map()
+                    .expect("production state has a shadow map")
+                    .visibility_3x3(Vec2::new(uv_x, 0.5), -0.6, 0.0)
+            })
+            .filter(|&visibility| visibility > 0.0 && visibility < 1.0)
+            .count();
+        assert!(
+            contact < middle && middle < far,
+            "contact={contact}, middle={middle}, far={far}"
+        );
+        assert!(
+            (contact as isize - legacy_contact as isize).abs() <= 1,
+            "contact={contact}, legacy_contact={legacy_contact}"
+        );
+    }
+
+    #[test]
+    fn production_pcss_depth_is_translation_invariant() {
+        let projection = Mat4::orthographic(-8.0, 8.0, -8.0, 8.0, 1.0, 11.0);
+        let direction = Vec3::new(0.6, 1.0, 0.4).normalize();
+        let target = Vec3::new(0.0, 0.0, 0.0);
+        let offset = Vec3::new(-30.0, 10.0, -25.0);
+        let matrix_a = projection
+            * crate::shadow::directional_light_view(
+                direction,
+                target,
+                12.0,
+                Vec3::new(0.0, 1.0, 0.0),
+            );
+        let matrix_b = projection
+            * crate::shadow::directional_light_view(
+                direction,
+                target + offset,
+                12.0,
+                Vec3::new(0.0, 1.0, 0.0),
+            );
+        let mut depth = vec![1.0; 64 * 8];
+        for y in 0..8 {
+            for x in 0..32 {
+                depth[y * 64 + x] = -0.62;
+            }
+        }
+        let map = ShadowMap::from_depth(64, 8, depth).unwrap();
+        let make_lighting = |matrix| {
+            let mut lighting = uniforms();
+            let mut shadow = ShadowState::new(matrix, map.clone());
+            shadow.set_bias(0.0, 0.0);
+            shadow.set_light_size(0.5);
+            let light = DirectionalLight::new(direction, Vec3::new(1.0, 1.0, 1.0));
+            lighting.set_directional_shadow(light, Some(shadow));
+            lighting
+        };
+        let lighting_a = make_lighting(matrix_a);
+        let lighting_b = make_lighting(matrix_b);
+        for receiver_depth in [-0.6, -0.2, 0.4] {
+            for uv_x in [0.25, 0.52, 0.55, 0.6, 0.75] {
+                let light_space = Vec4::new(uv_x * 2.0 - 1.0, 0.0, receiver_depth, 1.0);
+                let first =
+                    lighting_a.shadow_visibility(Vec3::ZERO, light_space, Vec3::new(0.0, 0.0, 1.0));
+                let second =
+                    lighting_b.shadow_visibility(offset, light_space, Vec3::new(0.0, 0.0, 1.0));
+                assert_eq!(first.to_bits(), second.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn production_pcss_zero_blocker_early_out_keeps_receiver_lit() {
+        let matrix = Mat4::orthographic(-2.0, 2.0, -2.0, 2.0, 1.0, 10.0);
+        let mut depth = vec![1.0; 32 * 4];
+        for y in 0..4 {
+            depth[y * 32 + 10] = -0.9;
+        }
+        let map = ShadowMap::from_depth(32, 4, depth).unwrap();
+        let mut shadow = ShadowState::new(matrix, map);
+        shadow.set_bias(0.0, 0.0);
+        shadow.set_light_size(1.0);
+        let mut lighting = uniforms();
+        let light = DirectionalLight::new(Vec3::new(0.0, 0.0, 1.0), Vec3::new(1.0, 1.0, 1.0));
+        lighting.set_directional_shadow(light, Some(shadow));
+        let visibility = lighting.shadow_visibility(
+            Vec3::ZERO,
+            Vec4::new(0.2, 0.0, -0.5, 1.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        );
+        assert_eq!(visibility, 1.0);
+    }
+
+    #[test]
+    fn production_pcss_scaled_bias_keeps_slope_lit_without_erasing_blocker() {
+        let matrix = Mat4::orthographic(-2.0, 2.0, -2.0, 2.0, 1.0, 11.0);
+        let mut depth = vec![-0.21; 64 * 8];
+        for y in 0..8 {
+            for x in 24..40 {
+                depth[y * 64 + x] = -0.8;
+            }
+        }
+        let map = ShadowMap::from_depth(64, 8, depth).unwrap();
+        let mut shadow = ShadowState::new(matrix, map);
+        shadow.set_bias(0.0, 0.002);
+        shadow.set_light_size(1.0);
+        let mut lighting = uniforms();
+        let light = DirectionalLight::new(Vec3::new(0.0, 0.0, 1.0), Vec3::new(1.0, 1.0, 1.0));
+        lighting.set_directional_shadow(light, Some(shadow));
+        let visibility = lighting.shadow_visibility(
+            Vec3::ZERO,
+            Vec4::new(0.3, 0.0, -0.2, 1.0),
+            Vec3::new(1.0, 0.0, 0.0),
+        );
+        assert!(
+            visibility > 0.4 && visibility < 1.0,
+            "visibility={visibility}"
+        );
     }
 }
