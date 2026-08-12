@@ -124,16 +124,30 @@ mod tests {
             alpha_mode: GltfAlphaMode::Opaque,
             alpha_cutoff: 0.5,
         };
-        let uniforms = make_gltf_lighting(
+        let parameters = material.render_parameters();
+        let lighting = make_gltf_lighting(
             Mat4::IDENTITY,
             Mat4::IDENTITY,
             Mat4::IDENTITY,
-            material.render_parameters(),
+            parameters,
             Vec3::ZERO,
             DirectionalLight::new(Vec3::ZERO, Vec3::ZERO),
             PointLight::new(Vec3::ZERO, Vec3::ZERO, 1.0, 0.0, 0.0),
         );
-        assert_eq!(uniforms.diffuse_color(), Vec3::new(0.5, 0.5, 0.5));
+        let uniforms = CookTorranceUniforms::new_with_linear_base_color(
+            lighting,
+            parameters.base_color,
+            parameters.metallic,
+            parameters.roughness,
+        );
+        let varyings = CookTorranceVaryings {
+            world_position: Vec3::ZERO,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            light_space_position: Vec4::new(0.0, 0.0, 0.0, 1.0),
+        };
+        // The production GGX draw sees the linear factor 0.5 once through
+        // neutral ambient 0.1: 0.1 * 0.5 = 0.05 linear, or sRGB 63.
+        assert_eq!(CookTorranceShader::shade(&varyings, &uniforms), 0xff3f3f3f);
     }
 
     #[test]

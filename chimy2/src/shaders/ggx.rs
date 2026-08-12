@@ -151,8 +151,12 @@ pub fn ggx_distribution(n_dot_h: f32, roughness: f32) -> f32 {
     let n_dot_h = n_dot_h.clamp(0.0, 1.0);
     let alpha = sanitize_roughness(roughness).powi(2);
     let alpha_squared = alpha * alpha;
-    let denominator = n_dot_h * n_dot_h * (alpha_squared - 1.0) + 1.0;
-    alpha_squared / (PI * denominator * denominator).max(GGX_EPSILON)
+    // Compute the inner term in this stable order to avoid cancellation at
+    // N dot H = 1. The roughness floor keeps it positive. Clamping the inner
+    // term, rather than pi times its square, preserves sharp highlights.
+    let n_dot_h_squared = n_dot_h * n_dot_h;
+    let denominator = ((1.0 - n_dot_h_squared) + n_dot_h_squared * alpha_squared).max(GGX_EPSILON);
+    alpha_squared / (PI * denominator * denominator)
 }
 
 /// Schlick's approximation to the Smith geometry term.
@@ -540,6 +544,15 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::excessive_precision)]
+    fn ggx_distribution_keeps_valid_low_roughness_values() {
+        // The 0.045 floor gives D = 1 / (pi * roughness^4) = 77624.71875.
+        assert_close(ggx_distribution(1.0, 0.045), 77624.71875);
+        // At roughness 0.1, D = 1 / (pi * 0.1^4) = 3183.0986.
+        assert!((ggx_distribution(1.0, 0.1) - 3183.0986).abs() < 0.001);
+    }
+
+    #[test]
     fn fresnel_f0_lerps_from_dielectric_to_metal() {
         let base_color = Vec3::new(0.8, 0.2, 0.1);
         assert_eq!(
@@ -583,12 +596,17 @@ mod tests {
 
     #[test]
     fn kd_energy_conservation_is_bounded() {
-        let base_color = Vec3::new(0.8, 0.2, 0.1);
-        let fresnel = schlick_fresnel(0.35, base_color, 0.35);
-        let kd = (Vec3::new(1.0, 1.0, 1.0) - fresnel) * (1.0 - 0.35);
-        let total = fresnel + kd * base_color;
-        assert!(total.x <= 1.0 && total.y <= 1.0 && total.z <= 1.0);
-        assert!(kd.x < 1.0 - fresnel.x);
+        let normal = Vec3::new(0.0, 0.0, 1.0);
+        let base_color = Vec3::new(0.8, 0.8, 0.8);
+        let dielectric = cook_torrance_brdf(normal, normal, normal, base_color, 0.0, 0.5);
+        let metal = cook_torrance_brdf(normal, normal, normal, base_color, 1.0, 0.5);
+        // Production BRDF arithmetic: D = 5.092958, G = 1, F = 0.04.
+        // Dielectric = (0.96 * 0.8) / pi + (0.04 * D / 4) = 0.2953916.
+        assert_close(dielectric.x, 0.2953916);
+        // Metallic kd is zero. Metal = 0.8 * D / 4 = 1.0185916.
+        // If production kd drops (1 - metallic), this assertion fails.
+        assert_close(metal.x, 1.0185916);
+        assert!(dielectric.x.is_finite() && metal.x.is_finite());
     }
 
     #[test]
