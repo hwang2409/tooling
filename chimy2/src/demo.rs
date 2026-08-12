@@ -492,6 +492,10 @@ pub fn build_lod_scene(aspect: f32) -> LodScene {
         80.0,
     );
     let source = subdivided_octahedron(3);
+    // Keep the shared golden scene platform-independent. This fixed focal
+    // length avoids libm differences in tan(PI / 6).
+    const FOCAL_Y: f32 = 1.7320508;
+    let projection = Mat4::perspective_from_focal_length(FOCAL_Y, aspect.max(0.01), 0.1, 80.0);
     let qem_mesh = LodMesh::new(source.clone());
     let mesh = LodMesh::from_levels(
         vec![
@@ -507,7 +511,7 @@ pub fn build_lod_scene(aspect: f32) -> LodScene {
     let base = BlinnPhongUniforms::new_with_linear_colors(
         Mat4::IDENTITY,
         camera.view_matrix(),
-        camera.projection_matrix(),
+        projection,
         Vec3::new(0.12, 0.12, 0.12),
         Vec3::new(0.72, 0.78, 0.9),
         Vec3::new(0.25, 0.25, 0.25),
