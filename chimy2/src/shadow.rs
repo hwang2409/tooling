@@ -1264,6 +1264,37 @@ mod tests {
     }
 
     #[test]
+    fn uniform_occlusion_is_continuous_across_a_cascade_boundary() {
+        let camera = Camera::new(
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            std::f32::consts::FRAC_PI_2,
+            1.0,
+            0.1,
+            20.0,
+        );
+        let maps = vec![
+            ShadowMap::from_depth(4, 4, vec![0.0; 16]).unwrap(),
+            ShadowMap::from_depth(4, 4, vec![0.0; 16]).unwrap(),
+        ];
+        let state = CascadeShadowState::new(camera, Vec3::new(0.0, 1.0, 0.0), maps).unwrap();
+        let boundary = state.split_depths()[0];
+        let before = state.visibility(
+            Vec3::new(0.0, 0.0, -boundary + 1e-4),
+            boundary - 1e-4,
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        );
+        let after = state.visibility(
+            Vec3::new(0.0, 0.0, -boundary - 1e-4),
+            boundary + 1e-4,
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        );
+        assert!((before - after).abs() <= 1.0 / 16.0);
+    }
+
+    #[test]
     fn cube_face_matrices_keep_axis_centers_and_tangent_orientation() {
         let light = Vec3::new(1.0, 2.0, 3.0);
         let matrices = cube_face_view_projections(light, 0.1, 20.0);
