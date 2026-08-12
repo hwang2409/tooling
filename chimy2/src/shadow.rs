@@ -1201,7 +1201,7 @@ mod tests {
                 (clip.x / clip.w).abs().max((clip.y / clip.w).abs())
             })
             .fold(0.0, f32::max);
-        assert!(max_xy > 0.8);
+        assert!(max_xy > 0.9998);
 
         let whole = frustum_slice_corners(camera, camera.near, camera.far);
         let whole_width = whole
