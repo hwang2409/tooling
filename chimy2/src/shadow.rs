@@ -605,10 +605,10 @@ fn fit_cascade_light_projection_with_casters(
     let near = (-depth_max - depth_padding).max(0.001);
     let far = (-depth_min + depth_padding).max(near + 0.001);
     Mat4::orthographic(
-        (min.x + max.x) * 0.5 - center_x - extent_x * 0.5,
-        (min.x + max.x) * 0.5 - center_x + extent_x * 0.5,
-        (min.y + max.y) * 0.5 - center_y - extent_y * 0.5,
-        (min.y + max.y) * 0.5 - center_y + extent_y * 0.5,
+        -extent_x * 0.5,
+        extent_x * 0.5,
+        -extent_y * 0.5,
+        extent_y * 0.5,
         near,
         far,
     ) * view
@@ -1430,7 +1430,9 @@ mod tests {
     fn production_snap_keeps_static_visibility_grid_for_subtexel_camera_motion() {
         let camera = test_camera();
         let ground = crate::demo::plane_xz(20.0, 20.0, 2, 1.0);
-        let meshes = [(&ground, Mat4::IDENTITY)];
+        let occluder = crate::demo::cube_with_uvs(0.5);
+        let occluder_model = Mat4::translate(Vec3::new(0.0, 0.5, -2.0));
+        let meshes = [(&ground, Mat4::IDENTITY), (&occluder, occluder_model)];
         let config = CascadeShadowConfig::new(2, 0.5);
         let first = render_cascade_shadow_maps_with_config(
             camera,
@@ -1456,7 +1458,7 @@ mod tests {
             &meshes,
         )
         .unwrap();
-        let receiver = Vec3::new(0.0, 0.0, 0.0);
+        let receiver = Vec3::new(-0.3, 0.0, -2.2);
         let first_visibility = first.visibility(
             receiver,
             5.0,
@@ -1469,7 +1471,28 @@ mod tests {
             Vec3::new(0.0, 1.0, 0.0),
             Vec3::new(0.6, 1.0, 0.4),
         );
-        assert!((first_visibility - second_visibility).abs() <= 1.0 / 9.0);
+        for x in [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5] {
+            for z in [-3.0, -2.75, -2.5, -2.25, -2.0, -1.75, -1.5] {
+                let point = Vec3::new(x, 0.0, z);
+                let first_grid = first.visibility(
+                    point,
+                    5.0 - z,
+                    Vec3::new(0.0, 1.0, 0.0),
+                    Vec3::new(0.6, 1.0, 0.4),
+                );
+                let second_grid = second.visibility(
+                    point,
+                    5.0 - z,
+                    Vec3::new(0.0, 1.0, 0.0),
+                    Vec3::new(0.6, 1.0, 0.4),
+                );
+                assert!(
+                    (first_grid - second_grid).abs() < 1e-6,
+                    "grid moved at {point:?}"
+                );
+            }
+        }
+        assert!((first_visibility - second_visibility).abs() < 1e-6);
     }
 
     #[test]
