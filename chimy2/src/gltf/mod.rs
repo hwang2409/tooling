@@ -1,4 +1,4 @@
-//! glTF 2.0 loading, animation sampling, and deterministic CPU skinning.
+//! glTF 2.0 loading, animation sampling, and deterministic CPU deformation.
 //!
 //! Supported features are documented by SUPPORTED_SUBSET. Unsupported
 //! features return an error. The loader uses no serialization crate because
@@ -23,7 +23,7 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-pub const SUPPORTED_SUBSET: &str = "glTF JSON (.gltf), external .bin buffers and base64 binary data URIs; TRIANGLES primitives with POSITION, optional NORMAL, TEXCOORD_0, JOINTS_0, WEIGHTS_0, and indices; semantic-typed FLOAT vertex and animation accessors; SCALAR/VEC2/VEC3/VEC4/MAT4 accessors with component types 5120-5126 and byteStride; node TRS or matrix hierarchy; PBR baseColorFactor/baseColorTexture and normalTexture; OPAQUE and BLEND alpha modes; skins with inverseBindMatrices; translation, rotation, and scale animations with LINEAR and STEP. Unsupported primitive modes, sparse accessors, morph targets, cubic animation, MASK alpha, GLB, and unsupported image formats return errors.";
+pub const SUPPORTED_SUBSET: &str = "glTF JSON (.gltf), external .bin buffers and base64 binary data URIs; TRIANGLES primitives with POSITION, optional NORMAL, TEXCOORD_0, JOINTS_0, WEIGHTS_0, morph POSITION/NORMAL targets, and indices; semantic-typed FLOAT vertex and animation accessors; SCALAR/VEC2/VEC3/VEC4/MAT4 accessors with component types 5120-5126 and byteStride; node TRS or matrix hierarchy; PBR baseColorFactor/baseColorTexture and normalTexture; OPAQUE and BLEND alpha modes; skins with inverseBindMatrices; translation, rotation, scale, and weights animations with LINEAR and STEP. Unsupported primitive modes, sparse accessors, cubic animation, MASK alpha, GLB, and unsupported image formats return errors. Morph targets are not combined with LodMeshes.";
 
 const WEIGHT_TOLERANCE: f32 = 1.0e-5;
 
@@ -82,6 +82,21 @@ pub struct GltfAsset {
 pub struct GltfMesh {
     pub name: String,
     pub primitives: Vec<GltfPrimitive>,
+    /// Default morph weights from the glTF mesh, one per primitive target.
+    pub weights: Vec<f32>,
+}
+
+/// Per-vertex glTF morph deltas.
+///
+/// This follows glTF 2.0 section 3.7.3, "Morph Targets":
+/// <https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#_morph_targets>.
+/// POSITION and NORMAL target attributes contain deltas, not replacement
+/// values. Sparse accessors are outside this renderer subset and are rejected
+/// by the accessor parser.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MorphTarget {
+    pub position_deltas: Vec<Vec3>,
+    pub normal_deltas: Option<Vec<Vec3>>,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +105,8 @@ pub struct GltfPrimitive {
     pub material: Option<usize>,
     pub joints: Vec<[u16; 4]>,
     pub weights: Vec<[f32; 4]>,
+    pub morph_targets: Vec<MorphTarget>,
+    morph_weights: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -145,6 +162,7 @@ pub enum AnimationPath {
     Translation,
     Rotation,
     Scale,
+    Weights,
 }
 
 #[derive(Clone, Debug)]

@@ -24,6 +24,12 @@ impl NodeTransform {
 
 impl GltfAnimationSampler {
     pub fn sample(&self, time: f32) -> Result<[f32; 4], GltfError> {
+        self.sample_with_mode(time, self.output_components == 4)
+    }
+
+    /// Samples one shared animation interpolation path. Rotation channels use
+    /// quaternion slerp; weights and vector channels use component lerp.
+    fn sample_with_mode(&self, time: f32, rotation: bool) -> Result<[f32; 4], GltfError> {
         if self.input.is_empty() || self.output.is_empty() {
             return Err(GltfError::new("animation sampler has no keyframes"));
         }
@@ -44,11 +50,19 @@ impl GltfAnimationSampler {
         if self.interpolation == Interpolation::Step {
             return Ok(self.output[index]);
         }
-        if self.output_components == 4 {
+        if rotation {
             Ok(slerp(self.output[index], self.output[index + 1], factor))
         } else {
             Ok(lerp4(self.output[index], self.output[index + 1], factor))
         }
+    }
+}
+
+pub fn sanitize_morph_weight(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 

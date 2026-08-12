@@ -1,4 +1,51 @@
 impl GltfAsset {
+    /// Samples morph weights for one node primitive from mesh defaults and the
+    /// same sampler used by translation, rotation, and scale channels.
+    pub fn sample_morph_weights(
+        &self,
+        animation: Option<usize>,
+        time: f32,
+        node_index: usize,
+        mesh_index: usize,
+        primitive_index: usize,
+    ) -> Result<Vec<f32>, GltfError> {
+        let primitive = self
+            .meshes
+            .get(mesh_index)
+            .and_then(|mesh| mesh.primitives.get(primitive_index))
+            .ok_or_else(|| GltfError::new("mesh primitive index is out of range"))?;
+        let mut weights = primitive.morph_weights.clone();
+        let Some(animation_index) = animation else {
+            return Ok(weights);
+        };
+        let animation = self
+            .animations
+            .get(animation_index)
+            .ok_or_else(|| GltfError::new("animation index is out of range"))?;
+        for channel in animation
+            .channels
+            .iter()
+            .filter(|channel| channel.node == node_index && channel.path == AnimationPath::Weights)
+        {
+            let sampler = animation
+                .samplers
+                .get(channel.sampler)
+                .ok_or_else(|| GltfError::new("animation sampler index is out of range"))?;
+            if sampler.output_components != weights.len() {
+                return Err(GltfError::new(
+                    "weights animation count does not match morph targets",
+                ));
+            }
+            let value = sampler.sample_with_mode(time, false)?;
+            weights = value[..weights.len()]
+                .iter()
+                .copied()
+                .map(sanitize_morph_weight)
+                .collect();
+        }
+        Ok(weights)
+    }
+
     pub fn node_world_transforms(
         &self,
         animation: Option<usize>,
@@ -59,20 +106,45 @@ impl GltfAsset {
             .get(mesh_index)
             .and_then(|mesh| mesh.primitives.get(primitive_index))
             .ok_or_else(|| GltfError::new("mesh primitive index is out of range"))?;
+        self.pose_mesh_with_weights(
+            mesh_index,
+            primitive_index,
+            node_index,
+            animation,
+            time,
+            &primitive.morph_weights,
+        )
+    }
+
+    pub fn pose_mesh_with_weights(
+        &self,
+        mesh_index: usize,
+        primitive_index: usize,
+        node_index: usize,
+        animation: Option<usize>,
+        time: f32,
+        morph_weights: &[f32],
+    ) -> Result<Mesh, GltfError> {
+        let primitive = self
+            .meshes
+            .get(mesh_index)
+            .and_then(|mesh| mesh.primitives.get(primitive_index))
+            .ok_or_else(|| GltfError::new("mesh primitive index is out of range"))?;
         let node = self
             .nodes
             .get(node_index)
             .ok_or_else(|| GltfError::new("node index is out of range"))?;
+        let morphed = blend_morph_targets(&primitive.mesh, &primitive.morph_targets, morph_weights)?;
         let Some(skin_index) = node.skin else {
-            return Ok(primitive.mesh.clone());
+            return Ok(morphed);
         };
         let worlds = self.node_world_transforms(animation, time)?;
         let skin = self
             .skins
             .get(skin_index)
             .ok_or_else(|| GltfError::new("skin index is out of range"))?;
-        if primitive.joints.len() != primitive.mesh.vertices().len()
-            || primitive.weights.len() != primitive.mesh.vertices().len()
+        if primitive.joints.len() != morphed.vertices().len()
+            || primitive.weights.len() != morphed.vertices().len()
         {
             return Err(GltfError::new("skin attributes do not match mesh vertices"));
         }
@@ -95,8 +167,8 @@ impl GltfAsset {
             joint_matrices.push(matrix);
             normal_matrices.push(normal);
         }
-        let mut vertices = Vec::with_capacity(primitive.mesh.vertices().len());
-        for (index, source) in primitive.mesh.vertices().iter().enumerate() {
+        let mut vertices = Vec::with_capacity(morphed.vertices().len());
+        for (index, source) in morphed.vertices().iter().enumerate() {
             let weights = normalize_weights(primitive.weights[index]);
             let mut position = Vec3::ZERO;
             let mut normal = Vec3::ZERO;
@@ -126,7 +198,7 @@ impl GltfAsset {
                 Some(normal.normalize()),
             ));
         }
-        Ok(Mesh::new(vertices, primitive.mesh.indices().to_vec()))
+        Ok(Mesh::new(vertices, morphed.indices().to_vec()))
     }
 
     pub fn scene_draws(
@@ -167,11 +239,21 @@ impl GltfAsset {
                     .get(mesh_index)
                     .ok_or_else(|| GltfError::new("node mesh index is out of range"))?;
                 for primitive_index in 0..mesh.primitives.len() {
-                    let posed = if node.skin.is_some() {
-                        self.pose_mesh(mesh_index, primitive_index, index, animation, time)?
-                    } else {
-                        mesh.primitives[primitive_index].mesh.clone()
-                    };
+                    let morph_weights = self.sample_morph_weights(
+                        animation,
+                        time,
+                        index,
+                        mesh_index,
+                        primitive_index,
+                    )?;
+                    let posed = self.pose_mesh_with_weights(
+                        mesh_index,
+                        primitive_index,
+                        index,
+                        animation,
+                        time,
+                        &morph_weights,
+                    )?;
                     draws.push(GltfDraw {
                         mesh: posed,
                         model: if node.skin.is_some() {
@@ -207,13 +289,17 @@ impl GltfAsset {
                     .samplers
                     .get(channel.sampler)
                     .ok_or_else(|| GltfError::new("animation sampler index is out of range"))?;
-                let value = sampler.sample(time)?;
+                let value = sampler.sample_with_mode(
+                    time,
+                    channel.path == AnimationPath::Rotation,
+                )?;
                 match channel.path {
                     AnimationPath::Translation => {
                         node.translation = Vec3::new(value[0], value[1], value[2])
                     }
                     AnimationPath::Rotation => node.rotation = value,
                     AnimationPath::Scale => node.scale = Vec3::new(value[0], value[1], value[2]),
+                    AnimationPath::Weights => {}
                 }
             }
         }
@@ -245,4 +331,105 @@ impl GltfAsset {
             .collect())
     }
 
+}
+
+impl MorphTarget {
+    pub fn new(
+        position_deltas: Vec<Vec3>,
+        normal_deltas: Option<Vec<Vec3>>,
+    ) -> Result<Self, GltfError> {
+        if normal_deltas
+            .as_ref()
+            .is_some_and(|values| values.len() != position_deltas.len())
+        {
+            return Err(GltfError::new(
+                "morph normal deltas do not match position deltas",
+            ));
+        }
+        Ok(Self {
+            position_deltas,
+            normal_deltas,
+        })
+    }
+}
+
+/// Applies glTF morph deltas before skinning or submission.
+///
+/// glTF 2.0 section 3.7.3 defines the blended position as the base position
+/// plus each weighted POSITION delta. NORMAL deltas are blended and then
+/// normalized. The returned Mesh rebuilds its bounds, so submission culling
+/// sees the deformed extent instead of stale base bounds.
+pub fn blend_morph_targets(
+    mesh: &Mesh,
+    targets: &[MorphTarget],
+    weights: &[f32],
+) -> Result<Mesh, GltfError> {
+    if targets.len() != weights.len() {
+        return Err(GltfError::new(
+            "morph weight count does not match morph targets",
+        ));
+    }
+    if targets.is_empty() || weights.iter().all(|&weight| sanitize_morph_weight(weight) == 0.0) {
+        return Ok(mesh.clone());
+    }
+    let vertex_count = mesh.vertices().len();
+    for (index, target) in targets.iter().enumerate() {
+        if target.position_deltas.len() != vertex_count {
+            return Err(GltfError::new(format!(
+                "morph target {index} position count does not match mesh"
+            )));
+        }
+        if target
+            .normal_deltas
+            .as_ref()
+            .is_some_and(|values| values.len() != vertex_count)
+        {
+            return Err(GltfError::new(format!(
+                "morph target {index} normal count does not match mesh"
+            )));
+        }
+    }
+    let mut vertices = Vec::with_capacity(vertex_count);
+    for (vertex_index, source) in mesh.vertices().iter().enumerate() {
+        let mut position = source.position();
+        let mut normal = source.normal().unwrap_or(Vec3::new(0.0, 0.0, 1.0));
+        for (target, &weight) in targets.iter().zip(weights) {
+            let weight = sanitize_morph_weight(weight);
+            position = position + target.position_deltas[vertex_index] * weight;
+            if let Some(normal_deltas) = &target.normal_deltas {
+                normal = normal + normal_deltas[vertex_index] * weight;
+            }
+        }
+        vertices.push(MeshVertex::new(
+            position,
+            source.texcoord(),
+            Some(normal.normalize()),
+        ));
+    }
+    Ok(Mesh::new(vertices, mesh.indices().to_vec()))
+}
+
+impl GltfPrimitive {
+    pub fn morph_weights(&self) -> &[f32] {
+        &self.morph_weights
+    }
+
+    pub fn set_morph_weights(&mut self, weights: &[f32]) -> Result<(), GltfError> {
+        if weights.len() != self.morph_targets.len() {
+            return Err(GltfError::new(
+                "morph weight count does not match morph targets",
+            ));
+        }
+        self.morph_weights = weights.iter().copied().map(sanitize_morph_weight).collect();
+        Ok(())
+    }
+
+    pub fn set_morph_weight(&mut self, index: usize, weight: f32) -> Result<(), GltfError> {
+        let value = self
+            .morph_weights
+            .get_mut(index)
+            .ok_or_else(|| GltfError::new("morph target index is out of range"))?;
+        *value = sanitize_morph_weight(weight);
+        Ok(())
+    }
 }

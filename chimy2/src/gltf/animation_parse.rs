@@ -43,7 +43,7 @@ fn parse_animations(
                         GltfError::new("animation output accessor is out of range")
                     })?;
                     let components = component_count(&accessor.kind);
-                    if !matches!(components, 3 | 4) {
+                    if !matches!(components, 1..=4) {
                         return Err(GltfError::new(format!(
                             "animation output accessor {output_accessor} must be VEC3 or VEC4"
                         )));
@@ -88,10 +88,13 @@ fn parse_animations(
                     if node >= node_count {
                         return Err(GltfError::new("animation target node is out of range"));
                     }
+                    // glTF 2.0 section 3.6.3 permits `weights` channels for
+                    // morph targets: https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#animations.
                     let path = match get_string(target, "path")? {
                         "translation" => AnimationPath::Translation,
                         "rotation" => AnimationPath::Rotation,
                         "scale" => AnimationPath::Scale,
+                        "weights" => AnimationPath::Weights,
                         other => {
                             return Err(GltfError::new(format!(
                                 "unsupported animation target {other}"
@@ -109,12 +112,16 @@ fn parse_animations(
                 let sampler = samplers
                     .get(channel.sampler)
                     .ok_or_else(|| GltfError::new("animation channel sampler is out of range"))?;
-                let expected = if channel.path == AnimationPath::Rotation {
-                    4
-                } else {
-                    3
+                let valid = match channel.path {
+                    AnimationPath::Translation | AnimationPath::Scale => {
+                        sampler.output_components == 3
+                    }
+                    AnimationPath::Rotation => sampler.output_components == 4,
+                    // The mesh target count is checked when the animation is
+                    // applied, because channels refer to node meshes.
+                    AnimationPath::Weights => (1..=4).contains(&sampler.output_components),
                 };
-                if sampler.output_components != expected {
+                if !valid {
                     return Err(GltfError::new(
                         "animation output type does not match its target path",
                     ));
@@ -158,4 +165,3 @@ fn parse_scenes(
         })
         .collect()
 }
-
