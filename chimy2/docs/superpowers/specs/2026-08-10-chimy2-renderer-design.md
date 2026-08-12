@@ -109,7 +109,9 @@ vignette -> Narkowicz's fitted ACES approximation -> one sRGB encode -> FXAA.
 FXAA stays after encoding because its edge luma matches display values.
 
 The ACES fit is `x * (2.51x + 0.03) / (x * (2.43x + 0.59) + 0.14)`. Exposure
-is a sanitized linear multiplier before the fit. Values above one are not
+is a sanitized linear multiplier in `[0, 100]` before the fit. The curve's
+display ceiling is reached near 7.25, so the implementation cuts over to 1.0
+at 8.0 before evaluating its quadratic terms. Values above one are not
 clamped before ACES. The final encoder is the only HDR RGB clamp.
 
 M6 uses fixed 64x64 pixel tiles. This size keeps bin lists small while giving

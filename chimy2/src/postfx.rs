@@ -308,15 +308,36 @@ impl AcesTonemapPass {
     }
 }
 
+/// Maximum exposure accepted at the post-processing boundary.
+pub const MAX_EXPOSURE: f32 = 100.0;
+
 pub fn sanitize_exposure(exposure: f32) -> f32 {
-    if exposure.is_finite() {
-        exposure.max(0.0)
+    if exposure.is_nan() {
+        1.0
+    } else if exposure.is_finite() {
+        exposure.clamp(0.0, MAX_EXPOSURE)
+    } else if exposure.is_sign_positive() {
+        MAX_EXPOSURE
     } else {
         1.0
     }
 }
 
+/// The fitted curve reaches its display ceiling near x=7.25. This cutover
+/// avoids overflow in the quadratic terms for larger finite HDR values.
+pub const ACES_SATURATION_CUTOFF: f32 = 8.0;
+
 pub fn aces_tonemap(value: f32) -> f32 {
+    let value = if value.is_nan() {
+        return 0.0;
+    } else if value.is_infinite() {
+        return if value.is_sign_positive() { 1.0 } else { 0.0 };
+    } else {
+        value
+    };
+    if value >= ACES_SATURATION_CUTOFF {
+        return 1.0;
+    }
     let numerator = value * (2.51 * value + 0.03);
     let denominator = value * (2.43 * value + 0.59) + 0.14;
     if denominator > 0.0 {
@@ -623,9 +644,25 @@ mod tests {
     }
 
     #[test]
+    fn aces_extreme_inputs_saturate_without_nan() {
+        for value in [1.0e20, f32::MAX, f32::INFINITY] {
+            let result = aces_tonemap(value);
+            assert_eq!(result, 1.0);
+            assert!(result.is_finite());
+        }
+    }
+
+    #[test]
+    fn exposure_sanitization_has_a_finite_sane_bound() {
+        assert_eq!(sanitize_exposure(1.0e20), MAX_EXPOSURE);
+        assert_eq!(sanitize_exposure(f32::INFINITY), MAX_EXPOSURE);
+        assert_eq!(sanitize_exposure(f32::NAN), 1.0);
+    }
+
+    #[test]
     fn aces_exposure_scales_linear_input_before_tonemap() {
         let mut framebuffer = Framebuffer::new(1, 1);
-        framebuffer.enable_hdr();
+        framebuffer.set_hdr(true);
         framebuffer.linear_pixels_mut().unwrap()[0] = [1.0, 0.5, 0.5, 0.5];
         PostChain::new()
             .with_pass(AcesTonemapPass::new(2.0))

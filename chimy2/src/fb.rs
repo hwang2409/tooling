@@ -18,16 +18,20 @@ impl Framebuffer {
         }
     }
 
-    /// Enables the HDR linear target and decodes the current presentation
-    /// pixels into it. The target is private to the renderer and is encoded
-    /// only when post-processing writes the final presentation buffer.
-    pub fn enable_hdr(&mut self) {
-        let pixels = self
-            .color
-            .iter()
-            .map(|&pixel| linear_rgba_from_argb8888(pixel))
-            .collect();
-        self.linear = Some(pixels);
+    /// Sets the color mode and keeps the linear target in sync with it.
+    /// Enabling HDR decodes current presentation pixels. Disabling HDR
+    /// removes the sidecar, so later draws use the byte-identical LDR path.
+    pub fn set_hdr(&mut self, hdr: bool) {
+        if hdr {
+            let pixels = self
+                .color
+                .iter()
+                .map(|&pixel| linear_rgba_from_argb8888(pixel))
+                .collect();
+            self.linear = Some(pixels);
+        } else {
+            self.linear = None;
+        }
     }
 
     pub const fn is_hdr(&self) -> bool {

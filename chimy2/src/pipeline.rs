@@ -8,7 +8,7 @@ use crate::clip::{ClipVertex, clip_triangle_near, cull_backface};
 use crate::fb::Framebuffer;
 use crate::math::{Mat4, Vec3, Vec4};
 use crate::mesh::{Mesh, MeshVertex};
-use crate::postfx::{PostChain, sanitize_exposure};
+use crate::postfx::PostChain;
 use crate::raster::{
     FragmentColor, PixelRect, RasterState, ScreenVertex, rasterize_triangle_with_sampling_state,
     rasterize_triangle_with_state, triangle_pixel_rect, viewport_transform,
@@ -198,7 +198,6 @@ pub struct Pipeline<VS, FS> {
     ssaa_scale: usize,
     post_chain: PostChain,
     hdr: bool,
-    exposure: f32,
 }
 
 impl<VS, FS> Pipeline<VS, FS> {
@@ -210,7 +209,6 @@ impl<VS, FS> Pipeline<VS, FS> {
             ssaa_scale: 1,
             post_chain: PostChain::new(),
             hdr: false,
-            exposure: 1.0,
         }
     }
 
@@ -238,14 +236,6 @@ impl<VS, FS> Pipeline<VS, FS> {
         self.hdr
     }
 
-    pub fn set_exposure(&mut self, exposure: f32) {
-        self.exposure = sanitize_exposure(exposure);
-    }
-
-    pub const fn exposure(&self) -> f32 {
-        self.exposure
-    }
-
     /// Replaces the optional post chain. The chain runs after SSAA downsample.
     pub fn set_post_chain(&mut self, post_chain: PostChain) {
         self.post_chain = post_chain;
@@ -269,9 +259,7 @@ impl<VS, FS> Pipeline<VS, FS> {
     where
         F: FnOnce(&mut RenderFrame<'a, VS, FS>, &mut Framebuffer),
     {
-        if self.hdr {
-            framebuffer.enable_hdr();
-        }
+        framebuffer.set_hdr(self.hdr);
         if self.ssaa_scale <= 1 {
             let mut frame = RenderFrame::new(self);
             draw(&mut frame, framebuffer);
@@ -282,9 +270,7 @@ impl<VS, FS> Pipeline<VS, FS> {
         let width = framebuffer.width.saturating_mul(self.ssaa_scale);
         let height = framebuffer.height.saturating_mul(self.ssaa_scale);
         let mut internal = Framebuffer::new(width, height);
-        if self.hdr {
-            internal.enable_hdr();
-        }
+        internal.set_hdr(self.hdr);
         let mut frame = RenderFrame::new(self);
         draw(&mut frame, &mut internal);
         frame.flush(&mut internal);
@@ -829,9 +815,7 @@ where
     V: Varyings + Clone,
 {
     let mut framebuffer = Framebuffer::new(tile.width, tile.height);
-    if source.is_hdr() {
-        framebuffer.enable_hdr();
-    }
+    framebuffer.set_hdr(source.is_hdr());
     for row in 0..tile.height {
         let source_start = (tile.y + row) * source.width + tile.x;
         let source_end = source_start + tile.width;
@@ -1079,6 +1063,43 @@ mod tests {
             frame.draw(target, &vertices, &[[0, 1, 2]], &());
         });
         assert!(framebuffer.color.contains(&argb8888(255, 20, 40, 60)));
+    }
+
+    #[test]
+    fn switching_hdr_to_ldr_reuses_the_byte_identical_ldr_target() {
+        let vertices = [
+            Vec4::new(-1.0, -1.0, 0.0, 1.0),
+            Vec4::new(1.0, -1.0, 0.0, 1.0),
+            Vec4::new(-1.0, 1.0, 0.0, 1.0),
+        ];
+        let mut reused = Framebuffer::new(4, 4);
+        let mut pipeline = Pipeline::new(
+            vertex_stage(|vertex: &Vec4, _: &()| VertexOutput::new(*vertex, ())),
+            fragment_stage(|_: &(), _: &()| argb8888(255, 20, 40, 60)),
+        );
+        pipeline.set_hdr(true);
+        pipeline.render(&mut reused, |frame, target| {
+            target.clear(argb8888(255, 1, 2, 3));
+            frame.draw(target, &vertices, &[[0, 1, 2]], &());
+        });
+        pipeline.set_hdr(false);
+        pipeline.render(&mut reused, |frame, target| {
+            target.clear(argb8888(255, 1, 2, 3));
+            frame.draw(target, &vertices, &[[0, 1, 2]], &());
+        });
+
+        let mut fresh = Framebuffer::new(4, 4);
+        let mut ldr_pipeline = Pipeline::new(
+            vertex_stage(|vertex: &Vec4, _: &()| VertexOutput::new(*vertex, ())),
+            fragment_stage(|_: &(), _: &()| argb8888(255, 20, 40, 60)),
+        );
+        ldr_pipeline.render(&mut fresh, |frame, target| {
+            target.clear(argb8888(255, 1, 2, 3));
+            frame.draw(target, &vertices, &[[0, 1, 2]], &());
+        });
+
+        assert!(!reused.is_hdr());
+        assert_eq!(reused.color, fresh.color);
     }
 
     #[test]
