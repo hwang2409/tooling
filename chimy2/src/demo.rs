@@ -12,12 +12,14 @@
 //!   uses this size directly for the offscreen framebuffer.
 //! - `--ssaa` — enable 2x linear-light supersampling in demos that opt in.
 //! - `--bloom`, `--fxaa`, `--vignette` — enable post-processing passes.
+//! - `--hdr` — keep linear HDR values through the render and bloom stages.
+//! - `--exposure X` — scale linear HDR values before ACES tonemapping.
 
 use crate::fb::Framebuffer;
 use crate::image::Texture;
 use crate::math::{Vec2, Vec3};
 use crate::mesh::{Mesh, MeshVertex};
-use crate::postfx::{BloomPass, FxaaPass, PostChain, VignettePass};
+use crate::postfx::{AcesTonemapPass, BloomPass, FxaaPass, PostChain, VignettePass};
 use crate::present::{InputState, run_with_input};
 use std::error::Error;
 use std::f32::consts::{PI, TAU};
@@ -27,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 pub const SCREENSHOT_FPS: f32 = 60.0;
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DemoArgs {
     pub frames: Option<usize>,
     pub screenshot: Option<PathBuf>,
@@ -36,6 +38,24 @@ pub struct DemoArgs {
     pub bloom: bool,
     pub fxaa: bool,
     pub vignette: bool,
+    pub hdr: bool,
+    pub exposure: f32,
+}
+
+impl Default for DemoArgs {
+    fn default() -> Self {
+        Self {
+            frames: None,
+            screenshot: None,
+            size: None,
+            ssaa: false,
+            bloom: false,
+            fxaa: false,
+            vignette: false,
+            hdr: false,
+            exposure: 1.0,
+        }
+    }
 }
 
 impl DemoArgs {
@@ -71,6 +91,15 @@ impl DemoArgs {
                 "--bloom" => args.bloom = true,
                 "--fxaa" => args.fxaa = true,
                 "--vignette" => args.vignette = true,
+                "--hdr" => args.hdr = true,
+                "--exposure" => {
+                    let value = source
+                        .next()
+                        .ok_or_else(|| "--exposure needs a number".to_string())?;
+                    args.exposure = value
+                        .parse::<f32>()
+                        .map_err(|_| format!("invalid --exposure value {value}"))?;
+                }
                 other => {
                     return Err(format!("unexpected argument: {other}"));
                 }
@@ -88,11 +117,21 @@ impl DemoArgs {
         if self.bloom {
             chain.push(BloomPass);
         }
-        if self.fxaa {
-            chain.push(FxaaPass);
-        }
-        if self.vignette {
-            chain.push(VignettePass);
+        if self.hdr {
+            if self.vignette {
+                chain.push(VignettePass);
+            }
+            chain.push(AcesTonemapPass::new(self.exposure));
+            if self.fxaa {
+                chain.push(FxaaPass);
+            }
+        } else {
+            if self.fxaa {
+                chain.push(FxaaPass);
+            }
+            if self.vignette {
+                chain.push(VignettePass);
+            }
         }
         chain
     }
@@ -418,6 +457,15 @@ mod tests {
         .unwrap();
         assert!(args.bloom && args.fxaa && args.vignette);
         assert_eq!(args.post_chain().len(), 3);
+    }
+
+    #[test]
+    fn parses_hdr_and_exposure() {
+        let args =
+            DemoArgs::parse(["--hdr", "--exposure", "2.0"].into_iter().map(String::from)).unwrap();
+        assert!(args.hdr);
+        assert_eq!(args.exposure, 2.0);
+        assert_eq!(args.post_chain().len(), 1);
     }
 
     #[test]

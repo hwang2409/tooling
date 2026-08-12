@@ -42,7 +42,7 @@ app / demos
             ├─ raster core     barycentric scan, perspective-correct
             │                  varying interpolation, z-test
             └─ fragment stage  FS(&Varyings, &Uniforms) -> Color
-  └─ targets: Framebuffer { color: Vec<u32>, depth: Vec<f32> }
+  └─ targets: Framebuffer { color: Vec<u32>, linear HDR sidecar, depth: Vec<f32> }
   └─ present: softbuffer blit
 ```
 
@@ -97,6 +97,22 @@ Each milestone is a bounded fleet ticket ending in CI-green, reviewed, merged.
    chimy's voice (why from scratch, what was learned).
 
 ### M6 implementation notes
+
+### HDR pipeline note
+
+HDR mode uses the post-processing linear intermediate as the primary color
+target. The framebuffer keeps a linear sidecar during raster writes, blending,
+and SSAA. LDR mode keeps the original `u32` write path byte-for-byte.
+
+The HDR order is render -> SSAA -> bloom with threshold 1.0 -> optional
+vignette -> Narkowicz's fitted ACES approximation -> one sRGB encode -> FXAA.
+FXAA stays after encoding because its edge luma matches display values.
+
+The ACES fit is `x * (2.51x + 0.03) / (x * (2.43x + 0.59) + 0.14)`. Exposure
+is a sanitized linear multiplier in `[0, 100]` before the fit. The curve's
+display ceiling is reached near 7.25, so the implementation cuts over to 1.0
+at 8.0 before evaluating its quadratic terms. Values above one are not
+clamped before ACES. The final encoder is the only HDR RGB clamp.
 
 M6 uses fixed 64x64 pixel tiles. This size keeps bin lists small while giving
 workers enough pixels to amortize local framebuffer setup and merge costs.

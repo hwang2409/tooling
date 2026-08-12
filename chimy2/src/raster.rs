@@ -7,6 +7,37 @@ use crate::fb::Framebuffer;
 use crate::math::{Vec3, Vec4};
 use crate::pipeline::{SampleDerivatives, SamplingVaryings, Varyings};
 
+#[derive(Clone, Copy, Debug)]
+pub enum FragmentColor {
+    Encoded(u32),
+    Linear([f32; 4]),
+}
+
+pub trait FragmentOutput {
+    fn write(self, framebuffer: &mut Framebuffer, index: usize, blend: bool);
+}
+
+impl FragmentOutput for u32 {
+    fn write(self, framebuffer: &mut Framebuffer, index: usize, blend: bool) {
+        if let Some(color) = framebuffer.color.get_mut(index) {
+            *color = if blend {
+                crate::fb::blend_argb8888_linear(*color, self)
+            } else {
+                self
+            };
+        }
+    }
+}
+
+impl FragmentOutput for FragmentColor {
+    fn write(self, framebuffer: &mut Framebuffer, index: usize, blend: bool) {
+        match self {
+            Self::Encoded(color) => color.write(framebuffer, index, blend),
+            Self::Linear(color) => crate::fb::write_linear_pixel(framebuffer, index, color, blend),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RasterState {
     pub depth_test: bool,
@@ -178,13 +209,14 @@ pub(crate) fn triangle_pixel_rect<V>(
 /// interpolation. Varyings use perspective-corrected interpolation instead.
 /// The framebuffer clears to `1`; a fragment passes only when its depth is
 /// strictly smaller.
-pub fn rasterize_triangle<V, F>(
+pub fn rasterize_triangle<V, F, O>(
     framebuffer: &mut Framebuffer,
     vertices: [ScreenVertex<V>; 3],
     fragment: F,
 ) where
     V: Varyings,
-    F: FnMut(V) -> u32,
+    F: FnMut(V) -> O,
+    O: FragmentOutput,
 {
     rasterize_triangle_in_rect(
         framebuffer,
@@ -199,14 +231,15 @@ pub fn rasterize_triangle<V, F>(
     )
 }
 
-pub fn rasterize_triangle_with_state<V, F>(
+pub fn rasterize_triangle_with_state<V, F, O>(
     framebuffer: &mut Framebuffer,
     vertices: [ScreenVertex<V>; 3],
     state: RasterState,
     fragment: F,
 ) where
     V: Varyings,
-    F: FnMut(V) -> u32,
+    F: FnMut(V) -> O,
+    O: FragmentOutput,
 {
     rasterize_triangle_in_rect_with_state(
         framebuffer,
@@ -241,13 +274,14 @@ where
 
 /// Rasterizes one triangle and passes sampler-facing derivatives with each
 /// fragment. Only sampling varyings opt into this channel.
-pub fn rasterize_triangle_with_sampling<V, F>(
+pub fn rasterize_triangle_with_sampling<V, F, O>(
     framebuffer: &mut Framebuffer,
     vertices: [ScreenVertex<V>; 3],
     fragment: F,
 ) where
     V: SamplingVaryings,
-    F: FnMut(V, SampleDerivatives) -> u32,
+    F: FnMut(V, SampleDerivatives) -> O,
+    O: FragmentOutput,
 {
     rasterize_triangle_in_rect_with_sampling(
         framebuffer,
@@ -262,14 +296,15 @@ pub fn rasterize_triangle_with_sampling<V, F>(
     );
 }
 
-pub fn rasterize_triangle_with_sampling_state<V, F>(
+pub fn rasterize_triangle_with_sampling_state<V, F, O>(
     framebuffer: &mut Framebuffer,
     vertices: [ScreenVertex<V>; 3],
     state: RasterState,
     fragment: F,
 ) where
     V: SamplingVaryings,
-    F: FnMut(V, SampleDerivatives) -> u32,
+    F: FnMut(V, SampleDerivatives) -> O,
+    O: FragmentOutput,
 {
     rasterize_triangle_in_rect_with_sampling_state(
         framebuffer,
@@ -292,14 +327,15 @@ pub fn rasterize_triangle_with_sampling_state<V, F>(
 /// The per-pixel coverage, depth, interpolation, and fragment code are shared
 /// by both paths. Each tile has one worker owner, so no two workers write the
 /// same color or depth element.
-pub(crate) fn rasterize_triangle_in_rect<V, F>(
+pub(crate) fn rasterize_triangle_in_rect<V, F, O>(
     framebuffer: &mut Framebuffer,
     vertices: [ScreenVertex<V>; 3],
     rect: PixelRect,
     fragment: F,
 ) where
     V: Varyings,
-    F: FnMut(V) -> u32,
+    F: FnMut(V) -> O,
+    O: FragmentOutput,
 {
     rasterize_triangle_in_rect_core(
         framebuffer,
@@ -318,7 +354,7 @@ pub(crate) fn rasterize_triangle_in_rect<V, F>(
     );
 }
 
-pub(crate) fn rasterize_triangle_in_rect_with_state<V, F>(
+pub(crate) fn rasterize_triangle_in_rect_with_state<V, F, O>(
     framebuffer: &mut Framebuffer,
     vertices: [ScreenVertex<V>; 3],
     rect: PixelRect,
@@ -326,7 +362,8 @@ pub(crate) fn rasterize_triangle_in_rect_with_state<V, F>(
     fragment: F,
 ) where
     V: Varyings,
-    F: FnMut(V) -> u32,
+    F: FnMut(V) -> O,
+    O: FragmentOutput,
 {
     rasterize_triangle_in_rect_core(
         framebuffer,
@@ -369,14 +406,15 @@ pub(crate) fn rasterize_triangle_depth_in_rect<V>(
     );
 }
 
-pub(crate) fn rasterize_triangle_in_rect_with_sampling<V, F>(
+pub(crate) fn rasterize_triangle_in_rect_with_sampling<V, F, O>(
     framebuffer: &mut Framebuffer,
     vertices: [ScreenVertex<V>; 3],
     rect: PixelRect,
     mut fragment: F,
 ) where
     V: SamplingVaryings,
-    F: FnMut(V, SampleDerivatives) -> u32,
+    F: FnMut(V, SampleDerivatives) -> O,
+    O: FragmentOutput,
 {
     rasterize_triangle_in_rect_core(
         framebuffer,
@@ -399,7 +437,7 @@ pub(crate) fn rasterize_triangle_in_rect_with_sampling<V, F>(
     );
 }
 
-pub(crate) fn rasterize_triangle_in_rect_with_sampling_state<V, F>(
+pub(crate) fn rasterize_triangle_in_rect_with_sampling_state<V, F, O>(
     framebuffer: &mut Framebuffer,
     vertices: [ScreenVertex<V>; 3],
     rect: PixelRect,
@@ -407,7 +445,8 @@ pub(crate) fn rasterize_triangle_in_rect_with_sampling_state<V, F>(
     mut fragment: F,
 ) where
     V: SamplingVaryings,
-    F: FnMut(V, SampleDerivatives) -> u32,
+    F: FnMut(V, SampleDerivatives) -> O,
+    O: FragmentOutput,
 {
     rasterize_triangle_in_rect_core(
         framebuffer,
@@ -430,7 +469,7 @@ pub(crate) fn rasterize_triangle_in_rect_with_sampling_state<V, F>(
     );
 }
 
-fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment>(
+fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment, O>(
     framebuffer: &mut Framebuffer,
     mut vertices: [ScreenVertex<V>; 3],
     rect: PixelRect,
@@ -440,7 +479,8 @@ fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment>(
 ) where
     V: Varyings,
     Interpolate: FnMut(&[ScreenVertex<V>; 3], Vec3, Vec3, Vec3, Vec3) -> Input,
-    Fragment: FnMut(Input) -> u32,
+    Fragment: FnMut(Input) -> O,
+    O: FragmentOutput,
 {
     let mut area = edge(
         vertices[0].position,
@@ -510,15 +550,8 @@ fn rasterize_triangle_in_rect_core<V, Input, Interpolate, Fragment>(
             if state.depth_write {
                 *buffer_depth = depth;
             }
-            if state.color_write
-                && let Some(color) = framebuffer.color.get_mut(index)
-            {
-                let source = fragment(input);
-                *color = if state.blend {
-                    crate::fb::blend_argb8888_linear(*color, source)
-                } else {
-                    source
-                };
+            if state.color_write {
+                fragment(input).write(framebuffer, index, state.blend);
             }
         }
     }

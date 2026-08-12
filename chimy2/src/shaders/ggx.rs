@@ -1,8 +1,8 @@
 //! Cook-Torrance GGX shaders.
 //!
 //! This family shares the existing world-space vertex, light, shadow, texture,
-//! and tangent seams with Blinn-Phong. It keeps lighting linear until the one
-//! sRGB encode in `argb8888_linear`.
+//! and tangent seams with Blinn-Phong. LDR calls encode at the write boundary;
+//! HDR calls return unclamped linear lighting to the post chain.
 
 use super::*;
 use std::f32::consts::PI;
@@ -118,6 +118,21 @@ impl VertexStage<MeshVertex, CookTorranceUniforms> for CookTorranceShader {
 impl FragmentStage<CookTorranceVaryings, CookTorranceUniforms> for CookTorranceShader {
     fn run(&self, varyings: &CookTorranceVaryings, uniforms: &CookTorranceUniforms) -> u32 {
         Self::shade(varyings, uniforms)
+    }
+
+    fn run_linear(
+        &self,
+        varyings: &CookTorranceVaryings,
+        uniforms: &CookTorranceUniforms,
+    ) -> [f32; 4] {
+        let lighted = evaluate_ggx_lighting(
+            varyings.world_position,
+            varyings.normal,
+            varyings.light_space_position,
+            uniforms,
+            Vec3::new(1.0, 1.0, 1.0),
+        );
+        [uniforms.lighting.alpha, lighted.x, lighted.y, lighted.z]
     }
 
     fn is_opaque(&self, uniforms: &CookTorranceUniforms) -> bool {
@@ -360,6 +375,16 @@ impl<'a> SampledFragmentStage<TexturedBlinnPhongVaryings, TexturedCookTorranceUn
         derivatives: &crate::pipeline::SampleDerivatives,
         uniforms: &TexturedCookTorranceUniforms<'a>,
     ) -> u32 {
+        let linear = self.run_linear_with_sampling(varyings, derivatives, uniforms);
+        argb8888_linear(linear[0], [linear[1], linear[2], linear[3]])
+    }
+
+    fn run_linear_with_sampling(
+        &self,
+        varyings: &TexturedBlinnPhongVaryings,
+        derivatives: &crate::pipeline::SampleDerivatives,
+        uniforms: &TexturedCookTorranceUniforms<'a>,
+    ) -> [f32; 4] {
         let pixel = sample_texture(
             uniforms.texture,
             varyings.texcoord,
@@ -376,10 +401,12 @@ impl<'a> SampledFragmentStage<TexturedBlinnPhongVaryings, TexturedCookTorranceUn
             &uniforms.lighting,
             Vec3::new(pixel[0], pixel[1], pixel[2]),
         );
-        argb8888_linear(
+        [
             pixel[3] * uniforms.alpha * uniforms.lighting.lighting.alpha,
-            [lighted.x, lighted.y, lighted.z],
-        )
+            lighted.x,
+            lighted.y,
+            lighted.z,
+        ]
     }
 
     fn is_opaque(&self, uniforms: &TexturedCookTorranceUniforms<'a>) -> bool {
@@ -468,6 +495,16 @@ impl<'a> SampledFragmentStage<NormalMappedBlinnPhongVaryings, NormalMappedCookTo
         derivatives: &crate::pipeline::SampleDerivatives,
         uniforms: &NormalMappedCookTorranceUniforms<'a>,
     ) -> u32 {
+        let linear = self.run_linear_with_sampling(varyings, derivatives, uniforms);
+        argb8888_linear(linear[0], [linear[1], linear[2], linear[3]])
+    }
+
+    fn run_linear_with_sampling(
+        &self,
+        varyings: &NormalMappedBlinnPhongVaryings,
+        derivatives: &crate::pipeline::SampleDerivatives,
+        uniforms: &NormalMappedCookTorranceUniforms<'a>,
+    ) -> [f32; 4] {
         let derivatives = TextureDerivatives {
             ddx: derivatives.ddx,
             ddy: derivatives.ddy,
@@ -492,10 +529,12 @@ impl<'a> SampledFragmentStage<NormalMappedBlinnPhongVaryings, NormalMappedCookTo
             &uniforms.lighting,
             Vec3::new(albedo_pixel[0], albedo_pixel[1], albedo_pixel[2]),
         );
-        argb8888_linear(
+        [
             albedo_pixel[3] * uniforms.lighting.lighting.alpha,
-            [lighted.x, lighted.y, lighted.z],
-        )
+            lighted.x,
+            lighted.y,
+            lighted.z,
+        ]
     }
 
     fn is_opaque(&self, uniforms: &NormalMappedCookTorranceUniforms<'a>) -> bool {

@@ -1,10 +1,9 @@
 //! Deterministic framebuffer post-processing.
 //!
-//! The renderer stores encoded sRGB colors in `Framebuffer`. A post chain
-//! starts by decoding those colors into one linear float buffer. Each pass
-//! declares its working color space. Conversion happens only at an explicit
-//! pass boundary, and the final buffer is encoded once into the framebuffer.
-//! The fixed render order is: render -> SSAA downsample -> post chain -> present.
+//! The renderer stores encoded sRGB colors in `Framebuffer`. HDR mode also
+//! stores a linear sidecar. Each pass declares its working color space.
+//! The HDR order is render -> SSAA -> bloom -> vignette -> ACES -> encode ->
+//! FXAA. LDR chains retain their existing pass order and byte output.
 
 use crate::fb::{Framebuffer, argb8888_linear};
 use crate::image::{srgb_to_linear, srgb_to_linear_u8};
@@ -27,6 +26,7 @@ pub struct PostBuffer {
     /// Pixels are `[alpha, red, green, blue]`, normalized to `0.0..=1.0`.
     pub pixels: Vec<[f32; 4]>,
     pub color_space: PostColorSpace,
+    hdr: bool,
 }
 
 impl PostBuffer {
@@ -36,6 +36,7 @@ impl PostBuffer {
             height,
             pixels: vec![[0.0; 4]; width.saturating_mul(height)],
             color_space,
+            hdr: false,
         }
     }
 
@@ -45,14 +46,19 @@ impl PostBuffer {
             framebuffer.height,
             PostColorSpace::Linear,
         );
-        for (destination, &pixel) in buffer.pixels.iter_mut().zip(&framebuffer.color) {
-            let [alpha, red, green, blue] = pixel.to_be_bytes();
-            *destination = [
-                f32::from(alpha) / 255.0,
-                srgb_to_linear_u8(red),
-                srgb_to_linear_u8(green),
-                srgb_to_linear_u8(blue),
-            ];
+        if let Some(linear) = framebuffer.linear_pixels() {
+            buffer.pixels.copy_from_slice(linear);
+            buffer.hdr = true;
+        } else {
+            for (destination, &pixel) in buffer.pixels.iter_mut().zip(&framebuffer.color) {
+                let [alpha, red, green, blue] = pixel.to_be_bytes();
+                *destination = [
+                    f32::from(alpha) / 255.0,
+                    srgb_to_linear_u8(red),
+                    srgb_to_linear_u8(green),
+                    srgb_to_linear_u8(blue),
+                ];
+            }
         }
         buffer
     }
@@ -62,6 +68,7 @@ impl PostBuffer {
             return self.clone();
         }
         let mut converted = Self::new(self.width, self.height, color_space);
+        converted.hdr = self.hdr;
         for (destination, &source) in converted.pixels.iter_mut().zip(&self.pixels) {
             *destination = match color_space {
                 PostColorSpace::Linear => [
@@ -82,8 +89,8 @@ impl PostBuffer {
     }
 
     fn write_to_framebuffer(&self, framebuffer: &mut Framebuffer) {
-        for (destination, &source) in framebuffer.color.iter_mut().zip(&self.pixels) {
-            *destination = match self.color_space {
+        for (index, &source) in self.pixels.iter().enumerate() {
+            framebuffer.color[index] = match self.color_space {
                 PostColorSpace::Linear => {
                     argb8888_linear(source[0], [source[1], source[2], source[3]])
                 }
@@ -95,6 +102,17 @@ impl PostBuffer {
                     u32::from_be_bytes([alpha, red, green, blue])
                 }
             };
+            if let Some(linear) = framebuffer.linear_pixels_mut() {
+                linear[index] = match self.color_space {
+                    PostColorSpace::Linear => source,
+                    PostColorSpace::EncodedSrgb => [
+                        source[0],
+                        srgb_to_linear(source[1]),
+                        srgb_to_linear(source[2]),
+                        srgb_to_linear(source[3]),
+                    ],
+                };
+            }
         }
     }
 }
@@ -164,6 +182,7 @@ impl PostChain {
         for pass in &self.passes {
             let input = current.convert_to(pass.color_space());
             let mut output = PostBuffer::new(input.width, input.height, pass.color_space());
+            output.hdr = input.hdr;
             pass.apply(&input, &mut output);
             current = output;
         }
@@ -172,6 +191,7 @@ impl PostChain {
 }
 
 pub const BLOOM_THRESHOLD: f32 = 0.70;
+pub const HDR_BLOOM_THRESHOLD: f32 = 1.0;
 pub const BLOOM_STRENGTH: f32 = 0.65;
 
 /// Normalized five-pair Gaussian taps for sigma 2.0 and radius 4.
@@ -203,7 +223,12 @@ impl PostPass for BloomPass {
         debug_assert_eq!(output.color_space, PostColorSpace::Linear);
         let mut extracted = vec![[0.0; 3]; input.pixels.len()];
         for (destination, pixel) in extracted.iter_mut().zip(&input.pixels) {
-            *destination = bloom_threshold_extract([pixel[1], pixel[2], pixel[3]], BLOOM_THRESHOLD);
+            let threshold = if input.hdr {
+                HDR_BLOOM_THRESHOLD
+            } else {
+                BLOOM_THRESHOLD
+            };
+            *destination = bloom_threshold_extract([pixel[1], pixel[2], pixel[3]], threshold);
         }
 
         let mut horizontal = vec![[0.0; 3]; input.pixels.len()];
@@ -248,15 +273,102 @@ impl PostPass for BloomPass {
                     }
                 }
                 let source = input.pixels[index];
+                let rgb = [
+                    source[1] + blur[0] * BLOOM_STRENGTH,
+                    source[2] + blur[1] * BLOOM_STRENGTH,
+                    source[3] + blur[2] * BLOOM_STRENGTH,
+                ];
                 output.pixels[index] = [
                     source[0],
-                    (source[1] + blur[0] * BLOOM_STRENGTH).min(1.0),
-                    (source[2] + blur[1] * BLOOM_STRENGTH).min(1.0),
-                    (source[3] + blur[2] * BLOOM_STRENGTH).min(1.0),
+                    if input.hdr { rgb[0] } else { rgb[0].min(1.0) },
+                    if input.hdr { rgb[1] } else { rgb[1].min(1.0) },
+                    if input.hdr { rgb[2] } else { rgb[2].min(1.0) },
                 ];
             }
         }
     }
+}
+
+/// Narkowicz's fitted ACES approximation. Exposure scales linear HDR values
+/// before the fit, and the result stays linear until the final sRGB encode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AcesTonemapPass {
+    exposure: f32,
+}
+
+impl AcesTonemapPass {
+    pub fn new(exposure: f32) -> Self {
+        Self {
+            exposure: sanitize_exposure(exposure),
+        }
+    }
+
+    pub const fn exposure(self) -> f32 {
+        self.exposure
+    }
+}
+
+/// Maximum exposure accepted at the post-processing boundary.
+pub const MAX_EXPOSURE: f32 = 100.0;
+
+pub fn sanitize_exposure(exposure: f32) -> f32 {
+    if exposure.is_nan() {
+        1.0
+    } else if exposure.is_finite() {
+        exposure.clamp(0.0, MAX_EXPOSURE)
+    } else if exposure.is_sign_positive() {
+        MAX_EXPOSURE
+    } else {
+        1.0
+    }
+}
+
+/// The fitted curve reaches its display ceiling near x=7.25. This cutover
+/// avoids overflow in the quadratic terms for larger finite HDR values.
+pub const ACES_SATURATION_CUTOFF: f32 = 8.0;
+
+pub fn aces_tonemap(value: f32) -> f32 {
+    let value = if value.is_nan() {
+        return 0.0;
+    } else if value.is_infinite() {
+        return if value.is_sign_positive() { 1.0 } else { 0.0 };
+    } else {
+        value
+    };
+    if value >= ACES_SATURATION_CUTOFF {
+        return 1.0;
+    }
+    let numerator = value * (2.51 * value + 0.03);
+    let denominator = value * (2.43 * value + 0.59) + 0.14;
+    if denominator > 0.0 {
+        (numerator / denominator).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+impl PostPass for AcesTonemapPass {
+    fn color_space(&self) -> PostColorSpace {
+        PostColorSpace::Linear
+    }
+
+    fn apply(&self, input: &PostBuffer, output: &mut PostBuffer) {
+        debug_assert_eq!(input.color_space, PostColorSpace::Linear);
+        debug_assert_eq!(output.color_space, PostColorSpace::Linear);
+        output.hdr = input.hdr;
+        for (destination, &source) in output.pixels.iter_mut().zip(&input.pixels) {
+            *destination = [
+                source[0],
+                aces_tonemap(source[1] * self.exposure),
+                aces_tonemap(source[2] * self.exposure),
+                aces_tonemap(source[3] * self.exposure),
+            ];
+        }
+    }
+}
+
+pub fn aces(exposure: f32) -> AcesTonemapPass {
+    AcesTonemapPass::new(exposure)
 }
 
 pub const FXAA_EDGE_THRESHOLD: f32 = 0.08;
@@ -515,5 +627,47 @@ mod tests {
         framebuffer.color[0] = 0x12345678;
         PostChain::new().apply(&mut framebuffer);
         assert_eq!(framebuffer.color[0], 0x12345678);
+    }
+
+    #[test]
+    fn aces_fit_matches_hand_computed_samples() {
+        // x=0: numerator=0, so the fitted curve returns 0.
+        assert_eq!(aces_tonemap(0.0), 0.0);
+        // x=0.18: 0.18*(2.51*0.18+0.03)=0.086724;
+        // denominator=0.18*(2.43*0.18+0.59)+0.14=0.324932;
+        // 0.086724/0.324932=0.2668987.
+        assert!((aces_tonemap(0.18) - 0.2668987).abs() < 1e-6);
+        // x=1: numerator=2.54, denominator=3.16, result=0.8037975.
+        assert!((aces_tonemap(1.0) - 0.8037975).abs() < 1e-6);
+        // x=10: 251.3/249.04=1.009..., then the display bound gives 1.
+        assert_eq!(aces_tonemap(10.0), 1.0);
+    }
+
+    #[test]
+    fn aces_extreme_inputs_saturate_without_nan() {
+        for value in [1.0e20, f32::MAX, f32::INFINITY] {
+            let result = aces_tonemap(value);
+            assert_eq!(result, 1.0);
+            assert!(result.is_finite());
+        }
+    }
+
+    #[test]
+    fn exposure_sanitization_has_a_finite_sane_bound() {
+        assert_eq!(sanitize_exposure(1.0e20), MAX_EXPOSURE);
+        assert_eq!(sanitize_exposure(f32::INFINITY), MAX_EXPOSURE);
+        assert_eq!(sanitize_exposure(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn aces_exposure_scales_linear_input_before_tonemap() {
+        let mut framebuffer = Framebuffer::new(1, 1);
+        framebuffer.set_hdr(true);
+        framebuffer.linear_pixels_mut().unwrap()[0] = [1.0, 0.5, 0.5, 0.5];
+        PostChain::new()
+            .with_pass(AcesTonemapPass::new(2.0))
+            .apply(&mut framebuffer);
+        let red = framebuffer.linear_pixels().unwrap()[0][1];
+        assert!((red - aces_tonemap(1.0)).abs() < 1e-6);
     }
 }

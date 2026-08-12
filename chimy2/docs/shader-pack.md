@@ -24,7 +24,8 @@ screen-space pixel width.
   channel.
 - `fog`: computes Euclidean view-space distance in the vertex stage. It uses
   linear fog from `fog_start` to `fog_end`. Fog and base colors stay linear;
-  `argb8888_linear` performs the only sRGB encode.
+  LDR uses `argb8888_linear`, while HDR-capable shaders return linear values
+  to the post chain for ACES and the one final sRGB encode.
 - `normals`: transforms the normal with the inverse-transpose model matrix and
   remaps `[-1, 1]` to `[0, 1]` in linear RGB.
 - `wireframe`: overlays an edge color when the minimum barycentric component is

@@ -22,6 +22,7 @@ fn load_skybox() -> Result<CubeTexture, Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = DemoArgs::from_env()?;
+    let hdr = args.hdr;
     let skybox = load_skybox()?;
     let sphere = uv_sphere(0.72, 24, 48);
 
@@ -75,6 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let mut pipeline = Pipeline::new(CookTorranceShader, CookTorranceShader);
+            pipeline.set_hdr(hdr);
             pipeline.render(framebuffer, |frame, target| {
                 frame.draw_skybox(target, &skybox, camera);
                 for uniform in &uniforms {

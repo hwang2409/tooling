@@ -241,6 +241,27 @@ pub(crate) fn render_skybox_with_threads(
     if framebuffer.width == 0 || framebuffer.height == 0 {
         return;
     }
+    if framebuffer.is_hdr() {
+        let inverse = inverse_view_projection(camera);
+        let pass = SkyboxPass {
+            camera,
+            inverse,
+            cube,
+            width: framebuffer.width,
+            height: framebuffer.height,
+        };
+        let depth = framebuffer.depth.clone();
+        let mut linear = framebuffer
+            .linear_pixels_mut()
+            .expect("HDR target")
+            .to_vec();
+        pass.render_rows_hdr(&mut framebuffer.color, &mut linear, &depth, 0);
+        framebuffer
+            .linear_pixels_mut()
+            .expect("HDR target")
+            .copy_from_slice(&linear);
+        return;
+    }
     let inverse = inverse_view_projection(camera);
     let pass = SkyboxPass {
         camera,
@@ -281,6 +302,33 @@ struct SkyboxPass<'a> {
 }
 
 impl SkyboxPass<'_> {
+    fn render_rows_hdr(
+        self,
+        color_rows: &mut [u32],
+        linear_rows: &mut [[f32; 4]],
+        depth: &[f32],
+        start_y: usize,
+    ) {
+        for (local_index, color) in color_rows.iter_mut().enumerate() {
+            let y = start_y + local_index / self.width;
+            let x = local_index % self.width;
+            let index = y * self.width + x;
+            if depth[index] < 1.0 {
+                continue;
+            }
+            let sample = self.cube.sample(skybox_ray_with_inverse(
+                self.camera,
+                self.inverse,
+                x,
+                y,
+                self.width,
+                self.height,
+            ));
+            linear_rows[local_index] = [sample[3], sample[0], sample[1], sample[2]];
+            *color = argb8888_linear(sample[3], [sample[0], sample[1], sample[2]]);
+        }
+    }
+
     fn render_rows(self, color_rows: &mut [u32], depth: &[f32], start_y: usize) {
         for (local_index, color) in color_rows.iter_mut().enumerate() {
             let y = start_y + local_index / self.width;

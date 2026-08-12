@@ -10,7 +10,7 @@ use crate::math::{Mat4, Vec3, Vec4};
 use crate::mesh::{Mesh, MeshVertex};
 use crate::postfx::PostChain;
 use crate::raster::{
-    PixelRect, RasterState, ScreenVertex, rasterize_triangle_with_sampling_state,
+    FragmentColor, PixelRect, RasterState, ScreenVertex, rasterize_triangle_with_sampling_state,
     rasterize_triangle_with_state, triangle_pixel_rect, viewport_transform,
 };
 use crate::skybox::{CubeTexture, render_skybox_with_threads};
@@ -44,6 +44,19 @@ pub trait SampledFragmentStage<V: SamplingVaryings, Uniforms> {
         derivatives: &SampleDerivatives,
         uniforms: &Uniforms,
     ) -> u32;
+
+    fn run_linear_with_sampling(
+        &self,
+        varyings: &V,
+        derivatives: &SampleDerivatives,
+        uniforms: &Uniforms,
+    ) -> [f32; 4] {
+        crate::fb::linear_rgba_from_argb8888(self.run_with_sampling(
+            varyings,
+            derivatives,
+            uniforms,
+        ))
+    }
 
     /// Returns whether this material has fully opaque coverage.
     fn is_opaque(&self, _uniforms: &Uniforms) -> bool {
@@ -113,6 +126,10 @@ pub trait VertexStage<Vertex, Uniforms> {
 pub trait FragmentStage<V: Varyings, Uniforms> {
     fn run(&self, varyings: &V, uniforms: &Uniforms) -> u32;
 
+    fn run_linear(&self, varyings: &V, uniforms: &Uniforms) -> [f32; 4] {
+        crate::fb::linear_rgba_from_argb8888(self.run(varyings, uniforms))
+    }
+
     fn is_opaque(&self, _uniforms: &Uniforms) -> bool {
         true
     }
@@ -180,6 +197,7 @@ pub struct Pipeline<VS, FS> {
     thread_count: usize,
     ssaa_scale: usize,
     post_chain: PostChain,
+    hdr: bool,
 }
 
 impl<VS, FS> Pipeline<VS, FS> {
@@ -190,6 +208,7 @@ impl<VS, FS> Pipeline<VS, FS> {
             thread_count: default_thread_count(),
             ssaa_scale: 1,
             post_chain: PostChain::new(),
+            hdr: false,
         }
     }
 
@@ -207,6 +226,14 @@ impl<VS, FS> Pipeline<VS, FS> {
 
     pub const fn ssaa_scale(&self) -> usize {
         self.ssaa_scale
+    }
+
+    pub fn set_hdr(&mut self, hdr: bool) {
+        self.hdr = hdr;
+    }
+
+    pub const fn hdr(&self) -> bool {
+        self.hdr
     }
 
     /// Replaces the optional post chain. The chain runs after SSAA downsample.
@@ -232,6 +259,7 @@ impl<VS, FS> Pipeline<VS, FS> {
     where
         F: FnOnce(&mut RenderFrame<'a, VS, FS>, &mut Framebuffer),
     {
+        framebuffer.set_hdr(self.hdr);
         if self.ssaa_scale <= 1 {
             let mut frame = RenderFrame::new(self);
             draw(&mut frame, framebuffer);
@@ -242,6 +270,7 @@ impl<VS, FS> Pipeline<VS, FS> {
         let width = framebuffer.width.saturating_mul(self.ssaa_scale);
         let height = framebuffer.height.saturating_mul(self.ssaa_scale);
         let mut internal = Framebuffer::new(width, height);
+        internal.set_hdr(self.hdr);
         let mut frame = RenderFrame::new(self);
         draw(&mut frame, &mut internal);
         frame.flush(&mut internal);
@@ -723,6 +752,13 @@ fn dispatch_prepared<V, FS, Uniforms>(
             let source_end = source_start + result.framebuffer.width;
             framebuffer.color[destination_start..destination_end]
                 .copy_from_slice(&result.framebuffer.color[source_start..source_end]);
+            if let (Some(destination), Some(source)) = (
+                framebuffer.linear_pixels_mut(),
+                result.framebuffer.linear_pixels(),
+            ) {
+                destination[destination_start..destination_end]
+                    .copy_from_slice(&source[source_start..source_end]);
+            }
             framebuffer.depth[destination_start..destination_end]
                 .copy_from_slice(&result.framebuffer.depth[source_start..source_end]);
         }
@@ -779,6 +815,7 @@ where
     V: Varyings + Clone,
 {
     let mut framebuffer = Framebuffer::new(tile.width, tile.height);
+    framebuffer.set_hdr(source.is_hdr());
     for row in 0..tile.height {
         let source_start = (tile.y + row) * source.width + tile.x;
         let source_end = source_start + tile.width;
@@ -786,6 +823,12 @@ where
         let destination_end = destination_start + tile.width;
         framebuffer.color[destination_start..destination_end]
             .copy_from_slice(&source.color[source_start..source_end]);
+        if let (Some(destination), Some(source_linear)) =
+            (framebuffer.linear_pixels_mut(), source.linear_pixels())
+        {
+            destination[destination_start..destination_end]
+                .copy_from_slice(&source_linear[source_start..source_end]);
+        }
         framebuffer.depth[destination_start..destination_end]
             .copy_from_slice(&source.depth[source_start..source_end]);
     }
@@ -814,8 +857,13 @@ fn rasterize_plain_triangle<V, FS, Uniforms>(
     V: Varyings,
     FS: FragmentStage<V, Uniforms>,
 {
+    let hdr = framebuffer.is_hdr();
     rasterize_triangle_with_state(framebuffer, vertices, state, |varyings| {
-        fragment.run(&varyings, uniforms)
+        if hdr {
+            FragmentColor::Linear(fragment.run_linear(&varyings, uniforms))
+        } else {
+            FragmentColor::Encoded(fragment.run(&varyings, uniforms))
+        }
     });
 }
 
@@ -841,11 +889,26 @@ fn rasterize_sampled_triangle<V, FS, Uniforms>(
     V: SamplingVaryings,
     FS: SampledFragmentStage<V, Uniforms>,
 {
+    let hdr = framebuffer.is_hdr();
     rasterize_triangle_with_sampling_state(
         framebuffer,
         vertices,
         state,
-        |varyings, derivatives| fragment.run_with_sampling(&varyings, &derivatives, uniforms),
+        |varyings, derivatives| {
+            if hdr {
+                FragmentColor::Linear(fragment.run_linear_with_sampling(
+                    &varyings,
+                    &derivatives,
+                    uniforms,
+                ))
+            } else {
+                FragmentColor::Encoded(fragment.run_with_sampling(
+                    &varyings,
+                    &derivatives,
+                    uniforms,
+                ))
+            }
+        },
     );
 }
 
@@ -1000,6 +1063,81 @@ mod tests {
             frame.draw(target, &vertices, &[[0, 1, 2]], &());
         });
         assert!(framebuffer.color.contains(&argb8888(255, 20, 40, 60)));
+    }
+
+    #[test]
+    fn switching_hdr_to_ldr_reuses_the_byte_identical_ldr_target() {
+        let vertices = [
+            Vec4::new(-1.0, -1.0, 0.0, 1.0),
+            Vec4::new(1.0, -1.0, 0.0, 1.0),
+            Vec4::new(-1.0, 1.0, 0.0, 1.0),
+        ];
+        let mut reused = Framebuffer::new(4, 4);
+        let mut pipeline = Pipeline::new(
+            vertex_stage(|vertex: &Vec4, _: &()| VertexOutput::new(*vertex, ())),
+            fragment_stage(|_: &(), _: &()| argb8888(255, 20, 40, 60)),
+        );
+        pipeline.set_hdr(true);
+        pipeline.render(&mut reused, |frame, target| {
+            target.clear(argb8888(255, 1, 2, 3));
+            frame.draw(target, &vertices, &[[0, 1, 2]], &());
+        });
+        pipeline.set_hdr(false);
+        pipeline.render(&mut reused, |frame, target| {
+            target.clear(argb8888(255, 1, 2, 3));
+            frame.draw(target, &vertices, &[[0, 1, 2]], &());
+        });
+
+        let mut fresh = Framebuffer::new(4, 4);
+        let mut ldr_pipeline = Pipeline::new(
+            vertex_stage(|vertex: &Vec4, _: &()| VertexOutput::new(*vertex, ())),
+            fragment_stage(|_: &(), _: &()| argb8888(255, 20, 40, 60)),
+        );
+        ldr_pipeline.render(&mut fresh, |frame, target| {
+            target.clear(argb8888(255, 1, 2, 3));
+            frame.draw(target, &vertices, &[[0, 1, 2]], &());
+        });
+
+        assert!(!reused.is_hdr());
+        assert_eq!(reused.color, fresh.color);
+    }
+
+    #[test]
+    fn resize_preserves_hdr_for_a_byte_identical_render() {
+        let vertices = [
+            Vec4::new(-1.0, -1.0, 0.0, 1.0),
+            Vec4::new(1.0, -1.0, 0.0, 1.0),
+            Vec4::new(-1.0, 1.0, 0.0, 1.0),
+        ];
+        let mut resized = Framebuffer::new(2, 2);
+        resized.set_hdr(true);
+        resized.resize(4, 3);
+        assert!(resized.is_hdr());
+
+        let mut fresh = Framebuffer::new(4, 3);
+        fresh.set_hdr(true);
+        let mut resized_pipeline = Pipeline::new(
+            vertex_stage(|vertex: &Vec4, _: &()| VertexOutput::new(*vertex, ())),
+            fragment_stage(|_: &(), _: &()| argb8888(255, 20, 40, 60)),
+        );
+        resized_pipeline.set_hdr(true);
+        resized_pipeline.render(&mut resized, |frame, target| {
+            target.clear(argb8888(255, 1, 2, 3));
+            frame.draw(target, &vertices, &[[0, 1, 2]], &());
+        });
+
+        let mut fresh_pipeline = Pipeline::new(
+            vertex_stage(|vertex: &Vec4, _: &()| VertexOutput::new(*vertex, ())),
+            fragment_stage(|_: &(), _: &()| argb8888(255, 20, 40, 60)),
+        );
+        fresh_pipeline.set_hdr(true);
+        fresh_pipeline.render(&mut fresh, |frame, target| {
+            target.clear(argb8888(255, 1, 2, 3));
+            frame.draw(target, &vertices, &[[0, 1, 2]], &());
+        });
+
+        assert!(resized.is_hdr());
+        assert_eq!(resized.color, fresh.color);
     }
 
     #[test]
