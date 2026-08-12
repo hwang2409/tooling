@@ -4,7 +4,7 @@ use crate::camera::Camera;
 use crate::fb::Framebuffer;
 use crate::math::{Mat4, Vec2, Vec3, Vec4};
 use crate::mesh::Mesh;
-use crate::pipeline::Pipeline;
+use crate::pipeline::{Instance, Pipeline};
 use crate::shadow::{
     ShadowDepthShader, ShadowDepthUniforms, ShadowMap, sanitize_bias, sanitize_far_plane,
     sanitize_near_plane, sanitize_position,
@@ -676,6 +676,88 @@ pub fn render_cascade_shadow_maps_with_config(
                 &mut target,
                 mesh,
                 &ShadowDepthUniforms::new(model, matrix),
+            );
+        }
+        maps.push(ShadowMap::from_framebuffer(&target)?);
+    }
+    CascadeShadowState::with_config_and_projections(
+        camera,
+        maps,
+        effective_config,
+        light_view_projections,
+    )
+}
+
+/// Renders cascades for mesh groups that share one material and use instances.
+pub fn render_cascade_shadow_maps_instanced(
+    camera: Camera,
+    light_direction: Vec3,
+    cascade_count: usize,
+    map_size: usize,
+    meshes: &[(&Mesh, &[Instance])],
+) -> Result<CascadeShadowState, String> {
+    render_cascade_shadow_maps_instanced_with_config(
+        camera,
+        light_direction,
+        CascadeShadowConfig::new(cascade_count, 0.5),
+        map_size,
+        meshes,
+    )
+}
+
+/// Renders configured cascades for mesh groups that share one material and use
+/// instances. Caster fitting includes every finite instance transform.
+pub fn render_cascade_shadow_maps_instanced_with_config(
+    camera: Camera,
+    light_direction: Vec3,
+    config: CascadeShadowConfig,
+    map_size: usize,
+    meshes: &[(&Mesh, &[Instance])],
+) -> Result<CascadeShadowState, String> {
+    if map_size == 0 {
+        return Err("cascade shadow-map size must be non-zero".to_string());
+    }
+    let camera = sanitize_camera(camera);
+    let count = effective_cascade_count(camera.near, camera.far, config.cascade_count());
+    let mut effective_config = config;
+    effective_config.set_cascade_count(count);
+    let split_depths = practical_split_depths(camera.near, camera.far, count, config.lambda());
+    let caster_points = meshes
+        .iter()
+        .flat_map(|(mesh, instances)| {
+            instances.iter().flat_map(|instance| {
+                mesh.vertices().iter().filter_map(|vertex| {
+                    finite_point(transform_point(instance.model(), vertex.position()))
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut maps = Vec::with_capacity(count);
+    let mut light_view_projections = [Mat4::IDENTITY; MAX_CASCADES];
+    let mut pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
+    for index in 0..count {
+        let slice_near = if index == 0 {
+            camera.near
+        } else {
+            split_depths[index - 1]
+        };
+        let matrix = fit_cascade_light_projection_with_casters(
+            camera,
+            light_direction,
+            slice_near,
+            split_depths[index],
+            map_size,
+            &caster_points,
+        );
+        light_view_projections[index] = matrix;
+        let mut target = Framebuffer::new(map_size, map_size);
+        target.clear(0);
+        for &(mesh, instances) in meshes {
+            pipeline.draw_mesh_depth_instanced_with_varyings(
+                &mut target,
+                mesh,
+                &ShadowDepthUniforms::new(Mat4::IDENTITY, matrix),
+                instances,
             );
         }
         maps.push(ShadowMap::from_framebuffer(&target)?);

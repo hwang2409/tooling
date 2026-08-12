@@ -2,7 +2,7 @@ use chimy2::camera::Camera;
 use chimy2::fb::Framebuffer;
 use chimy2::math::{Mat4, Quat, Vec3};
 use chimy2::mesh::{Mesh, MeshVertex};
-use chimy2::pipeline::Pipeline;
+use chimy2::pipeline::{Instance, InstanceUniforms, Pipeline};
 use chimy2::shaders::{BlinnPhongShader, BlinnPhongUniforms, DirectionalLight, PointLight};
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::path::Path;
@@ -56,6 +56,42 @@ fn render_at(mesh: &Mesh, thread_count: usize, width: usize, height: usize) {
 
 fn render(mesh: &Mesh, thread_count: usize) {
     render_at(mesh, thread_count, WIDTH, HEIGHT);
+}
+
+fn render_500_instances(instanced: bool) {
+    let mesh = Mesh::new(
+        vec![
+            MeshVertex::new(Vec3::new(-0.03, -0.03, 0.0), None, None),
+            MeshVertex::new(Vec3::new(0.03, -0.03, 0.0), None, None),
+            MeshVertex::new(Vec3::new(0.0, 0.03, 0.0), None, None),
+        ],
+        vec![[0, 1, 2]],
+    );
+    let base = uniforms(320, 180);
+    let instances = (0..500)
+        .map(|index| {
+            let x = (index % 25) as f32 * 0.08 - 1.0;
+            let y = (index / 25) as f32 * 0.08 - 0.8;
+            Instance::new(Mat4::translate(Vec3::new(x, y, 0.0)))
+        })
+        .collect::<Vec<_>>();
+    let individual_uniforms = instances
+        .iter()
+        .map(|instance| base.for_instance(instance))
+        .collect::<Vec<_>>();
+    let mut framebuffer = Framebuffer::new(320, 180);
+    let mut pipeline = Pipeline::new(BlinnPhongShader, BlinnPhongShader);
+    pipeline.set_thread_count(1);
+    pipeline.render(&mut framebuffer, |frame, target| {
+        if instanced {
+            frame.draw_mesh_instanced(target, &mesh, &base, &instances);
+        } else {
+            for uniforms in &individual_uniforms {
+                frame.draw_mesh(target, &mesh, uniforms);
+            }
+        }
+    });
+    black_box(framebuffer.color);
 }
 
 fn subdivided_icosahedron(levels: usize) -> Mesh {
@@ -136,6 +172,12 @@ fn bench_raster(c: &mut Criterion) {
     });
     c.bench_function("100000 triangle scene parallel", |b| {
         b.iter(|| render(black_box(&exact_100k), parallel_threads))
+    });
+    c.bench_function("500 mesh instances instanced", |b| {
+        b.iter(|| render_500_instances(true))
+    });
+    c.bench_function("500 mesh instances individual draws", |b| {
+        b.iter(|| render_500_instances(false))
     });
     c.bench_function("opaque 100000 triangles 320x180 serial", |b| {
         b.iter(|| render_at(black_box(&exact_100k), 1, 320, 180))

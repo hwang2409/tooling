@@ -11,7 +11,7 @@
 use crate::fb::Framebuffer;
 use crate::math::{Mat4, Vec2, Vec3, Vec4};
 use crate::mesh::{Mesh, MeshVertex};
-use crate::pipeline::{Pipeline, Varyings, VertexOutput, VertexStage};
+use crate::pipeline::{Instance, InstanceUniforms, Pipeline, Varyings, VertexOutput, VertexStage};
 use crate::raster::{DepthVaryings, ScreenVertex, perspective_correct_weights};
 use std::sync::Arc;
 
@@ -458,7 +458,9 @@ pub(crate) use crate::csm::fit_cascade_light_projection_with_casters;
 pub use crate::csm::{
     CascadeShadowConfig, CascadeShadowState, MAX_CASCADES, cascade_index,
     fit_cascade_light_projection, frustum_slice_corners, practical_split_depths,
-    render_cascade_shadow_maps, render_cascade_shadow_maps_with_config, snap_ortho_origin,
+    render_cascade_shadow_maps, render_cascade_shadow_maps_instanced,
+    render_cascade_shadow_maps_instanced_with_config, render_cascade_shadow_maps_with_config,
+    snap_ortho_origin,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -521,6 +523,14 @@ impl ShadowDepthUniforms {
     fn rebuild_transform(&mut self) {
         self.transform = self.light_view_projection * self.model;
     }
+}
+
+impl InstanceUniforms for ShadowDepthUniforms {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.set_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, _: Vec4) {}
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -908,6 +918,42 @@ pub fn render_cube_shadow_map(
                 face,
                 mesh,
                 &ShadowDepthUniforms::new_cube(model, matrices[index], light_position, far_plane),
+            );
+        }
+    }
+    CubeShadowMap::from_framebuffers(faces, near_plane, far_plane)
+}
+
+/// Renders all six faces for mesh groups that share one material and use
+/// instances.
+pub fn render_cube_shadow_map_instanced(
+    light_position: Vec3,
+    near_plane: f32,
+    far_plane: f32,
+    size: usize,
+    meshes: &[(&Mesh, &[Instance])],
+) -> Result<CubeShadowMap, String> {
+    if size == 0 {
+        return Err("cube shadow-map size must be non-zero".to_string());
+    }
+    let near_plane = sanitize_near_plane(near_plane);
+    let far_plane = sanitize_far_plane(far_plane, near_plane);
+    let matrices = cube_face_view_projections(light_position, near_plane, far_plane);
+    let mut faces = std::array::from_fn(|_| Framebuffer::new(size, size));
+    let mut pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
+    for (index, face) in faces.iter_mut().enumerate() {
+        face.clear(0);
+        for &(mesh, instances) in meshes {
+            pipeline.draw_mesh_depth_instanced_with_varyings(
+                face,
+                mesh,
+                &ShadowDepthUniforms::new_cube(
+                    Mat4::IDENTITY,
+                    matrices[index],
+                    light_position,
+                    far_plane,
+                ),
+                instances,
             );
         }
     }

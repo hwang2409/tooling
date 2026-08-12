@@ -4,13 +4,14 @@
 //! positions by `model`, and the fragment stage uses the world-space camera
 //! and lights. Final color clamps to `[0, 1]` before 8-bit conversion.
 
-use crate::fb::argb8888_linear;
+use crate::fb::{argb8888, argb8888_linear};
 use crate::ibl::IblMaps;
 use crate::image::{ColorSpace, Texture, TextureDerivatives, srgb_to_linear};
 use crate::math::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use crate::mesh::MeshVertex;
 use crate::pipeline::{
-    FragmentStage, SampledFragmentStage, SamplingVaryings, Varyings, VertexOutput, VertexStage,
+    FragmentStage, InstanceUniforms, SampledFragmentStage, SamplingVaryings, Varyings,
+    VertexOutput, VertexStage,
 };
 use crate::shadow::{CascadeShadowState, CubeShadowState, ShadowMap, ShadowState};
 use crate::skybox::CubeTexture;
@@ -1486,6 +1487,96 @@ fn color_alpha_is_one(color: u32) -> bool {
 
 fn texture_has_no_alpha(texture: &Texture) -> bool {
     texture.pixels().iter().all(|pixel| pixel[3] == 255)
+}
+
+fn tint_linear_color(color: Vec3, tint: Vec4) -> Vec3 {
+    color * Vec3::new(tint.x, tint.y, tint.z)
+}
+
+fn tint_encoded_color(color: u32, tint: Vec4) -> u32 {
+    let [alpha, red, green, blue] = color.to_be_bytes();
+    argb8888(
+        (f32::from(alpha) * tint.w).round() as u8,
+        (f32::from(red) * tint.x).round() as u8,
+        (f32::from(green) * tint.y).round() as u8,
+        (f32::from(blue) * tint.z).round() as u8,
+    )
+}
+
+impl InstanceUniforms for FlatColorUniforms {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.transform = self.transform * model;
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.color = tint_encoded_color(self.color, tint);
+        self.alpha = (self.alpha * tint.w).clamp(0.0, 1.0);
+    }
+}
+
+impl InstanceUniforms for MeshUniforms {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.set_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.color = tint_encoded_color(self.color, tint);
+        self.alpha = (self.alpha * tint.w).clamp(0.0, 1.0);
+    }
+}
+
+impl<'a> InstanceUniforms for TexturedUniforms<'a> {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.transform = self.transform * model;
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.alpha = (self.alpha * tint.w).clamp(0.0, 1.0);
+    }
+}
+
+impl InstanceUniforms for BlinnPhongUniforms {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.set_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.ambient_color = tint_linear_color(self.ambient_color, tint);
+        self.diffuse_color = tint_linear_color(self.diffuse_color, tint);
+        self.specular_color = tint_linear_color(self.specular_color, tint);
+        self.alpha = (self.alpha * tint.w).clamp(0.0, 1.0);
+    }
+}
+
+impl<'a> InstanceUniforms for EnvironmentBlinnPhongUniforms<'a> {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.lighting.set_instance_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.lighting.apply_instance_tint(tint);
+    }
+}
+
+impl<'a> InstanceUniforms for TexturedBlinnPhongUniforms<'a> {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.lighting.set_instance_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.lighting.apply_instance_tint(tint);
+        self.alpha = (self.alpha * tint.w).clamp(0.0, 1.0);
+    }
+}
+
+impl<'a> InstanceUniforms for NormalMappedBlinnPhongUniforms<'a> {
+    fn set_instance_model(&mut self, model: Mat4) {
+        self.lighting.set_instance_model(model);
+    }
+
+    fn apply_instance_tint(&mut self, tint: Vec4) {
+        self.lighting.apply_instance_tint(tint);
+    }
 }
 
 #[cfg(test)]
