@@ -97,11 +97,11 @@ impl World {
             for b in (a + 1)..n {
                 let ga = &self.geoms[a];
                 let gb = &self.geoms[b];
-                if ga.body.is_none() && gb.body.is_none() {
-                    continue; // static vs static: nothing to accelerate
-                }
+                // Same body (including two statics: None == None) → no
+                // contact. This single check subsumes the static-vs-static
+                // case without a second guard.
                 if ga.body == gb.body {
-                    continue; // same body: no self-contact
+                    continue;
                 }
                 out.push((a, b));
             }

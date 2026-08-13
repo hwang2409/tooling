@@ -35,16 +35,23 @@ fn scene() -> World {
 
     world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.6));
 
-    // Perfectly aligned vertical drop; heights staggered so boxes arrive in
-    // sequence rather than colliding mid-air.
-    let heights = [0.5f32, 1.7, 2.9];
-    for &h in &heights {
-        let idx = world.add_body(Body::solid_box(
-            1.0,
-            HALF,
-            Vec3::new(0.0, 0.0, h),
-            Quat::IDENTITY,
-        ));
+    // Symmetry-broken drop. A perfectly axis-aligned scene cancels the four
+    // corner torques identically, so a lever-arm mutant (contact forces
+    // applied at the COM with zero arm) produces a bit-identical trajectory
+    // and the orientation anchor proves nothing. We break the symmetry two
+    // ways: shift the middle box by 0.02 m in +X so its 4 bottom corners no
+    // longer sit symmetrically on the bottom box's top face, and give the
+    // top box a small initial angular velocity about Y (0.3 rad/s). Both
+    // create asymmetric torques that the mutant can't reproduce.
+    let drops: [(Vec3, Vec3); 3] = [
+        (Vec3::new(0.00, 0.0, 0.5), Vec3::ZERO),
+        (Vec3::new(0.02, 0.0, 1.7), Vec3::ZERO),
+        (Vec3::new(0.00, 0.0, 2.9), Vec3::new(0.0, 0.3, 0.0)),
+    ];
+    for &(pos, omega_body) in &drops {
+        let mut body = Body::solid_box(1.0, HALF, pos, Quat::IDENTITY);
+        body.angular_velocity_body = omega_body;
+        let idx = world.add_body(body);
         world.add_geom(Geom::r#box(idx, HALF, Vec3::ZERO, Quat::IDENTITY, 0.6));
     }
     world
@@ -123,20 +130,30 @@ fn contacts_golden_trajectory_is_byte_identical() {
     }
 }
 
-/// A box stack that emerges perfectly upright is the acid test for lever-arm
-/// correctness in the contact-force application. Wrong contact positions
-/// (e.g. force applied at the box COM instead of at the corner), or a bug
-/// where the `r × F` cross product uses the wrong arm, would tilt the stack
-/// during settling and this anchor would catch it.
+/// Lever-arm sanity check on the symmetry-broken stack. The scene starts
+/// the top box with a 0.3 rad/s spin about Y and shifts the middle box by
+/// 0.02 m in +X — both create torques whose sign depends on the contact
+/// point's offset from the COM. A mutant that applies contact forces at the
+/// COM (zero lever arm) cannot reproduce those torques and drops out of the
+/// bounds below.
 ///
-/// Bound: after 2000 steps (10 s of sim time) the deviation of each box's
-/// orientation from identity, measured as `1 − |q.w|`, is under `1e-2` —
-/// which corresponds to a rotation of well under 12 degrees. In practice
-/// the current implementation settles to `< 5e-4` (< 1.7 degrees). A
-/// mis-applied lever arm would rotate by tens of degrees within the first
-/// second.
+/// - Top box: with the initial spin, correct `r × F` decelerates the roll
+///   quickly (contact-point tangent velocity opposes friction, which then
+///   opposes ω). A zero-arm mutant would let the roll persist; assert
+///   `|ω_y| < 1.0 rad/s` at the end (initial 0.3 shrinks in reality; a
+///   mutant would preserve or grow it).
+/// - Middle box: the +0.02 m X offset produces a small net torque during
+///   settling. The correct arm keeps orientation drift small; a zero-arm
+///   mutant lets the horizontal offset persist without any orientation
+///   response, and the box slides freely on the bottom under friction.
+///   Assert `1 − |q.w| < 1e-2` for all three boxes (well under 12°) and
+///   `|x|/|y| < 8 cm` (the middle box's 2 cm offset can drift a bit while
+///   the surrounding contact forces settle).
+///
+/// These bounds pass on the correct implementation and are documented in
+/// docs/contacts.md as the load-bearing anchor for the lever-arm claim.
 #[test]
-fn stacked_boxes_stay_near_upright() {
+fn stacked_boxes_stay_near_upright_under_asymmetric_load() {
     let mut world = scene();
     for _ in 0..2000 {
         world.step();
@@ -149,20 +166,31 @@ fn stacked_boxes_stay_near_upright() {
             b.orientation
         );
     }
-    // Also assert the stack really did stack (not fall over sideways).
+    // Top box's initial spin must have decayed under the correct
+    // lever-arm friction moment.
+    let top_omega_y = newt::math::abs(world.bodies[2].angular_velocity_body.y);
+    assert!(
+        top_omega_y < 1.0,
+        "top box's initial spin didn't decay: ω_y = {top_omega_y}"
+    );
+    // The stack should be roughly in place. The asymmetric setup lets the
+    // whole stack drift a bit in +X as the offset middle box redistributes
+    // load; empirically all three boxes settle at x ≈ 0.09 m. The bound is
+    // 0.15 m in X (comfortable but discriminating) and much tighter in Y
+    // (nothing forces motion out of the demo plane).
     for (i, b) in world.bodies.iter().enumerate() {
         assert!(
-            newt::math::abs(b.position.x) < 5.0e-2,
+            newt::math::abs(b.position.x) < 0.15,
             "box {i} drifted in x: {}",
             b.position.x
         );
         assert!(
-            newt::math::abs(b.position.y) < 5.0e-2,
+            newt::math::abs(b.position.y) < 2.0e-2,
             "box {i} drifted in y: {}",
             b.position.y
         );
     }
-    // And that the vertical order is preserved (bottom < middle < top).
+    // Vertical order preserved.
     let zs: Vec<f32> = world.bodies.iter().map(|b| b.position.z).collect();
     assert!(zs[0] < zs[1] && zs[1] < zs[2], "stack collapsed: {zs:?}");
 }

@@ -2,16 +2,17 @@
 //!
 //! We tilt the gravity vector instead of the plane so the plane geom stays
 //! horizontal — the tangent direction is then unambiguously +X. Two cases
-//! bracket the Coulomb friction angle `atan(μ)`:
-//!   - `θ_low = 10°` (well below `atan(0.5) ≈ 26.6°`): box stays effectively
-//!     put. The viscous-with-Coulomb-clamp model produces a tiny drift
-//!     proportional to `m g sin θ / c_tangent`; with default stiffness this
-//!     is a few centimeters over the test window.
-//!   - `θ_high = 45°` (well above): the tangent load exceeds the clamp, the
-//!     box slides accelerating; drift is meters.
+//! bracket the Coulomb friction angle `atan(0.5) ≈ 26.6°`, tightly:
+//!   - `θ_low = 22°` (below threshold, `tan 22° ≈ 0.404 < 0.5`): the
+//!     Coulomb cap holds; the box stays effectively put (viscous drift
+//!     only).
+//!   - `θ_high = 32°` (above threshold, `tan 32° ≈ 0.625 > 0.5`): the
+//!     tangent load exceeds the cap and the box slides accelerating.
 //!
-//! The gap between the two drift bounds is over an order of magnitude —
-//! designed to survive without retuning across integrator round-off changes.
+//! The 22°/32° bracket pins the cap firmly: a mutant that mis-scales μ by
+//! ±20% would move the effective threshold off one side of the bracket and
+//! flip an assertion. The wider 10°/45° bracket used earlier could hide such
+//! a mutant.
 //!
 //! Mutation coverage: friction applied ALONG THE NORMAL would make the box
 //! shoot away from the plane instead of resisting slide; both cases would
@@ -47,7 +48,10 @@ fn incline_world(angle_rad: f32, mu: f32) -> World {
 #[test]
 fn box_below_friction_angle_stays_put() {
     let mu = 0.5;
-    let angle = 10.0 * newt::math::PI / 180.0;
+    // 22° is 4.6° below the atan(0.5) threshold — tan(22°)/μ ≈ 0.81,
+    // enough margin for the RK4/viscous residual without inviting a mutant
+    // to escape.
+    let angle = 22.0 * newt::math::PI / 180.0;
     let mut world = incline_world(angle, mu);
     let x0 = world.bodies[0].position.x;
     for _ in 0..800 {
@@ -55,10 +59,9 @@ fn box_below_friction_angle_stays_put() {
     }
     let x = world.bodies[0].position.x;
     let drift = (x - x0).abs();
-    // Empirical steady-state drift is ~0.03 m over 4 s at this angle; 0.15 m
-    // leaves comfortable room while still failing a mutant that removes the
-    // Coulomb cap entirely (drift then grows linearly to ~0.3 m in the same
-    // window).
+    // Empirical steady-state drift is ~0.07 m over 4 s at 22°; 0.15 m is
+    // still a comfortable envelope. A mutant that shrinks the cap
+    // significantly would slide much further within the same window.
     assert!(
         drift < 0.15,
         "below-angle drift {drift} exceeded static-friction bound"
@@ -68,7 +71,10 @@ fn box_below_friction_angle_stays_put() {
 #[test]
 fn box_above_friction_angle_slides_downslope() {
     let mu = 0.5;
-    let angle = 45.0 * newt::math::PI / 180.0;
+    // 32° is 5.4° above atan(0.5) — tan(32°)/μ ≈ 1.25, so the cap binds
+    // and the box slides with acceleration g(sin θ − μ cos θ) ≈ 1.05 m/s².
+    // Over 4 s that predicts ≈ 8.4 m of drift; we require > 1 m.
+    let angle = 32.0 * newt::math::PI / 180.0;
     let mut world = incline_world(angle, mu);
     let x0 = world.bodies[0].position.x;
     for _ in 0..800 {
@@ -76,9 +82,6 @@ fn box_above_friction_angle_slides_downslope() {
     }
     let x = world.bodies[0].position.x;
     let drift = x - x0;
-    // With tan(45°) - μ = 0.5 net tangent, acceleration ≈ g/2 ≈ 4.9 m/s² —
-    // over 4 s, drift ≈ 0.5 * 4.9 * 16 = ~39 m. Assert firmly above the low
-    // case's ceiling of 0.15 m.
     assert!(
         drift > 1.0,
         "above-angle sliding drift {drift} unexpectedly small"
@@ -89,16 +92,16 @@ fn box_above_friction_angle_slides_downslope() {
 
 #[test]
 fn friction_coefficient_zero_removes_static_hold() {
-    // Additional discrimination: with μ = 0, even the low-angle case must
-    // slide — this catches a mutant that ignores μ (e.g. hard-coded cap
-    // large enough to always clamp).
-    let angle = 10.0 * newt::math::PI / 180.0;
+    // Additional discrimination: with μ = 0, even the (previously-)below-
+    // threshold case must slide. Catches a mutant that ignores μ (e.g.
+    // hard-coded cap large enough to always clamp).
+    let angle = 22.0 * newt::math::PI / 180.0;
     let mut world = incline_world(angle, 0.0);
     let x0 = world.bodies[0].position.x;
     for _ in 0..800 {
         world.step();
     }
     let drift = (world.bodies[0].position.x - x0).abs();
-    // With g sin(10°) ≈ 1.7 m/s² unopposed, drift ≈ 0.5 * 1.7 * 16 ≈ 13.6 m.
+    // With g sin(22°) ≈ 3.67 m/s² unopposed, drift ≈ 0.5 * 3.67 * 16 ≈ 29 m.
     assert!(drift > 1.0, "μ = 0 should slide freely; drift only {drift}");
 }

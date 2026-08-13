@@ -16,7 +16,7 @@
 //!    oscillate for many steps; the second-half stddev bound fails.
 
 use newt::body::Body;
-use newt::geom::{Geom, SolRef, solref_to_kc};
+use newt::geom::Geom;
 use newt::math::{Quat, Vec3};
 use newt::world::World;
 
@@ -39,11 +39,16 @@ fn sphere_on_plane_settles_to_equilibrium_penetration() {
     world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5));
     world.add_geom(Geom::sphere(body_idx, radius, Vec3::ZERO, 0.5));
 
-    // Analytic equilibrium: δ_eq = m g / k with k derived from the default
-    // SolRef and the sphere's mass (single dynamic body → m_eff = mass).
-    let (k, _c) = solref_to_kc(SolRef::DEFAULT, mass);
-    let delta_eq = mass * 9.81 / k;
-    let z_eq = radius - delta_eq;
+    // Analytic equilibrium: δ_eq = m g / k. `k` is hand-derived from the
+    // documented formula `k = m_eff / timeconst²` with `timeconst = 0.02`
+    // (SolRef::DEFAULT) and `m_eff = mass` (body-vs-static). Written as a
+    // constant rather than calling `solref_to_kc` on purpose — an
+    // impl-derived expectation is self-comparison and would let a
+    // wrong-power mutant (`k = m / timeconst³` etc.) survive both sides of
+    // the assertion.
+    let k_expected: f32 = mass / (0.02 * 0.02);
+    let delta_eq: f32 = mass * 9.81 / k_expected;
+    let z_eq: f32 = radius - delta_eq;
 
     // Long enough to bleed off the drop's kinetic energy under critical
     // damping. 5000 steps @ 5 ms = 25 s.

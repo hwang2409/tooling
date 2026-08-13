@@ -388,18 +388,24 @@ pub fn box_box(
     let mut count = 0usize;
 
     // A's vertices in B — normal is B's out-normal along `dir_b` (from B into A).
+    // Project onto B's surface (contact convention: `position_world` sits on
+    // B). Moving `world_v` by `+pen` along the out-normal takes it from
+    // inside B onto B's face.
     for &(sx, sy, sz) in &CORNER_SIGNS {
         let local_a = Vec3::new(sx * half_a.x, sy * half_a.y, sz * half_a.z);
         let world_v = pose_a.point_to_world(local_a);
         let local_b = pose_b.orientation.inverse_rotate(world_v - pose_b.position);
         if let Some((pen, normal_local_b)) = face_along_direction(local_b, half_b, dir_b) {
             let normal_world = pose_b.rotate(normal_local_b);
-            candidates[count] = (pen, world_v, normal_world);
+            let position_on_b_surface = world_v + normal_world * pen;
+            candidates[count] = (pen, position_on_b_surface, normal_world);
             count += 1;
         }
     }
-    // B's vertices in A — face normal points OUT of A (that's from A into B).
-    // Flip to get "from B into A".
+    // B's vertices in A — face normal points OUT of A (that's from A into B),
+    // flipped to satisfy the "from B into A" convention. Here `world_v` is
+    // already a corner of B — it sits on B's surface — so it needs no
+    // projection to obey the convention.
     for &(sx, sy, sz) in &CORNER_SIGNS {
         let local_b = Vec3::new(sx * half_b.x, sy * half_b.y, sz * half_b.z);
         let world_v = pose_b.point_to_world(local_b);
@@ -455,10 +461,11 @@ fn face_along_direction(
     let dx = half.x - crate::math::abs(local_point.x);
     let dy = half.y - crate::math::abs(local_point.y);
     let dz = half.z - crate::math::abs(local_point.z);
-    // Outside the box on any axis → no penetration. Note the strict `< 0.0`:
-    // a vertex sitting ON a face (`d = 0`) still counts along orthogonal
-    // axes, which is what makes corner-on-corner axis-aligned stacks emit
-    // contacts. Only the chosen axis has to be strictly positive.
+    // A vertex is a candidate iff its coordinate is inside the box on ALL
+    // three axes (each `d >= 0`). Only the chosen (direction-aligned) axis
+    // has to be strictly positive further down; the other two are allowed to
+    // sit exactly on the face (`d == 0`) so corner-on-corner axis-aligned
+    // stacks still emit contacts along the chosen axis.
     if dx < 0.0 || dy < 0.0 || dz < 0.0 {
         return None;
     }

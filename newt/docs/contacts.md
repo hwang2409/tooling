@@ -130,14 +130,14 @@ bit-identical to tier 1 — the tier-1 tumbling golden still passes.
 | file | pin |
 |------|-----|
 | `tests/contacts_rest.rs` | sphere on plane converges to `δ_eq = m g / k`; second-half stddev of z stays below `5e-5` (no bounce growth). |
-| `tests/contacts_friction.rs::box_below_friction_angle_stays_put` | box at θ = 10° on a μ = 0.5 tilted-gravity incline drifts less than 0.15 m in 4 s. |
-| `tests/contacts_friction.rs::box_above_friction_angle_slides_downslope` | box at θ = 45° on a μ = 0.5 incline slides more than 1 m in 4 s (direction verified). |
+| `tests/contacts_friction.rs::box_below_friction_angle_stays_put` | box at θ = 22° on a μ = 0.5 tilted-gravity incline (below `atan(0.5) ≈ 26.6°`) drifts less than 0.15 m in 4 s. |
+| `tests/contacts_friction.rs::box_above_friction_angle_slides_downslope` | box at θ = 32° on a μ = 0.5 incline (above threshold) slides more than 1 m in 4 s (direction verified). |
 | `tests/contacts_friction.rs::friction_coefficient_zero_removes_static_hold` | μ = 0 sanity: box slides freely at any nonzero angle. |
 | `tests/contacts_rolling.rs::sphere_on_plane_transitions_toward_rolling` | slip `|v_x − r ω_y|` shrinks from ~5 m/s to below 0.1 m/s after 500 steps; sphere spins about +Y and keeps moving forward. |
 | `tests/contacts_energy.rs::bouncing_sphere_peaks_are_monotonically_decreasing` | at least 3 detectable peaks, each strictly less than the previous; first peak strictly below the drop height (energy really was lost). |
 | `tests/contacts_momentum.rs::head_on_collision_conserves_linear_momentum` | pairwise sphere collision: max `|Σp − Σp₀| < 1e-3` over 400 steps; both spheres exchanged velocity. |
-| `tests/contacts_golden.rs::contacts_golden_trajectory_is_byte_identical` | serialize `(q, qdot)` for the 3-BOX stacking scene at steps 0/100/1000; byte-compared against `tests/goldens/stacking_3_boxes.bin`. box-box + box-plane contacts are the primary shape exercised. |
-| `tests/contacts_golden.rs::stacked_boxes_stay_near_upright` | after 2000 steps (10 s), every box's `1 − |q.w|` under 1e-2, |x|/|y| drift under 5 cm, and z-order preserved — nothing tips over. this is the lever-arm sanity check: a wrong `r × F` in the contact-force application would tilt the stack visibly in the first second. |
+| `tests/contacts_golden.rs::contacts_golden_trajectory_is_byte_identical` | serialize `(q, qdot)` for the 3-BOX symmetry-broken stacking scene (middle box offset +0.02 m in X, top box spinning at 0.3 rad/s about Y) at steps 0/100/1000; byte-compared against `tests/goldens/stacking_3_boxes.bin`. box-box + box-plane contacts + non-trivial `r × F` are all exercised — a zero-lever-arm mutant flips this golden at snapshot 2. |
+| `tests/contacts_golden.rs::stacked_boxes_stay_near_upright_under_asymmetric_load` | after 2000 steps (10 s) on the same symmetry-broken scene, every box's `1 − |q.w|` under 1e-2 (< ~12°), |x| drift under 15 cm, |y| under 2 cm, top box's initial ω_y decayed to < 1 rad/s, and z-order preserved. This is the lever-arm anchor — verified locally by running with the zero-arm mutant applied (both `r × F` cross products replaced with `Vec3::ZERO`): top box tilts to `1 − |q.w| = 0.93` (~86°). The symmetry break is load-bearing; the perfectly-aligned scene the earlier draft used had corner torques that canceled and did NOT catch this mutant. |
 
 the golden was generated on macOS aarch64 (same convention as tier 1).
 regenerate ONLY on the reference host:
@@ -158,15 +158,15 @@ cannot silently swap the reference.
 | missing damping term | `contacts_energy.rs` — first peak stops decaying, or grows |
 | swapped Newton's third law (only one body gets the reaction) | `contacts_momentum.rs` — pairwise momentum drifts by tens of percent |
 | combine_solref picks stiffer damping instead of MIN | `contacts_energy.rs` — sphere overdamps and stops bouncing (this is exactly the bug caught during development) |
-| wrong contact-point lever arm in wrench application | `stacked_boxes_stay_near_upright` — mis-applied `r × F` rotates the boxes tens of degrees within the first second |
+| wrong contact-point lever arm in wrench application (e.g. `r_a`/`r_b` zeroed) | `stacked_boxes_stay_near_upright_under_asymmetric_load` — top box tilts to `1 − |q.w| ≈ 0.93` (~86°) within 10 s; the golden also flips at snapshot 2. Verified by local mutant application (documented in the PR body). |
 | box-box nearest-face picks the wrong wall (naive "closest face" instead of pose-delta-aligned) | 3-box demo would collapse to zero-height (upper boxes get pushed DOWN into the lower one); the box golden captures the correct settled height |
 
 ## running the demos
 
-three spheres dropping and settling into a stack:
+three boxes dropping and settling into a vertical stack:
 
 ```sh
-cargo run --release --example stack -- --frames 800 --out /tmp/stack.ppm --size 640x360
+cargo run --release --example stack -- --frames 1800 --out /tmp/stack.ppm --size 640x360
 ```
 
 two spheres rolling and colliding head-on:
@@ -182,8 +182,8 @@ sips -s format png /tmp/stack.ppm --out /tmp/stack.png
 sips -s format png /tmp/roll.ppm --out /tmp/roll.png
 ```
 
-both demos render three great circles per sphere so the spin (roll) or
-lack-of-spin (stack, after settling) is visible.
+the stack demo draws box wireframes (12 edges each); the roll demo draws
+three great circles per sphere so the spin is visible.
 
 ## verification
 
