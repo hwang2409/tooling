@@ -60,7 +60,7 @@ cargo run --bin scene_viewer -- --scene examples/showcase.scene.json --screensho
   "objects": [
     {"mesh": "../assets/icosahedron.obj", "material": {"type": "ggx", "metallic": 0.8, "roughness": 0.24}, "transform": {"position": [-1.25, 0.1, 0], "rotation": [0, 0.4, 0], "scale": [1.1, 1.1, 1.1]}, "instancing": {"count": 3, "grid": {"dimensions": [3, 1, 1], "spacing": [1.0, 0, 0]}}},
     {"mesh": "../assets/cube.obj", "material": {"type": "blinn_phong", "diffuse": [0.95, 0.24, 0.06], "shininess": 32}, "transform": {"position": [1.25, -0.35, 0], "rotation": [0.2, -0.5, 0.15], "scale": [0.8, 0.8, 0.8]}},
-    {"mesh": "../assets/icosahedron.obj", "material": {"type": "blinn_phong", "diffuse": [0.18, 0.7, 0.3]}, "transform": {"position": [0, -0.65, -1.4], "scale": [0.45, 0.45, 0.45]}, "lod": {"ratios": [0.5, 0.25], "thresholds": [256, 96]}}
+    {"mesh": "../assets/cube.obj", "material": {"type": "blinn_phong", "diffuse": [0.18, 0.7, 0.3]}, "transform": {"position": [0, -0.25, -0.4], "scale": [1, 1, 1]}, "lod": {"ratios": [0.5, 0.05], "thresholds": [1000, 0.1]}}
   ],
   "postfx": [{"type": "ssao", "radius": 0.55}, {"type": "bloom"}, {"type": "aces", "exposure": 1.15}],
   "particles": [{"position": [0, -0.8, 0], "emission_rate": 2, "lifetime_steps": 90, "initial_velocity": [0, 1.8, 0], "gravity": [0, -2.4, 0], "capacity": 128}],

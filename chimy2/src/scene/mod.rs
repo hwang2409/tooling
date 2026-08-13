@@ -292,14 +292,13 @@ impl Scene {
                 ShadowType::Cube => {}
             }
         }
-        if let Some((index, light)) = self
-            .lights
-            .iter()
-            .enumerate()
-            .find(|(_, light)| light.kind == LightType::Point)
-            && let Some(shadow) = light.shadow
-            && shadow.kind == ShadowType::Cube
-        {
+        for (index, light) in self.lights.iter().enumerate() {
+            if light.kind != LightType::Point {
+                continue;
+            }
+            let Some(shadow) = light.shadow else {
+                continue;
+            };
             let map = render_cube_shadow_map(
                 light.position,
                 shadow.near,

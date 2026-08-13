@@ -413,6 +413,15 @@ fn malformed_inputs_are_errors_with_paths_and_no_panics() {
     )
     .unwrap_err();
     assert!(incompatible.0.contains("objects[0]: instancing and lod"));
+    let unsupported_shadow = Scene::from_str(
+        r#"{"camera":{"position":[0,0,5],"target":[0,0,0],"fov":1,"near":0.1,"far":10},"lights":[{"type":"point","shadow":{"type":"csm"}}]}"#,
+    )
+    .unwrap_err();
+    assert!(
+        unsupported_shadow
+            .0
+            .contains("lights[0].shadow.type: unsupported shadow type")
+    );
     let asset = Scene::from_str(
         r#"{"camera":{"position":[0,0,5],"target":[0,0,0],"fov":1,"near":0.1,"far":10},"objects":[{"mesh":"missing.obj"}]}"#,
     )
@@ -511,6 +520,52 @@ fn shadow_bias_and_instanced_casters_reach_rendering() {
         false,
     );
     assert_ne!(low_bias.color, high_bias.color);
+}
+
+fn point_shadow_probe(first_shadow: bool, second_shadow: bool) -> Framebuffer {
+    let shadow = |enabled| {
+        if enabled {
+            ",\"shadow\":{\"type\":\"cube\",\"map_size\":64,\"near\":0.1,\"far\":20,\"bias\":0,\"slope_bias\":0}"
+        } else {
+            ""
+        }
+    };
+    let source = format!(
+        r#"{{
+          "camera":{{"position":[0,5,8],"target":[0,0,0],"fov":0.9,"near":0.1,"far":30}},
+          "lights":[
+            {{"type":"point","position":[-3,3,2],"color":[1,0.2,0.1],"constant":1,"linear":0.03,"quadratic":0.01{first}}},
+            {{"type":"point","position":[3,3,2],"color":[0.1,0.3,1],"constant":1,"linear":0.03,"quadratic":0.01{second}}}
+          ],
+          "objects":[
+            {{"mesh":"cube.obj","material":{{"diffuse":[0.35,0.35,0.35]}},"transform":{{"position":[0,-1.2,0],"scale":[5,0.2,5]}}}},
+            {{"mesh":"cube.obj","material":{{"diffuse":[0.8,0.2,0.1]}},"transform":{{"position":[-2,0,0],"scale":[0.8,1.2,0.8]}}}},
+            {{"mesh":"cube.obj","material":{{"diffuse":[0.1,0.2,0.8]}},"transform":{{"position":[2,0,0],"scale":[0.8,1.2,0.8]}}}}
+          ]
+        }}"#,
+        first = shadow(first_shadow),
+        second = shadow(second_shadow),
+    );
+    let scene = Scene::from_str(&source).unwrap();
+    let mut framebuffer = Framebuffer::new(96, 64);
+    scene.render(&mut framebuffer, assets()).unwrap();
+    framebuffer
+}
+
+#[test]
+fn every_shadowed_point_light_reaches_its_shader_slot() {
+    let control = point_shadow_probe(false, false);
+    let first = point_shadow_probe(true, false);
+    let second = point_shadow_probe(false, true);
+    assert_ne!(
+        first.color, control.color,
+        "first point shadow had no effect"
+    );
+    assert_ne!(
+        second.color, control.color,
+        "second point shadow had no effect"
+    );
+    assert_ne!(first.color, second.color);
 }
 
 #[test]
@@ -629,4 +684,24 @@ fn shipped_scene_golden_uses_the_demo_scene_file() {
         panic!("regenerated {}, rerun without GOLDEN_REGEN", path.display());
     }
     assert_eq!(fs::read(path).unwrap(), actual);
+}
+
+#[test]
+fn shipped_scene_golden_rejects_extreme_lod_thresholds() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/showcase.scene.json");
+    let source = fs::read_to_string(&path).unwrap();
+    let golden = fs::read(golden_path()).unwrap();
+    for thresholds in ["[0.0, 0.0]", "[10000.0, 10000.0]"] {
+        let mutated = source.replace(
+            "\"thresholds\": [1000.0, 0.1]",
+            &format!("\"thresholds\": {thresholds}"),
+        );
+        assert_ne!(mutated, source);
+        let scene = Scene::from_str(&mutated).unwrap();
+        let mut framebuffer = Framebuffer::new(96, 64);
+        scene
+            .render(&mut framebuffer, path.parent().unwrap())
+            .unwrap();
+        assert_ne!(ppm(&framebuffer), golden, "LOD mutation {thresholds}");
+    }
 }

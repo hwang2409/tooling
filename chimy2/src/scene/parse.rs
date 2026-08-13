@@ -162,6 +162,17 @@ fn parse_light(value: &Value, path: &str) -> Result<LightConfig, SceneError> {
         .optional("shadow")
         .map(|value| parse_shadow(value, &format!("{path}.shadow")))
         .transpose()?;
+    if let Some(shadow) = shadow {
+        let supported = match kind {
+            LightType::Directional => shadow.kind != ShadowType::Cube,
+            LightType::Point => shadow.kind == ShadowType::Cube,
+        };
+        if !supported {
+            return Err(SceneError(format!(
+                "{path}.shadow.type: unsupported shadow type for this light"
+            )));
+        }
+    }
     Ok(LightConfig {
         kind,
         direction,

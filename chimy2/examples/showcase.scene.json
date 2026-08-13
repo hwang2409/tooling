@@ -96,7 +96,7 @@
       }
     },
     {
-      "mesh": "../assets/icosahedron.obj",
+      "mesh": "../assets/cube.obj",
       "material": {
         "type": "blinn_phong",
         "ambient": [0.03, 0.03, 0.03],
@@ -105,11 +105,11 @@
         "shininess": 20.0
       },
       "transform": {
-        "position": [0.0, -0.65, -1.4],
+        "position": [0.0, -0.25, -0.4],
         "rotation": [0.2, 0.0, 0.3],
-        "scale": [0.45, 0.45, 0.45]
+        "scale": [1.0, 1.0, 1.0]
       },
-      "lod": {"ratios": [0.5, 0.25], "thresholds": [256.0, 96.0]}
+      "lod": {"ratios": [0.5, 0.05], "thresholds": [1000.0, 0.1]}
     }
   ],
   "postfx": [
