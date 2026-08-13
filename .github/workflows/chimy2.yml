@@ -93,8 +93,32 @@ jobs:
       - name: compare tracked wasm binary
         run: |
           generated="target/wasm32-unknown-unknown/release/chimy2.wasm"
-          tracked="web/chimy2.wasm"
+          tracked="web/public/chimy2.wasm"
           if ! cmp --silent "$generated" "$tracked"; then
-            echo "tracked wasm is out of date; run ./web/build.sh from the repository root and commit web/chimy2.wasm"
+            echo "tracked wasm is out of date; run ./web/build.sh from the repository root and commit web/public/chimy2.wasm"
+            exit 1
+          fi
+
+  web-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: chimy2/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.11.0"
+          cache: npm
+          cache-dependency-path: chimy2/web/package-lock.json
+      - run: npm ci
+      - name: stash committed dist
+        run: mv dist dist.committed
+      - run: npm run build
+      - name: compare tracked dist bundle
+        run: |
+          if ! diff -qr dist dist.committed >/dev/null; then
+            echo "tracked dist/ is out of date; run 'npm run build' inside chimy2/web and commit the updated dist/ folder"
+            diff -qr dist dist.committed || true
             exit 1
           fi
