@@ -1,43 +1,35 @@
 {
   "camera": {
-    "position": [0.0, 0.6, 5.6],
-    "target": [0.0, -0.15, 0.0],
+    "position": [0.0, 0.35, 4.4],
+    "target": [0.0, -0.20, 0.0],
     "fov": 0.75,
     "near": 0.1,
     "far": 100.0
   },
   "environment": {
-    "background": [0.030, 0.032, 0.040, 1.0],
-    "skybox": {
-      "px": "../../assets/skybox_px.qoi",
-      "nx": "../../assets/skybox_nx.qoi",
-      "py": "../../assets/skybox_py.qoi",
-      "ny": "../../assets/skybox_ny.qoi",
-      "pz": "../../assets/skybox_pz.qoi",
-      "nz": "../../assets/skybox_nz.qoi"
-    },
-    "ibl": {
-      "intensity": 1.10,
-      "irradiance_size": 16,
-      "prefilter_size": 32,
-      "prefilter_levels": 5
-    }
+    "background": [0.045, 0.048, 0.056, 1.0]
   },
   "lights": [
     {
       "type": "directional",
-      "direction": [-0.30, 0.85, 0.55],
-      "color": [1.0, 0.96, 0.88],
+      "direction": [-0.30, 0.80, 0.55],
+      "color": [1.0, 0.96, 0.90],
       "shadow": {
-        "type": "csm",
+        "type": "basic",
         "map_size": 1024,
-        "cascades": 3,
-        "lambda": 0.55,
         "bias": 0.0025,
         "slope_bias": 0.02,
         "near": 0.1,
-        "far": 40.0
+        "far": 30.0
       }
+    },
+    {
+      "type": "point",
+      "position": [-2.4, 0.5, 2.4],
+      "color": [0.20, 0.24, 0.32],
+      "constant": 1.0,
+      "linear": 0.12,
+      "quadratic": 0.06
     }
   ],
   "objects": [
@@ -45,110 +37,193 @@
       "mesh": "../../assets/cube.obj",
       "material": {
         "type": "blinn_phong",
-        "ambient": [0.010, 0.011, 0.014],
+        "ambient": [0.014, 0.015, 0.018],
         "diffuse": [0.14, 0.15, 0.18],
         "specular": [0.05, 0.05, 0.05],
         "shininess": 6.0
       },
       "transform": {
-        "position": [0.0, -1.35, 0.0],
+        "position": [0.0, -1.30, 0.0],
         "rotation": [0.0, 0.0, 0.0],
-        "scale": [8.0, 0.04, 4.0]
+        "scale": [10.0, 0.04, 6.0]
       }
     },
     {
-      "mesh": "../../assets/icosahedron.obj",
+      "mesh": "../../assets/icosphere.obj",
       "material": {
         "type": "ggx",
-        "ambient": [0.02, 0.02, 0.02],
-        "diffuse": [0.95, 0.72, 0.35],
+        "ambient": [0.020, 0.020, 0.024],
+        "diffuse": [0.95, 0.74, 0.36],
         "specular": [1.0, 0.86, 0.55],
         "shininess": 96.0,
-        "metallic": 0.98,
-        "roughness": 0.10
+        "metallic": 1.0,
+        "roughness": 0.05
       },
       "transform": {
-        "position": [-2.10, -0.60, 0.0],
-        "rotation": [0.0, 0.4, 0.0],
-        "scale": [0.55, 0.55, 0.55]
+        "position": [-2.20, 0.15, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
       }
     },
     {
-      "mesh": "../../assets/icosahedron.obj",
+      "mesh": "../../assets/icosphere.obj",
       "material": {
         "type": "ggx",
-        "ambient": [0.02, 0.02, 0.02],
-        "diffuse": [0.95, 0.72, 0.35],
+        "ambient": [0.020, 0.020, 0.024],
+        "diffuse": [0.95, 0.74, 0.36],
         "specular": [1.0, 0.86, 0.55],
         "shininess": 96.0,
-        "metallic": 0.98,
-        "roughness": 0.35
+        "metallic": 1.0,
+        "roughness": 0.25
       },
       "transform": {
-        "position": [-1.05, -0.60, 0.0],
-        "rotation": [0.0, 0.4, 0.0],
-        "scale": [0.55, 0.55, 0.55]
+        "position": [-1.10, 0.15, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
       }
     },
     {
-      "mesh": "../../assets/icosahedron.obj",
+      "mesh": "../../assets/icosphere.obj",
       "material": {
         "type": "ggx",
-        "ambient": [0.02, 0.02, 0.02],
-        "diffuse": [0.95, 0.72, 0.35],
+        "ambient": [0.020, 0.020, 0.024],
+        "diffuse": [0.95, 0.74, 0.36],
         "specular": [1.0, 0.86, 0.55],
         "shininess": 96.0,
-        "metallic": 0.98,
-        "roughness": 0.70
+        "metallic": 1.0,
+        "roughness": 0.45
       },
       "transform": {
-        "position": [0.0, -0.60, 0.0],
-        "rotation": [0.0, 0.4, 0.0],
-        "scale": [0.55, 0.55, 0.55]
+        "position": [0.0, 0.15, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
       }
     },
     {
-      "mesh": "../../assets/icosahedron.obj",
+      "mesh": "../../assets/icosphere.obj",
       "material": {
         "type": "ggx",
-        "ambient": [0.02, 0.02, 0.02],
-        "diffuse": [0.20, 0.35, 0.85],
+        "ambient": [0.020, 0.020, 0.024],
+        "diffuse": [0.95, 0.74, 0.36],
+        "specular": [1.0, 0.86, 0.55],
+        "shininess": 96.0,
+        "metallic": 1.0,
+        "roughness": 0.65
+      },
+      "transform": {
+        "position": [1.10, 0.15, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
+      }
+    },
+    {
+      "mesh": "../../assets/icosphere.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.020, 0.020, 0.024],
+        "diffuse": [0.95, 0.74, 0.36],
+        "specular": [1.0, 0.86, 0.55],
+        "shininess": 96.0,
+        "metallic": 1.0,
+        "roughness": 0.90
+      },
+      "transform": {
+        "position": [2.20, 0.15, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
+      }
+    },
+    {
+      "mesh": "../../assets/icosphere.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.014, 0.020, 0.028],
+        "diffuse": [0.22, 0.36, 0.85],
         "specular": [1.0, 1.0, 1.0],
         "shininess": 96.0,
-        "metallic": 0.05,
-        "roughness": 0.20
+        "metallic": 0.0,
+        "roughness": 0.05
       },
       "transform": {
-        "position": [1.05, -0.60, 0.0],
-        "rotation": [0.0, 0.4, 0.0],
-        "scale": [0.55, 0.55, 0.55]
+        "position": [-2.20, -0.80, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
       }
     },
     {
-      "mesh": "../../assets/icosahedron.obj",
+      "mesh": "../../assets/icosphere.obj",
       "material": {
         "type": "ggx",
-        "ambient": [0.02, 0.02, 0.02],
-        "diffuse": [0.20, 0.35, 0.85],
+        "ambient": [0.014, 0.020, 0.028],
+        "diffuse": [0.22, 0.36, 0.85],
         "specular": [1.0, 1.0, 1.0],
         "shininess": 96.0,
-        "metallic": 0.05,
-        "roughness": 0.55
+        "metallic": 0.0,
+        "roughness": 0.25
       },
       "transform": {
-        "position": [2.10, -0.60, 0.0],
-        "rotation": [0.0, 0.4, 0.0],
-        "scale": [0.55, 0.55, 0.55]
+        "position": [-1.10, -0.80, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
+      }
+    },
+    {
+      "mesh": "../../assets/icosphere.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.014, 0.020, 0.028],
+        "diffuse": [0.22, 0.36, 0.85],
+        "specular": [1.0, 1.0, 1.0],
+        "shininess": 96.0,
+        "metallic": 0.0,
+        "roughness": 0.45
+      },
+      "transform": {
+        "position": [0.0, -0.80, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
+      }
+    },
+    {
+      "mesh": "../../assets/icosphere.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.014, 0.020, 0.028],
+        "diffuse": [0.22, 0.36, 0.85],
+        "specular": [1.0, 1.0, 1.0],
+        "shininess": 96.0,
+        "metallic": 0.0,
+        "roughness": 0.65
+      },
+      "transform": {
+        "position": [1.10, -0.80, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
+      }
+    },
+    {
+      "mesh": "../../assets/icosphere.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.014, 0.020, 0.028],
+        "diffuse": [0.22, 0.36, 0.85],
+        "specular": [1.0, 1.0, 1.0],
+        "shininess": 96.0,
+        "metallic": 0.0,
+        "roughness": 0.90
+      },
+      "transform": {
+        "position": [2.20, -0.80, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
       }
     }
   ],
   "postfx": [
-    {"type": "ssao", "radius": 0.35, "bias": 0.02, "strength": 1.0, "range": 0.9, "blur_depth_threshold": 0.35},
-    {"type": "bloom"},
     {"type": "aces", "exposure": 1.05}
   ],
   "hud": [
     {"text": "CHIMY2 / PBR SWEEP", "x": 24, "y": 22, "scale": 2, "color": [0.96, 0.94, 0.90, 1.0]},
-    {"text": "GGX METAL - ROUGH SWEEP - DIELECTRIC PAIR", "x": 24, "y": 46, "scale": 1, "color": [0.66, 0.62, 0.55, 1.0]}
+    {"text": "TOP METALLIC 1 - BOTTOM DIELECTRIC 0 - ROUGHNESS 0.05 -> 0.90", "x": 24, "y": 46, "scale": 1, "color": [0.66, 0.62, 0.55, 1.0]}
   ]
 }

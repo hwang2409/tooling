@@ -227,6 +227,11 @@ pub struct ParticleConfig {
     pub gravity: Vec3,
     pub drag: f32,
     pub capacity: usize,
+    /// Number of fixed timesteps to advance before the screenshot renders.
+    /// A single-frame `scene_viewer --screenshot` otherwise sees the emitter
+    /// mid-emission-cycle; warming past `2 * lifetime_steps` gives the steady
+    /// state a fountain would show.
+    pub warmup_steps: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
