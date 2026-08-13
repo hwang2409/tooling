@@ -23,6 +23,8 @@
 //! `docs/core.md` for how to run the tumbling demo and the anchor tests.
 
 pub mod body;
+pub mod contact;
+pub mod geom;
 pub mod math;
 pub mod spatial;
 pub mod world;

@@ -71,13 +71,39 @@ impl Body {
     /// Uniform-density solid box of half-extents `hx, hy, hz` and mass `m`:
     /// principal moments `(m/3)(hy²+hz²), ...` (Featherstone Appendix A.1).
     pub fn solid_box(mass: f32, half_extents: Vec3, position: Vec3, orientation: Quat) -> Self {
-        let hx2 = half_extents.x * half_extents.x;
-        let hy2 = half_extents.y * half_extents.y;
-        let hz2 = half_extents.z * half_extents.z;
-        let ixx = (mass / 3.0) * (hy2 + hz2);
-        let iyy = (mass / 3.0) * (hx2 + hz2);
-        let izz = (mass / 3.0) * (hx2 + hy2);
-        Self::principal_axis(mass, ixx, iyy, izz, position, orientation)
+        Self::new(
+            mass,
+            crate::geom::solid_box_inertia(mass, half_extents),
+            position,
+            orientation,
+        )
+    }
+
+    /// Uniform-density solid sphere of radius `r` and mass `m`. `I = (2/5) m r²`.
+    pub fn solid_sphere(mass: f32, radius: f32, position: Vec3, orientation: Quat) -> Self {
+        Self::new(
+            mass,
+            crate::geom::solid_sphere_inertia(mass, radius),
+            position,
+            orientation,
+        )
+    }
+
+    /// Uniform-density solid capsule with axis along the body's local Z. See
+    /// [`crate::geom::solid_capsule_inertia`] for the derivation.
+    pub fn solid_capsule(
+        mass: f32,
+        radius: f32,
+        half_height: f32,
+        position: Vec3,
+        orientation: Quat,
+    ) -> Self {
+        Self::new(
+            mass,
+            crate::geom::solid_capsule_inertia(mass, radius, half_height),
+            position,
+            orientation,
+        )
     }
 
     /// Angular velocity re-expressed in world coordinates.
