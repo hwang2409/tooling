@@ -11,29 +11,34 @@ Reference implementation: MuJoCo. Prior art for validation: `~/me/fun/biped`
 Recreate MuJoCo from scratch in Rust: articulated dynamics in generalized
 coordinates, soft contacts, actuators, tendons, sensors, MJCF-compatible model
 loading — versioned v0/v1/v2/v3 because this is a long project. chimy2 renders
-it. The near-term endgame is an interactive robot simulation in the browser
-via wasm; the long-term endgame is genuine MuJoCo feature parity.
+it. The endgame is genuine MuJoCo feature parity.
 
 ## Relationship to chimy2 (the architecture split)
 
 Same split as MuJoCo core vs its viewer. newt is a pure computation library:
-zero dependencies, no rendering, runs headless, native, and in wasm. chimy2 is
-the viewer: native demo binaries and the chimy2 web demo page render newt
-worlds. Demo binaries couple the two; the engine crate never links the
-renderer.
+zero dependencies, no rendering, runs headless and native. chimy2 is the
+viewer: native demo binaries render newt worlds. Demo binaries couple the
+two; the engine crate never links the renderer.
+
+wasm is NOT a requirement (Henry, 2026-08-13). chimy2 compiles to wasm because
+Henry demos it on his website; newt does not need to. The zero-dependency rule
+happens to keep the door open, and a browser sim may become a nice-to-have
+later — but no ticket should carry wasm work or wasm CI for newt unless Henry
+asks.
 
 ## Non-goals (permanent)
 
 - No physics, math, collision, or linear-algebra crates. Everything is
   hand-written (the chimy rule, inherited).
-- No GPU compute. CPU (and wasm) only.
+- No GPU compute. CPU only.
 - No real-time guarantees beyond "the demos are interactive".
 
 ## Dependency rule
 
 Zero runtime dependencies for the engine crate. Demo binaries may dev-depend
-on chimy2. The wasm build follows chimy2's pattern: `wasm32-unknown-unknown`,
-scalar FFI, no wasm-bindgen.
+on chimy2. If a wasm build ever happens, it follows chimy2's pattern
+(`wasm32-unknown-unknown`, scalar FFI, no wasm-bindgen) — but see above: not
+a requirement.
 
 ## Architecture: generalized coordinates
 
@@ -80,8 +85,8 @@ Enough engine to make articulated toys real and visible end to end.
    commanded 3-link arm demo
 5. **model format** — JSON robots (hand-written parser, chimy2 json.rs
    style), sites, contact filtering
-6. **web** — wasm build, newt scenes inside the chimy2 web demo page,
-   interactive control
+(A former "web/wasm" tier was cut from v0 on 2026-08-13: wasm is an optional
+future nice-to-have, not a requirement.)
 
 ### v1 — MuJoCo core parity (kinematics, contacts, constraints)
 
@@ -116,7 +121,7 @@ Enough engine to make articulated toys real and visible end to end.
 - Newton solver; sparse factorization performance work
 - heightfields, SDF geoms; muscles; maybe flex/deformables
 - analytic derivatives
-- browser studio: interactive model editing + the sim in one page
+- (optional, only if Henry asks) wasm build and a browser sim/studio
 
 Version boundaries are checkpoints, not contracts — features can move when a
 tier teaches us something. Each version ships as fleet tickets with the
