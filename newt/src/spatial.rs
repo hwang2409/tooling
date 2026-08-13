@@ -283,6 +283,267 @@ impl Xform {
         let tau = self.rot_a_to_b * f.torque + self.translation_a_in_b.cross(fl);
         SpatialForce::new(tau, fl)
     }
+
+    /// Inverse transform (B → A). Derivation: for `X^{-1}(X(m)) = m` on all
+    /// motions, the rotation is `Rᵀ` and the translation is `-Rᵀ * t`, where
+    /// `R = rot_a_to_b` and `t = translation_a_in_b`.
+    pub fn inverse(self) -> Self {
+        let rot_t = self.rot_a_to_b.transpose();
+        let t_b_in_a = -(rot_t * self.translation_a_in_b);
+        Self {
+            rot_a_to_b: rot_t,
+            translation_a_in_b: t_b_in_a,
+        }
+    }
+
+    /// Pull a force from frame B back to frame A: `f_A = Xᵀ * f_B`. This is
+    /// what ABA uses to accumulate child wrenches into the parent frame. It
+    /// is equivalent to `self.inverse().force(f)` but skips a matrix inverse.
+    ///
+    /// Derivation: `X_motion(A→B) = [E, 0; -E[r]×, E]` in Featherstone's form
+    /// with `r = B in A coords`. Its transpose is
+    /// `[Eᵀ, -[r]ᵀ Eᵀ; 0, Eᵀ] = [Eᵀ, [r]× Eᵀ; 0, Eᵀ]` (using
+    /// `[r]×ᵀ = -[r]×`), which sends force `[τ_B; F_B]` to
+    /// `[Eᵀ τ_B + [r]× Eᵀ F_B; Eᵀ F_B]`. In our `t = -E r` convention this
+    /// simplifies to `τ_A = Rᵀ * (τ_B − t × F_B)`, `F_A = Rᵀ * F_B`.
+    pub fn transpose_force(self, f: SpatialForce) -> SpatialForce {
+        let rt = self.rot_a_to_b.transpose();
+        let f_a_lin = rt * f.linear;
+        let f_a_tau = rt * (f.torque - self.translation_a_in_b.cross(f.linear));
+        SpatialForce::new(f_a_tau, f_a_lin)
+    }
+
+    /// Pull a motion from frame B back to frame A: `m_A = X^{-1} * m_B`. Used
+    /// (rarely) for expressing child velocities back in a parent frame during
+    /// tests and diagnostics.
+    pub fn transpose_motion_inverse(self, m: SpatialMotion) -> SpatialMotion {
+        self.inverse().motion(m)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6x6 matrix — used for articulated-body inertia in ABA
+// ---------------------------------------------------------------------------
+
+/// A 6x6 matrix that maps a [`SpatialMotion`] to a [`SpatialForce`]. In ABA
+/// it stores the articulated-body inertia `IA[i]` at link `i`'s reference
+/// frame.
+///
+/// # Layout
+///
+/// Row-major, indexed `[row][col]`. The row/column split matches the
+/// `(angular, linear)` packing of `SpatialMotion` and the `(torque, linear)`
+/// packing of `SpatialForce`: rows 0..3 emit the torque part, rows 3..6 the
+/// linear force part; columns 0..3 read from the angular part of the motion,
+/// columns 3..6 from the linear part.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mat6 {
+    pub rows: [[f32; 6]; 6],
+}
+
+impl Mat6 {
+    pub const ZERO: Self = Self {
+        rows: [[0.0; 6]; 6],
+    };
+
+    /// Build the spatial-inertia 6x6 for a rigid body given the
+    /// [`SpatialInertia`] parameterization (mass, COM offset, `I_com`).
+    ///
+    /// Layout: `[I_com − m[c]×[c]×,  m[c]×; −m[c]×,  m I₃]` where `c` is the
+    /// COM offset from the reference point. When `c = 0` (link body frame at
+    /// COM) this reduces to `diag(I_com, m I₃)` — the common case in v0.
+    pub fn from_spatial_inertia(si: SpatialInertia) -> Self {
+        let SpatialInertia {
+            mass,
+            com,
+            inertia_com,
+        } = si;
+        let cx = Mat3::skew(com);
+        // upper-left = I_com − m [c]× [c]×  (note [c]× [c]× is symmetric-neg)
+        let cx_cx = cx * cx;
+        let upper_left = inertia_com + (cx_cx * (-mass));
+        let upper_right = cx * mass;
+        let lower_left = cx * (-mass);
+        let lower_right = Mat3::diag(mass, mass, mass);
+
+        let mut rows = [[0.0f32; 6]; 6];
+        for r in 0..3 {
+            for c in 0..3 {
+                rows[r][c] = upper_left.get(r, c);
+                rows[r][c + 3] = upper_right.get(r, c);
+                rows[r + 3][c] = lower_left.get(r, c);
+                rows[r + 3][c + 3] = lower_right.get(r, c);
+            }
+        }
+        Self { rows }
+    }
+
+    /// Apply the matrix to a spatial motion, producing a spatial force.
+    pub fn times_motion(self, m: SpatialMotion) -> SpatialForce {
+        let v = [
+            m.angular.x,
+            m.angular.y,
+            m.angular.z,
+            m.linear.x,
+            m.linear.y,
+            m.linear.z,
+        ];
+        let mut out = [0.0f32; 6];
+        for (r, out_slot) in out.iter_mut().enumerate() {
+            let mut s = 0.0;
+            for (c, &val) in v.iter().enumerate() {
+                s += self.rows[r][c] * val;
+            }
+            *out_slot = s;
+        }
+        SpatialForce::new(
+            Vec3::new(out[0], out[1], out[2]),
+            Vec3::new(out[3], out[4], out[5]),
+        )
+    }
+
+    /// Return `self + other`.
+    pub fn plus(self, other: Self) -> Self {
+        let mut out = self;
+        for (r, row) in out.rows.iter_mut().enumerate() {
+            for (c, slot) in row.iter_mut().enumerate() {
+                *slot += other.rows[r][c];
+            }
+        }
+        out
+    }
+
+    /// Return `self - other`.
+    pub fn minus(self, other: Self) -> Self {
+        let mut out = self;
+        for (r, row) in out.rows.iter_mut().enumerate() {
+            for (c, slot) in row.iter_mut().enumerate() {
+                *slot -= other.rows[r][c];
+            }
+        }
+        out
+    }
+
+    /// Rank-1 outer product `f * mᵀ`: the 6x6 whose (r,c) entry is
+    /// `f[r] * m[c]`, with the same row-then-column packing as this type.
+    /// ABA uses `IA - (IA S) (Sᵀ IA S + arm)^-1 (IA S)ᵀ` and this is that
+    /// outer product with `IA S` as the column and (scaled) row.
+    pub fn outer(f: SpatialForce, m: SpatialMotion) -> Self {
+        let fv = [
+            f.torque.x, f.torque.y, f.torque.z, f.linear.x, f.linear.y, f.linear.z,
+        ];
+        let mv = [
+            m.angular.x,
+            m.angular.y,
+            m.angular.z,
+            m.linear.x,
+            m.linear.y,
+            m.linear.z,
+        ];
+        let mut rows = [[0.0f32; 6]; 6];
+        for (r, fv_r) in fv.iter().enumerate() {
+            for (c, mv_c) in mv.iter().enumerate() {
+                rows[r][c] = fv_r * mv_c;
+            }
+        }
+        Self { rows }
+    }
+
+    /// Pull-back through a Plücker motion transform: given `IA_B` expressed
+    /// in frame B and a motion transform `Xform` from parent (A) to child
+    /// (B), return `IA_A = Xᵀ IA_B X` in frame A. Applied columnwise via
+    /// [`Xform::motion`] and [`Xform::transpose_force`], so it composes the
+    /// existing primitives instead of expanding a 6x6 matmul.
+    pub fn pull_back(self, xform_a_to_b: Xform) -> Self {
+        // For each parent-frame motion basis vector, transform to child, apply
+        // IA_B, then pull the force back to parent.
+        let basis = [
+            SpatialMotion::new(Vec3::new(1.0, 0.0, 0.0), Vec3::ZERO),
+            SpatialMotion::new(Vec3::new(0.0, 1.0, 0.0), Vec3::ZERO),
+            SpatialMotion::new(Vec3::new(0.0, 0.0, 1.0), Vec3::ZERO),
+            SpatialMotion::new(Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)),
+            SpatialMotion::new(Vec3::ZERO, Vec3::new(0.0, 1.0, 0.0)),
+            SpatialMotion::new(Vec3::ZERO, Vec3::new(0.0, 0.0, 1.0)),
+        ];
+        let mut rows = [[0.0f32; 6]; 6];
+        for (c, &e_a) in basis.iter().enumerate() {
+            let m_b = xform_a_to_b.motion(e_a);
+            let f_b = self.times_motion(m_b);
+            let f_a = xform_a_to_b.transpose_force(f_b);
+            rows[0][c] = f_a.torque.x;
+            rows[1][c] = f_a.torque.y;
+            rows[2][c] = f_a.torque.z;
+            rows[3][c] = f_a.linear.x;
+            rows[4][c] = f_a.linear.y;
+            rows[5][c] = f_a.linear.z;
+        }
+        Self { rows }
+    }
+
+    /// Solve `self * x = rhs` for `x`, returning `None` if singular.
+    /// Straight Gaussian elimination with partial pivoting on the 6x6 (small
+    /// enough that a fixed-loop routine is deterministic and fast).
+    pub fn solve(self, rhs: SpatialForce) -> Option<SpatialMotion> {
+        let mut a = [[0.0f32; 7]; 6];
+        for (r, row) in a.iter_mut().enumerate() {
+            for (c, slot) in row.iter_mut().take(6).enumerate() {
+                *slot = self.rows[r][c];
+            }
+        }
+        let rhs_v = [
+            rhs.torque.x,
+            rhs.torque.y,
+            rhs.torque.z,
+            rhs.linear.x,
+            rhs.linear.y,
+            rhs.linear.z,
+        ];
+        for (r, &val) in rhs_v.iter().enumerate() {
+            a[r][6] = val;
+        }
+        for col in 0..6 {
+            // pivot: pick row with largest |a[row][col]|.
+            let mut pivot_row = col;
+            let mut pivot_mag = crate::math::abs(a[col][col]);
+            for (r, row) in a.iter().enumerate().skip(col + 1) {
+                let mag = crate::math::abs(row[col]);
+                if mag > pivot_mag {
+                    pivot_row = r;
+                    pivot_mag = mag;
+                }
+            }
+            if pivot_mag == 0.0 {
+                return None;
+            }
+            if pivot_row != col {
+                a.swap(col, pivot_row);
+            }
+            let inv = 1.0 / a[col][col];
+            // Save the pivot row so the elimination loop below can borrow `a`
+            // mutably without conflicting with a `&a[col]` on the RHS.
+            let pivot_row_data = a[col];
+            for (r, row) in a.iter_mut().enumerate() {
+                if r == col {
+                    continue;
+                }
+                let factor = row[col] * inv;
+                if factor == 0.0 {
+                    continue;
+                }
+                for c in col..7 {
+                    row[c] -= factor * pivot_row_data[c];
+                }
+            }
+        }
+        let mut x = [0.0f32; 6];
+        for (r, x_slot) in x.iter_mut().enumerate() {
+            *x_slot = a[r][6] / a[r][r];
+        }
+        Some(SpatialMotion::new(
+            Vec3::new(x[0], x[1], x[2]),
+            Vec3::new(x[3], x[4], x[5]),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

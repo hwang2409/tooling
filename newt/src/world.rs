@@ -36,8 +36,9 @@
 
 use crate::body::Body;
 use crate::contact::{Contact, narrow_phase};
-use crate::geom::{Geom, GeomPose, combine_solref, geom_world_pose, solref_to_kc};
+use crate::geom::{Geom, GeomAttach, GeomPose, combine_solref, geom_world_pose, solref_to_kc};
 use crate::math::{Quat, Vec3};
+use crate::tree::{Tree, forward_kinematics as tree_forward_kinematics, rk4_step as tree_rk4_step};
 
 /// Simulation world.
 #[derive(Clone, Debug, PartialEq)]
@@ -46,14 +47,18 @@ pub struct World {
     pub dt: f32,
     /// Uniform gravity vector applied to every body's COM.
     pub gravity: Vec3,
-    /// Bodies. Index-stable.
+    /// Free bodies. Index-stable. Tier-1 style (no joints).
     pub bodies: Vec<Body>,
-    /// Geoms. Index-stable. A geom's `body: Some(i)` refers to `bodies[i]`.
+    /// Kinematic trees (tier 3). Index-stable. Free bodies and trees can
+    /// coexist in the same world; contacts see both.
+    pub trees: Vec<Tree>,
+    /// Geoms. Index-stable. A geom's attachment (body, tree link, or static)
+    /// determines which state drives its world pose.
     pub geoms: Vec<Geom>,
     /// Optional explicit pair list `(geom_a, geom_b)` with `a < b`. When
     /// `None`, contact detection enumerates every unordered geom pair whose
-    /// two geoms don't share a body and aren't both static; the resulting
-    /// order is `(min, max)` lexicographic.
+    /// two geoms don't share a body/link and aren't both static; the
+    /// resulting order is `(min, max)` lexicographic.
     pub pair_list: Option<Vec<(usize, usize)>>,
 }
 
@@ -69,15 +74,23 @@ impl World {
             dt: 0.005,
             gravity: Vec3::new(0.0, 0.0, -9.81),
             bodies: Vec::new(),
+            trees: Vec::new(),
             geoms: Vec::new(),
             pair_list: None,
         }
     }
 
-    /// Adds a body and returns its stable index.
+    /// Adds a free body and returns its stable index.
     pub fn add_body(&mut self, body: Body) -> usize {
         let idx = self.bodies.len();
         self.bodies.push(body);
+        idx
+    }
+
+    /// Adds a tree and returns its stable index.
+    pub fn add_tree(&mut self, tree: Tree) -> usize {
+        let idx = self.trees.len();
+        self.trees.push(tree);
         idx
     }
 
@@ -89,24 +102,32 @@ impl World {
     }
 
     /// Enumerate all valid contact pairs in canonical `(min, max)` order.
-    /// Used when `pair_list` is `None`.
+    /// Used when `pair_list` is `None`. Pairs are dropped when both geoms
+    /// share the same attachment (same body or same tree link, including
+    /// static-vs-static).
     fn auto_pairs(&self) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
         let n = self.geoms.len();
         for a in 0..n {
             for b in (a + 1)..n {
-                let ga = &self.geoms[a];
-                let gb = &self.geoms[b];
-                // Same body (including two statics: None == None) → no
-                // contact. This single check subsumes the static-vs-static
-                // case without a second guard.
-                if ga.body == gb.body {
+                let att_a = self.geoms[a].attachment();
+                let att_b = self.geoms[b].attachment();
+                if att_a == att_b {
+                    // Same body, same tree link, or two statics — no
+                    // meaningful pair.
                     continue;
                 }
                 out.push((a, b));
             }
         }
         out
+    }
+
+    /// Read-only accessor: current world-frame COM position + orientation of
+    /// a tree's link. Convenience for demos and tests that inspect state
+    /// without doing a full forward-kinematics walk themselves.
+    pub fn tree_link_pose(&self, tree_idx: usize, link_idx: usize) -> (Vec3, Quat) {
+        tree_forward_kinematics(&self.trees[tree_idx])[link_idx]
     }
 
     /// Advance the whole world by one fixed-dt RK4 step.
@@ -123,25 +144,32 @@ impl World {
     /// geoms, this collapses to tier-1 gravity-only RK4 bit-for-bit, and
     /// the golden `tumbling_3_body.bin` still passes.
     pub fn step(&mut self) {
-        let s0 = self.bodies.clone();
         let pairs = match &self.pair_list {
             Some(p) => p.clone(),
             None => self.auto_pairs(),
         };
+        self.step_bodies(&pairs);
+        self.step_trees(&pairs);
+    }
 
-        let ext1 = self.compute_wrenches(&s0, &pairs);
+    /// Advance only the free bodies. Preserves the tier-1/2 behavior
+    /// bit-for-bit when no tree links are in play.
+    fn step_bodies(&mut self, pairs: &[(usize, usize)]) {
+        let s0 = self.bodies.clone();
+
+        let ext1 = self.compute_wrenches(&s0, pairs);
         let k1 = evaluate_all(&s0, self.gravity, &ext1);
 
         let s1 = advance_all(&s0, &s0, &k1, self.dt * 0.5);
-        let ext2 = self.compute_wrenches(&s1, &pairs);
+        let ext2 = self.compute_wrenches(&s1, pairs);
         let k2 = evaluate_all(&s1, self.gravity, &ext2);
 
         let s2 = advance_all(&s0, &s0, &k2, self.dt * 0.5);
-        let ext3 = self.compute_wrenches(&s2, &pairs);
+        let ext3 = self.compute_wrenches(&s2, pairs);
         let k3 = evaluate_all(&s2, self.gravity, &ext3);
 
         let s3 = advance_all(&s0, &s0, &k3, self.dt);
-        let ext4 = self.compute_wrenches(&s3, &pairs);
+        let ext4 = self.compute_wrenches(&s3, pairs);
         let k4 = evaluate_all(&s3, self.gravity, &ext4);
 
         for i in 0..self.bodies.len() {
@@ -176,14 +204,54 @@ impl World {
         }
     }
 
-    /// Public: detect all contacts against the current body state. Useful for
-    /// tests that need to inspect contact geometry.
+    /// Advance the kinematic trees under gravity + contact wrenches.
+    ///
+    /// v0 simplification: cross-integration between free bodies and tree
+    /// links within a single sub-stage is NOT modeled. Contacts that touch
+    /// a tree link generate a wrench for the link's tree only; the other
+    /// side (a free body or a static geom) is treated as a "wall" for the
+    /// tree. Contacts that touch only free bodies are handled by
+    /// [`Self::step_bodies`]. Trees are integrated independently of each
+    /// other in stable index order.
+    fn step_trees(&mut self, pairs: &[(usize, usize)]) {
+        if self.trees.is_empty() {
+            return;
+        }
+        let n_trees = self.trees.len();
+        for ti in 0..n_trees {
+            // Filter pairs to those touching this tree.
+            let mut tree_pairs: Vec<(usize, usize)> = Vec::new();
+            for &(a, b) in pairs {
+                let att_a = self.geoms[a].attachment();
+                let att_b = self.geoms[b].attachment();
+                let a_ours = matches!(att_a, GeomAttach::Link(t, _) if t == ti);
+                let b_ours = matches!(att_b, GeomAttach::Link(t, _) if t == ti);
+                if a_ours || b_ours {
+                    tree_pairs.push((a, b));
+                }
+            }
+            // Split tree out of self so the closure below can borrow the
+            // rest.
+            let dt = self.dt;
+            let gravity = self.gravity;
+            let mut tree = std::mem::take(&mut self.trees[ti]);
+            let bodies = self.bodies.clone();
+            let geoms = self.geoms.clone();
+            tree_rk4_step(&mut tree, gravity, dt, |t| {
+                tree_wrenches_from_contacts(t, ti, &bodies, &geoms, &tree_pairs)
+            });
+            self.trees[ti] = tree;
+        }
+    }
+
+    /// Public: detect all contacts against the current body/tree state.
+    /// Useful for tests that need to inspect contact geometry.
     pub fn detect_contacts(&self) -> Vec<Contact> {
         let pairs = match &self.pair_list {
             Some(p) => p.clone(),
             None => self.auto_pairs(),
         };
-        collect_contacts(&self.bodies, &self.geoms, &pairs)
+        collect_contacts_full(&self.bodies, &self.trees, &self.geoms, &pairs)
     }
 
     /// Compute per-body external wrench arrays for a given body-state vector.
@@ -214,9 +282,55 @@ fn collect_contacts(state: &[Body], geoms: &[Geom], pairs: &[(usize, usize)]) ->
     // Pre-compute world poses for every geom in stable index order.
     let poses: Vec<GeomPose> = geoms
         .iter()
-        .map(|g| match g.body {
-            Some(i) => geom_world_pose(g, state[i].position, state[i].orientation),
-            None => geom_world_pose(g, Vec3::ZERO, Quat::IDENTITY),
+        .map(|g| match g.attachment() {
+            GeomAttach::Body(i) => geom_world_pose(g, state[i].position, state[i].orientation),
+            // Link-attached geoms cannot participate in the body-only path;
+            // return a static-style pose (unused because `apply_contact_wrench`
+            // ignores link geoms).
+            GeomAttach::Link(_, _) | GeomAttach::Static => {
+                geom_world_pose(g, Vec3::ZERO, Quat::IDENTITY)
+            }
+        })
+        .collect();
+
+    for &(a, b) in pairs {
+        // Skip pairs where either side is a tree link — those are handled
+        // in `step_trees`. Body-only path stays bit-identical to tier 2.
+        let att_a = geoms[a].attachment();
+        let att_b = geoms[b].attachment();
+        if matches!(att_a, GeomAttach::Link(_, _)) || matches!(att_b, GeomAttach::Link(_, _)) {
+            continue;
+        }
+        let buf = narrow_phase(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b]);
+        for c in buf.as_slice() {
+            out.push(*c);
+        }
+    }
+    out
+}
+
+/// Contact enumeration that considers both free bodies AND trees. Used by
+/// [`World::detect_contacts`] as a diagnostic surface.
+fn collect_contacts_full(
+    bodies: &[Body],
+    trees: &[Tree],
+    geoms: &[Geom],
+    pairs: &[(usize, usize)],
+) -> Vec<Contact> {
+    let mut out = Vec::new();
+    // Cache each tree's link poses so we don't redo forward kinematics per
+    // geom.
+    let tree_poses: Vec<Vec<(Vec3, Quat)>> = trees.iter().map(tree_forward_kinematics).collect();
+
+    let poses: Vec<GeomPose> = geoms
+        .iter()
+        .map(|g| match g.attachment() {
+            GeomAttach::Static => geom_world_pose(g, Vec3::ZERO, Quat::IDENTITY),
+            GeomAttach::Body(i) => geom_world_pose(g, bodies[i].position, bodies[i].orientation),
+            GeomAttach::Link(t, l) => {
+                let (p, o) = tree_poses[t][l];
+                geom_world_pose(g, p, o)
+            }
         })
         .collect();
 
@@ -227,6 +341,244 @@ fn collect_contacts(state: &[Body], geoms: &[Geom], pairs: &[(usize, usize)]) ->
         }
     }
     out
+}
+
+/// Compute per-link external wrenches for one tree at its current state.
+/// Iterates the pairs that touch this tree, resolves the OTHER side of each
+/// pair (a body, static, or another tree link), and applies the same
+/// penalty/friction contact model as tier 2, but records forces only on the
+/// tree's own links (Newton's-third-law reactions on free bodies or other
+/// trees are dropped — see the v0 simplification note on `step_trees`).
+fn tree_wrenches_from_contacts(
+    tree: &Tree,
+    tree_idx: usize,
+    bodies: &[Body],
+    geoms: &[Geom],
+    pairs: &[(usize, usize)],
+) -> Vec<(Vec3, Vec3)> {
+    let n_links = tree.links.len();
+    let mut out = vec![(Vec3::ZERO, Vec3::ZERO); n_links];
+    if pairs.is_empty() {
+        return out;
+    }
+    // Forward kinematics for this tree (sub-stage state).
+    let link_poses = tree_forward_kinematics(tree);
+    // Geom world poses restricted to geoms mentioned in `pairs`.
+    let pose_of = |g: &Geom| -> GeomPose {
+        match g.attachment() {
+            GeomAttach::Static => geom_world_pose(g, Vec3::ZERO, Quat::IDENTITY),
+            GeomAttach::Body(i) => geom_world_pose(g, bodies[i].position, bodies[i].orientation),
+            GeomAttach::Link(t, l) => {
+                if t == tree_idx {
+                    let (p, o) = link_poses[l];
+                    geom_world_pose(g, p, o)
+                } else {
+                    // Other-tree pose from its stored state (step-start).
+                    // v0 does not support cross-tree contacts anyway; return
+                    // a static-style pose so a narrow-phase call is well-
+                    // defined but likely produces no penetration in the
+                    // demos we care about.
+                    geom_world_pose(g, Vec3::ZERO, Quat::IDENTITY)
+                }
+            }
+        }
+    };
+    for &(a, b) in pairs {
+        let ga = &geoms[a];
+        let gb = &geoms[b];
+        let pose_a = pose_of(ga);
+        let pose_b = pose_of(gb);
+        let buf = narrow_phase(a, ga, &pose_a, b, gb, &pose_b);
+        for c in buf.as_slice() {
+            apply_tree_contact_wrench(&mut out, tree, tree_idx, &link_poses, bodies, geoms, c);
+        }
+    }
+    out
+}
+
+/// Apply one contact's wrench to a link of the given tree, following the
+/// same penalty / pyramidal-friction model as the free-body path. The
+/// "other side" of the contact contributes only its point velocity for the
+/// relative-normal-velocity term; equal-opposite reaction on the other side
+/// is discarded (v0 simplification — see `step_trees`).
+fn apply_tree_contact_wrench(
+    ext: &mut [(Vec3, Vec3)],
+    tree: &Tree,
+    tree_idx: usize,
+    link_poses: &[(Vec3, Quat)],
+    bodies: &[Body],
+    geoms: &[Geom],
+    contact: &Contact,
+) {
+    let ga = &geoms[contact.geom_a];
+    let gb = &geoms[contact.geom_b];
+    let normal = contact.normal_world;
+
+    // Effective mass: for a link-vs-static contact, use the link's own mass.
+    // Cross-tree/body-link cases fall back to the link's own mass (v0).
+    let link_mass =
+        |t: usize, l: usize| -> f32 { tree.links[l].mass * (t == tree_idx) as u8 as f32 };
+    let m_eff = {
+        let ma = match ga.attachment() {
+            GeomAttach::Link(t, l) => link_mass(t, l),
+            GeomAttach::Body(i) => bodies[i].mass,
+            GeomAttach::Static => 0.0,
+        };
+        let mb = match gb.attachment() {
+            GeomAttach::Link(t, l) => link_mass(t, l),
+            GeomAttach::Body(i) => bodies[i].mass,
+            GeomAttach::Static => 0.0,
+        };
+        if ma > 0.0 && mb > 0.0 {
+            ma * mb / (ma + mb)
+        } else if ma > 0.0 {
+            ma
+        } else if mb > 0.0 {
+            mb
+        } else {
+            return;
+        }
+    };
+
+    let solref = combine_solref(ga.solref, gb.solref);
+    let (k, c) = solref_to_kc(solref, m_eff);
+    let c_tangent = c;
+
+    // Point velocities.
+    let (v_a, _wa, r_a) = point_velocity_generic(
+        ga,
+        contact.position_world,
+        tree,
+        tree_idx,
+        link_poses,
+        bodies,
+    );
+    let (v_b, _wb, r_b) = point_velocity_generic(
+        gb,
+        contact.position_world,
+        tree,
+        tree_idx,
+        link_poses,
+        bodies,
+    );
+    let v_rel = v_a - v_b;
+    let v_n = v_rel.dot(normal);
+    let f_n_raw = k * contact.penetration - c * v_n;
+    let f_n = if f_n_raw > 0.0 { f_n_raw } else { 0.0 };
+    if f_n <= 0.0 {
+        return;
+    }
+    let (t1, t2) = tangent_basis(normal);
+    let v_t = v_rel - normal * v_n;
+    let v_t1 = v_t.dot(t1);
+    let v_t2 = v_t.dot(t2);
+    let cap = contact.friction * f_n;
+    let f_t1 = clamp_symmetric(-c_tangent * v_t1, cap);
+    let f_t2 = clamp_symmetric(-c_tangent * v_t2, cap);
+    let force_on_a = normal * f_n + t1 * f_t1 + t2 * f_t2;
+
+    if let GeomAttach::Link(t, l) = ga.attachment() {
+        if t == tree_idx {
+            let (f, tau) = &mut ext[l];
+            *f += force_on_a;
+            *tau += r_a.cross(force_on_a);
+        }
+    }
+    if let GeomAttach::Link(t, l) = gb.attachment() {
+        if t == tree_idx {
+            let force_on_b = -force_on_a;
+            let (f, tau) = &mut ext[l];
+            *f += force_on_b;
+            *tau += r_b.cross(force_on_b);
+        }
+    }
+}
+
+/// Point velocity + angular velocity + moment-arm at a world position for a
+/// geom attached to a link/body/static. Returns `(v_world, ω_world, r_arm)`
+/// where `r_arm` is the vector from the anchor's COM to the contact point.
+fn point_velocity_generic(
+    geom: &Geom,
+    contact_pos_world: Vec3,
+    tree: &Tree,
+    tree_idx: usize,
+    link_poses: &[(Vec3, Quat)],
+    bodies: &[Body],
+) -> (Vec3, Vec3, Vec3) {
+    match geom.attachment() {
+        GeomAttach::Static => (Vec3::ZERO, Vec3::ZERO, Vec3::ZERO),
+        GeomAttach::Body(i) => {
+            let body = &bodies[i];
+            let r = contact_pos_world - body.position;
+            let w = body.angular_velocity_world();
+            (body.linear_velocity + w.cross(r), w, r)
+        }
+        GeomAttach::Link(t, l) => {
+            if t == tree_idx {
+                let (com, _ori) = link_poses[l];
+                let (v_world, w_world) = link_world_velocity(tree, l, link_poses);
+                let r = contact_pos_world - com;
+                (v_world + w_world.cross(r), w_world, r)
+            } else {
+                (Vec3::ZERO, Vec3::ZERO, Vec3::ZERO)
+            }
+        }
+    }
+}
+
+/// World-frame (linear-at-COM, angular) velocity of a link in the given
+/// tree. Computed by walking the tree's spatial-velocity recursion from
+/// the root — same layout as ABA pass 1 but keeping only what the contact
+/// code needs.
+fn link_world_velocity(tree: &Tree, target: usize, link_poses: &[(Vec3, Quat)]) -> (Vec3, Vec3) {
+    use crate::joint::JointKind;
+    let n = tree.links.len();
+    // Ancestor chain root → target.
+    let mut chain = vec![target];
+    let mut cur = target;
+    while let Some(p) = tree.links[cur].parent {
+        chain.push(p);
+        cur = p;
+    }
+    chain.reverse();
+    let mut v_world = vec![Vec3::ZERO; n];
+    let mut w_world = vec![Vec3::ZERO; n];
+    // Seed root.
+    let root = chain[0];
+    if tree.links[root].joint == JointKind::Free {
+        let (_pos, ori) = link_poses[root];
+        let wb = Vec3::new(tree.qdot[0], tree.qdot[1], tree.qdot[2]);
+        let vb = Vec3::new(tree.qdot[3], tree.qdot[4], tree.qdot[5]);
+        w_world[root] = ori.rotate(wb);
+        v_world[root] = ori.rotate(vb);
+    }
+    // Walk down the chain.
+    for &i in chain.iter().skip(1) {
+        let parent = tree.links[i].parent.unwrap();
+        let (child_pos, _child_ori) = link_poses[i];
+        let (parent_pos, parent_ori) = link_poses[parent];
+        match tree.links[i].joint {
+            JointKind::Hinge { axis, .. } => {
+                let axis_world = parent_ori.rotate(axis);
+                let qdot_i = tree.hinge_rate(i);
+                w_world[i] = w_world[parent] + axis_world * qdot_i;
+                let joint_world =
+                    parent_pos + parent_ori.rotate(tree.links[i].joint_offset_in_parent.0);
+                let v_parent_at_child_com =
+                    v_world[parent] + w_world[parent].cross(child_pos - parent_pos);
+                v_world[i] =
+                    v_parent_at_child_com + (axis_world * qdot_i).cross(child_pos - joint_world);
+            }
+            JointKind::Fixed => {
+                w_world[i] = w_world[parent];
+                v_world[i] = v_world[parent] + w_world[parent].cross(child_pos - parent_pos);
+            }
+            JointKind::Free => {
+                // A non-root free joint isn't allowed in v0.
+            }
+        }
+    }
+    (v_world[target], w_world[target])
 }
 
 /// Apply one contact's wrench to the appropriate body/bodies. Static geoms

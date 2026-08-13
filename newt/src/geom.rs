@@ -132,14 +132,20 @@ pub enum GeomShape {
     },
 }
 
-/// A geom attached to a body (or the static world for planes).
+/// A geom attached to a body, a tree link, or the static world.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Geom {
     pub shape: GeomShape,
-    /// Owning body index, or `None` for a static (world) geom.
+    /// Owning free-body index, or `None` when this geom is static or
+    /// attached to a tree link. See [`Geom::attachment`].
     pub body: Option<usize>,
-    /// Local offset from parent body COM to geom origin (body frame). For a
-    /// static geom, this is the world-frame position of the geom.
+    /// Owning tree + link index (tier 3). `Some((t, l))` means the geom
+    /// attaches to `world.trees[t].links[l]`; takes precedence over `body`.
+    /// `None` when the geom is attached to a free body or is static.
+    pub link: Option<(usize, usize)>,
+    /// Local offset from the parent's body-frame origin to the geom origin
+    /// (in the parent's body frame). For a static geom this is the world-
+    /// frame position of the geom.
     pub local_offset: Vec3,
     /// Local orientation from parent body frame to geom frame. For a static
     /// geom, world → geom.
@@ -148,6 +154,32 @@ pub struct Geom {
     pub friction: f32,
     /// Contact stiffness parameters. See [`SolRef`] and [`solref_to_kc`].
     pub solref: SolRef,
+}
+
+/// Where a geom is attached. Convenience view over the `body`/`link` fields
+/// so callers do not have to open-code the priority rule (link over body
+/// over static).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GeomAttach {
+    /// Static geom in the world (planes, etc.).
+    Static,
+    /// Attached to `world.bodies[i]`.
+    Body(usize),
+    /// Attached to `world.trees[t].links[l]`.
+    Link(usize, usize),
+}
+
+impl Geom {
+    /// Return the attachment kind. `link` takes precedence over `body`.
+    pub fn attachment(&self) -> GeomAttach {
+        if let Some((t, l)) = self.link {
+            GeomAttach::Link(t, l)
+        } else if let Some(b) = self.body {
+            GeomAttach::Body(b)
+        } else {
+            GeomAttach::Static
+        }
+    }
 }
 
 impl Geom {
@@ -161,6 +193,7 @@ impl Geom {
         Self {
             shape: GeomShape::Plane,
             body: None,
+            link: None,
             local_offset: point,
             local_orientation: orientation,
             friction,
@@ -174,6 +207,27 @@ impl Geom {
         Self {
             shape: GeomShape::Sphere { radius },
             body: Some(body),
+            link: None,
+            local_offset,
+            local_orientation: Quat::IDENTITY,
+            friction,
+            solref: SolRef::DEFAULT,
+        }
+    }
+
+    /// Sphere attached to a tree link (tier 3). `local_offset` is
+    /// link-body-frame COM → sphere center.
+    pub fn sphere_on_link(
+        tree: usize,
+        link: usize,
+        radius: f32,
+        local_offset: Vec3,
+        friction: f32,
+    ) -> Self {
+        Self {
+            shape: GeomShape::Sphere { radius },
+            body: None,
+            link: Some((tree, link)),
             local_offset,
             local_orientation: Quat::IDENTITY,
             friction,
@@ -193,6 +247,27 @@ impl Geom {
         Self {
             shape: GeomShape::Box { half_extents },
             body: Some(body),
+            link: None,
+            local_offset,
+            local_orientation,
+            friction,
+            solref: SolRef::DEFAULT,
+        }
+    }
+
+    /// Box attached to a tree link (tier 3).
+    pub fn box_on_link(
+        tree: usize,
+        link: usize,
+        half_extents: Vec3,
+        local_offset: Vec3,
+        local_orientation: Quat,
+        friction: f32,
+    ) -> Self {
+        Self {
+            shape: GeomShape::Box { half_extents },
+            body: None,
+            link: Some((tree, link)),
             local_offset,
             local_orientation,
             friction,
@@ -215,6 +290,32 @@ impl Geom {
                 half_height,
             },
             body: Some(body),
+            link: None,
+            local_offset,
+            local_orientation,
+            friction,
+            solref: SolRef::DEFAULT,
+        }
+    }
+
+    /// Capsule attached to a tree link (tier 3). Axis along link body-frame
+    /// local Z after the `local_orientation`.
+    pub fn capsule_on_link(
+        tree: usize,
+        link: usize,
+        radius: f32,
+        half_height: f32,
+        local_offset: Vec3,
+        local_orientation: Quat,
+        friction: f32,
+    ) -> Self {
+        Self {
+            shape: GeomShape::Capsule {
+                radius,
+                half_height,
+            },
+            body: None,
+            link: Some((tree, link)),
             local_offset,
             local_orientation,
             friction,
@@ -251,19 +352,20 @@ impl GeomPose {
     }
 }
 
-/// Build the world-space pose of a geom given its parent body's pose.
-/// `parent_position`/`parent_orientation` are unused when the geom is static.
+/// Build the world-space pose of a geom given its parent's pose (whether
+/// that parent is a free body or a tree link — the caller resolves which).
+/// `parent_position`/`parent_orientation` are unused when the geom is
+/// static (see [`GeomAttach::Static`]).
 pub fn geom_world_pose(geom: &Geom, parent_position: Vec3, parent_orientation: Quat) -> GeomPose {
-    if geom.body.is_none() {
-        GeomPose {
+    match geom.attachment() {
+        GeomAttach::Static => GeomPose {
             position: geom.local_offset,
             orientation: geom.local_orientation,
-        }
-    } else {
-        GeomPose {
+        },
+        GeomAttach::Body(_) | GeomAttach::Link(_, _) => GeomPose {
             position: parent_position + parent_orientation.rotate(geom.local_offset),
             orientation: parent_orientation * geom.local_orientation,
-        }
+        },
     }
 }
 
