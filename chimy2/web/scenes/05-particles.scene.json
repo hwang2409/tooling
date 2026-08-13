@@ -1,0 +1,125 @@
+{
+  "camera": {
+    "position": [2.6, 0.9, 4.4],
+    "target": [0.0, 0.15, 0.0],
+    "fov": 0.72,
+    "near": 0.1,
+    "far": 100.0
+  },
+  "environment": {
+    "background": [0.010, 0.014, 0.024, 1.0]
+  },
+  "lights": [
+    {
+      "type": "directional",
+      "direction": [-0.35, 0.85, 0.65],
+      "color": [0.60, 0.60, 0.70],
+      "shadow": {
+        "type": "csm",
+        "map_size": 1024,
+        "cascades": 3,
+        "lambda": 0.55,
+        "bias": 0.002,
+        "slope_bias": 0.02,
+        "near": 0.1,
+        "far": 40.0
+      }
+    },
+    {
+      "type": "point",
+      "position": [0.0, 0.85, 0.6],
+      "color": [1.0, 0.55, 0.20],
+      "constant": 1.0,
+      "linear": 0.10,
+      "quadratic": 0.05
+    }
+  ],
+  "objects": [
+    {
+      "mesh": "../../assets/cube.obj",
+      "material": {
+        "type": "blinn_phong",
+        "ambient": [0.008, 0.009, 0.012],
+        "diffuse": [0.13, 0.14, 0.17],
+        "specular": [0.10, 0.10, 0.10],
+        "shininess": 12.0
+      },
+      "transform": {
+        "position": [0.0, -1.30, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [10.0, 0.04, 10.0]
+      }
+    },
+    {
+      "mesh": "../../assets/icosahedron.obj",
+      "material": {
+        "type": "blinn_phong",
+        "ambient": [0.02, 0.010, 0.006],
+        "diffuse": [0.90, 0.32, 0.14],
+        "specular": [1.0, 0.65, 0.30],
+        "shininess": 64.0
+      },
+      "transform": {
+        "position": [-1.9, -0.50, -0.9],
+        "rotation": [0.0, 0.6, 0.0],
+        "scale": [0.55, 0.55, 0.55]
+      }
+    },
+    {
+      "mesh": "../../assets/icosahedron.obj",
+      "material": {
+        "type": "blinn_phong",
+        "ambient": [0.008, 0.020, 0.018],
+        "diffuse": [0.18, 0.68, 0.68],
+        "specular": [0.7, 0.85, 0.85],
+        "shininess": 56.0
+      },
+      "transform": {
+        "position": [1.4, -0.65, -1.4],
+        "rotation": [0.2, -0.4, 0.0],
+        "scale": [0.42, 0.42, 0.42]
+      }
+    }
+  ],
+  "postfx": [
+    {"type": "ssao", "radius": 0.45, "bias": 0.02, "strength": 1.0, "range": 0.9, "blur_depth_threshold": 0.35},
+    {"type": "bloom"},
+    {"type": "aces", "exposure": 1.15}
+  ],
+  "particles": [
+    {
+      "position": [0.0, -1.10, 0.4],
+      "emission_rate": 4,
+      "lifetime_steps": 128,
+      "initial_velocity": [0.0, 3.1, 0.0],
+      "velocity_variation": [0.55, 0.35, 0.55],
+      "gravity": [0.0, -4.5, 0.0],
+      "drag": 0.02,
+      "capacity": 256
+    },
+    {
+      "position": [-0.55, -1.10, -0.10],
+      "emission_rate": 3,
+      "lifetime_steps": 96,
+      "initial_velocity": [0.4, 2.6, 0.1],
+      "velocity_variation": [0.35, 0.28, 0.35],
+      "gravity": [0.0, -3.6, 0.0],
+      "drag": 0.03,
+      "capacity": 160
+    },
+    {
+      "position": [0.55, -1.10, -0.10],
+      "emission_rate": 3,
+      "lifetime_steps": 96,
+      "initial_velocity": [-0.4, 2.6, 0.1],
+      "velocity_variation": [0.35, 0.28, 0.35],
+      "gravity": [0.0, -3.6, 0.0],
+      "drag": 0.03,
+      "capacity": 160
+    }
+  ],
+  "hud": [
+    {"text": "CHIMY2 / PARTICLES", "x": 24, "y": 22, "scale": 2, "color": [0.96, 0.94, 0.90, 1.0]},
+    {"text": "DETERMINISTIC CPU FOUNTAIN + POINT LIGHT + BLOOM", "x": 24, "y": 46, "scale": 1, "color": [0.66, 0.62, 0.55, 1.0]}
+  ]
+}
