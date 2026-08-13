@@ -128,11 +128,24 @@ fn golden_trajectory_is_byte_identical() {
 }
 
 /// Regenerate the golden file. Ignored so it does not run in CI. Only ever
-/// run this on the reference machine (macOS aarch64) — the whole point of the
-/// determinism doctrine is that Linux must reproduce these bytes exactly.
+/// run this on the reference machine (macOS aarch64) — the whole point of
+/// the determinism doctrine is that Linux must reproduce these bytes
+/// exactly, so a Linux regen would silently swap the reference and disable
+/// the cross-platform check on future runs. The platform guard below
+/// panics on any other host so an accidental `--ignored` invocation cannot
+/// slip through.
 #[test]
 #[ignore]
 fn regenerate_golden() {
+    if !(cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")) {
+        panic!(
+            "regenerate_golden may only run on the reference host \
+             (macOS aarch64); refusing to overwrite the tracked bytes on \
+             {} / {}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+    }
     let bytes = produce_golden_bytes();
     let dir = std::path::Path::new(GOLDEN_PATH).parent().unwrap();
     std::fs::create_dir_all(dir).unwrap();

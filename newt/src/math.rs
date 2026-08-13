@@ -38,8 +38,10 @@ pub const FRAC_PI_4: f32 = core::f32::consts::FRAC_PI_4;
 /// Deterministic sine.
 ///
 /// range-reduces `x` mod 2π using a Cody-Waite style split of π/2, then
-/// evaluates a minimax polynomial on `[-π/4, π/4]`. accuracy is ≈ 1 ULP at
-/// f32 precision. no libm.
+/// evaluates a minimax polynomial on `[-π/4, π/4]`. accuracy is ≲ 1 ULP for
+/// `|x| < a few π` and degrades roughly linearly in `|x|` from Cody-Waite
+/// reduction rounding — argument reduction for very large `|x|` (say > 10⁶)
+/// is still deterministic but not near-ULP-accurate. no libm.
 pub fn sin(x: f32) -> f32 {
     let (reduced, quadrant) = reduce_pi_over_2(x);
     match quadrant & 3 {
@@ -714,18 +716,57 @@ mod tests {
     }
 
     #[test]
-    fn quat_derivative_matches_finite_difference() {
-        let q0 = Quat::from_axis_angle(Vec3::Z, 0.3);
-        let omega_body = Vec3::new(0.0, 0.0, 1.7);
-        let dt = 1.0e-4;
-        // integrate: q(dt) ≈ (q0 + q0.derivative(omega) * dt).renormalize().
-        let q_step = (q0 + q0.derivative(omega_body) * dt).renormalize();
-        // reference: rotate q0 by an axis-angle for omega * dt on the RIGHT.
+    fn quat_derivative_uses_body_frame_right_multiplication() {
+        // Discriminating case designed so body-frame right-multiplication
+        // (correct) and body-frame LEFT-multiplication (a wrong-frame mutant)
+        // give visibly different quaternions after one Euler step, and
+        // `Quat::derivative(ω_body)` matches the right-mult reference alone.
+        //
+        // Setup: q0 rotates the body 90° about Z, ω_body along body Y. The
+        // earlier version of this test spun ω parallel to q's axis, so
+        // left- and right-mult agreed and could not distinguish conventions.
+        let q0 = Quat::from_axis_angle(Vec3::Z, FRAC_PI_2);
+        let omega_body = Vec3::new(0.0, 1.0, 0.0);
+        let dt = 1.0e-3;
+
+        // Exact one-step references.
         let rot = Quat::from_axis_angle(omega_body, omega_body.length() * dt);
-        let q_ref = (q0 * rot).renormalize();
-        // signs of quaternions may differ but the represented rotation is the
-        // same. compare via dot product (should be ≈ ±1).
-        let dot = q_step.x * q_ref.x + q_step.y * q_ref.y + q_step.z * q_ref.z + q_step.w * q_ref.w;
-        assert!(abs(dot).abs() > 1.0 - 1.0e-6);
+        let q_right = (q0 * rot).renormalize();
+        let q_left_wrong = (rot * q0).renormalize();
+
+        // Sanity: the two references really do differ for this setup.
+        let ref_diff = (q_right.x - q_left_wrong.x).abs()
+            + (q_right.y - q_left_wrong.y).abs()
+            + (q_right.z - q_left_wrong.z).abs()
+            + (q_right.w - q_left_wrong.w).abs();
+        assert!(
+            ref_diff > 1.0e-5,
+            "test is not discriminating: right/left mult agree (Σ|Δ| = {ref_diff})"
+        );
+
+        // Euler step of our derivative.
+        let q_step = (q0 + q0.derivative(omega_body) * dt).renormalize();
+
+        let dot_right = q_step.x * q_right.x
+            + q_step.y * q_right.y
+            + q_step.z * q_right.z
+            + q_step.w * q_right.w;
+        let dot_left_wrong = q_step.x * q_left_wrong.x
+            + q_step.y * q_left_wrong.y
+            + q_step.z * q_left_wrong.z
+            + q_step.w * q_left_wrong.w;
+
+        // Euler matches the correct right-mult reference to O(dt²).
+        assert!(
+            dot_right.abs() > 1.0 - 1.0e-4,
+            "derivative disagrees with body-frame right-mult; dot {dot_right}"
+        );
+        // And is NOT indistinguishable from the wrong-frame left-mult
+        // reference (which represents a genuinely different rotation for
+        // this q0 and ω_body).
+        assert!(
+            dot_left_wrong.abs() < 1.0 - 1.0e-8,
+            "derivative accidentally matches the wrong-frame left-mult; dot {dot_left_wrong}"
+        );
     }
 }

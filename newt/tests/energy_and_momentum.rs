@@ -33,19 +33,30 @@ fn energy_conserved_within_bound_over_10000_steps() {
     assert!(e0 > 0.0);
 
     let mut max_rel_drift: f32 = 0.0;
+    let mut max_quat_norm_error: f32 = 0.0;
     for _ in 0..10_000 {
         world.step();
-        let e = world.bodies[0].kinetic_energy();
+        let body = &world.bodies[0];
+        let e = body.kinetic_energy();
         let rel = ((e - e0) / e0).abs();
         if rel > max_rel_drift {
             max_rel_drift = rel;
         }
+        // Direct proof that renormalization ran and kept the quaternion
+        // unit — a renorm-skip mutant is caught here, not only at the
+        // golden-trajectory gate several minutes downstream.
+        let q_norm_err = (body.orientation.norm() - 1.0).abs();
+        if q_norm_err > max_quat_norm_error {
+            max_quat_norm_error = q_norm_err;
+        }
     }
 
-    // Reasonable RK4 bound: << 1e-3 relative energy drift over 50s of
-    // simulated time at dt=5ms. If you make dt bigger, this loosens.
+    // Tightened per review round 2. Observed drift is ~8e-6 over these
+    // 10k steps; 5e-5 is a comfortable but still-discriminating ceiling
+    // that a real regression (higher-order-order integrator loss, wrong
+    // gyroscopic sign, ...) would trip immediately.
     assert!(
-        max_rel_drift < 1.0e-3,
+        max_rel_drift < 5.0e-5,
         "energy drift {max_rel_drift} exceeded bound"
     );
     // Also confirm the drift is not literally zero — if it were, the test
@@ -56,6 +67,11 @@ fn energy_conserved_within_bound_over_10000_steps() {
         max_rel_drift > 0.0,
         "expected some numerical drift; got exactly zero — suspect fake conservation"
     );
+    assert!(
+        max_quat_norm_error < 1.0e-5,
+        "quaternion drifted from unit norm by {max_quat_norm_error} — \
+         renormalization step probably skipped"
+    );
 }
 
 #[test]
@@ -65,18 +81,29 @@ fn angular_momentum_conserved_in_world_frame() {
     let l0_mag = l0.length();
 
     let mut max_rel_drift: f32 = 0.0;
+    let mut max_quat_norm_error: f32 = 0.0;
     for _ in 0..10_000 {
         world.step();
-        let l = world.bodies[0].angular_momentum_world();
+        let body = &world.bodies[0];
+        let l = body.angular_momentum_world();
         let rel = (l - l0).length() / l0_mag;
         if rel > max_rel_drift {
             max_rel_drift = rel;
+        }
+        let q_norm_err = (body.orientation.norm() - 1.0).abs();
+        if q_norm_err > max_quat_norm_error {
+            max_quat_norm_error = q_norm_err;
         }
     }
     // Bound looser than energy because L involves both R and ω; both drift.
     assert!(
         max_rel_drift < 5.0e-3,
         "angular-momentum drift {max_rel_drift} exceeded bound"
+    );
+    assert!(
+        max_quat_norm_error < 1.0e-5,
+        "quaternion drifted from unit norm by {max_quat_norm_error} — \
+         renormalization step probably skipped"
     );
 }
 
@@ -152,5 +179,107 @@ fn minor_axis_spin_stays_bounded() {
     assert!(
         min_x_projection > 4.5,
         "minor-axis spin lost too much of its x-component: min {min_x_projection}"
+    );
+}
+
+/// Rotation matrix from a unit quaternion; used to build a non-diagonal
+/// inertia tensor for the anchor below via a similarity transform.
+fn rotation_matrix(q: Quat) -> Mat3 {
+    q.to_mat3()
+}
+
+#[test]
+fn energy_and_momentum_conserved_for_non_diagonal_inertia() {
+    // If the inertia in Body::new is ever accidentally transposed, or the
+    // gyroscopic term drops a Rᵀ, a purely diagonal inertia hides the bug
+    // (I = Iᵀ). Build I = R · diag(1,2,3) · Rᵀ for a nontrivial R so
+    // I ≠ diag and I ≠ Iᵀ transposed elementwise, then run the same 10k
+    // energy + world-frame L conservation bounds as the diagonal case.
+    let r = rotation_matrix(Quat::from_axis_angle(Vec3::new(1.0, 2.0, 3.0), 0.7));
+    let d = Mat3::diag(1.0, 2.0, 3.0);
+    let inertia = r * d * r.transpose();
+
+    // Assert the constructed inertia really is non-diagonal — a mutant
+    // that shortcuts to diag() would let this test regress silently.
+    let off_diag_mag = inertia.get(0, 1).abs() + inertia.get(0, 2).abs() + inertia.get(1, 2).abs();
+    assert!(
+        off_diag_mag > 0.1,
+        "off-diagonal magnitude {off_diag_mag} unexpectedly small; \
+         this anchor is designed for a non-diagonal I"
+    );
+
+    let mut world = World::new();
+    world.dt = 0.005;
+    world.gravity = Vec3::ZERO;
+    let mut body = Body::new(1.0, inertia, Vec3::ZERO, Quat::IDENTITY);
+    body.angular_velocity_body = Vec3::new(0.4, 1.2, 0.3);
+    world.add_body(body);
+
+    let e0 = world.bodies[0].kinetic_energy();
+    let l0 = world.bodies[0].angular_momentum_world();
+    let l0_mag = l0.length();
+    assert!(e0 > 0.0 && l0_mag > 0.0);
+
+    let mut max_e_drift: f32 = 0.0;
+    let mut max_l_drift: f32 = 0.0;
+    for _ in 0..10_000 {
+        world.step();
+        let body = &world.bodies[0];
+        let e_rel = ((body.kinetic_energy() - e0) / e0).abs();
+        let l_rel = (body.angular_momentum_world() - l0).length() / l0_mag;
+        if e_rel > max_e_drift {
+            max_e_drift = e_rel;
+        }
+        if l_rel > max_l_drift {
+            max_l_drift = l_rel;
+        }
+    }
+    assert!(
+        max_e_drift < 5.0e-5,
+        "non-diagonal I: energy drift {max_e_drift} exceeded bound"
+    );
+    assert!(
+        max_l_drift < 5.0e-3,
+        "non-diagonal I: angular-momentum drift {max_l_drift} exceeded bound"
+    );
+}
+
+#[test]
+fn angular_momentum_conserved_with_offset_initial_orientation() {
+    // The plain L-conservation test above starts from q0 = IDENTITY, so a
+    // wrong-frame implementation of `angular_momentum_world` that forgets
+    // to rotate `I ω` by the orientation would coincidentally look
+    // constant while R stayed near identity for the first few steps. Start
+    // from a nontrivial q0 with ω_body NOT parallel to q0's axis; the
+    // wrong-frame implementation now drifts within ~500 steps, but the
+    // correct implementation stays inside a tight bound.
+    let q0 = Quat::from_axis_angle(Vec3::new(1.0, -0.4, 0.3), 0.9);
+    let inertia = Mat3::diag(1.0, 2.0, 3.0);
+    let mut body = Body::new(1.0, inertia, Vec3::ZERO, q0);
+    // ω_body deliberately not aligned with q0's axis (1, -0.4, 0.3).
+    body.angular_velocity_body = Vec3::new(0.4, 1.2, 0.3);
+
+    let mut world = World::new();
+    world.dt = 0.005;
+    world.gravity = Vec3::ZERO;
+    world.add_body(body);
+
+    let l0 = world.bodies[0].angular_momentum_world();
+    let l0_mag = l0.length();
+    assert!(l0_mag > 0.0);
+
+    let mut max_rel_drift: f32 = 0.0;
+    for _ in 0..10_000 {
+        world.step();
+        let l = world.bodies[0].angular_momentum_world();
+        let rel = (l - l0).length() / l0_mag;
+        if rel > max_rel_drift {
+            max_rel_drift = rel;
+        }
+    }
+    assert!(
+        max_rel_drift < 5.0e-3,
+        "offset-q0 L drift {max_rel_drift} exceeded bound — suspect a \
+         wrong-frame angular-momentum-in-world implementation"
     );
 }
