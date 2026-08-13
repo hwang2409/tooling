@@ -43,6 +43,10 @@ const EMBEDDED_MESHES: &[(&str, &str)] = &[
         include_str!("../../assets/icosahedron.obj"),
     ),
     ("icosphere.obj", include_str!("../../assets/icosphere.obj")),
+    (
+        "icosphere_hires.obj",
+        include_str!("../../assets/icosphere_hires.obj"),
+    ),
 ];
 
 fn embedded_mesh_source(path: &Path) -> Option<&'static str> {
@@ -139,7 +143,12 @@ mod tests {
     fn embedded_fallback_matches_native_parse_when_fs_read_fails() {
         // Use a bogus root that no filesystem lookup can satisfy.
         let missing_root = PathBuf::from("/tmp/chimy2-scene-fallback-does-not-exist");
-        for name in ["cube.obj", "icosahedron.obj", "icosphere.obj"] {
+        for name in [
+            "cube.obj",
+            "icosahedron.obj",
+            "icosphere.obj",
+            "icosphere_hires.obj",
+        ] {
             let missing_path = missing_root.join(name);
             let fallback = load_mesh(&missing_path, "test.mesh")
                 .expect("embedded fallback should serve when fs read fails");

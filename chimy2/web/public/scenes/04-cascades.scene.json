@@ -7,13 +7,13 @@
     "far": 200.0
   },
   "environment": {
-    "background": [0.036, 0.040, 0.052, 1.0]
+    "background": [0.018, 0.021, 0.028, 1.0]
   },
   "lights": [
     {
       "type": "directional",
       "direction": [-0.35, 0.85, 0.30],
-      "color": [1.0, 0.94, 0.86],
+      "color": [1.05, 0.98, 0.88],
       "shadow": {
         "type": "csm",
         "map_size": 1024,
@@ -24,6 +24,14 @@
         "near": 0.1,
         "far": 120.0
       }
+    },
+    {
+      "type": "point",
+      "position": [0.0, 3.0, 4.0],
+      "color": [0.20, 0.34, 0.55],
+      "constant": 1.0,
+      "linear": 0.08,
+      "quadratic": 0.02
     }
   ],
   "objects": [
@@ -31,10 +39,10 @@
       "mesh": "../../assets/cube.obj",
       "material": {
         "type": "blinn_phong",
-        "ambient": [0.012, 0.014, 0.018],
-        "diffuse": [0.30, 0.32, 0.38],
-        "specular": [0.08, 0.08, 0.08],
-        "shininess": 8.0
+        "ambient": [0.006, 0.008, 0.012],
+        "diffuse": [0.14, 0.16, 0.20],
+        "specular": [0.04, 0.05, 0.07],
+        "shininess": 6.0
       },
       "transform": {
         "position": [0.0, -1.05, -6.0],
@@ -43,13 +51,13 @@
       }
     },
     {
-      "mesh": "../../assets/icosahedron.obj",
+      "mesh": "../../assets/icosphere_hires.obj",
       "material": {
         "type": "blinn_phong",
-        "ambient": [0.015, 0.018, 0.024],
-        "diffuse": [0.74, 0.80, 0.90],
-        "specular": [0.55, 0.62, 0.75],
-        "shininess": 42.0
+        "ambient": [0.018, 0.021, 0.028],
+        "diffuse": [0.70, 0.78, 0.90],
+        "specular": [0.68, 0.75, 0.90],
+        "shininess": 55.0
       },
       "transform": {
         "position": [-5.5, -0.65, 0.0],
@@ -68,10 +76,10 @@
       "mesh": "../../assets/cube.obj",
       "material": {
         "type": "blinn_phong",
-        "ambient": [0.02, 0.010, 0.005],
-        "diffuse": [0.92, 0.35, 0.15],
-        "specular": [0.85, 0.55, 0.24],
-        "shininess": 40.0
+        "ambient": [0.030, 0.014, 0.006],
+        "diffuse": [1.05, 0.42, 0.16],
+        "specular": [0.95, 0.62, 0.24],
+        "shininess": 44.0
       },
       "transform": {
         "position": [0.9, -0.85, 1.7],
@@ -81,11 +89,11 @@
     }
   ],
   "postfx": [
-    {"type": "ssao", "radius": 0.55, "bias": 0.02, "strength": 1.0, "range": 0.9, "blur_depth_threshold": 0.35},
-    {"type": "aces", "exposure": 1.05}
+    {"type": "ssao", "radius": 0.55, "bias": 0.02, "strength": 1.05, "range": 0.9, "blur_depth_threshold": 0.35},
+    {"type": "aces", "exposure": 1.02}
   ],
   "hud": [
-    {"text": "CHIMY2 / CASCADES", "x": 24, "y": 22, "scale": 2, "color": [0.96, 0.94, 0.90, 1.0]},
-    {"text": "CSM x 4 / INSTANCED FIELD (66 x)", "x": 24, "y": 46, "scale": 1, "color": [0.66, 0.66, 0.62, 1.0]}
+    {"text": "CHIMY2 / CASCADES", "x": 24, "y": 22, "scale": 2, "color": [0.94, 0.95, 0.98, 1.0]},
+    {"text": "CSM x 4 / INSTANCED FIELD (66 x)", "x": 24, "y": 46, "scale": 1, "color": [0.56, 0.62, 0.72, 1.0]}
   ]
 }
