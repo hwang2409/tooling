@@ -99,7 +99,8 @@ impl Framebuffer {
         if self.linear.is_some() {
             write_linear_pixel(self, index, linear_rgba_from_argb8888(source), true);
             if let Some(&linear) = self.linear.as_ref().and_then(|pixels| pixels.get(index)) {
-                self.color[index] = argb8888_linear(linear[0], [linear[1], linear[2], linear[3]]);
+                self.color[index] =
+                    argb8888_linear_dithered(x, y, linear[0], [linear[1], linear[2], linear[3]]);
             }
         } else {
             self.color[index] = blended;
@@ -157,7 +158,8 @@ impl Framebuffer {
                     linear[destination_index] = [average_alpha, rgb[0], rgb[1], rgb[2]];
                     destination.color[destination_index] = 0;
                 } else {
-                    destination.color[destination_index] = argb8888_linear(average_alpha, rgb);
+                    destination.color[destination_index] =
+                        argb8888_linear_dithered(x, y, average_alpha, rgb);
                 }
                 let mut minimum_depth: f32 = 1.0;
                 for sample_y in 0..scale_y {
@@ -190,6 +192,36 @@ pub fn argb8888_linear(alpha: f32, rgb: [f32; 3]) -> u32 {
         crate::image::linear_to_srgb(rgb[1]),
         crate::image::linear_to_srgb(rgb[2]),
     )
+}
+
+/// Encodes a linear-light color at pixel `(x, y)` with an ordered Bayer
+/// dither applied at the u8 quantization step. Use at final output paths
+/// that know their pixel coordinates: the postfx `write_to_framebuffer`
+/// hook, the HDR linear-sidecar sync, and the SSAA downsample resolve.
+///
+/// The plain rounded [`argb8888_linear`] stays for intermediate rasterizer
+/// writes where dither would fight later linear passes.
+pub fn argb8888_linear_dithered(x: usize, y: usize, alpha: f32, rgb: [f32; 3]) -> u32 {
+    let offset = crate::dither::bayer_offset(x, y);
+    argb8888(
+        (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+        crate::image::quantize_srgb_encoded(crate::image::linear_to_srgb_encoded(rgb[0]), offset),
+        crate::image::quantize_srgb_encoded(crate::image::linear_to_srgb_encoded(rgb[1]), offset),
+        crate::image::quantize_srgb_encoded(crate::image::linear_to_srgb_encoded(rgb[2]), offset),
+    )
+}
+
+/// Same as [`argb8888_linear_dithered`] but on an already-sRGB-encoded float
+/// input (0.0..=1.0). Used by the postfx pass that finishes in
+/// `PostColorSpace::EncodedSrgb`, which has done the transfer curve already.
+pub fn argb8888_encoded_srgb_dithered(x: usize, y: usize, encoded: [f32; 4]) -> u32 {
+    let offset = crate::dither::bayer_offset(x, y);
+    u32::from_be_bytes([
+        (encoded[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        crate::image::quantize_srgb_encoded(encoded[1].clamp(0.0, 1.0), offset),
+        crate::image::quantize_srgb_encoded(encoded[2].clamp(0.0, 1.0), offset),
+        crate::image::quantize_srgb_encoded(encoded[3].clamp(0.0, 1.0), offset),
+    ])
 }
 
 pub(crate) fn linear_rgba_from_argb8888(pixel: u32) -> [f32; 4] {
@@ -342,7 +374,10 @@ mod tests {
         ];
         let mut destination = Framebuffer::new(1, 1);
         source.downsample_linear_into(&mut destination);
-        assert_eq!(destination.color[0], argb8888(255, 188, 188, 188));
+        // Linear-light 0.5 encodes to sRGB 187.5. Bayer offset at pixel (0, 0)
+        // is -31.5/64, so the dithered u8 rounds down to 187. The linear box
+        // filter is validated by the huge gap to the naive 128 average.
+        assert_eq!(destination.color[0], argb8888(255, 187, 187, 187));
         assert_ne!(destination.color[0], argb8888(255, 128, 128, 128));
     }
 

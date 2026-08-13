@@ -2,6 +2,7 @@ pub mod camera;
 pub mod clip;
 pub mod csm;
 pub mod culling;
+pub mod dither;
 pub mod fb;
 pub mod font;
 pub mod gltf;

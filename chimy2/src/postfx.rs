@@ -8,7 +8,7 @@
 //! scene color and depth. SSAO modulates the full color, not only the ambient term.
 //! Ambient-only modulation needs a separate ambient buffer and is out of scope.
 
-use crate::fb::{Framebuffer, argb8888_linear};
+use crate::fb::{Framebuffer, argb8888_encoded_srgb_dithered, argb8888_linear_dithered};
 use crate::image::{srgb_to_linear, srgb_to_linear_u8};
 use crate::math::{Mat4, Vec3, Vec4};
 
@@ -93,18 +93,15 @@ impl PostBuffer {
     }
 
     fn write_to_framebuffer(&self, framebuffer: &mut Framebuffer) {
+        let width = self.width.max(1);
         for (index, &source) in self.pixels.iter().enumerate() {
+            let x = index % width;
+            let y = index / width;
             framebuffer.color[index] = match self.color_space {
                 PostColorSpace::Linear => {
-                    argb8888_linear(source[0], [source[1], source[2], source[3]])
+                    argb8888_linear_dithered(x, y, source[0], [source[1], source[2], source[3]])
                 }
-                PostColorSpace::EncodedSrgb => {
-                    let alpha = (source[0].clamp(0.0, 1.0) * 255.0).round() as u8;
-                    let red = (source[1].clamp(0.0, 1.0) * 255.0).round() as u8;
-                    let green = (source[2].clamp(0.0, 1.0) * 255.0).round() as u8;
-                    let blue = (source[3].clamp(0.0, 1.0) * 255.0).round() as u8;
-                    u32::from_be_bytes([alpha, red, green, blue])
-                }
+                PostColorSpace::EncodedSrgb => argb8888_encoded_srgb_dithered(x, y, source),
             };
             if let Some(linear) = framebuffer.linear_pixels_mut() {
                 linear[index] = match self.color_space {
