@@ -530,11 +530,7 @@ fn point_velocity_generic(
 /// tree. Computed by walking the tree's spatial-velocity recursion from
 /// the root — same layout as ABA pass 1 but keeping only what the contact
 /// code needs.
-fn link_world_velocity(
-    tree: &Tree,
-    target: usize,
-    link_poses: &[(Vec3, Quat)],
-) -> (Vec3, Vec3) {
+fn link_world_velocity(tree: &Tree, target: usize, link_poses: &[(Vec3, Quat)]) -> (Vec3, Vec3) {
     use crate::joint::JointKind;
     let n = tree.links.len();
     // Ancestor chain root → target.
