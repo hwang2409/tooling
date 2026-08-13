@@ -313,13 +313,29 @@ pub fn srgb_to_linear_u8(value: u8) -> f32 {
 }
 
 pub fn linear_to_srgb(value: f32) -> u8 {
+    quantize_srgb_encoded(linear_to_srgb_encoded(value), 0.0)
+}
+
+/// Encodes a linear-light value to the sRGB transfer curve as a `[0.0, 1.0]`
+/// float, WITHOUT quantizing to u8. Dither is added at quantization time on
+/// top of this encoded float.
+pub fn linear_to_srgb_encoded(value: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
-    let encoded = if value <= 0.0031308 {
+    if value <= 0.0031308 {
         value * 12.92
     } else {
         1.055 * value.powf(1.0 / 2.4) - 0.055
-    };
-    (encoded * 255.0).round() as u8
+    }
+}
+
+/// Quantizes an encoded sRGB float to u8 with a `dither_offset` in u8 units.
+///
+/// The offset comes from the shared Bayer table in [`crate::dither`], so a
+/// smooth encoded ramp resolves to alternating u8 neighbors instead of a
+/// visible staircase. `dither_offset == 0.0` reproduces the plain rounded
+/// quantization used by [`linear_to_srgb`].
+pub fn quantize_srgb_encoded(encoded: f32, dither_offset: f32) -> u8 {
+    ((encoded * 255.0 + dither_offset).clamp(0.0, 255.0)).round() as u8
 }
 
 fn decode_pixels(pixels: &[[u8; 4]], color_space: ColorSpace) -> Vec<[f32; 4]> {
