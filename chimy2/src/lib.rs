@@ -17,6 +17,7 @@ pub mod particles;
 pub mod pipeline;
 pub mod postfx;
 pub mod raster;
+pub mod scene;
 pub mod shaders;
 pub mod shadow;
 pub mod skybox;

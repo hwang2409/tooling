@@ -15,6 +15,7 @@ use crate::material::MaterialLibrary;
 use crate::math::{Mat4, Vec3};
 use crate::mesh::Mesh;
 use crate::pipeline::{FragmentStage, Pipeline, VertexStage};
+use crate::scene::Scene;
 use crate::shaders::{
     BlinnPhongUniforms, DirectionalLight, DitherShader, DitherUniforms, FogShader, FogUniforms,
     NormalMappedBlinnPhongShader, NormalMappedBlinnPhongUniforms, NormalsShader, NormalsUniforms,
@@ -28,6 +29,7 @@ use std::path::Path;
 use std::cell::UnsafeCell;
 
 const MAX_DIMENSION: u32 = 2048;
+const MAX_SCENE_BYTES: usize = 1 << 20;
 const CAMERA_DISTANCE: f32 = 4.2;
 
 const SHOWCASE_OBJ: &str = include_str!("../assets/multi_material.obj");
@@ -39,6 +41,57 @@ enum ShowcaseErrorCode {
     InvalidDimensions = -1,
     NotInitialized = -2,
     Render = -3,
+    Scene = -4,
+}
+
+fn load_scene_bytes_state(state: &mut Option<Showcase>, bytes: &[u8]) -> i32 {
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return api_error(ShowcaseErrorCode::Scene);
+    };
+    match Scene::from_str(source) {
+        Ok(scene) => {
+            let Some(showcase) = state.as_mut() else {
+                return api_error(ShowcaseErrorCode::NotInitialized);
+            };
+            showcase.scene = Some(scene);
+            0
+        }
+        Err(_) => api_error(ShowcaseErrorCode::Scene),
+    }
+}
+
+fn scene_alloc_state(state: &mut Option<Showcase>, length: u32) -> usize {
+    let Some(showcase) = state.as_mut() else {
+        return 0;
+    };
+    let length = length as usize;
+    if length == 0 || length > MAX_SCENE_BYTES {
+        return 0;
+    }
+    showcase.scene_upload.resize(length, 0);
+    showcase.scene_upload.as_mut_ptr() as usize
+}
+
+fn load_scene_json_state(state: &mut Option<Showcase>, pointer: usize, length: u32) -> i32 {
+    let Some(showcase) = state.as_mut() else {
+        return api_error(ShowcaseErrorCode::NotInitialized);
+    };
+    let length = length as usize;
+    let base = showcase.scene_upload.as_ptr() as usize;
+    if length == 0 || length > showcase.scene_upload.len() || pointer != base {
+        return api_error(ShowcaseErrorCode::Scene);
+    }
+    let source = &showcase.scene_upload[..length];
+    let Ok(source) = std::str::from_utf8(source) else {
+        return api_error(ShowcaseErrorCode::Scene);
+    };
+    match Scene::from_str(source) {
+        Ok(scene) => {
+            showcase.scene = Some(scene);
+            0
+        }
+        Err(_) => api_error(ShowcaseErrorCode::Scene),
+    }
 }
 
 #[derive(Debug)]
@@ -53,6 +106,8 @@ struct Showcase {
     skybox: CubeTexture,
     gltf: GltfAsset,
     materials: MaterialLibrary,
+    scene: Option<Scene>,
+    scene_upload: Vec<u8>,
 }
 
 impl Showcase {
@@ -101,10 +156,19 @@ impl Showcase {
             skybox,
             gltf,
             materials,
+            scene: None,
+            scene_upload: Vec::new(),
         })
     }
 
     fn render(&mut self, time_ms: f64, yaw: f32, pitch: f32, mode: u32) -> Result<(), String> {
+        if let Some(scene) = self.scene.clone() {
+            scene
+                .render(&mut self.framebuffer, Path::new("."))
+                .map_err(|error| error.to_string())?;
+            self.copy_rgba();
+            return Ok(());
+        }
         let time_seconds = if time_ms.is_finite() {
             (time_ms / 1000.0).clamp(-1_000_000.0, 1_000_000.0) as f32
         } else {
@@ -474,6 +538,18 @@ pub extern "C" fn framebuffer_height() -> u32 {
     framebuffer_height_state(state())
 }
 
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn scene_alloc(length: u32) -> u32 {
+    scene_alloc_state(state(), length) as u32
+}
+
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn load_scene_json(pointer: u32, length: u32) -> i32 {
+    load_scene_json_state(state(), pointer as usize, length)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +606,31 @@ mod tests {
         assert_eq!(init_state(&mut state, 32, 24), 0);
         assert_eq!(framebuffer_width_state(&state), 32);
         assert_eq!(framebuffer_height_state(&state), 24);
+    }
+
+    #[test]
+    fn scene_json_boundary_uses_the_strict_loader() {
+        let mut state = None;
+        let valid =
+            br#"{"camera":{"position":[0,0,5],"target":[0,0,0],"fov":1,"near":0.1,"far":10}}"#;
+        assert_eq!(load_scene_bytes_state(&mut state, valid), -2);
+        assert!(state.is_none());
+        init_state(&mut state, 32, 24);
+        let pointer = scene_alloc_state(&mut state, valid.len() as u32);
+        assert_ne!(pointer, 0);
+        state.as_mut().unwrap().scene_upload.copy_from_slice(valid);
+        assert_eq!(
+            load_scene_json_state(&mut state, pointer, valid.len() as u32),
+            0
+        );
+        assert!(state.as_ref().unwrap().scene.is_some());
+        assert_eq!(
+            load_scene_bytes_state(&mut state, br#"{"camera":{"position":[0,0,5]}}"#),
+            -4
+        );
+        assert!(state.as_ref().unwrap().scene.is_some());
+        assert_eq!(render_state(&mut state, 0.0, 0.0, 0.0, 0), 0);
+        assert_ne!(framebuffer_len_state(&state), 0);
     }
 
     #[test]

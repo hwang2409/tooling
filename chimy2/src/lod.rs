@@ -142,10 +142,7 @@ impl LodMesh {
     /// of simplified levels. Selection reads this cache directly.
     pub fn set_thresholds(&mut self, thresholds: Vec<f32>) {
         let count = self.levels.len().saturating_sub(1);
-        let mut sanitized = thresholds
-            .into_iter()
-            .filter(|value| value.is_finite() && *value >= 0.0)
-            .collect::<Vec<_>>();
+        let mut sanitized = sanitize_thresholds(thresholds);
         sanitized.truncate(count);
         for index in 1..sanitized.len() {
             sanitized[index] = sanitized[index].min(sanitized[index - 1]);
@@ -216,6 +213,20 @@ impl LodMesh {
     pub fn mesh_at_level(&self, level: usize) -> &Mesh {
         self.levels.get(level).unwrap_or(&self.levels[0])
     }
+}
+
+/// Applies the threshold value policy before a mesh level count is known.
+///
+/// Invalid values are removed. Later thresholds cannot exceed earlier ones.
+pub fn sanitize_thresholds(thresholds: Vec<f32>) -> Vec<f32> {
+    let mut sanitized = thresholds
+        .into_iter()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .collect::<Vec<_>>();
+    for index in 1..sanitized.len() {
+        sanitized[index] = sanitized[index].min(sanitized[index - 1]);
+    }
+    sanitized
 }
 
 fn default_thresholds(count: usize) -> Vec<f32> {
