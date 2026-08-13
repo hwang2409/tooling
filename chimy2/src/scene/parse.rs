@@ -436,6 +436,7 @@ fn parse_particle(value: &Value, path: &str) -> Result<ParticleConfig, SceneErro
             "gravity",
             "drag",
             "capacity",
+            "warmup_steps",
         ],
     )?;
     Ok(ParticleConfig {
@@ -467,6 +468,7 @@ fn parse_particle(value: &Value, path: &str) -> Result<ParticleConfig, SceneErro
         )?,
         drag: optional_scalar(&mut fields, "drag", 0.0)?.clamp(0.0, 1.0),
         capacity: optional_usize(&mut fields, "capacity", 128)?,
+        warmup_steps: optional_usize(&mut fields, "warmup_steps", 0)?,
     })
 }
 

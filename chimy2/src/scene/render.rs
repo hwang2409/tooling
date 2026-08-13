@@ -22,7 +22,8 @@ pub(super) fn render_particles(
         emitter.set_gravity(config.gravity);
         emitter.set_drag(config.drag);
         let mut system = ParticleSystem::new(emitter, config.capacity);
-        system.step();
+        let steps = config.warmup_steps.max(1);
+        system.step_n(steps);
         let instances = system.billboard_instances(camera, 0.16, Vec4::new(0.75, 0.9, 1.0, 0.9));
         let uniforms = TexturedUniforms::new(
             camera.projection_matrix() * camera.view_matrix(),
