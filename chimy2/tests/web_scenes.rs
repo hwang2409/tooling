@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 fn scene_files() -> Vec<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("web")
+        .join("public")
         .join("scenes");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&root)
         .expect("web/scenes/ directory must exist alongside the browser demo")
@@ -46,6 +47,7 @@ fn every_web_scene_parses_strictly() {
 fn every_web_scene_has_a_gallery_screenshot() {
     let gallery = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("web")
+        .join("public")
         .join("gallery");
     for scene in scene_files() {
         let stem = scene

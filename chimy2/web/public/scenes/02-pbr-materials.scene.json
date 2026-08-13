@@ -1,0 +1,229 @@
+{
+  "camera": {
+    "position": [0.0, 0.35, 4.4],
+    "target": [0.0, -0.20, 0.0],
+    "fov": 0.75,
+    "near": 0.1,
+    "far": 100.0
+  },
+  "environment": {
+    "background": [0.045, 0.048, 0.056, 1.0]
+  },
+  "lights": [
+    {
+      "type": "directional",
+      "direction": [-0.30, 0.80, 0.55],
+      "color": [1.0, 0.96, 0.90],
+      "shadow": {
+        "type": "basic",
+        "map_size": 1024,
+        "bias": 0.0025,
+        "slope_bias": 0.02,
+        "near": 0.1,
+        "far": 30.0
+      }
+    },
+    {
+      "type": "point",
+      "position": [-2.4, 0.5, 2.4],
+      "color": [0.20, 0.24, 0.32],
+      "constant": 1.0,
+      "linear": 0.12,
+      "quadratic": 0.06
+    }
+  ],
+  "objects": [
+    {
+      "mesh": "../../assets/cube.obj",
+      "material": {
+        "type": "blinn_phong",
+        "ambient": [0.014, 0.015, 0.018],
+        "diffuse": [0.14, 0.15, 0.18],
+        "specular": [0.05, 0.05, 0.05],
+        "shininess": 6.0
+      },
+      "transform": {
+        "position": [0.0, -1.30, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [10.0, 0.04, 6.0]
+      }
+    },
+    {
+      "mesh": "../../assets/icosphere.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.020, 0.020, 0.024],
+        "diffuse": [0.95, 0.74, 0.36],
+        "specular": [1.0, 0.86, 0.55],
+        "shininess": 96.0,
+        "metallic": 1.0,
+        "roughness": 0.05
+      },
+      "transform": {
+        "position": [-2.20, 0.15, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
+      }
+    },
+    {
+      "mesh": "../../assets/icosphere.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.020, 0.020, 0.024],
+        "diffuse": [0.95, 0.74, 0.36],
+        "specular": [1.0, 0.86, 0.55],
+        "shininess": 96.0,
+        "metallic": 1.0,
+        "roughness": 0.25
+      },
+      "transform": {
+        "position": [-1.10, 0.15, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
+      }
+    },
+    {
+      "mesh": "../../assets/icosphere.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.020, 0.020, 0.024],
+        "diffuse": [0.95, 0.74, 0.36],
+        "specular": [1.0, 0.86, 0.55],
+        "shininess": 96.0,
+        "metallic": 1.0,
+        "roughness": 0.45
+      },
+      "transform": {
+        "position": [0.0, 0.15, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
+      }
+    },
+    {
+      "mesh": "../../assets/icosphere.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.020, 0.020, 0.024],
+        "diffuse": [0.95, 0.74, 0.36],
+        "specular": [1.0, 0.86, 0.55],
+        "shininess": 96.0,
+        "metallic": 1.0,
+        "roughness": 0.65
+      },
+      "transform": {
+        "position": [1.10, 0.15, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
+      }
+    },
+    {
+      "mesh": "../../assets/icosphere.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.020, 0.020, 0.024],
+        "diffuse": [0.95, 0.74, 0.36],
+        "specular": [1.0, 0.86, 0.55],
+        "shininess": 96.0,
+        "metallic": 1.0,
+        "roughness": 0.90
+      },
+      "transform": {
+        "position": [2.20, 0.15, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
+      }
+    },
+    {
+      "mesh": "../../assets/icosphere.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.014, 0.020, 0.028],
+        "diffuse": [0.22, 0.36, 0.85],
+        "specular": [1.0, 1.0, 1.0],
+        "shininess": 96.0,
+        "metallic": 0.0,
+        "roughness": 0.05
+      },
+      "transform": {
+        "position": [-2.20, -0.80, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
+      }
+    },
+    {
+      "mesh": "../../assets/icosphere.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.014, 0.020, 0.028],
+        "diffuse": [0.22, 0.36, 0.85],
+        "specular": [1.0, 1.0, 1.0],
+        "shininess": 96.0,
+        "metallic": 0.0,
+        "roughness": 0.25
+      },
+      "transform": {
+        "position": [-1.10, -0.80, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
+      }
+    },
+    {
+      "mesh": "../../assets/icosphere.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.014, 0.020, 0.028],
+        "diffuse": [0.22, 0.36, 0.85],
+        "specular": [1.0, 1.0, 1.0],
+        "shininess": 96.0,
+        "metallic": 0.0,
+        "roughness": 0.45
+      },
+      "transform": {
+        "position": [0.0, -0.80, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
+      }
+    },
+    {
+      "mesh": "../../assets/icosphere.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.014, 0.020, 0.028],
+        "diffuse": [0.22, 0.36, 0.85],
+        "specular": [1.0, 1.0, 1.0],
+        "shininess": 96.0,
+        "metallic": 0.0,
+        "roughness": 0.65
+      },
+      "transform": {
+        "position": [1.10, -0.80, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
+      }
+    },
+    {
+      "mesh": "../../assets/icosphere.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.014, 0.020, 0.028],
+        "diffuse": [0.22, 0.36, 0.85],
+        "specular": [1.0, 1.0, 1.0],
+        "shininess": 96.0,
+        "metallic": 0.0,
+        "roughness": 0.90
+      },
+      "transform": {
+        "position": [2.20, -0.80, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [0.44, 0.44, 0.44]
+      }
+    }
+  ],
+  "postfx": [
+    {"type": "aces", "exposure": 1.05}
+  ],
+  "hud": [
+    {"text": "CHIMY2 / PBR SWEEP", "x": 24, "y": 22, "scale": 2, "color": [0.96, 0.94, 0.90, 1.0]},
+    {"text": "TOP METALLIC 1 - BOTTOM DIELECTRIC 0 - ROUGHNESS 0.05 -> 0.90", "x": 24, "y": 46, "scale": 1, "color": [0.66, 0.62, 0.55, 1.0]}
+  ]
+}
