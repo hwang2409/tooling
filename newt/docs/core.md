@@ -61,13 +61,17 @@ transcendental is hand-written in `src/math.rs`:
 - `newt::math::abs` — bit fiddling
 
 no platform libm (`.sin() .cos() .tan() .exp() .ln() .powf()`) anywhere in
-the engine. grep it if you doubt me:
+the engine. the `libm-free` CI job (`.github/workflows/newt.yml`) enforces
+this on every push and PR by grepping `newt/src/` for those patterns and
+failing if any land in live code (comment lines are tolerated so this doc
+and the module-level policy can still name them). run it locally with:
 
 ```sh
-rg -tp rust '\.(sin|cos|tan|exp|ln|powf)\(' src/
+grep -rnE '\.(sin|cos|tan|exp|ln|powf)\(' newt/src/ \
+  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//'
 ```
 
-should be empty.
+should print nothing.
 
 ## anchor tests
 
@@ -76,14 +80,18 @@ should be empty.
 | file | what it pins down |
 |------|-------------------|
 | `tests/projectile.rs` | free-fall COM matches closed-form parabola after 1000 steps |
-| `tests/energy_and_momentum.rs` | torque-free tumbling: energy drift < 1e-3 over 10k steps, angular momentum in world frame < 5e-3 |
+| `tests/energy_and_momentum.rs` | torque-free tumbling: energy drift < 5e-5 over 10k steps, angular momentum in world frame < 5e-3, quaternion norm within 1e-5 of unit throughout the run |
+| `tests/energy_and_momentum.rs::energy_and_momentum_conserved_for_non_diagonal_inertia` | same bounds for `I = R diag(1,2,3) Rᵀ` (guards against a transposed-inertia mutant that a diagonal test would hide) |
+| `tests/energy_and_momentum.rs::angular_momentum_conserved_with_offset_initial_orientation` | L stays constant when `q0 ≠ IDENTITY` and `ω_body` is NOT parallel to `q0`'s axis (guards against a wrong-frame `angular_momentum_world`) |
 | `tests/energy_and_momentum.rs::dzhanibekov_intermediate_axis_flip_occurs` | intermediate-axis instability flips a body spun about I₂ |
 | `tests/energy_and_momentum.rs::major_axis_spin_stays_bounded`, `::minor_axis_spin_stays_bounded` | I₁ and I₃ spins are stable |
 | `tests/golden.rs` | serialize `(q, qdot)` for a fixed 3-body scene at steps 0/100/1000; byte-compare against `tests/goldens/tumbling_3_body.bin` |
 
 the golden was generated on macOS aarch64. CI on ubuntu-latest re-runs the
 golden test; if the bytes differ, the scalar policy is being violated
-somewhere. regenerate ONLY on the reference machine:
+somewhere. regenerate ONLY on the reference machine — the ignored
+`regenerate_golden` test panics on any other host so an accidental
+`--ignored` invocation cannot silently swap the reference:
 
 ```sh
 cargo test --test golden regenerate_golden -- --ignored --nocapture

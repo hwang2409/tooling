@@ -206,20 +206,17 @@ impl SpatialInertia {
         self.inertia_com + (sk_t * sk) * self.mass
     }
 
-    /// Spatial inertia times a spatial motion (interpreted as an acceleration
-    /// when producing the wrench, or as a velocity to compute momentum).
+    /// Spatial inertia times a spatial motion. Interpreted as
+    /// momentum-per-velocity (call with a twist to get the spatial momentum)
+    /// or as wrench-per-acceleration (call with an acceleration to get the
+    /// required wrench, ignoring the gyroscopic bias which the caller adds).
     ///
-    /// h = I * v = ( I_c ω + m c×(v_lin − ω×c wait no ),... )
-    ///
-    /// Using the reference-frame form for a body with COM offset `c`:
-    /// ```text
-    /// f_τ = I_com * ω + m * c × (v + ω × ??? )   -- see below
-    /// ```
-    /// Simpler: rewrite in terms of COM-frame quantities. Let `v_com = v +
-    /// ω × c` be the COM linear velocity. Then linear momentum is `p = m v_com`
-    /// and angular momentum about the reference origin is `L = I_com ω + c × p`.
-    /// This is exactly the wrench a linear-momentum + angular-momentum pair
-    /// exchange with the body per unit acceleration.
+    /// Derivation in COM-frame quantities. Let `v_com = v + ω × c` be the
+    /// COM linear velocity for reference-frame velocity `v` and offset `c`.
+    /// Linear momentum is `p = m * v_com`. Angular momentum about the
+    /// reference origin is `L = I_com * ω + c × p` (parallel-axis for the
+    /// angular part). The returned SpatialForce packs `(L, p)` in the
+    /// `(torque, linear)` layout, matching the M/F pairing convention.
     pub fn times_motion(self, motion: SpatialMotion) -> SpatialForce {
         let v_com = motion.linear + motion.angular.cross(self.com);
         let p = v_com * self.mass;
@@ -234,56 +231,56 @@ impl SpatialInertia {
 
 /// Plücker transform between coordinate frames.
 ///
-/// If a motion vector `m_a` is expressed in frame A, then `xform_ba * m_a`
-/// gives the same physical motion expressed in frame B. The transform is
-/// parameterized by the rotation of A relative to B (`rot_ba`) and the
-/// position of A's origin in B (`translation_a_in_b`).
+/// Applied to a motion vector `m_a` expressed in frame A, it produces the
+/// same physical motion expressed in frame B. The transform is parameterized
+/// by [`Xform::rot_a_to_b`] (the linear map from A-coords to B-coords) and
+/// [`Xform::translation_a_in_b`] (the origin of A expressed in B).
 ///
 /// For motion vectors:
 /// ```text
-/// m_b.ω = R_ba * m_a.ω
-/// m_b.v = R_ba * m_a.v + p × (R_ba * m_a.ω)
+/// m_b.ω = R_a→b * m_a.ω
+/// m_b.v = R_a→b * m_a.v + p × (R_a→b * m_a.ω)
 /// ```
 /// For force vectors:
 /// ```text
-/// f_b.F = R_ba * f_a.F
-/// f_b.τ = R_ba * f_a.τ + p × (R_ba * f_a.F)
+/// f_b.F = R_a→b * f_a.F
+/// f_b.τ = R_a→b * f_a.τ + p × (R_a→b * f_a.F)
 /// ```
 ///
 /// The force transform is the transpose-inverse of the motion transform;
 /// the block structure above is Featherstone's Plücker matrix `X*` for force.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Xform {
-    /// Rotation of A relative to B, applied to vectors expressed in A.
-    pub rot_ba: Mat3,
+    /// Linear map from A-coordinates to B-coordinates: `v_b = rot_a_to_b * v_a`.
+    pub rot_a_to_b: Mat3,
     /// Origin of A expressed in B coordinates.
     pub translation_a_in_b: Vec3,
 }
 
 impl Xform {
     pub const IDENTITY: Self = Self {
-        rot_ba: Mat3::IDENTITY,
+        rot_a_to_b: Mat3::IDENTITY,
         translation_a_in_b: Vec3::ZERO,
     };
 
-    pub const fn new(rot_ba: Mat3, translation_a_in_b: Vec3) -> Self {
+    pub const fn new(rot_a_to_b: Mat3, translation_a_in_b: Vec3) -> Self {
         Self {
-            rot_ba,
+            rot_a_to_b,
             translation_a_in_b,
         }
     }
 
     /// Push a motion vector from frame A to frame B.
     pub fn motion(self, m: SpatialMotion) -> SpatialMotion {
-        let w = self.rot_ba * m.angular;
-        let v = self.rot_ba * m.linear + self.translation_a_in_b.cross(w);
+        let w = self.rot_a_to_b * m.angular;
+        let v = self.rot_a_to_b * m.linear + self.translation_a_in_b.cross(w);
         SpatialMotion::new(w, v)
     }
 
     /// Push a force vector from frame A to frame B.
     pub fn force(self, f: SpatialForce) -> SpatialForce {
-        let fl = self.rot_ba * f.linear;
-        let tau = self.rot_ba * f.torque + self.translation_a_in_b.cross(fl);
+        let fl = self.rot_a_to_b * f.linear;
+        let tau = self.rot_a_to_b * f.torque + self.translation_a_in_b.cross(fl);
         SpatialForce::new(tau, fl)
     }
 }
