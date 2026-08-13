@@ -15,8 +15,10 @@ export function Stage({ index }: Props) {
   const [dragging, setDragging] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  const demo = DEMOS[index];
+
   const { state, telemetry } = useRenderer(canvasRef, {
-    mode: index,
+    sceneFile: demo.file,
     paused: false,
     orbit: orbitRef,
     onError: setErrorMessage,
@@ -31,7 +33,10 @@ export function Stage({ index }: Props) {
     return () => window.removeEventListener("chimy2:reset-orbit", reset);
   }, []);
 
-  const demo = DEMOS[index];
+  useEffect(() => {
+    setErrorMessage(null);
+  }, [demo.file]);
+
   const ready = state.status === "ready";
 
   return (

@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build && rm -rf dist/gallery dist/scenes",
+    "build": "tsc --noEmit && vite build && rm -rf dist/gallery",
     "preview": "vite preview"
   },
   "dependencies": {

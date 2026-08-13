@@ -62,7 +62,9 @@ impl Scene {
         let root = root.as_ref();
         for (index, object) in self.objects.iter().enumerate() {
             let path = root.join(&object.mesh);
-            if !path.is_file() {
+            // Accept the mesh if either the fs check passes (native path) or
+            // the load_mesh embedded fallback covers this filename (wasm path).
+            if !path.is_file() && !crate::scene::assets::has_embedded_fallback(&path) {
                 return Err(SceneError(format!(
                     "objects[{index}].mesh: asset does not exist: {}",
                     path.display()
