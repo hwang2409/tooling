@@ -78,8 +78,7 @@
           {"position": [0.0, -0.8, -1.0], "rotation": [0.2, 0.5, 0.0], "scale": [0.55, 0.55, 0.55]},
           {"position": [0.0, 0.8, -1.0], "rotation": [-0.2, -0.3, 0.0], "scale": [0.42, 0.42, 0.42]}
         ]
-      },
-      "lod": {"ratios": [0.5, 0.25], "thresholds": [256.0, 96.0]}
+      }
     },
     {
       "mesh": "../assets/cube.obj",
@@ -95,6 +94,22 @@
         "rotation": [0.2, -0.5, 0.15],
         "scale": [0.8, 0.8, 0.8]
       }
+    },
+    {
+      "mesh": "../assets/icosahedron.obj",
+      "material": {
+        "type": "blinn_phong",
+        "ambient": [0.03, 0.03, 0.03],
+        "diffuse": [0.18, 0.7, 0.3],
+        "specular": [0.3, 0.5, 0.3],
+        "shininess": 20.0
+      },
+      "transform": {
+        "position": [0.0, -0.65, -1.4],
+        "rotation": [0.2, 0.0, 0.3],
+        "scale": [0.45, 0.45, 0.45]
+      },
+      "lod": {"ratios": [0.5, 0.25], "thresholds": [256.0, 96.0]}
     }
   ],
   "postfx": [

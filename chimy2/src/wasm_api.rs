@@ -43,13 +43,16 @@ enum ShowcaseErrorCode {
     Scene = -4,
 }
 
-fn load_scene_bytes_state(state: &mut Option<Scene>, bytes: &[u8]) -> i32 {
+fn load_scene_bytes_state(state: &mut Option<Showcase>, bytes: &[u8]) -> i32 {
     let Ok(source) = std::str::from_utf8(bytes) else {
         return api_error(ShowcaseErrorCode::Scene);
     };
     match Scene::from_str(source) {
         Ok(scene) => {
-            *state = Some(scene);
+            let Some(showcase) = state.as_mut() else {
+                return api_error(ShowcaseErrorCode::NotInitialized);
+            };
+            showcase.scene = Some(scene);
             0
         }
         Err(_) => api_error(ShowcaseErrorCode::Scene),
@@ -68,6 +71,7 @@ struct Showcase {
     skybox: CubeTexture,
     gltf: GltfAsset,
     materials: MaterialLibrary,
+    scene: Option<Scene>,
 }
 
 impl Showcase {
@@ -116,10 +120,18 @@ impl Showcase {
             skybox,
             gltf,
             materials,
+            scene: None,
         })
     }
 
     fn render(&mut self, time_ms: f64, yaw: f32, pitch: f32, mode: u32) -> Result<(), String> {
+        if let Some(scene) = self.scene.clone() {
+            scene
+                .render(&mut self.framebuffer, Path::new("."))
+                .map_err(|error| error.to_string())?;
+            self.copy_rgba();
+            return Ok(());
+        }
         let time_seconds = if time_ms.is_finite() {
             (time_ms / 1000.0).clamp(-1_000_000.0, 1_000_000.0) as f32
         } else {
@@ -395,24 +407,10 @@ unsafe impl Sync for WasmState {}
 static STATE: WasmState = WasmState(UnsafeCell::new(None));
 
 #[cfg(target_arch = "wasm32")]
-static SCENE_STATE: WasmSceneState = WasmSceneState(UnsafeCell::new(None));
-
-#[cfg(target_arch = "wasm32")]
-struct WasmSceneState(UnsafeCell<Option<Scene>>);
-
-#[cfg(target_arch = "wasm32")]
-unsafe impl Sync for WasmSceneState {}
-
-#[cfg(target_arch = "wasm32")]
 fn state() -> &'static mut Option<Showcase> {
     // JavaScript calls this API on one thread. The browser contract forbids
     // reentrant calls while a frame is being rendered.
     unsafe { &mut *STATE.0.get() }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn scene_state() -> &'static mut Option<Scene> {
-    unsafe { &mut *SCENE_STATE.0.get() }
 }
 
 fn api_error(code: ShowcaseErrorCode) -> i32 {
@@ -503,17 +501,11 @@ pub extern "C" fn framebuffer_height() -> u32 {
     framebuffer_height_state(state())
 }
 
-/// Loads a scene JSON string from JavaScript memory.
-///
-/// The caller keeps the bytes alive for the duration of this call.
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
-pub extern "C" fn load_scene_json(bytes: *const u8, length: usize) -> i32 {
-    if bytes.is_null() {
-        return api_error(ShowcaseErrorCode::Scene);
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(bytes, length) };
-    load_scene_bytes_state(scene_state(), bytes)
+#[allow(improper_ctypes_definitions)]
+pub extern "C" fn load_scene_json(bytes: &[u8]) -> i32 {
+    load_scene_bytes_state(state(), bytes)
 }
 
 #[cfg(test)]
@@ -576,16 +568,21 @@ mod tests {
 
     #[test]
     fn scene_json_boundary_uses_the_strict_loader() {
-        let mut scene = None;
+        let mut state = None;
         let valid =
             br#"{"camera":{"position":[0,0,5],"target":[0,0,0],"fov":1,"near":0.1,"far":10}}"#;
-        assert_eq!(load_scene_bytes_state(&mut scene, valid), 0);
-        assert!(scene.is_some());
+        assert_eq!(load_scene_bytes_state(&mut state, valid), -2);
+        assert!(state.is_none());
+        init_state(&mut state, 32, 24);
+        assert_eq!(load_scene_bytes_state(&mut state, valid), 0);
+        assert!(state.as_ref().unwrap().scene.is_some());
         assert_eq!(
-            load_scene_bytes_state(&mut scene, br#"{"camera":{"position":[0,0,5]}}"#),
+            load_scene_bytes_state(&mut state, br#"{"camera":{"position":[0,0,5]}}"#),
             -4
         );
-        assert!(scene.is_some());
+        assert!(state.as_ref().unwrap().scene.is_some());
+        assert_eq!(render_state(&mut state, 0.0, 0.0, 0.0, 0), 0);
+        assert_ne!(framebuffer_len_state(&state), 0);
     }
 
     #[test]

@@ -21,7 +21,8 @@ and integer sizes.
 - `lights` is an ordered list of `directional` and `point` lights. Directional
   shadows accept `basic`, `csm`, and `pcss`. Point shadows accept `cube`.
 - `objects` is an ordered list. Each object has a mesh path, optional material
-  override, TRS transform, optional instancing, and optional LOD settings.
+  override, TRS transform, optional instancing, or optional LOD settings.
+  Instancing and LOD cannot be combined on one object. Use separate objects.
   OBJ paths are loaded by the existing OBJ loader. The material `type` is
   `blinn_phong` or `ggx` and maps to existing renderer material capabilities.
 - `postfx` is an ordered list of `ssao`, `dof`, `bloom`, `fxaa`, `vignette`,
@@ -57,8 +58,9 @@ cargo run --bin scene_viewer -- --scene examples/showcase.scene.json --screensho
     {"type": "point", "position": [2, 2.5, 3], "color": [1, 0.25, 0.08], "constant": 1, "linear": 0.04, "quadratic": 0.01, "shadow": {"type": "cube", "map_size": 512}}
   ],
   "objects": [
-    {"mesh": "../assets/icosahedron.obj", "material": {"type": "ggx", "metallic": 0.8, "roughness": 0.24}, "transform": {"position": [-1.25, 0.1, 0], "rotation": [0, 0.4, 0], "scale": [1.1, 1.1, 1.1]}, "instancing": {"count": 3, "grid": {"dimensions": [3, 1, 1], "spacing": [1.0, 0, 0]}}, "lod": {"ratios": [0.5, 0.25], "thresholds": [256, 96]}},
-    {"mesh": "../assets/cube.obj", "material": {"type": "blinn_phong", "diffuse": [0.95, 0.24, 0.06], "shininess": 32}, "transform": {"position": [1.25, -0.35, 0], "rotation": [0.2, -0.5, 0.15], "scale": [0.8, 0.8, 0.8]}}
+    {"mesh": "../assets/icosahedron.obj", "material": {"type": "ggx", "metallic": 0.8, "roughness": 0.24}, "transform": {"position": [-1.25, 0.1, 0], "rotation": [0, 0.4, 0], "scale": [1.1, 1.1, 1.1]}, "instancing": {"count": 3, "grid": {"dimensions": [3, 1, 1], "spacing": [1.0, 0, 0]}}},
+    {"mesh": "../assets/cube.obj", "material": {"type": "blinn_phong", "diffuse": [0.95, 0.24, 0.06], "shininess": 32}, "transform": {"position": [1.25, -0.35, 0], "rotation": [0.2, -0.5, 0.15], "scale": [0.8, 0.8, 0.8]}},
+    {"mesh": "../assets/icosahedron.obj", "material": {"type": "blinn_phong", "diffuse": [0.18, 0.7, 0.3]}, "transform": {"position": [0, -0.65, -1.4], "scale": [0.45, 0.45, 0.45]}, "lod": {"ratios": [0.5, 0.25], "thresholds": [256, 96]}}
   ],
   "postfx": [{"type": "ssao", "radius": 0.55}, {"type": "bloom"}, {"type": "aces", "exposure": 1.15}],
   "particles": [{"position": [0, -0.8, 0], "emission_rate": 2, "lifetime_steps": 90, "initial_velocity": [0, 1.8, 0], "gravity": [0, -2.4, 0], "capacity": 128}],
