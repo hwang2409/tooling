@@ -49,7 +49,10 @@ export function Stage({ index }: Props) {
         <span className="caption__meta">{demo.tag}</span>
         <span className="caption__spacer" aria-hidden />
         <span className="caption__stats tabular">
-          {telemetry.fps.toString().padStart(2, "0")} fps · 960 × 640
+          {telemetry.fps.toString().padStart(2, "0")} fps ·{" "}
+          {state.status === "ready"
+            ? `${state.width} × ${state.height}`
+            : "— × —"}
         </span>
       </figcaption>
 
@@ -57,8 +60,6 @@ export function Stage({ index }: Props) {
         <canvas
           ref={canvasRef}
           className="plinth__canvas"
-          width={960}
-          height={640}
           aria-label={`live CPU rasterizer — ${demo.name} (drag to orbit)`}
           onPointerDown={(event) => {
             event.currentTarget.setPointerCapture(event.pointerId);
