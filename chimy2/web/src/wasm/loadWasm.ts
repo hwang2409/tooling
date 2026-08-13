@@ -6,6 +6,8 @@ export type Chimy2Exports = {
   framebuffer_len: () => number;
   framebuffer_width: () => number;
   framebuffer_height: () => number;
+  scene_alloc: (len: number) => number;
+  load_scene_json: (ptr: number, len: number) => number;
 };
 
 export type Chimy2Instance = {

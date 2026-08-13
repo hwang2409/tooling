@@ -3,6 +3,7 @@ import { loadWasm, type Chimy2Instance } from "../wasm/loadWasm";
 
 export type RendererState =
   | { status: "loading" }
+  | { status: "loading-scene"; scene: string }
   | { status: "ready"; width: number; height: number }
   | { status: "error"; message: string };
 
@@ -18,14 +19,12 @@ export type OrbitRef = {
   pitch: number;
 };
 
-// Vite serves public/ contents from the site root in both dev and production,
-// so a document-relative URL works in both environments.
 const RUNTIME_WASM_URL = "./chimy2.wasm";
 
 export function useRenderer(
   canvasRef: React.RefObject<HTMLCanvasElement | null>,
   options: {
-    mode: number;
+    sceneFile: string;
     paused: boolean;
     orbit: React.MutableRefObject<OrbitRef>;
     onError?: (message: string) => void;
@@ -38,15 +37,11 @@ export function useRenderer(
     yaw: 0,
     pitch: 0,
   });
+  const [bootTick, setBootTick] = useState(0);
   const instanceRef = useRef<Chimy2Instance | null>(null);
+  const sceneReadyRef = useRef(false);
 
-  // Keep the mutable options in refs so the RAF loop reads current values
-  // without needing to be torn down and re-established on every render.
-  const modeRef = useRef(options.mode);
   const pausedRef = useRef(options.paused);
-  useEffect(() => {
-    modeRef.current = options.mode;
-  }, [options.mode]);
   useEffect(() => {
     pausedRef.current = options.paused;
   }, [options.paused]);
@@ -77,17 +72,23 @@ export function useRenderer(
         if (!ctx) throw new Error("2d context unavailable");
         imageData = ctx.createImageData(width, height);
         instanceRef.current = instance;
-        setState({ status: "ready", width, height });
+        setBootTick((n) => n + 1);
         fpsTimestamp = performance.now();
 
         const loop = (time: number) => {
           if (cancelled) return;
-          if (!pausedRef.current && instanceRef.current && imageData && ctx) {
+          if (
+            !pausedRef.current &&
+            instanceRef.current &&
+            imageData &&
+            ctx &&
+            sceneReadyRef.current
+          ) {
             const result = instanceRef.current.exports.render_frame(
               time,
               options.orbit.current.yaw,
               options.orbit.current.pitch,
-              modeRef.current,
+              0,
             );
             if (result !== 0) {
               options.onError?.(`render failed (${result})`);
@@ -116,8 +117,6 @@ export function useRenderer(
                 });
                 lastTelemetry = time;
               } else if (time - lastTelemetry >= 100) {
-                // Cheap frame/orbit refresh at ~10 Hz so the readout tracks the
-                // pointer without hitting React on every RAF tick.
                 setTelemetry((prev) => ({
                   ...prev,
                   frame: sessionFrames,
@@ -145,6 +144,53 @@ export function useRenderer(
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Load the requested scene JSON into the wasm instance whenever the scene
+  // changes (or the wasm just finished booting). Sequence:
+  //   fetch(json) -> scene_alloc(len) -> copy bytes -> load_scene_json(ptr,len)
+  // The wasm's scene mesh assets are embedded via the Rust `include_str!`
+  // fallback in scene/assets.rs, so `render_frame` returns rc=0 for every
+  // shipped scene without any browser-side asset fetching beyond the JSON.
+  useEffect(() => {
+    if (bootTick === 0) return;
+    const instance = instanceRef.current;
+    if (!instance) return;
+    let cancelled = false;
+    sceneReadyRef.current = false;
+    setState({ status: "loading-scene", scene: options.sceneFile });
+    (async () => {
+      try {
+        const response = await fetch(options.sceneFile);
+        if (!response.ok) {
+          throw new Error(`fetch ${options.sceneFile}: HTTP ${response.status}`);
+        }
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (cancelled) return;
+        const ptr = instance.exports.scene_alloc(bytes.length);
+        if (ptr === 0) throw new Error("scene_alloc returned null");
+        const target = new Uint8Array(instance.exports.memory.buffer, ptr, bytes.length);
+        target.set(bytes);
+        const rc = instance.exports.load_scene_json(ptr, bytes.length);
+        if (rc !== 0) throw new Error(`load_scene_json rc=${rc}`);
+        if (cancelled) return;
+        options.orbit.current.yaw = 0;
+        options.orbit.current.pitch = 0;
+        sceneReadyRef.current = true;
+        const width = instance.exports.framebuffer_width();
+        const height = instance.exports.framebuffer_height();
+        setState({ status: "ready", width, height });
+      } catch (error) {
+        if (cancelled) return;
+        const message = error instanceof Error ? error.message : String(error);
+        setState({ status: "error", message });
+        options.onError?.(message);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [options.sceneFile, bootTick]);
 
   return { state, telemetry };
 }
