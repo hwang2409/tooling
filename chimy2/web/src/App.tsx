@@ -1,22 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Header } from "./components/Header";
-import { Hero } from "./components/Hero";
-import { LiveViewport } from "./components/LiveViewport";
-import { SceneGallery } from "./components/SceneGallery";
-import { SceneDetail } from "./components/SceneDetail";
-import { About } from "./components/About";
-import { Footer } from "./components/Footer";
-import { TelemetryPill } from "./components/TelemetryPill";
-import { SHADER_MODES } from "./data/modes";
-import { SCENES } from "./data/scenes";
-import { useSceneRoute } from "./hooks/useSceneRoute";
+import { useEffect } from "react";
+import { Stage } from "./components/Stage";
+import { DemoList } from "./components/DemoList";
+import { DEMOS } from "./data/demos";
+import { useDemoRoute } from "./hooks/useDemoRoute";
 
 export default function App() {
-  const [mode, setMode] = useState(0);
-  const [paused, setPaused] = useState(false);
-  const [sceneIndex, setSceneIndex] = useSceneRoute(0);
-  const [telemetry, setTelemetry] = useState({ fps: 0, frame: 0, mode: 0 });
-  const detailAnchorRef = useRef<HTMLDivElement>(null);
+  const [index, setIndex] = useDemoRoute(0);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -29,118 +18,62 @@ export default function App() {
         return;
       }
       const digit = Number(event.key);
-      if (Number.isInteger(digit) && digit >= 1 && digit <= SHADER_MODES.length) {
-        setMode(digit - 1);
+      if (Number.isInteger(digit) && digit >= 1 && digit <= DEMOS.length) {
+        setIndex(digit - 1);
         return;
       }
-      if (event.key === "[") {
-        setMode((m) => (m - 1 + SHADER_MODES.length) % SHADER_MODES.length);
+      if (event.key === "ArrowDown" || event.key === "ArrowRight") {
+        event.preventDefault();
+        setIndex(index + 1);
         return;
       }
-      if (event.key === "]") {
-        setMode((m) => (m + 1) % SHADER_MODES.length);
-        return;
-      }
-      if (event.key === "ArrowLeft") {
-        setSceneIndex(sceneIndex - 1);
-        return;
-      }
-      if (event.key === "ArrowRight") {
-        setSceneIndex(sceneIndex + 1);
+      if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
+        event.preventDefault();
+        setIndex(index - 1);
         return;
       }
       if (event.key.toLowerCase() === "r") {
-        // Reset dispatched via a custom event so the LiveViewport orbit ref is the
-        // only source of truth for orbit state — no lifted state, no rerender.
         window.dispatchEvent(new CustomEvent("chimy2:reset-orbit"));
-        return;
-      }
-      if (event.key === " ") {
-        event.preventDefault();
-        setPaused((p) => !p);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [sceneIndex, setSceneIndex]);
-
-  const onTelemetry = useCallback(
-    (next: { fps: number; frame: number; mode: number }) => {
-      setTelemetry((prev) =>
-        prev.fps === next.fps && prev.frame === next.frame && prev.mode === next.mode
-          ? prev
-          : next,
-      );
-    },
-    [],
-  );
-
-  const goToScene = useCallback(
-    (index: number) => {
-      const wrapped =
-        ((index % SCENES.length) + SCENES.length) % SCENES.length;
-      setSceneIndex(wrapped);
-      requestAnimationFrame(() => {
-        detailAnchorRef.current?.scrollIntoView({
-          behavior: "smooth",
-          block: "start",
-        });
-      });
-    },
-    [setSceneIndex],
-  );
+  }, [index, setIndex]);
 
   return (
-    <>
-      <Header />
-      <main className="page">
-        <Hero />
+    <main className="room">
+      <aside className="rail">
+        <a className="mark" href="#/scene/01" aria-label="chimy2">
+          <span className="mark__word">chimy</span>
+          <span className="mark__two">2</span>
+        </a>
+        <p className="rail__caption">
+          Eight live demos of a CPU rasterizer written from scratch. Every
+          frame drawn in <span className="rail__cap-em">wasm</span>, on this
+          thread.
+        </p>
 
-        <LiveViewport
-          mode={mode}
-          onModeChange={setMode}
-          paused={paused}
-          onPausedChange={setPaused}
-          onTelemetryUpdate={onTelemetry}
-        />
+        <DemoList index={index} onSelect={setIndex} />
 
-        <section id="scenes" className="scenes">
-          <div className="section-head">
-            <span className="section-head__idx">02</span>
-            <h2 className="section-head__title">
-              Scene format · Curated gallery
-            </h2>
-            <span className="section-head__meta">
-              rendered natively · <span className="tabular">960 × 640</span>
-            </span>
+        <footer className="rail__foot">
+          <div className="hint">
+            <kbd>↑</kbd><kbd>↓</kbd><span>pick</span>
           </div>
-          <p className="scenes__lede">
-            These eight scenes are authored in chimy2's strict JSON scene format
-            (<code>docs/scene.md</code>). Every camera, light, mesh, shadow map,
-            particle emitter, HUD glyph and post effect is described by data —
-            then rendered by the same pipeline the browser runs above.
-          </p>
+          <div className="hint">
+            <kbd>1</kbd>–<kbd>8</kbd><span>jump</span>
+          </div>
+          <div className="hint">
+            <kbd>drag</kbd><span>orbit</span>
+          </div>
+          <div className="hint">
+            <kbd>R</kbd><span>reset</span>
+          </div>
+        </footer>
+      </aside>
 
-          <SceneGallery selectedIndex={sceneIndex} onSelect={goToScene} />
-
-          <div ref={detailAnchorRef} aria-hidden />
-
-          <SceneDetail
-            index={sceneIndex}
-            onPrev={() => setSceneIndex(sceneIndex - 1)}
-            onNext={() => setSceneIndex(sceneIndex + 1)}
-          />
-        </section>
-
-        <About />
-      </main>
-      <Footer />
-
-      <TelemetryPill
-        fps={telemetry.fps}
-        frame={telemetry.frame}
-        mode={mode}
-      />
-    </>
+      <section className="panel" aria-label="live render">
+        <Stage index={index} />
+      </section>
+    </main>
   );
 }
