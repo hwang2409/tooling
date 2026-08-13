@@ -15,6 +15,7 @@ use crate::material::MaterialLibrary;
 use crate::math::{Mat4, Vec3};
 use crate::mesh::Mesh;
 use crate::pipeline::{FragmentStage, Pipeline, VertexStage};
+use crate::scene::Scene;
 use crate::shaders::{
     BlinnPhongUniforms, DirectionalLight, DitherShader, DitherUniforms, FogShader, FogUniforms,
     NormalMappedBlinnPhongShader, NormalMappedBlinnPhongUniforms, NormalsShader, NormalsUniforms,
@@ -39,6 +40,20 @@ enum ShowcaseErrorCode {
     InvalidDimensions = -1,
     NotInitialized = -2,
     Render = -3,
+    Scene = -4,
+}
+
+fn load_scene_bytes_state(state: &mut Option<Scene>, bytes: &[u8]) -> i32 {
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return api_error(ShowcaseErrorCode::Scene);
+    };
+    match Scene::from_str(source) {
+        Ok(scene) => {
+            *state = Some(scene);
+            0
+        }
+        Err(_) => api_error(ShowcaseErrorCode::Scene),
+    }
 }
 
 #[derive(Debug)]
@@ -380,10 +395,24 @@ unsafe impl Sync for WasmState {}
 static STATE: WasmState = WasmState(UnsafeCell::new(None));
 
 #[cfg(target_arch = "wasm32")]
+static SCENE_STATE: WasmSceneState = WasmSceneState(UnsafeCell::new(None));
+
+#[cfg(target_arch = "wasm32")]
+struct WasmSceneState(UnsafeCell<Option<Scene>>);
+
+#[cfg(target_arch = "wasm32")]
+unsafe impl Sync for WasmSceneState {}
+
+#[cfg(target_arch = "wasm32")]
 fn state() -> &'static mut Option<Showcase> {
     // JavaScript calls this API on one thread. The browser contract forbids
     // reentrant calls while a frame is being rendered.
     unsafe { &mut *STATE.0.get() }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn scene_state() -> &'static mut Option<Scene> {
+    unsafe { &mut *SCENE_STATE.0.get() }
 }
 
 fn api_error(code: ShowcaseErrorCode) -> i32 {
@@ -474,6 +503,19 @@ pub extern "C" fn framebuffer_height() -> u32 {
     framebuffer_height_state(state())
 }
 
+/// Loads a scene JSON string from JavaScript memory.
+///
+/// The caller keeps the bytes alive for the duration of this call.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn load_scene_json(bytes: *const u8, length: usize) -> i32 {
+    if bytes.is_null() {
+        return api_error(ShowcaseErrorCode::Scene);
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(bytes, length) };
+    load_scene_bytes_state(scene_state(), bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +572,20 @@ mod tests {
         assert_eq!(init_state(&mut state, 32, 24), 0);
         assert_eq!(framebuffer_width_state(&state), 32);
         assert_eq!(framebuffer_height_state(&state), 24);
+    }
+
+    #[test]
+    fn scene_json_boundary_uses_the_strict_loader() {
+        let mut scene = None;
+        let valid =
+            br#"{"camera":{"position":[0,0,5],"target":[0,0,0],"fov":1,"near":0.1,"far":10}}"#;
+        assert_eq!(load_scene_bytes_state(&mut scene, valid), 0);
+        assert!(scene.is_some());
+        assert_eq!(
+            load_scene_bytes_state(&mut scene, br#"{"camera":{"position":[0,0,5]}}"#),
+            -4
+        );
+        assert!(scene.is_some());
     }
 
     #[test]

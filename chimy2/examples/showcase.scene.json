@@ -1,0 +1,121 @@
+{
+  "camera": {
+    "position": [0.0, 1.4, 6.2],
+    "target": [0.0, 0.3, 0.0],
+    "fov": 0.95,
+    "near": 0.1,
+    "far": 100.0
+  },
+  "environment": {
+    "background": [0.008, 0.012, 0.028, 1.0],
+    "skybox": {
+      "px": "../assets/skybox_px.qoi",
+      "nx": "../assets/skybox_nx.qoi",
+      "py": "../assets/skybox_py.qoi",
+      "ny": "../assets/skybox_ny.qoi",
+      "pz": "../assets/skybox_pz.qoi",
+      "nz": "../assets/skybox_nz.qoi"
+    },
+    "ibl": {
+      "intensity": 0.8,
+      "irradiance_size": 16,
+      "prefilter_size": 32,
+      "prefilter_levels": 5
+    }
+  },
+  "lights": [
+    {
+      "type": "directional",
+      "direction": [-0.35, 0.75, 1.0],
+      "color": [1.0, 0.92, 0.82],
+      "shadow": {
+        "type": "csm",
+        "map_size": 1024,
+        "cascades": 3,
+        "lambda": 0.55,
+        "bias": 0.002,
+        "slope_bias": 0.02,
+        "near": 0.1,
+        "far": 100.0
+      }
+    },
+    {
+      "type": "point",
+      "position": [2.0, 2.5, 3.0],
+      "color": [1.0, 0.25, 0.08],
+      "constant": 1.0,
+      "linear": 0.04,
+      "quadratic": 0.01,
+      "shadow": {
+        "type": "cube",
+        "map_size": 512,
+        "near": 0.1,
+        "far": 25.0
+      }
+    }
+  ],
+  "objects": [
+    {
+      "mesh": "../assets/icosahedron.obj",
+      "material": {
+        "type": "ggx",
+        "ambient": [0.03, 0.04, 0.08],
+        "diffuse": [0.16, 0.38, 0.95],
+        "specular": [1.0, 0.85, 0.55],
+        "shininess": 48.0,
+        "metallic": 0.8,
+        "roughness": 0.24
+      },
+      "transform": {
+        "position": [-1.25, 0.1, 0.0],
+        "rotation": [0.0, 0.4, 0.0],
+        "scale": [1.1, 1.1, 1.1]
+      },
+      "instancing": {
+        "count": 3,
+        "transforms": [
+          {"position": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0]},
+          {"position": [0.0, -0.8, -1.0], "rotation": [0.2, 0.5, 0.0], "scale": [0.55, 0.55, 0.55]},
+          {"position": [0.0, 0.8, -1.0], "rotation": [-0.2, -0.3, 0.0], "scale": [0.42, 0.42, 0.42]}
+        ]
+      },
+      "lod": {"ratios": [0.5, 0.25], "thresholds": [256.0, 96.0]}
+    },
+    {
+      "mesh": "../assets/cube.obj",
+      "material": {
+        "type": "blinn_phong",
+        "ambient": [0.08, 0.025, 0.012],
+        "diffuse": [0.95, 0.24, 0.06],
+        "specular": [1.0, 0.55, 0.22],
+        "shininess": 32.0
+      },
+      "transform": {
+        "position": [1.25, -0.35, 0.0],
+        "rotation": [0.2, -0.5, 0.15],
+        "scale": [0.8, 0.8, 0.8]
+      }
+    }
+  ],
+  "postfx": [
+    {"type": "ssao", "radius": 0.55, "bias": 0.025, "strength": 1.0, "range": 0.9, "blur_depth_threshold": 0.35},
+    {"type": "bloom"},
+    {"type": "aces", "exposure": 1.15}
+  ],
+  "particles": [
+    {
+      "position": [0.0, -0.8, 0.0],
+      "emission_rate": 2,
+      "lifetime_steps": 90,
+      "initial_velocity": [0.0, 1.8, 0.0],
+      "velocity_variation": [0.35, 0.25, 0.35],
+      "gravity": [0.0, -2.4, 0.0],
+      "drag": 0.02,
+      "capacity": 128
+    }
+  ],
+  "hud": [
+    {"text": "CHIMY2 SCENE FORMAT", "x": 20, "y": 20, "scale": 2, "color": [0.85, 0.92, 1.0, 1.0]},
+    {"text": "ORDERED OBJECTS / CSM / CUBE SHADOWS / POSTFX", "x": 20, "y": 42, "scale": 1, "color": [0.45, 0.65, 0.9, 1.0]}
+  ]
+}
