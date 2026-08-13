@@ -10,8 +10,9 @@
 //! # Narrow-phase coverage (tier 2)
 //!
 //! [`sphere_plane`], [`box_plane`], [`capsule_plane`], [`sphere_sphere`],
-//! [`sphere_capsule`], [`capsule_capsule`]. Box-box and box-sphere are
-//! deferred to a later tier; the deferral note is in the PR body.
+//! [`sphere_capsule`], [`capsule_capsule`], [`box_box`] (vertex-vs-face).
+//! Box-sphere and box-capsule are deferred to a later tier; the deferral
+//! note is in the PR body.
 //!
 //! # Determinism
 //!
@@ -325,6 +326,164 @@ pub fn sphere_capsule(
     )
 }
 
+/// Box vs box: vertex-vs-face (Sutherland-style pruning is deferred to a
+/// later tier).
+///
+/// For each pair (A's 8 vertices vs B's interior, and B's 8 vertices vs A's
+/// interior), a penetrating vertex generates one contact whose normal is the
+/// out-normal of the nearest face of the containing box. Contacts are pooled,
+/// sorted by penetration depth, and the four deepest are kept.
+///
+/// **Coverage limits.** This misses pure edge-vs-edge intersections (two
+/// obliquely oriented boxes clashing on edges with all vertices outside the
+/// other). The stacking regime this tier targets is dominated by
+/// vertex-vs-face — 4 corners of the upper box resting on the top face of
+/// the lower — so the shortcut buys the coverage we need. A full SAT + face
+/// clipping arrives with tier v1 alongside cylinder/mesh geoms.
+#[allow(clippy::too_many_arguments)]
+pub fn box_box(
+    idx_a: usize,
+    pose_a: &GeomPose,
+    half_a: Vec3,
+    idx_b: usize,
+    pose_b: &GeomPose,
+    half_b: Vec3,
+    friction: f32,
+) -> ContactBuf {
+    const CORNER_SIGNS: [(f32, f32, f32); 8] = [
+        (-1.0, -1.0, -1.0),
+        (-1.0, -1.0, 1.0),
+        (-1.0, 1.0, -1.0),
+        (-1.0, 1.0, 1.0),
+        (1.0, -1.0, -1.0),
+        (1.0, -1.0, 1.0),
+        (1.0, 1.0, -1.0),
+        (1.0, 1.0, 1.0),
+    ];
+
+    // "Canonical" separation direction from B's center toward A's center, in
+    // both boxes' local frames. Used to pick which face of the containing box
+    // the contact belongs to — the "nearest face" rule alone chooses the
+    // wrong face when the intruding vertex sits closer to the far wall of
+    // the container, which is exactly the regime that stacking hits.
+    let delta_world = pose_a.position - pose_b.position;
+    let delta_in_b = pose_b.orientation.inverse_rotate(delta_world);
+    let delta_in_a = pose_a.orientation.inverse_rotate(-delta_world);
+    // Fallback direction when the two centers coincide.
+    let fallback = Vec3::Z;
+    let dir_b = if delta_in_b.length_squared() > 0.0 {
+        delta_in_b
+    } else {
+        fallback
+    };
+    let dir_a = if delta_in_a.length_squared() > 0.0 {
+        delta_in_a
+    } else {
+        -fallback
+    };
+
+    // Candidate contacts: (penetration, position_world, normal_world). Up to
+    // 16 (8 vertices from each side); the caller keeps 4 deepest.
+    let mut candidates: [(f32, Vec3, Vec3); 16] = [(0.0, Vec3::ZERO, Vec3::Z); 16];
+    let mut count = 0usize;
+
+    // A's vertices in B — normal is B's out-normal along `dir_b` (from B into A).
+    for &(sx, sy, sz) in &CORNER_SIGNS {
+        let local_a = Vec3::new(sx * half_a.x, sy * half_a.y, sz * half_a.z);
+        let world_v = pose_a.point_to_world(local_a);
+        let local_b = pose_b.orientation.inverse_rotate(world_v - pose_b.position);
+        if let Some((pen, normal_local_b)) = face_along_direction(local_b, half_b, dir_b) {
+            let normal_world = pose_b.rotate(normal_local_b);
+            candidates[count] = (pen, world_v, normal_world);
+            count += 1;
+        }
+    }
+    // B's vertices in A — face normal points OUT of A (that's from A into B).
+    // Flip to get "from B into A".
+    for &(sx, sy, sz) in &CORNER_SIGNS {
+        let local_b = Vec3::new(sx * half_b.x, sy * half_b.y, sz * half_b.z);
+        let world_v = pose_b.point_to_world(local_b);
+        let local_a = pose_a.orientation.inverse_rotate(world_v - pose_a.position);
+        if let Some((pen, normal_local_a)) = face_along_direction(local_a, half_a, dir_a) {
+            let normal_world = -pose_a.rotate(normal_local_a);
+            candidates[count] = (pen, world_v, normal_world);
+            count += 1;
+        }
+    }
+
+    // Stable sort descending by penetration; ties by candidate index.
+    let mut order: [usize; 16] = std::array::from_fn(|i| i);
+    for i in 1..count {
+        let mut j = i;
+        while j > 0 && candidates[order[j]].0 > candidates[order[j - 1]].0 {
+            order.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    let take = if count > 4 { 4 } else { count };
+    let mut out = ContactBuf::new();
+    for &i in &order[..take] {
+        let (pen, pos, normal) = candidates[i];
+        out.push(Contact {
+            geom_a: idx_a,
+            geom_b: idx_b,
+            position_world: pos,
+            normal_world: normal,
+            penetration: pen,
+            friction,
+        });
+    }
+    out
+}
+
+/// If `local_point` is strictly inside the AABB of half-extents `half`,
+/// return `(penetration, out-normal in local frame)` for the face aligned
+/// with `direction_local`. The face is picked by the largest-magnitude
+/// component of `direction_local` (with sign); penetration is the distance
+/// from `local_point` to that face measured *along the out-normal*.
+///
+/// This is what makes vertex-vs-face box-box work in a stacking regime:
+/// the "closest face" rule alone chooses the wrong face when the intruding
+/// vertex sits closer to the far wall of the container, driving the
+/// separation force the wrong way. Anchoring the face to the pose delta
+/// gets the stack to actually settle.
+fn face_along_direction(
+    local_point: Vec3,
+    half: Vec3,
+    direction_local: Vec3,
+) -> Option<(f32, Vec3)> {
+    let dx = half.x - crate::math::abs(local_point.x);
+    let dy = half.y - crate::math::abs(local_point.y);
+    let dz = half.z - crate::math::abs(local_point.z);
+    // Outside the box on any axis → no penetration. Note the strict `< 0.0`:
+    // a vertex sitting ON a face (`d = 0`) still counts along orthogonal
+    // axes, which is what makes corner-on-corner axis-aligned stacks emit
+    // contacts. Only the chosen axis has to be strictly positive.
+    if dx < 0.0 || dy < 0.0 || dz < 0.0 {
+        return None;
+    }
+    let adx = crate::math::abs(direction_local.x);
+    let ady = crate::math::abs(direction_local.y);
+    let adz = crate::math::abs(direction_local.z);
+    let (pen, normal_local) = if adx >= ady && adx >= adz {
+        let sign = if direction_local.x >= 0.0 { 1.0 } else { -1.0 };
+        let p = half.x - sign * local_point.x;
+        (p, Vec3::new(sign, 0.0, 0.0))
+    } else if ady >= adz {
+        let sign = if direction_local.y >= 0.0 { 1.0 } else { -1.0 };
+        let p = half.y - sign * local_point.y;
+        (p, Vec3::new(0.0, sign, 0.0))
+    } else {
+        let sign = if direction_local.z >= 0.0 { 1.0 } else { -1.0 };
+        let p = half.z - sign * local_point.z;
+        (p, Vec3::new(0.0, 0.0, sign))
+    };
+    if pen <= 0.0 {
+        return None;
+    }
+    Some((pen, normal_local))
+}
+
 /// Capsule vs capsule. Segment-segment closest points then sphere-vs-sphere.
 #[allow(clippy::too_many_arguments)]
 pub fn capsule_capsule(
@@ -518,6 +677,15 @@ fn try_narrow_phase(
                 half_height: hb,
             },
         ) => capsule_capsule(idx_a, pose_a, ra, ha, idx_b, pose_b, rb, hb, friction),
+        (
+            GeomShape::Box {
+                half_extents: half_a,
+            },
+            GeomShape::Box {
+                half_extents: half_b,
+            },
+        ) => box_box(idx_a, pose_a, half_a, idx_b, pose_b, half_b, friction),
+        // Still deferred: box-sphere, box-capsule.
         _ => return None,
     })
 }
@@ -629,6 +797,44 @@ mod tests {
         assert!(approx(c.penetration, 1.0, 1e-5));
         // Normal from B (-x) to A (+x): +X direction.
         assert!(approx_vec(c.normal_world, Vec3::X, 1e-6));
+    }
+
+    #[test]
+    fn box_box_axis_aligned_stack_gives_four_bottom_corner_contacts() {
+        // Upper box (unit-cube-ish) resting on lower box, both axis-aligned.
+        // Upper's 4 bottom corners penetrate lower's top face by ~0.05.
+        let upper_pose = GeomPose {
+            position: Vec3::new(0.0, 0.0, 0.75),
+            orientation: Quat::IDENTITY,
+        };
+        let lower_pose = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let hu = Vec3::splat(0.3);
+        let hl = Vec3::splat(0.5);
+        let buf = box_box(0, &upper_pose, hu, 1, &lower_pose, hl, 0.5);
+        assert_eq!(buf.len, 4);
+        for c in buf.as_slice() {
+            // Upper bottom = 0.75 − 0.3 = 0.45. Lower top = 0 + 0.5 = 0.5.
+            // Overlap = 0.05 in +Z of lower box.
+            assert!((c.penetration - 0.05).abs() < 1e-5);
+            assert!(approx_vec(c.normal_world, Vec3::Z, 1e-5));
+        }
+    }
+
+    #[test]
+    fn box_box_disjoint_returns_no_contacts() {
+        let a = GeomPose {
+            position: Vec3::new(0.0, 0.0, 5.0),
+            orientation: Quat::IDENTITY,
+        };
+        let b = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let buf = box_box(0, &a, Vec3::splat(0.5), 1, &b, Vec3::splat(0.5), 0.5);
+        assert_eq!(buf.len, 0);
     }
 
     #[test]

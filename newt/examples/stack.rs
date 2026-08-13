@@ -1,6 +1,7 @@
-//! Tier 2 demo: three spheres dropped and settling into a vertical stack on
-//! a static plane. Renders a wireframe PPM through chimy2 the same way
-//! `tumble.rs` does.
+//! Tier 2 demo: three boxes dropped and settling into a vertical stack on
+//! a static plane. Exercises box-plane (bottom box, 4 corner contacts) and
+//! box-box (upper boxes, vertex-vs-face) contact paths under gravity.
+//! Wireframe PPM via chimy2, same rendering plumbing as `tumble.rs`.
 //!
 //! Run:
 //! ```text
@@ -13,7 +14,7 @@ use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
 
 use newt::body::Body;
 use newt::geom::Geom;
-use newt::math::{Quat, Vec3, cos, sin};
+use newt::math::{Quat, Vec3};
 use newt::world::World;
 
 use std::path::PathBuf;
@@ -38,23 +39,63 @@ fn parse_args() -> (usize, PathBuf, (usize, usize)) {
     (frames, out, size)
 }
 
-const RADIUS: f32 = 0.3;
+const HALF: Vec3 = Vec3::new(0.35, 0.35, 0.35);
 
 fn build_world() -> World {
     let mut world = World::new();
     world.dt = 0.005;
     world.gravity = Vec3::new(0.0, 0.0, -9.81);
     world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.6));
-    for &h in &[0.5f32, 1.3, 2.1] {
-        let idx = world.add_body(Body::solid_sphere(
-            1.0,
-            RADIUS,
-            Vec3::new(0.0, 0.0, h),
-            Quat::IDENTITY,
-        ));
-        world.add_geom(Geom::sphere(idx, RADIUS, Vec3::ZERO, 0.6));
+
+    // Drop heights are staggered so the boxes arrive in sequence rather
+    // than crashing together mid-air. Perfect vertical alignment on X/Y —
+    // box_box's face-along-direction pick handles the corner-on-corner
+    // degeneracy that a naive nearest-face rule would trip on.
+    let drops = [
+        (Vec3::new(0.0, 0.0, 0.5), Quat::IDENTITY),
+        (Vec3::new(0.0, 0.0, 1.7), Quat::IDENTITY),
+        (Vec3::new(0.0, 0.0, 2.9), Quat::IDENTITY),
+    ];
+    for &(pos, ori) in &drops {
+        let idx = world.add_body(Body::solid_box(1.0, HALF, pos, ori));
+        world.add_geom(Geom::r#box(idx, HALF, Vec3::ZERO, Quat::IDENTITY, 0.6));
     }
     world
+}
+
+// Box wireframe: 8 corners, 12 edges — same shape as tier-1 tumble.rs.
+const BOX_CORNERS_LOCAL: [(f32, f32, f32); 8] = [
+    (-1.0, -1.0, -1.0),
+    (1.0, -1.0, -1.0),
+    (1.0, 1.0, -1.0),
+    (-1.0, 1.0, -1.0),
+    (-1.0, -1.0, 1.0),
+    (1.0, -1.0, 1.0),
+    (1.0, 1.0, 1.0),
+    (-1.0, 1.0, 1.0),
+];
+const BOX_EDGES: [(usize, usize); 12] = [
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 0),
+    (4, 5),
+    (5, 6),
+    (6, 7),
+    (7, 4),
+    (0, 4),
+    (1, 5),
+    (2, 6),
+    (3, 7),
+];
+
+fn box_world_corners(body: &Body, half: Vec3) -> [Vec3; 8] {
+    let mut out = [Vec3::ZERO; 8];
+    for (i, &(sx, sy, sz)) in BOX_CORNERS_LOCAL.iter().enumerate() {
+        let local = Vec3::new(sx * half.x, sy * half.y, sz * half.z);
+        out[i] = body.position + body.orientation.rotate(local);
+    }
+    out
 }
 
 fn draw_line(fb: &mut Framebuffer, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: u32) {
@@ -84,8 +125,8 @@ fn draw_line(fb: &mut Framebuffer, mut x0: i32, mut y0: i32, x1: i32, y1: i32, c
     }
 }
 
-fn project(camera_matrix: Mat4, world_pt: Vec3, width: usize, height: usize) -> Option<(i32, i32)> {
-    let clip = camera_matrix * Vec4::new(world_pt.x, world_pt.y, world_pt.z, 1.0);
+fn project(camera: Mat4, world_pt: Vec3, width: usize, height: usize) -> Option<(i32, i32)> {
+    let clip = camera * Vec4::new(world_pt.x, world_pt.y, world_pt.z, 1.0);
     if clip.w <= 0.0 {
         return None;
     }
@@ -100,40 +141,12 @@ fn project(camera_matrix: Mat4, world_pt: Vec3, width: usize, height: usize) -> 
     Some((sx as i32, sy as i32))
 }
 
-/// Draw three great circles (xy, xz, yz) through the sphere center to sketch
-/// its silhouette without pulling in a real mesh.
-fn draw_sphere_wireframe(
-    fb: &mut Framebuffer,
-    camera: Mat4,
-    width: usize,
-    height: usize,
-    center: Vec3,
-    radius: f32,
-    color: u32,
-) {
-    const SEGMENTS: usize = 24;
-    let planes: [(Vec3, Vec3); 3] = [(Vec3::X, Vec3::Y), (Vec3::X, Vec3::Z), (Vec3::Y, Vec3::Z)];
-    for &(u, v) in &planes {
-        let mut prev: Option<(i32, i32)> = None;
-        for i in 0..=SEGMENTS {
-            let theta = (i as f32) / (SEGMENTS as f32) * (2.0 * newt::math::PI);
-            let p = center + u * (radius * cos(theta)) + v * (radius * sin(theta));
-            let cur = project(camera, p, width, height);
-            if let (Some(a), Some(b)) = (prev, cur) {
-                draw_line(fb, a.0, a.1, b.0, b.1, color);
-            }
-            prev = cur;
-        }
-    }
-}
-
 fn draw_ground_grid(fb: &mut Framebuffer, camera: Mat4, width: usize, height: usize, color: u32) {
     let span = 3.0;
     let step = 0.5;
     let n = (2.0 * span / step) as i32;
     for i in 0..=n {
         let t = -span + (i as f32) * step;
-        // Line parallel to X:
         let a = Vec3::new(-span, t, 0.0);
         let b = Vec3::new(span, t, 0.0);
         if let (Some(p0), Some(p1)) = (
@@ -163,7 +176,7 @@ fn render(world: &World, width: usize, height: usize) -> Framebuffer {
         200.0,
     ) * Mat4::look_at(
         CVec3::new(3.5, -4.5, 2.5),
-        CVec3::new(0.0, 0.0, 0.8),
+        CVec3::new(0.0, 0.0, 1.2),
         CVec3::new(0.0, 0.0, 1.0),
     );
     draw_ground_grid(&mut fb, camera, width, height, argb8888(0xff, 40, 45, 55));
@@ -172,16 +185,15 @@ fn render(world: &World, width: usize, height: usize) -> Framebuffer {
         argb8888(0xff, 90, 220, 240),
         argb8888(0xff, 240, 100, 140),
     ];
-    for (i, body) in world.bodies.iter().enumerate() {
-        draw_sphere_wireframe(
-            &mut fb,
-            camera,
-            width,
-            height,
-            body.position,
-            RADIUS,
-            colors[i],
-        );
+    for (idx, body) in world.bodies.iter().enumerate() {
+        let corners = box_world_corners(body, HALF);
+        let projected: [Option<(i32, i32)>; 8] =
+            std::array::from_fn(|i| project(camera, corners[i], width, height));
+        for &(a, b) in BOX_EDGES.iter() {
+            if let (Some((x0, y0)), Some((x1, y1))) = (projected[a], projected[b]) {
+                draw_line(&mut fb, x0, y0, x1, y1, colors[idx]);
+            }
+        }
     }
     fb
 }
@@ -195,15 +207,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fb = render(&world, width, height);
     write_ppm(&out, &fb)?;
     println!(
-        "wrote {} ({}x{}) — final body z positions: {:?}",
+        "wrote {} ({}x{}) — final box positions: {:?}",
         out.display(),
         width,
         height,
-        world
-            .bodies
-            .iter()
-            .map(|b| b.position.z)
-            .collect::<Vec<_>>()
+        world.bodies.iter().map(|b| b.position).collect::<Vec<_>>()
     );
     Ok(())
 }

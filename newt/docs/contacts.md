@@ -38,12 +38,16 @@ custom mass distribution build the inertia tensor themselves and pass it to
 | sphere-sphere | `contact::sphere_sphere` | ≤ 1 |
 | sphere-capsule | `contact::sphere_capsule` | ≤ 1 |
 | capsule-capsule | `contact::capsule_capsule` | ≤ 1 |
+| box-box | `contact::box_box` (vertex-vs-face) | ≤ 4 (deepest of 16 candidates) |
 
-box-box, box-sphere, and box-capsule are **deferred to a later tier**. the
-stacking demo therefore uses spheres, which give equivalent stress on the
-contact math (normal spring, tangent pyramid, third-law reaction sum) without
-needing SAT-style oriented-box logic. that logic returns in v0-tier5-ish along
-with mesh geoms.
+box-sphere and box-capsule are **deferred to a later tier**. box-box ships as
+vertex-vs-face — it emits a contact for every vertex of A that is strictly
+inside B (and vice versa), picks the face aligned with the pose delta as the
+contact normal, and keeps the four deepest. this covers the full stacking
+regime (four bottom corners of the upper box on the top face of the lower).
+what it misses is **edge-vs-edge** — two obliquely oriented boxes clashing on
+edges with no vertex inside the other. that misses along with box-sphere in
+v0-tier-late alongside cylinder/mesh geoms and a real SAT + face clipper.
 
 pair filtering: when `World::pair_list` is `None`, pairs are enumerated as
 `(i, j)` with `i < j` over the geom vector, skipping same-body pairs and
@@ -132,7 +136,8 @@ bit-identical to tier 1 — the tier-1 tumbling golden still passes.
 | `tests/contacts_rolling.rs::sphere_on_plane_transitions_toward_rolling` | slip `|v_x − r ω_y|` shrinks from ~5 m/s to below 0.1 m/s after 500 steps; sphere spins about +Y and keeps moving forward. |
 | `tests/contacts_energy.rs::bouncing_sphere_peaks_are_monotonically_decreasing` | at least 3 detectable peaks, each strictly less than the previous; first peak strictly below the drop height (energy really was lost). |
 | `tests/contacts_momentum.rs::head_on_collision_conserves_linear_momentum` | pairwise sphere collision: max `|Σp − Σp₀| < 1e-3` over 400 steps; both spheres exchanged velocity. |
-| `tests/contacts_golden.rs` | serialize `(q, qdot)` for the 3-sphere stacking scene at steps 0/100/1000; byte-compared against `tests/goldens/stacking_3_spheres.bin`. |
+| `tests/contacts_golden.rs::contacts_golden_trajectory_is_byte_identical` | serialize `(q, qdot)` for the 3-BOX stacking scene at steps 0/100/1000; byte-compared against `tests/goldens/stacking_3_boxes.bin`. box-box + box-plane contacts are the primary shape exercised. |
+| `tests/contacts_golden.rs::stacked_boxes_stay_near_upright` | after 2000 steps (10 s), every box's `1 − |q.w|` under 1e-2, |x|/|y| drift under 5 cm, and z-order preserved — nothing tips over. this is the lever-arm sanity check: a wrong `r × F` in the contact-force application would tilt the stack visibly in the first second. |
 
 the golden was generated on macOS aarch64 (same convention as tier 1).
 regenerate ONLY on the reference host:
@@ -153,6 +158,8 @@ cannot silently swap the reference.
 | missing damping term | `contacts_energy.rs` — first peak stops decaying, or grows |
 | swapped Newton's third law (only one body gets the reaction) | `contacts_momentum.rs` — pairwise momentum drifts by tens of percent |
 | combine_solref picks stiffer damping instead of MIN | `contacts_energy.rs` — sphere overdamps and stops bouncing (this is exactly the bug caught during development) |
+| wrong contact-point lever arm in wrench application | `stacked_boxes_stay_near_upright` — mis-applied `r × F` rotates the boxes tens of degrees within the first second |
+| box-box nearest-face picks the wrong wall (naive "closest face" instead of pose-delta-aligned) | 3-box demo would collapse to zero-height (upper boxes get pushed DOWN into the lower one); the box golden captures the correct settled height |
 
 ## running the demos
 
