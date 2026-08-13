@@ -1,8 +1,9 @@
 //! Cook-Torrance GGX roughness and metallic grid under the skybox.
 
 use chimy2::camera::OrbitController;
-use chimy2::demo::{DemoArgs, run_demo, uv_sphere};
+use chimy2::demo::{DemoArgs, run_demo_with_overlay, uv_sphere};
 use chimy2::fb::{Framebuffer, argb8888};
+use chimy2::font::draw_ascii_hud;
 use chimy2::ibl::{FloatCube, IblMaps};
 use chimy2::image::Texture;
 use chimy2::math::{Mat4, Vec3};
@@ -48,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let sphere = uv_sphere(0.72, 24, 48);
 
-    run_demo(
+    run_demo_with_overlay(
         "chimy2 cook-torrance ggx",
         960,
         720,
@@ -124,6 +125,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             }
+        },
+        move |framebuffer: &mut Framebuffer, elapsed: f32, _: &InputState| {
+            draw_ascii_hud(framebuffer, (elapsed * 60.0).round() as u32);
         },
     )
 }

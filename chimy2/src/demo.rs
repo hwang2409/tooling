@@ -213,10 +213,52 @@ pub fn run_demo<F>(
     default_width: u32,
     default_height: u32,
     args: DemoArgs,
-    mut draw: F,
+    draw: F,
 ) -> Result<(), Box<dyn Error>>
 where
     F: FnMut(&mut Framebuffer, f32, &InputState),
+{
+    run_demo_with_overlay(
+        title,
+        default_width,
+        default_height,
+        args,
+        draw,
+        |_, _, _| {},
+    )
+}
+
+fn render_demo_frame<F, O>(
+    framebuffer: &mut Framebuffer,
+    elapsed: f32,
+    input: &InputState,
+    post_chain: &PostChain,
+    draw: &mut F,
+    overlay: &mut O,
+) where
+    F: FnMut(&mut Framebuffer, f32, &InputState),
+    O: FnMut(&mut Framebuffer, f32, &InputState),
+{
+    draw(framebuffer, elapsed, input);
+    post_chain.apply(framebuffer);
+    overlay(framebuffer, elapsed, input);
+}
+
+/// Runs a demo and invokes the overlay callback after post-processing.
+///
+/// The overlay is screen-space presentation work. It must run after the
+/// [`PostChain`] so UI text is not bloomed or tonemapped with the scene.
+pub fn run_demo_with_overlay<F, O>(
+    title: &str,
+    default_width: u32,
+    default_height: u32,
+    args: DemoArgs,
+    mut draw: F,
+    mut overlay: O,
+) -> Result<(), Box<dyn Error>>
+where
+    F: FnMut(&mut Framebuffer, f32, &InputState),
+    O: FnMut(&mut Framebuffer, f32, &InputState),
 {
     let (width, height) = args.size.unwrap_or((default_width, default_height));
     let post_chain = args.post_chain();
@@ -226,8 +268,14 @@ where
         let input = InputState::default();
         for frame in 0..frames {
             let elapsed = frame as f32 / SCREENSHOT_FPS;
-            draw(&mut framebuffer, elapsed, &input);
-            post_chain.apply(&mut framebuffer);
+            render_demo_frame(
+                &mut framebuffer,
+                elapsed,
+                &input,
+                &post_chain,
+                &mut draw,
+                &mut overlay,
+            );
         }
         write_ppm(path, &framebuffer)?;
         Ok(())
@@ -238,8 +286,14 @@ where
             height,
             args.frames,
             move |framebuffer, elapsed, input| {
-                draw(framebuffer, elapsed, input);
-                post_chain.apply(framebuffer);
+                render_demo_frame(
+                    framebuffer,
+                    elapsed,
+                    input,
+                    &post_chain,
+                    &mut draw,
+                    &mut overlay,
+                );
             },
         )
     }
@@ -877,6 +931,35 @@ mod tests {
         assert!(args.dof);
         assert_eq!(args.post_chain().len(), 3);
         assert_eq!(args.post_chain_with_projection(Mat4::IDENTITY).len(), 4);
+    }
+
+    #[test]
+    fn overlay_order_is_after_hdr_bloom() {
+        let args = DemoArgs {
+            bloom: true,
+            hdr: true,
+            ..DemoArgs::default()
+        };
+        let post_chain = args.post_chain();
+        let mut framebuffer = Framebuffer::new(8, 8);
+        framebuffer.set_hdr(true);
+        let input = InputState::default();
+        let mut draw = |framebuffer: &mut Framebuffer, _: f32, _: &InputState| {
+            framebuffer.clear(argb8888(255, 8, 10, 16));
+        };
+        let text_color = argb8888(255, 235, 240, 255);
+        let mut overlay = |framebuffer: &mut Framebuffer, _: f32, _: &InputState| {
+            framebuffer.draw_text(0, 0, "A", 1, text_color);
+        };
+        render_demo_frame(
+            &mut framebuffer,
+            0.0,
+            &input,
+            &post_chain,
+            &mut draw,
+            &mut overlay,
+        );
+        assert_eq!(framebuffer.color[3], text_color);
     }
 
     #[test]
