@@ -114,6 +114,26 @@ impl Link {
         mass: f32,
         inertia_body: Mat3,
     ) -> Self {
+        // v0 convention for joint-frame anchors: the joint anchor frame in
+        // both parent and child body coords must have IDENTITY orientation.
+        // Non-identity orientations are silently ignored by `xup_for_link`
+        // (it reads only the translation components), so a caller who passes
+        // a rotated offset would get subtly wrong dynamics. The v1 lift will
+        // thread these quats into `Xup` and drop this assert.
+        //
+        // Exemption: for a Free root, `joint_offset_in_parent` doubles as
+        // the root's initial world pose (see `push_link` — its orientation
+        // is written into `q[3..7]`), not a joint-frame offset, so any
+        // orientation is meaningful there.
+        let is_free_root = parent.is_none() && matches!(joint, JointKind::Free);
+        debug_assert!(
+            is_free_root || joint_offset_in_parent.1 == Quat::IDENTITY,
+            "v0: joint_offset_in_parent.orientation must be IDENTITY (v1 will lift this)"
+        );
+        debug_assert!(
+            joint_offset_in_child.1 == Quat::IDENTITY,
+            "v0: joint_offset_in_child.orientation must be IDENTITY (v1 will lift this)"
+        );
         let inertia_body_inverse = inertia_body
             .inverse()
             .expect("link inertia tensor must be invertible");
@@ -177,6 +197,15 @@ impl Tree {
             assert!(
                 link.parent.is_none(),
                 "root link (index 0) must have parent = None"
+            );
+            // Only Free / Fixed are valid at the root — hinge or any future
+            // joint kind at the root would reach an `unreachable!` deep inside
+            // `aba`, so reject it here where the failure message points at
+            // the actual bug.
+            assert!(
+                matches!(link.joint, JointKind::Free | JointKind::Fixed),
+                "root joint must be Free or Fixed (got {:?})",
+                link.joint
             );
         } else {
             let parent = link.parent.expect("non-root link must have Some(parent)");
@@ -378,9 +407,6 @@ struct AbaWorkspace {
     qddot_joint: Vec<f32>,
     /// Per-link spatial acceleration (computed in pass 3, body frame at COM).
     a: Vec<SpatialMotion>,
-    /// Root spatial acceleration (only meaningful when root is Free). For
-    /// fixed root this stays zero.
-    root_a: SpatialMotion,
 }
 
 impl AbaWorkspace {
@@ -397,7 +423,6 @@ impl AbaWorkspace {
             tau: vec![0.0; n],
             qddot_joint: vec![0.0; n],
             a: vec![SpatialMotion::ZERO; n],
-            root_a: SpatialMotion::ZERO,
         }
     }
 }
@@ -573,7 +598,6 @@ pub fn aba(
                 .solve(rhs)
                 .expect("root articulated inertia is singular — degenerate mass distribution?");
             w.a[0] = a0;
-            w.root_a = a0;
             // Store the 6 free-root accelerations (body-frame at COM) into
             // qddot slots 0..6.
             qddot[0] = a0.angular.x;
@@ -585,7 +609,6 @@ pub fn aba(
         }
         JointKind::Fixed => {
             w.a[0] = SpatialMotion::ZERO;
-            w.root_a = SpatialMotion::ZERO;
         }
         JointKind::Hinge { .. } => unreachable!("hinge cannot be root"),
     }
