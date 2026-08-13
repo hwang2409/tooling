@@ -1,0 +1,15 @@
+[package]
+name = "newt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "A from-scratch rigid-body physics engine"
+
+[lib]
+crate-type = ["rlib"]
+
+# Zero runtime dependencies. See docs/superpowers/specs/2026-08-13-newt-physics-design.md.
+
+[dev-dependencies]
+chimy2 = { path = "../chimy2" }

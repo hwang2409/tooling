@@ -1,0 +1,93 @@
+name: newt
+
+on:
+  pull_request:
+    paths:
+      - newt/**
+      - chimy2/**
+      - .github/workflows/newt.yml
+  push:
+    branches:
+      - main
+    paths:
+      - newt/**
+      - chimy2/**
+      - .github/workflows/newt.yml
+
+jobs:
+  libm-free:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: no libm calls in engine sources
+        # The engine must be libm-free (see newt/docs/core.md). Fail on any
+        # transcendental method call under newt/src/, but tolerate the pattern
+        # inside comment lines so docstrings can name what is forbidden.
+        # Grep exits 1 on no-match; we invert that with the pipeline pattern
+        # below so the STEP passes exactly when zero live-code hits remain.
+        run: |
+          set -euo pipefail
+          matches="$(grep -rnE '\.(sin|cos|tan|exp|ln|powf)\(' newt/src/ \
+            | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)"
+          if [ -n "$matches" ]; then
+            echo "libm call found in newt/src/ (engine must be libm-free):"
+            echo "$matches"
+            exit 1
+          fi
+
+  fmt:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: newt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            newt/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('newt/Cargo.lock') }}
+      - run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: newt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            newt/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('newt/Cargo.lock') }}
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: newt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            newt/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('newt/Cargo.lock') }}
+      - run: cargo test
