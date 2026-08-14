@@ -257,10 +257,17 @@ lookup by name resolves to a mesh id used at runtime.
 - **solimp** — MuJoCo-style 5-parameter impedance sigmoid. Optional;
   default is `SolImp::DEFAULT`. Only consulted when
   `solver.mode = "pgs"`. See [`docs/solver.md`](solver.md).
-- **condim** — Contact dimensionality. `1` (frictionless) or `3`
-  (normal + 2 tangents, sliding friction). Default `3`. Values `4`
-  and `6` (torsional / rolling) are reserved and rejected. Only
-  consulted when `solver.mode = "pgs"`.
+- **condim** — Contact dimensionality. `1` (frictionless), `3`
+  (normal + 2 tangents, sliding friction), `4` (adds torsion about
+  the normal), or `6` (adds two rolling rows about the tangents).
+  Default `3`. Only consulted when `solver.mode = "pgs"`. See
+  [`docs/solver.md`](solver.md) for the row structure.
+- **torsional_friction** — Coulomb coefficient about the contact
+  normal, ≥ 0. Default `0`. Only read when the pair's condim ≥ 4;
+  paired via `min` with the other geom's value.
+- **rolling_friction** — Coulomb coefficient about the contact
+  tangents, ≥ 0. Default `0`. Only read when the pair's condim = 6;
+  paired via `min` with the other geom's value.
 - **margin** — MuJoCo-style contact activation zone (m), ≥ 0. Default `0`.
   See [`docs/contacts.md`](contacts.md) for semantics.
 - **gap** — MuJoCo-style force-free zone (m), ≥ 0. Default `0`.
@@ -286,6 +293,78 @@ pre-v1-tier-4 scene stays byte-identical.
 - **iterations** — positive integer, number of PGS sweeps per step
   (no early exit — determinism). Default `20`.
 - **cone** — `"pyramidal"` (default) or `"elliptic"`.
+
+## equality (root array, optional)
+
+Bilateral constraints solved alongside contacts in the PGS sweep. Four
+kinds; every kind carries an optional per-constraint `solref` /
+`solimp` (same schemas as on a geom). See [`docs/solver.md`](solver.md)
+for the row-count / row-geometry table.
+
+### connect — 3-DOF point coincidence
+
+```json
+{
+  "kind": "connect",
+  "body_a": "ball_1",      // body name, or "world" for a static-world anchor
+  "body_b": "ball_2",
+  "anchor_a": [0, 0, 0.1], // body-local (world-frame if body_a == "world")
+  "anchor_b": [0, 0, -0.1],
+  "solref": {"timeconst": 0.01, "dampratio": 1.0},
+  "solimp": {"dmin": 0.99, "dmax": 0.999, "width": 0.001, "midpoint": 0.5, "power": 2}
+}
+```
+
+At least one of `body_a` / `body_b` must reference a real body.
+
+### weld — 6-DOF pose lock
+
+```json
+{
+  "kind": "weld",
+  "body_a": "a",
+  "body_b": "b",
+  "anchor_a": [0, 0, 0],
+  "anchor_b": [0, 0, 0],
+  "relative_orientation": [0, 0, 0, 1]  // optional; default IDENTITY
+}
+```
+
+`relative_orientation` locks the child-in-parent quaternion
+(`q_B_world = q_A_world · relative_orientation`). Default `IDENTITY`
+locks the two body frames parallel.
+
+### joint — polynomial coupling of two 1-DOF joints on the same tree
+
+```json
+{
+  "kind": "joint",
+  "tree": "linkage",
+  "joint_a": "follower",   // link name (hinge or slide) in the tree
+  "joint_b": "crank",
+  "polycoef": [0, 2, 0]    // q_a = c0 + c1·q_b + c2·q_b²  (up to quadratic)
+}
+```
+
+Cross-tree coupling is out of scope this tier — both joints must live
+on the same tree, and both must be hinge or slide (ball is rejected).
+
+### distance — fixed anchor-to-anchor distance
+
+```json
+{
+  "kind": "distance",
+  "body_a": "a",
+  "body_b": "b",
+  "anchor_a": [0, 0, 0],
+  "anchor_b": [0, 0, 0],
+  "distance": 1.0
+}
+```
+
+`distance` must be ≥ 0. The constraint elides its row for one step
+when the current separation drops below 1 µm (degenerate direction);
+it re-engages as soon as the pair separates past the guard.
 
 ## sites
 
