@@ -46,11 +46,19 @@
 //!   limits for hinge/slide. Opt-in via `world.solver.mode = Pgs`;
 //!   penalty is still default and preserves every existing golden.
 //!   See `docs/solver.md`.
+//! - **v1 tier 5** (`equality`, solver/model extensions) — equality
+//!   constraints (connect, weld, joint coupling, distance) as bilateral
+//!   PGS rows with per-constraint `(solref, solimp)`; contact `condim`
+//!   extended to `4` (torsional friction about the normal) and `6`
+//!   (rolling friction about the two tangents), both pyramidal and
+//!   elliptic. See `docs/solver.md` (equality-constraint rows + condim
+//!   4/6 block).
 
 pub mod actuator;
 pub mod body;
 pub mod contact;
 pub mod dynamics;
+pub mod equality;
 pub mod geom;
 pub mod joint;
 pub mod json;
