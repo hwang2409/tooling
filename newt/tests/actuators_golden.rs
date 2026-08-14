@@ -14,7 +14,7 @@
 //! A zero-lever-arm, wrong-axis, or wrong-channel mutant flips this
 //! golden at snapshot 2 or later.
 
-use newt::actuator::PdServo;
+use newt::actuator::Actuator;
 use newt::joint::JointKind;
 use newt::math::{Mat3, Quat, Vec3};
 use newt::tree::{Link, Tree, rk4_step};
@@ -76,11 +76,11 @@ fn produce_golden_bytes() -> Vec<u8> {
 
     // Servos: distinct kp/dampratio/clamp per joint so a mis-routed servo
     // (indexing bug) shifts a snapshot.
-    let s1 = PdServo::from_dampratio(
+    let s1 = Actuator::position_from_dampratio(
         1, /*kp*/ 80.0, /*ζ*/ 0.8, /*I_ref*/ 0.3, /*clamp*/ 10.0,
     );
-    let s2 = PdServo::from_dampratio(2, 60.0, 0.9, 0.15, 8.0);
-    let s3 = PdServo::from_dampratio(3, 40.0, 1.0, 0.10, 6.0);
+    let s2 = Actuator::position_from_dampratio(2, 60.0, 0.9, 0.15, 8.0);
+    let s3 = Actuator::position_from_dampratio(3, 40.0, 1.0, 0.10, 6.0);
     let a1 = tree.add_actuator(s1);
     let a2 = tree.add_actuator(s2);
     let a3 = tree.add_actuator(s3);

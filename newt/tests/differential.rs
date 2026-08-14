@@ -162,6 +162,30 @@ fn tolerance(name: &str) -> Tolerance {
             qpos: 6.0e-6,
             qvel: 6.0e-6,
         },
+        // v2 tier 2: velocity actuator on slide (cart) + free hinge (pole).
+        // Both engines use gain=fixed(kv), bias=affine(0,0,-kv) semantics
+        // and evaluate identically inside RK4; component divergence sits
+        // at f32-quant scale over the 4 s horizon. A semantic mismatch
+        // (wrong bias sign, missed gear, ctrl-vs-vel swap) would blow
+        // divergence to O(0.1 m or rad).
+        // Observed max qpos 2.70e-7, qvel 5.77e-7.
+        "velocity_cartpole" => Tolerance {
+            qpos: 1.0e-6,
+            qvel: 2.0e-6,
+        },
+        // v2 tier 2: filter activation on a single-hinge pendulum.
+        // Newt integrates activation with forward Euler at the RK4 step
+        // boundary (ZOH within the step — see src/actuator.rs);
+        // MuJoCo integrates activation through the same RK4 stages as
+        // the mechanical state. The residual scales with dt/tau (0.1
+        // here) and the ctrl step amplitude; parity remains bounded
+        // and steady after the filter settles. Called out as a
+        // bounded-divergence row in docs/differential.md.
+        // Observed max qpos 2.56e-4 rad, qvel 1.34e-3 rad/s.
+        "filtered_motor_pendulum" => Tolerance {
+            qpos: 6.0e-4,
+            qvel: 3.0e-3,
+        },
         other => panic!("no tolerance for scenario {other:?}"),
     }
 }
@@ -1236,4 +1260,16 @@ fn differential_floating_base() {
 fn differential_double_pendulum_energy() {
     let report = run_energy_scenario(&scenario("double_pendulum_energy"));
     assert_energy_bounds("double_pendulum_energy", &report);
+}
+
+#[test]
+fn differential_velocity_cartpole() {
+    let d = run_scenario(&scenario("velocity_cartpole"));
+    assert_within_tolerance("velocity_cartpole", &d);
+}
+
+#[test]
+fn differential_filtered_motor_pendulum() {
+    let d = run_scenario(&scenario("filtered_motor_pendulum"));
+    assert_within_tolerance("filtered_motor_pendulum", &d);
 }

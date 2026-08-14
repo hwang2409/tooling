@@ -7,7 +7,7 @@
 //! stays at its rest state (~0) — the servo only actuates `q_b`, so
 //! without the coupling, `q_a` has nothing to move it.
 
-use newt::actuator::PdServo;
+use newt::actuator::Actuator;
 use newt::joint::JointKind;
 use newt::math::{Mat3, Quat, Vec3};
 use newt::solver::{ConeKind, SolImp, SolverConfig, SolverMode};
@@ -47,7 +47,7 @@ fn build_scene(with_coupling: bool) -> (World, usize, usize, usize) {
     // Soft gains — kp small enough to stay well inside the RK4/dt=5ms
     // stability envelope for a 0.01 kg·m² hinge. Critical damping is
     // ≈0.45 N·m·s/rad; kd=1.0 is ≈2× critical.
-    tree.add_actuator(PdServo::new(link_b, 5.0, 1.0, 100.0, 0.5));
+    tree.add_actuator(Actuator::position(link_b, 5.0, 1.0, 100.0, 0.5));
 
     let mut w = World::new();
     w.dt = 0.005;
@@ -255,7 +255,7 @@ fn coupling_tracks_fast_time_varying_q_b_under_quadratic_polycoef() {
         1.0,
         Mat3::diag(0.01, 0.01, 0.01),
     ));
-    tree.add_actuator(PdServo::new(link_b, 5.0, 1.0, 100.0, 0.0));
+    tree.add_actuator(Actuator::position(link_b, 5.0, 1.0, 100.0, 0.0));
     let mut w = World::new();
     w.dt = 0.005;
     w.gravity = Vec3::ZERO;
@@ -335,7 +335,7 @@ fn coupling_polycoef_higher_order_terms_track() {
         1.0,
         Mat3::diag(0.01, 0.01, 0.01),
     ));
-    tree.add_actuator(PdServo::new(link_b, 5.0, 1.0, 100.0, 0.3));
+    tree.add_actuator(Actuator::position(link_b, 5.0, 1.0, 100.0, 0.3));
     let mut w = World::new();
     w.dt = 0.005;
     w.gravity = Vec3::ZERO;

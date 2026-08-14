@@ -24,7 +24,7 @@ use chimy2::demo::write_ppm;
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
 
-use newt::actuator::PdServo;
+use newt::actuator::Actuator;
 use newt::body::Body;
 use newt::equality::Equality;
 use newt::geom::SolRef;
@@ -121,7 +121,7 @@ fn build_world() -> (World, usize, usize) {
         0.3,
         Mat3::diag(0.01, 0.01, 0.005),
     ));
-    tree.add_actuator(PdServo::new(crank, 5.0, 1.0, 100.0, 0.0));
+    tree.add_actuator(Actuator::position(crank, 5.0, 1.0, 100.0, 0.0));
     let tree_idx = w.add_tree(tree);
 
     // Free coupler bar. World-space rest pose: horizontal at the level

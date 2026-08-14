@@ -67,7 +67,7 @@
 //! contribution accumulations are additive so the child order does not
 //! affect the result.
 
-use crate::actuator::{PdServo, clamp_symmetric};
+use crate::actuator::{Actuator, clamp_symmetric};
 use crate::joint::{JointKind, JointLimit};
 use crate::math::{Mat3, Quat, Vec3};
 use crate::spatial::{Mat6, SpatialForce, SpatialInertia, SpatialMotion, Xform};
@@ -183,9 +183,12 @@ pub struct Tree {
     /// helpers (see [`Tree::set_joint_torque_clamped`]) write here.
     pub qfrc_applied: Vec<f32>,
 
-    /// PD position servos (tier 4). Persistent; targets settable per step via
-    /// [`Tree::set_actuator_target`]. Each is bound to a hinge link.
-    pub actuators: Vec<PdServo>,
+    /// Actuators attached to hinge/slide joints (tier 4, generalized in
+    /// v2 tier 2 — see [`Actuator`]). Controls settable per step via
+    /// [`Tree::set_actuator_target`].
+    /// Activation state (when `dyn_type = Filter`) is integrated once per
+    /// step at the end of [`rk4_step`].
+    pub actuators: Vec<Actuator>,
     /// Per-link user-applied world-frame wrenches at each link's COM,
     /// `(force_world, torque_world)`. Length equals `links.len()`; grows
     /// automatically on [`Tree::push_link`]. Sums with contact wrenches
@@ -280,39 +283,52 @@ impl Tree {
         idx
     }
 
-    /// Attach a PD position actuator to a hinge or slide link. Returns the
+    /// Attach an actuator to a hinge or slide link. Returns the
     /// actuator's stable index (usable with [`Tree::set_actuator_target`]).
-    /// Panics if `servo.link_idx` is out of range or does not reference a
+    /// Panics if `actuator.link_idx` is out of range or does not reference a
     /// hinge or slide.
     ///
-    /// The PD equation `τ = kp·(target − q) − kd·qdot` is identical for
-    /// both: for a hinge the "τ" is a torque about the axis (N·m), for a
-    /// slide it is a force along the axis (N). Same 1-DOF generalized-force
-    /// slot in either case, so the actuator plumbing does not need to know
-    /// which kind it is attached to.
-    pub fn add_actuator(&mut self, servo: PdServo) -> usize {
+    /// Whichever flavor (position/velocity/motor/general), the actuator
+    /// contributes a scalar joint force to the 1-DOF slot — hinges see it
+    /// as N·m, slides as N — so the plumbing does not need to know which
+    /// kind of joint it hangs off.
+    pub fn add_actuator(&mut self, actuator: Actuator) -> usize {
         assert!(
-            servo.link_idx < self.links.len(),
+            actuator.link_idx < self.links.len(),
             "actuator link out of range"
         );
         assert!(
             matches!(
-                self.links[servo.link_idx].joint,
+                self.links[actuator.link_idx].joint,
                 JointKind::Hinge { .. } | JointKind::Slide { .. }
             ),
-            "PD servo can only actuate a Hinge or Slide joint (link {} is {:?})",
-            servo.link_idx,
-            self.links[servo.link_idx].joint
+            "actuators only attach to Hinge or Slide joints (link {} is {:?})",
+            actuator.link_idx,
+            self.links[actuator.link_idx].joint
         );
         let idx = self.actuators.len();
-        self.actuators.push(servo);
+        self.actuators.push(actuator);
         idx
     }
 
-    /// Set the target angle of a previously-added actuator. Panics on
-    /// out-of-range index.
-    pub fn set_actuator_target(&mut self, actuator_idx: usize, target: f32) {
-        self.actuators[actuator_idx].target = target;
+    /// Set an actuator's control input (`ctrl`) — for position this is the
+    /// target setpoint; for velocity the target rate; for motor the raw
+    /// command scale; for general the input to `gain*ctrl + bias` (or the
+    /// driving input to the activation filter). Panics on out-of-range
+    /// index. Retains the v0 name for API stability; MuJoCo would call
+    /// this `data.ctrl[i]`.
+    pub fn set_actuator_target(&mut self, actuator_idx: usize, ctrl: f32) {
+        self.actuators[actuator_idx].ctrl = ctrl;
+    }
+
+    /// Integrate every actuator's activation state forward by `dt`
+    /// (forward Euler on the filter ODE). Called at the end of
+    /// [`rk4_step`] — see [`crate::actuator`] for the ZOH-per-step
+    /// convention.
+    pub fn integrate_activations(&mut self, dt: f32) {
+        for a in &mut self.actuators {
+            a.integrate_activation(dt);
+        }
     }
 
     /// Directly write a generalized joint force into `qfrc_applied` for a
@@ -1298,6 +1314,13 @@ where
             tree.q[off + 3] = q.w;
         }
     }
+    // Activation-state update. Filter actuators use forward Euler on
+    // `act' = (u - act)/tau`, integrated ONCE per RK4 step at the
+    // boundary. The four RK4 sub-stages above saw `act` from step start
+    // (ZOH), so this update takes effect on the NEXT step — mirroring
+    // the ZOH convention for ctrl/qfrc_applied/applied_wrenches. Non-
+    // filter actuators are no-ops here. See docs/actuators.md.
+    tree.integrate_activations(dt);
 }
 
 /// Compute the position and velocity derivatives for every DOF of the tree,

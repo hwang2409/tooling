@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::actuator::PdServo;
+use crate::actuator::{Actuator, BiasType, DynType, GainType};
 use crate::body::Body;
 use crate::equality::Equality;
 use crate::geom::{Geom, GeomShape, SolRef};
@@ -1785,32 +1785,14 @@ fn parse_actuator(
     trees_by_name: &HashMap<String, usize>,
     links_by_name: &[HashMap<String, usize>],
     world: &World,
-) -> Result<(String, usize, PdServo), ModelError> {
+) -> Result<(String, usize, Actuator), ModelError> {
     let fields = get_object(v, path)?;
-    reject_unknown(
-        fields,
-        &[
-            "name",
-            "type",
-            "tree",
-            "link",
-            "kp",
-            "kd",
-            "dampratio",
-            "reflected_inertia",
-            "clamp",
-            "target",
-        ],
-        path,
-    )?;
+    // Schema is a discriminated union on "type". Supported types (v2 tier 2):
+    //   position | velocity | motor | general
+    // The full keyset is the union of every type's fields; per-type paths
+    // reject unknowns after they read what they need.
     let name = get_str(required(fields, "name", path)?, &format!("{path}.name"))?.to_string();
     let ty = get_str(required(fields, "type", path)?, &format!("{path}.type"))?;
-    if ty != "position" {
-        return fail(
-            &format!("{path}.type"),
-            format!("v0 supports only \"position\" actuators (got \"{ty}\")"),
-        );
-    }
     let tn = get_str(required(fields, "tree", path)?, &format!("{path}.tree"))?;
     let tidx = trees_by_name
         .get(tn)
@@ -1823,8 +1805,6 @@ fn parse_actuator(
             format!("unknown link \"{ln}\" in tree \"{tn}\""),
         )
     })?;
-    // Actuator must reference a hinge or slide (world's Tree::add_actuator
-    // would panic otherwise; catch it here with a friendly path).
     if !matches!(
         world.trees[tidx].links[lidx].joint,
         JointKind::Hinge { .. } | JointKind::Slide { .. }
@@ -1832,29 +1812,99 @@ fn parse_actuator(
         return fail(
             &format!("{path}.link"),
             format!(
-                "actuator target link \"{ln}\" is not a hinge or slide; PD servos only actuate 1-DOF joints"
+                "actuator target link \"{ln}\" is not a hinge or slide; actuators only attach to 1-DOF joints"
             ),
         );
     }
 
-    let kp = get_f32(required(fields, "kp", path)?, &format!("{path}.kp"))?;
-    if kp < 0.0 {
-        return fail(&format!("{path}.kp"), "kp must be ≥ 0");
-    }
-    let clamp = optional(fields, "clamp")
-        .map(|v| get_f32(v, &format!("{path}.clamp")))
-        .transpose()?
-        .unwrap_or(0.0);
     let target = optional(fields, "target")
         .map(|v| get_f32(v, &format!("{path}.target")))
         .transpose()?
         .unwrap_or(0.0);
+    let clamp = optional(fields, "clamp")
+        .map(|v| get_f32(v, &format!("{path}.clamp")))
+        .transpose()?
+        .unwrap_or(0.0);
 
+    let mut actuator = match ty {
+        "position" => {
+            reject_unknown(
+                fields,
+                &[
+                    "name",
+                    "type",
+                    "tree",
+                    "link",
+                    "kp",
+                    "kd",
+                    "dampratio",
+                    "reflected_inertia",
+                    "clamp",
+                    "target",
+                ],
+                path,
+            )?;
+            parse_position_actuator(fields, path, lidx, clamp, target)?
+        }
+        "velocity" => {
+            reject_unknown(
+                fields,
+                &["name", "type", "tree", "link", "kv", "clamp", "target"],
+                path,
+            )?;
+            let kv = get_f32(required(fields, "kv", path)?, &format!("{path}.kv"))?;
+            if kv < 0.0 {
+                return fail(&format!("{path}.kv"), "kv must be ≥ 0");
+            }
+            let mut a = Actuator::velocity(lidx, kv, clamp);
+            a.ctrl = target;
+            a
+        }
+        "motor" => {
+            reject_unknown(
+                fields,
+                &["name", "type", "tree", "link", "gear", "clamp", "target"],
+                path,
+            )?;
+            let gear = optional(fields, "gear")
+                .map(|v| get_f32(v, &format!("{path}.gear")))
+                .transpose()?
+                .unwrap_or(1.0);
+            let mut a = Actuator::motor(lidx, gear, clamp);
+            a.ctrl = target;
+            a
+        }
+        "general" => parse_general_actuator(fields, path, lidx, target)?,
+        other => {
+            return fail(
+                &format!("{path}.type"),
+                format!(
+                    "unknown actuator type \"{other}\"; expected one of \
+                     position, velocity, motor, general"
+                ),
+            );
+        }
+    };
+    actuator.link_idx = lidx;
+    Ok((name, tidx, actuator))
+}
+
+fn parse_position_actuator(
+    fields: &[(String, Value)],
+    path: &str,
+    lidx: usize,
+    clamp: f32,
+    target: f32,
+) -> Result<Actuator, ModelError> {
+    let kp = get_f32(required(fields, "kp", path)?, &format!("{path}.kp"))?;
+    if kp < 0.0 {
+        return fail(&format!("{path}.kp"), "kp must be ≥ 0");
+    }
     let has_kd = optional(fields, "kd").is_some();
     let has_dampratio = optional(fields, "dampratio").is_some();
     let has_ref_i = optional(fields, "reflected_inertia").is_some();
 
-    let mut servo = if has_kd {
+    let mut actuator = if has_kd {
         if has_dampratio || has_ref_i {
             return fail(
                 path,
@@ -1865,7 +1915,7 @@ fn parse_actuator(
         if kd < 0.0 {
             return fail(&format!("{path}.kd"), "kd must be ≥ 0");
         }
-        PdServo::new(lidx, kp, kd, clamp, target)
+        Actuator::position(lidx, kp, kd, clamp, target)
     } else if has_dampratio {
         let zeta = get_f32(
             optional(fields, "dampratio").unwrap(),
@@ -1890,18 +1940,166 @@ fn parse_actuator(
                 "reflected_inertia must be > 0",
             );
         }
-        PdServo::from_dampratio(lidx, kp, zeta, ir, clamp)
+        Actuator::position_from_dampratio(lidx, kp, zeta, ir, clamp)
     } else {
         return fail(
             path,
-            "actuator must specify either \"kd\" or (\"dampratio\" + \"reflected_inertia\")",
+            "position actuator must specify either \"kd\" or (\"dampratio\" + \"reflected_inertia\")",
         );
     };
-    // `from_dampratio` sets target = 0; carry through the explicit target
-    // for both branches for consistency.
-    servo.target = target;
+    actuator.ctrl = target;
+    Ok(actuator)
+}
 
-    Ok((name, tidx, servo))
+fn parse_general_actuator(
+    fields: &[(String, Value)],
+    path: &str,
+    lidx: usize,
+    target: f32,
+) -> Result<Actuator, ModelError> {
+    reject_unknown(
+        fields,
+        &[
+            "name",
+            "type",
+            "tree",
+            "link",
+            "gaintype",
+            "gainprm",
+            "biastype",
+            "biasprm",
+            "gear",
+            "dyntype",
+            "dynprm",
+            "ctrlrange",
+            "forcerange",
+            "target",
+        ],
+        path,
+    )?;
+    let gain_type = match optional(fields, "gaintype")
+        .map(|v| get_str(v, &format!("{path}.gaintype")))
+        .transpose()?
+        .unwrap_or("fixed")
+    {
+        "fixed" => GainType::Fixed,
+        "affine" => GainType::Affine,
+        other => {
+            return fail(
+                &format!("{path}.gaintype"),
+                format!("unknown gaintype \"{other}\"; expected fixed or affine"),
+            );
+        }
+    };
+    let gain_prm = parse_prm3(fields, "gainprm", path, [1.0, 0.0, 0.0])?;
+    let bias_type = match optional(fields, "biastype")
+        .map(|v| get_str(v, &format!("{path}.biastype")))
+        .transpose()?
+        .unwrap_or("none")
+    {
+        "none" => BiasType::None,
+        "affine" => BiasType::Affine,
+        other => {
+            return fail(
+                &format!("{path}.biastype"),
+                format!("unknown biastype \"{other}\"; expected none or affine"),
+            );
+        }
+    };
+    let bias_prm = parse_prm3(fields, "biasprm", path, [0.0, 0.0, 0.0])?;
+    let gear = optional(fields, "gear")
+        .map(|v| get_f32(v, &format!("{path}.gear")))
+        .transpose()?
+        .unwrap_or(1.0);
+    let dyn_type = match optional(fields, "dyntype")
+        .map(|v| get_str(v, &format!("{path}.dyntype")))
+        .transpose()?
+        .unwrap_or("none")
+    {
+        "none" => DynType::None,
+        "filter" => DynType::Filter,
+        other => {
+            return fail(
+                &format!("{path}.dyntype"),
+                format!("unknown dyntype \"{other}\"; expected none or filter"),
+            );
+        }
+    };
+    let dyn_prm = optional(fields, "dynprm")
+        .map(|v| get_f32(v, &format!("{path}.dynprm")))
+        .transpose()?
+        .unwrap_or(1.0);
+    let ctrl_range = parse_range(fields, "ctrlrange", path)?;
+    let force_range = parse_range(fields, "forcerange", path)?;
+    if matches!(dyn_type, DynType::Filter) && dyn_prm <= 0.0 {
+        return fail(
+            &format!("{path}.dynprm"),
+            "filter dyntype requires dynprm (tau) > 0",
+        );
+    }
+    let mut a = Actuator::general(
+        lidx,
+        gain_type,
+        gain_prm,
+        bias_type,
+        bias_prm,
+        gear,
+        dyn_type,
+        [dyn_prm],
+        ctrl_range,
+        force_range,
+    );
+    a.ctrl = target;
+    Ok(a)
+}
+
+fn parse_prm3(
+    fields: &[(String, Value)],
+    key: &str,
+    path: &str,
+    default: [f32; 3],
+) -> Result<[f32; 3], ModelError> {
+    let Some(v) = optional(fields, key) else {
+        return Ok(default);
+    };
+    let arr = get_array(v, &format!("{path}.{key}"))?;
+    if arr.len() != 3 {
+        return fail(
+            &format!("{path}.{key}"),
+            format!("expected 3 numbers, got {}", arr.len()),
+        );
+    }
+    let mut out = [0.0f32; 3];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = get_f32(&arr[i], &format!("{path}.{key}[{i}]"))?;
+    }
+    Ok(out)
+}
+
+fn parse_range(
+    fields: &[(String, Value)],
+    key: &str,
+    path: &str,
+) -> Result<Option<(f32, f32)>, ModelError> {
+    let Some(v) = optional(fields, key) else {
+        return Ok(None);
+    };
+    let arr = get_array(v, &format!("{path}.{key}"))?;
+    if arr.len() != 2 {
+        return fail(
+            &format!("{path}.{key}"),
+            format!("expected 2 numbers (lo, hi), got {}", arr.len()),
+        );
+    }
+    let lo = get_f32(&arr[0], &format!("{path}.{key}[0]"))?;
+    let hi = get_f32(&arr[1], &format!("{path}.{key}[1]"))?;
+    if lo >= hi {
+        return fail(
+            &format!("{path}.{key}"),
+            format!("range lo ({lo}) must be strictly less than hi ({hi})"),
+        );
+    }
+    Ok(Some((lo, hi)))
 }
 
 /// Parse one entry in the top-level `"sensors"` array.

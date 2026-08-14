@@ -62,6 +62,8 @@ those units.
 | sphere_drop_soft   | 4.55e-2           | 7.0e-2     | 3.80e-1           | 8.0e-1     | bounded divergence |
 | box_stack          | 1.11e-2           | 5.0e-2     | 7.68e-2           | 5.0e-1     | parity (recovered) |
 | joint_limit_swing  | 1.08e-1           | 1.5e-1     | 9.10e-1           | 1.2e+0     | bounded divergence |
+| velocity_cartpole  | 2.70e-7           | 1.0e-6     | 5.77e-7           | 2.0e-6     | parity             |
+| filtered_motor_pendulum | 2.56e-4      | 6.0e-4     | 1.34e-3           | 3.0e-3     | bounded divergence |
 
 ### sphere_drop solref sweep (steady-state penetration)
 
@@ -228,6 +230,44 @@ old collapse was NOT solver-convergence-limited — even 400 PGS
 iterations still let the stack fall — so the "under-converging PGS"
 hypothesis was wrong. The full evidence trace lives in this
 ticket's PR body.
+
+### velocity_cartpole (parity)
+
+Cart on a slide + free-swinging pole; a `<velocity kv="15">` actuator
+holds the cart at a constant 0.4 m/s target rate over 4 s while
+gravity dumps the pole into random-ish swings that couple back into
+the cart through Coriolis reaction. Purpose: validate the v2 tier 2
+`<velocity>` semantics (gain=fixed(kv), bias=affine(0,0,-kv)) against
+real MuJoCo end-to-end.
+
+Both engines evaluate the actuator identically inside RK4, so
+component divergence sits at f32-quant scale — 2.7e-7 qpos and
+5.8e-7 qvel over the full trajectory. A semantic mismatch (wrong bias
+sign, missed gear, ctrl-vs-vel swap) would blow divergence to
+O(0.1 m or rad).
+
+### filtered_motor_pendulum (bounded divergence)
+
+Single-hinge pendulum driven by a `<general dyntype="filter">`
+actuator with `tau=0.05 s`, `ctrl=0.7 N·m` from `t=0`. The activation
+ODE low-passes the step so the applied torque ramps in over
+~0.15 s. Purpose: validate the general actuator's filter dynamics
+against real MuJoCo.
+
+Newt integrates activation with **forward Euler** at each RK4 step
+boundary (ZOH within the step — see `docs/actuators.md`). Real
+MuJoCo, running under `integrator=RK4`, integrates activation through
+the same RK4 stages as the mechanical state. The residual is bounded
+and steady-state after the filter settles:
+
+| metric | observed | bound |
+|--------|----------|-------|
+| qpos (rad) | 2.56e-4 | 6.0e-4 |
+| qvel (rad/s) | 1.34e-3 | 3.0e-3 |
+
+The gap scales with `dt/tau` and the ctrl-step amplitude; it is much
+smaller than the bounded divergences on `sphere_drop_*` and
+`joint_limit_swing`, and it does not accumulate over the horizon.
 
 ### joint_limit_swing (bounded divergence)
 

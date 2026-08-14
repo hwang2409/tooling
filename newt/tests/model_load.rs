@@ -11,7 +11,7 @@
 //! Determinism: goldens are macOS-only regen (same guard convention as
 //! tiers 1–4); the byte comparison runs on every host.
 
-use newt::actuator::PdServo;
+use newt::actuator::Actuator;
 use newt::body::Body;
 use newt::geom::Geom;
 use newt::joint::JointKind;
@@ -63,21 +63,21 @@ fn build_arm_programmatic() -> Tree {
         ));
     }
     // Servos — kp / clamp / reflected inertia mirror `attach_servos`.
-    tree.add_actuator(PdServo::from_dampratio(
+    tree.add_actuator(Actuator::position_from_dampratio(
         1,
         200.0,
         1.0,
         ARM_M[0] * ARM_L * ARM_L,
         60.0,
     ));
-    tree.add_actuator(PdServo::from_dampratio(
+    tree.add_actuator(Actuator::position_from_dampratio(
         2,
         150.0,
         1.0,
         ARM_M[1] * ARM_L * ARM_L,
         40.0,
     ));
-    tree.add_actuator(PdServo::from_dampratio(
+    tree.add_actuator(Actuator::position_from_dampratio(
         3,
         100.0,
         1.0,

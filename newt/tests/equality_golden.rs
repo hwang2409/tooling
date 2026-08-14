@@ -8,7 +8,7 @@
 //! mutation that swaps an axis or drops a lever arm surfaces as a
 //! byte-level diff (the NEWT-5 arc lesson).
 
-use newt::actuator::PdServo;
+use newt::actuator::Actuator;
 use newt::body::Body;
 use newt::equality::Equality;
 use newt::geom::{Geom, SolRef};
@@ -89,7 +89,7 @@ fn coupling_scene() -> World {
         1.0,
         Mat3::diag(0.01, 0.01, 0.01),
     ));
-    tree.add_actuator(PdServo::new(link_b, 5.0, 1.0, 100.0, 0.5));
+    tree.add_actuator(Actuator::position(link_b, 5.0, 1.0, 100.0, 0.5));
     let mut w = World::new();
     w.dt = 0.005;
     w.gravity = Vec3::ZERO;

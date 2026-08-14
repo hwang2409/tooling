@@ -90,8 +90,8 @@ the same penalty spring-damper model as hinge; units follow the DOF
 (N per m of violation for slide vs. N·m per rad for hinge). Armature is
 a reflected translational inertia (kg) added on the ABA diagonal —
 motor-style, e.g. a rack-and-pinion. Actuator plumbing is unchanged:
-[`PdServo`](../src/actuator.rs) actuates hinges *and* slides through the
-same 1-DOF `qfrc_applied` slot.
+[`Actuator`](../src/actuator.rs) (all flavors) actuates hinges *and*
+slides through the same 1-DOF `qfrc_applied` slot.
 
 ## joint kind: `Ball`
 

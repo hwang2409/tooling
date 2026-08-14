@@ -12,7 +12,7 @@
 //! force is applied at the tip link's COM; the analytic steady-state
 //! angles come from a torque-balance argument computed in the test.
 
-use newt::actuator::PdServo;
+use newt::actuator::Actuator;
 use newt::joint::JointKind;
 use newt::math::{Mat3, Quat, Vec3};
 use newt::tree::{Link, Tree, aba, forward_kinematics, rk4_step};
@@ -80,8 +80,8 @@ fn constant_wrench_on_tip_link_produces_hand_derived_static_deflection() {
     // ζ = 1 for fast, non-oscillating convergence. I_ref is a rough estimate
     // (I = m·L² for the tip mass, m·L²/3 for the pivoting rod at the base
     // — anything in the ballpark gives good damping).
-    let servo1 = PdServo::from_dampratio(1, kp, 1.0, m * l * l, 0.0);
-    let servo2 = PdServo::from_dampratio(2, kp, 1.0, m * l * l, 0.0);
+    let servo1 = Actuator::position_from_dampratio(1, kp, 1.0, m * l * l, 0.0);
+    let servo2 = Actuator::position_from_dampratio(2, kp, 1.0, m * l * l, 0.0);
     tree.add_actuator(servo1);
     tree.add_actuator(servo2);
 

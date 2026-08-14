@@ -4,15 +4,15 @@
   `tests/mjcf_anchor.rs`. The kp/dampratio/reflected_inertia trio in
   the JSON's `dampratio` form is encoded here with an explicit `kv`
   computed at fixture-authoring time by `2 * dampratio * sqrt(kp *
-  reflected_inertia)` — this is what the JSON loader stores in the
-  PdServo.kd field. Values:
+  reflected_inertia)` — this is the value stored in the
+  Position-flavor actuator's `kv` slot. Values:
 
-      shoulder_servo: kp=200, kd=2·1·√(200·0.25) = 2·√50   ≈ 14.14213562373095
-      elbow_servo:    kp=150, kd=2·1·√(150·0.20) = 2·√30   ≈ 10.95445115010332
-      wrist_servo:    kp=100, kd=2·1·√(100·0.15) = 2·√15   ≈ 7.745966692414834
+      shoulder_servo: kp=200, kv=2·1·√(200·0.25) = 2·√50   ≈ 14.14213562373095
+      elbow_servo:    kp=150, kv=2·1·√(150·0.20) = 2·√30   ≈ 10.95445115010332
+      wrist_servo:    kp=100, kv=2·1·√(100·0.15) = 2·√15   ≈ 7.745966692414834
 
   Byte-identity is preserved because both loaders end up calling
-  `PdServo::new(link, kp, kd, clamp, target)` with the same numbers.
+  `Actuator::position(link, kp, kv, clamp, target)` with the same numbers.
   See `tests/mjcf_anchor.rs`. If you touch these numbers or the JSON,
   keep them in lockstep.
 -->
