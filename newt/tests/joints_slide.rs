@@ -9,7 +9,7 @@
 //! literally the child's world-frame z coordinate (relative to the root).
 
 use newt::joint::{JointKind, JointLimit};
-use newt::math::{Mat3, Quat, Vec3};
+use newt::math::{FRAC_PI_2, Mat3, Quat, Vec3};
 use newt::tree::{Link, Tree, rk4_step};
 
 fn zero_ext(n: usize) -> impl Fn(&Tree) -> Vec<(Vec3, Vec3)> {
@@ -261,5 +261,55 @@ fn slide_damping_decelerates_a_coasting_slider() {
     assert!(
         (v_got - v_expected).abs() < 5e-4,
         "damped coast v at t={t}: got {v_got}, expected {v_expected}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slide FK under a rotated parent (mutation-coverage recipe from NEWT-6 review)
+// ---------------------------------------------------------------------------
+
+/// Forward kinematics for a slide joint must rotate the displacement
+/// `axis · q` from the parent body frame into world coordinates before
+/// adding it to the world-anchor. The obvious mutant — dropping
+/// `parent_ori.rotate(...)` and using `axis · q` directly — passes every
+/// existing anchor because they all leave the parent at identity orientation.
+///
+/// Recipe: parent fixed at `Rot_z(π/2)`, slide axis = parent-frame +X,
+/// `q_slide = 0.5`. Parent +X rotates into world +Y, so the child COM must
+/// sit at world `(0, 0.5, 0)`. With the mutant present the child would land
+/// at `(0.5, 0, 0)` and this test catches it cleanly.
+#[test]
+fn slide_fk_rotates_displacement_through_parent_orientation() {
+    let mut tree = Tree::new();
+    // Root fixed at world origin, rotated 90° about +Z.
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::from_axis_angle(Vec3::Z, FRAC_PI_2)),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    // Slide along parent-frame +X.
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::Slide {
+            axis: Vec3::X,
+            range: None,
+            damping: 0.0,
+            armature: 0.0,
+            limit: JointLimit::DEFAULT,
+        },
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1e-4, 1e-4, 1e-4),
+    ));
+    tree.set_slide_position(1, 0.5);
+
+    let (pos, _ori) = tree.link_pose(1);
+    assert!(
+        pos.x.abs() < 1e-6 && (pos.y - 0.5).abs() < 1e-6 && pos.z.abs() < 1e-6,
+        "slide displacement not rotated through parent_ori: got {pos:?}, expected (0, 0.5, 0)"
     );
 }
