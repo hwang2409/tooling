@@ -116,27 +116,12 @@ fn tolerance(name: &str) -> Tolerance {
 const MAGIC: &[u8; 8] = b"NEWTDIF1";
 
 struct Fixture {
-    /// Provenance line kept so a failing test can print exactly which
-    /// capture (mujoco version, date, settings) produced the reference.
-    #[allow(dead_code)]
-    provenance: String,
-    /// Kept for symmetry with the fixture format; the reader validates
-    /// per-sample lengths, so nq/nv are not consulted after read.
-    #[allow(dead_code)]
-    nq: usize,
-    #[allow(dead_code)]
-    nv: usize,
     stride: u32,
     n_steps: u32,
     samples: Vec<Sample>,
 }
 
 struct Sample {
-    /// Step index. Not consulted post-read (the reader emits them in
-    /// order and the harness lines them up positionally against newt),
-    /// but preserved so a fixture-format debugger can dump it.
-    #[allow(dead_code)]
-    step: u32,
     qpos: Vec<f64>,
     qvel: Vec<f64>,
 }
@@ -154,10 +139,10 @@ fn read_fixture(path: &Path) -> Fixture {
         std::str::from_utf8(magic).unwrap_or("<non-utf8>")
     );
     let prov_len = c.u32() as usize;
-    let prov_bytes = c.take(prov_len);
-    let provenance = std::str::from_utf8(prov_bytes)
-        .expect("provenance not utf8")
-        .to_string();
+    // Skip the provenance line — the tool's version guard uses it; the
+    // harness does not, since the tolerances table is versioned alongside
+    // the fixtures.
+    let _ = c.take(prov_len);
     let nq = c.u32() as usize;
     let nv = c.u32() as usize;
     let stride = c.u32();
@@ -165,7 +150,7 @@ fn read_fixture(path: &Path) -> Fixture {
     let n_steps = c.u32();
     let mut samples = Vec::with_capacity(n_samples);
     for _ in 0..n_samples {
-        let step = c.u32();
+        let _step = c.u32();
         let mut qpos = Vec::with_capacity(nq);
         for _ in 0..nq {
             qpos.push(c.f64());
@@ -174,7 +159,7 @@ fn read_fixture(path: &Path) -> Fixture {
         for _ in 0..nv {
             qvel.push(c.f64());
         }
-        samples.push(Sample { step, qpos, qvel });
+        samples.push(Sample { qpos, qvel });
     }
     assert_eq!(
         c.remaining(),
@@ -183,9 +168,6 @@ fn read_fixture(path: &Path) -> Fixture {
         path.display()
     );
     Fixture {
-        provenance,
-        nq,
-        nv,
         stride,
         n_steps,
         samples,
@@ -539,7 +521,7 @@ fn compare_and_measure(
                 .collect();
             eprintln!(
                 "  {scenario_name} sample {i:3} step {:5}: qpos_err=[{}] qvel_err=[{}]",
-                fix.step,
+                (i as u32) * fixture.stride,
                 per_qpos.join(","),
                 per_qvel.join(","),
             );
