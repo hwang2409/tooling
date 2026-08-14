@@ -421,9 +421,38 @@ fn parse_solid_inertia(v: &Value, mass: f32, path: &str) -> Result<Mat3, ModelEr
             }
             Ok(crate::geom::solid_capsule_inertia(mass, r, h))
         }
+        "cylinder" => {
+            reject_unknown(fields, &["kind", "radius", "half_height"], path)?;
+            let r = get_f32(required(fields, "radius", path)?, &format!("{path}.radius"))?;
+            let h = get_f32(
+                required(fields, "half_height", path)?,
+                &format!("{path}.half_height"),
+            )?;
+            if r <= 0.0 || h < 0.0 {
+                return fail(
+                    path,
+                    "cylinder radius must be > 0 and half_height must be ≥ 0",
+                );
+            }
+            Ok(crate::geom::solid_cylinder_inertia(mass, r, h))
+        }
+        "ellipsoid" => {
+            reject_unknown(fields, &["kind", "semi_axes"], path)?;
+            let sa = parse_vec3(
+                required(fields, "semi_axes", path)?,
+                &format!("{path}.semi_axes"),
+            )?;
+            if sa.x <= 0.0 || sa.y <= 0.0 || sa.z <= 0.0 {
+                return fail(path, "ellipsoid semi_axes must be > 0 on every axis");
+            }
+            Ok(crate::geom::solid_ellipsoid_inertia(mass, sa))
+        }
         other => fail(
             &format!("{path}.kind"),
-            format!("unknown solid shape \"{other}\"; expected box | sphere | capsule"),
+            format!(
+                "unknown solid shape \"{other}\"; expected \
+                 box | sphere | capsule | cylinder | ellipsoid"
+            ),
         ),
     }
 }
@@ -646,6 +675,7 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
             "bodies",
             "trees",
             "geoms",
+            "meshes",
             "sites",
             "actuators",
             "contact_pairs",
@@ -720,14 +750,38 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
         }
     }
 
+    // ---- Meshes (asset table, referenced by geoms via `{"kind":"mesh","mesh":<name>}`)
+    let mut meshes_by_name: HashMap<String, usize> = HashMap::new();
+    if let Some(v) = optional(root_fields, "meshes") {
+        let arr = get_array(v, "meshes")?;
+        for (i, mesh_v) in arr.iter().enumerate() {
+            let p = format!("meshes[{i}]");
+            let (mesh, name) = parse_mesh_asset(mesh_v, &p)?;
+            if meshes_by_name.contains_key(&name) {
+                return fail(
+                    &format!("{p}.name"),
+                    format!("duplicate mesh name \"{name}\""),
+                );
+            }
+            let idx = world.add_mesh(mesh);
+            meshes_by_name.insert(name, idx);
+        }
+    }
+
     // ---- Geoms ----
     let mut geoms_by_name: HashMap<String, usize> = HashMap::new();
     if let Some(v) = optional(root_fields, "geoms") {
         let arr = get_array(v, "geoms")?;
         for (i, geom_v) in arr.iter().enumerate() {
             let p = format!("geoms[{i}]");
-            let (geom, name) =
-                parse_geom(geom_v, &p, &bodies_by_name, &trees_by_name, &links_by_name)?;
+            let (geom, name) = parse_geom(
+                geom_v,
+                &p,
+                &bodies_by_name,
+                &trees_by_name,
+                &links_by_name,
+                &meshes_by_name,
+            )?;
             if geoms_by_name.contains_key(&name) {
                 return fail(
                     &format!("{p}.name"),
@@ -1044,12 +1098,14 @@ fn approx_identity(q: Quat) -> bool {
 // geom + site + actuator + contact_pairs parsers
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn parse_geom(
     v: &Value,
     path: &str,
     bodies_by_name: &HashMap<String, usize>,
     trees_by_name: &HashMap<String, usize>,
     links_by_name: &[HashMap<String, usize>],
+    meshes_by_name: &HashMap<String, usize>,
 ) -> Result<(Geom, String), ModelError> {
     let fields = get_object(v, path)?;
     reject_unknown(
@@ -1062,6 +1118,8 @@ fn parse_geom(
             "local_orientation",
             "friction",
             "solref",
+            "margin",
+            "gap",
         ],
         path,
     )?;
@@ -1069,7 +1127,11 @@ fn parse_geom(
     if name.is_empty() {
         return fail(&format!("{path}.name"), "geom name must not be empty");
     }
-    let shape = parse_geom_shape(required(fields, "shape", path)?, &format!("{path}.shape"))?;
+    let shape = parse_geom_shape(
+        required(fields, "shape", path)?,
+        &format!("{path}.shape"),
+        meshes_by_name,
+    )?;
     let (attach_body, attach_link) = parse_attach(
         required(fields, "attach", path)?,
         &format!("{path}.attach"),
@@ -1126,6 +1188,8 @@ fn parse_geom(
         None => SolRef::DEFAULT,
     };
 
+    let (margin, gap) = parse_margin_gap(fields, path)?;
+
     let geom = Geom {
         shape,
         body: attach_body,
@@ -1134,11 +1198,101 @@ fn parse_geom(
         local_orientation,
         friction,
         solref,
+        margin,
+        gap,
     };
     Ok((geom, name))
 }
 
-fn parse_geom_shape(v: &Value, path: &str) -> Result<GeomShape, ModelError> {
+/// Parse one entry of the top-level `meshes` array. Schema:
+///
+/// ```json
+/// {
+///   "name": "tetra",
+///   "vertices": [[x, y, z], ...],   // ≥ 4 finite triples
+///   "faces":    [[i, j, k], ...]    // ≥ 4 triangle index triples
+/// }
+/// ```
+///
+/// The mesh's convex hull is TRUSTED — the loader runs only the cheap
+/// structural checks in [`crate::geom::ConvexMesh::validate`] (vertex
+/// count, face count, index range, finite coordinates). Non-convex meshes
+/// silently produce incorrect contacts.
+fn parse_mesh_asset(v: &Value, path: &str) -> Result<(crate::geom::ConvexMesh, String), ModelError> {
+    let fields = get_object(v, path)?;
+    reject_unknown(fields, &["name", "vertices", "faces"], path)?;
+    let name = get_str(required(fields, "name", path)?, &format!("{path}.name"))?.to_string();
+    if name.is_empty() {
+        return fail(&format!("{path}.name"), "mesh name must not be empty");
+    }
+    // Vertices — array of [x, y, z].
+    let verts_v = required(fields, "vertices", path)?;
+    let verts_arr = get_array(verts_v, &format!("{path}.vertices"))?;
+    let mut vertices: Vec<Vec3> = Vec::with_capacity(verts_arr.len());
+    for (i, ve) in verts_arr.iter().enumerate() {
+        vertices.push(parse_vec3(ve, &format!("{path}.vertices[{i}]"))?);
+    }
+    // Faces — array of [i, j, k] indices.
+    let faces_v = required(fields, "faces", path)?;
+    let faces_arr = get_array(faces_v, &format!("{path}.faces"))?;
+    let mut faces: Vec<[u32; 3]> = Vec::with_capacity(faces_arr.len());
+    for (i, fe) in faces_arr.iter().enumerate() {
+        let tri = get_array(fe, &format!("{path}.faces[{i}]"))?;
+        if tri.len() != 3 {
+            return fail(
+                &format!("{path}.faces[{i}]"),
+                format!("face must have exactly 3 vertex indices, got {}", tri.len()),
+            );
+        }
+        let mut idx = [0u32; 3];
+        for (k, e) in tri.iter().enumerate() {
+            let n = get_f32(e, &format!("{path}.faces[{i}][{k}]"))?;
+            if n < 0.0 || n != n.floor() {
+                return fail(
+                    &format!("{path}.faces[{i}][{k}]"),
+                    format!("face vertex index must be a non-negative integer, got {n}"),
+                );
+            }
+            idx[k] = n as u32;
+        }
+        faces.push(idx);
+    }
+    let mesh = crate::geom::ConvexMesh { vertices, faces };
+    mesh.validate().map_err(|m| ModelError::new(path, m))?;
+    Ok((mesh, name))
+}
+
+/// Parse the optional `margin` and `gap` fields on a geom object. Zero
+/// defaults. Rejects negative values.
+fn parse_margin_gap(fields: &[(String, Value)], path: &str) -> Result<(f32, f32), ModelError> {
+    let margin = match optional(fields, "margin") {
+        Some(v) => {
+            let m = get_f32(v, &format!("{path}.margin"))?;
+            if m < 0.0 {
+                return fail(&format!("{path}.margin"), "margin must be ≥ 0");
+            }
+            m
+        }
+        None => 0.0,
+    };
+    let gap = match optional(fields, "gap") {
+        Some(v) => {
+            let g = get_f32(v, &format!("{path}.gap"))?;
+            if g < 0.0 {
+                return fail(&format!("{path}.gap"), "gap must be ≥ 0");
+            }
+            g
+        }
+        None => 0.0,
+    };
+    Ok((margin, gap))
+}
+
+fn parse_geom_shape(
+    v: &Value,
+    path: &str,
+    meshes_by_name: &HashMap<String, usize>,
+) -> Result<GeomShape, ModelError> {
     let fields = get_object(v, path)?;
     let kind = required(fields, "kind", path)?;
     let kind_s = get_str(kind, &format!("{path}.kind"))?;
@@ -1184,9 +1338,55 @@ fn parse_geom_shape(v: &Value, path: &str) -> Result<GeomShape, ModelError> {
                 half_height: h,
             })
         }
+        "cylinder" => {
+            reject_unknown(fields, &["kind", "radius", "half_height"], path)?;
+            let r = get_f32(required(fields, "radius", path)?, &format!("{path}.radius"))?;
+            let h = get_f32(
+                required(fields, "half_height", path)?,
+                &format!("{path}.half_height"),
+            )?;
+            if r <= 0.0 || h < 0.0 {
+                return fail(
+                    path,
+                    "cylinder radius must be > 0 and half_height must be ≥ 0",
+                );
+            }
+            Ok(GeomShape::Cylinder {
+                radius: r,
+                half_height: h,
+            })
+        }
+        "ellipsoid" => {
+            reject_unknown(fields, &["kind", "semi_axes"], path)?;
+            let sa = parse_vec3(
+                required(fields, "semi_axes", path)?,
+                &format!("{path}.semi_axes"),
+            )?;
+            if sa.x <= 0.0 || sa.y <= 0.0 || sa.z <= 0.0 {
+                return fail(path, "ellipsoid semi_axes must be > 0 on every axis");
+            }
+            Ok(GeomShape::Ellipsoid { semi_axes: sa })
+        }
+        "mesh" => {
+            reject_unknown(fields, &["kind", "mesh"], path)?;
+            let mn = get_str(required(fields, "mesh", path)?, &format!("{path}.mesh"))?;
+            let mesh_id = meshes_by_name.get(mn).copied().ok_or_else(|| {
+                ModelError::new(
+                    format!("{path}.mesh"),
+                    format!(
+                        "unknown mesh name \"{mn}\" — declare it in the top-level \
+                         \"meshes\" array before referencing"
+                    ),
+                )
+            })?;
+            Ok(GeomShape::Mesh { mesh_id })
+        }
         other => fail(
             &format!("{path}.kind"),
-            format!("unknown geom shape \"{other}\"; expected plane | sphere | box | capsule"),
+            format!(
+                "unknown geom shape \"{other}\"; expected \
+                 plane | sphere | box | capsule | cylinder | ellipsoid | mesh"
+            ),
         ),
     }
 }
