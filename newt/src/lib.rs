@@ -39,6 +39,13 @@
 //!   dynamics `τ(q, qdot, qddot)`, bias vector `h(q, qdot)`, and a hand-
 //!   rolled dense Cholesky factor + solve. Building blocks the v1 soft-
 //!   constraint solver consumes. See `docs/dynamics.md`.
+//! - **v1 tier 4** (`solver`) — MuJoCo soft-constraint contact model
+//!   (5-parameter SolImp, SolRef reference acceleration, regularized
+//!   dual) solved with fixed-iteration PGS. Ships condim 1 / 3, both
+//!   pyramidal and elliptic friction cones, and constraint-based joint
+//!   limits for hinge/slide. Opt-in via `world.solver.mode = Pgs`;
+//!   penalty is still default and preserves every existing golden.
+//!   See `docs/solver.md`.
 
 pub mod actuator;
 pub mod body;
