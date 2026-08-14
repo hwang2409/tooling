@@ -693,7 +693,7 @@ fn box_box_edge_edge_fallback(
     let ea1 = edge_a_midpoint + edge_a_dir * a_len;
     let eb0 = edge_b_midpoint - edge_b_dir * b_len;
     let eb1 = edge_b_midpoint + edge_b_dir * b_len;
-    let (pa, pb) = closest_points_on_segments(ea0, ea1, eb0, eb1);
+    let (_pa, pb) = closest_points_on_segments(ea0, ea1, eb0, eb1);
     // Contact point on B's surface = pb.
     let mut out = ContactBuf::new();
     out.push(Contact {
@@ -705,9 +705,6 @@ fn box_box_edge_edge_fallback(
         friction,
         gap,
     });
-    // Kept unused to remind a future reader that pa (closest point on A's
-    // edge) is available for a mid-point convention if needed.
-    let _ = pa;
     out
 }
 
@@ -820,21 +817,23 @@ pub fn capsule_capsule(
 // v1 tier 2 additions: cylinder / ellipsoid / mesh vs plane and vs sphere
 // ---------------------------------------------------------------------------
 
-/// Cylinder (axis local Z) vs static plane. Samples 10 candidate points on
-/// the cylinder surface (2 cap centers + 4 cardinal rim points per cap),
-/// keeps up to 4 deepest with shifted penetration `pen_raw + margin > 0`.
+/// Cylinder (axis local Z) vs static plane. Samples 18 candidate points on
+/// the cylinder surface (2 cap centers + 8 evenly-spaced rim points per cap
+/// at 0°, 45°, 90°, ..., 315°), keeps up to 4 deepest with shifted
+/// penetration `pen_raw + margin > 0`.
 ///
 /// Adequate for the three MuJoCo-parity resting cases:
-/// - cap flat on plane (axis parallel to normal): 4 cardinal rim points fire.
-/// - side lying (axis in plane): 2 cardinal rim points on each cap fire → 4.
-/// - tilted (axis at angle): 1 rim point on the down cap fires; the cap
-///   centers are near-miss and typically excluded.
+/// - cap flat on plane (axis parallel to normal): 8 rim points all fire →
+///   4 deepest kept.
+/// - side lying (axis in plane): 4 rim points along the down direction fire
+///   → 4 kept.
+/// - tilted (axis at angle): 1–2 rim points on the down cap fire.
 ///
 /// Missed case: a cylinder tilted so the deepest rim point sits between two
-/// cardinal samples (e.g. 22.5° local rotation about the cap). The
-/// max sampling error is bounded by `R · (1 − cos(π/4)) ≈ 0.293 R`, which
-/// shows up as slightly reduced penetration; contact still fires when the
-/// cylinder truly overlaps the plane at any point.
+/// samples (worst case: 22.5° local rotation about the cap). The max
+/// sampling error is bounded by `R · (1 − cos(π/8)) ≈ 0.076 R` (down from
+/// `≈ 0.293 R` with the earlier 4-sample version); contact still fires when
+/// the cylinder truly overlaps the plane at any point.
 #[allow(clippy::too_many_arguments)]
 pub fn cylinder_plane(
     idx_cyl: usize,
@@ -854,21 +853,33 @@ pub fn cylinder_plane(
     let y_local = cyl_pose.rotate(Vec3::Y);
     let top = cyl_pose.position + axis * half_height;
     let bot = cyl_pose.position - axis * half_height;
-    // 10 candidates: 2 cap centers + (top, bot) × 4 rim directions.
-    let mut samples: [Vec3; 10] = [Vec3::ZERO; 10];
+    // 18 candidates: 2 cap centers + (top, bot) × 8 rim directions spaced
+    // at 45°. cos/sin baked as constants for determinism (no runtime trig).
+    const INV_SQRT2: f32 = 0.707_106_77;
+    // Order of rim directions: 0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°.
+    let rim_dirs: [Vec3; 8] = [
+        x_local,
+        x_local * INV_SQRT2 + y_local * INV_SQRT2,
+        y_local,
+        -x_local * INV_SQRT2 + y_local * INV_SQRT2,
+        -x_local,
+        -x_local * INV_SQRT2 + -y_local * INV_SQRT2,
+        -y_local,
+        x_local * INV_SQRT2 + -y_local * INV_SQRT2,
+    ];
+    let mut samples: [Vec3; 18] = [Vec3::ZERO; 18];
     samples[0] = top;
     samples[1] = bot;
-    let rim_dirs = [x_local, y_local, -x_local, -y_local];
     for (i, &d) in rim_dirs.iter().enumerate() {
         samples[2 + i * 2] = top + d * radius;
         samples[3 + i * 2] = bot + d * radius;
     }
-    let mut pens = [(0.0f32, Vec3::ZERO); 10];
+    let mut pens = [(0.0f32, Vec3::ZERO); 18];
     for (slot, &pt) in pens.iter_mut().zip(samples.iter()) {
         let signed = (pt - p0).dot(n);
         *slot = (margin - signed, pt);
     }
-    let mut order = [0usize; 10];
+    let mut order = [0usize; 18];
     let mut count = 0usize;
     for (i, &p) in pens.iter().enumerate() {
         if p.0 > 0.0 {
@@ -1170,18 +1181,22 @@ pub fn sphere_ellipsoid(
     }
 
     // Newton on `f(t) = Σ (a_i p.i / (a_i² + t))² - 1`. Iterate 12 times.
+    // On a zero denominator (t = -a_k²), nudge `t` and RESTART the outer
+    // iteration so we never mix accumulations against a stale `t` for some
+    // k with a fresh `t` for others — mixing produces a garbage step.
     let ap = [a * p_local.x, b * p_local.y, c * p_local.z];
     let a2 = [a * a, b * b, c * c];
     let mut t = 0.0f32;
-    for _ in 0..12 {
+    'outer: for _ in 0..12 {
         let mut f = -1.0;
         let mut fp = 0.0;
         for k in 0..3 {
             let denom = a2[k] + t;
             if denom == 0.0 {
-                // Guard against a zero denominator (would blow up); nudge.
+                // Guard: nudge t away from the pole and restart this
+                // iteration with a coherent accumulator.
                 t += 1.0e-6 * (a2[k] + 1.0);
-                continue;
+                continue 'outer;
             }
             let inv = 1.0 / denom;
             let num = ap[k] * inv;
@@ -1436,9 +1451,31 @@ pub fn narrow_phase(
     let gap = combine_max(geom_a.gap, geom_b.gap);
     // Try in the order given; if that combination isn't a known primitive,
     // swap and dispatch, then relabel the results (flipping normal and A/B).
-    if let Some(buf) = try_narrow_phase(
+    //
+    // Invariant: for any two DIFFERENT shape kinds, at most one of
+    // `(A, B)` or `(B, A)` matches a primitive arm. Symmetric same-kind
+    // pairs (sphere-sphere, box-box, capsule-capsule) match both trivially
+    // and short-circuit at the first arm below, so the swap arm never runs
+    // — safe. The one-directional invariant matters only for asymmetric
+    // pairs: if a NEW primitive is added and accidentally registered under
+    // BOTH `(X, Y)` and `(Y, X)`, the swap relabel (flipping A/B and
+    // negating the normal) would double-count with opposite sign. The
+    // debug_assert on the first arm guards against that regression for
+    // asymmetric callers.
+    let first = try_narrow_phase(
         idx_a, geom_a, pose_a, idx_b, geom_b, pose_b, friction, margin, gap, meshes,
-    ) {
+    );
+    if let Some(buf) = first {
+        debug_assert!(
+            std::mem::discriminant(&geom_a.shape) == std::mem::discriminant(&geom_b.shape)
+                || try_narrow_phase(
+                    idx_b, geom_b, pose_b, idx_a, geom_a, pose_a, friction, margin, gap, meshes,
+                )
+                .is_none(),
+            "narrow_phase invariant violated: an asymmetric shape pair matched a primitive \
+             in BOTH orderings — a new primitive is registered against both `(A, B)` and \
+             `(B, A)` combinations"
+        );
         return buf;
     }
     if let Some(mut buf) = try_narrow_phase(
