@@ -13,3 +13,4 @@ crate-type = ["rlib"]
 
 [dev-dependencies]
 chimy2 = { path = "../chimy2" }
+winit = "0.30"
