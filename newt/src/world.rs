@@ -271,6 +271,33 @@ impl World {
         tree_forward_kinematics(&self.trees[tree_idx])[link_idx]
     }
 
+    /// Joint-space mass matrix `M(q)` for the tree at index `tree_idx`.
+    /// Convenience wrapper around [`Tree::mass_matrix`] that also picks up
+    /// the world's gravity semantics (mass matrix itself does not use
+    /// gravity, but keeping the API co-located avoids the caller having to
+    /// juggle borrows across the world and its trees).
+    pub fn mass_matrix(&self, tree_idx: usize) -> Vec<f32> {
+        self.trees[tree_idx].mass_matrix()
+    }
+
+    /// Bias forces `h(q, qdot)` for a tree under the world's gravity.
+    pub fn bias_forces(&self, tree_idx: usize) -> Vec<f32> {
+        self.trees[tree_idx].bias_forces(self.gravity)
+    }
+
+    /// Inverse dynamics for a tree with the world's gravity. Callers pass
+    /// their own `external_wrenches` (matching [`Tree::inverse_dynamics`]);
+    /// contact wrenches from the world's pipeline are not automatically
+    /// re-derived here.
+    pub fn inverse_dynamics(
+        &self,
+        tree_idx: usize,
+        qddot: &[f32],
+        external_wrenches: &crate::tree::ExternalWrenches,
+    ) -> Vec<f32> {
+        self.trees[tree_idx].inverse_dynamics(qddot, self.gravity, external_wrenches)
+    }
+
     /// Advance the whole world by one fixed-dt RK4 step.
     ///
     /// Contact forces are recomputed at each RK4 sub-stage from the

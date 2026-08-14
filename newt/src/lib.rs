@@ -35,10 +35,15 @@
 //!   hand-written parser, strict-by-default loader with JSON-path errors,
 //!   packaged model files (`newt/models/*.json`), sites with world-pose
 //!   query. See `docs/model-format.md`.
+//! - **v1 tier 3** (`dynamics`) — CRB mass matrix `M(q)`, RNE inverse
+//!   dynamics `τ(q, qdot, qddot)`, bias vector `h(q, qdot)`, and a hand-
+//!   rolled dense Cholesky factor + solve. Building blocks the v1 soft-
+//!   constraint solver consumes. See `docs/dynamics.md`.
 
 pub mod actuator;
 pub mod body;
 pub mod contact;
+pub mod dynamics;
 pub mod geom;
 pub mod joint;
 pub mod json;
