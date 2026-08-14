@@ -100,9 +100,9 @@ fn tree_energy(tree: &Tree, gravity_z: f32) -> f32 {
                 v_lin_world[i] =
                     v_lin_world[parent] + w_world[parent].cross(child_pos - parent_pos);
             }
-            JointKind::Free => {
-                // Not exercised in this test (no free-root chain here) but
-                // the branch keeps the function total.
+            JointKind::Free | JointKind::Slide { .. } | JointKind::Ball { .. } => {
+                // Not exercised in this scenario (hinge-only chain) but the
+                // branches keep the function total for exhaustiveness.
                 v_lin_world[i] = Vec3::ZERO;
                 w_body[i] = Vec3::ZERO;
                 w_world[i] = Vec3::ZERO;

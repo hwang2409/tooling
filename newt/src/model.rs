@@ -25,7 +25,7 @@ use std::path::Path;
 use crate::actuator::PdServo;
 use crate::body::Body;
 use crate::geom::{Geom, GeomShape, SolRef};
-use crate::joint::{HingeLimit, JointKind};
+use crate::joint::{JointKind, JointLimit};
 use crate::json::{self, Value};
 use crate::math::{Mat3, Quat, Vec3};
 use crate::tree::{Link, Tree, forward_kinematics};
@@ -464,37 +464,53 @@ fn parse_joint(v: &Value, path: &str) -> Result<JointKind, ModelError> {
             Ok(JointKind::Fixed)
         }
         "hinge" => {
-            reject_unknown(
-                fields,
-                &["kind", "axis", "range", "damping", "armature", "limit"],
-                path,
-            )?;
-            let axis = parse_vec3(required(fields, "axis", path)?, &format!("{path}.axis"))?;
-            if axis.length_squared() < 1e-12 {
-                return fail(&format!("{path}.axis"), "hinge axis must be non-zero");
+            let SingleDofAxisJoint {
+                axis,
+                range,
+                damping,
+                armature,
+                limit,
+            } = parse_single_dof_axis_joint(fields, path, "hinge")?;
+            Ok(JointKind::Hinge {
+                axis,
+                range,
+                damping,
+                armature,
+                limit,
+            })
+        }
+        "slide" => {
+            let SingleDofAxisJoint {
+                axis,
+                range,
+                damping,
+                armature,
+                limit,
+            } = parse_single_dof_axis_joint(fields, path, "slide")?;
+            Ok(JointKind::Slide {
+                axis,
+                range,
+                damping,
+                armature,
+                limit,
+            })
+        }
+        "ball" => {
+            // Check `range` FIRST — the reject-unknown pass below would
+            // otherwise fire a generic "unknown field" error. Ball limits
+            // (cone / swing-twist) need the v1 constraint solver landing
+            // in a follow-up ticket; give a pointer at that deferral so a
+            // user who tries to add limits gets a clear message instead of
+            // a generic typo error.
+            if optional(fields, "range").is_some() {
+                return fail(
+                    &format!("{path}.range"),
+                    "ball joints do not support range limits in v0/v1-tier-1; \
+                     a 3-DOF cone / swing-twist limit needs the constraint \
+                     solver in a follow-up ticket",
+                );
             }
-            let axis = axis.normalize();
-            let range = match optional(fields, "range") {
-                None | Some(Value::Null) => None,
-                Some(v) => {
-                    let arr = get_array(v, &format!("{path}.range"))?;
-                    if arr.len() != 2 {
-                        return fail(
-                            &format!("{path}.range"),
-                            format!("expected [lo, hi] (2 numbers), got {}", arr.len()),
-                        );
-                    }
-                    let lo = get_f32(&arr[0], &format!("{path}.range[0]"))?;
-                    let hi = get_f32(&arr[1], &format!("{path}.range[1]"))?;
-                    if lo >= hi {
-                        return fail(
-                            &format!("{path}.range"),
-                            format!("range low ({lo}) must be < high ({hi})"),
-                        );
-                    }
-                    Some((lo, hi))
-                }
-            };
+            reject_unknown(fields, &["kind", "damping", "armature"], path)?;
             let damping = optional(fields, "damping")
                 .map(|v| get_f32(v, &format!("{path}.damping")))
                 .transpose()?
@@ -509,41 +525,109 @@ fn parse_joint(v: &Value, path: &str) -> Result<JointKind, ModelError> {
             if armature < 0.0 {
                 return fail(&format!("{path}.armature"), "armature must be ≥ 0");
             }
-            let limit = match optional(fields, "limit") {
-                None => HingeLimit::DEFAULT,
-                Some(v) => {
-                    let lfields = get_object(v, &format!("{path}.limit"))?;
-                    reject_unknown(lfields, &["stiffness", "damping"], &format!("{path}.limit"))?;
-                    let stiffness = get_f32(
-                        required(lfields, "stiffness", &format!("{path}.limit"))?,
-                        &format!("{path}.limit.stiffness"),
-                    )?;
-                    let damping = get_f32(
-                        required(lfields, "damping", &format!("{path}.limit"))?,
-                        &format!("{path}.limit.damping"),
-                    )?;
-                    if stiffness < 0.0 || damping < 0.0 {
-                        return fail(
-                            &format!("{path}.limit"),
-                            "limit stiffness and damping must be ≥ 0",
-                        );
-                    }
-                    HingeLimit::new(stiffness, damping)
-                }
-            };
-            Ok(JointKind::Hinge {
-                axis,
-                range,
-                damping,
-                armature,
-                limit,
-            })
+            Ok(JointKind::Ball { damping, armature })
         }
         other => fail(
             &format!("{path}.kind"),
-            format!("unknown joint kind \"{other}\"; expected free | fixed | hinge"),
+            format!("unknown joint kind \"{other}\"; expected free | fixed | hinge | slide | ball"),
         ),
     }
+}
+
+/// Parsed fields shared by every 1-DOF axis joint (hinge, slide).
+struct SingleDofAxisJoint {
+    axis: Vec3,
+    range: Option<(f32, f32)>,
+    damping: f32,
+    armature: f32,
+    limit: JointLimit,
+}
+
+/// Shared parser for single-DOF axis joints (hinge / slide). `kind_label` is
+/// only used in error messages (`hinge axis must be non-zero` vs `slide axis
+/// must be non-zero`).
+fn parse_single_dof_axis_joint(
+    fields: &[(String, Value)],
+    path: &str,
+    kind_label: &str,
+) -> Result<SingleDofAxisJoint, ModelError> {
+    reject_unknown(
+        fields,
+        &["kind", "axis", "range", "damping", "armature", "limit"],
+        path,
+    )?;
+    let axis = parse_vec3(required(fields, "axis", path)?, &format!("{path}.axis"))?;
+    if axis.length_squared() < 1e-12 {
+        return fail(
+            &format!("{path}.axis"),
+            format!("{kind_label} axis must be non-zero"),
+        );
+    }
+    let axis = axis.normalize();
+    let range = match optional(fields, "range") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let arr = get_array(v, &format!("{path}.range"))?;
+            if arr.len() != 2 {
+                return fail(
+                    &format!("{path}.range"),
+                    format!("expected [lo, hi] (2 numbers), got {}", arr.len()),
+                );
+            }
+            let lo = get_f32(&arr[0], &format!("{path}.range[0]"))?;
+            let hi = get_f32(&arr[1], &format!("{path}.range[1]"))?;
+            if lo >= hi {
+                return fail(
+                    &format!("{path}.range"),
+                    format!("range low ({lo}) must be < high ({hi})"),
+                );
+            }
+            Some((lo, hi))
+        }
+    };
+    let damping = optional(fields, "damping")
+        .map(|v| get_f32(v, &format!("{path}.damping")))
+        .transpose()?
+        .unwrap_or(0.0);
+    if damping < 0.0 {
+        return fail(&format!("{path}.damping"), "damping must be ≥ 0");
+    }
+    let armature = optional(fields, "armature")
+        .map(|v| get_f32(v, &format!("{path}.armature")))
+        .transpose()?
+        .unwrap_or(0.0);
+    if armature < 0.0 {
+        return fail(&format!("{path}.armature"), "armature must be ≥ 0");
+    }
+    let limit = match optional(fields, "limit") {
+        None => JointLimit::DEFAULT,
+        Some(v) => {
+            let lfields = get_object(v, &format!("{path}.limit"))?;
+            reject_unknown(lfields, &["stiffness", "damping"], &format!("{path}.limit"))?;
+            let stiffness = get_f32(
+                required(lfields, "stiffness", &format!("{path}.limit"))?,
+                &format!("{path}.limit.stiffness"),
+            )?;
+            let damping = get_f32(
+                required(lfields, "damping", &format!("{path}.limit"))?,
+                &format!("{path}.limit.damping"),
+            )?;
+            if stiffness < 0.0 || damping < 0.0 {
+                return fail(
+                    &format!("{path}.limit"),
+                    "limit stiffness and damping must be ≥ 0",
+                );
+            }
+            JointLimit::new(stiffness, damping)
+        }
+    };
+    Ok(SingleDofAxisJoint {
+        axis,
+        range,
+        damping,
+        armature,
+        limit,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -874,12 +958,20 @@ fn parse_link(
     };
 
     let joint = parse_joint(required(fields, "joint", path)?, &format!("{path}.joint"))?;
-    // Consistency: hinge cannot be a root; free/fixed cannot be non-root.
+    // Consistency: only Free/Fixed are allowed at the root; the non-root
+    // joints (Hinge, Slide, Ball) all need a parent to reference.
+    let joint_kind_name = match &joint {
+        JointKind::Free => "free",
+        JointKind::Fixed => "fixed",
+        JointKind::Hinge { .. } => "hinge",
+        JointKind::Slide { .. } => "slide",
+        JointKind::Ball { .. } => "ball",
+    };
     match (index, &joint) {
-        (0, JointKind::Hinge { .. }) => {
+        (0, JointKind::Hinge { .. } | JointKind::Slide { .. } | JointKind::Ball { .. }) => {
             return fail(
                 &format!("{path}.joint"),
-                "root joint must be \"free\" or \"fixed\", not \"hinge\"",
+                format!("root joint must be \"free\" or \"fixed\", not \"{joint_kind_name}\""),
             );
         }
         (_, JointKind::Free) if index > 0 => {
@@ -1251,12 +1343,17 @@ fn parse_actuator(
             format!("unknown link \"{ln}\" in tree \"{tn}\""),
         )
     })?;
-    // Actuator must reference a hinge (world's Tree::add_actuator would
-    // panic otherwise; catch it here with a friendly path).
-    if !matches!(world.trees[tidx].links[lidx].joint, JointKind::Hinge { .. }) {
+    // Actuator must reference a hinge or slide (world's Tree::add_actuator
+    // would panic otherwise; catch it here with a friendly path).
+    if !matches!(
+        world.trees[tidx].links[lidx].joint,
+        JointKind::Hinge { .. } | JointKind::Slide { .. }
+    ) {
         return fail(
             &format!("{path}.link"),
-            format!("actuator target link \"{ln}\" is not a hinge; PD servos only actuate hinges"),
+            format!(
+                "actuator target link \"{ln}\" is not a hinge or slide; PD servos only actuate 1-DOF joints"
+            ),
         );
     }
 
@@ -1515,6 +1612,134 @@ mod tests {
         }"#;
         let e = err(src);
         assert!(e.message.contains("root joint"), "{}", e.message);
+    }
+
+    #[test]
+    fn zero_slide_axis_rejected() {
+        let src = r#"{
+            "trees":[{"name":"t","links":[
+              {"name":"root","joint":{"kind":"fixed"},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}},
+              {"name":"s","parent":"root","joint":{"kind":"slide","axis":[0,0,0]},"mass":1,"inertia":{"kind":"diag","values":[1e-4,1e-4,1e-4]}}
+            ]}]
+        }"#;
+        let e = err(src);
+        assert!(e.message.contains("slide axis"), "{}", e.message);
+        assert!(e.message.contains("non-zero"), "{}", e.message);
+    }
+
+    #[test]
+    fn slide_at_root_rejected() {
+        let src = r#"{
+            "trees":[{"name":"t","links":[
+              {"name":"root","joint":{"kind":"slide","axis":[1,0,0]},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}}
+            ]}]
+        }"#;
+        let e = err(src);
+        assert!(e.message.contains("root joint"), "{}", e.message);
+        assert!(e.message.contains("slide"), "{}", e.message);
+    }
+
+    #[test]
+    fn ball_at_root_rejected() {
+        let src = r#"{
+            "trees":[{"name":"t","links":[
+              {"name":"root","joint":{"kind":"ball"},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}}
+            ]}]
+        }"#;
+        let e = err(src);
+        assert!(e.message.contains("root joint"), "{}", e.message);
+        assert!(e.message.contains("ball"), "{}", e.message);
+    }
+
+    #[test]
+    fn ball_with_range_rejected_with_solver_deferral_hint() {
+        let src = r#"{
+            "trees":[{"name":"t","links":[
+              {"name":"root","joint":{"kind":"fixed"},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}},
+              {"name":"b","parent":"root","joint":{"kind":"ball","range":[-1,1]},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}}
+            ]}]
+        }"#;
+        let e = err(src);
+        assert!(e.path.ends_with(".range"), "path: {}", e.path);
+        assert!(
+            e.message.contains("do not support") && e.message.contains("solver"),
+            "message should mention deferral to solver: {}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn slide_link_all_fields_round_trip() {
+        // Positive-side sanity: slide with damping, armature, and range
+        // loads cleanly and its DOF counts are wired through.
+        let src = r#"{
+            "trees":[{"name":"t","links":[
+              {"name":"root","joint":{"kind":"fixed"},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}},
+              {"name":"s","parent":"root",
+               "joint":{"kind":"slide","axis":[0,0,1],"range":[-0.5,0.5],"damping":0.1,"armature":0.05,
+                        "limit":{"stiffness":1500,"damping":50}},
+               "mass":1.5,"inertia":{"kind":"diag","values":[1e-4,1e-4,1e-4]}}
+            ]}]
+        }"#;
+        let s = scene(src);
+        let tree = &s.world.trees[0];
+        assert_eq!(tree.nq(), 1);
+        assert_eq!(tree.nv(), 1);
+        assert!(matches!(tree.links[1].joint, JointKind::Slide { .. }));
+    }
+
+    #[test]
+    fn ball_link_dof_counts_wire_through() {
+        let src = r#"{
+            "trees":[{"name":"t","links":[
+              {"name":"root","joint":{"kind":"fixed"},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}},
+              {"name":"b","parent":"root","joint":{"kind":"ball","damping":0.2,"armature":0.03},
+               "mass":1.0,"inertia":{"kind":"diag","values":[0.05,0.05,1e-6]}}
+            ]}]
+        }"#;
+        let s = scene(src);
+        let tree = &s.world.trees[0];
+        assert_eq!(tree.nq(), 4);
+        assert_eq!(tree.nv(), 3);
+        // Default ball q = identity quaternion (renormalized to `(0,0,0,1)`).
+        assert_eq!(tree.q[0], 0.0);
+        assert_eq!(tree.q[1], 0.0);
+        assert_eq!(tree.q[2], 0.0);
+        assert_eq!(tree.q[3], 1.0);
+        assert!(matches!(tree.links[1].joint, JointKind::Ball { .. }));
+    }
+
+    #[test]
+    fn actuator_on_slide_accepted() {
+        // PD servo on a slide joint should load cleanly (v1 tier 1 adds
+        // slide-actuation coverage; previously the loader rejected non-hinge
+        // actuator targets).
+        let src = r#"{
+            "trees":[{"name":"t","links":[
+              {"name":"root","joint":{"kind":"fixed"},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}},
+              {"name":"s","parent":"root","joint":{"kind":"slide","axis":[1,0,0]},
+               "mass":1,"inertia":{"kind":"diag","values":[1e-4,1e-4,1e-4]}}
+            ]}],
+            "actuators":[{"name":"a","type":"position","tree":"t","link":"s","kp":100,"kd":10}]
+        }"#;
+        let s = scene(src);
+        assert!(s.actuators_by_name.contains_key("a"));
+    }
+
+    #[test]
+    fn actuator_on_ball_rejected() {
+        // The 1-DOF PD servo cannot address a 3-DOF ball joint's rotational
+        // slots. Reject at load time.
+        let src = r#"{
+            "trees":[{"name":"t","links":[
+              {"name":"root","joint":{"kind":"fixed"},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}},
+              {"name":"b","parent":"root","joint":{"kind":"ball"},
+               "mass":1,"inertia":{"kind":"diag","values":[0.05,0.05,1e-6]}}
+            ]}],
+            "actuators":[{"name":"a","type":"position","tree":"t","link":"b","kp":100,"kd":10}]
+        }"#;
+        let e = err(src);
+        assert!(e.message.contains("hinge or slide"), "{}", e.message);
     }
 
     #[test]

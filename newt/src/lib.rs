@@ -23,9 +23,10 @@
 //! - **Tier 2** (`geom`, `contact`, contacts in `world`) — collision
 //!   primitives + penalty contact model + pyramidal friction. See
 //!   `docs/contacts.md`.
-//! - **Tier 3** (`joint`, `tree`) — kinematic trees, hinge joints with
-//!   limits/damping/armature, Featherstone's ABA for O(n) forward dynamics,
-//!   RK4 on generalized coordinates. See `docs/joints.md`.
+//! - **Tier 3 / v1 tier 1** (`joint`, `tree`) — kinematic trees, hinge /
+//!   slide / ball joints with limits/damping/armature (ball limits deferred
+//!   to the v1 solver), Featherstone's ABA for O(n) forward dynamics, RK4
+//!   on generalized coordinates. See `docs/joints.md`.
 //! - **Tier 4** (`actuator`, tree extensions) — PD position servos with
 //!   damping-ratio parameterization and force clamp, motor-style direct
 //!   joint torques, and world-frame external wrenches on articulated

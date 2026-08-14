@@ -14,8 +14,12 @@
 //!   link's [`joint_offset_in_parent`](crate::tree::Link::joint_offset_in_parent).
 //! - [`JointKind::Hinge`] — single axis rotation. `nq = 1`, `nv = 1`. State is
 //!   the joint angle (radians) and joint rate (rad/s).
-//!
-//! Ball and slide joints are on the v1 roadmap.
+//! - [`JointKind::Slide`] — single axis prismatic. `nq = 1`, `nv = 1`. State
+//!   is displacement along the axis (meters) and rate (m/s).
+//! - [`JointKind::Ball`] — 3-DOF rotation. `nq = 4` (child-frame quaternion
+//!   `(qx, qy, qz, qw)`, renormalized at step end like the free root). `nv =
+//!   3` (body-frame ω). Ball joint limits are deferred to the v1 constraint
+//!   solver; see the field docs on [`JointKind::Ball`].
 //!
 //! # Free-root velocity frame
 //!
@@ -45,7 +49,7 @@ pub enum JointKind {
         axis: Vec3,
         /// Optional `(low, high)` joint angle limits, radians. Enforced as a
         /// smooth spring-damper penalty torque outside the range; see
-        /// [`HingeLimit`].
+        /// [`JointLimit`].
         range: Option<(f32, f32)>,
         /// Joint damping torque coefficient: `τ_damp = -damping * qdot`.
         damping: f32,
@@ -53,34 +57,82 @@ pub enum JointKind {
         /// articulated-inertia scalar `Sᵀ IA S + armature` in ABA and shows
         /// up as the classical MuJoCo reflected inertia.
         armature: f32,
-        /// Penalty parameters for the range limit; see [`HingeLimit`].
-        limit: HingeLimit,
+        /// Penalty parameters for the range limit; see [`JointLimit`].
+        limit: JointLimit,
+    },
+    /// Single-axis prismatic (slide) joint. `nq = nv = 1`; the coordinate is
+    /// a displacement `q` in meters along the axis. The axis is in the joint
+    /// frame, which coincides with the child body frame at `q = 0`; since a
+    /// slide keeps the two frames identically oriented, the axis is fixed in
+    /// both parent and child at all `q`. The ABA joint subspace is a pure
+    /// translation `S = (0, axis)` at the child COM.
+    Slide {
+        /// Unit-length slide axis in the joint frame.
+        axis: Vec3,
+        /// Optional `(low, high)` slide displacement limits (meters). Same
+        /// penalty spring-damper model as hinge; see [`JointLimit`].
+        range: Option<(f32, f32)>,
+        /// Linear damping coefficient: `F_damp = -damping * qdot`.
+        damping: f32,
+        /// Reflected translational inertia added on the axis (kg). Enters
+        /// ABA's diagonal as `Sᵀ IA S + armature`. Analogous to a motor
+        /// rotor mass reflected through a rack-and-pinion.
+        armature: f32,
+        /// Penalty parameters for the range limit; see [`JointLimit`].
+        limit: JointLimit,
+    },
+    /// Ball (3-DOF spherical) joint. `nq = 4` — a child-frame quaternion
+    /// `(qx, qy, qz, qw)` representing the child body's rotation relative to
+    /// the parent (right-multiplied: `child_ori = parent_ori * q_ball`).
+    /// `nv = 3` — body-frame angular velocity `(ωx, ωy, ωz)` in the child's
+    /// body frame at the COM. The ABA joint subspace is 3 columns
+    /// `S_k = (e_k, r_jc × e_k)` for `k ∈ {0, 1, 2}` (the joint anchor in
+    /// child body coords is `r_jc`).
+    ///
+    /// # Deferred: joint limits
+    ///
+    /// Ball joints do NOT support range limits in v0/v1-tier-1. A physically
+    /// correct 3-DOF orientation limit (cone, swing/twist) needs the real
+    /// constraint solver landing in the next ticket (v1 tier 2 — PGS over
+    /// solref/solimp). The [`crate::model`] loader rejects a `range` field
+    /// on a ball joint with an error pointing at that deferral.
+    Ball {
+        /// Isotropic angular damping: `τ_damp = -damping * ω_body` on each
+        /// rotational axis (added as a 3-vector into `qfrc_applied`'s
+        /// effective torque during ABA pass 2).
+        damping: f32,
+        /// Reflected rotor inertia (kg·m²) added on the diagonal of the ball
+        /// joint's articulated-inertia block `D = Sᵀ IA S + armature · I₃`.
+        /// Uniform across the three rotational axes.
+        armature: f32,
     },
 }
 
-/// Spring-damper parameters for enforcing a hinge's range limit. Interpreted
-/// per side (low and high) as a one-sided spring: force is zero inside the
-/// range and grows linearly with the violation depth outside.
+/// Spring-damper parameters for enforcing a single-DOF joint's range limit
+/// (hinge or slide). Interpreted per side (low and high) as a one-sided
+/// spring: the generalized force is zero inside the range and grows linearly
+/// with the violation depth outside.
 ///
-/// This is the v0 model. v1 will replace it with a real constraint solved by
-/// the same solver that handles contacts.
+/// This is the v0 penalty model. v1 will replace it with a real constraint
+/// solved by the same solver that handles contacts.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct HingeLimit {
-    /// Spring stiffness per unit violation (N·m/rad).
+pub struct JointLimit {
+    /// Spring stiffness per unit violation (units follow the joint DOF —
+    /// N·m/rad for hinge, N/m for slide).
     pub stiffness: f32,
     /// Damping coefficient applied to the joint rate WHEN the joint is
     /// outside the range on the corresponding side. `2 sqrt(k I_eff)` is
-    /// critical damping; we default to a comfortably damped value.
+    /// critical damping; the default is a comfortably damped value.
     pub damping: f32,
 }
 
-impl HingeLimit {
-    /// Reasonable stiff-but-stable defaults for a single unit-mass link with
-    /// `I ≈ 1` about the hinge axis: `k = 1000 N·m/rad` gives a limit
-    /// frequency of ≈ 31 rad/s (period ≈ 200 ms) — much slower than the
-    /// dt = 5 ms integrator so RK4 stays stable, and much faster than
-    /// typical motion so the limit feels rigid on human timescales.
-    /// Damping is ≈ critical for that spring/inertia.
+impl JointLimit {
+    /// Stiff-but-stable defaults for a single unit-mass link with
+    /// `I ≈ 1` about the hinge axis (or an equivalent single unit mass on a
+    /// slide): `k = 1000` gives a limit frequency of ≈ 31 rad/s (period ≈
+    /// 200 ms) — much slower than the `dt = 5 ms` integrator so RK4 stays
+    /// stable, and much faster than typical motion so the limit feels rigid
+    /// on human timescales. Damping is ≈ critical for that spring/inertia.
     pub const DEFAULT: Self = Self {
         stiffness: 1000.0,
         damping: 60.0,
@@ -91,6 +143,11 @@ impl HingeLimit {
     }
 }
 
+/// Historical alias — the v0 code called this `HingeLimit`; v1 promoted the
+/// type to cover slide joints too (same math, different units on the DOF).
+/// Kept so tier-3 tests that reference `HingeLimit` compile unchanged.
+pub type HingeLimit = JointLimit;
+
 impl JointKind {
     /// Number of position (q) slots this joint contributes.
     pub const fn nq(&self) -> usize {
@@ -98,6 +155,8 @@ impl JointKind {
             JointKind::Free => 7,
             JointKind::Fixed => 0,
             JointKind::Hinge { .. } => 1,
+            JointKind::Slide { .. } => 1,
+            JointKind::Ball { .. } => 4,
         }
     }
 
@@ -107,6 +166,8 @@ impl JointKind {
             JointKind::Free => 6,
             JointKind::Fixed => 0,
             JointKind::Hinge { .. } => 1,
+            JointKind::Slide { .. } => 1,
+            JointKind::Ball { .. } => 3,
         }
     }
 
@@ -118,7 +179,27 @@ impl JointKind {
             range: None,
             damping: 0.0,
             armature: 0.0,
-            limit: HingeLimit::DEFAULT,
+            limit: JointLimit::DEFAULT,
+        }
+    }
+
+    /// Convenience constructor for a slide with default penalty limits and
+    /// zero damping/armature.
+    pub fn slide(axis: Vec3) -> Self {
+        JointKind::Slide {
+            axis,
+            range: None,
+            damping: 0.0,
+            armature: 0.0,
+            limit: JointLimit::DEFAULT,
+        }
+    }
+
+    /// Convenience constructor for a ball joint with zero damping/armature.
+    pub fn ball() -> Self {
+        JointKind::Ball {
+            damping: 0.0,
+            armature: 0.0,
         }
     }
 }
@@ -136,5 +217,11 @@ mod tests {
         let h = JointKind::hinge(Vec3::X);
         assert_eq!(h.nq(), 1);
         assert_eq!(h.nv(), 1);
+        let s = JointKind::slide(Vec3::Z);
+        assert_eq!(s.nq(), 1);
+        assert_eq!(s.nv(), 1);
+        let b = JointKind::ball();
+        assert_eq!(b.nq(), 4);
+        assert_eq!(b.nv(), 3);
     }
 }
