@@ -67,12 +67,12 @@ those units.
 
 The load-bearing NEWT-14 signal from Finding 2: after the
 split-α reference-term fix, newt's steady-state penetration
-tracks MuJoCo to within ~10 μm at three points across a 5x
-solref timeconst sweep (stiff / default / soft). Numbers are
-z-center at t=3 s (well past bounce and settle); pen = 0.1 − z.
-Fixtures: `sphere_drop_stiff.xml` (tc=0.010), `sphere_drop.xml`
-(tc=0.020, default), `sphere_drop_soft.xml` (tc=0.050). The
-dedicated test that guards this is
+tracks MuJoCo **within the fitted window `tc ∈ [0.010, 0.050]`**
+at dampratio = 1. Numbers are z-center at t=3 s (well past
+bounce and settle); pen = 0.1 − z. Fixtures:
+`sphere_drop_stiff.xml` (tc=0.010), `sphere_drop.xml` (tc=0.020,
+default), `sphere_drop_soft.xml` (tc=0.050). The dedicated test
+that guards this is
 `sphere_drop_steady_state_penetration_matches_mujoco` in
 `tests/differential.rs`.
 
@@ -85,6 +85,10 @@ dedicated test that guards this is
 Pre-NEWT-14 newt at tc=0.020 sat at 216 μm below the same MuJoCo
 point (395 μm penetration where MJ was 216 μm). See the NEWT-14
 Finding 2 note below for the derivation and the empirical fit.
+
+**Outside the fitted window the fit does not extrapolate — see
+the "MuJoCo k_impedance functional form outside fitted window"
+open finding below for numbers and scope.**
 
 ### Energy scorecard (long-horizon)
 
@@ -284,6 +288,46 @@ Remaining bounded divergences (documented per-scenario above):
   peak phase drift; scorecard row and bound unchanged.
 
 Both findings are documented in the NEWT-14 PR body.
+
+### NEW OPEN FINDING: MuJoCo `k_impedance` functional form outside `tc ∈ [0.010, 0.050]`
+
+The `α_k = 2` fit that closes the in-window sphere_drop finding
+was measured on six solref timeconst points at dampratio = 1
+(`tc ∈ {0.010, 0.015, 0.020, 0.030, 0.050, 0.100}`; the largest
+was already borderline). Round-2 out-of-sample probes at
+`tc ∈ {0.005, 0.070, 0.100}` show the fit does NOT extrapolate —
+newt over-penetrates real MuJoCo by 0.5 to 1.2 mm outside
+`[0.010, 0.050]`:
+
+| tc     | mj_z        | newt_z      | mj_pen (μm) | newt_pen (μm) | gap (μm) |
+|--------|-------------|-------------|-------------|---------------|----------|
+| 0.005  | 0.099986    | 0.098745    | 14.3        | 1254.9        | 1240.6   |
+| 0.070  | 0.098739    | 0.098216    | 1261.3      | 1784.5        | 523.1    |
+| 0.100  | 0.097426    | 0.096381    | 2574.1      | 3618.8        | 1044.7   |
+
+Iteration count was ruled out (bumped 20 → 200; no material
+change at these tc). The pre-NEWT-14 code was uniformly worse
+across the entire tc range (2/d ratio); the round-1 fix
+correctly closes the fitted window while ALSO improving the
+tc=0.100 case from 5476 μm to 3619 μm, but does not match
+MuJoCo bit-for-bit outside `[0.010, 0.050]`.
+
+Interpretation. The true MuJoCo `k_impedance` functional form
+almost certainly is NOT the single-scalar `α_k = 2` shape that
+happens to match in-window. Deriving it would need either
+(a) reading the MuJoCo source's `mj_makeConstraint` /
+`mj_softConstraint` directly to extract the actual `k` and
+`b` expressions, or (b) fitting a more expressive form
+(e.g., `α_k(tc, d)` with tc-dependent scaling, or a proper
+midpoint-stabilization term) against a denser sweep.
+
+**Scope for NEWT-14: report, do not paper over.** The scorecard
+verdict for the in-window sweep is "parity (fitted window)"; the
+out-of-window numbers are called out here and are NOT asserted
+by any test (that would either force us to widen the tolerance
+into meaninglessness or lie about the fit). A future ticket
+should either extend the fit or replace `α_k = 2` with a
+tc-dependent expression informed by MuJoCo's source.
 
 ## Regeneration
 

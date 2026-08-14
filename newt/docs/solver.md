@@ -147,18 +147,26 @@ where:
   never surveyed empirically and their tests are calibrated to the
   old scaling.
 
-**NEWT-14 derivation.** For a contact-normal row on a sphere at rest,
-the (A + R) f = -b at equilibrium yields a steady-state penetration
-`r_ss = g(1 − d) / (α_k · d · k)`. With the pre-NEWT-14 `α_k = d(r)`
-this is `g(1 − d) / (d² · k)` — approximately `2/d ≈ 2.1×` MuJoCo's
-observed penetration across the sweep. With the NEWT-14 `α_k = 2`
-this is `g(1 − d) / (2 · d · k)`, which matches MuJoCo's steady state
-to within ~10 μm at the stiff and default sweep points and ~24 μm at
-the soft point. The damping-side `α_b` stays at 1 (rather than 2)
-because scaling it up makes the bias multiplier on `v_current`
-(`1 + α_b · b · dt`) large enough at MuJoCo-comparable timesteps
-(dt=5 ms, tc=20 ms → `b·dt = 0.5`) to over-correct the approach
-velocity and turn the contact near-elastic.
+**NEWT-14 derivation (scope: fitted window).** For a contact-normal
+row on a sphere at rest, the (A + R) f = -b at equilibrium yields a
+steady-state penetration `r_ss = g(1 − d) / (α_k · d · k)`. With
+the pre-NEWT-14 `α_k = d(r)` this is `g(1 − d) / (d² · k)` —
+approximately `2/d ≈ 2.1×` MuJoCo's observed penetration across
+the sweep. With `α_k = 2` this is `g(1 − d) / (2 · d · k)`, which
+matches MuJoCo's steady state to within ~10 μm at the stiff and
+default sweep points and ~24 μm at the soft point, **but only
+within `tc ∈ [0.010, 0.050]` at dampratio = 1**. Out-of-window
+probes at tc = 0.005 / 0.070 / 0.100 show newt over-penetrates
+MuJoCo by 0.5–1.2 mm — the true MuJoCo `k_impedance` functional
+form outside the fitted window is unknown and NOT captured by
+`α_k = 2`. See `docs/differential.md`, "MuJoCo k_impedance
+functional form outside fitted window" (NEW OPEN FINDING).
+
+The damping-side `α_b` stays at 1 (rather than 2) because scaling
+it up makes the bias multiplier on `v_current` (`1 + α_b · b · dt`)
+large enough at MuJoCo-comparable timesteps (dt=5 ms, tc=20 ms →
+`b·dt = 0.5`) to over-correct the approach velocity and turn the
+contact near-elastic.
 
 For a free body with mass `m` and world-frame inertia
 `I_w = R I_body Rᵀ`, contact at arm `r_arm`:
@@ -315,10 +323,13 @@ down: `dir = −sign(r_raw) · dir_raw`. Then `J · qdot = −r_dot` in the
 row's convention, matching the contact-normal escape convention.
 Equality rows use the pre-NEWT-14 impedance-scaled reference
 (`b = J·qdot_free + d · a_ref(r, −J·qdot) · dt`) rather than the
-split-α form used by contact-normal rows — the NEWT-14 fit was
-scoped to contact penetration; equality tests
-(`equality_connect_two_bodies_hold_together_under_gravity`) rely on
-the older scaling.
+split-α form used by contact-normal rows. This is engineering
+scope, not a physics claim: we have only FIT contact-normal rows
+against MuJoCo (the NEWT-14 sphere_drop sweep). Equality rows keep
+the old formula until a future ticket does the same measurement
+for equality constraints —
+`equality_connect_two_bodies_hold_together_under_gravity` and the
+other equality tests were calibrated against the old scaling.
 
 **Distance-at-zero-separation guard.** When `|p_A − p_B| <
 DISTANCE_DEGENERATE_EPS` (currently 1 µm) the row is elided that step:

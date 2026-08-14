@@ -336,14 +336,21 @@ pub const CONTACT_AREF_ALPHA_DAMPING: f32 = 1.0;
 /// Empirical fit from the NEWT-14 solref sweep against real MuJoCo
 /// (`docs/differential.md`, sphere_drop row): 2 matches MuJoCo's
 /// steady-state penetration formula `r_ss = g(1−d) / (2·d·k)`
-/// across the tc sweep (tc ∈ {0.010..0.100}, dampratio=1). The
-/// pre-NEWT-14 code used `α_k = d(r)` here (impedance-scaled
-/// reference), which put newt's steady-state penetration at
-/// roughly `2/d ≈ 2.1×` MuJoCo's — the v1 open finding this
-/// scoping closes. Scoped to CONTACT normal rows because the
-/// fit was measured on contact penetration; equality and joint-
-/// limit rows continue to use the impedance-scaled reference
-/// (unchanged from pre-NEWT-14) to preserve their tested behaviour.
+/// **only within the fitted window `tc ∈ [0.010, 0.050]` at
+/// dampratio = 1**. Out-of-window probes at tc = 0.005, 0.070,
+/// 0.100 show newt over-penetrating by 0.5–1.2 mm (see the "new
+/// open finding" section in `docs/differential.md`) — the true
+/// MuJoCo `k_impedance` functional form outside the window is
+/// unknown and NOT captured by this constant. The pre-NEWT-14
+/// code used `α_k = d(r)` here (impedance-scaled reference),
+/// which put newt's in-window steady-state penetration at
+/// roughly `2/d ≈ 2.1×` MuJoCo's — that v1 signal is what this
+/// constant closes.
+///
+/// Scoping: applied only on CONTACT normal rows. We have NOT
+/// fitted equality or joint-limit rows against MuJoCo; they keep
+/// the pre-NEWT-14 impedance-scaled reference until a future
+/// ticket does the same measurement for those row types.
 pub const CONTACT_AREF_ALPHA_STIFFNESS: f32 = 2.0;
 
 // ---------------------------------------------------------------------------
@@ -755,10 +762,13 @@ pub fn solve_free_bodies_diag(
                 &dw_body_free_per_body,
                 bodies,
             );
-            // Equality rows continue to use the pre-NEWT-14
-            // impedance-scaled reference: the NEWT-14 fit was on
-            // contact-normal penetration, and equality tests rely on
-            // the old scaling (e.g. connect long-run sag bound).
+            // We have only FIT contact-normal rows against MuJoCo
+            // (the NEWT-14 sphere_drop sweep). Equality rows keep the
+            // pre-NEWT-14 impedance-scaled reference until a future
+            // ticket does the same measurement for equality
+            // constraints. This is engineering scope, not a physics
+            // claim: the old formula is what our equality tests
+            // (e.g. `equality_connect`) were calibrated against.
             let r_dot = -v_cur;
             let a_ref = reference_accel(r, r_dot, pe.solref);
             rows[ri].bias = v_cur + dv_free + d * a_ref * dt;
@@ -1785,10 +1795,12 @@ pub fn solve_tree_limits(
         // Limit rows: sign chosen so v_row = sign · qdot[v_slot] = escape
         // velocity (positive when escaping). Coupling rows: flipped at
         // construction so `+f` reduces |signed residual|.
+        // We have only FIT contact-normal rows against MuJoCo.
         // Joint-limit / joint-coupling rows keep the pre-NEWT-14
-        // impedance-scaled reference: the NEWT-14 fit was scoped to
-        // contact-normal penetration; scaling these rows differently
-        // regresses `equality_connect` and `joint_limit_swing`.
+        // impedance-scaled reference until a future ticket does the
+        // same measurement for these row types. Engineering scope,
+        // not a physics claim: `joint_limit_swing` and the coupling
+        // tests were calibrated to the old formula.
         let r_dot = -v_row;
         let a_ref = reference_accel(row.violation, r_dot, row.solref);
         let d = impedance(row.violation, row.solimp);
