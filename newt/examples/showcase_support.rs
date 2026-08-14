@@ -16,7 +16,6 @@ use chimy2::shadow::{
     ShadowDepthShader, ShadowDepthUniforms, ShadowMap, ShadowState, directional_light_view,
 };
 
-use newt::body::Body;
 use newt::geom::{GeomShape, geom_world_pose};
 use newt::math::{Quat, Vec3 as NVec3};
 use newt::tree::forward_kinematics;
@@ -354,14 +353,6 @@ fn palette(index: usize) -> Material {
     Material::new(colors[index % colors.len()], 0.18, 0.38)
 }
 
-fn look_orientation(position: Vec3, target: Vec3) -> CQuat {
-    let forward = (target - position).normalize();
-    let yaw = forward.x.atan2(-forward.z);
-    let pitch = forward.y.asin();
-    CQuat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), yaw)
-        * CQuat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), -pitch)
-}
-
 fn align_z(vector: NVec3) -> Quat {
     let direction = vector.normalize();
     if direction.length() == 0.0 {
@@ -487,10 +478,6 @@ fn capsule_mesh(segments: usize, rings: usize, radius: f32, half_height: f32) ->
         })
         .collect();
     Mesh::new(vertices, sphere.indices().to_vec())
-}
-
-pub fn body_pose(body: &Body) -> (NVec3, Quat) {
-    (body.position, body.orientation)
 }
 
 fn main() {}
