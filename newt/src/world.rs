@@ -36,6 +36,7 @@
 
 use crate::body::Body;
 use crate::contact::{Contact, is_pair_supported, narrow_phase};
+use crate::equality::Equality;
 use crate::geom::{
     ConvexMesh, Geom, GeomAttach, GeomPose, GeomShape, combine_solref, geom_world_pose,
     solref_to_kc,
@@ -72,6 +73,13 @@ pub struct World {
     /// pre-v1-tier-4 golden byte-identical. Set to
     /// `SolverMode::Pgs` to switch on the MuJoCo soft-constraint solver.
     pub solver: SolverConfig,
+    /// Equality constraints (v1 tier 5). Only active when
+    /// `solver.mode == Pgs`. Free-body equalities (connect / weld /
+    /// distance) contribute rows to the free-body PGS solve; tree
+    /// joint-couplings contribute one row each to their tree's PGS solve.
+    /// Empty by default so every pre-v1-tier-5 golden and every scene
+    /// that does not declare an equality is bit-for-bit unchanged.
+    pub equalities: Vec<Equality>,
     /// Cached pair-support fingerprint from the last successful validation.
     /// Encoded as `(geoms.len() << 32) | pair_list_encoded` where
     /// `pair_list_encoded` is `(pair_list.len() as u32) + 1` when
@@ -100,6 +108,7 @@ impl PartialEq for World {
             && self.meshes == other.meshes
             && self.pair_list == other.pair_list
             && self.solver == other.solver
+            && self.equalities == other.equalities
     }
 }
 
@@ -129,6 +138,7 @@ impl World {
             meshes: Vec::new(),
             pair_list: None,
             solver: SolverConfig::DEFAULT,
+            equalities: Vec::new(),
             checked_pairs: std::cell::Cell::new(0),
         }
     }
@@ -454,7 +464,13 @@ impl World {
             let mut solver_qfrc_delta: Vec<f32> = Vec::new();
             let prior_disable = tree.disable_penalty_limits;
             if solver_mode == SolverMode::Pgs {
-                solver_qfrc_delta = crate::solver::solve_tree_limits(&tree, dt, solver_iterations);
+                solver_qfrc_delta = crate::solver::solve_tree_limits(
+                    &tree,
+                    ti,
+                    &self.equalities,
+                    dt,
+                    solver_iterations,
+                );
                 for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
                     tree.qfrc_applied[slot] += delta;
                 }
@@ -510,11 +526,10 @@ impl World {
         state: &[Body],
         pairs: &[(usize, usize)],
     ) -> Vec<(Vec3, Vec3)> {
-        let n = state.len();
-        if self.geoms.is_empty() {
-            return vec![(Vec3::ZERO, Vec3::ZERO); n];
-        }
-        // Filter pairs to free-body-only ones (both sides Body or Static).
+        // Filter pairs to free-body-only ones (both sides Body or
+        // Static). `solve_free_bodies` returns per-body zero wrenches
+        // when there are no contacts AND no free-body equalities, so
+        // the outer fast path is redundant.
         let mut free_pairs: Vec<(usize, usize)> = Vec::with_capacity(pairs.len());
         for &(a, b) in pairs {
             let att_a = self.geoms[a].attachment();
@@ -529,6 +544,7 @@ impl World {
             state,
             &self.geoms,
             &contacts,
+            &self.equalities,
             self.gravity,
             self.dt,
             self.solver.cone,

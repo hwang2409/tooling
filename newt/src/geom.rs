@@ -277,18 +277,47 @@ pub struct Geom {
     /// max(a.gap, b.gap)`. Zero (default) means every detected contact
     /// applies force.
     pub gap: f32,
-    /// Contact dimensionality (v1 tier 4). `1` — frictionless (normal
-    /// force only); `3` — normal + 2 tangents (sliding friction). `4` and
-    /// `6` (torsional / rolling) are deferred to the equality-constraints
-    /// ticket. Only consulted when `world.solver.mode == Pgs`; penalty
-    /// mode always applies the pyramidal friction pathway.
+    /// Contact dimensionality. `1` — frictionless (normal force only);
+    /// `3` — normal + 2 tangents (sliding friction); `4` — condim 3 plus a
+    /// torsional row about the normal (drills spinning); `6` — condim 4
+    /// plus two rolling rows about the tangent axes. Only consulted when
+    /// `world.solver.mode == Pgs`; penalty mode always applies the
+    /// condim-3 pyramidal path.
     ///
     /// Pair rule: `min(a.condim, b.condim)` — the less-detailed cone
-    /// wins, matching MuJoCo. Default `3`.
+    /// wins, matching MuJoCo. Default `3`. condim `4` reads
+    /// `torsional_friction`; condim `6` also reads `rolling_friction`.
     pub condim: u8,
+    /// Torsional Coulomb coefficient about the contact normal (used when
+    /// the pair's condim ≥ 4). Cone cap on the torsion row is
+    /// `torsional_friction · f_n`. Default `0.0` — condim ≤ 3 ignores
+    /// this, and condim ≥ 4 with `0.0` degenerates to "no torsional
+    /// friction" (the row exists but its cone collapses to the origin
+    /// and produces no torque).
+    pub torsional_friction: f32,
+    /// Rolling Coulomb coefficient about the two tangent axes (used when
+    /// the pair's condim = 6). Cone cap per rolling row is
+    /// `rolling_friction · f_n`. Default `0.0` — condim ≤ 5 ignores
+    /// this. Following MuJoCo, both rolling rows share this coefficient
+    /// (single scalar), not a per-axis pair.
+    pub rolling_friction: f32,
     /// Impedance profile for the constraint solver. See [`SolImp`]. Only
     /// consulted when `world.solver.mode == Pgs`. Default `SolImp::DEFAULT`.
     pub solimp: SolImp,
+}
+
+/// Combine two geoms' torsional friction coefficients. Rule: `min`, same
+/// as sliding friction. Rationale: user-set friction on either geom bounds
+/// the pair's friction (the "grabbier" material can't lift the pair above
+/// the smoother material's cap).
+pub fn combine_torsional_friction(a: f32, b: f32) -> f32 {
+    if a <= b { a } else { b }
+}
+
+/// Combine two geoms' rolling friction coefficients. Same `min` rule as
+/// [`combine_torsional_friction`].
+pub fn combine_rolling_friction(a: f32, b: f32) -> f32 {
+    if a <= b { a } else { b }
 }
 
 /// Where a geom is attached. Convenience view over the `body`/`link` fields
@@ -336,6 +365,8 @@ impl Geom {
             margin: 0.0,
             gap: 0.0,
             condim: 3,
+            torsional_friction: 0.0,
+            rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
         }
     }
@@ -354,6 +385,8 @@ impl Geom {
             margin: 0.0,
             gap: 0.0,
             condim: 3,
+            torsional_friction: 0.0,
+            rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
         }
     }
@@ -378,6 +411,8 @@ impl Geom {
             margin: 0.0,
             gap: 0.0,
             condim: 3,
+            torsional_friction: 0.0,
+            rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
         }
     }
@@ -402,6 +437,8 @@ impl Geom {
             margin: 0.0,
             gap: 0.0,
             condim: 3,
+            torsional_friction: 0.0,
+            rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
         }
     }
@@ -426,6 +463,8 @@ impl Geom {
             margin: 0.0,
             gap: 0.0,
             condim: 3,
+            torsional_friction: 0.0,
+            rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
         }
     }
@@ -453,6 +492,8 @@ impl Geom {
             margin: 0.0,
             gap: 0.0,
             condim: 3,
+            torsional_friction: 0.0,
+            rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
         }
     }
@@ -482,6 +523,8 @@ impl Geom {
             margin: 0.0,
             gap: 0.0,
             condim: 3,
+            torsional_friction: 0.0,
+            rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
         }
     }
@@ -509,6 +552,8 @@ impl Geom {
             margin: 0.0,
             gap: 0.0,
             condim: 3,
+            torsional_friction: 0.0,
+            rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
         }
     }
@@ -532,6 +577,8 @@ impl Geom {
             margin: 0.0,
             gap: 0.0,
             condim: 3,
+            torsional_friction: 0.0,
+            rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
         }
     }
@@ -556,6 +603,8 @@ impl Geom {
             margin: 0.0,
             gap: 0.0,
             condim: 3,
+            torsional_friction: 0.0,
+            rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
         }
     }
