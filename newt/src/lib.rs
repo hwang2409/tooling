@@ -30,13 +30,19 @@
 //!   damping-ratio parameterization and force clamp, motor-style direct
 //!   joint torques, and world-frame external wrenches on articulated
 //!   links. See `docs/actuators.md`.
+//! - **Tier 5** (`json`, `model`) — native JSON scene format:
+//!   hand-written parser, strict-by-default loader with JSON-path errors,
+//!   packaged model files (`newt/models/*.json`), sites with world-pose
+//!   query. See `docs/model-format.md`.
 
 pub mod actuator;
 pub mod body;
 pub mod contact;
 pub mod geom;
 pub mod joint;
+pub mod json;
 pub mod math;
+pub mod model;
 pub mod spatial;
 pub mod tree;
 pub mod world;

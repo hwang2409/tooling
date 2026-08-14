@@ -1,0 +1,59 @@
+{
+  "version": "1",
+  "gravity": [0.0, 0.0, -9.81],
+  "timestep": 0.005,
+
+  "bodies": [
+    {
+      "name": "bottom",
+      "mass": 1.2,
+      "inertia": {"kind": "solid", "shape": {"kind": "box", "half_extents": [0.35, 0.35, 0.35]}},
+      "pose": {"position": [0.02, -0.01, 0.5]}
+    },
+    {
+      "name": "middle",
+      "mass": 0.9,
+      "inertia": {"kind": "solid", "shape": {"kind": "box", "half_extents": [0.35, 0.35, 0.35]}},
+      "pose": {
+        "position": [-0.03, 0.04, 1.7],
+        "orientation": [0.0, 0.0, 0.25881904, 0.9659258]
+      }
+    },
+    {
+      "name": "top",
+      "mass": 1.5,
+      "inertia": {"kind": "solid", "shape": {"kind": "box", "half_extents": [0.35, 0.35, 0.35]}},
+      "pose": {
+        "position": [0.05, 0.02, 2.9],
+        "orientation": [0.0, 0.0, -0.19509032, 0.98078525]
+      }
+    }
+  ],
+
+  "geoms": [
+    {
+      "name": "ground",
+      "shape": {"kind": "plane"},
+      "attach": {"kind": "static"},
+      "friction": 0.6
+    },
+    {
+      "name": "bottom_box",
+      "shape": {"kind": "box", "half_extents": [0.35, 0.35, 0.35]},
+      "attach": {"kind": "body", "body": "bottom"},
+      "friction": 0.6
+    },
+    {
+      "name": "middle_box",
+      "shape": {"kind": "box", "half_extents": [0.35, 0.35, 0.35]},
+      "attach": {"kind": "body", "body": "middle"},
+      "friction": 0.6
+    },
+    {
+      "name": "top_box",
+      "shape": {"kind": "box", "half_extents": [0.35, 0.35, 0.35]},
+      "attach": {"kind": "body", "body": "top"},
+      "friction": 0.6
+    }
+  ]
+}
