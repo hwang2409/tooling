@@ -43,9 +43,10 @@ steps. If you touch either loader, keep the anchors green.
 | `<sensor>`   | Sensor kinds listed below.                                |
 | `<equality>` | `<connect>`, `<weld>`, `<joint>` children.                |
 | `<contact>`  | `<pair>` XOR `<exclude>` children (exclusive).            |
+| `<keyframe>` | `<key>` snapshots with `qpos`, `qvel`, `act`, and `ctrl`. |
 
-Rejected top-level elements (clean `unsupported in v1 subset` error):
-`<asset>`, `<tendon>`, `<keyframe>`, `<custom>`, `<visual>`, `<size>`,
+Rejected top-level elements (clean `unsupported in v2 tier 4` error):
+`<asset>`, `<tendon>`, `<custom>`, `<visual>`, `<size>`,
 `<statistic>`, `<extension>`, `<include>`.
 
 ### `<compiler>`
@@ -66,12 +67,13 @@ errors out with the attribute name.
 | ------------ | --------------------------------------------- | ----- |
 | `timestep`   | positive float                                | Sets `World::dt`. |
 | `gravity`    | `x y z`                                       | Sets `World::gravity`. |
+| `magnetic`   | `x y z`                                       | Sets `World::magnetic_field`. |
 | `integrator` | `RK4` / `rk4`                                 | Others error (only RK4 is implemented). |
 | `cone`       | `pyramidal` or `elliptic`                     | Maps to `World::solver.cone`. |
 | `iterations` | positive integer                              | Maps to `World::solver.iterations`. |
 | `solver`     | `PGS` / `pgs`                                 | Switches `World::solver.mode` to `Pgs`. Newt's default stays `Penalty` when this attribute is absent. |
 
-Everything else (`wind`, `magnetic`, `density`, `viscosity`, `impratio`,
+Everything else (`wind`, `density`, `viscosity`, `impratio`,
 `o_margin`, `o_solref`, `o_solimp`, `tolerance`, `noslip_*`, `mpr_*`,
 `collision`, `jacobian`, `apirate`…) errors out with the attribute name.
 
@@ -90,6 +92,7 @@ root, `<light>`, `<camera>`, `<frame>` — rejected.
 | `euler`        | `x y z` intrinsic (compiler `eulerseq="xyz"`), degree-scaled per `<compiler>`. |
 | `axisangle`    | `ax ay az angle`. |
 | `childclass`   | Default class name for descendant elements. |
+| `mocap`        | `true` only on a root body. The root pose is kinematic. |
 
 Child elements: `<inertial>` (optional, see [Body inertia](#body-inertia)),
 `<freejoint>` OR `<joint>` (at most one — v1 subset does not support
@@ -101,6 +104,15 @@ free-body-only child element that seeds the initial linear /
 body-frame angular velocity. Mirrors the JSON model's `"velocity"`
 field so `stack.xml` can hit the byte-identical trajectory anchor.
 Not part of stock MJCF.
+
+### `<keyframe>`
+
+`<keyframe>` accepts `<key>` children. `qpos`, `qvel`, `act`, and `ctrl`
+are space-separated arrays in generalized-state and actuator declaration
+order. Missing arrays default to zero. Dimensions are checked while loading.
+
+`World::reset_to_keyframe` restores a named snapshot without changing the
+model or integration settings.
 
 ### Body inertia
 
@@ -369,10 +381,8 @@ of this commit.
   equivalent mass, similar span) but not identical. Impact:
   slightly different natural period, does not change the
   qualitative inverted-pendulum instability.
-- **No `<keyframe>` support.** A pre-crouched initial pose would
-  reduce the ballistic-fall transient the pure-PD test observes.
-  The newt `target` extension on `<position>` bakes the standing
-  setpoint, but the joints still start at q=0.
+- **Keyframes are supported.** A pre-crouched initial pose can load from
+  `<keyframe>` and be restored with `World::reset_to_keyframe`.
 
 **Why joint PD alone cannot stand (numbers).** With a ~20 kg
 body-mass biped whose CoM sits ~0.9 m above the ankles, the

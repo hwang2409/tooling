@@ -53,6 +53,8 @@ pub struct World {
     pub dt: f32,
     /// Uniform gravity vector applied to every body's COM.
     pub gravity: Vec3,
+    /// Global magnetic field in world coordinates for magnetometer sensors.
+    pub magnetic_field: Vec3,
     /// Free bodies. Index-stable. Tier-1 style (no joints).
     pub bodies: Vec<Body>,
     /// Kinematic trees (tier 3). Index-stable. Free bodies and trees can
@@ -87,6 +89,8 @@ pub struct World {
     /// so every pre-v1-tier-6 golden and every scene without sensors is
     /// bit-for-bit unchanged.
     pub sensors: SensorBank,
+    /// Named generalized-state snapshots.
+    pub keyframes: Vec<Keyframe>,
     /// Cached pair-support fingerprint from the last successful validation.
     /// Encoded as `(geoms.len() << 32) | pair_list_encoded` where
     /// `pair_list_encoded` is `(pair_list.len() as u32) + 1` when
@@ -102,6 +106,29 @@ pub struct World {
     checked_pairs: std::cell::Cell<u64>,
 }
 
+/// A named generalized-state snapshot. Vectors flatten trees in world tree
+/// order. `act` and `ctrl` flatten actuators in the same order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Keyframe {
+    pub name: String,
+    pub q: Vec<f32>,
+    pub qdot: Vec<f32>,
+    pub act: Vec<f32>,
+    pub ctrl: Vec<f32>,
+}
+
+/// Keyframe lookup or dimension validation failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyframeError(pub String);
+
+impl std::fmt::Display for KeyframeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for KeyframeError {}
+
 // Manual PartialEq: the pair-check cache is not part of logical world state.
 // Two worlds with identical bodies/trees/geoms/meshes/pair_list are equal
 // regardless of whether either has run the pair check.
@@ -109,6 +136,7 @@ impl PartialEq for World {
     fn eq(&self, other: &Self) -> bool {
         self.dt == other.dt
             && self.gravity == other.gravity
+            && self.magnetic_field == other.magnetic_field
             && self.bodies == other.bodies
             && self.trees == other.trees
             && self.geoms == other.geoms
@@ -117,6 +145,7 @@ impl PartialEq for World {
             && self.solver == other.solver
             && self.equalities == other.equalities
             && self.sensors == other.sensors
+            && self.keyframes == other.keyframes
     }
 }
 
@@ -140,6 +169,7 @@ impl World {
         Self {
             dt: 0.005,
             gravity: Vec3::new(0.0, 0.0, -9.81),
+            magnetic_field: Vec3::new(0.0, -0.5, 0.0),
             bodies: Vec::new(),
             trees: Vec::new(),
             geoms: Vec::new(),
@@ -148,6 +178,7 @@ impl World {
             solver: SolverConfig::DEFAULT,
             equalities: Vec::new(),
             sensors: SensorBank::new(),
+            keyframes: Vec::new(),
             checked_pairs: std::cell::Cell::new(0),
         }
     }
@@ -165,6 +196,79 @@ impl World {
         let idx = self.sensors.sensors.len();
         self.sensors.push(sensor);
         Ok(idx)
+    }
+
+    /// Add a named keyframe after checking every vector against the current
+    /// model dimensions.
+    pub fn add_keyframe(
+        &mut self,
+        name: impl Into<String>,
+        q: Vec<f32>,
+        qdot: Vec<f32>,
+        act: Vec<f32>,
+        ctrl: Vec<f32>,
+    ) -> Result<(), KeyframeError> {
+        let name = name.into();
+        if self.keyframes.iter().any(|key| key.name == name) {
+            return Err(KeyframeError(format!("duplicate keyframe name {name:?}")));
+        }
+        let expected = self.keyframe_dimensions();
+        for (label, actual, wanted) in [
+            ("q", q.len(), expected.0),
+            ("qdot", qdot.len(), expected.1),
+            ("act", act.len(), expected.2),
+            ("ctrl", ctrl.len(), expected.2),
+        ] {
+            if actual != wanted {
+                return Err(KeyframeError(format!(
+                    "keyframe {name:?} {label} dimension mismatch: expected {wanted}, got {actual}"
+                )));
+            }
+        }
+        self.keyframes.push(Keyframe {
+            name,
+            q,
+            qdot,
+            act,
+            ctrl,
+        });
+        Ok(())
+    }
+
+    /// Reset generalized positions, velocities, activations, and controls to
+    /// a named keyframe. The model and integration settings stay unchanged.
+    pub fn reset_to_keyframe(&mut self, name: &str) -> Result<(), KeyframeError> {
+        let key = self
+            .keyframes
+            .iter()
+            .find(|key| key.name == name)
+            .cloned()
+            .ok_or_else(|| KeyframeError(format!("unknown keyframe {name:?}")))?;
+        let mut q = 0;
+        let mut qdot = 0;
+        let mut actuator = 0;
+        for tree in &mut self.trees {
+            let nq = tree.nq();
+            let nv = tree.nv();
+            tree.q.copy_from_slice(&key.q[q..q + nq]);
+            tree.qdot.copy_from_slice(&key.qdot[qdot..qdot + nv]);
+            q += nq;
+            qdot += nv;
+            for item in &mut tree.actuators {
+                item.act = key.act[actuator];
+                item.ctrl = key.ctrl[actuator];
+                actuator += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn keyframe_dimensions(&self) -> (usize, usize, usize) {
+        (
+            self.trees.iter().map(Tree::nq).sum(),
+            self.trees.iter().map(Tree::nv).sum(),
+            self.trees.iter().map(|tree| tree.actuators.len()).sum(),
+        )
     }
 
     /// Read-only slice of the latest sensor reading for sensor `idx`, or
@@ -319,6 +423,52 @@ impl World {
         tree_forward_kinematics(&self.trees[tree_idx])[link_idx]
     }
 
+    /// Dense world-frame Jacobian for a tree link COM.
+    pub fn tree_link_jacobian(
+        &self,
+        tree_idx: usize,
+        link_idx: usize,
+    ) -> crate::jacobian::Jacobian {
+        self.trees[tree_idx].link_jacobian(link_idx)
+    }
+
+    /// Dense world-frame Jacobian for a point in a tree link's body frame.
+    pub fn tree_point_jacobian(
+        &self,
+        tree_idx: usize,
+        link_idx: usize,
+        point_local: Vec3,
+    ) -> crate::jacobian::Jacobian {
+        self.trees[tree_idx].point_jacobian(link_idx, point_local)
+    }
+
+    /// Dense world-frame Jacobian for a free-body point in body coordinates.
+    pub fn body_point_jacobian(
+        &self,
+        body_idx: usize,
+        point_local: Vec3,
+    ) -> crate::jacobian::Jacobian {
+        let body = &self.bodies[body_idx];
+        crate::jacobian::free_body_jacobian(body.position, body.orientation, point_local)
+    }
+
+    /// Dense world-frame Jacobian for a site frame attachment.
+    pub fn site_jacobian(&self, site: &crate::sensor::SiteFrame) -> crate::jacobian::Jacobian {
+        match site.attach {
+            crate::sensor::SensorAttach::Body(body) => {
+                self.body_point_jacobian(body, site.local_offset)
+            }
+            crate::sensor::SensorAttach::Link(tree, link) => {
+                self.tree_point_jacobian(tree, link, site.local_offset)
+            }
+        }
+    }
+
+    /// Set a mocap root pose by tree index.
+    pub fn set_mocap_pose(&mut self, tree_idx: usize, position: Vec3, orientation: Quat) {
+        self.trees[tree_idx].set_mocap_pose(position, orientation);
+    }
+
     /// Joint-space mass matrix `M(q)` for the tree at index `tree_idx`.
     /// Convenience wrapper around [`Tree::mass_matrix`] that also picks up
     /// the world's gravity semantics (mass matrix itself does not use
@@ -344,6 +494,18 @@ impl World {
         external_wrenches: &crate::tree::ExternalWrenches,
     ) -> Vec<f32> {
         self.trees[tree_idx].inverse_dynamics(qddot, self.gravity, external_wrenches)
+    }
+
+    /// World-level inverse dynamics for an explicit tree state.
+    pub fn inverse_dynamics_at(
+        &self,
+        tree_idx: usize,
+        q: &[f32],
+        qdot: &[f32],
+        qddot: &[f32],
+        external_wrenches: &crate::tree::ExternalWrenches,
+    ) -> Vec<f32> {
+        self.trees[tree_idx].inverse_dynamics_at(q, qdot, qddot, self.gravity, external_wrenches)
     }
 
     /// Advance the whole world by one fixed-dt RK4 step.
@@ -517,6 +679,7 @@ impl World {
             geoms: &self.geoms,
             meshes: &self.meshes,
             gravity: self.gravity,
+            magnetic_field: self.magnetic_field,
             dt: self.dt,
             body_wrenches,
             tree_wrenches,
@@ -729,7 +892,7 @@ impl World {
             &free_pairs,
             ContactManifold::Full,
         );
-        solve_free_bodies(
+        let mut wrenches = solve_free_bodies(
             state,
             &self.geoms,
             &contacts,
@@ -738,7 +901,9 @@ impl World {
             self.dt,
             self.solver.cone,
             self.solver.iterations,
-        )
+        );
+        self.apply_mocap_wrenches(&mut wrenches, state, pairs);
+        wrenches
     }
 
     /// Compute per-body external wrench arrays for a given body-state vector.
@@ -762,7 +927,48 @@ impl World {
         for c in &contacts {
             apply_contact_wrench(&mut out, state, &self.geoms, c);
         }
+        self.apply_mocap_wrenches(&mut out, state, pairs);
         out
+    }
+
+    fn apply_mocap_wrenches(
+        &self,
+        out: &mut [(Vec3, Vec3)],
+        bodies: &[Body],
+        pairs: &[(usize, usize)],
+    ) {
+        if !self
+            .trees
+            .iter()
+            .any(|tree| tree.links.first().is_some_and(|link| link.mocap))
+        {
+            return;
+        }
+        let contacts = collect_contacts_full(bodies, &self.trees, &self.geoms, &self.meshes, pairs);
+        let poses: Vec<Vec<(Vec3, Quat)>> =
+            self.trees.iter().map(tree_forward_kinematics).collect();
+        for contact in contacts {
+            let a = self.geoms[contact.geom_a].attachment();
+            let b = self.geoms[contact.geom_b].attachment();
+            let (body_idx, mocap_tree) = match (a, b) {
+                (GeomAttach::Body(body), GeomAttach::Link(tree, _)) => (body, tree),
+                (GeomAttach::Link(tree, _), GeomAttach::Body(body)) => (body, tree),
+                _ => continue,
+            };
+            if !self.trees[mocap_tree].links[0].mocap {
+                continue;
+            }
+            apply_one_mocap_wrench(MocapWrenchInput {
+                out,
+                bodies,
+                tree: &self.trees[mocap_tree],
+                tree_idx: mocap_tree,
+                link_poses: &poses[mocap_tree],
+                geoms: &self.geoms,
+                contact: &contact,
+                body_idx,
+            });
+        }
     }
 }
 
@@ -1072,7 +1278,10 @@ fn link_world_velocity(tree: &Tree, target: usize, link_poses: &[(Vec3, Quat)]) 
     let mut w_world = vec![Vec3::ZERO; n];
     // Seed root.
     let root = chain[0];
-    if tree.links[root].joint == JointKind::Free {
+    if tree.links[root].mocap {
+        w_world[root] = tree.mocap_angular_velocity;
+        v_world[root] = tree.mocap_linear_velocity;
+    } else if tree.links[root].joint == JointKind::Free {
         let (_pos, ori) = link_poses[root];
         let wb = Vec3::new(tree.qdot[0], tree.qdot[1], tree.qdot[2]);
         let vb = Vec3::new(tree.qdot[3], tree.qdot[4], tree.qdot[5]);
@@ -1208,6 +1417,72 @@ fn apply_contact_wrench(
         *f += force_on_b;
         *tau += r_b.cross(force_on_b);
     }
+}
+
+struct MocapWrenchInput<'a> {
+    out: &'a mut [(Vec3, Vec3)],
+    bodies: &'a [Body],
+    tree: &'a Tree,
+    tree_idx: usize,
+    link_poses: &'a [(Vec3, Quat)],
+    geoms: &'a [Geom],
+    contact: &'a Contact,
+    body_idx: usize,
+}
+
+fn apply_one_mocap_wrench(input: MocapWrenchInput<'_>) {
+    let MocapWrenchInput {
+        out,
+        bodies,
+        tree,
+        tree_idx,
+        link_poses,
+        geoms,
+        contact,
+        body_idx,
+    } = input;
+    let ga = &geoms[contact.geom_a];
+    let gb = &geoms[contact.geom_b];
+    let (v_a, _, r_a) = point_velocity_generic(
+        ga,
+        contact.position_world,
+        tree,
+        tree_idx,
+        link_poses,
+        bodies,
+    );
+    let (v_b, _, r_b) = point_velocity_generic(
+        gb,
+        contact.position_world,
+        tree,
+        tree_idx,
+        link_poses,
+        bodies,
+    );
+    let body_is_a = matches!(ga.attachment(), GeomAttach::Body(index) if index == body_idx);
+    let body_mass = bodies[body_idx].mass;
+    let (k, damping) = solref_to_kc(combine_solref(ga.solref, gb.solref), body_mass);
+    let v_rel = v_a - v_b;
+    let normal = contact.normal_world;
+    let v_n = v_rel.dot(normal);
+    let penetration = contact.penetration - contact.gap;
+    if penetration <= 0.0 {
+        return;
+    }
+    let normal_force = (k * penetration - damping * v_n).max(0.0);
+    if normal_force <= 0.0 {
+        return;
+    }
+    let (t1, t2) = tangent_basis(normal);
+    let tangent_velocity = v_rel - normal * v_n;
+    let cap = contact.friction * normal_force;
+    let force_on_a = normal * normal_force
+        + t1 * clamp_symmetric(-damping * tangent_velocity.dot(t1), cap)
+        + t2 * clamp_symmetric(-damping * tangent_velocity.dot(t2), cap);
+    let force_on_body = if body_is_a { force_on_a } else { -force_on_a };
+    let moment_arm = if body_is_a { r_a } else { r_b };
+    out[body_idx].0 += force_on_body;
+    out[body_idx].1 += moment_arm.cross(force_on_body);
 }
 
 /// World-frame linear velocity of the contact point on a geom's parent body.

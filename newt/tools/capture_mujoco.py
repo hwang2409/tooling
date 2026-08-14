@@ -147,6 +147,8 @@ def _capture_scenario(mujoco, np, scenario: dict, refs_dir: Path) -> tuple[Path,
     `<name>_energy.bin` file is written next to the main fixture with
     per-sample MuJoCo kinetic and potential energies (f64 pairs). The
     Rust harness reads this to compare long-horizon energy drift.
+    If `scenario["compare_sensors"]` is true, a `<name>_sensors.bin`
+    sidecar stores MuJoCo's `sensordata` at each sampled step.
     """
     name = scenario["name"]
     mjcf_path = refs_dir / scenario["mjcf"]
@@ -154,6 +156,7 @@ def _capture_scenario(mujoco, np, scenario: dict, refs_dir: Path) -> tuple[Path,
     stride = int(scenario["stride"])
     check_kind = scenario.get("check_kind", "state")
     want_energy = check_kind == "energy"
+    want_sensors = bool(scenario.get("compare_sensors", False))
     if stride <= 0 or n_steps <= 0:
         raise ValueError(f"{name}: stride and n_steps must be > 0")
 
@@ -210,6 +213,7 @@ def _capture_scenario(mujoco, np, scenario: dict, refs_dir: Path) -> tuple[Path,
     qpos_samples = [data.qpos.copy()]
     qvel_samples = [data.qvel.copy()]
     energy_samples: list[tuple[float, float]] = []
+    sensor_samples = [data.sensordata.copy()] if want_sensors else []
     if want_energy:
         energy_samples.append(snap_energy())
 
@@ -222,6 +226,8 @@ def _capture_scenario(mujoco, np, scenario: dict, refs_dir: Path) -> tuple[Path,
             qvel_samples.append(data.qvel.copy())
             if want_energy:
                 energy_samples.append(snap_energy())
+            if want_sensors:
+                sensor_samples.append(data.sensordata.copy())
 
     provenance = (
         f"name={name}|mujoco={mujoco.__version__}"
@@ -241,6 +247,15 @@ def _capture_scenario(mujoco, np, scenario: dict, refs_dir: Path) -> tuple[Path,
         with open(energy_path, "wb") as f:
             for kin, pot in energy_samples:
                 f.write(struct.pack("<dd", kin, pot))
+    if want_sensors:
+        sensor_path = refs_dir / f"{name}_sensors.bin"
+        sensor_dim = int(sensor_samples[0].shape[0])
+        with open(sensor_path, "wb") as f:
+            f.write(struct.pack("<II", len(sensor_samples), sensor_dim))
+            for sample in sensor_samples:
+                if int(sample.shape[0]) != sensor_dim:
+                    raise ValueError(f"{name}: sensordata dimension changed during capture")
+                f.write(struct.pack(f"<{sensor_dim}d", *sample.astype("float64").tolist()))
     return path, provenance
 
 

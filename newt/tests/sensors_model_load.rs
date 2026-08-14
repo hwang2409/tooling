@@ -40,13 +40,19 @@ fn every_sensor_kind_round_trips() {
         {"name":"h","kind":"accelerometer","site":"s"},
         {"name":"i","kind":"touch","geom":"g"},
         {"name":"j","kind":"force","tree":"t","link":"hip"},
-        {"name":"k","kind":"torque","tree":"t","link":"hip"}
+        {"name":"k","kind":"torque","tree":"t","link":"hip"},
+        {"name":"l","kind":"velocimeter","site":"s"},
+        {"name":"m","kind":"magnetometer","site":"s"},
+        {"name":"n","kind":"rangefinder","site":"s"},
+        {"name":"o","kind":"framelinvel","site":"s"},
+        {"name":"p","kind":"frameangvel","site":"s"},
+        {"name":"q","kind":"subtreecom","tree":"t","link":"root"}
     "#,
     );
     let scene = load_str(&src).unwrap();
-    // Expect 11 sensors with a known total dim = 1+1+4+3+3+4+3+3+1+3+3 = 29.
-    assert_eq!(scene.world.sensors.sensors.len(), 11);
-    assert_eq!(scene.world.sensors.data.len(), 29);
+    // Expect 17 sensors with a known total dim = 45.
+    assert_eq!(scene.world.sensors.sensors.len(), 17);
+    assert_eq!(scene.world.sensors.data.len(), 45);
     assert_eq!(scene.sensors_by_name.get("h"), Some(&7));
     // Data reads zero pre-step; sanity-check that.
     assert_eq!(scene.world.sensor(0).unwrap().len(), 1);
@@ -55,6 +61,26 @@ fn every_sensor_kind_round_trips() {
     for (i, off) in scene.world.sensors.offsets.iter().enumerate().skip(1) {
         assert!(*off > scene.world.sensors.offsets[i - 1]);
     }
+}
+
+#[test]
+fn keyframe_and_mocap_load_from_json() {
+    let src = r#"
+    {
+      "trees":[{"name":"t","links":[
+        {"name":"root","joint":{"kind":"fixed"},"mass":1,
+         "inertia":{"kind":"diag","values":[1,1,1]},"mocap":true},
+        {"name":"hip","parent":"root","joint":{"kind":"hinge","axis":[0,0,1]},"mass":1,
+         "inertia":{"kind":"diag","values":[1,1,1]}}
+      ]}],
+      "keyframes":[{"name":"ready","q":[0.2],"qdot":[-0.1],"act":[],"ctrl":[]}]
+    }
+    "#;
+    let mut scene = load_str(src).unwrap();
+    assert!(scene.world.trees[0].links[0].mocap);
+    scene.world.reset_to_keyframe("ready").unwrap();
+    assert_eq!(scene.world.trees[0].q, vec![0.2]);
+    assert_eq!(scene.world.trees[0].qdot, vec![-0.1]);
 }
 
 #[test]

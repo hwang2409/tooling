@@ -30,6 +30,7 @@ use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
 
 use newt::math::{Quat, Vec3};
 use newt::model::{Scene, load_from_path};
+use newt::sensor::{SensorAttach, SiteFrame};
 use newt::tree::{forward_kinematics, rk4_step};
 
 use std::path::PathBuf;
@@ -128,6 +129,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .trees_by_name
         .get("arm")
         .expect("model must define a tree named \"arm\"");
+    let tip_site = scene
+        .sites
+        .iter()
+        .find(|site| site.name == "tip_imu")
+        .expect("arm.json must define tip_imu");
+    let tip_frame = SiteFrame {
+        attach: match tip_site.attach {
+            newt::model::SiteAttach::Body(body) => SensorAttach::Body(body),
+            newt::model::SiteAttach::Link { tree, link } => SensorAttach::Link(tree, link),
+        },
+        local_offset: tip_site.local_offset,
+        local_orientation: tip_site.local_orientation,
+    };
     let servo_ids: [(usize, usize); 3] =
         ["shoulder_servo", "elbow_servo", "wrist_servo"].map(|n| {
             *scene
@@ -177,6 +191,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // perturb the tree, so sampling here leaves the simulation
                 // trajectory bit-identical to the pre-tier-6 golden.
                 scene.world.evaluate_sensors(&[]);
+                let jacobian_velocity = scene
+                    .world
+                    .site_jacobian(&tip_frame)
+                    .velocity(&scene.world.trees[arm_idx].qdot)
+                    .0;
+                let velocimeter = scene
+                    .world
+                    .sensor(*scene.sensors_by_name.get("tip_velocimeter").unwrap())
+                    .unwrap();
+                let error = (jacobian_velocity
+                    - Vec3::new(velocimeter[0], velocimeter[1], velocimeter[2]))
+                .length();
+                println!("jacobian/velocimeter tip velocity error at frame {frame}: {error:.6e}");
                 sensor_log.push((frame, scene.world.sensors.data.clone()));
             }
         }
@@ -249,14 +276,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `sensors` declaration order in `arm.json`. See `docs/sensors.md`.
     println!();
     println!(
-        "frame |  shoulder_q  elbow_q   wrist_q   |  shoulder_qd  elbow_qd  wrist_qd  |  tip_pos            |  gyro                |  accel               |  elbow_force         |  elbow_torque"
+        "frame |  shoulder_q  elbow_q   wrist_q   |  shoulder_qd  elbow_qd  wrist_qd  |  tip_pos            |  tip_vel             |  gyro                |  accel               |  elbow_force         |  elbow_torque"
     );
     println!(
-        "------+----------------------------------+---------------------------------+---------------------+----------------------+----------------------+----------------------+----------------------"
+        "------+----------------------------------+---------------------------------+---------------------+---------------------+----------------------+----------------------+----------------------+----------------------"
     );
     for (f, data) in &sensor_log {
         println!(
-            "{f:5} | {:9.3} {:9.3} {:9.3} | {:9.3} {:9.3} {:9.3} | ({:5.2}, {:5.2}, {:5.2}) | ({:6.2}, {:6.2}, {:6.2}) | ({:6.2}, {:6.2}, {:6.2}) | ({:6.2}, {:6.2}, {:6.2}) | ({:6.3}, {:6.3}, {:6.3})",
+            "{f:5} | {:9.3} {:9.3} {:9.3} | {:9.3} {:9.3} {:9.3} | ({:5.2}, {:5.2}, {:5.2}) | ({:6.2}, {:6.2}, {:6.2}) | ({:6.2}, {:6.2}, {:6.2}) | ({:6.2}, {:6.2}, {:6.2}) | ({:6.2}, {:6.2}, {:6.2}) | ({:6.3}, {:6.3}, {:6.3})",
             data[0],
             data[1],
             data[2],
@@ -278,6 +305,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             data[18],
             data[19],
             data[20],
+            data[21],
+            data[22],
+            data[23],
         );
     }
     Ok(())

@@ -1,0 +1,18 @@
+<!-- Differential sensor scenario: a mocap site reads a fixed plane. -->
+<mujoco model="mocap_rangefinder">
+  <compiler angle="radian"/>
+  <option timestep="0.005" gravity="0 0 -9.81" magnetic="0 -0.5 0"
+          integrator="RK4" solver="PGS" cone="pyramidal" iterations="20"/>
+  <worldbody>
+    <geom name="ceiling" type="box" pos="0 0 2" size="3 3 0.1"/>
+    <body name="probe" mocap="true" pos="0 0 1">
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <site name="probe_site" pos="0 0 0"/>
+    </body>
+  </worldbody>
+  <sensor>
+    <rangefinder name="probe_range" site="probe_site"/>
+    <velocimeter name="probe_velocity" site="probe_site"/>
+    <magnetometer name="probe_magnetic" site="probe_site"/>
+  </sensor>
+</mujoco>

@@ -103,6 +103,7 @@
     {"name": "elbow_qdot",     "kind": "jointvel",      "tree": "arm", "link": "elbow"},
     {"name": "wrist_qdot",     "kind": "jointvel",      "tree": "arm", "link": "wrist"},
     {"name": "tip_pos",        "kind": "framepos",      "site": "tip"},
+    {"name": "tip_velocimeter", "kind": "velocimeter",   "site": "tip_imu"},
     {"name": "tip_imu_gyro",   "kind": "gyro",          "site": "tip_imu"},
     {"name": "tip_imu_accel",  "kind": "accelerometer", "site": "tip_imu"},
     {"name": "elbow_force",    "kind": "force",         "tree": "arm", "link": "elbow"},

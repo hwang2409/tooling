@@ -84,7 +84,7 @@
 
 use crate::body::Body;
 use crate::contact::Contact;
-use crate::geom::Geom;
+use crate::geom::{Geom, GeomAttach, GeomShape, geom_world_pose};
 use crate::joint::JointKind;
 use crate::math::{Quat, Vec3};
 use crate::spatial::{SpatialMotion, Xform};
@@ -180,6 +180,18 @@ pub enum SensorKind {
     TendonPos { tree: usize, tendon: usize },
     /// Tendon rate `Ldot` — one scalar per sensor.
     TendonVel { tree: usize, tendon: usize },
+    /// Site linear velocity expressed in the site frame.
+    Velocimeter(SiteFrame),
+    /// Global magnetic field expressed in the site frame.
+    Magnetometer(SiteFrame),
+    /// Distance from the site along local +Z to the nearest geom, or -1.
+    Rangefinder(SiteFrame),
+    /// World-frame COM of the subtree rooted at a link.
+    SubtreeCom { tree: usize, link: usize },
+    /// World-frame linear velocity of a site.
+    FrameLinVel(SiteFrame),
+    /// World-frame angular velocity of a site parent body.
+    FrameAngVel(SiteFrame),
 }
 
 impl SensorKind {
@@ -196,7 +208,13 @@ impl SensorKind {
             | SensorKind::Gyro(_)
             | SensorKind::Accelerometer(_)
             | SensorKind::Force { .. }
-            | SensorKind::Torque { .. } => 3,
+            | SensorKind::Torque { .. }
+            | SensorKind::Velocimeter(_)
+            | SensorKind::Magnetometer(_)
+            | SensorKind::SubtreeCom { .. }
+            | SensorKind::FrameLinVel(_)
+            | SensorKind::FrameAngVel(_) => 3,
+            SensorKind::Rangefinder(_) => 1,
             SensorKind::BallQuat { .. } | SensorKind::FrameQuat(_) => 4,
         }
     }
@@ -255,7 +273,12 @@ impl Sensor {
             SensorKind::FramePos(s)
             | SensorKind::FrameQuat(s)
             | SensorKind::Gyro(s)
-            | SensorKind::Accelerometer(s) => check_site(s, bodies, trees),
+            | SensorKind::Accelerometer(s)
+            | SensorKind::Velocimeter(s)
+            | SensorKind::Magnetometer(s)
+            | SensorKind::Rangefinder(s)
+            | SensorKind::FrameLinVel(s)
+            | SensorKind::FrameAngVel(s) => check_site(s, bodies, trees),
             SensorKind::Touch { geom } => {
                 if *geom >= geoms.len() {
                     return Err(SensorError(format!(
@@ -290,6 +313,9 @@ impl Sensor {
                     )));
                 }
                 Ok(())
+            }
+            SensorKind::SubtreeCom { tree, link } => {
+                check_tree_link(*tree, *link, trees).map(|_| ())
             }
         }
     }
@@ -395,6 +421,7 @@ pub struct SensorInputs<'a> {
     pub geoms: &'a [Geom],
     pub meshes: &'a [crate::geom::ConvexMesh],
     pub gravity: Vec3,
+    pub magnetic_field: Vec3,
     pub dt: f32,
     /// Per-free-body external world-frame wrench `(force, torque_about_com)`.
     /// The world assembles this the same way it does for its RK4 sub-stages
@@ -435,10 +462,15 @@ pub fn evaluate(bank: &mut SensorBank, inputs: &SensorInputs<'_>) {
         )
     });
     let needs_va = needs_qddot
-        || bank
-            .sensors
-            .iter()
-            .any(|s| matches!(s.kind, SensorKind::Gyro(_)));
+        || bank.sensors.iter().any(|s| {
+            matches!(
+                s.kind,
+                SensorKind::Gyro(_)
+                    | SensorKind::Velocimeter(_)
+                    | SensorKind::FrameLinVel(_)
+                    | SensorKind::FrameAngVel(_)
+            )
+        });
     let tree_qddot: Vec<Vec<f32>> = if needs_qddot {
         (0..n_trees)
             .map(|t| {
@@ -620,8 +652,332 @@ pub fn evaluate(bank: &mut SensorBank, inputs: &SensorInputs<'_>) {
                     crate::tendon::tendon_kinematics(&t.tendons[*tendon], t, &tree_poses[*tree]);
                 out[0] = kin.velocity;
             }
+            SensorKind::Velocimeter(s) => {
+                let (linear, _) = site_velocity(s, inputs.bodies, &tree_poses, &tree_va);
+                let (_, site_orientation) = site_world_pose(s, inputs.bodies, &tree_poses);
+                let value = site_orientation.inverse_rotate(linear);
+                out[0] = value.x;
+                out[1] = value.y;
+                out[2] = value.z;
+            }
+            SensorKind::Magnetometer(s) => {
+                let (_, site_orientation) = site_world_pose(s, inputs.bodies, &tree_poses);
+                let value = site_orientation.inverse_rotate(inputs.magnetic_field);
+                out[0] = value.x;
+                out[1] = value.y;
+                out[2] = value.z;
+            }
+            SensorKind::Rangefinder(s) => {
+                let (origin, orientation) = site_world_pose(s, inputs.bodies, &tree_poses);
+                let direction = orientation.rotate(Vec3::Z);
+                out[0] = rangefinder_reading(
+                    origin,
+                    direction,
+                    inputs.bodies,
+                    inputs.geoms,
+                    inputs.meshes,
+                    &tree_poses,
+                );
+            }
+            SensorKind::SubtreeCom { tree, link } => {
+                let (position, _) = subtree_com(*tree, *link, inputs.trees, &tree_poses);
+                out[0] = position.x;
+                out[1] = position.y;
+                out[2] = position.z;
+            }
+            SensorKind::FrameLinVel(s) => {
+                let (linear, _) = site_velocity(s, inputs.bodies, &tree_poses, &tree_va);
+                out[0] = linear.x;
+                out[1] = linear.y;
+                out[2] = linear.z;
+            }
+            SensorKind::FrameAngVel(s) => {
+                let (_, angular) = site_velocity(s, inputs.bodies, &tree_poses, &tree_va);
+                out[0] = angular.x;
+                out[1] = angular.y;
+                out[2] = angular.z;
+            }
         }
     }
+}
+
+fn site_velocity(
+    site: &SiteFrame,
+    bodies: &[Body],
+    tree_poses: &[Vec<(Vec3, Quat)>],
+    tree_va: &[Vec<(SpatialMotion, SpatialMotion)>],
+) -> (Vec3, Vec3) {
+    match site.attach {
+        SensorAttach::Body(index) => {
+            let body = &bodies[index];
+            let angular = body.orientation.rotate(body.angular_velocity_body);
+            let offset_world = body.orientation.rotate(site.local_offset);
+            (body.linear_velocity + angular.cross(offset_world), angular)
+        }
+        SensorAttach::Link(tree, link) => {
+            let (v, _) = tree_va[tree][link];
+            let (_, orientation) = tree_poses[tree][link];
+            let angular = orientation.rotate(v.angular);
+            let linear = orientation.rotate(v.linear + v.angular.cross(site.local_offset));
+            (linear, angular)
+        }
+    }
+}
+
+fn subtree_com(
+    tree: usize,
+    root: usize,
+    trees: &[Tree],
+    tree_poses: &[Vec<(Vec3, Quat)>],
+) -> (Vec3, f32) {
+    let model = &trees[tree];
+    let mut weighted = Vec3::ZERO;
+    let mut mass = 0.0;
+    for (link_idx, (position, _)) in tree_poses[tree].iter().enumerate().take(model.links.len()) {
+        let mut current = Some(link_idx);
+        let mut included = false;
+        while let Some(index) = current {
+            if index == root {
+                included = true;
+                break;
+            }
+            current = model.links[index].parent;
+        }
+        if included {
+            weighted += *position * model.links[link_idx].mass;
+            mass += model.links[link_idx].mass;
+        }
+    }
+    if mass == 0.0 {
+        (Vec3::ZERO, 0.0)
+    } else {
+        (weighted / mass, mass)
+    }
+}
+
+fn rangefinder_reading(
+    origin: Vec3,
+    direction: Vec3,
+    bodies: &[Body],
+    geoms: &[Geom],
+    meshes: &[crate::geom::ConvexMesh],
+    tree_poses: &[Vec<(Vec3, Quat)>],
+) -> f32 {
+    let mut nearest = f32::MAX;
+    for geom in geoms {
+        let pose = match geom.attachment() {
+            GeomAttach::Static => geom_world_pose(geom, Vec3::ZERO, Quat::IDENTITY),
+            GeomAttach::Body(body) => {
+                geom_world_pose(geom, bodies[body].position, bodies[body].orientation)
+            }
+            GeomAttach::Link(tree, link) => {
+                let (position, orientation) = tree_poses[tree][link];
+                geom_world_pose(geom, position, orientation)
+            }
+        };
+        let local_origin = pose.orientation.inverse_rotate(origin - pose.position);
+        let local_direction = pose.orientation.inverse_rotate(direction);
+        if let Some(distance) = ray_shape_hit(geom.shape, local_origin, local_direction, meshes) {
+            if distance >= 0.0 && distance < nearest {
+                nearest = distance;
+            }
+        }
+    }
+    if nearest == f32::MAX { -1.0 } else { nearest }
+}
+
+fn ray_shape_hit(
+    shape: GeomShape,
+    origin: Vec3,
+    direction: Vec3,
+    meshes: &[crate::geom::ConvexMesh],
+) -> Option<f32> {
+    match shape {
+        GeomShape::Plane => {
+            if direction.z.abs() < 1.0e-8 {
+                None
+            } else {
+                positive_hit(-origin.z / direction.z)
+            }
+        }
+        GeomShape::Sphere { radius } => ray_sphere(origin, direction, Vec3::ZERO, radius),
+        GeomShape::Box { half_extents } => ray_box(origin, direction, half_extents),
+        GeomShape::Capsule {
+            radius,
+            half_height,
+        } => {
+            let mut hit = ray_cylinder(origin, direction, radius, half_height);
+            for center in [
+                Vec3::new(0.0, 0.0, -half_height),
+                Vec3::new(0.0, 0.0, half_height),
+            ] {
+                hit = min_hit(hit, ray_sphere(origin, direction, center, radius));
+            }
+            hit
+        }
+        GeomShape::Cylinder {
+            radius,
+            half_height,
+        } => ray_cylinder(origin, direction, radius, half_height),
+        GeomShape::Ellipsoid { semi_axes } => ray_ellipsoid(origin, direction, semi_axes),
+        GeomShape::Mesh { mesh_id } => ray_mesh(origin, direction, &meshes[mesh_id]),
+    }
+}
+
+fn positive_hit(value: f32) -> Option<f32> {
+    if value >= 0.0 { Some(value) } else { None }
+}
+
+fn min_hit(a: Option<f32>, b: Option<f32>) -> Option<f32> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if x <= y { x } else { y }),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
+    }
+}
+
+fn ray_sphere(origin: Vec3, direction: Vec3, center: Vec3, radius: f32) -> Option<f32> {
+    let offset = origin - center;
+    let a = direction.dot(direction);
+    if a <= 0.0 {
+        return None;
+    }
+    let half_b = offset.dot(direction);
+    let c = offset.dot(offset) - radius * radius;
+    let discriminant = half_b * half_b - a * c;
+    if discriminant < 0.0 {
+        return None;
+    }
+    let root = discriminant.sqrt();
+    let first = (-half_b - root) / a;
+    if first >= 0.0 {
+        Some(first)
+    } else {
+        positive_hit((-half_b + root) / a)
+    }
+}
+
+fn ray_box(origin: Vec3, direction: Vec3, half: Vec3) -> Option<f32> {
+    let mut near = 0.0;
+    let mut far = f32::MAX;
+    for (o, d, h) in [
+        (origin.x, direction.x, half.x),
+        (origin.y, direction.y, half.y),
+        (origin.z, direction.z, half.z),
+    ] {
+        if d.abs() < 1.0e-8 {
+            if o < -h || o > h {
+                return None;
+            }
+        } else {
+            let mut a = (-h - o) / d;
+            let mut b = (h - o) / d;
+            if a > b {
+                core::mem::swap(&mut a, &mut b);
+            }
+            if a > near {
+                near = a;
+            }
+            if b < far {
+                far = b;
+            }
+            if near > far {
+                return None;
+            }
+        }
+    }
+    if near >= 0.0 {
+        Some(near)
+    } else {
+        positive_hit(far)
+    }
+}
+
+fn ray_cylinder(origin: Vec3, direction: Vec3, radius: f32, half_height: f32) -> Option<f32> {
+    let mut best = None;
+    let a = direction.x * direction.x + direction.y * direction.y;
+    if a > 1.0e-8 {
+        let half_b = origin.x * direction.x + origin.y * direction.y;
+        let c = origin.x * origin.x + origin.y * origin.y - radius * radius;
+        let disc = half_b * half_b - a * c;
+        if disc >= 0.0 {
+            let root = disc.sqrt();
+            for t in [(-half_b - root) / a, (-half_b + root) / a] {
+                if t >= 0.0 {
+                    let z = origin.z + direction.z * t;
+                    if z >= -half_height && z <= half_height {
+                        best = min_hit(best, Some(t));
+                    }
+                }
+            }
+        }
+    }
+    if direction.z.abs() > 1.0e-8 {
+        for z in [-half_height, half_height] {
+            let t = (z - origin.z) / direction.z;
+            if t >= 0.0 {
+                let x = origin.x + direction.x * t;
+                let y = origin.y + direction.y * t;
+                if x * x + y * y <= radius * radius {
+                    best = min_hit(best, Some(t));
+                }
+            }
+        }
+    }
+    best
+}
+
+fn ray_ellipsoid(origin: Vec3, direction: Vec3, axes: Vec3) -> Option<f32> {
+    let ox = origin.x / axes.x;
+    let oy = origin.y / axes.y;
+    let oz = origin.z / axes.z;
+    let dx = direction.x / axes.x;
+    let dy = direction.y / axes.y;
+    let dz = direction.z / axes.z;
+    let a = dx * dx + dy * dy + dz * dz;
+    let half_b = ox * dx + oy * dy + oz * dz;
+    let c = ox * ox + oy * oy + oz * oz - 1.0;
+    let disc = half_b * half_b - a * c;
+    if disc < 0.0 || a <= 0.0 {
+        return None;
+    }
+    let root = disc.sqrt();
+    let first = (-half_b - root) / a;
+    if first >= 0.0 {
+        Some(first)
+    } else {
+        positive_hit((-half_b + root) / a)
+    }
+}
+
+fn ray_mesh(origin: Vec3, direction: Vec3, mesh: &crate::geom::ConvexMesh) -> Option<f32> {
+    let mut nearest = None;
+    for face in &mesh.faces {
+        let a = mesh.vertices[face[0] as usize];
+        let b = mesh.vertices[face[1] as usize];
+        let c = mesh.vertices[face[2] as usize];
+        let normal = (b - a).cross(c - a);
+        let denom = normal.dot(direction);
+        if denom.abs() < 1.0e-8 {
+            continue;
+        }
+        let t = normal.dot(a - origin) / denom;
+        if t < 0.0 {
+            continue;
+        }
+        let point = origin + direction * t;
+        let e0 = b - a;
+        let e1 = c - b;
+        let e2 = a - c;
+        if normal.dot((point - a).cross(e0)) >= -1.0e-6
+            && normal.dot((point - b).cross(e1)) >= -1.0e-6
+            && normal.dot((point - c).cross(e2)) >= -1.0e-6
+        {
+            nearest = min_hit(nearest, Some(t));
+        }
+    }
+    nearest
 }
 
 fn site_world_pose(

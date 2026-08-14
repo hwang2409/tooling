@@ -204,6 +204,10 @@ fn tolerance(name: &str) -> Tolerance {
             qpos: 3.0e-7,
             qvel: 3.0e-6,
         },
+        "mocap_rangefinder" => Tolerance {
+            qpos: 1.0e-6,
+            qvel: 1.0e-6,
+        },
         other => panic!("no tolerance for scenario {other:?}"),
     }
 }
@@ -218,6 +222,10 @@ struct Fixture {
     stride: u32,
     n_steps: u32,
     samples: Vec<Sample>,
+}
+
+struct SensorFixture {
+    samples: Vec<Vec<f64>>,
 }
 
 struct Sample {
@@ -273,6 +281,33 @@ fn read_fixture(path: &Path) -> Fixture {
     }
 }
 
+fn read_sensor_fixture(name: &str) -> SensorFixture {
+    let path = references_dir().join(format!("{name}_sensors.bin"));
+    let bytes = fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "{name}: cannot read sensor fixture {}: {e}; regenerate with tools/capture_mujoco.py",
+            path.display()
+        )
+    });
+    let mut c = Cursor::new(&bytes);
+    let n_samples = c.u32() as usize;
+    let dim = c.u32() as usize;
+    let mut samples = Vec::with_capacity(n_samples);
+    for _ in 0..n_samples {
+        let mut sample = Vec::with_capacity(dim);
+        for _ in 0..dim {
+            sample.push(c.f64());
+        }
+        samples.push(sample);
+    }
+    assert_eq!(
+        c.remaining(),
+        0,
+        "{name}: sensor fixture has trailing bytes"
+    );
+    SensorFixture { samples }
+}
+
 struct Cursor<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -320,6 +355,7 @@ struct ScenarioSpec {
     /// drift instead of per-component state divergence (which would
     /// fail for chaotic trajectories over a long horizon).
     check_kind: CheckKind,
+    compare_sensors: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -385,6 +421,11 @@ fn parse_scenario(v: Value) -> ScenarioSpec {
         },
         Some(other) => panic!("check_kind must be a string, got {}", other.type_name()),
     };
+    let compare_sensors = match get("compare_sensors") {
+        None => false,
+        Some(Value::Bool(value)) => value,
+        Some(other) => panic!("compare_sensors must be boolean, got {}", other.type_name()),
+    };
     ScenarioSpec {
         name,
         mjcf,
@@ -394,6 +435,7 @@ fn parse_scenario(v: Value) -> ScenarioSpec {
         init_qvel,
         actuator_targets,
         check_kind,
+        compare_sensors,
     }
 }
 
@@ -799,6 +841,42 @@ fn compare_and_measure(
     d
 }
 
+fn compare_sensor_samples(name: &str, fixture: &SensorFixture, samples: &[Vec<f64>]) {
+    assert_eq!(
+        samples.len(),
+        fixture.samples.len(),
+        "{name}: sensor sample count mismatch (newt {}, fixture {})",
+        samples.len(),
+        fixture.samples.len()
+    );
+    let mut max_error = 0.0f64;
+    let mut max_at = (0usize, 0usize);
+    for (sample_idx, (actual, expected)) in samples.iter().zip(&fixture.samples).enumerate() {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{name}: sensor dimension mismatch at sample {sample_idx}"
+        );
+        for (component, (a, b)) in actual.iter().zip(expected).enumerate() {
+            let error = (a - b).abs();
+            if error > max_error {
+                max_error = error;
+                max_at = (sample_idx, component);
+            }
+        }
+    }
+    println!(
+        "differential[{name}] sensors: max_err={max_error:.3e} at sample {}, component {}",
+        max_at.0, max_at.1
+    );
+    assert!(
+        max_error <= 2.0e-6,
+        "{name}: sensor error {max_error:.3e} exceeds 2e-6 at sample {}, component {}",
+        max_at.0,
+        max_at.1
+    );
+}
+
 /// Number of leading free bodies in the qpos layout for a scenario. Used
 /// to canonicalize quaternion sign for those slots.
 fn scenario_free_body_slots(name: &str) -> usize {
@@ -982,6 +1060,23 @@ fn run_scenario(spec: &ScenarioSpec) -> Divergence {
         spec.name, fixture.stride, spec.stride
     );
 
+    let sensor_fixture = spec
+        .compare_sensors
+        .then(|| read_sensor_fixture(&spec.name));
+    let mut newt_sensor_samples = Vec::new();
+    if spec.compare_sensors {
+        scene.world.evaluate_sensors(&[]);
+        newt_sensor_samples.push(
+            scene
+                .world
+                .sensors
+                .data
+                .iter()
+                .map(|value| *value as f64)
+                .collect(),
+        );
+    }
+
     // Sample step 0 (initial state, post-init).
     let mut newt_samples = Vec::with_capacity(fixture.samples.len());
     newt_samples.push((extract_qpos(&scene.world), extract_qvel(&scene.world)));
@@ -989,7 +1084,21 @@ fn run_scenario(spec: &ScenarioSpec) -> Divergence {
         scene.world.step();
         if step % spec.stride == 0 {
             newt_samples.push((extract_qpos(&scene.world), extract_qvel(&scene.world)));
+            if spec.compare_sensors {
+                newt_sensor_samples.push(
+                    scene
+                        .world
+                        .sensors
+                        .data
+                        .iter()
+                        .map(|value| *value as f64)
+                        .collect(),
+                );
+            }
         }
+    }
+    if let Some(sensor_fixture) = sensor_fixture {
+        compare_sensor_samples(&spec.name, &sensor_fixture, &newt_sensor_samples);
     }
     compare_and_measure(&spec.name, &fixture, &newt_samples)
 }
@@ -1302,4 +1411,10 @@ fn differential_tendon_coupled() {
 fn differential_tendon_wrap() {
     let d = run_scenario(&scenario("tendon_wrap"));
     assert_within_tolerance("tendon_wrap", &d);
+}
+
+#[test]
+fn differential_mocap_rangefinder() {
+    let d = run_scenario(&scenario("mocap_rangefinder"));
+    assert_within_tolerance("mocap_rangefinder", &d);
 }

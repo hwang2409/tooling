@@ -109,6 +109,10 @@ pub struct Link {
 
     /// Precomputed inverse of `inertia_body`.
     pub inertia_body_inverse: Mat3,
+
+    /// A mocap link is posed by the caller and is never integrated by the
+    /// dynamics solver. Only root mocap links are supported in this tier.
+    pub mocap: bool,
 }
 
 impl Link {
@@ -153,6 +157,7 @@ impl Link {
             mass,
             inertia_body,
             inertia_body_inverse,
+            mocap: false,
         }
     }
 
@@ -214,6 +219,10 @@ pub struct Tree {
     /// the joint per-link path. Empty by default, so every pre-v2-tier-3
     /// scene runs unchanged.
     pub tendons: Vec<Tendon>,
+    /// User-supplied world-frame velocity for a mocap root. It is used for
+    /// contact relative velocity and is not integrated.
+    pub mocap_linear_velocity: Vec3,
+    pub mocap_angular_velocity: Vec3,
 }
 
 impl Tree {
@@ -230,6 +239,8 @@ impl Tree {
             applied_wrenches: Vec::new(),
             disable_penalty_limits: false,
             tendons: Vec::new(),
+            mocap_linear_velocity: Vec3::ZERO,
+            mocap_angular_velocity: Vec3::ZERO,
         }
     }
 
@@ -541,6 +552,47 @@ impl Tree {
         forward_kinematics(self)[i]
     }
 
+    /// Dense world-frame Jacobian for a link COM.
+    pub fn link_jacobian(&self, link: usize) -> crate::jacobian::Jacobian {
+        crate::jacobian::link_jacobian(self, link)
+    }
+
+    /// Dense world-frame Jacobian for a point in a link's body frame.
+    pub fn point_jacobian(&self, link: usize, point_local: Vec3) -> crate::jacobian::Jacobian {
+        crate::jacobian::point_jacobian(self, link, point_local)
+    }
+
+    /// Mark a root link as mocap. Mocap links are kinematic and cannot carry
+    /// a movable child chain in this tier.
+    pub fn set_mocap(&mut self, link: usize, mocap: bool) {
+        assert_eq!(link, 0, "only a tree root can be mocap in this tier");
+        self.links[link].mocap = mocap;
+        assert!(
+            matches!(self.links[link].joint, JointKind::Free | JointKind::Fixed),
+            "mocap root must use a free or fixed joint"
+        );
+    }
+
+    /// Set the world pose of a mocap root. A free root stores the pose in q;
+    /// a fixed root stores it in its world anchor.
+    pub fn set_mocap_pose(&mut self, position: Vec3, orientation: Quat) {
+        assert!(self.links.first().is_some_and(|link| link.mocap));
+        match self.links[0].joint {
+            JointKind::Free => self.set_free_root_pose(position, orientation),
+            JointKind::Fixed => {
+                self.links[0].joint_offset_in_parent = (position, orientation.renormalize());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Set the world-frame velocity used by contacts against a mocap root.
+    pub fn set_mocap_velocity(&mut self, linear: Vec3, angular: Vec3) {
+        assert!(self.links.first().is_some_and(|link| link.mocap));
+        self.mocap_linear_velocity = linear;
+        self.mocap_angular_velocity = angular;
+    }
+
     /// Dense joint-space mass matrix `M(q)` (row-major, `nv × nv`). See
     /// [`crate::dynamics::mass_matrix`] for the algorithm and layout.
     pub fn mass_matrix(&self) -> Vec<f32> {
@@ -564,6 +616,26 @@ impl Tree {
         external_wrenches: &ExternalWrenches,
     ) -> Vec<f32> {
         crate::dynamics::inverse_dynamics(self, qddot, gravity, external_wrenches)
+    }
+
+    /// Inverse dynamics for an explicit state. The input vectors are copied
+    /// into a temporary tree, so this call does not change the live state.
+    /// Damping, armature, limits, actuators, and `qfrc_applied` stay outside
+    /// the RNE contract; only gravity and `external_wrenches` enter here.
+    pub fn inverse_dynamics_at(
+        &self,
+        q: &[f32],
+        qdot: &[f32],
+        qddot: &[f32],
+        gravity: Vec3,
+        external_wrenches: &ExternalWrenches,
+    ) -> Vec<f32> {
+        assert_eq!(q.len(), self.nq(), "q length must match tree.nq()");
+        assert_eq!(qdot.len(), self.nv(), "qdot length must match tree.nv()");
+        let mut state = self.clone();
+        state.q.copy_from_slice(q);
+        state.qdot.copy_from_slice(qdot);
+        state.inverse_dynamics(qddot, gravity, external_wrenches)
     }
 }
 
@@ -1352,6 +1424,10 @@ where
     }
     for j in 0..s0.qdot.len() {
         tree.qdot[j] = s0.qdot[j] + (dv1[j] + 2.0 * dv2[j] + 2.0 * dv3[j] + dv4[j]) * (dt * sixth);
+    }
+    if s0.links.first().is_some_and(|link| link.mocap) {
+        tree.q[..s0.q.len()].copy_from_slice(&s0.q);
+        tree.qdot[..s0.qdot.len()].copy_from_slice(&s0.qdot);
     }
     // Renormalize free-root and ball-joint quaternions once at step end
     // (mirrors tier 1; mid-RK4 renormalization would break the linearity the

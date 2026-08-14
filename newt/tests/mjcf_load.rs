@@ -40,8 +40,26 @@ fn tendon_unknown_child_rejected() {
 }
 
 #[test]
-fn keyframe_top_level_rejected() {
-    expect_err(r#"<mujoco><keyframe/></mujoco>"#, "<keyframe>");
+fn keyframe_top_level_accepted() {
+    let scene = newt::mjcf::load_mjcf_str(r#"<mujoco><keyframe/></mujoco>"#).unwrap();
+    assert!(scene.world.keyframes.is_empty());
+}
+
+#[test]
+fn keyframe_and_mocap_load_from_mjcf() {
+    let scene = newt::mjcf::load_mjcf_str(
+        r#"<mujoco><worldbody>
+          <body name="root" mocap="true"><inertial mass="1" diaginertia="1 1 1"/>
+            <body name="hinge"><joint name="h" axis="0 0 1"/>
+              <inertial mass="1" diaginertia="1 1 1"/>
+            </body>
+          </body>
+        </worldbody><keyframe><key name="ready" qpos="0.2" qvel="-0.1"/></keyframe></mujoco>"#,
+    )
+    .unwrap();
+    assert!(scene.world.trees[0].links[0].mocap);
+    assert_eq!(scene.world.keyframes[0].q, vec![0.2]);
+    assert_eq!(scene.world.keyframes[0].qdot, vec![-0.1]);
 }
 
 #[test]

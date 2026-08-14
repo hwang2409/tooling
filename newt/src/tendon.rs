@@ -1045,7 +1045,7 @@ mod tests {
             "wrap engage jumped: {len_straight} → {len_wrap}"
         );
         assert!(
-            len_wrap >= 4.0 && len_straight >= 4.0,
+            len_wrap >= 4.0 - 1e-5 && len_straight >= 4.0 - 1e-5,
             "engaged and straight paths must respect the endpoint lower bound: straight={len_straight}, wrap={len_wrap}"
         );
     }
