@@ -99,17 +99,17 @@ When `|CA × CB| / (|CA| · |CB|)` falls below
 `SIDE_HINT_COLINEARITY_EPS = 1e-4`, we treat `A`, `B`, `C` as colinear.
 With a `side_hint_world` present, we build an artificial wrap plane
 containing `AB` and the perpendicular component of the hint. With no
-hint, we fall back to straight (documented behavior; MuJoCo raises a
-compile-time error).
+hint, the endpoint-inside-sphere case is ill-posed, so newt falls back
+to the straight segment and ignores the sphere. MuJoCo raises a
+compile-time error for this configuration.
 
 ## Actuator transmission on tendons
 
 An actuator can target a tendon via `Actuator::on_tendon(tendon_idx)`.
 The evaluation model is unchanged: `torque = f(gear, ctrl, act, len,
-vel)` where `(len, vel)` are the tendon length and velocity in
-transmission space (MuJoCo convention: len = `gear · L`, vel =
-`gear · Ldot` for affine gain / bias sampling — same as the joint
-transmission from NEWT-15). The resulting scalar force is distributed
+vel)` where `(len, vel)` are the tendon length and velocity in the
+actuator's transmission space. MuJoCo's gear rescales these values
+inside the General actuator. The resulting scalar force is distributed
 across the tree's DOFs via `Jᵀ · F`, where `J` is the tendon Jacobian
 row.
 
