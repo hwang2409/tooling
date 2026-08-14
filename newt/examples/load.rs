@@ -1,7 +1,10 @@
 //! Tier-5 demo: load a scene from a `newt` model file, step it, and render
-//! a wireframe of the final state via chimy2. Works for any of the packaged
-//! models (`models/pendulum.json`, `models/arm.json`, `models/stack.json`)
-//! or an external file passed via `--model`.
+//! a wireframe of the final state via chimy2. Dispatches by file extension:
+//! `.json` uses [`newt::model::load_from_path`] and `.xml` uses
+//! [`newt::mjcf::load_mjcf_path`] (v1 tier 7). Works with any of the packaged
+//! models (`models/pendulum.json|xml`, `models/arm.json|xml`,
+//! `models/stack.json|xml`, `models/biped-simple.xml`) or an external file
+//! passed via `--model`.
 //!
 //! Free bodies are drawn as unit-cube wireframes scaled by 2·half_extents;
 //! trees are drawn as rods between each hinge link's parent joint anchor
@@ -10,6 +13,7 @@
 //! Run:
 //! ```text
 //! cargo run --release --example load -- --model models/arm.json --frames 900 --out /tmp/arm.ppm
+//! cargo run --release --example load -- --model models/biped-simple.xml --frames 400 --out /tmp/biped.ppm
 //! ```
 
 use chimy2::demo::write_ppm;
@@ -18,6 +22,7 @@ use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
 
 use newt::geom::{GeomAttach, GeomShape};
 use newt::math::{Quat, Vec3};
+use newt::mjcf::load_mjcf_path;
 use newt::model::{Scene, load_from_path};
 use newt::tree::forward_kinematics;
 
@@ -56,8 +61,17 @@ fn parse_args() -> Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
-    let mut scene =
-        load_from_path(&args.model).unwrap_or_else(|e| panic!("load {:?}: {e}", args.model));
+    let ext = args
+        .model
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("json");
+    let mut scene = match ext {
+        "xml" | "mjcf" => {
+            load_mjcf_path(&args.model).unwrap_or_else(|e| panic!("load {:?}: {e}", args.model))
+        }
+        _ => load_from_path(&args.model).unwrap_or_else(|e| panic!("load {:?}: {e}", args.model)),
+    };
     for _ in 0..args.frames {
         scene.world.step();
     }
