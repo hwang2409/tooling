@@ -115,13 +115,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     draw_sites(&mut fb, &scene, camera, width, height);
 
     write_ppm(&args.out, &fb)?;
+    let assist_label = if args.balance {
+        "WITH source-style torso balance assist"
+    } else {
+        "with pure joint PD (NO external assist)"
+    };
     println!(
-        "wrote {} ({}x{}) after {} steps of {}",
+        "wrote {} ({}x{}) after {} steps of {} — {}",
         args.out.display(),
         width,
         height,
         args.frames,
-        args.model.display()
+        args.model.display(),
+        assist_label,
     );
     Ok(())
 }
@@ -499,7 +505,10 @@ fn draw_link_geoms(
 /// applied to the first tree's root link via `applied_wrenches[0]`.
 /// See `newt/docs/mjcf.md` and
 /// `~/me/fun/biped/biped/mujoco_biped.py::_apply_balance_controller` —
-/// the biped stand scenario relies on this alongside joint PD.
+/// the biped stand scenario relies on this alongside joint PD. Only
+/// invoked when the caller passes `--balance`; the plain-PD demo
+/// leaves this off so the render matches actual pure-PD behavior
+/// (biped falls).
 fn apply_stand_balance(world: &mut newt::world::World, target_z: f32) {
     if world.trees.is_empty() {
         return;

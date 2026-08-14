@@ -290,24 +290,25 @@ fn fromto_capsule_hand_computed() {
 }
 
 // ---------------------------------------------------------------------------
-// biped-simple: load, step 2000, root stays upright standing (v1 finale)
+// biped-simple: v1 finale. TWO SEPARATE TESTS — one records the pure-PD
+// behavior (the biped falls, matching the source biped's behavior when
+// balance assist is off — this is the honest smoke), and one asserts
+// standing WITH the source biped's balance assist explicitly applied.
 // ---------------------------------------------------------------------------
 
-/// Apply the source biped's balance controller to the torso — mirrors
-/// `_apply_balance_controller` in `~/me/fun/biped/biped/mujoco_biped.py`
-/// for the `stand` scenario. Height PD (kp 240 / kd 70) plus a body-tilt
-/// torque (kp 135 / kd 24) via `applied_wrenches[0]`. This is what the
-/// source stand scenario applies to hold quiet upright; joint PD alone
-/// with source-range gains (kp 45-80) leaves the biped a marginally
-/// unstable inverted pendulum — total ankle stiffness of 2·kp≈90 Nm/rad
-/// is less than the ~177 Nm/rad tipping moment of the ~20 kg body about
-/// the ankles, so it topples. Documented in `newt/docs/mjcf.md`.
+/// Torso balance controller mirroring
+/// `~/me/fun/biped/biped/mujoco_biped.py::_apply_balance_controller`
+/// at `assist_scale=1.0` — the wrench the source biped's `stand`
+/// scenario writes into `data.xfrc_applied[torso]` every step. Height
+/// PD (kp 240 / kd 70, clamped to `[-90, 260] N`) plus an upright
+/// torque (kp 135 / kd 24, clamped to ±95 N·m). Applied via
+/// `Tree::applied_wrenches[0]` (torso is link 0).
+///
+/// This is explicit external stabilization on the torso — NOT joint
+/// PD. Callers that want a pure-PD run must not invoke it.
 fn apply_source_balance_wrench(world: &mut newt::world::World, target_z: f32) {
     let (torso_pos, torso_ori) = forward_kinematics(&world.trees[0])[0];
     let up_world = torso_ori.rotate(newt::math::Vec3::new(0.0, 0.0, 1.0));
-    // Free-root velocity layout in `Tree::qdot`: `(ω_body, v_body)`,
-    // so slot 5 is body-frame vz. For a small tilt this approximates
-    // world-frame vz well enough for the PD height loop.
     let vz = world.trees[0].qdot[5];
     let fz = (240.0 * (target_z - torso_pos.z) - 70.0 * vz).clamp(-90.0, 260.0);
     let tx = (135.0 * up_world.y).clamp(-95.0, 95.0);
@@ -318,12 +319,21 @@ fn apply_source_balance_wrench(world: &mut newt::world::World, target_z: f32) {
     );
 }
 
+/// Load-and-stability smoke under PURE joint PD — NO external assist.
+/// The biped is expected to fall: joint PD alone with source-range
+/// gains (`kp ∈ [45, 80]`) cannot stabilize the inverted-pendulum
+/// dynamics of a ~20 kg body above ~0.9 m ankles (tipping moment
+/// ≈ 177 θ Nm/rad, total ankle stiffness ≤ 2·80 = 160 Nm/rad). The
+/// source biped's own `stand` scenario ships with `balance_mode:
+/// "controller"` + `assist_scale: 1.0` for exactly this reason. This
+/// test asserts only that the simulation stays finite and stays in a
+/// generous world-sized box — a clean load-and-step smoke — and
+/// documents the falling behavior as the current pure-PD baseline
+/// pending the NEWT-13 differential-vs-MuJoCo work.
 #[test]
-fn biped_simple_stands_for_2000_steps() {
+fn biped_simple_pure_pd_smoke() {
     let base = std::env::current_dir().unwrap();
     let scene = load_mjcf_path(base.join("models/biped-simple.xml")).unwrap();
-    // Structural sanity — one tree, 11 links (torso + 10 leg segments),
-    // 10 hinge actuators.
     assert_eq!(scene.world.trees.len(), 1);
     assert_eq!(scene.world.trees[0].links.len(), 11);
     assert_eq!(scene.actuators_by_name.len(), 10);
@@ -335,9 +345,78 @@ fn biped_simple_stands_for_2000_steps() {
         "initial root z = {initial_root_z}"
     );
 
-    let mut min_ratio = 1.0_f32;
+    let mut min_ratio = 1.0f32;
+    let mut fell_step: Option<usize> = None;
+    for step in 0..2000 {
+        // NO balance wrench — pure joint PD only.
+        world.step();
+        let root = forward_kinematics(&world.trees[0])[0].0;
+        assert!(
+            root.x.is_finite() && root.y.is_finite() && root.z.is_finite(),
+            "root pose went non-finite at step {step}: {:?}",
+            root
+        );
+        // Bounded box — the simulation must not explode. Root does drift
+        // during the fall (see `docs/mjcf.md#biped-simple-standing-note`
+        // for the recorded trajectory) but stays inside a reasonable
+        // world-scale envelope.
+        assert!(
+            root.x.abs() < 10.0 && root.y.abs() < 10.0 && root.z > -1.0 && root.z < 5.0,
+            "root escaped the world box at step {step}: {:?}",
+            root
+        );
+        let ratio = root.z / initial_root_z;
+        if ratio < min_ratio {
+            min_ratio = ratio;
+        }
+        if fell_step.is_none() && ratio < 0.5 {
+            fell_step = Some(step + 1);
+        }
+    }
+    // Documented current behavior: under pure PD the biped falls
+    // between steps ~350 and ~500 and lies flat afterwards. If any
+    // future change lifts pure-PD standing above 50% of initial
+    // height, this assertion catches it so we can promote the
+    // fixture / test accordingly.
+    let fell_step = fell_step.expect(
+        "biped stayed above 50% of initial height under pure PD — \
+         update the smoke and docs; a pure-PD standing biped is a \
+         significant behavior change worth surfacing.",
+    );
+    assert!(
+        (300..=600).contains(&fell_step),
+        "biped fell at step {fell_step} — outside the recorded [300, 600] \
+         window (see docs/mjcf.md#biped-simple-standing-note)",
+    );
+    assert!(
+        min_ratio < 0.20,
+        "biped only dropped to {:.1}% of initial — recorded floor is ~11%",
+        100.0 * min_ratio,
+    );
+}
+
+/// The reference "standing" test — biped holds a quiet upright pose
+/// WHEN the source biped's balance controller is applied each step.
+/// This is NOT joint PD alone: `apply_source_balance_wrench` writes
+/// an external torso wrench mirroring the same
+/// `_apply_balance_controller` the source biped's `stand` scenario
+/// runs at `assist_scale=1.0` (see
+/// `~/me/fun/biped/biped/mujoco_biped.py::SCENARIO_DEFINITIONS["stand"]`
+/// and `_apply_balance_controller`). Standing here reproduces the
+/// source `stand` scenario's own behavior — joint PD + balance
+/// controller together, which is the source's own architecture for a
+/// held stand.
+#[test]
+fn biped_simple_stands_with_source_balance_assist() {
+    let base = std::env::current_dir().unwrap();
+    let scene = load_mjcf_path(base.join("models/biped-simple.xml")).unwrap();
+    let mut world = scene.world.clone();
+    let initial_root_z = forward_kinematics(&world.trees[0])[0].0.z;
+
+    let mut min_ratio = 1.0f32;
     let mut max_tilt: f32 = 0.0;
     for step in 0..2000 {
+        // DISCLOSED external assist — see fn docstring.
         apply_source_balance_wrench(&mut world, initial_root_z);
         world.step();
         let (root, ori) = forward_kinematics(&world.trees[0])[0];
@@ -351,25 +430,24 @@ fn biped_simple_stands_for_2000_steps() {
             min_ratio = ratio;
         }
         let up_world = ori.rotate(newt::math::Vec3::new(0.0, 0.0, 1.0));
-        // sin(tilt) ≈ sqrt(1 - up_world.z²) for a small tilt.
         let tilt = (1.0 - up_world.z * up_world.z).max(0.0).sqrt();
         if tilt > max_tilt {
             max_tilt = tilt;
         }
     }
-    // Root height stays above 80% of the initial standing height for the
-    // full 2000-step run (10 s at dt=5 ms) — biped is upright, not
-    // crumpled. Torso tilt stays below ~15° (0.26 rad) for the same
-    // window so the assertion catches a slow topple that never quite
-    // sinks the root height below the 80% threshold.
+    // With the source balance controller running the biped stays
+    // above 80% of initial standing height and torso tilt stays
+    // under ~15° for every one of the 2000 steps (10 s at dt=5 ms).
     assert!(
         min_ratio > 0.80,
-        "root height dropped to {:.1}% of initial standing height",
+        "root height dropped to {:.1}% of initial (assist ON — \
+         should stay > 80%)",
         100.0 * min_ratio,
     );
     assert!(
         max_tilt < 0.26,
-        "torso tilted to {:.3} rad (~{:.1} deg)",
+        "torso tilted to {:.3} rad (~{:.1} deg) — assist ON should \
+         hold tilt < 15°",
         max_tilt,
         max_tilt.asin().to_degrees(),
     );

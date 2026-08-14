@@ -250,66 +250,144 @@ underlying `xml::Error` offset in the message.
 ## Rendering the biped
 
 ```text
+# Pure PD (no external assist) — biped FALLS. This is the honest
+# baseline; the render shows the torso lying on the ground after
+# the fall between steps ~350 and ~500.
 cargo run --release --example load -- \
-  --model models/biped-simple.xml --frames 400  --balance --out /tmp/biped-400.ppm
+  --model models/biped-simple.xml --frames 2000 --out /tmp/biped-purepd.ppm
+
+# Standing WITH the source-style balance assist — mirrors the source
+# biped's `stand` scenario, which itself runs balance assist at
+# assist_scale=1.0. Render shows a quiet upright biped.
 cargo run --release --example load -- \
-  --model models/biped-simple.xml --frames 2000 --balance --out /tmp/biped-2000.ppm
+  --model models/biped-simple.xml --frames 2000 --balance --out /tmp/biped-stand.ppm
 ```
 
-Renders the biped standing on the ground plane — torso and foot
-wireframe boxes, capsule leg segments, ground grid centered on the
-torso. `--balance` toggles the source-mirrored torso balance
-controller so the render shows a quiet standing biped instead of a
-collapsed one (see the standing note below).
+The demo prints its assist state ("with pure joint PD (NO external
+assist)" or "WITH source-style torso balance assist") on every run
+so the caption in a saved image never lies about what physics ran.
 
-## Biped-simple standing note (v1 finale)
+## Biped-simple standing note (v1 finale, honest edition)
 
-`tests/mjcf_load.rs::biped_simple_stands_for_2000_steps` asserts:
+**Ship state — two tests.** `tests/mjcf_load.rs` carries two
+biped smoke tests with truthful names:
 
-- Root height stays above **80% of the initial standing height** for
-  every one of the 2000 steps (10 s at `dt=5 ms`).
-- Torso tilt stays below **~15° (0.26 rad)** across the whole run.
+1. `biped_simple_pure_pd_smoke` — pure joint PD, **NO external
+   assist**. Asserts (a) the simulation stays finite and inside a
+   generous world box, and (b) the biped's characteristic fall
+   between steps 300 and 600 down to ≤ 20 % of initial height. This
+   is the honest current pure-PD behavior baseline.
+2. `biped_simple_stands_with_source_balance_assist` — applies the
+   source biped's `_apply_balance_controller` wrench each step
+   (kp 240 / kd 70 height PD, kp 135 / kd 24 upright torque, same
+   clamps the source uses) via `Tree::applied_wrenches[0]`.
+   Asserts root height > 80 % of initial and torso tilt < 15° for
+   every one of 2000 steps. This is the same architecture the
+   source `stand` scenario uses — `SCENARIO_DEFINITIONS["stand"]`
+   in `biped/mujoco_biped.py` sets `balance_mode: "controller"`
+   with `assist_scale: 1.0`, i.e. the balance controller is on with
+   full authority. Standing here reproduces the source's own
+   architecture, not a shortcut around it.
 
-To hit that bar the test applies the *same* torso balance controller
-the source biped's `stand` scenario runs
-(`~/me/fun/biped/biped/mujoco_biped.py::_apply_balance_controller`):
-a height PD (kp 240 / kd 70, clamped to `[-90, 260] N`) plus an
-upright torque (kp 135 / kd 24, clamped to ±95 N·m) written into
-`Tree::applied_wrenches[0]` each step. Joint PD with the source
-biped's `stand` gains (`kp ∈ [45, 80]`, `forcerange ∈ ±[45, 80]`,
-`damping ∈ [2, 8]`) is what the 10 `<position>` actuators encode in
-`models/biped-simple.xml`.
+### Parameter-by-parameter comparison vs source biped
 
-**Why the external balance controller is necessary.** The biped is
-an inverted pendulum. With a ~20 kg body carried above the ankles,
-the gravitational tipping moment at a small tilt θ is roughly
-`m · g · L_com · θ ≈ 20 · 9.81 · 0.9 · θ = 177 θ Nm/rad`. Total
-ankle-joint restoring stiffness with two ankles at source-range
-`kp = 45` is `2 · 45 = 90 Nm/rad`. Net stiffness is negative
-(`+90 − 177 = −87 Nm/rad`) — the biped is unstable in the small.
-Even at the top of the source range (`kp = 80` per ankle) the net
-is `160 − 177 = −17 Nm/rad`, still unstable. The diagnostic
-(`examples/biped_diag.rs` in the working tree, not shipped) confirms
-this experimentally: without the balance wrench the torso tilts
-0.24 rad by step 300 and topples to ~90° by step 500. **The source
-biped's `stand` scenario reproduces the same behavior**: its
-`SCENARIO_DEFINITIONS["stand"]` sets `balance_mode: "controller"`
-with `assist_scale: 1.0`, i.e. the balance controller is on with
-full authority. Joint PD alone is not a control policy strong
-enough to stabilize the pendulum with source-realistic gains.
+Numbers pulled from `~/me/fun/biped/biped/models/biped.xml`
+(reference biped) and `biped/mujoco_biped.py` (stand scenario) as
+of this commit.
 
-**Follow-ups this diagnosis suggests (candidate NEWT-13 seeds).**
+| Slot                     | Source biped (stand)                | biped-simple.xml (this fixture)         | Match? |
+| ------------------------ | ----------------------------------- | ---------------------------------------- | ------ |
+| `<option timestep>`      | 0.005                               | 0.005                                    | yes    |
+| `<option gravity>`       | 0 0 -9.81                           | 0 0 -9.81                                | yes    |
+| `<option integrator>`    | RK4                                 | RK4 (default)                            | yes    |
+| `<option cone>`          | elliptic                            | elliptic                                 | yes    |
+| `<option solver>`        | default (Newton)                    | PGS (newt has no Newton solver)          | **NO** |
+| joint `damping` default  | 2.0                                 | 2.0                                      | yes    |
+| joint `damping` roll     | 8.0 (hip_roll) / 5.0 (ankle_roll)   | 8.0 / 5.0                                | yes    |
+| joint `armature` default | 0.02                                | 0.02                                     | yes    |
+| joint `armature` roll    | 0.05 (hip_roll) / 0.04 (ankle_roll) | 0.05 / 0.04                              | yes    |
+| joint `limited`          | true                                | true (default in loader)                 | yes    |
+| geom `friction`          | 1.2 0.08 0.02                       | 1.2 0.08 0.02                            | yes    |
+| geom `solref`            | 0.02 1                              | 0.02 1                                   | yes    |
+| geom `solimp`            | 0.9 0.95 0.001                      | 0.9 0.95 0.001                           | yes    |
+| geom `contype/conaffinity` | 2/1 (tree) 1/2 (ground)           | not modeled; tree self-collide=false via loader auto-filter | equivalent for this fixture |
+| Actuator `kp` (hip)      | 70                                  | 70                                       | yes    |
+| Actuator `kp` (knee)     | 80                                  | 80                                       | yes    |
+| Actuator `kp` (ankle)    | 45                                  | 45                                       | yes    |
+| Actuator `dampratio`     | 1.0                                 | `kv=6`/`kv=5` — see gap note below       | **NO** (approximation) |
+| Actuator `forcerange`    | ±70 / ±80 / ±45 per joint           | same numbers                              | yes    |
+| Body topology            | torso = chest box + pelvis box + head sphere; each leg has 5 nested bodies | torso = single box (chest+pelvis+head lumped); each leg has 5 nested bodies matching source | **partial** |
+| Foot support polygon (x) | [-0.095, 0.245] m from ankle        | [-0.095, 0.245] m from ankle             | yes    |
+| Initial CoM              | ~x=0 (inside support polygon)       | ~x=0 (inside support polygon)            | yes    |
+| Initial ankle-support gap | feet at z≈0 flush with ground      | feet flush (`torso pos="0 0 1.235"`)     | yes    |
 
-- Add a first-class MJCF extension for per-body applied wrenches
-  so the balance controller can be encoded declaratively (right
-  now the test writes into `Tree::applied_wrenches` at the Rust
-  level).
-- Stiffer solver limits at the ankle-joint hinge (v1 tier 4 PGS
-  limits with tuned `solref` might tighten the effective ankle
-  stiffness without changing kp).
-- Faithful `<keyframe>` support so a pre-crouched initial pose can
-  bake stability into the scene instead of relying on runtime
-  balance.
+**Identified engine-level gaps (candidate NEWT-13 seeds):**
+
+- **No Newton solver.** MuJoCo's default constraint solver is Newton;
+  newt only ships Penalty and PGS in v1. The stand scenario's contact
+  model may behave differently under PGS iterations vs. Newton at the
+  same solref/solimp. Impact: unknown until we run the NEWT-13
+  differential harness against real MuJoCo trajectories.
+- **`dampratio` in `<position>` uses a unit-inertia approximation.**
+  The loader converts `dampratio=ζ` into `kd = 2ζ·√(kp·1)` because
+  the actuator does not know the joint's `Sᵀ IA S` at parse time
+  (that would tie the loader to ABA). Source biped's `dampratio=1.0`
+  therefore does not translate to an equal kd in newt vs MuJoCo
+  when the joint's effective inertia differs from 1. In this
+  fixture we side-step it with explicit `kv=` and document the
+  choice; a proper fix would materialize the diagonal `Sᵀ IA S`
+  during actuator wiring or at first step.
+- **Torso lumped into one box.** The source torso is three geoms
+  (chest, pelvis, head) at three positions; auto-inertia in newt's
+  v1 subset only handles a single geom at the body origin per
+  body. Effective torso inertia is close (single big box of
+  equivalent mass, similar span) but not identical. Impact:
+  slightly different natural period, does not change the
+  qualitative inverted-pendulum instability.
+- **No `<keyframe>` support.** A pre-crouched initial pose would
+  reduce the ballistic-fall transient the pure-PD test observes.
+  The newt `target` extension on `<position>` bakes the standing
+  setpoint, but the joints still start at q=0.
+
+**Why joint PD alone cannot stand (numbers).** With a ~20 kg
+body-mass biped whose CoM sits ~0.9 m above the ankles, the
+gravity-driven tipping moment for a small tilt θ is
+`m · g · L_com · θ ≈ 177 θ Nm/rad`. Total ankle-joint restoring
+stiffness with two ankles at source `kp = 45` is `2 · 45 = 90
+Nm/rad`. Even at the top of the source range (`kp = 80`), total is
+`160 Nm/rad` — still under 177. Net stiffness is negative in both
+cases, so the linearized dynamics have an unstable eigenvalue and
+any small perturbation grows exponentially. Observed pure-PD
+trajectory (`examples/biped_diag.rs`, not shipped as a test):
+
+```
+step  100  root=(-0.022,-0.000,1.2459)  z_ratio=1.009  tilt≈0.018 rad
+step  200  root=(-0.102,+0.000,1.2403)  z_ratio=1.004  tilt≈0.102 rad
+step  300  root=(-0.329,+0.000,1.1918)  z_ratio=0.965  tilt≈0.339 rad
+step  400  root=(-0.981,+0.000,0.7768)  z_ratio=0.629  tilt≈0.972 rad
+step  500  root=(-1.318,+0.000,0.1388)  z_ratio=0.112  tilt≈1.567 rad
+...
+min z ratio: 0.105 (10.5% of initial)
+first crossed z_ratio < 0.5 at step 413
+```
+
+The source biped's `stand` scenario ships with the balance
+controller ON because the same physics applies to the reference
+biped in MuJoCo — no joint-PD-only stand scenario exists in the
+source repo.
+
+**Follow-ups this diagnosis suggests (NEWT-13 candidates):**
+
+- Differential harness against real MuJoCo trajectories on the same
+  biped model, both with and without balance assist. That gives us
+  a per-tolerance-band claim (e.g. "matches MuJoCo to 1% for the
+  first 200 steps of the fall, drifts past 5% after step 500").
+- MJCF extension for per-body applied wrenches so the balance
+  controller can live in the fixture instead of the test loop.
+- `<keyframe>` support so the biped starts in the pre-crouched
+  standing pose the source uses.
+- Newton solver (out of v1 scope but the differential harness will
+  tell us how much of a gap PGS-vs-Newton opens on this model).
 
 `models/biped-simple.xml` carries a provenance comment pointing at
 `~/me/fun/biped/biped/models/biped.xml` (the reference biped) and

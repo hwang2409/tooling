@@ -26,11 +26,11 @@
 -->
 <mujoco model="biped-simple">
   <compiler angle="radian"/>
-  <option timestep="0.005" gravity="0 0 -9.81"/>
+  <option timestep="0.005" gravity="0 0 -9.81" cone="elliptic" solver="PGS"/>
 
   <default>
     <joint damping="2.0" armature="0.02"/>
-    <geom friction="1.2" solref="0.02 1" solimp="0.9 0.95 0.001"/>
+    <geom friction="1.2 0.08 0.02" solref="0.02 1" solimp="0.9 0.95 0.001"/>
   </default>
 
   <!-- torso pos so foot-box bottom = 0 (feet flush with ground).
@@ -39,7 +39,7 @@
        + foot half-z 0.035 = 1.235. Foot center at torso_z - 1.20 = 0.035
        so foot bottom = 0. -->
   <worldbody>
-    <geom name="ground" type="plane" friction="1.2"/>
+    <geom name="ground" type="plane" friction="1.2 0.08 0.02"/>
 
     <body name="torso" pos="0 0 1.235">
       <freejoint name="torso_root"/>
