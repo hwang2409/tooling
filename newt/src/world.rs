@@ -416,8 +416,14 @@ impl World {
             return;
         }
         let n_trees = self.trees.len();
+        // Snapshot scalars before we start borrowing the vector fields.
+        let dt = self.dt;
+        let gravity = self.gravity;
+        let solver_mode = self.solver.mode;
+        let solver_iterations = self.solver.iterations;
         for ti in 0..n_trees {
-            // Filter pairs to those touching this tree.
+            // Filter pairs to those touching this tree (immutable borrow
+            // of self.geoms, released before the mem::take below).
             let mut tree_pairs: Vec<(usize, usize)> = Vec::new();
             for &(a, b) in pairs {
                 let att_a = self.geoms[a].attachment();
@@ -428,14 +434,15 @@ impl World {
                     tree_pairs.push((a, b));
                 }
             }
-            // Split tree out of self so the closure below can borrow the
-            // rest.
-            let dt = self.dt;
-            let gravity = self.gravity;
+            // Move the current tree out so the closure below can borrow
+            // the rest of `self` immutably without conflicting with the
+            // `&mut tree` that tree_rk4_step wants. std::mem::take
+            // replaces the slot with `Tree::default()`; we overwrite
+            // that with the stepped tree at the end. No clone of
+            // bodies/geoms/meshes — the closure captures those as
+            // borrows, whose lifetime ends before we mutate self.trees
+            // again.
             let mut tree = std::mem::take(&mut self.trees[ti]);
-            let bodies = self.bodies.clone();
-            let geoms = self.geoms.clone();
-            let meshes = self.meshes.clone();
             // Solver mode: compute per-DOF limit force ONCE at s0 and
             // hold it constant across the RK4 stages via qfrc_applied.
             // Preserves the pre-step qfrc_applied so user-set torques
@@ -446,17 +453,30 @@ impl World {
             // switch on solver mode.
             let mut solver_qfrc_delta: Vec<f32> = Vec::new();
             let prior_disable = tree.disable_penalty_limits;
-            if self.solver.mode == SolverMode::Pgs {
-                solver_qfrc_delta =
-                    crate::solver::solve_tree_limits(&tree, dt, self.solver.iterations);
+            if solver_mode == SolverMode::Pgs {
+                solver_qfrc_delta = crate::solver::solve_tree_limits(&tree, dt, solver_iterations);
                 for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
                     tree.qfrc_applied[slot] += delta;
                 }
                 tree.disable_penalty_limits = true;
             }
-            tree_rk4_step(&mut tree, gravity, dt, |t| {
-                tree_wrenches_from_contacts(t, ti, &bodies, &geoms, &meshes, &tree_pairs)
-            });
+            {
+                // Scope the immutable borrows so the closure lifetime
+                // ends before we mutate self.trees[ti] on the next line.
+                let bodies_ref = &self.bodies;
+                let geoms_ref = &self.geoms;
+                let meshes_ref = &self.meshes;
+                tree_rk4_step(&mut tree, gravity, dt, |t| {
+                    tree_wrenches_from_contacts(
+                        t,
+                        ti,
+                        bodies_ref,
+                        geoms_ref,
+                        meshes_ref,
+                        &tree_pairs,
+                    )
+                });
+            }
             // Roll back the ZOH limit torque + penalty-limit gate so
             // neither accumulates across steps (the solver recomputes
             // both fresh at each step start).
