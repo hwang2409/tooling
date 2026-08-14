@@ -569,6 +569,34 @@ fn link_world_velocity(tree: &Tree, target: usize, link_poses: &[(Vec3, Quat)]) 
                 v_world[i] =
                     v_parent_at_child_com + (axis_world * qdot_i).cross(child_pos - joint_world);
             }
+            JointKind::Slide { axis, .. } => {
+                // Slide never rotates; child ω = parent ω. Child COM adds
+                // the joint's linear velocity (axis * qdot) to the parent's
+                // point velocity at the child COM.
+                let axis_world = parent_ori.rotate(axis);
+                let qdot_i = tree.slide_rate(i);
+                w_world[i] = w_world[parent];
+                let v_parent_at_child_com =
+                    v_world[parent] + w_world[parent].cross(child_pos - parent_pos);
+                v_world[i] = v_parent_at_child_com + axis_world * qdot_i;
+            }
+            JointKind::Ball { .. } => {
+                // Body-frame ω on the child; rotate into world by the child
+                // orientation (equivalent to parent_ori * q_ball, but we
+                // already computed it in link_poses).
+                let (_, child_ori) = link_poses[i];
+                let omega_body = tree.ball_omega(i);
+                let omega_child_world = child_ori.rotate(omega_body);
+                w_world[i] = w_world[parent] + omega_child_world;
+                // The ball's joint anchor coincides with parent's anchor —
+                // the ball doesn't translate; only rotates.
+                let joint_world =
+                    parent_pos + parent_ori.rotate(tree.links[i].joint_offset_in_parent.0);
+                let v_parent_at_child_com =
+                    v_world[parent] + w_world[parent].cross(child_pos - parent_pos);
+                v_world[i] =
+                    v_parent_at_child_com + omega_child_world.cross(child_pos - joint_world);
+            }
             JointKind::Fixed => {
                 w_world[i] = w_world[parent];
                 v_world[i] = v_world[parent] + w_world[parent].cross(child_pos - parent_pos);

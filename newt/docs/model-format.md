@@ -130,13 +130,31 @@ zero hinge axes — every branch has a dedicated unit test in
  "armature": 0.02,
  "limit":    {"stiffness": 1000, "damping": 60}
 }
+{"kind": "slide",
+ "axis":     [0, 0, 1],
+ "range":    [-0.5, 0.5],
+ "damping":  0.1,
+ "armature": 0.05,
+ "limit":    {"stiffness": 1500, "damping": 50}
+}
+{"kind": "ball",
+ "damping":  0.05,
+ "armature": 0.01
+}
 ```
 
-- **kind** = `free` (6-DOF root), `fixed`, or `hinge`.
-- Hinges only: **axis** (required, normalized on load; zero rejected),
+- **kind** = `free` (6-DOF root), `fixed`, `hinge`, `slide`, or `ball`.
+- Hinges + slides: **axis** (required, normalized on load; zero rejected),
   **range** (optional `[lo, hi]`, lo < hi enforced), **damping**,
-  **armature**, **limit.stiffness** / **limit.damping**.
-- `free` is only valid on the root; `hinge` is invalid on the root.
+  **armature**, **limit.stiffness** / **limit.damping**. Units follow
+  the DOF — hinge is rad / rad/s / N·m, slide is m / m/s / N.
+- Ball: **damping** (isotropic angular, N·m per rad/s), **armature**
+  (per-axis rotor inertia, kg·m²). **NO `range` field** — a physically
+  correct 3-DOF orientation limit needs the v1 solver landing in a
+  follow-up ticket; the loader rejects a `range` on a ball joint with a
+  pointer at that deferral.
+- `free` is only valid on the root; `hinge` / `slide` / `ball` are
+  invalid on the root (they need a parent to anchor against).
 
 ## inertia
 
@@ -222,8 +240,8 @@ default).
 ```
 
 - **type** — v0 supports only `"position"`; anything else is rejected.
-- **tree** / **link** — must reference a hinge link. Non-hinge targets
-  are rejected at load.
+- **tree** / **link** — must reference a hinge OR slide link. Ball and
+  free/fixed targets are rejected at load (PD servos are single-DOF).
 - **kp**, **clamp**, **target** — as in
   [`newt::actuator::PdServo`](../src/actuator.rs).
 - **kd** — direct velocity gain. Mutually exclusive with
@@ -250,8 +268,8 @@ or
   suppressed).
 - **disable** — start from the auto list (including the `self_collide`
   filter per tree) and subtract the listed pairs.
-- The two are mutually exclusive; a single object cannot mix them
-  through the current v0 grammar (specify one or the other).
+- The two are mutually exclusive: passing both is a load-time error
+  (`contact_pairs: "explicit" and "disable" are mutually exclusive`).
 
 ## validation coverage
 
@@ -280,6 +298,12 @@ Every branch below is asserted by a dedicated test in
 | non-positive timestep                                         | `negative_timestep_rejected`                         |
 | unsupported version string                                    | `version_mismatch_rejected`                          |
 | contact pair referencing a missing geom                       | `contact_pair_unknown_geom_rejected`                 |
+| contact_pairs with both `explicit` and `disable`              | `contact_pairs_explicit_and_disable_together_rejected` |
+| zero slide axis                                                | `zero_slide_axis_rejected`                             |
+| slide joint at the root                                        | `slide_at_root_rejected`                               |
+| ball joint at the root                                         | `ball_at_root_rejected`                                |
+| ball joint with a `range` (deferred to the v1 solver)          | `ball_with_range_rejected_with_solver_deferral_hint`   |
+| PD actuator on a ball joint (non-1-DOF target)                 | `actuator_on_ball_rejected`                            |
 
 Plus the parser's own layer:
 [`newt/src/json.rs::tests`](../src/json.rs) pins malformed inputs
@@ -303,8 +327,9 @@ runaway nesting, `1e9999` overflow).
   on the middle and top boxes — that tickled a **latent tier-2
   limitation**: [`contact::box_box`](../src/contact.rs) is a
   vertex-only SAT that misses edge-edge intersections between
-  rotated boxes (any yaw ≥ 5° drops all box-box contact candidates
-  even when the boxes clearly overlap). The tier-2 box-box golden
+  rotated boxes (any nonzero yaw drops all box-box contact
+  candidates even when the boxes clearly overlap; the collapse is
+  continuous with yaw, not gated at any particular angle). The tier-2 box-box golden
   path only exercises axis-aligned boxes, so the bug never surfaced
   before; the tier-5 round-trip test caught it here. Fixing the
   box-box narrow phase is a tier-2 follow-up (needs a proper SAT or

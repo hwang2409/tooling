@@ -28,6 +28,9 @@
 //!   - Fixed root: `nq = nv = 0`. Root pose is fixed at
 //!     `joint_offset_in_parent` (used as the world-frame anchor pose).
 //!   - Hinge: `nq = nv = 1`. Angle (rad) / rate (rad/s).
+//!   - Slide: `nq = nv = 1`. Displacement (m) / rate (m/s) along the axis.
+//!   - Ball: `nq = 4` (child-frame quaternion, renormalized at step end),
+//!     `nv = 3` (body-frame ω). Ball limits are deferred to the v1 solver.
 //!
 //! `qfrc_applied` is a dense `nv`-vector of user-applied generalized forces
 //! (tier-4 actuators plug in here). Zero-initialized.
@@ -63,7 +66,7 @@
 //! affect the result.
 
 use crate::actuator::{PdServo, clamp_symmetric};
-use crate::joint::{HingeLimit, JointKind};
+use crate::joint::{JointKind, JointLimit};
 use crate::math::{Mat3, Quat, Vec3};
 use crate::spatial::{Mat6, SpatialForce, SpatialInertia, SpatialMotion, Xform};
 
@@ -247,6 +250,14 @@ impl Tree {
             JointKind::Hinge { .. } => {
                 self.q.push(0.0);
             }
+            JointKind::Slide { .. } => {
+                self.q.push(0.0);
+            }
+            JointKind::Ball { .. } => {
+                // Default ball q = IDENTITY quaternion (no rotation between
+                // parent and child at t=0).
+                self.q.extend_from_slice(&[0.0, 0.0, 0.0, 1.0]);
+            }
         }
         self.qdot.extend(std::iter::repeat_n(0.0, nv));
         self.qfrc_applied.extend(std::iter::repeat_n(0.0, nv));
@@ -255,17 +266,27 @@ impl Tree {
         idx
     }
 
-    /// Attach a PD position actuator to a hinge link. Returns the actuator's
-    /// stable index (usable with [`Tree::set_actuator_target`]). Panics if
-    /// `servo.link_idx` is out of range or does not reference a hinge.
+    /// Attach a PD position actuator to a hinge or slide link. Returns the
+    /// actuator's stable index (usable with [`Tree::set_actuator_target`]).
+    /// Panics if `servo.link_idx` is out of range or does not reference a
+    /// hinge or slide.
+    ///
+    /// The PD equation `τ = kp·(target − q) − kd·qdot` is identical for
+    /// both: for a hinge the "τ" is a torque about the axis (N·m), for a
+    /// slide it is a force along the axis (N). Same 1-DOF generalized-force
+    /// slot in either case, so the actuator plumbing does not need to know
+    /// which kind it is attached to.
     pub fn add_actuator(&mut self, servo: PdServo) -> usize {
         assert!(
             servo.link_idx < self.links.len(),
             "actuator link out of range"
         );
         assert!(
-            matches!(self.links[servo.link_idx].joint, JointKind::Hinge { .. }),
-            "PD servo can only actuate a Hinge joint (link {} is {:?})",
+            matches!(
+                self.links[servo.link_idx].joint,
+                JointKind::Hinge { .. } | JointKind::Slide { .. }
+            ),
+            "PD servo can only actuate a Hinge or Slide joint (link {} is {:?})",
             servo.link_idx,
             self.links[servo.link_idx].joint
         );
@@ -280,18 +301,21 @@ impl Tree {
         self.actuators[actuator_idx].target = target;
     }
 
-    /// Directly write a generalized joint torque into `qfrc_applied` for a
-    /// hinge link, symmetric-clamped to `force_range` (pass `0.0` or a
-    /// negative value to disable the clamp). This is the motor-style input
-    /// tier-4 exposes on top of the raw `qfrc_applied` buffer. Persists
-    /// across steps — call again to update, or use
+    /// Directly write a generalized joint force into `qfrc_applied` for a
+    /// hinge or slide link, symmetric-clamped to `force_range` (pass `0.0`
+    /// or a negative value to disable the clamp). This is the motor-style
+    /// input tier-4 exposes on top of the raw `qfrc_applied` buffer.
+    /// Persists across steps — call again to update, or use
     /// [`Tree::clear_qfrc_applied`] to zero every slot.
     ///
-    /// Panics if `link_idx` is not a hinge.
+    /// Panics if `link_idx` is not a hinge or slide.
     pub fn set_joint_torque_clamped(&mut self, link_idx: usize, torque: f32, force_range: f32) {
         assert!(
-            matches!(self.links[link_idx].joint, JointKind::Hinge { .. }),
-            "set_joint_torque_clamped requires a Hinge link"
+            matches!(
+                self.links[link_idx].joint,
+                JointKind::Hinge { .. } | JointKind::Slide { .. }
+            ),
+            "set_joint_torque_clamped requires a Hinge or Slide link"
         );
         self.qfrc_applied[self.v_offset[link_idx]] = clamp_symmetric(torque, force_range);
     }
@@ -353,6 +377,73 @@ impl Tree {
     pub fn hinge_rate(&self, i: usize) -> f32 {
         assert!(matches!(self.links[i].joint, JointKind::Hinge { .. }));
         self.qdot[self.v_offset[i]]
+    }
+
+    /// Overwrite the slide displacement for link `i`. Panics if `i`'s joint
+    /// is not a slide.
+    pub fn set_slide_position(&mut self, i: usize, position: f32) {
+        assert!(matches!(self.links[i].joint, JointKind::Slide { .. }));
+        let off = self.q_offset[i];
+        self.q[off] = position;
+    }
+
+    /// Overwrite the slide rate for link `i`.
+    pub fn set_slide_rate(&mut self, i: usize, rate: f32) {
+        assert!(matches!(self.links[i].joint, JointKind::Slide { .. }));
+        let off = self.v_offset[i];
+        self.qdot[off] = rate;
+    }
+
+    /// Read the slide displacement at link `i`.
+    pub fn slide_position(&self, i: usize) -> f32 {
+        assert!(matches!(self.links[i].joint, JointKind::Slide { .. }));
+        self.q[self.q_offset[i]]
+    }
+
+    /// Read the slide rate at link `i`.
+    pub fn slide_rate(&self, i: usize) -> f32 {
+        assert!(matches!(self.links[i].joint, JointKind::Slide { .. }));
+        self.qdot[self.v_offset[i]]
+    }
+
+    /// Read the ball joint's child-relative-to-parent orientation at link
+    /// `i`. Panics if `i`'s joint is not a ball.
+    pub fn ball_orientation(&self, i: usize) -> Quat {
+        assert!(matches!(self.links[i].joint, JointKind::Ball { .. }));
+        let off = self.q_offset[i];
+        Quat::new(
+            self.q[off],
+            self.q[off + 1],
+            self.q[off + 2],
+            self.q[off + 3],
+        )
+    }
+
+    /// Overwrite the ball joint's orientation at link `i` (renormalized).
+    pub fn set_ball_orientation(&mut self, i: usize, orientation: Quat) {
+        assert!(matches!(self.links[i].joint, JointKind::Ball { .. }));
+        let q = orientation.renormalize();
+        let off = self.q_offset[i];
+        self.q[off] = q.x;
+        self.q[off + 1] = q.y;
+        self.q[off + 2] = q.z;
+        self.q[off + 3] = q.w;
+    }
+
+    /// Read the ball joint's body-frame angular velocity at link `i`.
+    pub fn ball_omega(&self, i: usize) -> Vec3 {
+        assert!(matches!(self.links[i].joint, JointKind::Ball { .. }));
+        let off = self.v_offset[i];
+        Vec3::new(self.qdot[off], self.qdot[off + 1], self.qdot[off + 2])
+    }
+
+    /// Overwrite the ball joint's body-frame angular velocity at link `i`.
+    pub fn set_ball_omega(&mut self, i: usize, omega: Vec3) {
+        assert!(matches!(self.links[i].joint, JointKind::Ball { .. }));
+        let off = self.v_offset[i];
+        self.qdot[off] = omega.x;
+        self.qdot[off + 1] = omega.y;
+        self.qdot[off + 2] = omega.z;
     }
 
     /// Set the free-root pose (position + orientation) for link 0. Panics if
@@ -449,6 +540,39 @@ pub fn forward_kinematics(tree: &Tree) -> Vec<(Vec3, Quat)> {
                 let child_pos = joint_pos_world - child_ori.rotate(offset_c_p);
                 (child_pos, child_ori)
             }
+            JointKind::Slide { axis, .. } => {
+                let parent_idx = link.parent.expect("slide joint must have a parent");
+                let (parent_pos, parent_ori) = out[parent_idx];
+                let q_slide = tree.q[tree.q_offset[i]];
+                let (offset_p, _offset_p_o) = link.joint_offset_in_parent;
+                let (offset_c_p, _offset_c_o) = link.joint_offset_in_child;
+                // Child orientation = parent orientation (slide never rotates).
+                let child_ori = parent_ori;
+                // Joint anchor in world at q=0: parent-anchor pose. Slide
+                // displaces the child body by axis*q along the (child = parent
+                // frame) axis direction, rotated into world.
+                let joint_pos_world = parent_pos + parent_ori.rotate(offset_p);
+                let slide_world = parent_ori.rotate(axis * q_slide);
+                let child_pos = joint_pos_world + slide_world - child_ori.rotate(offset_c_p);
+                (child_pos, child_ori)
+            }
+            JointKind::Ball { .. } => {
+                let parent_idx = link.parent.expect("ball joint must have a parent");
+                let (parent_pos, parent_ori) = out[parent_idx];
+                let off = tree.q_offset[i];
+                let q_ball = Quat::new(
+                    tree.q[off],
+                    tree.q[off + 1],
+                    tree.q[off + 2],
+                    tree.q[off + 3],
+                );
+                let (offset_p, _offset_p_o) = link.joint_offset_in_parent;
+                let (offset_c_p, _offset_c_o) = link.joint_offset_in_child;
+                let joint_pos_world = parent_pos + parent_ori.rotate(offset_p);
+                let child_ori = parent_ori * q_ball;
+                let child_pos = joint_pos_world - child_ori.rotate(offset_c_p);
+                (child_pos, child_ori)
+            }
         };
         out.push(pose);
     }
@@ -460,46 +584,75 @@ pub fn forward_kinematics(tree: &Tree) -> Vec<(Vec3, Quat)> {
 // ---------------------------------------------------------------------------
 
 /// Per-link scratch used by the ABA passes.
+///
+/// The scalar slots (`s`, `ia_s`, `d`, `tau`, `qddot_joint`) carry the state
+/// for single-DOF joints (Hinge, Slide). The ball-joint slots (`s3`,
+/// `ia_s3`, `d3_inv`, `tau3`, `qddot3`) carry the 3-column parallel state
+/// for the 3-DOF ball joint. Only one set is meaningful per link, decided
+/// by the link's `JointKind`; the other is left at its default and never
+/// read on that link's ABA arms.
 struct AbaWorkspace {
     /// Motion transform from parent body frame to this link's body frame.
     xup: Vec<Xform>,
-    /// Joint subspace basis (child-body-frame spatial motion per unit qdot).
-    /// Only meaningful for hinge/free joints; empty for fixed.
+    /// Joint subspace basis (child-body-frame spatial motion per unit qdot)
+    /// for single-DOF joints. Meaningful for hinge/slide; unused for
+    /// fixed/free/ball.
     s: Vec<SpatialMotion>,
+    /// 3-column joint subspace for ball joints (columns k=0..3 give the
+    /// spatial motion per unit `qdot_k` in the child body frame at COM).
+    s3: Vec<[SpatialMotion; 3]>,
     /// Per-link spatial velocity in body frame at COM.
     v: Vec<SpatialMotion>,
-    /// Per-link coriolis bias `c[i] = v[i] × (S[i] * qdot[i])`.
+    /// Per-link coriolis bias `c[i] = v[i] × (S[i] * qdot[i])` (spatial
+    /// motion). For a ball joint, `S[i] * qdot[i]` is `Σ_k S_k * qdot_k`
+    /// (the 3-DOF joint velocity in body frame).
     c: Vec<SpatialMotion>,
     /// Articulated-body inertia at each link (body frame at COM).
     ia: Vec<Mat6>,
     /// Articulated-body bias force at each link.
     pa: Vec<SpatialForce>,
-    /// Per-link `IA[i] * S[i]` (cached from pass 2 for reuse in pass 3).
+    /// Per-link `IA[i] * S[i]` for single-DOF joints (hinge/slide).
     ia_s: Vec<SpatialForce>,
-    /// Per-link `Sᵀ IA S + armature` (scalar for hinge).
+    /// Per-link `IA[i] * S_k[i]` for ball joints (3 spatial forces).
+    ia_s3: Vec<[SpatialForce; 3]>,
+    /// Per-link `Sᵀ IA S + armature` (scalar) for single-DOF joints.
     d: Vec<f32>,
-    /// Per-link joint scalar torque applied at pass-2 (damping, armature-related,
-    /// limits, external qfrc_applied). Cached for pass 3.
+    /// Per-link inverse of `Sᵀ IA S + armature·I₃` (3x3 Mat3) for ball joints.
+    d3_inv: Vec<Mat3>,
+    /// Per-link joint scalar torque applied at pass-2 for single-DOF joints
+    /// (damping, armature-related, limits, external qfrc_applied, actuators).
+    /// Cached for pass 3.
     tau: Vec<f32>,
-    /// Per-link joint qddot (computed in pass 3).
+    /// Per-link 3-vector joint torque for ball joints (damping + qfrc_applied).
+    tau3: Vec<Vec3>,
+    /// Per-link joint qddot (single-DOF, computed in pass 3).
     qddot_joint: Vec<f32>,
+    /// Per-link joint qddot (ball, 3-vector).
+    qddot_ball: Vec<Vec3>,
     /// Per-link spatial acceleration (computed in pass 3, body frame at COM).
     a: Vec<SpatialMotion>,
 }
 
 impl AbaWorkspace {
     fn new(n: usize) -> Self {
+        let zero_s3 = [SpatialMotion::ZERO; 3];
+        let zero_f3 = [SpatialForce::ZERO; 3];
         Self {
             xup: vec![Xform::IDENTITY; n],
             s: vec![SpatialMotion::ZERO; n],
+            s3: vec![zero_s3; n],
             v: vec![SpatialMotion::ZERO; n],
             c: vec![SpatialMotion::ZERO; n],
             ia: vec![Mat6::ZERO; n],
             pa: vec![SpatialForce::ZERO; n],
             ia_s: vec![SpatialForce::ZERO; n],
+            ia_s3: vec![zero_f3; n],
             d: vec![0.0; n],
+            d3_inv: vec![Mat3::ZERO; n],
             tau: vec![0.0; n],
+            tau3: vec![Vec3::ZERO; n],
             qddot_joint: vec![0.0; n],
+            qddot_ball: vec![Vec3::ZERO; n],
             a: vec![SpatialMotion::ZERO; n],
         }
     }
@@ -555,7 +708,7 @@ pub fn aba(
             JointKind::Hinge { axis, .. } => {
                 let parent = link.parent.expect("hinge must have parent");
                 let q_angle = tree.q[tree.q_offset[i]];
-                let xup = xup_for_link(link, q_angle);
+                let xup = xup_for_link_hinge(link, axis, q_angle);
                 w.xup[i] = xup;
                 // Joint subspace in child body frame at COM: (axis, r_jc × axis)
                 // where r_jc = joint_offset_in_child.translation.
@@ -564,6 +717,45 @@ pub fn aba(
                 w.s[i] = s;
                 let qdot_i = tree.qdot[tree.v_offset[i]];
                 let s_qdot = s * qdot_i;
+                let v_parent = xup.motion(w.v[parent]);
+                w.v[i] = v_parent + s_qdot;
+                w.c[i] = w.v[i].cross_motion(s_qdot);
+            }
+            JointKind::Slide { axis, .. } => {
+                let parent = link.parent.expect("slide must have parent");
+                let q_slide = tree.q[tree.q_offset[i]];
+                let xup = xup_for_link_slide(link, axis, q_slide);
+                w.xup[i] = xup;
+                // Slide joint subspace at COM: pure translation along axis.
+                // Angular part = 0; linear part = axis (in child body coords).
+                let s = SpatialMotion::new(Vec3::ZERO, axis);
+                w.s[i] = s;
+                let qdot_i = tree.qdot[tree.v_offset[i]];
+                let s_qdot = s * qdot_i;
+                let v_parent = xup.motion(w.v[parent]);
+                w.v[i] = v_parent + s_qdot;
+                w.c[i] = w.v[i].cross_motion(s_qdot);
+            }
+            JointKind::Ball { .. } => {
+                let parent = link.parent.expect("ball must have parent");
+                let off = tree.q_offset[i];
+                let q_ball = Quat::new(
+                    tree.q[off],
+                    tree.q[off + 1],
+                    tree.q[off + 2],
+                    tree.q[off + 3],
+                );
+                let xup = xup_for_link_ball(link, q_ball);
+                w.xup[i] = xup;
+                // 3-column joint subspace at COM: S_k = (e_k, r_jc × e_k).
+                let r_jc = link.joint_offset_in_child.0;
+                let sx = SpatialMotion::new(Vec3::X, r_jc.cross(Vec3::X));
+                let sy = SpatialMotion::new(Vec3::Y, r_jc.cross(Vec3::Y));
+                let sz = SpatialMotion::new(Vec3::Z, r_jc.cross(Vec3::Z));
+                w.s3[i] = [sx, sy, sz];
+                let voff = tree.v_offset[i];
+                let omega = Vec3::new(tree.qdot[voff], tree.qdot[voff + 1], tree.qdot[voff + 2]);
+                let s_qdot = sx * omega.x + sy * omega.y + sz * omega.z;
                 let v_parent = xup.motion(w.v[parent]);
                 w.v[i] = v_parent + s_qdot;
                 w.c[i] = w.v[i].cross_motion(s_qdot);
@@ -626,18 +818,9 @@ pub fn aba(
                 ..
             } => {
                 let parent = link.parent.expect("hinge must have parent");
-                let s = w.s[i];
-                let ia_s = w.ia[i].times_motion(s);
-                // Sᵀ (IA S) + armature = scalar for a hinge.
-                let d_scalar = spatial_dot_ms(s, ia_s) + armature;
-                // τ_effective = qfrc_applied − damping * qdot + limit penalty
-                //                + Σ actuator torques on this link.
                 let qdot_i = tree.qdot[tree.v_offset[i]];
                 let q_i = tree.q[tree.q_offset[i]];
-                let tau_lim = hinge_limit_torque(q_i, qdot_i, range, limit);
-                // Sum every PD actuator bound to this link. Small linear scan;
-                // v0 tree sizes are tiny (biped ≈ 10 hinges). Deterministic —
-                // order-independent because it's a sum of scalars.
+                let tau_lim = joint_limit_scalar_force(q_i, qdot_i, range, limit);
                 let mut tau_act = 0.0;
                 for act in &tree.actuators {
                     if act.link_idx == i {
@@ -646,33 +829,112 @@ pub fn aba(
                 }
                 let tau_scalar =
                     tree.qfrc_applied[tree.v_offset[i]] - damping * qdot_i + tau_lim + tau_act;
-                // Featherstone's reduced-inertia form: pA_reduced = pA + I_a c
-                // + U u / D with I_a = IA - U D⁻¹ Uᵀ. Expanding I_a c and
-                // grouping gives the equivalent form we use here (avoids
-                // materializing I_a * c separately):
-                //
-                //     p_stage = pA + IA c
-                //     u_stage = τ − Sᵀ p_stage    (= u − Sᵀ IA c)
-                //     pA_reduced = p_stage + IA S · u_stage / D
+                single_dof_pass2(&mut w, tree, i, parent, armature, tau_scalar);
+            }
+            JointKind::Slide {
+                damping,
+                armature,
+                range,
+                limit,
+                ..
+            } => {
+                // Slide's pass-2 arithmetic is IDENTICAL to hinge's — both
+                // are 1-DOF with a scalar `Sᵀ IA S + armature`. The only
+                // difference is the semantic of `q_i` (radians vs meters)
+                // and the sign convention on the limit, both encoded in
+                // `joint_limit_scalar_force` and `single_dof_pass2` which
+                // work off `w.s[i]` cached from pass 1.
+                let parent = link.parent.expect("slide must have parent");
+                let qdot_i = tree.qdot[tree.v_offset[i]];
+                let q_i = tree.q[tree.q_offset[i]];
+                let tau_lim = joint_limit_scalar_force(q_i, qdot_i, range, limit);
+                let mut tau_act = 0.0;
+                for act in &tree.actuators {
+                    if act.link_idx == i {
+                        tau_act += act.torque(q_i, qdot_i);
+                    }
+                }
+                let tau_scalar =
+                    tree.qfrc_applied[tree.v_offset[i]] - damping * qdot_i + tau_lim + tau_act;
+                single_dof_pass2(&mut w, tree, i, parent, armature, tau_scalar);
+            }
+            JointKind::Ball { damping, armature } => {
+                let parent = link.parent.expect("ball must have parent");
+                let s3 = w.s3[i];
+                // Compute IA * S_k for k = 0..3.
+                let ia_s3 = [
+                    w.ia[i].times_motion(s3[0]),
+                    w.ia[i].times_motion(s3[1]),
+                    w.ia[i].times_motion(s3[2]),
+                ];
+                // D = Sᵀ IA S + armature * I₃  (3x3 symmetric).
+                // Written out column-major (matches Mat3's layout) so clippy's
+                // needless_range_loop lint doesn't fire on nested index loops.
+                let d_mat = Mat3::new([
+                    spatial_dot_ms(s3[0], ia_s3[0]) + armature,
+                    spatial_dot_ms(s3[1], ia_s3[0]),
+                    spatial_dot_ms(s3[2], ia_s3[0]),
+                    spatial_dot_ms(s3[0], ia_s3[1]),
+                    spatial_dot_ms(s3[1], ia_s3[1]) + armature,
+                    spatial_dot_ms(s3[2], ia_s3[1]),
+                    spatial_dot_ms(s3[0], ia_s3[2]),
+                    spatial_dot_ms(s3[1], ia_s3[2]),
+                    spatial_dot_ms(s3[2], ia_s3[2]) + armature,
+                ]);
+                let d_inv = d_mat
+                    .inverse()
+                    .expect("ball articulated-inertia block is singular");
+                // Ball joint torque: qfrc_applied - damping * omega (isotropic).
+                let voff = tree.v_offset[i];
+                let omega = Vec3::new(tree.qdot[voff], tree.qdot[voff + 1], tree.qdot[voff + 2]);
+                let tau3 = Vec3::new(
+                    tree.qfrc_applied[voff] - damping * omega.x,
+                    tree.qfrc_applied[voff + 1] - damping * omega.y,
+                    tree.qfrc_applied[voff + 2] - damping * omega.z,
+                );
+
+                // p_stage = pA + IA c
                 let ia_c = w.ia[i].times_motion(w.c[i]);
                 let p_stage = w.pa[i] + ia_c;
-                let s_dot_p_stage = spatial_dot_ms(s, p_stage);
-                let u_stage = tau_scalar - s_dot_p_stage;
-                let pa_full = p_stage + ia_s * (u_stage / d_scalar);
+                // u_stage = tau3 - Sᵀ p_stage  (3-vector)
+                let sp = Vec3::new(
+                    spatial_dot_ms(s3[0], p_stage),
+                    spatial_dot_ms(s3[1], p_stage),
+                    spatial_dot_ms(s3[2], p_stage),
+                );
+                let u_stage = tau3 - sp;
+                // qddot_stage = D⁻¹ u_stage.
+                let qdd_stage = d_inv * u_stage;
+                // pA_full = p_stage + Σ_k (IA S_k) * qdd_stage[k].
+                let pa_full = p_stage
+                    + ia_s3[0] * qdd_stage.x
+                    + ia_s3[1] * qdd_stage.y
+                    + ia_s3[2] * qdd_stage.z;
 
-                // IA update within child: IA -= (IA S)(IA S)ᵀ / d
-                let outer = Mat6::outer(ia_s, s_force_to_motion(ia_s));
-                let ia_full = w.ia[i].minus(scale_mat6(outer, 1.0 / d_scalar));
+                // IA_full = IA - (IA S) D⁻¹ (IA S)ᵀ.
+                // Write A_col_k = Σ_j (IA S_j) * D_inv[j, k]; then update
+                // is Σ_k outer(A_col_k, (IA S_k) as motion).
+                let a_col = [
+                    ia_s3[0] * d_inv.get(0, 0)
+                        + ia_s3[1] * d_inv.get(1, 0)
+                        + ia_s3[2] * d_inv.get(2, 0),
+                    ia_s3[0] * d_inv.get(0, 1)
+                        + ia_s3[1] * d_inv.get(1, 1)
+                        + ia_s3[2] * d_inv.get(2, 1),
+                    ia_s3[0] * d_inv.get(0, 2)
+                        + ia_s3[1] * d_inv.get(1, 2)
+                        + ia_s3[2] * d_inv.get(2, 2),
+                ];
+                let ia_full = w.ia[i]
+                    .minus(Mat6::outer(a_col[0], s_force_to_motion(ia_s3[0])))
+                    .minus(Mat6::outer(a_col[1], s_force_to_motion(ia_s3[1])))
+                    .minus(Mat6::outer(a_col[2], s_force_to_motion(ia_s3[2])));
 
-                // Cache for pass 3. `tau` is the raw applied joint torque
-                // (damping + limits + qfrc_applied). Pass 3 recomputes u
-                // relative to the parent-driven acceleration a′ so it uses
-                // this raw τ, NOT `u_stage`.
-                w.ia_s[i] = ia_s;
-                w.d[i] = d_scalar;
-                w.tau[i] = tau_scalar;
+                // Cache for pass 3.
+                w.ia_s3[i] = ia_s3;
+                w.d3_inv[i] = d_inv;
+                w.tau3[i] = tau3;
 
-                // Propagate to parent via Xup pull-back.
                 let ia_parent_contrib = ia_full.pull_back(w.xup[i]);
                 w.ia[parent] = w.ia[parent].plus(ia_parent_contrib);
                 let pa_parent_contrib = w.xup[i].transpose_force(pa_full);
@@ -705,7 +967,9 @@ pub fn aba(
         JointKind::Fixed => {
             w.a[0] = SpatialMotion::ZERO;
         }
-        JointKind::Hinge { .. } => unreachable!("hinge cannot be root"),
+        JointKind::Hinge { .. } | JointKind::Slide { .. } | JointKind::Ball { .. } => {
+            unreachable!("only Free/Fixed joints are valid at the root — push_link rejects others")
+        }
     }
 
     for i in 1..n {
@@ -716,7 +980,7 @@ pub fn aba(
                 // No DOF; a[i] = Xup a[parent] + c[i] (c is zero).
                 w.a[i] = w.xup[i].motion(w.a[parent]);
             }
-            JointKind::Hinge { .. } => {
+            JointKind::Hinge { .. } | JointKind::Slide { .. } => {
                 let parent = link.parent.unwrap();
                 let a_parent_at_child = w.xup[i].motion(w.a[parent]);
                 let s = w.s[i];
@@ -731,6 +995,28 @@ pub fn aba(
                 w.a[i] = acc_prime + s * qdd;
                 qddot[tree.v_offset[i]] = qdd;
             }
+            JointKind::Ball { .. } => {
+                let parent = link.parent.unwrap();
+                let a_parent_at_child = w.xup[i].motion(w.a[parent]);
+                let s3 = w.s3[i];
+                let ia = w.ia[i];
+                let pa = w.pa[i];
+                let acc_prime = a_parent_at_child + w.c[i];
+                let inner = ia.times_motion(acc_prime) + pa;
+                let s_inner = Vec3::new(
+                    spatial_dot_ms(s3[0], inner),
+                    spatial_dot_ms(s3[1], inner),
+                    spatial_dot_ms(s3[2], inner),
+                );
+                let u = w.tau3[i] - s_inner;
+                let qdd3 = w.d3_inv[i] * u;
+                w.qddot_ball[i] = qdd3;
+                w.a[i] = acc_prime + s3[0] * qdd3.x + s3[1] * qdd3.y + s3[2] * qdd3.z;
+                let voff = tree.v_offset[i];
+                qddot[voff] = qdd3.x;
+                qddot[voff + 1] = qdd3.y;
+                qddot[voff + 2] = qdd3.z;
+            }
             JointKind::Free => unreachable!(),
         }
     }
@@ -738,30 +1024,95 @@ pub fn aba(
     qddot
 }
 
-/// Motion transform from parent body frame to link i's body frame at joint
-/// angle `q_angle` (ignored for `Fixed`). Assumes joint orientation offsets
-/// are identity in both parent and child (v0 convention).
-fn xup_for_link(link: &Link, q_angle: f32) -> Xform {
-    let (r_pj, _o_pj) = link.joint_offset_in_parent;
-    let (r_jc, _o_jc) = link.joint_offset_in_child;
-    let rot_c_from_p = match link.joint {
-        JointKind::Fixed => Mat3::IDENTITY,
-        JointKind::Hinge { axis, .. } => {
-            // Rotation from parent body coords to child body coords is
-            // Rot(axis, -q). Encode via the quaternion, then to matrix.
-            Quat::from_axis_angle(axis, -q_angle).to_mat3()
-        }
-        JointKind::Free => Mat3::IDENTITY,
-    };
+/// Motion transform from parent body frame to a `Fixed`-jointed child's body
+/// frame. Assumes joint orientation offsets are identity (v0 convention).
+fn xup_for_link(link: &Link, _unused: f32) -> Xform {
+    let (r_pj, _) = link.joint_offset_in_parent;
+    let (r_jc, _) = link.joint_offset_in_child;
+    let rot_c_from_p = Mat3::IDENTITY;
     let t_p_in_c = r_jc - rot_c_from_p * r_pj;
     Xform::new(rot_c_from_p, t_p_in_c)
 }
 
-/// Range-limit spring-damper torque. Zero inside `range` (or unconditionally
-/// if `range = None`). Outside, a one-sided spring pulls the joint back
-/// toward the limit; a damping term on qdot activates too (also one-sided so
-/// it doesn't resist motion INTO the allowed range).
-fn hinge_limit_torque(q: f32, qdot: f32, range: Option<(f32, f32)>, limit: HingeLimit) -> f32 {
+/// Xup for a hinge at angle `q_angle`. `rot_c_from_p = Rot(axis, -q)`.
+fn xup_for_link_hinge(link: &Link, axis: Vec3, q_angle: f32) -> Xform {
+    let (r_pj, _) = link.joint_offset_in_parent;
+    let (r_jc, _) = link.joint_offset_in_child;
+    let rot_c_from_p = Quat::from_axis_angle(axis, -q_angle).to_mat3();
+    let t_p_in_c = r_jc - rot_c_from_p * r_pj;
+    Xform::new(rot_c_from_p, t_p_in_c)
+}
+
+/// Xup for a slide at displacement `q_slide`. The child body frame stays
+/// identically oriented to the parent (slide never rotates), so
+/// `rot_c_from_p = I`. The translation part carries the extra `-axis*q`
+/// term for the displacement.
+fn xup_for_link_slide(link: &Link, axis: Vec3, q_slide: f32) -> Xform {
+    let (r_pj, _) = link.joint_offset_in_parent;
+    let (r_jc, _) = link.joint_offset_in_child;
+    let rot_c_from_p = Mat3::IDENTITY;
+    // parent origin in child coords = r_jc - r_pj - axis * q  (child ori =
+    // parent ori, so no rotation shift).
+    let t_p_in_c = r_jc - r_pj - axis * q_slide;
+    Xform::new(rot_c_from_p, t_p_in_c)
+}
+
+/// Xup for a ball at orientation `q_ball` (child relative to parent).
+/// `rot_c_from_p = R(q_ball)ᵀ`.
+fn xup_for_link_ball(link: &Link, q_ball: Quat) -> Xform {
+    let (r_pj, _) = link.joint_offset_in_parent;
+    let (r_jc, _) = link.joint_offset_in_child;
+    let rot_c_from_p = q_ball.conjugate().to_mat3();
+    let t_p_in_c = r_jc - rot_c_from_p * r_pj;
+    Xform::new(rot_c_from_p, t_p_in_c)
+}
+
+/// Pass-2 update shared by all single-DOF joints (hinge, slide). Consumes
+/// the cached `w.s[i]` from pass 1 plus the caller-computed scalar τ, and
+/// mutates `w.ia[parent]` / `w.pa[parent]` / caches for pass 3.
+fn single_dof_pass2(
+    w: &mut AbaWorkspace,
+    _tree: &Tree,
+    i: usize,
+    parent: usize,
+    armature: f32,
+    tau_scalar: f32,
+) {
+    let s = w.s[i];
+    let ia_s = w.ia[i].times_motion(s);
+    let d_scalar = spatial_dot_ms(s, ia_s) + armature;
+    // Featherstone's reduced-inertia form; see the derivation comment in
+    // docs/joints.md ("the u_stage form").
+    let ia_c = w.ia[i].times_motion(w.c[i]);
+    let p_stage = w.pa[i] + ia_c;
+    let s_dot_p_stage = spatial_dot_ms(s, p_stage);
+    let u_stage = tau_scalar - s_dot_p_stage;
+    let pa_full = p_stage + ia_s * (u_stage / d_scalar);
+
+    let outer = Mat6::outer(ia_s, s_force_to_motion(ia_s));
+    let ia_full = w.ia[i].minus(scale_mat6(outer, 1.0 / d_scalar));
+
+    w.ia_s[i] = ia_s;
+    w.d[i] = d_scalar;
+    w.tau[i] = tau_scalar;
+
+    let ia_parent_contrib = ia_full.pull_back(w.xup[i]);
+    w.ia[parent] = w.ia[parent].plus(ia_parent_contrib);
+    let pa_parent_contrib = w.xup[i].transpose_force(pa_full);
+    w.pa[parent] = w.pa[parent] + pa_parent_contrib;
+}
+
+/// Range-limit spring-damper generalized force for a single-DOF joint
+/// (hinge or slide). Zero inside `range` (or unconditionally if
+/// `range = None`). Outside, a one-sided spring pulls the joint back
+/// toward the limit; a damping term on `qdot` activates too (also one-
+/// sided so it doesn't resist motion INTO the allowed range).
+fn joint_limit_scalar_force(
+    q: f32,
+    qdot: f32,
+    range: Option<(f32, f32)>,
+    limit: JointLimit,
+) -> f32 {
     let (lo, hi) = match range {
         Some(pair) => pair,
         None => return 0.0,
@@ -874,13 +1225,31 @@ where
     for j in 0..s0.qdot.len() {
         tree.qdot[j] = s0.qdot[j] + (dv1[j] + 2.0 * dv2[j] + 2.0 * dv3[j] + dv4[j]) * (dt * sixth);
     }
-    // Renormalize free-root quaternion once at step end (mirrors tier 1).
+    // Renormalize free-root and ball-joint quaternions once at step end
+    // (mirrors tier 1; mid-RK4 renormalization would break the linearity the
+    // integrator relies on).
     if let JointKind::Free = tree.links[0].joint {
         let q = Quat::new(tree.q[3], tree.q[4], tree.q[5], tree.q[6]).renormalize();
         tree.q[3] = q.x;
         tree.q[4] = q.y;
         tree.q[5] = q.z;
         tree.q[6] = q.w;
+    }
+    for i in 0..tree.links.len() {
+        if let JointKind::Ball { .. } = tree.links[i].joint {
+            let off = tree.q_offset[i];
+            let q = Quat::new(
+                tree.q[off],
+                tree.q[off + 1],
+                tree.q[off + 2],
+                tree.q[off + 3],
+            )
+            .renormalize();
+            tree.q[off] = q.x;
+            tree.q[off + 1] = q.y;
+            tree.q[off + 2] = q.z;
+            tree.q[off + 3] = q.w;
+        }
     }
 }
 
@@ -923,10 +1292,29 @@ fn tree_deriv(tree: &Tree, qddot: &[f32]) -> (Vec<f32>, Vec<f32>) {
                 dq[qoff + 6] = dqori.w;
             }
             JointKind::Fixed => {}
-            JointKind::Hinge { .. } => {
+            JointKind::Hinge { .. } | JointKind::Slide { .. } => {
                 let qoff = tree.q_offset[i];
                 let voff = tree.v_offset[i];
                 dq[qoff] = tree.qdot[voff];
+            }
+            JointKind::Ball { .. } => {
+                let qoff = tree.q_offset[i];
+                let voff = tree.v_offset[i];
+                let q_ball = Quat::new(
+                    tree.q[qoff],
+                    tree.q[qoff + 1],
+                    tree.q[qoff + 2],
+                    tree.q[qoff + 3],
+                );
+                let omega_body =
+                    Vec3::new(tree.qdot[voff], tree.qdot[voff + 1], tree.qdot[voff + 2]);
+                // dq/dt = 0.5 * q * (omega_body, 0)  (same body-frame right-
+                // multiplication as the free root; see math::Quat::derivative).
+                let dqori = q_ball.derivative(omega_body);
+                dq[qoff] = dqori.x;
+                dq[qoff + 1] = dqori.y;
+                dq[qoff + 2] = dqori.z;
+                dq[qoff + 3] = dqori.w;
             }
         }
     }

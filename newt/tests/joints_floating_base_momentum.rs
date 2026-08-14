@@ -89,7 +89,9 @@ fn total_momentum(tree: &Tree) -> (Vec3, Vec3) {
             v_lin_world[0] = ori.rotate(vb);
         }
         JointKind::Fixed => {}
-        JointKind::Hinge { .. } => unreachable!(),
+        JointKind::Hinge { .. } | JointKind::Slide { .. } | JointKind::Ball { .. } => {
+            unreachable!("root joint must be Free or Fixed")
+        }
     }
     for i in 1..n {
         let link = &tree.links[i];
@@ -115,7 +117,13 @@ fn total_momentum(tree: &Tree) -> (Vec3, Vec3) {
                 v_lin_world[i] =
                     v_lin_world[parent] + w_world[parent].cross(child_pos - parent_pos);
             }
-            JointKind::Free => unreachable!(),
+            JointKind::Free | JointKind::Slide { .. } | JointKind::Ball { .. } => {
+                // Not exercised by this scenario (free-root + hinge chain
+                // only); keep exhaustive.
+                v_lin_world[i] = Vec3::ZERO;
+                w_body[i] = Vec3::ZERO;
+                w_world[i] = Vec3::ZERO;
+            }
         }
     }
     let mut p_total = Vec3::ZERO;

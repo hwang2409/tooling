@@ -1,11 +1,12 @@
-# newt joints (tier 3)
+# newt joints (tier 3 / v1 tier 1)
 
-kinematic trees, hinge joints (with limits, damping, armature), free-root
-6-DOF joint, and Featherstone's Articulated Body Algorithm (ABA) for O(n)
-forward dynamics. builds on tier 1's [core](core.md) and tier 2's
-[contacts](contacts.md). the two demos are **pendulum** (double-pendulum
-tip trace) and **chain** (5-link chain settling onto the ground plane —
-joints + contacts together).
+kinematic trees, hinge / slide / ball joints (with limits, damping,
+armature), free-root 6-DOF joint, and Featherstone's Articulated Body
+Algorithm (ABA) for O(n) forward dynamics. builds on tier 1's
+[core](core.md) and tier 2's [contacts](contacts.md). the demos are
+**pendulum** (double-pendulum tip trace), **chain** (5-link chain onto
+the ground plane), and **cartpole** (cart on a slide + pole on a hinge,
+PD servo on the slide).
 
 design of record:
 [superpowers/specs/2026-08-13-newt-physics-design.md](superpowers/specs/2026-08-13-newt-physics-design.md).
@@ -34,6 +35,8 @@ joint order. slot counts per joint kind:
 | `Free` (root only) | 7 | 6 | `(px, py, pz, qx, qy, qz, qw)` | `(ωx, ωy, ωz, vx, vy, vz)` body-frame at COM |
 | `Fixed` | 0 | 0 | — | — |
 | `Hinge` | 1 | 1 | angle (rad) | rate (rad/s) |
+| `Slide` | 1 | 1 | displacement (m) | rate (m/s) |
+| `Ball` | 4 | 3 | child→parent quaternion `(qx, qy, qz, qw)` (renormalized at step end) | body-frame ω `(ωx, ωy, ωz)` |
 
 `qfrc_applied` is a dense `nv`-vector of user-applied generalized forces
 (tier-4 actuators plug in here). zero-initialized on `push_link`.
@@ -65,6 +68,56 @@ JointKind::Hinge {
   the range) plus `−damping · qdot` (only when moving further outside).
   v0 uses this penalty model; v1 will add real constraints solved with
   the contact solver.
+
+## joint kind: `Slide`
+
+```text
+JointKind::Slide {
+    axis: Vec3,               // unit axis in the joint frame
+    range: Option<(f32, f32)>, // (low, high) displacement limits (m)
+    damping: f32,             // F_damp = -damping * qdot
+    armature: f32,            // reflected translational inertia (kg)
+    limit: JointLimit { stiffness, damping },
+}
+```
+
+Prismatic (1-DOF translation) joint. Displacement `q` in meters along the
+axis. The child body frame stays identically oriented to the parent
+(slide never rotates), so ABA's Xup transform for a slide is
+`(rot = I, translation = r_jc − r_pj − axis · q)` and the joint subspace
+is a pure translation `S = (0, axis)` at the child COM. Range limits use
+the same penalty spring-damper model as hinge; units follow the DOF
+(N per m of violation for slide vs. N·m per rad for hinge). Armature is
+a reflected translational inertia (kg) added on the ABA diagonal —
+motor-style, e.g. a rack-and-pinion. Actuator plumbing is unchanged:
+[`PdServo`](../src/actuator.rs) actuates hinges *and* slides through the
+same 1-DOF `qfrc_applied` slot.
+
+## joint kind: `Ball`
+
+```text
+JointKind::Ball {
+    damping: f32,   // isotropic angular damping (τ = -damping * ω_body)
+    armature: f32,  // rotor inertia added on each rotational axis (kg·m²)
+}
+```
+
+3-DOF spherical joint. Position is a 4-component child-relative-to-parent
+quaternion (`nq = 4`); velocity is a 3-component body-frame angular
+velocity (`nv = 3`). ABA's joint subspace is a 3-column S matrix
+`S_k = (e_k, r_jc × e_k)` for `k ∈ {0, 1, 2}` (analogous to the hinge
+column but for every body axis). The pass-2 articulated-inertia block
+`D = Sᵀ IA S + armature · I₃` is a 3×3 matrix; the ABA `IA − U D⁻¹ Uᵀ`
+rank-3 update takes the place of the hinge's scalar `1/d`. The
+quaternion is renormalized at the end of each RK4 step (same as the
+free root — mid-stage renorm breaks the linearity RK4 relies on).
+
+**Ball limits are deferred.** A physically correct 3-DOF orientation
+limit (cone, swing/twist) needs the real constraint solver landing in
+the next ticket (v1 tier 2 — PGS over solref/solimp). The
+[`crate::model`] loader rejects a `range` field on a ball joint with an
+error pointing at that deferral, so a user who tries to add limits gets
+a clear message instead of a silent no-op.
 
 ## ABA in body-frame coordinates
 
@@ -146,6 +199,16 @@ works out of the box.
 | `tests/joints_floating_base_momentum.rs::floating_base_conserves_linear_and_angular_momentum` | free-root box + swinging arm, no gravity, no wrenches. `Σ p` and `Σ L` about world origin drift < 5e-4 / 5e-3 over 2 s. **primary anchor for tree-pass math** — a wrong Xup / wrong-force-pull-back bug would silently dump momentum into the "wall" with a fixed root but not with a free root. |
 | `tests/joints_floating_base_momentum.rs::free_root_alone_gravity_preserves_body_frame_free_fall` | single free-root link; body-frame linear accel = `ori⁻¹ · gravity_world`. exercises the free-root 6x6 solve independent of any joint chain. |
 | `tests/joints_golden.rs::joints_golden_trajectory_is_byte_identical` | 3-link chain + floating-base scene, `(q, qdot)` serialized at steps 0/100/1000, byte-compared against `tests/goldens/joints_chain_and_floating.bin`. |
+| `tests/joints_slide.rs::slide_free_fall_matches_closed_form_gravity_acceleration` | mass on a vertical frictionless slide under gravity vs closed-form `q0 + v0 t − ½ g t²`; non-zero initial displacement + rate. |
+| `tests/joints_slide.rs::slide_damped_free_fall_approaches_terminal_velocity` | damped slide `v(t) = v_∞ (1 − e^{-(c/m) t})` matches at 1-s intervals through 10 s (5 τ). |
+| `tests/joints_slide.rs::slide_range_limit_confines_release_from_outside` | slide analog of the hinge range-limit test — released above the upper limit, settles inside, no violation growth over 6 s. |
+| `tests/joints_slide.rs::slide_armature_scales_static_acceleration_by_hand_ratio` | slide armature enters ABA's diagonal as `Sᵀ IA S + armature`; applied force α ratio matches `1 / (1 + A/m)`. |
+| `tests/joints_slide.rs::slide_damping_decelerates_a_coasting_slider` | zero-gravity coast: `v(t) = v0 e^{-(c/m) t}` matches at 2 s. |
+| `tests/joints_cartpole.rs::cartpole_matches_hand_lagrangian_over_two_seconds` | THE primary slide+hinge coupling anchor. Cart on slide + pole on hinge vs the hand-derived Lagrangian EOM (independent RK4 twin, scalar math only). 2 s window, 5 ms dt, drift < 5e-3 in both `x` and `θ`. |
+| `tests/joints_cartpole.rs::cartpole_energy_conservation_no_damping` | mechanical energy drift < 5e-3 over 2 s — catches Coriolis / pA-update sign errors the twin match could hide if both had the same latent bug. |
+| `tests/joints_ball.rs::spherical_pendulum_conserves_energy_and_vertical_angular_momentum` | ball joint under gravity: total energy AND `L_z` about the pivot conserved (gravity torque about the pivot has zero z-component). Non-planar ICs → genuinely 3D motion. |
+| `tests/joints_ball.rs::ball_joint_with_pivot_at_com_reproduces_torque_free_free_body` | ball joint with anchor at child COM, no gravity → pure torque-free rotation. Compared against tier-1 `Body` with identical inertia + ω. |
+| `tests/joints_mixed_golden.rs::joints_mixed_golden_is_byte_identical` | Free + Hinge + Slide + Ball in one tree, symmetry broken on every joint; `(q, qdot)` serialized at 0/100/500/1000 steps, byte-compared against `tests/goldens/joints_mixed.bin`. Cross-platform pin for the whole v1 tier-1 joint set. |
 
 ### symmetry-breaking notes (per the tier-2 lesson)
 
@@ -191,19 +254,28 @@ cargo run --release --example chain -- --frames 6000 --out /tmp/chain.ppm --size
 sips -s format png /tmp/chain.ppm --out /tmp/chain.png
 ```
 
+cart-pole (slide + hinge; PD servo on the slide holds the cart while the
+pole swings):
+
+```sh
+cargo run --release --example cartpole -- --frames 1200 --out /tmp/cartpole.ppm --size 640x360
+sips -s format png /tmp/cartpole.ppm --out /tmp/cartpole.png
+```
+
 both write PPMs via chimy2's `Framebuffer`; convert to PNG on macOS with
 `sips`, or open the PPM directly in most image viewers.
 
-## regenerating the golden (macOS-only)
+## regenerating the goldens (macOS-only)
 
 ```sh
-cargo test --test joints_golden regenerate_joints_golden -- --ignored --nocapture
+cargo test --test joints_golden       regenerate_joints_golden       -- --ignored --nocapture
+cargo test --test joints_mixed_golden regenerate_mixed_joints_golden -- --ignored --nocapture
 ```
 
-the ignored test guards on `target_os = "macos"` + `target_arch =
-"aarch64"` and panics on any other host so accidental `--ignored` runs
+both ignored tests guard on `target_os = "macos"` + `target_arch =
+"aarch64"` and panic on any other host so accidental `--ignored` runs
 cannot silently swap the reference. CI on ubuntu-latest re-runs the
-normal test; a bytes mismatch means the scalar policy is being violated
+normal tests; a bytes mismatch means the scalar policy is being violated
 somewhere (probably a new libm call in the engine — the
 `libm-free` CI gate catches this too).
 

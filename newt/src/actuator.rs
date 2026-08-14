@@ -2,10 +2,13 @@
 //!
 //! Two flavors of controlled input in v0:
 //!
-//! - [`PdServo`] — PD position servo for a single hinge joint. Computes
-//!   `τ = kp·(target − q) − kd·qdot`, clamped to a symmetric force bound.
-//!   The `kd` gain is derived at construction from a damping ratio and a
-//!   caller-supplied reflected inertia estimate — see [`PdServo::from_dampratio`].
+//! - [`PdServo`] — PD position servo for a single 1-DOF joint (hinge or,
+//!   from v1 tier 1, slide). Computes `τ = kp·(target − q) − kd·qdot`,
+//!   clamped to a symmetric force bound. For a hinge `τ` is a torque
+//!   (N·m) and `q` is an angle (rad); for a slide `τ` is a force (N) and
+//!   `q` is a displacement (m). Same 1-DOF plumbing either way. The `kd`
+//!   gain is derived at construction from a damping ratio and a caller-
+//!   supplied reflected inertia estimate — see [`PdServo::from_dampratio`].
 //! - Direct joint torques — go through the existing `Tree::qfrc_applied`
 //!   slot. Convenience helpers on [`Tree`] (`set_joint_torque_clamped`,
 //!   `add_joint_torque`) write into it with an optional symmetric clamp.
@@ -40,9 +43,9 @@
 //! calibrating in the field can measure the effective inertia and pass it
 //! in directly.
 
-/// PD position servo for a hinge joint.
+/// PD position servo for a 1-DOF joint (hinge or slide).
 ///
-/// Torque at a joint state `(q, qdot)` is
+/// Generalized force at a joint state `(q, qdot)` is
 ///
 /// ```text
 /// τ_raw = kp·(target − q) − kd·qdot
@@ -50,10 +53,13 @@
 /// ```
 ///
 /// with `force_range <= 0` interpreted as "no clamp". `target` is settable
-/// per step through [`crate::tree::Tree::set_actuator_target`].
+/// per step through [`crate::tree::Tree::set_actuator_target`]. Units follow
+/// the joint kind (hinge: rad / rad·s / N·m; slide: m / m·s / N) — the
+/// servo does not need to know which; `qfrc_applied` is the same 1-DOF
+/// generalized-force slot either way.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PdServo {
-    /// Link index in the containing tree. Must reference a hinge joint.
+    /// Link index in the containing tree. Must reference a hinge or slide.
     pub link_idx: usize,
     /// Position gain (N·m per rad of error).
     pub kp: f32,
