@@ -86,17 +86,22 @@
     </body>
   </worldbody>
 
+  <!--
+    These kv values are MuJoCo's compiled dampratio=1 values. Newt's MJCF
+    loader does not have MuJoCo's articulated inertia at actuator load time,
+    so explicit kv keeps the compiled controller gains identical.
+  -->
   <actuator>
-    <position name="left_hip_roll_motor" joint="left_hip_roll" kp="70" dampratio="1.0" ctrlrange="-0.7 0.7" forcerange="-70 70"/>
-    <position name="left_hip_motor" joint="left_hip" kp="70" dampratio="1.0" ctrlrange="-0.9 0.9" forcerange="-70 70"/>
-    <position name="left_knee_motor" joint="left_knee" kp="80" dampratio="1.0" ctrlrange="-0.05 1.4" forcerange="-80 80"/>
-    <position name="left_ankle_roll_motor" joint="left_ankle_roll" kp="45" dampratio="1.0" ctrlrange="-0.5 0.5" forcerange="-45 45"/>
-    <position name="left_ankle_motor" joint="left_ankle" kp="45" dampratio="1.0" ctrlrange="-0.7 0.7" forcerange="-45 45"/>
-    <position name="right_hip_roll_motor" joint="right_hip_roll" kp="70" dampratio="1.0" ctrlrange="-0.7 0.7" forcerange="-70 70"/>
-    <position name="right_hip_motor" joint="right_hip" kp="70" dampratio="1.0" ctrlrange="-0.9 0.9" forcerange="-70 70"/>
-    <position name="right_knee_motor" joint="right_knee" kp="80" dampratio="1.0" ctrlrange="-0.05 1.4" forcerange="-80 80"/>
-    <position name="right_ankle_roll_motor" joint="right_ankle_roll" kp="45" dampratio="1.0" ctrlrange="-0.5 0.5" forcerange="-45 45"/>
-    <position name="right_ankle_motor" joint="right_ankle" kp="45" dampratio="1.0" ctrlrange="-0.7 0.7" forcerange="-45 45"/>
+    <position name="left_hip_roll_motor" joint="left_hip_roll" kp="70" kv="20.300636017982495" ctrlrange="-0.7 0.7" forcerange="-70 70"/>
+    <position name="left_hip_motor" joint="left_hip" kp="70" kv="20.161543163523177" ctrlrange="-0.9 0.9" forcerange="-70 70"/>
+    <position name="left_knee_motor" joint="left_knee" kp="80" kv="9.699400068906062" ctrlrange="-0.05 1.4" forcerange="-80 80"/>
+    <position name="left_ankle_roll_motor" joint="left_ankle_roll" kp="45" kv="2.76434440690736" ctrlrange="-0.5 0.5" forcerange="-45 45"/>
+    <position name="left_ankle_motor" joint="left_ankle" kp="45" kv="2.4317894645713047" ctrlrange="-0.7 0.7" forcerange="-45 45"/>
+    <position name="right_hip_roll_motor" joint="right_hip_roll" kp="70" kv="20.300636017982495" ctrlrange="-0.7 0.7" forcerange="-70 70"/>
+    <position name="right_hip_motor" joint="right_hip" kp="70" kv="20.161543163523177" ctrlrange="-0.9 0.9" forcerange="-70 70"/>
+    <position name="right_knee_motor" joint="right_knee" kp="80" kv="9.699400068906062" ctrlrange="-0.05 1.4" forcerange="-80 80"/>
+    <position name="right_ankle_roll_motor" joint="right_ankle_roll" kp="45" kv="2.76434440690736" ctrlrange="-0.5 0.5" forcerange="-45 45"/>
+    <position name="right_ankle_motor" joint="right_ankle" kp="45" kv="2.4317894645713047" ctrlrange="-0.7 0.7" forcerange="-45 45"/>
   </actuator>
 
   <sensor>

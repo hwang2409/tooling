@@ -232,16 +232,14 @@ pub struct GaitWindowSample {
 }
 
 pub fn gait_window_sample(scene: &Scene) -> GaitWindowSample {
-    let left_sensor = scene.sensors_by_name["left_foot_touch"];
-    let right_sensor = scene.sensors_by_name["right_foot_touch"];
     GaitWindowSample {
         root_x: scene.world.trees[0].q[0],
         root_z: scene.world.trees[0].q[2],
         forward_speed: scene.world.trees[0].qdot[3],
         left_clearance: foot_clearance(scene, "left"),
         right_clearance: foot_clearance(scene, "right"),
-        left_contact: sensor_contact(scene, left_sensor, "left"),
-        right_contact: sensor_contact(scene, right_sensor, "right"),
+        left_contact: foot_in_contact(scene, "left"),
+        right_contact: foot_in_contact(scene, "right"),
     }
 }
 
@@ -249,9 +247,9 @@ pub fn gait_window_sample(scene: &Scene) -> GaitWindowSample {
 pub struct JointWalkController {
     config: GaitConfig,
     phase_time: f32,
+    last_timing_time: f32,
     legs: [LegState; 2],
     contacts: ContactEvents,
-    touch_sensors: [usize; 2],
     initial_root_x: f32,
 }
 
@@ -305,12 +303,11 @@ impl JointWalkController {
     const HIGH_SPEED_BRAKE_ANKLE: f32 = 0.6429862135;
 
     fn new(scene: &Scene, config: GaitConfig) -> Self {
-        let left = scene.sensors_by_name["left_foot_touch"];
-        let right = scene.sensors_by_name["right_foot_touch"];
         let initial_root_x = scene.world.trees[0].q[0];
         Self {
             config,
             phase_time: 0.0,
+            last_timing_time: 0.0,
             legs: [LegState {
                 contact: true,
                 ..LegState::default()
@@ -319,14 +316,13 @@ impl JointWalkController {
                 left: true,
                 right: true,
             },
-            touch_sensors: [left, right],
             initial_root_x,
         }
     }
 
     fn observe_contacts(&mut self, scene: &Scene) {
-        let left = sensor_contact(scene, self.touch_sensors[0], "left");
-        let right = sensor_contact(scene, self.touch_sensors[1], "right");
+        let left = foot_in_contact(scene, "left");
+        let right = foot_in_contact(scene, "right");
         self.contacts = ContactEvents { left, right };
         self.legs[0].contact = left;
         self.legs[1].contact = right;
@@ -369,7 +365,9 @@ impl JointWalkController {
         } else {
             1.0
         };
-        self.phase_time += DT * phase_rate;
+        let elapsed = (time - self.last_timing_time).max(0.0);
+        self.last_timing_time = time;
+        self.phase_time += elapsed * phase_rate;
         let _ = (left, right, tree, time);
     }
 
@@ -508,11 +506,21 @@ impl JointWalkController {
         };
         let contact = [self.contacts.left, self.contacts.right][side];
         let other_contact = [self.contacts.left, self.contacts.right][1 - side];
+        let timing_gain = clamp(Self::CONTACT_TIMING_GAIN, 0.0, 1.0);
+        if timing_gain <= 0.0 {
+            return planned;
+        }
         if planned.0 && contact && !other_contact && planned.1 < Self::CONTACT_SWING_HOLD_PROGRESS {
-            return (false, 1.0);
+            if timing_gain >= 0.95 {
+                return (false, 1.0);
+            }
+            return (true, planned.1 * (1.0 - timing_gain));
         }
         if !planned.0 && !contact && planned.1 < Self::CONTACT_STANCE_EXTENSION_PROGRESS {
-            return (true, Self::CONTACT_LANDING_PROGRESS);
+            if timing_gain >= 0.95 {
+                return (true, Self::CONTACT_LANDING_PROGRESS);
+            }
+            return (false, planned.1 * (1.0 - timing_gain));
         }
         let _ = time;
         planned
@@ -604,6 +612,48 @@ pub fn run_walk_from_path(path: &Path, config: GaitConfig) -> WalkResult {
     run_walk_observed_from_path(path, config, |_, _| {})
 }
 
+/// Return the commanded ten-joint targets before each physics step.
+///
+/// The trace follows the source loop: step zero sees time zero, then each
+/// later sample sees the state after the prior physics step.
+pub fn controller_target_trace(config: GaitConfig, steps: usize) -> Vec<[f32; 10]> {
+    let mut scene = load_mjcf_path(Path::new(MODEL_PATH)).expect("biped-walk MJCF must load");
+    scene.world.trees[0].set_free_root_pose(
+        Vec3::new(0.0, 0.0, config.newt_root_height()),
+        Quat::IDENTITY,
+    );
+    scene.world.trees[0].qdot.fill(0.0);
+    let initial_targets = [
+        0.0,
+        -0.4389568694,
+        0.06,
+        0.0,
+        config.ankle_target,
+        0.0,
+        0.4492281700,
+        0.1390241230,
+        0.0,
+        0.1388300015,
+    ];
+    set_hinge_pose(&mut scene, initial_targets);
+    scene.world.evaluate_sensors(&[]);
+    let mut controller = JointWalkController::new(&scene, config);
+    controller.observe_contacts(&scene);
+    let mut trace = Vec::with_capacity(steps);
+    for step in 0..steps {
+        let time = step as f32 * DT;
+        controller.apply_balance(&mut scene, time);
+        let tree_snapshot = scene.world.trees[0].clone();
+        controller.before_step(&tree_snapshot, time);
+        let targets = controller.targets(&tree_snapshot, time);
+        trace.push(targets);
+        controller.apply_targets(&mut scene, targets);
+        scene.world.step();
+        controller.observe_contacts(&scene);
+    }
+    trace
+}
+
 pub fn run_walk_observed<F>(config: GaitConfig, observer: F) -> WalkResult
 where
     F: FnMut(usize, &Scene),
@@ -634,6 +684,7 @@ where
     set_hinge_pose(&mut scene, initial_targets);
     scene.world.evaluate_sensors(&[]);
     let mut controller = JointWalkController::new(&scene, config);
+    controller.observe_contacts(&scene);
     controller.initial_root_x = scene.world.trees[0].q[0];
     let initial_contacts = controller.contacts;
     let mut metrics = MetricsAccumulator::new(controller.initial_root_x, initial_contacts);
@@ -750,13 +801,10 @@ fn foot_clearance(scene: &Scene, side: &str) -> f32 {
     0.0f32.max(heel.min(toe))
 }
 
-fn sensor_contact(scene: &Scene, sensor: usize, side: &str) -> bool {
-    scene
-        .world
-        .sensor(sensor)
-        .and_then(|data| data.first())
-        .map(|force| *force > 0.0)
-        .unwrap_or_else(|| foot_clearance(scene, side) <= FOOT_CONTACT_HEIGHT)
+fn foot_in_contact(scene: &Scene, side: &str) -> bool {
+    let heel = scene.site_pose(&format!("{side}_heel_site")).unwrap().0.z;
+    let toe = scene.site_pose(&format!("{side}_toe_site")).unwrap().0.z;
+    heel <= FOOT_CONTACT_HEIGHT || toe <= FOOT_CONTACT_HEIGHT
 }
 
 fn root_up(tree: &Tree) -> Vec3 {
