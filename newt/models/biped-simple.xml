@@ -1,0 +1,134 @@
+<!-- biped-simple.xml — v1 finale fixture.
+
+  Simplified version of the reference biped model at
+  ~/me/fun/biped/biped/models/biped.xml (10 hinge joints, freejoint
+  torso, capsule limbs, box feet, position actuators). Simplifications
+  applied to stay within newt's v1 MJCF subset (see docs/mjcf.md):
+
+    * torso collapsed from three geoms (chest + pelvis + head) into
+      one box at the body origin, so the auto-inertia helper handles
+      it without a parallel-axis walk
+    * body origins re-anchored to their geom centers so every leg
+      body carries exactly one geom at pos=[0 0 0] with identity
+      orientation (autoinertia constraint)
+    * <asset> / <material> / rendering-only bits stripped
+    * kp bumped from real-biped defaults so the standing anchor
+      holds under our contact model + neutral targets
+
+  The load-and-stand smoke lives in tests/mjcf_load.rs
+  (`biped_simple_stands_for_2000_steps`).
+-->
+<mujoco model="biped-simple">
+  <compiler angle="radian"/>
+  <option timestep="0.005" gravity="0 0 -9.81"/>
+
+  <default>
+    <joint damping="2.0" armature="0.02"/>
+    <geom friction="1.2" solref="0.02 1" solimp="0.9 0.95 0.001"/>
+  </default>
+
+  <worldbody>
+    <geom name="ground" type="plane" friction="1.2"/>
+
+    <body name="torso" pos="0 0 1.30">
+      <freejoint name="torso_root"/>
+      <geom name="torso_geom" type="box" size="0.14 0.13 0.35" mass="9.7"/>
+
+      <!-- ============ left leg ============ -->
+      <body name="left_hip_roll_link" pos="0 0.18 -0.35">
+        <inertial pos="0 0 0" mass="0.05" diaginertia="0.001 0.001 0.001"/>
+        <joint name="left_hip_roll" type="hinge" axis="1 0 0"
+               range="-0.7 0.7" damping="8.0" armature="0.05"/>
+
+        <body name="left_thigh" pos="0 0 -0.21">
+          <joint name="left_hip" type="hinge" axis="0 1 0" pos="0 0 0.21"
+                 range="-1.0 1.0"/>
+          <geom name="left_thigh_geom" type="capsule" size="0.045 0.21" mass="2.2"/>
+
+          <body name="left_shin" pos="0 0 -0.42">
+            <joint name="left_knee" type="hinge" axis="0 1 0" pos="0 0 0.21"
+                   range="-0.1 1.7"/>
+            <geom name="left_shin_geom" type="capsule" size="0.038 0.21" mass="1.6"/>
+
+            <body name="left_ankle_roll_link" pos="0 0 -0.21">
+              <inertial pos="0 0 0" mass="0.03" diaginertia="0.0005 0.0005 0.0005"/>
+              <joint name="left_ankle_roll" type="hinge" axis="1 0 0"
+                     range="-0.5 0.5" damping="5.0" armature="0.04"/>
+
+              <body name="left_foot" pos="0.075 0 -0.035">
+                <joint name="left_ankle" type="hinge" axis="0 1 0"
+                       pos="-0.075 0 0.035" range="-0.8 0.8"/>
+                <geom name="left_foot_geom" type="box"
+                      size="0.17 0.07 0.035" mass="0.8"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+
+      <!-- ============ right leg ============ -->
+      <body name="right_hip_roll_link" pos="0 -0.18 -0.35">
+        <inertial pos="0 0 0" mass="0.05" diaginertia="0.001 0.001 0.001"/>
+        <joint name="right_hip_roll" type="hinge" axis="1 0 0"
+               range="-0.7 0.7" damping="8.0" armature="0.05"/>
+
+        <body name="right_thigh" pos="0 0 -0.21">
+          <joint name="right_hip" type="hinge" axis="0 1 0" pos="0 0 0.21"
+                 range="-1.0 1.0"/>
+          <geom name="right_thigh_geom" type="capsule" size="0.045 0.21" mass="2.2"/>
+
+          <body name="right_shin" pos="0 0 -0.42">
+            <joint name="right_knee" type="hinge" axis="0 1 0" pos="0 0 0.21"
+                   range="-0.1 1.7"/>
+            <geom name="right_shin_geom" type="capsule" size="0.038 0.21" mass="1.6"/>
+
+            <body name="right_ankle_roll_link" pos="0 0 -0.21">
+              <inertial pos="0 0 0" mass="0.03" diaginertia="0.0005 0.0005 0.0005"/>
+              <joint name="right_ankle_roll" type="hinge" axis="1 0 0"
+                     range="-0.5 0.5" damping="5.0" armature="0.04"/>
+
+              <body name="right_foot" pos="0.075 0 -0.035">
+                <joint name="right_ankle" type="hinge" axis="0 1 0"
+                       pos="-0.075 0 0.035" range="-0.8 0.8"/>
+                <geom name="right_foot_geom" type="box"
+                      size="0.17 0.07 0.035" mass="0.8"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <!-- Actuator gains are stronger than the reference biped's (kp 45–80)
+       because the simplified 1-geom-per-body layout increases effective
+       link inertia at each joint, and because the ticket asks the
+       biped to hold its neutral pose under gravity for the smoke.
+       Higher kp × 5 ms timestep also flirts with integrator stiffness,
+       so we cap at the values below and rely on the passive damping
+       (damping="2" from the <default> block, plus per-joint bumps on
+       the roll links) to soak the transient. -->
+  <actuator>
+    <position name="left_hip_roll_motor"   joint="left_hip_roll"
+              kp="500" kv="30" forcerange="-400 400"/>
+    <position name="left_hip_motor"        joint="left_hip"
+              kp="500" kv="30" forcerange="-400 400"/>
+    <position name="left_knee_motor"       joint="left_knee"
+              kp="500" kv="30" forcerange="-400 400"/>
+    <position name="left_ankle_roll_motor" joint="left_ankle_roll"
+              kp="300" kv="25" forcerange="-300 300"/>
+    <position name="left_ankle_motor"      joint="left_ankle"
+              kp="300" kv="25" forcerange="-300 300"/>
+
+    <position name="right_hip_roll_motor"   joint="right_hip_roll"
+              kp="500" kv="30" forcerange="-400 400"/>
+    <position name="right_hip_motor"        joint="right_hip"
+              kp="500" kv="30" forcerange="-400 400"/>
+    <position name="right_knee_motor"       joint="right_knee"
+              kp="500" kv="30" forcerange="-400 400"/>
+    <position name="right_ankle_roll_motor" joint="right_ankle_roll"
+              kp="300" kv="25" forcerange="-300 300"/>
+    <position name="right_ankle_motor"      joint="right_ankle"
+              kp="300" kv="25" forcerange="-300 300"/>
+  </actuator>
+</mujoco>

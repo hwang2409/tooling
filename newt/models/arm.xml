@@ -1,0 +1,68 @@
+<!-- MJCF mirror of models/arm.json.
+
+  Byte-identical trajectory anchor against arm.json — see
+  `tests/mjcf_anchor.rs`. The kp/dampratio/reflected_inertia trio in
+  the JSON's `dampratio` form is encoded here with an explicit `kv`
+  computed at fixture-authoring time by `2 * dampratio * sqrt(kp *
+  reflected_inertia)` — this is what the JSON loader stores in the
+  PdServo.kd field. Values:
+
+      shoulder_servo: kp=200, kd=2·1·√(200·0.25) = 2·√50   ≈ 14.14213562373095
+      elbow_servo:    kp=150, kd=2·1·√(150·0.20) = 2·√30   ≈ 10.95445115010332
+      wrist_servo:    kp=100, kd=2·1·√(100·0.15) = 2·√15   ≈ 7.745966692414834
+
+  Byte-identity is preserved because both loaders end up calling
+  `PdServo::new(link, kp, kd, clamp, target)` with the same numbers.
+  See `tests/mjcf_anchor.rs`. If you touch these numbers or the JSON,
+  keep them in lockstep.
+-->
+<mujoco model="arm">
+  <compiler angle="radian"/>
+  <option timestep="0.005" gravity="0 0 -9.81"/>
+
+  <worldbody>
+    <body name="anchor" pos="0 0 1.6">
+      <inertial pos="0 0 0" mass="1.0" diaginertia="1.0 1.0 1.0"/>
+
+      <body name="shoulder" pos="0 0 -0.25">
+        <joint name="shoulder_hinge" type="hinge" axis="1 0 0" pos="0 0 0.25"/>
+        <inertial pos="0 0 0" mass="1.0" diaginertia="0.020833334 0.020833334 1e-6"/>
+
+        <body name="elbow" pos="0 0 -0.5">
+          <joint name="elbow_hinge" type="hinge" axis="1 0 0" pos="0 0 0.25"/>
+          <inertial pos="0 0 0" mass="0.8" diaginertia="0.016666668 0.016666668 1e-6"/>
+
+          <body name="wrist" pos="0 0 -0.5">
+            <joint name="wrist_hinge" type="hinge" axis="1 0 0" pos="0 0 0.25"/>
+            <inertial pos="0 0 0" mass="0.6" diaginertia="0.012500001 0.012500001 1e-6"/>
+            <site name="tip" pos="0 0 -0.25"/>
+            <site name="tip_imu" pos="0 0 -0.25"/>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <position name="shoulder_servo" joint="shoulder_hinge"
+              kp="200" kv="14.14213562373095" forcerange="-60 60"/>
+    <position name="elbow_servo" joint="elbow_hinge"
+              kp="150" kv="10.95445115010332" forcerange="-40 40"/>
+    <position name="wrist_servo" joint="wrist_hinge"
+              kp="100" kv="7.745966692414834" forcerange="-30 30"/>
+  </actuator>
+
+  <sensor>
+    <jointpos name="shoulder_q"     joint="shoulder_hinge"/>
+    <jointpos name="elbow_q"        joint="elbow_hinge"/>
+    <jointpos name="wrist_q"        joint="wrist_hinge"/>
+    <jointvel name="shoulder_qdot"  joint="shoulder_hinge"/>
+    <jointvel name="elbow_qdot"     joint="elbow_hinge"/>
+    <jointvel name="wrist_qdot"     joint="wrist_hinge"/>
+    <framepos      name="tip_pos"       site="tip"/>
+    <gyro          name="tip_imu_gyro"  site="tip_imu"/>
+    <accelerometer name="tip_imu_accel" site="tip_imu"/>
+    <force  name="elbow_force"  body="elbow"/>
+    <torque name="elbow_torque" body="elbow"/>
+  </sensor>
+</mujoco>
