@@ -479,6 +479,31 @@ impl Tree {
     pub fn link_pose(&self, i: usize) -> (Vec3, Quat) {
         forward_kinematics(self)[i]
     }
+
+    /// Dense joint-space mass matrix `M(q)` (row-major, `nv × nv`). See
+    /// [`crate::dynamics::mass_matrix`] for the algorithm and layout.
+    pub fn mass_matrix(&self) -> Vec<f32> {
+        crate::dynamics::mass_matrix(self)
+    }
+
+    /// Coriolis + centrifugal + gravity torques `h(q, qdot)` — RNE with
+    /// `qddot = 0` and no external wrenches. See
+    /// [`crate::dynamics::bias_forces`].
+    pub fn bias_forces(&self, gravity: Vec3) -> Vec<f32> {
+        crate::dynamics::bias_forces(self, gravity)
+    }
+
+    /// Inverse dynamics: generalized force required to produce `qddot`
+    /// under `gravity` and `external_wrenches`. See
+    /// [`crate::dynamics::inverse_dynamics`].
+    pub fn inverse_dynamics(
+        &self,
+        qddot: &[f32],
+        gravity: Vec3,
+        external_wrenches: &ExternalWrenches,
+    ) -> Vec<f32> {
+        crate::dynamics::inverse_dynamics(self, qddot, gravity, external_wrenches)
+    }
 }
 
 impl Default for Tree {
@@ -1029,7 +1054,7 @@ pub fn aba(
 
 /// Motion transform from parent body frame to a `Fixed`-jointed child's body
 /// frame. Assumes joint orientation offsets are identity (v0 convention).
-fn xup_for_link(link: &Link, _unused: f32) -> Xform {
+pub(crate) fn xup_for_link(link: &Link, _unused: f32) -> Xform {
     let (r_pj, _) = link.joint_offset_in_parent;
     let (r_jc, _) = link.joint_offset_in_child;
     let rot_c_from_p = Mat3::IDENTITY;
@@ -1038,7 +1063,7 @@ fn xup_for_link(link: &Link, _unused: f32) -> Xform {
 }
 
 /// Xup for a hinge at angle `q_angle`. `rot_c_from_p = Rot(axis, -q)`.
-fn xup_for_link_hinge(link: &Link, axis: Vec3, q_angle: f32) -> Xform {
+pub(crate) fn xup_for_link_hinge(link: &Link, axis: Vec3, q_angle: f32) -> Xform {
     let (r_pj, _) = link.joint_offset_in_parent;
     let (r_jc, _) = link.joint_offset_in_child;
     let rot_c_from_p = Quat::from_axis_angle(axis, -q_angle).to_mat3();
@@ -1050,7 +1075,7 @@ fn xup_for_link_hinge(link: &Link, axis: Vec3, q_angle: f32) -> Xform {
 /// identically oriented to the parent (slide never rotates), so
 /// `rot_c_from_p = I`. The translation part carries the extra `-axis*q`
 /// term for the displacement.
-fn xup_for_link_slide(link: &Link, axis: Vec3, q_slide: f32) -> Xform {
+pub(crate) fn xup_for_link_slide(link: &Link, axis: Vec3, q_slide: f32) -> Xform {
     let (r_pj, _) = link.joint_offset_in_parent;
     let (r_jc, _) = link.joint_offset_in_child;
     let rot_c_from_p = Mat3::IDENTITY;
@@ -1062,7 +1087,7 @@ fn xup_for_link_slide(link: &Link, axis: Vec3, q_slide: f32) -> Xform {
 
 /// Xup for a ball at orientation `q_ball` (child relative to parent).
 /// `rot_c_from_p = R(q_ball)ᵀ`.
-fn xup_for_link_ball(link: &Link, q_ball: Quat) -> Xform {
+pub(crate) fn xup_for_link_ball(link: &Link, q_ball: Quat) -> Xform {
     let (r_pj, _) = link.joint_offset_in_parent;
     let (r_jc, _) = link.joint_offset_in_child;
     let rot_c_from_p = q_ball.conjugate().to_mat3();
@@ -1152,7 +1177,7 @@ fn joint_limit_scalar_force(
 /// Scalar dot of a spatial motion with a spatial force: `ω·τ + v·F`. Wrapper
 /// around [`crate::spatial::spatial_dot`] for readability inside ABA.
 #[inline]
-fn spatial_dot_ms(m: SpatialMotion, f: SpatialForce) -> f32 {
+pub(crate) fn spatial_dot_ms(m: SpatialMotion, f: SpatialForce) -> f32 {
     m.angular.dot(f.torque) + m.linear.dot(f.linear)
 }
 
@@ -1163,7 +1188,7 @@ fn spatial_dot_ms(m: SpatialMotion, f: SpatialForce) -> f32 {
 /// "column". Using [`Mat6::outer`] directly with two `SpatialForce`s would
 /// require another wrapper.
 #[inline]
-fn s_force_to_motion(f: SpatialForce) -> SpatialMotion {
+pub(crate) fn s_force_to_motion(f: SpatialForce) -> SpatialMotion {
     SpatialMotion::new(f.torque, f.linear)
 }
 
