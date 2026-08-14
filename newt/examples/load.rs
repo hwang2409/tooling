@@ -33,6 +33,7 @@ struct Args {
     frames: usize,
     out: PathBuf,
     size: (usize, usize),
+    balance: bool,
 }
 
 fn parse_args() -> Args {
@@ -41,6 +42,7 @@ fn parse_args() -> Args {
         frames: 600,
         out: PathBuf::from("newt-load.ppm"),
         size: (640, 360),
+        balance: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -53,6 +55,11 @@ fn parse_args() -> Args {
                 let (w, h) = s.split_once('x').expect("--size WxH");
                 a.size = (w.parse().unwrap(), h.parse().unwrap());
             }
+            // Apply the source biped's torso balance controller each
+            // step — pass this for biped-simple.xml so the render
+            // shows a standing biped (joint PD alone can't stabilize
+            // the inverted-pendulum, see docs/mjcf.md).
+            "--balance" => a.balance = true,
             _ => panic!("unknown arg: {arg}"),
         }
     }
@@ -72,7 +79,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => load_from_path(&args.model).unwrap_or_else(|e| panic!("load {:?}: {e}", args.model)),
     };
+    let stand_target_z = scene
+        .world
+        .trees
+        .first()
+        .map(|t| forward_kinematics(t)[0].0.z)
+        .unwrap_or(0.0);
     for _ in 0..args.frames {
+        if args.balance {
+            apply_stand_balance(&mut scene.world, stand_target_z);
+        }
         scene.world.step();
     }
 
@@ -84,9 +100,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so a scene we've never seen still fits the camera view.
     let (center, radius) = scene_extent(&scene);
     let camera = build_camera(center, radius, width, height);
-    draw_ground_grid(&mut fb, camera, width, height, argb8888(0xff, 40, 45, 55));
+    draw_ground_grid(
+        &mut fb,
+        camera,
+        center,
+        radius,
+        width,
+        height,
+        argb8888(0xff, 40, 45, 55),
+    );
     draw_bodies(&mut fb, &scene.world, camera, width, height);
     draw_trees(&mut fb, &scene.world, camera, width, height);
+    draw_link_geoms(&mut fb, &scene.world, camera, width, height);
     draw_sites(&mut fb, &scene, camera, width, height);
 
     write_ppm(&args.out, &fb)?;
@@ -106,15 +131,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------------------
 
 fn scene_extent(scene: &Scene) -> (Vec3, f32) {
+    // Focus the camera on the biped-like actor: for scenes that have a
+    // tree, center on the root link and pick a radius that fits the
+    // tree's own span (independent of any drift). For scenes with only
+    // free bodies (stack, projectile…), fall back to a bounding-sphere
+    // over the bodies. This keeps the biped in frame even after it
+    // slides across the ground while still framing multi-body demos.
+    if let Some(tree) = scene.world.trees.first() {
+        let poses = forward_kinematics(tree);
+        let root = poses[0].0;
+        let mut r_sq: f32 = 0.0;
+        for (p, _) in &poses {
+            let d = *p - root;
+            let dd = d.dot(d);
+            if dd > r_sq {
+                r_sq = dd;
+            }
+        }
+        let radius = (r_sq.sqrt() + 0.6).max(1.5);
+        return (root, radius);
+    }
     let mut pts: Vec<Vec3> = Vec::new();
     for b in &scene.world.bodies {
         pts.push(b.position);
-    }
-    for t in &scene.world.trees {
-        let poses = forward_kinematics(t);
-        for (p, _) in &poses {
-            pts.push(*p);
-        }
     }
     for i in 0..scene.sites.len() {
         pts.push(scene.site_pose_by_index(i).0);
@@ -203,15 +242,33 @@ fn draw_line(fb: &mut Framebuffer, mut x0: i32, mut y0: i32, x1: i32, y1: i32, c
     }
 }
 
-fn draw_ground_grid(fb: &mut Framebuffer, camera: Mat4, width: usize, height: usize, color: u32) {
-    let span = 3.0;
+fn draw_ground_grid(
+    fb: &mut Framebuffer,
+    camera: Mat4,
+    center: Vec3,
+    radius: f32,
+    width: usize,
+    height: usize,
+    color: u32,
+) {
+    // Grid centered under the camera focus so the biped stays over
+    // visible floor even when it drifts across the world.
+    let span = (radius * 2.0).max(3.0);
     let step = 0.5;
     let n = (2.0 * span / step) as i32;
+    let cx = center.x;
+    let cy = center.y;
     for i in 0..=n {
         let t = -span + (i as f32) * step;
         for (a, b) in [
-            (Vec3::new(-span, t, 0.0), Vec3::new(span, t, 0.0)),
-            (Vec3::new(t, -span, 0.0), Vec3::new(t, span, 0.0)),
+            (
+                Vec3::new(cx - span, cy + t, 0.0),
+                Vec3::new(cx + span, cy + t, 0.0),
+            ),
+            (
+                Vec3::new(cx + t, cy - span, 0.0),
+                Vec3::new(cx + t, cy + span, 0.0),
+            ),
         ] {
             if let (Some(p0), Some(p1)) = (
                 project(camera, a, width, height),
@@ -336,6 +393,124 @@ fn draw_trees(
             }
         }
     }
+}
+
+/// Draw every geom attached to a tree link as a wireframe: boxes get
+/// their 8-corner cube edges, capsules and cylinders get their axis
+/// segment plus cross-hairs at the two endpoints. Non-tree-attached
+/// geoms are handled by `draw_bodies`; static planes are represented
+/// by the ground grid.
+fn draw_link_geoms(
+    fb: &mut Framebuffer,
+    world: &newt::world::World,
+    camera: Mat4,
+    width: usize,
+    height: usize,
+) {
+    let color = argb8888(0xff, 200, 220, 240);
+    for tree in &world.trees {
+        let poses = forward_kinematics(tree);
+        for g in &world.geoms {
+            let GeomAttach::Link(t_idx, l_idx) = g.attachment() else {
+                continue;
+            };
+            let this_tree = std::ptr::from_ref(tree) as usize;
+            let matching_tree = std::ptr::from_ref(&world.trees[t_idx]) as usize;
+            if this_tree != matching_tree {
+                continue;
+            }
+            let (link_pos, link_ori) = poses[l_idx];
+            let center = link_pos + link_ori.rotate(g.local_offset);
+            let ori_world = link_ori * g.local_orientation;
+            match g.shape {
+                GeomShape::Box { half_extents } => {
+                    let corners = box_corners_world(center, ori_world, half_extents);
+                    let proj: [Option<(i32, i32)>; 8] =
+                        std::array::from_fn(|i| project(camera, corners[i], width, height));
+                    for &(a, b) in BOX_EDGES.iter() {
+                        if let (Some(p0), Some(p1)) = (proj[a], proj[b]) {
+                            draw_line(fb, p0.0, p0.1, p1.0, p1.1, color);
+                        }
+                    }
+                }
+                GeomShape::Capsule {
+                    radius,
+                    half_height,
+                }
+                | GeomShape::Cylinder {
+                    radius,
+                    half_height,
+                } => {
+                    let axis = ori_world.rotate(Vec3::new(0.0, 0.0, half_height));
+                    let a = center - axis;
+                    let b = center + axis;
+                    if let (Some(pa), Some(pb)) = (
+                        project(camera, a, width, height),
+                        project(camera, b, width, height),
+                    ) {
+                        draw_line(fb, pa.0, pa.1, pb.0, pb.1, color);
+                        let r = radius.max(0.01);
+                        // Rough end caps: cross-hairs of width `2r` in the
+                        // link's XY plane (screen-projected).
+                        for &(p, _) in &[(a, ()), (b, ())] {
+                            let ex = ori_world.rotate(Vec3::new(r, 0.0, 0.0));
+                            let ey = ori_world.rotate(Vec3::new(0.0, r, 0.0));
+                            if let (Some(p0), Some(p1)) = (
+                                project(camera, p - ex, width, height),
+                                project(camera, p + ex, width, height),
+                            ) {
+                                draw_line(fb, p0.0, p0.1, p1.0, p1.1, color);
+                            }
+                            if let (Some(p0), Some(p1)) = (
+                                project(camera, p - ey, width, height),
+                                project(camera, p + ey, width, height),
+                            ) {
+                                draw_line(fb, p0.0, p0.1, p1.0, p1.1, color);
+                            }
+                        }
+                    }
+                }
+                GeomShape::Sphere { radius } => {
+                    let r = radius;
+                    let ex = ori_world.rotate(Vec3::new(r, 0.0, 0.0));
+                    let ey = ori_world.rotate(Vec3::new(0.0, r, 0.0));
+                    let ez = ori_world.rotate(Vec3::new(0.0, 0.0, r));
+                    for e in [ex, ey, ez] {
+                        if let (Some(p0), Some(p1)) = (
+                            project(camera, center - e, width, height),
+                            project(camera, center + e, width, height),
+                        ) {
+                            draw_line(fb, p0.0, p0.1, p1.0, p1.1, color);
+                        }
+                    }
+                }
+                _ => {
+                    if let Some((x, y)) = project(camera, center, width, height) {
+                        draw_line(fb, x - 3, y, x + 3, y, color);
+                        draw_line(fb, x, y - 3, x, y + 3, color);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Source-mirror torso balance controller (height PD + upright torque)
+/// applied to the first tree's root link via `applied_wrenches[0]`.
+/// See `newt/docs/mjcf.md` and
+/// `~/me/fun/biped/biped/mujoco_biped.py::_apply_balance_controller` —
+/// the biped stand scenario relies on this alongside joint PD.
+fn apply_stand_balance(world: &mut newt::world::World, target_z: f32) {
+    if world.trees.is_empty() {
+        return;
+    }
+    let (torso_pos, torso_ori) = forward_kinematics(&world.trees[0])[0];
+    let up_world = torso_ori.rotate(Vec3::new(0.0, 0.0, 1.0));
+    let vz = world.trees[0].qdot.get(5).copied().unwrap_or(0.0);
+    let fz = (240.0 * (target_z - torso_pos.z) - 70.0 * vz).clamp(-90.0, 260.0);
+    let tx = (135.0 * up_world.y).clamp(-95.0, 95.0);
+    let ty = (-135.0 * up_world.x).clamp(-95.0, 95.0);
+    world.trees[0].applied_wrenches[0] = (Vec3::new(0.0, 0.0, fz), Vec3::new(tx, ty, 0.0));
 }
 
 fn draw_sites(fb: &mut Framebuffer, scene: &Scene, camera: Mat4, width: usize, height: usize) {

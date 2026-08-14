@@ -251,14 +251,66 @@ underlying `xml::Error` offset in the message.
 
 ```text
 cargo run --release --example load -- \
-  --model models/biped-simple.xml --frames 400 --out /tmp/biped.ppm
+  --model models/biped-simple.xml --frames 400  --balance --out /tmp/biped-400.ppm
+cargo run --release --example load -- \
+  --model models/biped-simple.xml --frames 2000 --balance --out /tmp/biped-2000.ppm
 ```
 
-Renders the biped as a torso wireframe plus leg-link rods after
-stepping it 400 times (2 s at `dt=0.005`). See
-`tests/mjcf_load.rs::biped_simple_loads_and_stands_for_2000_steps`
-for the automated smoke that asserts the root stays finite and
-bounded across 2000 steps. `models/biped-simple.xml` carries a
-provenance comment pointing at `~/me/fun/biped/biped/models/biped.xml`
-(the reference biped) and lists every simplification applied to fit
-the v1 subset.
+Renders the biped standing on the ground plane — torso and foot
+wireframe boxes, capsule leg segments, ground grid centered on the
+torso. `--balance` toggles the source-mirrored torso balance
+controller so the render shows a quiet standing biped instead of a
+collapsed one (see the standing note below).
+
+## Biped-simple standing note (v1 finale)
+
+`tests/mjcf_load.rs::biped_simple_stands_for_2000_steps` asserts:
+
+- Root height stays above **80% of the initial standing height** for
+  every one of the 2000 steps (10 s at `dt=5 ms`).
+- Torso tilt stays below **~15° (0.26 rad)** across the whole run.
+
+To hit that bar the test applies the *same* torso balance controller
+the source biped's `stand` scenario runs
+(`~/me/fun/biped/biped/mujoco_biped.py::_apply_balance_controller`):
+a height PD (kp 240 / kd 70, clamped to `[-90, 260] N`) plus an
+upright torque (kp 135 / kd 24, clamped to ±95 N·m) written into
+`Tree::applied_wrenches[0]` each step. Joint PD with the source
+biped's `stand` gains (`kp ∈ [45, 80]`, `forcerange ∈ ±[45, 80]`,
+`damping ∈ [2, 8]`) is what the 10 `<position>` actuators encode in
+`models/biped-simple.xml`.
+
+**Why the external balance controller is necessary.** The biped is
+an inverted pendulum. With a ~20 kg body carried above the ankles,
+the gravitational tipping moment at a small tilt θ is roughly
+`m · g · L_com · θ ≈ 20 · 9.81 · 0.9 · θ = 177 θ Nm/rad`. Total
+ankle-joint restoring stiffness with two ankles at source-range
+`kp = 45` is `2 · 45 = 90 Nm/rad`. Net stiffness is negative
+(`+90 − 177 = −87 Nm/rad`) — the biped is unstable in the small.
+Even at the top of the source range (`kp = 80` per ankle) the net
+is `160 − 177 = −17 Nm/rad`, still unstable. The diagnostic
+(`examples/biped_diag.rs` in the working tree, not shipped) confirms
+this experimentally: without the balance wrench the torso tilts
+0.24 rad by step 300 and topples to ~90° by step 500. **The source
+biped's `stand` scenario reproduces the same behavior**: its
+`SCENARIO_DEFINITIONS["stand"]` sets `balance_mode: "controller"`
+with `assist_scale: 1.0`, i.e. the balance controller is on with
+full authority. Joint PD alone is not a control policy strong
+enough to stabilize the pendulum with source-realistic gains.
+
+**Follow-ups this diagnosis suggests (candidate NEWT-13 seeds).**
+
+- Add a first-class MJCF extension for per-body applied wrenches
+  so the balance controller can be encoded declaratively (right
+  now the test writes into `Tree::applied_wrenches` at the Rust
+  level).
+- Stiffer solver limits at the ankle-joint hinge (v1 tier 4 PGS
+  limits with tuned `solref` might tighten the effective ankle
+  stiffness without changing kp).
+- Faithful `<keyframe>` support so a pre-crouched initial pose can
+  bake stability into the scene instead of relying on runtime
+  balance.
+
+`models/biped-simple.xml` carries a provenance comment pointing at
+`~/me/fun/biped/biped/models/biped.xml` (the reference biped) and
+lists every simplification applied to fit the v1 subset.

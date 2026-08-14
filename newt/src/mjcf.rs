@@ -2106,7 +2106,7 @@ impl Loader {
         for (k, _) in &e.attrs {
             match k.as_str() {
                 "name" | "joint" | "kp" | "kv" | "dampratio" | "forcerange" | "ctrlrange"
-                | "class" | "ctrllimited" | "forcelimited" => {}
+                | "class" | "ctrllimited" | "forcelimited" | "target" => {}
                 other => {
                     return fail(
                         path,
@@ -2159,7 +2159,16 @@ impl Loader {
         if let Some(v) = e.attr("forcelimited") {
             let _ = parse_bool(v, path, "forcelimited")?;
         }
-        let servo = if has_kv {
+        // Newt extension: an optional `target` attribute on <position>
+        // seeds the PD servo's initial setpoint at load time. Real MJCF
+        // sets targets via <keyframe qctrl=...> (out of subset); this
+        // shortcut lets a fixture bake a standing pose without an
+        // external setup step.
+        let initial_target = match attr_with_default(e, "position", "target", &dc) {
+            Some(v) => parse_f32(v, path, "target")?,
+            None => 0.0,
+        };
+        let mut servo = if has_kv {
             let kv = parse_f32(
                 attr_with_default(e, "position", "kv", &dc).unwrap(),
                 path,
@@ -2168,7 +2177,7 @@ impl Loader {
             if kv < 0.0 {
                 return fail(path, "kv must be ≥ 0");
             }
-            PdServo::new(link_idx, kp, kv, clamp, 0.0)
+            PdServo::new(link_idx, kp, kv, clamp, initial_target)
         } else if has_dr {
             let dr = parse_f32(
                 attr_with_default(e, "position", "dampratio", &dc).unwrap(),
@@ -2186,6 +2195,7 @@ impl Loader {
         } else {
             return fail(path, "<position> actuator must specify kv or dampratio");
         };
+        servo.target = initial_target;
         if self.actuators_by_name.contains_key(&name) {
             return fail(path, format!("duplicate actuator name \"{name}\""));
         }

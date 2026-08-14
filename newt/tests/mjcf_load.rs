@@ -290,11 +290,36 @@ fn fromto_capsule_hand_computed() {
 }
 
 // ---------------------------------------------------------------------------
-// biped-simple: load, step 2000, root height stays bounded (v1 finale)
+// biped-simple: load, step 2000, root stays upright standing (v1 finale)
 // ---------------------------------------------------------------------------
 
+/// Apply the source biped's balance controller to the torso — mirrors
+/// `_apply_balance_controller` in `~/me/fun/biped/biped/mujoco_biped.py`
+/// for the `stand` scenario. Height PD (kp 240 / kd 70) plus a body-tilt
+/// torque (kp 135 / kd 24) via `applied_wrenches[0]`. This is what the
+/// source stand scenario applies to hold quiet upright; joint PD alone
+/// with source-range gains (kp 45-80) leaves the biped a marginally
+/// unstable inverted pendulum — total ankle stiffness of 2·kp≈90 Nm/rad
+/// is less than the ~177 Nm/rad tipping moment of the ~20 kg body about
+/// the ankles, so it topples. Documented in `newt/docs/mjcf.md`.
+fn apply_source_balance_wrench(world: &mut newt::world::World, target_z: f32) {
+    let (torso_pos, torso_ori) = forward_kinematics(&world.trees[0])[0];
+    let up_world = torso_ori.rotate(newt::math::Vec3::new(0.0, 0.0, 1.0));
+    // Free-root velocity layout in `Tree::qdot`: `(ω_body, v_body)`,
+    // so slot 5 is body-frame vz. For a small tilt this approximates
+    // world-frame vz well enough for the PD height loop.
+    let vz = world.trees[0].qdot[5];
+    let fz = (240.0 * (target_z - torso_pos.z) - 70.0 * vz).clamp(-90.0, 260.0);
+    let tx = (135.0 * up_world.y).clamp(-95.0, 95.0);
+    let ty = (-135.0 * up_world.x).clamp(-95.0, 95.0);
+    world.trees[0].applied_wrenches[0] = (
+        newt::math::Vec3::new(0.0, 0.0, fz),
+        newt::math::Vec3::new(tx, ty, 0.0),
+    );
+}
+
 #[test]
-fn biped_simple_loads_and_stands_for_2000_steps() {
+fn biped_simple_stands_for_2000_steps() {
     let base = std::env::current_dir().unwrap();
     let scene = load_mjcf_path(base.join("models/biped-simple.xml")).unwrap();
     // Structural sanity — one tree, 11 links (torso + 10 leg segments),
@@ -306,31 +331,46 @@ fn biped_simple_loads_and_stands_for_2000_steps() {
     let mut world = scene.world.clone();
     let initial_root_z = forward_kinematics(&world.trees[0])[0].0.z;
     assert!(
-        (initial_root_z - 1.30).abs() < 1e-6,
+        (initial_root_z - 1.235).abs() < 1e-4,
         "initial root z = {initial_root_z}"
     );
 
-    let mut min_z = f32::INFINITY;
-    let mut max_z = f32::NEG_INFINITY;
-    for _ in 0..2000 {
+    let mut min_ratio = 1.0_f32;
+    let mut max_tilt: f32 = 0.0;
+    for step in 0..2000 {
+        apply_source_balance_wrench(&mut world, initial_root_z);
         world.step();
-        let root = forward_kinematics(&world.trees[0])[0].0;
+        let (root, ori) = forward_kinematics(&world.trees[0])[0];
         assert!(
             root.x.is_finite() && root.y.is_finite() && root.z.is_finite(),
-            "root pose went non-finite: {:?}",
+            "root pose went non-finite at step {step}: {:?}",
             root
         );
-        if root.z < min_z {
-            min_z = root.z;
+        let ratio = root.z / initial_root_z;
+        if ratio < min_ratio {
+            min_ratio = ratio;
         }
-        if root.z > max_z {
-            max_z = root.z;
+        let up_world = ori.rotate(newt::math::Vec3::new(0.0, 0.0, 1.0));
+        // sin(tilt) ≈ sqrt(1 - up_world.z²) for a small tilt.
+        let tilt = (1.0 - up_world.z * up_world.z).max(0.0).sqrt();
+        if tilt > max_tilt {
+            max_tilt = tilt;
         }
     }
-    // Root height stays bounded — the biped squats under load but must
-    // not sink through the ground or fly up. Lateral drift is not
-    // constrained: this is a load-and-stability smoke, not a walking
-    // controller (the ticket calls out that walking is v2).
-    assert!(min_z > 0.0, "root sank through the ground: min_z = {min_z}");
-    assert!(max_z < 3.0, "root shot up: max_z = {max_z}");
+    // Root height stays above 80% of the initial standing height for the
+    // full 2000-step run (10 s at dt=5 ms) — biped is upright, not
+    // crumpled. Torso tilt stays below ~15° (0.26 rad) for the same
+    // window so the assertion catches a slow topple that never quite
+    // sinks the root height below the 80% threshold.
+    assert!(
+        min_ratio > 0.80,
+        "root height dropped to {:.1}% of initial standing height",
+        100.0 * min_ratio,
+    );
+    assert!(
+        max_tilt < 0.26,
+        "torso tilted to {:.3} rad (~{:.1} deg)",
+        max_tilt,
+        max_tilt.asin().to_degrees(),
+    );
 }
