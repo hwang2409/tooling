@@ -1,0 +1,119 @@
+<!--
+  biped-walk.xml — source biped port for the NEWT-18 walking milestone.
+
+  Geometry, joint ranges, damping, armature, actuator gains, force limits,
+  friction, and timestep come from ~/me/fun/biped/biped/models/biped.xml.
+  Newt stores each link origin at its MuJoCo COM. The source's joint anchors
+  and geom offsets are therefore expressed through joint_offset_in_parent /
+  joint_offset_in_child by the loader's normal MJCF mapping.
+
+  Newt disables same-tree self collision for MJCF trees. This is equivalent
+  to the source's robot contype=2 / conaffinity=1 filter against itself.
+-->
+<mujoco model="phase3_biped_3d_v1">
+  <compiler angle="radian" coordinate="local"/>
+  <option timestep="0.005" gravity="0 0 -9.81" integrator="RK4" cone="elliptic" solver="PGS"/>
+
+  <default>
+    <joint damping="2.0" armature="0.02" limited="true"/>
+    <geom friction="1.2 0.08 0.02" solref="0.02 1" solimp="0.9 0.95 0.001"/>
+    <site size="0.018"/>
+  </default>
+
+  <worldbody>
+    <geom name="ground" type="plane" size="10 10 0.05" friction="1.2 0.08 0.02"/>
+
+    <!-- Source torso body origin is 1.18 m. Its compound COM is 0.023298969 m
+         above that origin, so this newt link starts at the source COM. -->
+    <body name="torso" pos="0 0 1.203298969">
+      <freejoint name="root"/>
+      <inertial mass="9.7" diaginertia="0.6291711 0.6033411 0.13512333"/>
+      <geom name="chest_geom" type="box" pos="0 0 0.026701031" size="0.14 0.13 0.31" mass="6.5"/>
+      <geom name="pelvis_geom" type="box" pos="0 0 -0.268298969" size="0.12 0.24 0.055" mass="2.2"/>
+      <geom name="head_geom" type="sphere" pos="0 0 0.416701031" size="0.09" mass="1.0"/>
+
+      <body name="left_hip_roll_link" pos="0 0.18 -0.283298969">
+        <inertial mass="0.05" diaginertia="0.001 0.001 0.001"/>
+        <joint name="left_hip_roll" type="hinge" axis="1 0 0" range="-0.7 0.7" damping="8.0" armature="0.05"/>
+        <body name="left_thigh" pos="0 0 -0.21">
+          <inertial mass="2.2" diaginertia="0.043571344 0.043571344 0.0021718125"/>
+          <joint name="left_hip" type="hinge" axis="0 1 0" pos="0 0 0.21" range="-1.0 1.0"/>
+          <geom name="left_thigh_geom" type="capsule" size="0.045 0.21" mass="2.2"/>
+          <body name="left_shin" pos="0 0 -0.42">
+            <inertial mass="1.6" diaginertia="0.0302295468 0.0302295468 0.0011303288"/>
+            <joint name="left_knee" type="hinge" axis="0 1 0" pos="0 0 0.21" range="-0.1 1.7"/>
+            <geom name="left_shin_geom" type="capsule" size="0.038 0.21" mass="1.6"/>
+            <body name="left_ankle_roll_link" pos="0 0 -0.21">
+              <inertial mass="0.03" diaginertia="0.0005 0.0005 0.0005"/>
+              <joint name="left_ankle_roll" type="hinge" axis="1 0 0" range="-0.5 0.5" damping="5.0" armature="0.04"/>
+              <body name="left_foot" pos="0.075 0 -0.02">
+                <inertial mass="0.8" diaginertia="0.0016333333 0.0080333333 0.0090133333"/>
+                <joint name="left_ankle" type="hinge" axis="0 1 0" pos="-0.075 0 0.02" range="-0.8 0.8"/>
+                <geom name="left_foot_geom" type="box" size="0.17 0.07 0.035" mass="0.8"/>
+                <site name="left_heel_site" pos="-0.155 0 -0.035"/>
+                <site name="left_toe_site" pos="0.155 0 -0.035"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+
+      <body name="right_hip_roll_link" pos="0 -0.18 -0.283298969">
+        <inertial mass="0.05" diaginertia="0.001 0.001 0.001"/>
+        <joint name="right_hip_roll" type="hinge" axis="1 0 0" range="-0.7 0.7" damping="8.0" armature="0.05"/>
+        <body name="right_thigh" pos="0 0 -0.21">
+          <inertial mass="2.2" diaginertia="0.043571344 0.043571344 0.0021718125"/>
+          <joint name="right_hip" type="hinge" axis="0 1 0" pos="0 0 0.21" range="-1.0 1.0"/>
+          <geom name="right_thigh_geom" type="capsule" size="0.045 0.21" mass="2.2"/>
+          <body name="right_shin" pos="0 0 -0.42">
+            <inertial mass="1.6" diaginertia="0.0302295468 0.0302295468 0.0011303288"/>
+            <joint name="right_knee" type="hinge" axis="0 1 0" pos="0 0 0.21" range="-0.1 1.7"/>
+            <geom name="right_shin_geom" type="capsule" size="0.038 0.21" mass="1.6"/>
+            <body name="right_ankle_roll_link" pos="0 0 -0.21">
+              <inertial mass="0.03" diaginertia="0.0005 0.0005 0.0005"/>
+              <joint name="right_ankle_roll" type="hinge" axis="1 0 0" range="-0.5 0.5" damping="5.0" armature="0.04"/>
+              <body name="right_foot" pos="0.075 0 -0.02">
+                <inertial mass="0.8" diaginertia="0.0016333333 0.0080333333 0.0090133333"/>
+                <joint name="right_ankle" type="hinge" axis="0 1 0" pos="-0.075 0 0.02" range="-0.8 0.8"/>
+                <geom name="right_foot_geom" type="box" size="0.17 0.07 0.035" mass="0.8"/>
+                <site name="right_heel_site" pos="-0.155 0 -0.035"/>
+                <site name="right_toe_site" pos="0.155 0 -0.035"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <!--
+    These kv values are MuJoCo's compiled dampratio=1 values. Newt's MJCF
+    loader does not have MuJoCo's articulated inertia at actuator load time,
+    so explicit kv keeps the compiled controller gains identical.
+  -->
+  <actuator>
+    <position name="left_hip_roll_motor" joint="left_hip_roll" kp="70" kv="20.300636017982495" ctrlrange="-0.7 0.7" forcerange="-70 70"/>
+    <position name="left_hip_motor" joint="left_hip" kp="70" kv="20.161543163523177" ctrlrange="-0.9 0.9" forcerange="-70 70"/>
+    <position name="left_knee_motor" joint="left_knee" kp="80" kv="9.699400068906062" ctrlrange="-0.05 1.4" forcerange="-80 80"/>
+    <position name="left_ankle_roll_motor" joint="left_ankle_roll" kp="45" kv="2.76434440690736" ctrlrange="-0.5 0.5" forcerange="-45 45"/>
+    <position name="left_ankle_motor" joint="left_ankle" kp="45" kv="2.4317894645713047" ctrlrange="-0.7 0.7" forcerange="-45 45"/>
+    <position name="right_hip_roll_motor" joint="right_hip_roll" kp="70" kv="20.300636017982495" ctrlrange="-0.7 0.7" forcerange="-70 70"/>
+    <position name="right_hip_motor" joint="right_hip" kp="70" kv="20.161543163523177" ctrlrange="-0.9 0.9" forcerange="-70 70"/>
+    <position name="right_knee_motor" joint="right_knee" kp="80" kv="9.699400068906062" ctrlrange="-0.05 1.4" forcerange="-80 80"/>
+    <position name="right_ankle_roll_motor" joint="right_ankle_roll" kp="45" kv="2.76434440690736" ctrlrange="-0.5 0.5" forcerange="-45 45"/>
+    <position name="right_ankle_motor" joint="right_ankle" kp="45" kv="2.4317894645713047" ctrlrange="-0.7 0.7" forcerange="-45 45"/>
+  </actuator>
+
+  <sensor>
+    <touch name="ground_touch" geom="ground"/>
+    <touch name="chest_touch" geom="chest_geom"/>
+    <touch name="pelvis_touch" geom="pelvis_geom"/>
+    <touch name="head_touch" geom="head_geom"/>
+    <touch name="left_thigh_touch" geom="left_thigh_geom"/>
+    <touch name="left_shin_touch" geom="left_shin_geom"/>
+    <touch name="left_foot_touch" geom="left_foot_geom"/>
+    <touch name="right_thigh_touch" geom="right_thigh_geom"/>
+    <touch name="right_shin_touch" geom="right_shin_geom"/>
+    <touch name="right_foot_touch" geom="right_foot_geom"/>
+  </sensor>
+</mujoco>
