@@ -30,6 +30,7 @@ use crate::joint::{JointKind, JointLimit};
 use crate::json::{self, Value};
 use crate::math::{Mat3, Quat, Vec3};
 use crate::sensor::{Sensor, SensorAttach, SensorKind, SiteFrame};
+use crate::tendon::{FixedTendonJoint, SpatialTendonSite, Tendon, WrapSphere};
 use crate::tree::{Link, Tree, forward_kinematics};
 use crate::world::World;
 
@@ -132,6 +133,10 @@ pub struct Scene {
     /// [`World::sensor`] takes; the field is here purely so callers can
     /// address sensors by the JSON name.
     pub sensors_by_name: HashMap<String, usize>,
+
+    /// Tendon name → `(tree_idx, tendon_idx_within_tree)`. Enables
+    /// tendon-target lookup by name for actuators, sensors, and tests.
+    pub tendons_by_name: HashMap<String, (usize, usize)>,
 }
 
 impl Scene {
@@ -788,6 +793,7 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
             "contact_pairs",
             "equality",
             "sensors",
+            "tendons",
         ],
         path,
     )?;
@@ -925,14 +931,43 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
         }
     }
 
+    // ---- Tendons ----
+    // Parsed BEFORE actuators so an actuator can reference a tendon by
+    // name via the `tendon` field.
+    let mut tendons_by_name: HashMap<String, (usize, usize)> = HashMap::new();
+    if let Some(v) = optional(root_fields, "tendons") {
+        let arr = get_array(v, "tendons")?;
+        for (i, td_v) in arr.iter().enumerate() {
+            let p = format!("tendons[{i}]");
+            let (name, tree_idx, tendon) = parse_tendon(td_v, &p, &trees_by_name, &links_by_name)?;
+            tendon
+                .validate(&world.trees[tree_idx])
+                .map_err(|m| ModelError::new(p.clone(), m))?;
+            if tendons_by_name.contains_key(&name) {
+                return fail(
+                    &format!("{p}.name"),
+                    format!("duplicate tendon name \"{name}\""),
+                );
+            }
+            let ti = world.trees[tree_idx].add_tendon(tendon);
+            tendons_by_name.insert(name, (tree_idx, ti));
+        }
+    }
+
     // ---- Actuators ----
     let mut actuators_by_name: HashMap<String, (usize, usize)> = HashMap::new();
     if let Some(v) = optional(root_fields, "actuators") {
         let arr = get_array(v, "actuators")?;
         for (i, act_v) in arr.iter().enumerate() {
             let p = format!("actuators[{i}]");
-            let (name, tree_idx, servo) =
-                parse_actuator(act_v, &p, &trees_by_name, &links_by_name, &world)?;
+            let (name, tree_idx, servo) = parse_actuator(
+                act_v,
+                &p,
+                &trees_by_name,
+                &links_by_name,
+                &tendons_by_name,
+                &world,
+            )?;
             if actuators_by_name.contains_key(&name) {
                 return fail(
                     &format!("{p}.name"),
@@ -983,9 +1018,10 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
     }
 
     // ---- Sensors ----
-    // Parsed AFTER geoms/sites so name resolution has the full universe of
-    // referenceable entities. World.add_sensor validates each spec, so a
-    // bad reference here surfaces at the corresponding JSON path.
+    // Parsed AFTER geoms/sites/tendons so name resolution has the full
+    // universe of referenceable entities. World.add_sensor validates each
+    // spec, so a bad reference here surfaces at the corresponding JSON
+    // path.
     let mut sensors_by_name: HashMap<String, usize> = HashMap::new();
     if let Some(v) = optional(root_fields, "sensors") {
         let arr = get_array(v, "sensors")?;
@@ -1000,6 +1036,7 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
                 &geoms_by_name,
                 &sites,
                 &sites_by_name,
+                &tendons_by_name,
             )?;
             if sensors_by_name.contains_key(&sensor.name) {
                 return fail(
@@ -1044,6 +1081,7 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
         sites_by_name,
         actuators_by_name,
         sensors_by_name,
+        tendons_by_name,
     })
 }
 
@@ -1784,13 +1822,15 @@ fn parse_actuator(
     path: &str,
     trees_by_name: &HashMap<String, usize>,
     links_by_name: &[HashMap<String, usize>],
+    tendons_by_name: &HashMap<String, (usize, usize)>,
     world: &World,
 ) -> Result<(String, usize, Actuator), ModelError> {
     let fields = get_object(v, path)?;
-    // Schema is a discriminated union on "type". Supported types (v2 tier 2):
+    // Schema is a discriminated union on "type". Supported types (v2 tier 3):
     //   position | velocity | motor | general
-    // The full keyset is the union of every type's fields; per-type paths
-    // reject unknowns after they read what they need.
+    // Transmission is either joint (default: `tree` + `link`) OR tendon
+    // (`tree` + `tendon`). Full keyset is a union; per-type paths reject
+    // unknowns after reading what they need.
     let name = get_str(required(fields, "name", path)?, &format!("{path}.name"))?.to_string();
     let ty = get_str(required(fields, "type", path)?, &format!("{path}.type"))?;
     let tn = get_str(required(fields, "tree", path)?, &format!("{path}.tree"))?;
@@ -1798,24 +1838,57 @@ fn parse_actuator(
         .get(tn)
         .copied()
         .ok_or_else(|| ModelError::new(format!("{path}.tree"), format!("unknown tree \"{tn}\"")))?;
-    let ln = get_str(required(fields, "link", path)?, &format!("{path}.link"))?;
-    let lidx = links_by_name[tidx].get(ln).copied().ok_or_else(|| {
-        ModelError::new(
-            format!("{path}.link"),
-            format!("unknown link \"{ln}\" in tree \"{tn}\""),
-        )
-    })?;
-    if !matches!(
-        world.trees[tidx].links[lidx].joint,
-        JointKind::Hinge { .. } | JointKind::Slide { .. }
-    ) {
+    // Tendon transmission if `tendon` present. Rejects both link+tendon
+    // (ambiguous) up front.
+    let tendon_field = optional(fields, "tendon");
+    let link_field = optional(fields, "link");
+    if tendon_field.is_some() && link_field.is_some() {
         return fail(
-            &format!("{path}.link"),
-            format!(
-                "actuator target link \"{ln}\" is not a hinge or slide; actuators only attach to 1-DOF joints"
-            ),
+            path,
+            "actuator: specify either \"link\" (joint transmission) OR \"tendon\" \
+             (tendon transmission), not both",
         );
     }
+    let (lidx, tendon_target) = if let Some(tv) = tendon_field {
+        let tname = get_str(tv, &format!("{path}.tendon"))?;
+        let &(tt, ti) = tendons_by_name.get(tname).ok_or_else(|| {
+            ModelError::new(
+                format!("{path}.tendon"),
+                format!("unknown tendon \"{tname}\""),
+            )
+        })?;
+        if tt != tidx {
+            return fail(
+                &format!("{path}.tendon"),
+                format!("tendon \"{tname}\" belongs to tree {tt}, but actuator's tree is {tidx}"),
+            );
+        }
+        (0, Some(ti))
+    } else {
+        let ln = get_str(
+            link_field
+                .ok_or_else(|| ModelError::new(path, "actuator missing \"link\" or \"tendon\""))?,
+            &format!("{path}.link"),
+        )?;
+        let lidx = links_by_name[tidx].get(ln).copied().ok_or_else(|| {
+            ModelError::new(
+                format!("{path}.link"),
+                format!("unknown link \"{ln}\" in tree \"{tn}\""),
+            )
+        })?;
+        if !matches!(
+            world.trees[tidx].links[lidx].joint,
+            JointKind::Hinge { .. } | JointKind::Slide { .. }
+        ) {
+            return fail(
+                &format!("{path}.link"),
+                format!(
+                    "actuator target link \"{ln}\" is not a hinge or slide; actuators only attach to 1-DOF joints"
+                ),
+            );
+        }
+        (lidx, None)
+    };
 
     let target = optional(fields, "target")
         .map(|v| get_f32(v, &format!("{path}.target")))
@@ -1835,6 +1908,7 @@ fn parse_actuator(
                     "type",
                     "tree",
                     "link",
+                    "tendon",
                     "kp",
                     "kd",
                     "dampratio",
@@ -1849,7 +1923,9 @@ fn parse_actuator(
         "velocity" => {
             reject_unknown(
                 fields,
-                &["name", "type", "tree", "link", "kv", "clamp", "target"],
+                &[
+                    "name", "type", "tree", "link", "tendon", "kv", "clamp", "target",
+                ],
                 path,
             )?;
             let kv = get_f32(required(fields, "kv", path)?, &format!("{path}.kv"))?;
@@ -1863,7 +1939,9 @@ fn parse_actuator(
         "motor" => {
             reject_unknown(
                 fields,
-                &["name", "type", "tree", "link", "gear", "clamp", "target"],
+                &[
+                    "name", "type", "tree", "link", "tendon", "gear", "clamp", "target",
+                ],
                 path,
             )?;
             let gear = optional(fields, "gear")
@@ -1885,6 +1963,10 @@ fn parse_actuator(
             );
         }
     };
+    let mut actuator = actuator;
+    if let Some(ti) = tendon_target {
+        actuator = actuator.on_tendon(ti);
+    }
     Ok((name, tidx, actuator))
 }
 
@@ -1963,6 +2045,7 @@ fn parse_general_actuator(
             "type",
             "tree",
             "link",
+            "tendon",
             "gaintype",
             "gainprm",
             "biastype",
@@ -2137,6 +2220,7 @@ fn parse_sensor(
     geoms_by_name: &HashMap<String, usize>,
     sites: &[Site],
     sites_by_name: &HashMap<String, usize>,
+    tendons_by_name: &HashMap<String, (usize, usize)>,
 ) -> Result<Sensor, ModelError> {
     let fields = get_object(v, path)?;
     let name = get_str(required(fields, "name", path)?, &format!("{path}.name"))?.to_string();
@@ -2185,13 +2269,31 @@ fn parse_sensor(
             })?;
             SensorKind::Touch { geom: gidx }
         }
+        "tendonpos" | "tendonvel" => {
+            reject_unknown(fields, &["name", "kind", "tendon"], path)?;
+            let tn = get_str(required(fields, "tendon", path)?, &format!("{path}.tendon"))?;
+            let &(tree_idx, tendon_idx) = tendons_by_name.get(tn).ok_or_else(|| {
+                ModelError::new(format!("{path}.tendon"), format!("unknown tendon \"{tn}\""))
+            })?;
+            match kind_str {
+                "tendonpos" => SensorKind::TendonPos {
+                    tree: tree_idx,
+                    tendon: tendon_idx,
+                },
+                "tendonvel" => SensorKind::TendonVel {
+                    tree: tree_idx,
+                    tendon: tendon_idx,
+                },
+                _ => unreachable!(),
+            }
+        }
         other => {
             return fail(
                 &format!("{path}.kind"),
                 format!(
                     "unknown sensor kind \"{other}\"; expected \
                      jointpos | jointvel | ballquat | ballangvel | framepos | framequat | \
-                     gyro | accelerometer | touch | force | torque"
+                     gyro | accelerometer | touch | force | torque | tendonpos | tendonvel"
                 ),
             );
         }
@@ -2671,6 +2773,268 @@ fn auto_pairs_with_self_collision_filter(
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// tendon parser
+// ---------------------------------------------------------------------------
+
+/// Parse one entry in the top-level `"tendons"` array.
+///
+/// Schema (discriminated union on `"kind"`):
+///
+/// ```json
+/// // fixed tendon: linear combination of hinge/slide joints in one tree
+/// { "name": "coupling", "tree": "t", "kind": "fixed",
+///   "joints": [ {"link": "j1", "coef": 1.0}, {"link": "j2", "coef": -1.0} ],
+///   "springlength": 0.0, "stiffness": 1000.0, "damping": 20.0,
+///   "range": [-0.1, 0.1] }
+///
+/// // spatial tendon: chain of sites with optional sphere wraps
+/// { "name": "cable", "tree": "t", "kind": "spatial",
+///   "sites": [ {"link": "root", "position": [0, 0, 1]},
+///              {"link": "box",  "position": [0, 0, 0]} ],
+///   "wraps": [ {"link": "root", "center": [0, 0, 0.5], "radius": 0.1} ] }
+/// ```
+///
+/// Cylinder wrap and pulley branches are rejected with a
+/// `deferred in v2 tier 3` error — the no-silent-ignore doctrine.
+fn parse_tendon(
+    v: &Value,
+    path: &str,
+    trees_by_name: &HashMap<String, usize>,
+    links_by_name: &[HashMap<String, usize>],
+) -> Result<(String, usize, Tendon), ModelError> {
+    let fields = get_object(v, path)?;
+    let name = get_str(required(fields, "name", path)?, &format!("{path}.name"))?.to_string();
+    if name.is_empty() {
+        return fail(&format!("{path}.name"), "tendon name must not be empty");
+    }
+    let tn = get_str(required(fields, "tree", path)?, &format!("{path}.tree"))?;
+    let tidx = trees_by_name
+        .get(tn)
+        .copied()
+        .ok_or_else(|| ModelError::new(format!("{path}.tree"), format!("unknown tree \"{tn}\"")))?;
+    let kind_str = get_str(required(fields, "kind", path)?, &format!("{path}.kind"))?;
+    // Common passive-parameter parsers.
+    let parse_common = |t: &mut Tendon| -> Result<(), ModelError> {
+        if let Some(v) = optional(fields, "springlength") {
+            t.springlength = Some(get_f32(v, &format!("{path}.springlength"))?);
+        }
+        if let Some(v) = optional(fields, "stiffness") {
+            t.stiffness = get_f32(v, &format!("{path}.stiffness"))?;
+        }
+        if let Some(v) = optional(fields, "damping") {
+            t.damping = get_f32(v, &format!("{path}.damping"))?;
+        }
+        if let Some(rv) = optional(fields, "range") {
+            let arr = get_array(rv, &format!("{path}.range"))?;
+            if arr.len() != 2 {
+                return fail(
+                    &format!("{path}.range"),
+                    format!("expected [lo, hi] (2 numbers), got {}", arr.len()),
+                );
+            }
+            let lo = get_f32(&arr[0], &format!("{path}.range[0]"))?;
+            let hi = get_f32(&arr[1], &format!("{path}.range[1]"))?;
+            if lo > hi {
+                return fail(
+                    &format!("{path}.range"),
+                    format!("range lo ({lo}) must be ≤ hi ({hi})"),
+                );
+            }
+            t.range = Some((lo, hi));
+        }
+        Ok(())
+    };
+    let tendon = match kind_str {
+        "fixed" => {
+            reject_unknown(
+                fields,
+                &[
+                    "name",
+                    "tree",
+                    "kind",
+                    "joints",
+                    "springlength",
+                    "stiffness",
+                    "damping",
+                    "range",
+                ],
+                path,
+            )?;
+            let joints_v = required(fields, "joints", path)?;
+            let joints_arr = get_array(joints_v, &format!("{path}.joints"))?;
+            if joints_arr.is_empty() {
+                return fail(
+                    &format!("{path}.joints"),
+                    "fixed tendon must have ≥ 1 joint entry",
+                );
+            }
+            let mut joints = Vec::with_capacity(joints_arr.len());
+            for (i, jv) in joints_arr.iter().enumerate() {
+                let jp = format!("{path}.joints[{i}]");
+                let jfields = get_object(jv, &jp)?;
+                reject_unknown(jfields, &["link", "coef"], &jp)?;
+                let ln = get_str(required(jfields, "link", &jp)?, &format!("{jp}.link"))?;
+                let lidx = links_by_name[tidx].get(ln).copied().ok_or_else(|| {
+                    ModelError::new(
+                        format!("{jp}.link"),
+                        format!("unknown link \"{ln}\" in tree \"{tn}\""),
+                    )
+                })?;
+                let coef = get_f32(required(jfields, "coef", &jp)?, &format!("{jp}.coef"))?;
+                joints.push(FixedTendonJoint { link: lidx, coef });
+            }
+            let mut t = Tendon::fixed(joints);
+            parse_common(&mut t)?;
+            t
+        }
+        "spatial" => {
+            reject_unknown(
+                fields,
+                &[
+                    "name",
+                    "tree",
+                    "kind",
+                    "sites",
+                    "wraps",
+                    "springlength",
+                    "stiffness",
+                    "damping",
+                    "range",
+                ],
+                path,
+            )?;
+            let sites_v = required(fields, "sites", path)?;
+            let sites_arr = get_array(sites_v, &format!("{path}.sites"))?;
+            if sites_arr.len() < 2 {
+                return fail(
+                    &format!("{path}.sites"),
+                    "spatial tendon must have ≥ 2 sites",
+                );
+            }
+            let mut sites: Vec<SpatialTendonSite> = Vec::with_capacity(sites_arr.len());
+            for (i, sv) in sites_arr.iter().enumerate() {
+                let sp = format!("{path}.sites[{i}]");
+                let sfields = get_object(sv, &sp)?;
+                reject_unknown(sfields, &["link", "position"], &sp)?;
+                let link = if let Some(lv) = optional(sfields, "link") {
+                    let ln = get_str(lv, &format!("{sp}.link"))?;
+                    if ln == "world" {
+                        None
+                    } else {
+                        Some(links_by_name[tidx].get(ln).copied().ok_or_else(|| {
+                            ModelError::new(
+                                format!("{sp}.link"),
+                                format!("unknown link \"{ln}\" in tree \"{tn}\""),
+                            )
+                        })?)
+                    }
+                } else {
+                    None
+                };
+                let position_local = parse_vec3(
+                    required(sfields, "position", &sp)?,
+                    &format!("{sp}.position"),
+                )?;
+                sites.push(SpatialTendonSite {
+                    link,
+                    position_local,
+                });
+            }
+            let n_segments = sites.len() - 1;
+            let mut wraps: Vec<Option<WrapSphere>> = vec![None; n_segments];
+            if let Some(wv) = optional(fields, "wraps") {
+                let warr = get_array(wv, &format!("{path}.wraps"))?;
+                for (i, wv) in warr.iter().enumerate() {
+                    let wp = format!("{path}.wraps[{i}]");
+                    let wf = get_object(wv, &wp)?;
+                    reject_unknown(
+                        wf,
+                        &["segment", "kind", "link", "center", "radius", "side_hint"],
+                        &wp,
+                    )?;
+                    // `kind` is optional; defaults to "sphere". Cylinder /
+                    // pulley loudly rejected — no silent ignore.
+                    let kind = optional(wf, "kind")
+                        .map(|v| get_str(v, &format!("{wp}.kind")))
+                        .transpose()?
+                        .unwrap_or("sphere");
+                    match kind {
+                        "sphere" => {}
+                        "cylinder" => {
+                            return fail(
+                                &format!("{wp}.kind"),
+                                "cylinder wrap is deferred in v2 tier 3 (see docs/tendons.md); \
+                                 use \"sphere\"",
+                            );
+                        }
+                        "pulley" => {
+                            return fail(
+                                &format!("{wp}.kind"),
+                                "pulley wrap is deferred in v2 tier 3 (see docs/tendons.md)",
+                            );
+                        }
+                        other => {
+                            return fail(
+                                &format!("{wp}.kind"),
+                                format!("unknown wrap kind \"{other}\" (only \"sphere\")"),
+                            );
+                        }
+                    }
+                    let seg_idx =
+                        get_f32(required(wf, "segment", &wp)?, &format!("{wp}.segment"))? as usize;
+                    if seg_idx >= n_segments {
+                        return fail(
+                            &format!("{wp}.segment"),
+                            format!("wrap segment {seg_idx} out of range (0..{n_segments})"),
+                        );
+                    }
+                    let link = if let Some(lv) = optional(wf, "link") {
+                        let ln = get_str(lv, &format!("{wp}.link"))?;
+                        if ln == "world" {
+                            None
+                        } else {
+                            Some(links_by_name[tidx].get(ln).copied().ok_or_else(|| {
+                                ModelError::new(
+                                    format!("{wp}.link"),
+                                    format!("unknown link \"{ln}\" in tree \"{tn}\""),
+                                )
+                            })?)
+                        }
+                    } else {
+                        None
+                    };
+                    let center_local =
+                        parse_vec3(required(wf, "center", &wp)?, &format!("{wp}.center"))?;
+                    let radius = get_f32(required(wf, "radius", &wp)?, &format!("{wp}.radius"))?;
+                    if radius <= 0.0 {
+                        return fail(&format!("{wp}.radius"), "radius must be > 0");
+                    }
+                    let side_hint_world = optional(wf, "side_hint")
+                        .map(|v| parse_vec3(v, &format!("{wp}.side_hint")))
+                        .transpose()?;
+                    wraps[seg_idx] = Some(WrapSphere {
+                        link,
+                        center_local,
+                        radius,
+                        side_hint_world,
+                    });
+                }
+            }
+            let mut t = Tendon::spatial(sites, wraps);
+            parse_common(&mut t)?;
+            t
+        }
+        other => {
+            return fail(
+                &format!("{path}.kind"),
+                format!("unknown tendon kind \"{other}\"; expected fixed | spatial"),
+            );
+        }
+    };
+    Ok((name, tidx, tendon))
 }
 
 // ---------------------------------------------------------------------------

@@ -186,6 +186,24 @@ fn tolerance(name: &str) -> Tolerance {
             qpos: 6.0e-4,
             qvel: 3.0e-3,
         },
+        // v2 tier 3 (tendons): the tendon Jacobian is a linear map on
+        // qdot in both engines and the passive spring/damper enters
+        // through Jᵀ identically. Divergence should sit at f32-quant
+        // scale — a mapping bug (wrong sign, dropped chain-rule) would
+        // blow this by orders. Bounds ~2× observation.
+        // Observed max qpos 5.60e-8, qvel 3.65e-7.
+        "tendon_coupled" => Tolerance {
+            qpos: 2.0e-7,
+            qvel: 1.0e-6,
+        },
+        // Observed max qpos 1.26e-7, qvel 1.35e-6 — the wrap-arc math
+        // adds one atan2 and two asin, giving a modest f32-quant
+        // inflation over the fixed-tendon path but still well below
+        // any semantic-mismatch threshold.
+        "tendon_wrap" => Tolerance {
+            qpos: 3.0e-7,
+            qvel: 3.0e-6,
+        },
         other => panic!("no tolerance for scenario {other:?}"),
     }
 }
@@ -1272,4 +1290,16 @@ fn differential_velocity_cartpole() {
 fn differential_filtered_motor_pendulum() {
     let d = run_scenario(&scenario("filtered_motor_pendulum"));
     assert_within_tolerance("filtered_motor_pendulum", &d);
+}
+
+#[test]
+fn differential_tendon_coupled() {
+    let d = run_scenario(&scenario("tendon_coupled"));
+    assert_within_tolerance("tendon_coupled", &d);
+}
+
+#[test]
+fn differential_tendon_wrap() {
+    let d = run_scenario(&scenario("tendon_wrap"));
+    assert_within_tolerance("tendon_wrap", &d);
 }

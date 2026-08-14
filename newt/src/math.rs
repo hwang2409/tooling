@@ -139,6 +139,116 @@ pub fn abs(x: f32) -> f32 {
     f32::from_bits(x.to_bits() & 0x7fff_ffff)
 }
 
+/// Deterministic arcsine on `[-1, 1]`. Range-clamps out-of-domain arguments
+/// to the endpoints (returns `±π/2` for `|x| ≥ 1`) so a marginally-rounded
+/// dot product doesn't NaN us.
+///
+/// Implementation: for `|x| ≤ 0.5`, evaluate the plain Taylor series
+/// truncated at `x^13`. For `|x| > 0.5`, use the identity
+/// `asin(x) = π/2 − 2·asin(√((1 − x)/2))` (Abramowitz & Stegun 4.4.32) to
+/// fold the argument into `[0, 0.5]` before applying the same polynomial.
+/// Max error ~5e-7 on `[-1, 1]`. Uses only `+ − * / sqrt`.
+pub fn asin(x: f32) -> f32 {
+    // Clamp domain. `asin` diverges outside `[-1, 1]` — clip to the
+    // endpoints so a caller supplying a dot product that overshoots
+    // 1.0 by a ULP still gets a sensible ±π/2 instead of NaN.
+    let clipped = x.clamp(-1.0, 1.0);
+    let sign = if clipped < 0.0 { -1.0 } else { 1.0 };
+    let ax = abs(clipped);
+    // Split at 0.5. For ax ∈ [0, 0.5] the Taylor series through x^13 has
+    // error ≲ (231/13312)·0.5^13 · (residual factor) ≈ 5e-7.
+    if ax <= 0.5 {
+        sign * asin_poly_small(ax)
+    } else {
+        // t = √((1 − ax)/2). ax ∈ (0.5, 1] → t ∈ [0, 0.5].
+        let t = ((1.0 - ax) * 0.5).sqrt();
+        sign * (FRAC_PI_2 - 2.0 * asin_poly_small(t))
+    }
+}
+
+/// asin polynomial on `[0, 0.5]` — plain Taylor `asin(x) = x + Σ_{k≥1}
+/// C(2k,k)/(4^k·(2k+1))·x^(2k+1)` truncated after `x^13`. On this
+/// interval the truncation error stays ≲ 5e-7.
+#[inline]
+fn asin_poly_small(x: f32) -> f32 {
+    let x2 = x * x;
+    // Coefficients — Taylor:
+    //   c1 = 1/6         = 0.166_666_67
+    //   c2 = 3/40        = 0.075
+    //   c3 = 5/112       = 0.044_642_857
+    //   c4 = 35/1152     = 0.030_381_944
+    //   c5 = 63/2816     = 0.022_372_159
+    //   c6 = 231/13312   = 0.017_352_764
+    let c1 = 1.0 / 6.0;
+    let c2 = 3.0 / 40.0;
+    let c3 = 5.0 / 112.0;
+    let c4 = 35.0 / 1152.0;
+    let c5 = 63.0 / 2816.0;
+    let c6 = 231.0 / 13312.0;
+    x * (1.0 + x2 * (c1 + x2 * (c2 + x2 * (c3 + x2 * (c4 + x2 * (c5 + x2 * c6))))))
+}
+
+/// Deterministic four-quadrant arctangent `atan2(y, x) ∈ (−π, π]`.
+///
+/// Two-stage reduction:
+/// 1. Octant fold — divide the smaller magnitude by the larger so the
+///    reduced argument `t = min(|y|, |x|) / max(|y|, |x|) ∈ [0, 1]`.
+/// 2. Near-π/4 fold — for `t > tan(π/8) ≈ 0.414`, use `atan(t) = π/4 +
+///    atan((t − 1)/(t + 1))` so the polynomial input is `≤ tan(π/8)`.
+///
+/// The polynomial is then a plain Taylor series through `t^11`, accurate
+/// to ~5e-7 on `[0, tan(π/8)]`. `atan2(0, 0)` returns `0` (documented
+/// convention; matches most libm implementations).
+pub fn atan2(y: f32, x: f32) -> f32 {
+    if x == 0.0 && y == 0.0 {
+        return 0.0;
+    }
+    let ax = abs(x);
+    let ay = abs(y);
+    let (t, swap) = if ay <= ax {
+        (ay / ax, false)
+    } else {
+        (ax / ay, true)
+    };
+    const TAN_PI_8: f32 = 0.414_213_57; // tan(π/8)
+    let (base, tt) = if t <= TAN_PI_8 {
+        (0.0, t)
+    } else {
+        (FRAC_PI_4, (t - 1.0) / (t + 1.0))
+    };
+    let atan_reduced = base + atan_poly_small(tt);
+    let atan_abs = if swap {
+        FRAC_PI_2 - atan_reduced
+    } else {
+        atan_reduced
+    };
+    if x > 0.0 {
+        if y >= 0.0 { atan_abs } else { -atan_abs }
+    } else {
+        // x < 0 (x == 0 was handled by the swap: |y| > |x| = 0 puts atan_abs = π/2).
+        if y >= 0.0 {
+            PI - atan_abs
+        } else {
+            atan_abs - PI
+        }
+    }
+}
+
+/// atan polynomial on `[-tan(π/8), tan(π/8)]`. Plain Taylor
+/// `atan(t) = t − t³/3 + t⁵/5 − t⁷/7 + t⁹/9 − t¹¹/11`. Interval
+/// endpoint magnitude ≈ 0.414; residual after `t^11` is
+/// `t^13/13 ≈ 4.4e-7`.
+#[inline]
+fn atan_poly_small(t: f32) -> f32 {
+    let t2 = t * t;
+    let a1 = -1.0 / 3.0;
+    let a2 = 1.0 / 5.0;
+    let a3 = -1.0 / 7.0;
+    let a4 = 1.0 / 9.0;
+    let a5 = -1.0 / 11.0;
+    t * (1.0 + t2 * (a1 + t2 * (a2 + t2 * (a3 + t2 * (a4 + t2 * a5)))))
+}
+
 // ---------------------------------------------------------------------------
 // Vec3
 // ---------------------------------------------------------------------------
@@ -633,6 +743,92 @@ mod tests {
         let sqrt3_over_2 = (3.0_f32).sqrt() / 2.0;
         assert!(abs(sin(PI / 6.0) - half) < 1.0e-6);
         assert!(abs(cos(PI / 6.0) - sqrt3_over_2) < 1.0e-6);
+    }
+
+    #[test]
+    fn asin_boundaries_and_symmetry() {
+        // asin(0) = 0, asin(±1) = ±π/2.
+        assert!(abs(asin(0.0)) < 1.0e-6);
+        assert!(abs(asin(1.0) - FRAC_PI_2) < 2.0e-6);
+        assert!(abs(asin(-1.0) + FRAC_PI_2) < 2.0e-6);
+        // Odd function: asin(-x) = -asin(x).
+        for i in -9..=9 {
+            let x = (i as f32) * 0.1;
+            assert!(abs(asin(x) + asin(-x)) < 2.0e-6, "asin odd fails at {x}");
+        }
+    }
+
+    #[test]
+    fn asin_round_trip_matches_sin() {
+        // sin(asin(x)) == x within f32 accuracy.
+        for i in -19..=19 {
+            let x = (i as f32) * 0.05;
+            let back = sin(asin(x));
+            assert!(
+                abs(back - x) < 3.0e-6,
+                "asin round-trip at {x}: back={back}"
+            );
+        }
+    }
+
+    #[test]
+    fn asin_domain_clip_returns_finite() {
+        // Values just past 1 (dot-product rounding) must return finite ±π/2, not NaN.
+        assert!(abs(asin(1.0000001) - FRAC_PI_2) < 5.0e-6);
+        assert!(abs(asin(-1.0000001) + FRAC_PI_2) < 5.0e-6);
+        assert!(asin(2.0) == FRAC_PI_2);
+        assert!(asin(-2.0) == -FRAC_PI_2);
+    }
+
+    #[test]
+    fn atan2_hits_cardinal_directions() {
+        // (x=+1, y=0)  → 0
+        // (x=0,  y=+1) → π/2
+        // (x=-1, y=0)  → π
+        // (x=0,  y=-1) → -π/2
+        assert!(abs(atan2(0.0, 1.0)) < 1.0e-6);
+        assert!(abs(atan2(1.0, 0.0) - FRAC_PI_2) < 2.0e-6);
+        assert!(abs(atan2(0.0, -1.0) - PI) < 2.0e-6);
+        assert!(abs(atan2(-1.0, 0.0) + FRAC_PI_2) < 2.0e-6);
+        // atan2(0, 0) documented as 0.
+        assert_eq!(atan2(0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn atan2_matches_atan_ratio_in_first_quadrant() {
+        // For (x>0, y≥0), atan2(y, x) == atan(y/x). Compare against tan()
+        // by round-tripping: tan(atan2(y, x)) ≈ y/x when x > 0.
+        for iy in 0..=8 {
+            for ix in 1..=8 {
+                let y = iy as f32 * 0.13;
+                let x = ix as f32 * 0.19;
+                let a = atan2(y, x);
+                let back = tan(a);
+                assert!(
+                    abs(back - y / x) < 2.0e-5,
+                    "atan2({y}, {x})={a}, tan(a)={back}, y/x={}",
+                    y / x,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn atan2_quadrants() {
+        // Verify signs / magnitudes in all four quadrants by sin/cos identity.
+        for angle_i in -18..=18 {
+            let angle = (angle_i as f32) * 0.15;
+            let x = cos(angle);
+            let y = sin(angle);
+            let a = atan2(y, x);
+            // atan2 return is in (-π, π]; angle is in (-2.85, 2.85) here,
+            // which straddles the branch cut only for angle near ±π.
+            let diff = abs(a - angle);
+            let wrapped = abs(a - angle + 2.0 * PI);
+            let wrapped2 = abs(a - angle - 2.0 * PI);
+            let best = diff.min(wrapped).min(wrapped2);
+            assert!(best < 3.0e-5, "atan2 mismatch at angle {angle}: got {a}");
+        }
     }
 
     #[test]

@@ -1,0 +1,29 @@
+<!-- Differential scenario: hanging mass on a slide joint, spatial tendon
+  from a world anchor over a fixed sphere wrap to a site on the slide's
+  mass. Newt's wrap-arc geometry + envelope-theorem Jacobian must match
+  MuJoCo's over a short horizon. Damping is generous so the transient
+  settles quickly. -->
+<mujoco model="tendon_wrap">
+  <compiler angle="radian"/>
+  <option timestep="0.005" gravity="0 0 -9.81"
+          integrator="RK4" solver="PGS" cone="pyramidal" iterations="20"/>
+  <worldbody>
+    <body name="rig" pos="0 0 0">
+      <inertial pos="0 0 0" mass="1.0" diaginertia="1.0 1.0 1.0"/>
+      <geom name="wrap_sphere" type="sphere" size="0.3" pos="0.5 0 -0.4"/>
+      <site name="anchor" pos="0 0 0"/>
+      <body name="mass" pos="1.0 0 -0.9">
+        <inertial pos="0 0 0" mass="1.0" diaginertia="1e-3 1e-3 1e-3"/>
+        <joint name="lift" type="slide" axis="0 0 -1" pos="0 0 0" damping="4.0"/>
+        <site name="attach" pos="0 0 0"/>
+      </body>
+    </body>
+  </worldbody>
+  <tendon>
+    <spatial name="cable" springlength="1.5" stiffness="200" damping="10">
+      <site site="anchor"/>
+      <geom geom="wrap_sphere"/>
+      <site site="attach"/>
+    </spatial>
+  </tendon>
+</mujoco>

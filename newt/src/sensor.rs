@@ -174,6 +174,12 @@ pub enum SensorKind {
     /// Interaction torque at the child link's parent-joint connection,
     /// reported at the joint anchor in the child body frame.
     Torque { tree: usize, link: usize },
+    /// Tendon length `L` — one scalar per sensor. Consumes
+    /// [`crate::tendon::tendon_kinematics`] on the referenced tendon at
+    /// the post-step state.
+    TendonPos { tree: usize, tendon: usize },
+    /// Tendon rate `Ldot` — one scalar per sensor.
+    TendonVel { tree: usize, tendon: usize },
 }
 
 impl SensorKind {
@@ -182,7 +188,9 @@ impl SensorKind {
         match self {
             SensorKind::JointPos { .. }
             | SensorKind::JointVel { .. }
-            | SensorKind::Touch { .. } => 1,
+            | SensorKind::Touch { .. }
+            | SensorKind::TendonPos { .. }
+            | SensorKind::TendonVel { .. } => 1,
             SensorKind::BallAngVel { .. }
             | SensorKind::FramePos(_)
             | SensorKind::Gyro(_)
@@ -264,6 +272,22 @@ impl Sensor {
                         "force/torque sensor requires a non-root link (needs a parent joint)"
                             .to_string(),
                     ));
+                }
+                Ok(())
+            }
+            SensorKind::TendonPos { tree, tendon } | SensorKind::TendonVel { tree, tendon } => {
+                if *tree >= trees.len() {
+                    return Err(SensorError(format!(
+                        "tendon sensor tree {tree} out of range ({} trees)",
+                        trees.len()
+                    )));
+                }
+                if *tendon >= trees[*tree].tendons.len() {
+                    return Err(SensorError(format!(
+                        "tendon sensor: tendon index {tendon} out of range for tree {tree} \
+                         ({} tendons)",
+                        trees[*tree].tendons.len()
+                    )));
                 }
                 Ok(())
             }
@@ -583,6 +607,18 @@ pub fn evaluate(bank: &mut SensorBank, inputs: &SensorInputs<'_>) {
                 out[0] = tau_joint.x;
                 out[1] = tau_joint.y;
                 out[2] = tau_joint.z;
+            }
+            SensorKind::TendonPos { tree, tendon } => {
+                let t = &inputs.trees[*tree];
+                let kin =
+                    crate::tendon::tendon_kinematics(&t.tendons[*tendon], t, &tree_poses[*tree]);
+                out[0] = kin.length;
+            }
+            SensorKind::TendonVel { tree, tendon } => {
+                let t = &inputs.trees[*tree];
+                let kin =
+                    crate::tendon::tendon_kinematics(&t.tendons[*tendon], t, &tree_poses[*tree]);
+                out[0] = kin.velocity;
             }
         }
     }

@@ -101,6 +101,22 @@
       "stride": 20,
       "actuator_targets": {"filtered_motor": 0.7},
       "horizon_note": "2.0 s filtered-motor step response (ctrl=0.7 through a tau=0.05 activation filter). Validates v2 tier-2 activation dynamics (dyntype=filter). Bounded divergence expected because newt uses forward Euler on activation vs MuJoCo's RK4."
+    },
+    {
+      "name": "tendon_coupled",
+      "mjcf": "tendon_coupled.xml",
+      "n_steps": 400,
+      "stride": 20,
+      "init_qpos": [0.4, -0.15],
+      "horizon_note": "2.0 s two-pendulum fixed-tendon coupling under gravity. Validates v2 tier-3 fixed-tendon length + Jacobian + passive-spring Jᵀ distribution."
+    },
+    {
+      "name": "tendon_wrap",
+      "mjcf": "tendon_wrap.xml",
+      "n_steps": 400,
+      "stride": 20,
+      "init_qpos": [0.4],
+      "horizon_note": "2.0 s hanging mass on a spatial tendon wrapping a sphere. Validates v2 tier-3 site position Jacobian + sphere-wrap tangent-arc geometry + envelope-theorem force distribution."
     }
   ]
 }

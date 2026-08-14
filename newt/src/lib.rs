@@ -59,6 +59,14 @@
 //!   the [`World`], evaluated after each `step` into a flat deterministic
 //!   `sensordata` vector, no perturbation to the simulation state. See
 //!   `docs/sensors.md`.
+//! - **v2 tier 3** (`tendon`) — fixed and spatial tendons with sphere
+//!   wrap. Fixed tendons sum scalar joint coordinates; spatial tendons
+//!   chain sites with the envelope-theorem Jacobian. Passive springs
+//!   / dampers feed the tree's `tau` via `Jᵀ · F` inside ABA. PGS
+//!   solver rows enforce length limits per tendon; actuators may
+//!   target a tendon (motor / general etc.) with the same transmission-
+//!   space convention as joint transmissions. Cylinder wrap and pulley
+//!   branches are rejected loudly at load time. See `docs/tendons.md`.
 
 pub mod actuator;
 pub mod body;
@@ -74,6 +82,7 @@ pub mod model;
 pub mod sensor;
 pub mod solver;
 pub mod spatial;
+pub mod tendon;
 pub mod tree;
 pub mod world;
 pub mod xml;

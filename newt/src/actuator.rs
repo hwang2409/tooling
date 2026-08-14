@@ -153,11 +153,26 @@ pub enum ActuatorFlavor {
     },
 }
 
-/// One actuator attached to a 1-DOF joint (hinge or slide) in a tree.
+/// One actuator attached to a 1-DOF joint (hinge or slide) OR to a tendon
+/// in the containing tree.
+///
+/// `link_idx` selects the joint slot when `tendon_target` is `None` (the
+/// v2-tier-2 default). When `tendon_target` is `Some(i)`, the actuator
+/// drives tendon `i` on the tree — see [`crate::tendon`] for the tendon
+/// transmission model. In tendon mode, `link_idx` is unused (kept in the
+/// struct so the layout stays `Copy`; the JSON loader sets it to 0).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Actuator {
-    /// Link index in the containing tree. Must reference a hinge or slide.
+    /// Link index in the containing tree. Must reference a hinge or
+    /// slide WHEN `tendon_target` is `None` (joint-transmission mode).
+    /// Ignored in tendon-transmission mode.
     pub link_idx: usize,
+    /// Tendon-transmission target: `Some(i)` = drive
+    /// `tree.tendons[i]`; `None` = joint transmission on `link_idx`.
+    /// Introduced in v2 tier 3 (tendons). All existing constructors
+    /// leave this as `None`, keeping the joint-transmission path
+    /// bit-for-bit identical.
+    pub tendon_target: Option<usize>,
     /// How torque is computed from `(len, vel, ctrl, act)`.
     pub flavor: ActuatorFlavor,
     /// Activation-dynamics shape.
@@ -192,6 +207,7 @@ impl Actuator {
         assert!(kv >= 0.0, "position kv must be >= 0");
         Self {
             link_idx,
+            tendon_target: None,
             flavor: ActuatorFlavor::Position { kp, kv },
             dyn_type: DynType::None,
             dyn_prm: [0.0],
@@ -222,6 +238,7 @@ impl Actuator {
         assert!(kv >= 0.0, "velocity kv must be >= 0");
         Self {
             link_idx,
+            tendon_target: None,
             flavor: ActuatorFlavor::Velocity { kv },
             dyn_type: DynType::None,
             dyn_prm: [0.0],
@@ -236,6 +253,7 @@ impl Actuator {
     pub fn motor(link_idx: usize, gear: f32, force_range: f32) -> Self {
         Self {
             link_idx,
+            tendon_target: None,
             flavor: ActuatorFlavor::Motor { gear },
             dyn_type: DynType::None,
             dyn_prm: [0.0],
@@ -278,6 +296,7 @@ impl Actuator {
         }
         Self {
             link_idx,
+            tendon_target: None,
             flavor: ActuatorFlavor::General {
                 gain_type,
                 gain_prm,
@@ -292,6 +311,26 @@ impl Actuator {
             ctrl: 0.0,
             act: 0.0,
         }
+    }
+
+    // ---- tendon-transmission builder ---------------------------------
+
+    /// Retarget a joint-mode actuator at a tendon. Consumes `self` and
+    /// returns the retargeted actuator. `link_idx` becomes unused (set to
+    /// 0 in the returned struct) — the actuator's scalar force is
+    /// distributed through the tendon's Jacobian by
+    /// [`crate::tendon::accumulate_tendon_actuator_qfrc`] instead of
+    /// entering the ABA per-link `tau_scalar`.
+    ///
+    /// The evaluation model is unchanged: `(len, vel)` passed to
+    /// [`Actuator::torque`] become the tendon length and velocity (in
+    /// transmission space — MuJoCo semantics). For a motor tendon
+    /// actuator, `torque = gear * ctrl` and the resulting scalar force
+    /// pulls both endpoints in via the length-gradient.
+    pub fn on_tendon(mut self, tendon_idx: usize) -> Self {
+        self.tendon_target = Some(tendon_idx);
+        self.link_idx = 0;
+        self
     }
 
     // ---- evaluation ---------------------------------------------------

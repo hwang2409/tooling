@@ -1500,22 +1500,23 @@ use crate::dynamics::{cholesky, cholesky_solve, mass_matrix};
 use crate::joint::JointKind;
 use crate::tree::Tree;
 
-/// One assembled tree-space row. Both limits and joint-coupling
-/// equalities reduce to a sparse row on the tree's `nv` velocity vector:
-/// a limit has one non-zero component (`+1` at the limited DOF's slot,
-/// negated for the high side); a coupling has two (`+1` at `v_slot_a`,
-/// `-k` at `v_slot_b`, where `k = c1 + 2·c2·q_b` — the derivative of the
-/// polynomial constraint). Storing them uniformly lets one PGS sweep
-/// handle both.
+/// One assembled tree-space row. Joint limits, joint-coupling equalities,
+/// AND tendon length limits all reduce to a sparse row on the tree's `nv`
+/// velocity vector:
 ///
-/// `sparse_coeffs` is at most two `(slot, coeff)` pairs; the second is
-/// zero for a plain limit row.
-#[derive(Clone, Copy, Debug)]
+/// - Joint limit: 1 non-zero (`±1` at the limited DOF's slot).
+/// - Joint coupling: 2 non-zeros (`+1` at `v_slot_a`, `-k` at `v_slot_b`,
+///   with `k = c1 + 2·c2·q_b` — the derivative of the polynomial
+///   constraint).
+/// - Tendon length limit: potentially many non-zeros — the tendon's
+///   Jacobian row `dL/dqdot` (or its negation on the high side).
+///
+/// Storing them uniformly lets one PGS sweep handle all three.
+#[derive(Clone, Debug)]
 struct TreeRow {
-    /// Two (slot, coefficient) pairs. For a limit only the first is
-    /// populated; the second slot is set equal to the first and its
-    /// coefficient is 0.0 (a no-op in dot products).
-    sparse_coeffs: [(u32, f32); 2],
+    /// Sparse `(v_slot, coefficient)` entries. Joint limits have length
+    /// 1, couplings length 2, tendon limits variable.
+    sparse_coeffs: Vec<(u32, f32)>,
     /// Signed violation `r` (rad, m, or polynomial residual). For limits
     /// this is always ≥ 0 (the row is only added when active); for
     /// couplings the value is signed.
@@ -1537,17 +1538,21 @@ enum TreeRowProjection {
 impl TreeRow {
     /// `J · qdot` for this row (scalar constraint velocity).
     fn dot_qdot(&self, qdot: &[f32]) -> f32 {
-        let (s0, c0) = self.sparse_coeffs[0];
-        let (s1, c1) = self.sparse_coeffs[1];
-        c0 * qdot[s0 as usize] + c1 * qdot[s1 as usize]
+        let mut s = 0.0f32;
+        for &(slot, coeff) in &self.sparse_coeffs {
+            s += coeff * qdot[slot as usize];
+        }
+        s
     }
 
     /// `e_i · d_j` — the dense `A_ij` entry, computed sparsely from this
     /// row's coefficients and the response vector `d_j` for row `j`.
     fn dot_response(&self, d_vec: &[f32]) -> f32 {
-        let (s0, c0) = self.sparse_coeffs[0];
-        let (s1, c1) = self.sparse_coeffs[1];
-        c0 * d_vec[s0 as usize] + c1 * d_vec[s1 as usize]
+        let mut s = 0.0f32;
+        for &(slot, coeff) in &self.sparse_coeffs {
+            s += coeff * d_vec[slot as usize];
+        }
+        s
     }
 }
 
@@ -1610,6 +1615,42 @@ pub fn tree_coupling_jacobian_probe(
         .collect()
 }
 
+/// A tendon-row probe — one entry per active length-limit row. Mirrors
+/// [`CouplingRowProbe`]: exposes the sparse Jacobian assembled by
+/// [`build_tree_solver_rows`] so hand-derivation tests can pin the row
+/// against a `dL/dqdot` reference and detect a chain-rule mutant.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TendonRowProbe {
+    /// Sparse `(v_slot, coefficient)` entries after the escape-convention
+    /// flip (`+f impulse` reduces `violation`). Copy of the live row.
+    pub sparse_coeffs: Vec<(u32, f32)>,
+    /// Magnitude of the length violation (always ≥ 0).
+    pub violation: f32,
+    /// SolRef the row uses.
+    pub solref: SolRef,
+}
+
+/// One [`TendonRowProbe`] per active tendon length-limit row on `tree`.
+/// Empty when no tendon range is violated.
+pub fn tree_tendon_row_probe(tree: &Tree) -> Vec<TendonRowProbe> {
+    build_tree_solver_rows(tree, 0, &[])
+        .into_iter()
+        .filter_map(|row| {
+            // Tendon rows are non-negative (like limits) and can have >2
+            // sparse entries — pure joint limits have exactly 1.
+            if row.projection != TreeRowProjection::NonNegative || row.sparse_coeffs.len() < 2 {
+                None
+            } else {
+                Some(TendonRowProbe {
+                    sparse_coeffs: row.sparse_coeffs.clone(),
+                    violation: row.violation,
+                    solref: row.solref,
+                })
+            }
+        })
+        .collect()
+}
+
 /// Assemble the tree-space PGS rows for one tree: active hinge / slide
 /// range limits, followed by joint-coupling equalities in declaration
 /// order. The row structure (sparse coefficients, signed-residual
@@ -1642,7 +1683,7 @@ fn build_tree_solver_rows(tree: &Tree, tree_idx: usize, equalities: &[Equality])
         let q = tree.q[tree.q_offset[li]];
         if q < lo {
             rows.push(TreeRow {
-                sparse_coeffs: [(v_slot, 1.0), (v_slot, 0.0)],
+                sparse_coeffs: vec![(v_slot, 1.0)],
                 violation: lo - q,
                 solref: per_joint_solref,
                 solimp: per_joint_solimp,
@@ -1650,7 +1691,7 @@ fn build_tree_solver_rows(tree: &Tree, tree_idx: usize, equalities: &[Equality])
             });
         } else if q > hi {
             rows.push(TreeRow {
-                sparse_coeffs: [(v_slot, -1.0), (v_slot, 0.0)],
+                sparse_coeffs: vec![(v_slot, -1.0)],
                 violation: q - hi,
                 solref: per_joint_solref,
                 solimp: per_joint_solimp,
@@ -1706,12 +1747,69 @@ fn build_tree_solver_rows(tree: &Tree, tree_idx: usize, equalities: &[Equality])
         let r_signed = q_a - (c0 + c1 * q_b + c2 * q_b * q_b);
         let flip = if r_signed >= 0.0 { -1.0 } else { 1.0 };
         rows.push(TreeRow {
-            sparse_coeffs: [(slot_a, 1.0 * flip), (slot_b, -k * flip)],
+            sparse_coeffs: vec![(slot_a, flip), (slot_b, -k * flip)],
             violation: r_signed.abs(),
             solref: *solref,
             solimp: *solimp,
             projection: TreeRowProjection::Bilateral,
         });
+    }
+    // Tendon length limits (v2 tier 3). Iterate tendons in declaration
+    // order — one row per active violation (low OR high side). The row's
+    // Jacobian is the tendon's `dL/dqdot` (or its negation on the high
+    // side so `+f impulse` reduces the violation in escape convention).
+    // Per-tendon solref/solimp are threaded (NEWT-9 lesson: a defaulted
+    // solref masks per-tendon tuning).
+    if !tree.tendons.is_empty() {
+        let poses = crate::tree::forward_kinematics(tree);
+        for tendon in &tree.tendons {
+            let Some((lo, hi)) = tendon.range else {
+                continue;
+            };
+            let per_solref = tendon.limit_solref.unwrap_or(SolRef::DEFAULT);
+            let per_solimp = tendon.limit_solimp.unwrap_or(SolImp::DEFAULT);
+            let kin = crate::tendon::tendon_kinematics(tendon, tree, &poses);
+            if kin.length < lo {
+                // Compress Jacobian into sparse (skip zeros so the PGS
+                // Cholesky solve doesn't pay for a dense vector).
+                let sparse: Vec<(u32, f32)> = kin
+                    .jacobian
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &c)| c != 0.0)
+                    .map(|(i, &c)| (i as u32, c))
+                    .collect();
+                if !sparse.is_empty() {
+                    rows.push(TreeRow {
+                        sparse_coeffs: sparse,
+                        violation: lo - kin.length,
+                        solref: per_solref,
+                        solimp: per_solimp,
+                        projection: TreeRowProjection::NonNegative,
+                    });
+                }
+            } else if kin.length > hi {
+                // High side: negate the Jacobian entries so `+f` reduces
+                // `L` (equivalent to the `-1` sign on a high-side joint
+                // limit row).
+                let sparse: Vec<(u32, f32)> = kin
+                    .jacobian
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &c)| c != 0.0)
+                    .map(|(i, &c)| (i as u32, -c))
+                    .collect();
+                if !sparse.is_empty() {
+                    rows.push(TreeRow {
+                        sparse_coeffs: sparse,
+                        violation: kin.length - hi,
+                        solref: per_solref,
+                        solimp: per_solimp,
+                        projection: TreeRowProjection::NonNegative,
+                    });
+                }
+            }
+        }
     }
     rows
 }
@@ -1766,7 +1864,7 @@ pub fn solve_tree_limits(
     let mut d_vecs: Vec<Vec<f32>> = Vec::with_capacity(n_rows);
     for row in &rows {
         let mut e = vec![0.0f32; nv];
-        for (slot, coeff) in row.sparse_coeffs {
+        for &(slot, coeff) in &row.sparse_coeffs {
             if coeff != 0.0 {
                 e[slot as usize] += coeff;
             }
@@ -1848,7 +1946,7 @@ pub fn solve_tree_limits(
     // (impulse/dt). Row's J^T distributes over its sparse coefficients.
     for (i, row) in rows.iter().enumerate() {
         let f_dt = f[i] / dt;
-        for (slot, coeff) in row.sparse_coeffs {
+        for &(slot, coeff) in &row.sparse_coeffs {
             if coeff != 0.0 {
                 qfrc[slot as usize] += coeff * f_dt;
             }
