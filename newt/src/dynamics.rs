@@ -34,6 +34,14 @@
 //!   armature slot, so the top-left 6×6 block is exactly `Ic[0]` — the
 //!   composite spatial inertia of the whole tree at the root, materialized
 //!   in `Mat6` form.
+//! - The CRB pass fills each off-diagonal `(i, j)` cell and mirrors it to
+//!   `(j, i)` in the same loop iteration — so a "M is symmetric" unit check
+//!   is non-discriminating for that class of mutation. The load-bearing
+//!   anchors for CRB correctness are (a) the ABA-solve round-trip
+//!   `M · qddot ≈ τ` for a random `τ`, (b) the kinetic energy identity
+//!   `KE = ½ qdotᵀ M qdot` cross-checked against a per-link sum, and
+//!   (c) the PD-servo closed-loop response matching an independent
+//!   Lagrangian twin. Those live in `newt/tests/dynamics_crb_rne.rs`.
 //! - `h(q, qdot)` (== `bias_forces`) is `C(q, qdot) · qdot + g(q)`:
 //!   Coriolis + centrifugal + gravity torques, per Newton-Euler. Gravity
 //!   is applied as a per-link body-force `m_i · g_world` at each COM
@@ -80,6 +88,20 @@
 //!   `tree.applied_wrenches` (or set `f_ext` in ABA/RNE to sum them).
 //! - `armature` may be any value — it is on the M diagonal and RNE adds
 //!   `armature · qddot_slot` per DOF, so the identity holds.
+//!
+//! # Fixed-root gravity / external wrenches: a physical no-op
+//!
+//! For a tree whose root is `JointKind::Fixed`, the root link is pinned to
+//! the world — `nq = nv = 0` at that slot. Any body-force applied there
+//! (gravity `m_root · g`, or an external wrench passed via `f_ext[0]`) has
+//! no DOF to attribute itself to: the RNE Pass-2 walk-up terminates at the
+//! root with the accumulated wrench dropped on the floor, and `M(q)` has no
+//! root row/column for it to enter. This mirrors what MuJoCo does with
+//! `worldbody` and is not a bug — it is what a "fixed to the world" root
+//! MEANS. Users who want a floating base should use `JointKind::Free` on
+//! the root; users who want to sense the reaction wrench at a fixed base
+//! will get it from a follow-up sensor/anchor-constraint ticket, not from
+//! RNE.
 
 use crate::joint::JointKind;
 use crate::math::{Quat, Vec3};
@@ -666,5 +688,24 @@ mod tests {
         // Negative diagonal.
         let a = vec![-1.0, 0.0, 0.0, 1.0];
         assert!(cholesky(&a, 2).is_none());
+    }
+
+    /// The initial diagonal check catches a plainly non-PD matrix. This one
+    /// slips past that — every diagonal entry is +1 > 0 — but the FIRST
+    /// Schur update makes the (1, 1) pivot negative:
+    /// `A[1][1] − L[1][0]² = 1 − 2² = −3`.
+    /// A cholesky that only guarded `A[i][i] > 0` up front would sqrt a
+    /// negative and produce a NaN factor; the loop's per-row `sum <= 0`
+    /// guard is what makes this case return `None`.
+    #[test]
+    fn cholesky_rejects_negative_schur_pivot() {
+        let a = vec![
+            1.0, 2.0, //
+            2.0, 1.0,
+        ];
+        assert!(
+            cholesky(&a, 2).is_none(),
+            "matrix with positive diag but negative Schur pivot must be rejected"
+        );
     }
 }

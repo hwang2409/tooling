@@ -283,6 +283,8 @@ fn box_box_sat_uses_face_normal_when_it_wins_min_overlap() {
         solref: newt::geom::SolRef::DEFAULT,
         margin: 0.0,
         gap: 0.0,
+        condim: 3,
+        solimp: newt::solver::SolImp::DEFAULT,
     };
     let buf = narrow_phase(0, &ga, &pose_a, 1, &gb, &pose_b, &[]);
     assert!(

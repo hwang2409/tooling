@@ -41,6 +41,7 @@ use crate::geom::{
     solref_to_kc,
 };
 use crate::math::{Quat, Vec3};
+use crate::solver::{SolverConfig, SolverMode, solve_free_bodies};
 use crate::tree::{Tree, forward_kinematics as tree_forward_kinematics, rk4_step as tree_rk4_step};
 
 /// Simulation world.
@@ -66,6 +67,11 @@ pub struct World {
     /// two geoms don't share a body/link and aren't both static; the
     /// resulting order is `(min, max)` lexicographic.
     pub pair_list: Option<Vec<(usize, usize)>>,
+    /// Constraint solver configuration (v1 tier 4). Default is
+    /// [`SolverConfig::DEFAULT`] — `SolverMode::Penalty`, which keeps every
+    /// pre-v1-tier-4 golden byte-identical. Set to
+    /// `SolverMode::Pgs` to switch on the MuJoCo soft-constraint solver.
+    pub solver: SolverConfig,
     /// Cached pair-support fingerprint from the last successful validation.
     /// Encoded as `(geoms.len() << 32) | pair_list_encoded` where
     /// `pair_list_encoded` is `(pair_list.len() as u32) + 1` when
@@ -93,6 +99,7 @@ impl PartialEq for World {
             && self.geoms == other.geoms
             && self.meshes == other.meshes
             && self.pair_list == other.pair_list
+            && self.solver == other.solver
     }
 }
 
@@ -121,6 +128,7 @@ impl World {
             geoms: Vec::new(),
             meshes: Vec::new(),
             pair_list: None,
+            solver: SolverConfig::DEFAULT,
             checked_pairs: std::cell::Cell::new(0),
         }
     }
@@ -329,19 +337,37 @@ impl World {
     fn step_bodies(&mut self, pairs: &[(usize, usize)]) {
         let s0 = self.bodies.clone();
 
-        let ext1 = self.compute_wrenches(&s0, pairs);
+        // Solver mode dispatch:
+        // - `Penalty` recomputes contact wrenches at each RK4 sub-stage
+        //   (the tier-2 path, unchanged).
+        // - `Pgs` solves the constraint system ONCE at s0 and holds those
+        //   per-body wrenches constant (zero-order hold) across all four
+        //   sub-stages. See newt/docs/solver.md, "Once-per-step under RK4",
+        //   for the rationale + tradeoffs.
+        let solver_zoh: Option<Vec<(Vec3, Vec3)>> = match self.solver.mode {
+            SolverMode::Penalty => None,
+            SolverMode::Pgs => Some(self.compute_solver_wrenches(&s0, pairs)),
+        };
+        let sample_wrenches = |state: &[Body], pairs: &[(usize, usize)]| -> Vec<(Vec3, Vec3)> {
+            match &solver_zoh {
+                Some(w) => w.clone(),
+                None => self.compute_wrenches(state, pairs),
+            }
+        };
+
+        let ext1 = sample_wrenches(&s0, pairs);
         let k1 = evaluate_all(&s0, self.gravity, &ext1);
 
-        let s1 = advance_all(&s0, &s0, &k1, self.dt * 0.5);
-        let ext2 = self.compute_wrenches(&s1, pairs);
+        let s1 = advance_all(&s0, &k1, self.dt * 0.5);
+        let ext2 = sample_wrenches(&s1, pairs);
         let k2 = evaluate_all(&s1, self.gravity, &ext2);
 
-        let s2 = advance_all(&s0, &s0, &k2, self.dt * 0.5);
-        let ext3 = self.compute_wrenches(&s2, pairs);
+        let s2 = advance_all(&s0, &k2, self.dt * 0.5);
+        let ext3 = sample_wrenches(&s2, pairs);
         let k3 = evaluate_all(&s2, self.gravity, &ext3);
 
-        let s3 = advance_all(&s0, &s0, &k3, self.dt);
-        let ext4 = self.compute_wrenches(&s3, pairs);
+        let s3 = advance_all(&s0, &k3, self.dt);
+        let ext4 = sample_wrenches(&s3, pairs);
         let k4 = evaluate_all(&s3, self.gravity, &ext4);
 
         for i in 0..self.bodies.len() {
@@ -390,8 +416,14 @@ impl World {
             return;
         }
         let n_trees = self.trees.len();
+        // Snapshot scalars before we start borrowing the vector fields.
+        let dt = self.dt;
+        let gravity = self.gravity;
+        let solver_mode = self.solver.mode;
+        let solver_iterations = self.solver.iterations;
         for ti in 0..n_trees {
-            // Filter pairs to those touching this tree.
+            // Filter pairs to those touching this tree (immutable borrow
+            // of self.geoms, released before the mem::take below).
             let mut tree_pairs: Vec<(usize, usize)> = Vec::new();
             for &(a, b) in pairs {
                 let att_a = self.geoms[a].attachment();
@@ -402,17 +434,56 @@ impl World {
                     tree_pairs.push((a, b));
                 }
             }
-            // Split tree out of self so the closure below can borrow the
-            // rest.
-            let dt = self.dt;
-            let gravity = self.gravity;
+            // Move the current tree out so the closure below can borrow
+            // the rest of `self` immutably without conflicting with the
+            // `&mut tree` that tree_rk4_step wants. std::mem::take
+            // replaces the slot with `Tree::default()`; we overwrite
+            // that with the stepped tree at the end. No clone of
+            // bodies/geoms/meshes — the closure captures those as
+            // borrows, whose lifetime ends before we mutate self.trees
+            // again.
             let mut tree = std::mem::take(&mut self.trees[ti]);
-            let bodies = self.bodies.clone();
-            let geoms = self.geoms.clone();
-            let meshes = self.meshes.clone();
-            tree_rk4_step(&mut tree, gravity, dt, |t| {
-                tree_wrenches_from_contacts(t, ti, &bodies, &geoms, &meshes, &tree_pairs)
-            });
+            // Solver mode: compute per-DOF limit force ONCE at s0 and
+            // hold it constant across the RK4 stages via qfrc_applied.
+            // Preserves the pre-step qfrc_applied so user-set torques
+            // remain in effect (the solver term is added on top and
+            // subtracted back after the step). ALSO: disable the tier-3
+            // penalty limit torque for this step so the PGS constraint
+            // is the sole limit authority — mirrors how contacts already
+            // switch on solver mode.
+            let mut solver_qfrc_delta: Vec<f32> = Vec::new();
+            let prior_disable = tree.disable_penalty_limits;
+            if solver_mode == SolverMode::Pgs {
+                solver_qfrc_delta = crate::solver::solve_tree_limits(&tree, dt, solver_iterations);
+                for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
+                    tree.qfrc_applied[slot] += delta;
+                }
+                tree.disable_penalty_limits = true;
+            }
+            {
+                // Scope the immutable borrows so the closure lifetime
+                // ends before we mutate self.trees[ti] on the next line.
+                let bodies_ref = &self.bodies;
+                let geoms_ref = &self.geoms;
+                let meshes_ref = &self.meshes;
+                tree_rk4_step(&mut tree, gravity, dt, |t| {
+                    tree_wrenches_from_contacts(
+                        t,
+                        ti,
+                        bodies_ref,
+                        geoms_ref,
+                        meshes_ref,
+                        &tree_pairs,
+                    )
+                });
+            }
+            // Roll back the ZOH limit torque + penalty-limit gate so
+            // neither accumulates across steps (the solver recomputes
+            // both fresh at each step start).
+            for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
+                tree.qfrc_applied[slot] -= delta;
+            }
+            tree.disable_penalty_limits = prior_disable;
             self.trees[ti] = tree;
         }
     }
@@ -425,6 +496,44 @@ impl World {
             None => self.auto_pairs(),
         };
         collect_contacts_full(&self.bodies, &self.trees, &self.geoms, &self.meshes, &pairs)
+    }
+
+    /// Compute per-body external wrench arrays for solver mode.
+    ///
+    /// Runs the PGS solve at `state` (typically s0 — start of RK4 step) and
+    /// returns per-body `(force_world, torque_world_at_com)` to hold
+    /// constant across all four RK4 sub-stages. Contacts touching tree
+    /// links are dropped (v1-tier-4 scope: cross-tree/body contacts remain
+    /// on the penalty pathway; see newt/docs/solver.md).
+    fn compute_solver_wrenches(
+        &self,
+        state: &[Body],
+        pairs: &[(usize, usize)],
+    ) -> Vec<(Vec3, Vec3)> {
+        let n = state.len();
+        if self.geoms.is_empty() {
+            return vec![(Vec3::ZERO, Vec3::ZERO); n];
+        }
+        // Filter pairs to free-body-only ones (both sides Body or Static).
+        let mut free_pairs: Vec<(usize, usize)> = Vec::with_capacity(pairs.len());
+        for &(a, b) in pairs {
+            let att_a = self.geoms[a].attachment();
+            let att_b = self.geoms[b].attachment();
+            if matches!(att_a, GeomAttach::Link(_, _)) || matches!(att_b, GeomAttach::Link(_, _)) {
+                continue;
+            }
+            free_pairs.push((a, b));
+        }
+        let contacts = collect_contacts(state, &self.geoms, &self.meshes, &free_pairs);
+        solve_free_bodies(
+            state,
+            &self.geoms,
+            &contacts,
+            self.gravity,
+            self.dt,
+            self.solver.cone,
+            self.solver.iterations,
+        )
     }
 
     /// Compute per-body external wrench arrays for a given body-state vector.
@@ -967,13 +1076,9 @@ fn evaluate_all(states: &[Body], gravity: Vec3, ext: &[(Vec3, Vec3)]) -> Vec<Der
     out
 }
 
-/// Advance a whole slice of bodies by (from_state + deriv * dt). `origin` is
-/// the RK4 stage anchor — always `s0` in our loop.
-fn advance_all(origin: &[Body], _from: &[Body], deriv: &[Deriv], dt: f32) -> Vec<Body> {
-    // NOTE on `_from`: kept for signature symmetry; we always advance from
-    // the anchor `origin` = s0 (standard RK4). The parameter is unused today
-    // but reserved for future integrators that treat the stage state as a
-    // proper linearization point.
+/// Advance a whole slice of bodies by `origin + deriv * dt`. Used at each
+/// RK4 sub-stage with `origin = s0` (the step's start state).
+fn advance_all(origin: &[Body], deriv: &[Deriv], dt: f32) -> Vec<Body> {
     let mut out = Vec::with_capacity(origin.len());
     for (i, &state) in origin.iter().enumerate() {
         let d = deriv[i];

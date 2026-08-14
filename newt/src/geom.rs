@@ -69,6 +69,7 @@
 //! the equal-weight case.
 
 use crate::math::{Mat3, Quat, Vec3};
+use crate::solver::SolImp;
 
 /// Contact stiffness/damping parameterization, mirroring MuJoCo's `solref`.
 ///
@@ -276,6 +277,18 @@ pub struct Geom {
     /// max(a.gap, b.gap)`. Zero (default) means every detected contact
     /// applies force.
     pub gap: f32,
+    /// Contact dimensionality (v1 tier 4). `1` — frictionless (normal
+    /// force only); `3` — normal + 2 tangents (sliding friction). `4` and
+    /// `6` (torsional / rolling) are deferred to the equality-constraints
+    /// ticket. Only consulted when `world.solver.mode == Pgs`; penalty
+    /// mode always applies the pyramidal friction pathway.
+    ///
+    /// Pair rule: `min(a.condim, b.condim)` — the less-detailed cone
+    /// wins, matching MuJoCo. Default `3`.
+    pub condim: u8,
+    /// Impedance profile for the constraint solver. See [`SolImp`]. Only
+    /// consulted when `world.solver.mode == Pgs`. Default `SolImp::DEFAULT`.
+    pub solimp: SolImp,
 }
 
 /// Where a geom is attached. Convenience view over the `body`/`link` fields
@@ -322,6 +335,8 @@ impl Geom {
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
+            condim: 3,
+            solimp: SolImp::DEFAULT,
         }
     }
 
@@ -338,6 +353,8 @@ impl Geom {
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
+            condim: 3,
+            solimp: SolImp::DEFAULT,
         }
     }
 
@@ -360,6 +377,8 @@ impl Geom {
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
+            condim: 3,
+            solimp: SolImp::DEFAULT,
         }
     }
 
@@ -382,6 +401,8 @@ impl Geom {
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
+            condim: 3,
+            solimp: SolImp::DEFAULT,
         }
     }
 
@@ -404,6 +425,8 @@ impl Geom {
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
+            condim: 3,
+            solimp: SolImp::DEFAULT,
         }
     }
 
@@ -429,6 +452,8 @@ impl Geom {
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
+            condim: 3,
+            solimp: SolImp::DEFAULT,
         }
     }
 
@@ -456,6 +481,8 @@ impl Geom {
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
+            condim: 3,
+            solimp: SolImp::DEFAULT,
         }
     }
 
@@ -481,6 +508,8 @@ impl Geom {
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
+            condim: 3,
+            solimp: SolImp::DEFAULT,
         }
     }
 
@@ -502,6 +531,8 @@ impl Geom {
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
+            condim: 3,
+            solimp: SolImp::DEFAULT,
         }
     }
 
@@ -524,6 +555,8 @@ impl Geom {
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
+            condim: 3,
+            solimp: SolImp::DEFAULT,
         }
     }
 

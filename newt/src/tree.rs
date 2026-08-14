@@ -191,6 +191,16 @@ pub struct Tree {
     /// automatically on [`Tree::push_link`]. Sums with contact wrenches
     /// inside [`aba`] — no special-casing per link kind.
     pub applied_wrenches: Vec<(Vec3, Vec3)>,
+
+    /// When `true`, [`aba`] skips the tier-3 penalty limit torque
+    /// contribution for every hinge/slide range. Owned by
+    /// [`crate::world::World`], which sets this before each RK4 step when
+    /// `SolverMode::Pgs` is active so the PGS limit constraint (see
+    /// [`crate::solver::solve_tree_limits`]) is the sole limit
+    /// enforcer — mirroring how contacts already switch. Default `false`
+    /// preserves every pre-v1-tier-4 golden and any direct
+    /// [`aba`]/[`rk4_step`] caller under the penalty pathway.
+    pub disable_penalty_limits: bool,
 }
 
 impl Tree {
@@ -205,6 +215,7 @@ impl Tree {
             qfrc_applied: Vec::new(),
             actuators: Vec::new(),
             applied_wrenches: Vec::new(),
+            disable_penalty_limits: false,
         }
     }
 
@@ -848,7 +859,11 @@ pub fn aba(
                 let parent = link.parent.expect("hinge must have parent");
                 let qdot_i = tree.qdot[tree.v_offset[i]];
                 let q_i = tree.q[tree.q_offset[i]];
-                let tau_lim = joint_limit_scalar_force(q_i, qdot_i, range, limit);
+                let tau_lim = if tree.disable_penalty_limits {
+                    0.0
+                } else {
+                    joint_limit_scalar_force(q_i, qdot_i, range, limit)
+                };
                 let mut tau_act = 0.0;
                 for act in &tree.actuators {
                     if act.link_idx == i {
@@ -875,7 +890,11 @@ pub fn aba(
                 let parent = link.parent.expect("slide must have parent");
                 let qdot_i = tree.qdot[tree.v_offset[i]];
                 let q_i = tree.q[tree.q_offset[i]];
-                let tau_lim = joint_limit_scalar_force(q_i, qdot_i, range, limit);
+                let tau_lim = if tree.disable_penalty_limits {
+                    0.0
+                } else {
+                    joint_limit_scalar_force(q_i, qdot_i, range, limit)
+                };
                 let mut tau_act = 0.0;
                 for act in &tree.actuators {
                     if act.link_idx == i {

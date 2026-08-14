@@ -157,6 +157,12 @@ zero hinge axes — every branch has a dedicated unit test in
   **range** (optional `[lo, hi]`, lo < hi enforced), **damping**,
   **armature**, **limit.stiffness** / **limit.damping**. Units follow
   the DOF — hinge is rad / rad/s / N·m, slide is m / m/s / N.
+- **limit.solref** / **limit.solimp** (optional): per-limit override
+  for the PGS constraint solver — same shape as the geom-level
+  `solref` / `solimp` blocks (`{"timeconst", "dampratio"}` and
+  `{"dmin", "dmax", "width", "midpoint", "power"}` respectively).
+  Omitted → `SolRef::DEFAULT` / `SolImp::DEFAULT`. Only consulted
+  under `solver.mode = "pgs"`.
 - Ball: **damping** (isotropic angular, N·m per rad/s), **armature**
   (per-axis rotor inertia, kg·m²). **NO `range` field** — a physically
   correct 3-DOF orientation limit needs the v1 solver landing in a
@@ -221,6 +227,8 @@ lookup by name resolves to a mesh id used at runtime.
   "local_orientation": [0, 0, 0, 1],
   "friction": 0.6,
   "solref": {"timeconst": 0.02, "dampratio": 1.0},
+  "solimp": {"dmin": 0.9, "dmax": 0.95, "width": 0.001, "midpoint": 0.5, "power": 2},
+  "condim": 3,
   "margin": 0.0,
   "gap":    0.0
 }
@@ -246,9 +254,38 @@ lookup by name resolves to a mesh id used at runtime.
 - **solref** — MuJoCo-style `(timeconst, dampratio)`. Optional; default
   is `SolRef::DEFAULT` (`timeconst = 0.02`, critical damping). See
   [`docs/contacts.md`](contacts.md).
+- **solimp** — MuJoCo-style 5-parameter impedance sigmoid. Optional;
+  default is `SolImp::DEFAULT`. Only consulted when
+  `solver.mode = "pgs"`. See [`docs/solver.md`](solver.md).
+- **condim** — Contact dimensionality. `1` (frictionless) or `3`
+  (normal + 2 tangents, sliding friction). Default `3`. Values `4`
+  and `6` (torsional / rolling) are reserved and rejected. Only
+  consulted when `solver.mode = "pgs"`.
 - **margin** — MuJoCo-style contact activation zone (m), ≥ 0. Default `0`.
   See [`docs/contacts.md`](contacts.md) for semantics.
 - **gap** — MuJoCo-style force-free zone (m), ≥ 0. Default `0`.
+
+## solver (root object, optional)
+
+Optional top-level constraint-solver configuration. Omitted → defaults
+(`SolverMode::Penalty`, 20 iterations, pyramidal cone) — every
+pre-v1-tier-4 scene stays byte-identical.
+
+```json
+{
+  "solver": {
+    "mode": "pgs",
+    "iterations": 30,
+    "cone": "pyramidal"
+  }
+}
+```
+
+- **mode** — `"penalty"` (default) or `"pgs"`. See
+  [`docs/solver.md`](solver.md) for the model derivation.
+- **iterations** — positive integer, number of PGS sweeps per step
+  (no early exit — determinism). Default `20`.
+- **cone** — `"pyramidal"` (default) or `"elliptic"`.
 
 ## sites
 

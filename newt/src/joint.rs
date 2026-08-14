@@ -31,6 +31,7 @@
 //! since ABA never mixes free-body-only code paths with articulated trees.
 
 use crate::math::Vec3;
+use crate::solver::SolImp;
 
 /// Kind of joint connecting a link to its parent.
 ///
@@ -113,17 +114,30 @@ pub enum JointKind {
 /// spring: the generalized force is zero inside the range and grows linearly
 /// with the violation depth outside.
 ///
-/// This is the v0 penalty model. v1 will replace it with a real constraint
-/// solved by the same solver that handles contacts.
+/// `stiffness` and `damping` drive the v0/penalty pathway. `solref` and
+/// `solimp` drive the v1 constraint solver ([`crate::solver::solve_tree_limits`]);
+/// both default to `None`, which the solver reads as
+/// [`crate::geom::SolRef::DEFAULT`] / [`crate::solver::SolImp::DEFAULT`].
+/// Populated overrides tune the limit's constraint-solver behavior per joint,
+/// mirroring how contacts already carry per-geom SolRef/SolImp.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct JointLimit {
-    /// Spring stiffness per unit violation (units follow the joint DOF —
-    /// N·m/rad for hinge, N/m for slide).
+    /// Penalty spring stiffness per unit violation (N·m/rad for hinge,
+    /// N/m for slide). Only consulted under [`crate::solver::SolverMode::Penalty`].
     pub stiffness: f32,
-    /// Damping coefficient applied to the joint rate WHEN the joint is
-    /// outside the range on the corresponding side. `2 sqrt(k I_eff)` is
-    /// critical damping; the default is a comfortably damped value.
+    /// Penalty damping coefficient applied to the joint rate WHEN outside
+    /// the range on the violated side. Only consulted under
+    /// [`crate::solver::SolverMode::Penalty`]. `2 sqrt(k I_eff)` is
+    /// critical damping.
     pub damping: f32,
+    /// Optional per-limit override for the PGS constraint's SolRef.
+    /// `None` → use [`crate::geom::SolRef::DEFAULT`]. Only consulted
+    /// under [`crate::solver::SolverMode::Pgs`].
+    pub solref: Option<crate::geom::SolRef>,
+    /// Optional per-limit override for the PGS constraint's SolImp.
+    /// `None` → use [`SolImp::DEFAULT`]. Only consulted under
+    /// [`crate::solver::SolverMode::Pgs`].
+    pub solimp: Option<SolImp>,
 }
 
 impl JointLimit {
@@ -133,13 +147,34 @@ impl JointLimit {
     /// 200 ms) — much slower than the `dt = 5 ms` integrator so RK4 stays
     /// stable, and much faster than typical motion so the limit feels rigid
     /// on human timescales. Damping is ≈ critical for that spring/inertia.
+    /// Both solver overrides default to `None` so the solver falls back
+    /// to `SolRef::DEFAULT` / `SolImp::DEFAULT`.
     pub const DEFAULT: Self = Self {
         stiffness: 1000.0,
         damping: 60.0,
+        solref: None,
+        solimp: None,
     };
 
     pub const fn new(stiffness: f32, damping: f32) -> Self {
-        Self { stiffness, damping }
+        Self {
+            stiffness,
+            damping,
+            solref: None,
+            solimp: None,
+        }
+    }
+
+    /// Override the PGS solver's SolRef for this limit (builder-style).
+    pub const fn with_solref(mut self, solref: crate::geom::SolRef) -> Self {
+        self.solref = Some(solref);
+        self
+    }
+
+    /// Override the PGS solver's SolImp for this limit (builder-style).
+    pub const fn with_solimp(mut self, solimp: SolImp) -> Self {
+        self.solimp = Some(solimp);
+        self
     }
 }
 
