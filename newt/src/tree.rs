@@ -71,6 +71,7 @@ use crate::actuator::{Actuator, clamp_symmetric};
 use crate::joint::{JointKind, JointLimit};
 use crate::math::{Mat3, Quat, Vec3};
 use crate::spatial::{Mat6, SpatialForce, SpatialInertia, SpatialMotion, Xform};
+use crate::tendon::Tendon;
 
 /// One link in a kinematic tree.
 #[derive(Clone, Debug, PartialEq)]
@@ -204,6 +205,15 @@ pub struct Tree {
     /// preserves every pre-v1-tier-4 golden and any direct
     /// [`aba`]/[`rk4_step`] caller under the penalty pathway.
     pub disable_penalty_limits: bool,
+
+    /// Tendons in this tree (v2 tier 3). Fixed and spatial — see
+    /// [`crate::tendon`]. Passive spring/damper forces are computed
+    /// inside every ABA call and added to the effective `tau`. Tendon-
+    /// attached actuators (`Actuator::tendon_target = Some(_)`) route
+    /// their scalar force through the same tendon Jacobian instead of
+    /// the joint per-link path. Empty by default, so every pre-v2-tier-3
+    /// scene runs unchanged.
+    pub tendons: Vec<Tendon>,
 }
 
 impl Tree {
@@ -219,7 +229,21 @@ impl Tree {
             actuators: Vec::new(),
             applied_wrenches: Vec::new(),
             disable_penalty_limits: false,
+            tendons: Vec::new(),
         }
+    }
+
+    /// Append a tendon to this tree. Returns its stable index (usable as
+    /// `Actuator::on_tendon(idx)` or `tree.tendons[idx]`). Validated at
+    /// call time — panics on a bad tendon (loader routes structured
+    /// errors instead).
+    pub fn add_tendon(&mut self, tendon: Tendon) -> usize {
+        tendon.validate(self).expect(
+            "Tree::add_tendon: tendon failed validation (use loader for structured errors)",
+        );
+        let idx = self.tendons.len();
+        self.tendons.push(tendon);
+        idx
     }
 
     /// Append a link and grow `q`/`qdot`/`qfrc_applied` accordingly. Returns
@@ -293,19 +317,29 @@ impl Tree {
     /// as N·m, slides as N — so the plumbing does not need to know which
     /// kind of joint it hangs off.
     pub fn add_actuator(&mut self, actuator: Actuator) -> usize {
-        assert!(
-            actuator.link_idx < self.links.len(),
-            "actuator link out of range"
-        );
-        assert!(
-            matches!(
-                self.links[actuator.link_idx].joint,
-                JointKind::Hinge { .. } | JointKind::Slide { .. }
-            ),
-            "actuators only attach to Hinge or Slide joints (link {} is {:?})",
-            actuator.link_idx,
-            self.links[actuator.link_idx].joint
-        );
+        // Tendon-mode actuators skip the joint kind check — their scalar
+        // force enters via the tendon Jacobian, not a joint-slot torque.
+        if let Some(tid) = actuator.tendon_target {
+            assert!(
+                tid < self.tendons.len(),
+                "tendon-mode actuator: tendon index {tid} out of range ({} tendons)",
+                self.tendons.len()
+            );
+        } else {
+            assert!(
+                actuator.link_idx < self.links.len(),
+                "actuator link out of range"
+            );
+            assert!(
+                matches!(
+                    self.links[actuator.link_idx].joint,
+                    JointKind::Hinge { .. } | JointKind::Slide { .. }
+                ),
+                "actuators only attach to Hinge or Slide joints (link {} is {:?})",
+                actuator.link_idx,
+                self.links[actuator.link_idx].joint
+            );
+        }
         let idx = self.actuators.len();
         self.actuators.push(actuator);
         idx
@@ -818,6 +852,15 @@ pub fn aba(
         }
     }
 
+    // Tendon contributions: compute passive spring/damper AND tendon-
+    // attached actuator forces into a per-DOF buffer that pass 2 folds
+    // into `tau_scalar` per link. Cached across the whole aba call.
+    let mut tendon_qfrc = vec![0.0f32; tree.nv()];
+    if !tree.tendons.is_empty() {
+        let tendon_state = crate::tendon::accumulate_tendon_passive(tree, poses, &mut tendon_qfrc);
+        crate::tendon::accumulate_tendon_actuator_qfrc(tree, &tendon_state, &mut tendon_qfrc);
+    }
+
     // --- Pass 2: leaves→root, accumulate IA and pA. ---
     // Initialize each link's IA = spatial inertia and pA = velocity-product bias.
     let mut ext_body: Vec<SpatialForce> = Vec::with_capacity(n);
@@ -882,12 +925,19 @@ pub fn aba(
                 };
                 let mut tau_act = 0.0;
                 for act in &tree.actuators {
-                    if act.link_idx == i {
+                    // Tendon-mode actuators are dispatched by
+                    // `accumulate_tendon_actuator_qfrc` (fed into
+                    // `tendon_qfrc` before pass 2) and MUST NOT double-
+                    // count via the joint-link scan.
+                    if act.tendon_target.is_none() && act.link_idx == i {
                         tau_act += act.torque(q_i, qdot_i);
                     }
                 }
-                let tau_scalar =
-                    tree.qfrc_applied[tree.v_offset[i]] - damping * qdot_i + tau_lim + tau_act;
+                let tau_scalar = tree.qfrc_applied[tree.v_offset[i]]
+                    + tendon_qfrc[tree.v_offset[i]]
+                    - damping * qdot_i
+                    + tau_lim
+                    + tau_act;
                 single_dof_pass2(&mut w, tree, i, parent, armature, tau_scalar);
             }
             JointKind::Slide {
@@ -913,12 +963,15 @@ pub fn aba(
                 };
                 let mut tau_act = 0.0;
                 for act in &tree.actuators {
-                    if act.link_idx == i {
+                    if act.tendon_target.is_none() && act.link_idx == i {
                         tau_act += act.torque(q_i, qdot_i);
                     }
                 }
-                let tau_scalar =
-                    tree.qfrc_applied[tree.v_offset[i]] - damping * qdot_i + tau_lim + tau_act;
+                let tau_scalar = tree.qfrc_applied[tree.v_offset[i]]
+                    + tendon_qfrc[tree.v_offset[i]]
+                    - damping * qdot_i
+                    + tau_lim
+                    + tau_act;
                 single_dof_pass2(&mut w, tree, i, parent, armature, tau_scalar);
             }
             JointKind::Ball { damping, armature } => {
@@ -951,9 +1004,9 @@ pub fn aba(
                 let voff = tree.v_offset[i];
                 let omega = Vec3::new(tree.qdot[voff], tree.qdot[voff + 1], tree.qdot[voff + 2]);
                 let tau3 = Vec3::new(
-                    tree.qfrc_applied[voff] - damping * omega.x,
-                    tree.qfrc_applied[voff + 1] - damping * omega.y,
-                    tree.qfrc_applied[voff + 2] - damping * omega.z,
+                    tree.qfrc_applied[voff] + tendon_qfrc[voff] - damping * omega.x,
+                    tree.qfrc_applied[voff + 1] + tendon_qfrc[voff + 1] - damping * omega.y,
+                    tree.qfrc_applied[voff + 2] + tendon_qfrc[voff + 2] - damping * omega.z,
                 );
 
                 // p_stage = pA + IA c
@@ -1012,8 +1065,20 @@ pub fn aba(
     let mut qddot = vec![0.0; tree.nv()];
     match tree.links[0].joint {
         JointKind::Free => {
-            // At root: IA[0] a[0] = -pA[0]. Solve 6x6.
-            let rhs = SpatialForce::new(-w.pa[0].torque, -w.pa[0].linear);
+            // At root: IA[0] a[0] = tau_free_gen - pA[0]. The generalized
+            // free-root force is a spatial force in body-frame-at-COM
+            // coordinates conjugate to the 6 slot layout (ω_body, v_body)
+            // — populated by tendons via `tendon_qfrc[0..6]`. Zero when
+            // no tendon touches the free-root link (pre-v2-tier-3
+            // behavior preserved bit-for-bit).
+            let tau_free = SpatialForce::new(
+                Vec3::new(tendon_qfrc[0], tendon_qfrc[1], tendon_qfrc[2]),
+                Vec3::new(tendon_qfrc[3], tendon_qfrc[4], tendon_qfrc[5]),
+            );
+            let rhs = SpatialForce::new(
+                tau_free.torque - w.pa[0].torque,
+                tau_free.linear - w.pa[0].linear,
+            );
             let a0 = w.ia[0]
                 .solve(rhs)
                 .expect("root articulated inertia is singular — degenerate mass distribution?");

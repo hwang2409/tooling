@@ -53,6 +53,7 @@ use crate::math::{self, Mat3, Quat, Vec3};
 use crate::model::{Scene, Site, SiteAttach};
 use crate::sensor::{Sensor, SensorAttach, SensorKind, SiteFrame};
 use crate::solver::SolImp;
+use crate::tendon::{FixedTendonJoint, SpatialTendonSite, Tendon, WrapSphere};
 use crate::tree::{Link, Tree};
 use crate::world::World;
 use crate::xml::{self, Element};
@@ -466,6 +467,9 @@ struct Loader {
     sites_by_name: HashMap<String, usize>,
     actuators_by_name: HashMap<String, (usize, usize)>,
     sensors_by_name: HashMap<String, usize>,
+    /// Tendon-name → `(tree_idx, tendon_idx)`. Populated by the `<tendon>`
+    /// block; consumed by actuator + sensor name lookups.
+    tendons_by_name: HashMap<String, (usize, usize)>,
 
     /// Joint-name → `(tree_idx, link_idx)` — MJCF references actuators/
     /// sensors/equalities to joints by name (rather than by tree+link).
@@ -503,6 +507,7 @@ impl Loader {
             sites_by_name: HashMap::new(),
             actuators_by_name: HashMap::new(),
             sensors_by_name: HashMap::new(),
+            tendons_by_name: HashMap::new(),
             joints_by_name: HashMap::new(),
             tree_bodies_by_name: HashMap::new(),
             angle_scale: 1.0,
@@ -524,6 +529,7 @@ impl Loader {
             sites_by_name: self.sites_by_name,
             actuators_by_name: self.actuators_by_name,
             sensors_by_name: self.sensors_by_name,
+            tendons_by_name: self.tendons_by_name,
         }
     }
 
@@ -551,19 +557,19 @@ impl Loader {
         }
         self.defaults = build_defaults(root, &path)?;
 
+        // Two-phase walk for order-independent tendon references:
+        //   phase A: worldbody + tendon (define joints, sites, tendons)
+        //   phase B: actuator + sensor + equality + contact (may reference
+        //            tendons/joints/sites by name)
         for child in root.child_elements() {
             let subpath = child_path(&path, &child.name, child.attr("name"));
             match child.name.as_str() {
-                "compiler" | "option" | "default" => {} // handled above
+                "compiler" | "option" | "default" => {}
                 "worldbody" => self.walk_worldbody(child, &subpath)?,
-                "actuator" => self.walk_actuator(child, &subpath)?,
-                "sensor" => self.walk_sensor(child, &subpath)?,
-                "equality" => self.walk_equality(child, &subpath)?,
-                "contact" => self.walk_contact(child, &subpath)?,
-                // Explicitly-known but unsupported MJCF top-level elements
-                // — clean error naming the feature.
-                "asset" | "tendon" | "keyframe" | "custom" | "visual" | "size" | "statistic"
-                | "extension" | "include" => {
+                "tendon" => self.walk_tendon(child, &subpath)?,
+                "actuator" | "sensor" | "equality" | "contact" => {}
+                "asset" | "keyframe" | "custom" | "visual" | "size" | "statistic" | "extension"
+                | "include" => {
                     return fail(
                         &subpath,
                         format!(
@@ -577,10 +583,21 @@ impl Loader {
                         &subpath,
                         format!(
                             "unknown top-level element <{other}> under <mujoco>; supported: \
-                             compiler, option, default, worldbody, actuator, sensor, equality, contact"
+                             compiler, option, default, worldbody, tendon, actuator, sensor, \
+                             equality, contact"
                         ),
                     );
                 }
+            }
+        }
+        for child in root.child_elements() {
+            let subpath = child_path(&path, &child.name, child.attr("name"));
+            match child.name.as_str() {
+                "actuator" => self.walk_actuator(child, &subpath)?,
+                "sensor" => self.walk_sensor(child, &subpath)?,
+                "equality" => self.walk_equality(child, &subpath)?,
+                "contact" => self.walk_contact(child, &subpath)?,
+                _ => {}
             }
         }
         // Apply the JSON loader's auto pair-list filter for the same-tree /
@@ -2117,6 +2134,326 @@ impl Loader {
         })
     }
 
+    // ---------- tendon --------------------------------------------------
+
+    /// MJCF `<tendon>` block: children `<fixed>` and `<spatial>`.
+    fn walk_tendon(&mut self, e: &Element, path: &str) -> Result<(), MjcfError> {
+        if let Some((k, _)) = e.attrs.first() {
+            return fail(path, format!("<tendon> takes no attributes (got \"{k}\")"));
+        }
+        for child in e.child_elements() {
+            let subpath = child_path(path, &child.name, child.attr("name"));
+            match child.name.as_str() {
+                "fixed" => self.add_fixed_tendon(child, &subpath)?,
+                "spatial" => self.add_spatial_tendon(child, &subpath)?,
+                other => {
+                    return fail(
+                        &subpath,
+                        format!(
+                            "<{other}> tendon child is not supported (v2 tier 3: fixed | spatial only)"
+                        ),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn add_fixed_tendon(&mut self, e: &Element, path: &str) -> Result<(), MjcfError> {
+        for (k, _) in &e.attrs {
+            match k.as_str() {
+                "name" | "springlength" | "stiffness" | "damping" | "range" | "limited"
+                | "class" => {}
+                other => {
+                    return fail(
+                        path,
+                        format!("<fixed> tendon unknown attribute \"{other}\""),
+                    );
+                }
+            }
+        }
+        let name = attr_required(e, "name", path)?.to_string();
+        if self.tendons_by_name.contains_key(&name) {
+            return fail(path, format!("duplicate tendon name \"{name}\""));
+        }
+        // Collect joint entries; a fixed tendon requires all joints in one tree.
+        let mut joints: Vec<FixedTendonJoint> = Vec::new();
+        let mut tree_idx: Option<usize> = None;
+        for child in e.child_elements() {
+            let cp = child_path(path, &child.name, None);
+            if child.name != "joint" {
+                return fail(
+                    &cp,
+                    format!(
+                        "<fixed> only accepts <joint> children (got <{}>)",
+                        child.name
+                    ),
+                );
+            }
+            for (k, _) in &child.attrs {
+                if k != "joint" && k != "coef" {
+                    return fail(&cp, format!("<joint> unknown attribute \"{k}\""));
+                }
+            }
+            let jn = attr_required(child, "joint", &cp)?;
+            let &(tt, li) = self
+                .joints_by_name
+                .get(jn)
+                .ok_or_else(|| MjcfError::new(cp.clone(), format!("unknown joint \"{jn}\"")))?;
+            if tt == usize::MAX {
+                return fail(&cp, format!("fixed tendon joint \"{jn}\" is a freejoint"));
+            }
+            match tree_idx {
+                None => tree_idx = Some(tt),
+                Some(existing) if existing != tt => {
+                    return fail(
+                        &cp,
+                        format!(
+                            "fixed tendon joints must belong to the same tree (got tree {existing} and tree {tt})"
+                        ),
+                    );
+                }
+                _ => {}
+            }
+            let coef = parse_f32(attr_required(child, "coef", &cp)?, &cp, "coef")?;
+            joints.push(FixedTendonJoint { link: li, coef });
+        }
+        let tidx = tree_idx
+            .ok_or_else(|| MjcfError::new(path, "fixed tendon must have ≥ 1 <joint> child"))?;
+        let mut tendon = Tendon::fixed(joints);
+        self.set_tendon_passive_attrs(e, path, &mut tendon)?;
+        tendon
+            .validate(&self.world.trees[tidx])
+            .map_err(|m| MjcfError::new(path, m))?;
+        let ti = self.world.trees[tidx].add_tendon(tendon);
+        self.tendons_by_name.insert(name, (tidx, ti));
+        Ok(())
+    }
+
+    fn add_spatial_tendon(&mut self, e: &Element, path: &str) -> Result<(), MjcfError> {
+        for (k, _) in &e.attrs {
+            match k.as_str() {
+                "name" | "springlength" | "stiffness" | "damping" | "range" | "limited"
+                | "class" => {}
+                other => {
+                    return fail(
+                        path,
+                        format!("<spatial> tendon unknown attribute \"{other}\""),
+                    );
+                }
+            }
+        }
+        let name = attr_required(e, "name", path)?.to_string();
+        if self.tendons_by_name.contains_key(&name) {
+            return fail(path, format!("duplicate tendon name \"{name}\""));
+        }
+        // Ordered children: <site>, <geom>, <pulley> etc. Only <site> and
+        // <geom type="sphere"> are supported. Sites define the chain;
+        // <geom> nodes attach as wrap objects for the SEGMENT they appear
+        // in between two sites (MuJoCo's ordering rule).
+        let mut sites: Vec<SpatialTendonSite> = Vec::new();
+        let mut segments: Vec<Option<WrapSphere>> = Vec::new();
+        let mut tree_idx: Option<usize> = None;
+        // MJCF spatial tendon: alternate site → optional wrap → site → ...
+        let mut pending_wrap: Option<WrapSphere> = None;
+        let mut expecting_site = true;
+        for child in e.child_elements() {
+            let cp = child_path(path, &child.name, None);
+            match child.name.as_str() {
+                "site" => {
+                    if !expecting_site && sites.is_empty() {
+                        return fail(&cp, "spatial tendon must start with a <site>");
+                    }
+                    if !sites.is_empty() {
+                        // Just closed a segment.
+                        segments.push(pending_wrap.take());
+                    }
+                    for (k, _) in &child.attrs {
+                        if k != "site" {
+                            return fail(
+                                &cp,
+                                format!("<site> tendon-child unknown attribute \"{k}\""),
+                            );
+                        }
+                    }
+                    let sn = attr_required(child, "site", &cp)?;
+                    let sidx = self.sites_by_name.get(sn).copied().ok_or_else(|| {
+                        MjcfError::new(cp.clone(), format!("unknown site \"{sn}\""))
+                    })?;
+                    let site = &self.sites[sidx];
+                    let link = match site.attach {
+                        SiteAttach::Link { tree, link } => {
+                            match tree_idx {
+                                None => tree_idx = Some(tree),
+                                Some(existing) if existing != tree => {
+                                    return fail(
+                                        &cp,
+                                        format!(
+                                            "spatial tendon sites must belong to the same tree \
+                                             (got tree {existing} and tree {tree})"
+                                        ),
+                                    );
+                                }
+                                _ => {}
+                            }
+                            Some(link)
+                        }
+                        SiteAttach::Body(_) => {
+                            return fail(
+                                &cp,
+                                "spatial tendon sites on free bodies are not supported (v2 tier 3)",
+                            );
+                        }
+                    };
+                    sites.push(SpatialTendonSite {
+                        link,
+                        position_local: site.local_offset,
+                    });
+                    expecting_site = false;
+                }
+                "geom" => {
+                    // Between two sites: a wrap. Only sphere is supported.
+                    let ty = child.attr("type").unwrap_or("sphere");
+                    if ty != "sphere" {
+                        return fail(
+                            &cp,
+                            format!(
+                                "spatial tendon wrap type \"{ty}\" is not supported (v2 tier 3: sphere only; \
+                                 cylinder/pulley deferred — see docs/tendons.md)"
+                            ),
+                        );
+                    }
+                    for (k, _) in &child.attrs {
+                        if k != "geom" && k != "type" && k != "sidesite" {
+                            return fail(&cp, format!("<geom> wrap unknown attribute \"{k}\""));
+                        }
+                    }
+                    let gn = attr_required(child, "geom", &cp)?;
+                    let gidx = self.geoms_by_name.get(gn).copied().ok_or_else(|| {
+                        MjcfError::new(cp.clone(), format!("unknown geom \"{gn}\""))
+                    })?;
+                    let g = &self.world.geoms[gidx];
+                    let radius = match g.shape {
+                        crate::geom::GeomShape::Sphere { radius } => radius,
+                        other => {
+                            return fail(
+                                &cp,
+                                format!(
+                                    "wrap geom \"{gn}\" is not a sphere (got {other:?}); spatial tendon \
+                                     wraps must reference a sphere geom"
+                                ),
+                            );
+                        }
+                    };
+                    let (center_local, link_wrap) = match g.attachment() {
+                        crate::geom::GeomAttach::Static => (g.local_offset, None),
+                        crate::geom::GeomAttach::Link(_, link_idx) => {
+                            (g.local_offset, Some(link_idx))
+                        }
+                        crate::geom::GeomAttach::Body(_) => {
+                            return fail(
+                                &cp,
+                                "spatial tendon wrap on free body geom is not supported (v2 tier 3)",
+                            );
+                        }
+                    };
+                    let side_hint_world = if let Some(sn) = child.attr("sidesite") {
+                        let sidx = self.sites_by_name.get(sn).copied().ok_or_else(|| {
+                            MjcfError::new(cp.clone(), format!("unknown sidesite \"{sn}\""))
+                        })?;
+                        Some(self.sites[sidx].local_offset)
+                    } else {
+                        None
+                    };
+                    pending_wrap = Some(WrapSphere {
+                        link: link_wrap,
+                        center_local,
+                        radius,
+                        side_hint_world,
+                    });
+                }
+                "pulley" => {
+                    return fail(
+                        &cp,
+                        "<pulley> spatial tendon branch is deferred in v2 tier 3 (see docs/tendons.md)",
+                    );
+                }
+                other => {
+                    return fail(
+                        &cp,
+                        format!("<{other}> is not a supported spatial-tendon child"),
+                    );
+                }
+            }
+        }
+        if !sites.is_empty() {
+            // Close the final segment. Note we push one segment slot per
+            // consecutive-site pair, so this is only pushed when at least
+            // 2 sites already exist.
+        }
+        // Reconstruct segments from the pending-wrap flow:
+        //   between sites k and k+1, wrap = the wrap emitted after site k.
+        // Simpler: assemble again. Rewrite the segment tracking to be
+        // explicit (the flow above only pushes on next-site).
+        // We already push_wrap on next-site; total segments = sites.len() - 1.
+        // If a wrap trailed the LAST site (i.e. no closing site), that's
+        // structurally invalid — reject.
+        if pending_wrap.is_some() {
+            return fail(
+                path,
+                "spatial tendon ended with a wrap without a closing site",
+            );
+        }
+        if sites.len() < 2 {
+            return fail(path, "spatial tendon must have ≥ 2 sites");
+        }
+        if segments.len() != sites.len() - 1 {
+            return fail(
+                path,
+                format!(
+                    "spatial tendon segment count {} does not match sites-1 {}",
+                    segments.len(),
+                    sites.len() - 1
+                ),
+            );
+        }
+        let tidx = tree_idx.expect("spatial tendon: tree resolved by first site");
+        let mut tendon = Tendon::spatial(sites, segments);
+        self.set_tendon_passive_attrs(e, path, &mut tendon)?;
+        tendon
+            .validate(&self.world.trees[tidx])
+            .map_err(|m| MjcfError::new(path, m))?;
+        let ti = self.world.trees[tidx].add_tendon(tendon);
+        self.tendons_by_name.insert(name, (tidx, ti));
+        Ok(())
+    }
+
+    fn set_tendon_passive_attrs(
+        &self,
+        e: &Element,
+        path: &str,
+        tendon: &mut Tendon,
+    ) -> Result<(), MjcfError> {
+        if let Some(v) = e.attr("springlength") {
+            tendon.springlength = Some(parse_f32(v, path, "springlength")?);
+        }
+        if let Some(v) = e.attr("stiffness") {
+            tendon.stiffness = parse_f32(v, path, "stiffness")?;
+        }
+        if let Some(v) = e.attr("damping") {
+            tendon.damping = parse_f32(v, path, "damping")?;
+        }
+        if let Some(v) = e.attr("range") {
+            let nums = parse_f32_list(v, path, "range")?;
+            require_len(&nums, 2, path, "range")?;
+            if nums[0] > nums[1] {
+                return fail(path, "tendon range lo must be ≤ hi");
+            }
+            tendon.range = Some((nums[0], nums[1]));
+        }
+        Ok(())
+    }
+
     // ---------- actuator ------------------------------------------------
 
     fn walk_actuator(&mut self, e: &Element, path: &str) -> Result<(), MjcfError> {
@@ -2264,7 +2601,7 @@ impl Loader {
         let dc = self.defaults.lookup(&class).cloned().unwrap_or_default();
         for (k, _) in &e.attrs {
             match k.as_str() {
-                "name" | "joint" | "gear" | "forcerange" | "ctrlrange" | "class"
+                "name" | "joint" | "tendon" | "gear" | "forcerange" | "ctrlrange" | "class"
                 | "ctrllimited" | "forcelimited" => {}
                 other => {
                     return fail(path, format!("<motor> attribute \"{other}\" not supported"));
@@ -2272,8 +2609,7 @@ impl Loader {
             }
         }
         let name = attr_required(e, "name", path)?.to_string();
-        let joint_name = attr_required(e, "joint", path)?;
-        let (tree_idx, link_idx) = self.resolve_1dof_joint_for_actuator(joint_name, path)?;
+        let (tree_idx, link_idx, tendon_idx) = self.resolve_actuator_transmission(e, path)?;
         let gear = match attr_with_default(e, "motor", "gear", &dc) {
             Some(v) => {
                 let nums = parse_f32_list(v, path, "gear")?;
@@ -2320,6 +2656,9 @@ impl Loader {
         // Real MuJoCo <motor>: gainprm=[1,0,0], bias=none, gear scales the
         // output. Torque = gear * ctrl, force-clamped.
         let mut actuator = Actuator::motor(link_idx, gear, clamp);
+        if let Some(ti) = tendon_idx {
+            actuator = actuator.on_tendon(ti);
+        }
         actuator.ctrl_range = ctrl_range;
         if self.actuators_by_name.contains_key(&name) {
             return fail(path, format!("duplicate actuator name \"{name}\""));
@@ -2520,6 +2859,38 @@ impl Loader {
         Ok(())
     }
 
+    /// Read `joint="..."` OR `tendon="..."` and return
+    /// `(tree_idx, link_idx, tendon_idx)`. `link_idx` is `0` when the
+    /// actuator is tendon-transmission (ignored downstream); `tendon_idx`
+    /// is `Some(i)` iff `tendon=` was present. Rejects both/neither
+    /// present with a clear error.
+    fn resolve_actuator_transmission(
+        &self,
+        e: &Element,
+        path: &str,
+    ) -> Result<(usize, usize, Option<usize>), MjcfError> {
+        let has_joint = e.attr("joint").is_some();
+        let has_tendon = e.attr("tendon").is_some();
+        if has_joint && has_tendon {
+            return fail(
+                path,
+                "actuator: specify either \"joint\" or \"tendon\", not both",
+            );
+        }
+        if has_tendon {
+            let tn = attr_required(e, "tendon", path)?;
+            let &(tree_idx, tendon_idx) = self
+                .tendons_by_name
+                .get(tn)
+                .ok_or_else(|| MjcfError::new(path, format!("unknown tendon \"{tn}\"")))?;
+            Ok((tree_idx, 0, Some(tendon_idx)))
+        } else {
+            let joint_name = attr_required(e, "joint", path)?;
+            let (t, l) = self.resolve_1dof_joint_for_actuator(joint_name, path)?;
+            Ok((t, l, None))
+        }
+    }
+
     fn resolve_1dof_joint_for_actuator(
         &self,
         joint_name: &str,
@@ -2698,13 +3069,33 @@ impl Loader {
                 }
                 SensorKind::Torque { tree: t, link: l }
             }
+            "tendonpos" | "tendonvel" => {
+                attrs_ok(&["name", "tendon"])?;
+                let tn = attr_required(e, "tendon", path)?;
+                let &(tt, ti) = self
+                    .tendons_by_name
+                    .get(tn)
+                    .ok_or_else(|| MjcfError::new(path, format!("unknown tendon \"{tn}\"")))?;
+                match e.name.as_str() {
+                    "tendonpos" => SensorKind::TendonPos {
+                        tree: tt,
+                        tendon: ti,
+                    },
+                    "tendonvel" => SensorKind::TendonVel {
+                        tree: tt,
+                        tendon: ti,
+                    },
+                    _ => unreachable!(),
+                }
+            }
             other => {
                 return fail(
                     path,
                     format!(
                         "sensor kind <{other}> is not supported in the v1 subset \
                          (supported: jointpos, jointvel, ballquat, ballangvel, \
-                         framepos, framequat, gyro, accelerometer, touch, force, torque)"
+                         framepos, framequat, gyro, accelerometer, touch, force, torque, \
+                         tendonpos, tendonvel)"
                     ),
                 );
             }

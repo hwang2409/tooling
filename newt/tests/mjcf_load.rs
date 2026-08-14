@@ -31,8 +31,12 @@ fn asset_top_level_rejected() {
 }
 
 #[test]
-fn tendon_top_level_rejected() {
-    expect_err(r#"<mujoco><tendon/></mujoco>"#, "<tendon>");
+fn tendon_unknown_child_rejected() {
+    // <tendon> is supported (v2 tier 3); its unknown children are not.
+    expect_err(
+        r#"<mujoco><tendon><flex name="x"/></tendon></mujoco>"#,
+        "<flex>",
+    );
 }
 
 #[test]

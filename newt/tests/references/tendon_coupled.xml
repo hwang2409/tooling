@@ -1,0 +1,28 @@
+<!-- Differential scenario: two hinges under gravity coupled by a fixed
+  tendon with a stiff spring. Newt requires body origin = COM, so each
+  pendulum body is placed at the mass position and the joint anchor is
+  offset upward via joint `pos` (in body frame). -->
+<mujoco model="tendon_coupled">
+  <compiler angle="radian"/>
+  <option timestep="0.005" gravity="0 0 -9.81"
+          integrator="RK4" solver="PGS" cone="pyramidal" iterations="20"/>
+  <worldbody>
+    <body name="anchor" pos="0 0 0">
+      <inertial pos="0 0 0" mass="1.0" diaginertia="1.0 1.0 1.0"/>
+      <body name="pa" pos="-0.4 0 -0.9">
+        <inertial pos="0 0 0" mass="0.8" diaginertia="1e-3 1e-3 1e-3"/>
+        <joint name="ja" type="hinge" axis="1 0 0" pos="0 0 0.9" damping="0.3"/>
+      </body>
+      <body name="pb" pos="0.4 0 -1.1">
+        <inertial pos="0 0 0" mass="1.2" diaginertia="1e-3 1e-3 1e-3"/>
+        <joint name="jb" type="hinge" axis="1 0 0" pos="0 0 1.1" damping="0.3"/>
+      </body>
+    </body>
+  </worldbody>
+  <tendon>
+    <fixed name="coup" springlength="0" stiffness="47" damping="8">
+      <joint joint="ja" coef="1"/>
+      <joint joint="jb" coef="-1"/>
+    </fixed>
+  </tendon>
+</mujoco>
