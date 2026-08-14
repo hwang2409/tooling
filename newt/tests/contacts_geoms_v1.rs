@@ -307,6 +307,103 @@ fn box_box_sat_uses_face_normal_when_it_wins_min_overlap() {
     }
 }
 
+/// Reviewer's round-2 blocker probe: with an axis-aligned box-box overlap
+/// (A above B by exactly 0.02 m of overlap), the full-manifold path must
+/// place every contact position on B's top surface (z = 1.0 for
+/// half_extent = 1). Pre-fix (`- normal_world * (pen − margin)`), positions
+/// landed at z = 0.96 — off by exactly `2 × penetration` in the wrong
+/// direction, invisible on symmetric-stack trajectories because the
+/// error cancels around the COM but visible any time the contact frame
+/// is queried (torque about the wrong arm, sensor readings, dictated-
+/// case debug dumps).
+#[test]
+fn box_box_full_manifold_places_contact_on_b_surface_axis_aligned() {
+    use newt::contact::narrow_phase_solver;
+    let half = Vec3::splat(1.0);
+    // A centered at z=1.98, B centered at z=0.0. A's bottom face at 0.98,
+    // B's top face at 1.0 — penetration = 0.02.
+    let pose_a = geom_world_pose(
+        &Geom::r#box(0, half, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        Vec3::new(0.0, 0.0, 1.98),
+        Quat::IDENTITY,
+    );
+    let pose_b = geom_world_pose(
+        &Geom::r#box(1, half, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        Vec3::ZERO,
+        Quat::IDENTITY,
+    );
+    let ga = Geom::r#box(0, half, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let gb = Geom::r#box(1, half, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let buf = narrow_phase_solver(0, &ga, &pose_a, 1, &gb, &pose_b, &[]);
+    assert!(
+        buf.len >= 4,
+        "full-manifold path must emit ≥ 4 corner contacts for a flat face-face overlap; got {}",
+        buf.len
+    );
+    for c in buf.as_slice() {
+        assert!(
+            approx(c.position_world.z, 1.0, 1e-4),
+            "contact position must lie on B's top surface (z = 1.0); got {:?} (raw pen {}). \
+             The pre-round-2 bug placed positions at z = 0.96 (off by 2×penetration in the \
+             wrong direction) — this assertion is the reviewer's dictated regression.",
+            c.position_world,
+            c.penetration,
+        );
+        // Sanity: shifted penetration should equal the raw overlap plus
+        // margin (0.02 + 0 default margin = 0.02).
+        assert!(
+            approx(c.penetration, 0.02, 1e-4),
+            "penetration must equal raw overlap 0.02; got {}",
+            c.penetration
+        );
+    }
+}
+
+/// Reviewer's round-2 nit-turned-blocker (finding 4): a rotated-yaw
+/// box-box case where the winning SAT axis is definitely B's +Z face
+/// (`reference_is_a` = false). Assert `position_world` lies on B's top
+/// surface. Complements the axis-aligned test above by exercising the
+/// OTHER branch (the `else` in the pos_on_b logic) so a future mutation
+/// that inverts the wrong branch is caught.
+#[test]
+fn box_box_full_manifold_places_contact_on_b_surface_rotated_reference_b() {
+    use newt::contact::narrow_phase_solver;
+    let half = Vec3::splat(1.0);
+    // B axis-aligned. A yawed 45° about Z, still above B by a small
+    // penetration. All 4 of A's bottom corners hang over B's top face
+    // edges (vertex-vs-face empty on the primary axis), so SAT selects
+    // the face-normal axis with min overlap. Because A's yaw is 45°,
+    // A's face-normal Z axis projects the same as before; the winner
+    // depends on tie-breaking. Empirically here reference_is_a=false
+    // (B is chosen as the reference); the assertion below is on the
+    // resulting positions.
+    let pose_a = geom_world_pose(
+        &Geom::r#box(0, half, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        Vec3::new(0.0, 0.0, 1.98),
+        Quat::from_axis_angle(Vec3::Z, FRAC_PI_4),
+    );
+    let pose_b = geom_world_pose(
+        &Geom::r#box(1, half, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        Vec3::ZERO,
+        Quat::IDENTITY,
+    );
+    let ga = Geom::r#box(0, half, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let gb = Geom::r#box(1, half, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let buf = narrow_phase_solver(0, &ga, &pose_a, 1, &gb, &pose_b, &[]);
+    assert!(
+        buf.len > 0,
+        "full-manifold path must emit contacts for a yawed face-face overlap"
+    );
+    for c in buf.as_slice() {
+        assert!(
+            approx(c.position_world.z, 1.0, 1e-3),
+            "contact position must lie on B's top surface (z = 1.0); got {:?} — a mutation \
+             on the `else` branch of the pos_on_b logic would place positions above / below.",
+            c.position_world,
+        );
+    }
+}
+
 #[test]
 fn yawed_boxes_stack_and_do_not_collapse_through_each_other() {
     // Two identical boxes, each rotated 45° about world +Z. Upper dropped

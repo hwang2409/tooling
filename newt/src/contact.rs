@@ -944,16 +944,27 @@ fn box_box_face_reference_contacts(
             continue;
         }
         // Contact point sits on the reference face (i.e. on the reference
-        // box's surface). By convention `position_world` sits on B — so
-        // when A is reference (`reference_is_a`), we shift the point onto
-        // B's surface by walking `-normal_world * (pen - margin)`
-        // (equivalently the raw penetration in the direction from B into A).
+        // box's surface). By convention `position_world` sits on B, so
+        // when A is reference (`reference_is_a`), we must shift the
+        // point off A's face onto B's surface.
+        //
+        // In the interpenetrating regime A's face has crossed into B, so
+        // B's surface is on the OPPOSITE side of A's face from A's
+        // interior — the direction from A INTO B. `normal_world` points
+        // from B into A by convention; the direction from A into B is
+        // therefore `+normal_world` for the shift here (do not confuse
+        // "from A toward B's centre" with the direction that lands on
+        // B's surface starting from an already-penetrating point on A's
+        // face). The shift magnitude is the raw penetration depth
+        // `pen − margin`.
+        //
+        // Sanity: axis-aligned A(0,0,1.98) on B(0,0,0) at half=1 gives
+        // A_bottom=0.98, B_top=1.0, pen=0.02 (post shift). With A as
+        // reference the contact must land on z=1.0 — reached from
+        // z=0.98 by `+normal_world · 0.02` with normal_world = +Z.
         let point_on_ref = ref_face_center + ref_u * cv.u + ref_v * cv.v;
         let pos_on_b = if reference_is_a {
-            // Ref is A. `point_on_ref` sits on A's face. Move along
-            // `-normal_world` (from A toward B) by the raw penetration
-            // (pen − margin) to land on B's surface.
-            point_on_ref - normal_world * (pen - margin)
+            point_on_ref + normal_world * (pen - margin)
         } else {
             point_on_ref
         };
