@@ -42,6 +42,7 @@ use crate::geom::{
     solref_to_kc,
 };
 use crate::math::{Quat, Vec3};
+use crate::sensor::{Sensor, SensorBank, SensorError, SensorInputs};
 use crate::solver::{SolverConfig, SolverMode, solve_free_bodies};
 use crate::tree::{Tree, forward_kinematics as tree_forward_kinematics, rk4_step as tree_rk4_step};
 
@@ -80,6 +81,12 @@ pub struct World {
     /// Empty by default so every pre-v1-tier-5 golden and every scene
     /// that does not declare an equality is bit-for-bit unchanged.
     pub equalities: Vec<Equality>,
+    /// Sensor bank (v1 tier 6). Sensors are declared here and evaluated at
+    /// the end of every [`Self::step`] into `sensors.data`. Empty by
+    /// default — a scene with no sensors skips the whole sensor pipeline,
+    /// so every pre-v1-tier-6 golden and every scene without sensors is
+    /// bit-for-bit unchanged.
+    pub sensors: SensorBank,
     /// Cached pair-support fingerprint from the last successful validation.
     /// Encoded as `(geoms.len() << 32) | pair_list_encoded` where
     /// `pair_list_encoded` is `(pair_list.len() as u32) + 1` when
@@ -109,6 +116,7 @@ impl PartialEq for World {
             && self.pair_list == other.pair_list
             && self.solver == other.solver
             && self.equalities == other.equalities
+            && self.sensors == other.sensors
     }
 }
 
@@ -139,8 +147,30 @@ impl World {
             pair_list: None,
             solver: SolverConfig::DEFAULT,
             equalities: Vec::new(),
+            sensors: SensorBank::new(),
             checked_pairs: std::cell::Cell::new(0),
         }
+    }
+
+    /// Add a sensor to the world's sensor bank. Validates the sensor's
+    /// references against the current bodies/trees/geoms and returns the
+    /// sensor's stable index. Fails with a [`SensorError`] if the
+    /// reference is out of range or the joint kind doesn't match the sensor
+    /// (see [`Sensor::validate`]).
+    ///
+    /// The returned index also indexes `self.sensors.offsets` and picks out
+    /// this sensor's slice via [`SensorBank::slice`].
+    pub fn add_sensor(&mut self, sensor: Sensor) -> Result<usize, SensorError> {
+        sensor.validate(&self.bodies, &self.trees, &self.geoms)?;
+        let idx = self.sensors.sensors.len();
+        self.sensors.push(sensor);
+        Ok(idx)
+    }
+
+    /// Read-only slice of the latest sensor reading for sensor `idx`, or
+    /// `None` when `idx` is out of range.
+    pub fn sensor(&self, idx: usize) -> Option<&[f32]> {
+        self.sensors.slice(idx)
     }
 
     /// Invalidate the pair-support cache, forcing the next [`Self::step`]
@@ -340,6 +370,131 @@ impl World {
         };
         self.step_bodies(&pairs);
         self.step_trees(&pairs);
+        // Sensor evaluation runs strictly on post-step state — no
+        // perturbation. Skipped when no sensors are declared so every
+        // pre-v1-tier-6 golden path is bit-for-bit untouched.
+        if !self.sensors.sensors.is_empty() {
+            self.evaluate_sensors(&pairs);
+        }
+    }
+
+    /// Recompute every sensor reading against the current world state and
+    /// store the results in `self.sensors.data`. Called automatically by
+    /// [`Self::step`] when the sensor bank is non-empty; exposed publicly
+    /// so tests / callers who bypass `step` (e.g. loading a scene and
+    /// wanting a snapshot before the first integration) can force an
+    /// evaluation.
+    pub fn evaluate_sensors(&mut self, pairs: &[(usize, usize)]) {
+        // Take the sensor bank out temporarily so `build_sensor_inputs` can
+        // borrow `self` immutably without conflicting with the &mut we need
+        // for the sensor writeback. `std::mem::take` swaps in the default
+        // (empty) SensorBank; we restore the original at the end.
+        let mut bank = std::mem::take(&mut self.sensors);
+        {
+            let inputs = self.build_sensor_inputs(pairs);
+            crate::sensor::evaluate(&mut bank, &inputs);
+        }
+        self.sensors = bank;
+    }
+
+    /// Build the [`SensorInputs`] bundle for the post-step state. Uses the
+    /// solver-mode-appropriate wrench source (penalty vs PGS) so an
+    /// accelerometer or touch reading sees the SAME contact forces the
+    /// integrator did.
+    fn build_sensor_inputs<'a>(&'a self, pairs: &'a [(usize, usize)]) -> SensorInputs<'a> {
+        // Detect the full contact set from the same pipeline `step` uses.
+        // Split into free-body-only and per-tree lists so we can reuse the
+        // solver/penalty machinery downstream unchanged.
+        let mut free_pairs: Vec<(usize, usize)> = Vec::new();
+        for &(a, b) in pairs {
+            let att_a = self.geoms[a].attachment();
+            let att_b = self.geoms[b].attachment();
+            if !matches!(att_a, GeomAttach::Link(_, _)) && !matches!(att_b, GeomAttach::Link(_, _))
+            {
+                free_pairs.push((a, b));
+            }
+        }
+        let free_body_contacts =
+            collect_contacts(&self.bodies, &self.geoms, &self.meshes, &free_pairs);
+
+        // Body wrenches + per-contact normal forces (touch sensor input).
+        let (body_wrenches, free_body_contact_forces): (Vec<(Vec3, Vec3)>, Vec<f32>) =
+            match self.solver.mode {
+                SolverMode::Penalty => {
+                    let w = self.compute_wrenches(&self.bodies, pairs);
+                    let f: Vec<f32> = free_body_contacts
+                        .iter()
+                        .map(|c| penalty_normal_force(c, &self.bodies, &self.geoms))
+                        .collect();
+                    (w, f)
+                }
+                SolverMode::Pgs => crate::solver::solve_free_bodies_diag(
+                    &self.bodies,
+                    &self.geoms,
+                    &free_body_contacts,
+                    &self.equalities,
+                    self.gravity,
+                    self.dt,
+                    self.solver.cone,
+                    self.solver.iterations,
+                ),
+            };
+
+        // Per-tree external wrenches + contacts touching each tree. We
+        // package all tree contacts for touch (each with its penalty-formula
+        // normal force — trees always use the penalty pathway for wrenches
+        // in the current implementation).
+        let mut tree_wrenches: Vec<crate::tree::ExternalWrenches> =
+            Vec::with_capacity(self.trees.len());
+        let mut tree_contacts: Vec<Contact> = Vec::new();
+        let mut tree_contact_forces: Vec<f32> = Vec::new();
+        for (ti, tree) in self.trees.iter().enumerate() {
+            let mut tp: Vec<(usize, usize)> = Vec::new();
+            for &(a, b) in pairs {
+                let att_a = self.geoms[a].attachment();
+                let att_b = self.geoms[b].attachment();
+                let a_ours = matches!(att_a, GeomAttach::Link(t, _) if t == ti);
+                let b_ours = matches!(att_b, GeomAttach::Link(t, _) if t == ti);
+                if a_ours || b_ours {
+                    tp.push((a, b));
+                }
+            }
+            tree_wrenches.push(tree_wrenches_from_contacts(
+                tree,
+                ti,
+                &self.bodies,
+                &self.geoms,
+                &self.meshes,
+                &tp,
+            ));
+            let cts =
+                collect_contacts_full(&self.bodies, &self.trees, &self.geoms, &self.meshes, &tp);
+            for c in &cts {
+                tree_contact_forces.push(penalty_normal_force(c, &self.bodies, &self.geoms));
+            }
+            tree_contacts.extend(cts);
+        }
+
+        // Merge free-body + tree contacts (preserving order) so touch
+        // sensors on either attachment kind read from one list.
+        let mut contacts: Vec<Contact> = free_body_contacts;
+        contacts.extend(tree_contacts);
+        let mut contact_normal_forces = free_body_contact_forces;
+        contact_normal_forces.extend(tree_contact_forces);
+
+        SensorInputs {
+            bodies: &self.bodies,
+            trees: &self.trees,
+            geoms: &self.geoms,
+            meshes: &self.meshes,
+            pairs,
+            gravity: self.gravity,
+            dt: self.dt,
+            body_wrenches,
+            tree_wrenches,
+            contacts,
+            contact_normal_forces,
+        }
     }
 
     /// Advance only the free bodies. Preserves the tier-1/2 behavior
@@ -1034,6 +1189,60 @@ fn shape_name(s: GeomShape) -> &'static str {
         GeomShape::Ellipsoid { .. } => "ellipsoid",
         GeomShape::Mesh { .. } => "mesh",
     }
+}
+
+/// Penalty-formula normal-force magnitude for one contact: the same
+/// `max(0, k · pen_eff − c · v_n)` [`World`] uses when computing per-body
+/// contact wrenches under [`SolverMode::Penalty`]. Used by the touch
+/// sensor input assembly so a touch reading in Penalty mode reports the
+/// force the world would actually apply at this contact.
+fn penalty_normal_force(c: &Contact, bodies: &[Body], geoms: &[Geom]) -> f32 {
+    let ga = &geoms[c.geom_a];
+    let gb = &geoms[c.geom_b];
+    let ma = match ga.attachment() {
+        GeomAttach::Body(i) => bodies[i].mass,
+        _ => 0.0,
+    };
+    let mb = match gb.attachment() {
+        GeomAttach::Body(i) => bodies[i].mass,
+        _ => 0.0,
+    };
+    let m_eff = if ma > 0.0 && mb > 0.0 {
+        ma * mb / (ma + mb)
+    } else if ma > 0.0 {
+        ma
+    } else if mb > 0.0 {
+        mb
+    } else {
+        return 0.0;
+    };
+    let solref = combine_solref(ga.solref, gb.solref);
+    let (k, c_damp) = solref_to_kc(solref, m_eff);
+    let pen_eff = c.penetration - c.gap;
+    if pen_eff <= 0.0 {
+        return 0.0;
+    }
+    // Approximate v_n from body linear velocities projected onto the
+    // contact normal at the contact point.
+    let v_a = match ga.attachment() {
+        GeomAttach::Body(i) => {
+            let b = &bodies[i];
+            let r = c.position_world - b.position;
+            b.linear_velocity + b.angular_velocity_world().cross(r)
+        }
+        _ => Vec3::ZERO,
+    };
+    let v_b = match gb.attachment() {
+        GeomAttach::Body(i) => {
+            let b = &bodies[i];
+            let r = c.position_world - b.position;
+            b.linear_velocity + b.angular_velocity_world().cross(r)
+        }
+        _ => Vec3::ZERO,
+    };
+    let v_n = (v_a - v_b).dot(c.normal_world);
+    let f = k * pen_eff - c_damp * v_n;
+    if f > 0.0 { f } else { 0.0 }
 }
 
 fn clamp_symmetric(x: f32, cap: f32) -> f32 {

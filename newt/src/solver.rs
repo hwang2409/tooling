@@ -453,11 +453,36 @@ pub fn solve_free_bodies(
     cone: ConeKind,
     iterations: u32,
 ) -> Vec<(Vec3, Vec3)> {
+    let (wrenches, _) = solve_free_bodies_diag(
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations,
+    );
+    wrenches
+}
+
+/// Diagnostic variant of [`solve_free_bodies`]. Returns the same per-body
+/// wrenches PLUS a `Vec<f32>` with one entry per input contact: the
+/// per-contact normal force (impulse / dt) after the PGS sweep. Used by
+/// the touch sensor to read the actual constraint-normal force applied to
+/// a specific contact instead of approximating via the penalty formula.
+///
+/// The order of `contact_normal_forces` matches `contacts` one-to-one.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_free_bodies_diag(
+    bodies: &[Body],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    equalities: &[Equality],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     let n_bodies = bodies.len();
     let mut wrenches = vec![(Vec3::ZERO, Vec3::ZERO); n_bodies];
+    let mut contact_normal_forces = vec![0.0f32; contacts.len()];
     let has_free_eq = equalities.iter().any(|e| e.is_free_body());
     if (contacts.is_empty() && !has_free_eq) || dt <= 0.0 {
-        return wrenches;
+        return (wrenches, contact_normal_forces);
     }
 
     let mut rows: Vec<ConstraintRow> = Vec::new();
@@ -599,7 +624,7 @@ pub fn solve_free_bodies(
 
     let n_rows = rows.len();
     if n_rows == 0 {
-        return wrenches;
+        return (wrenches, contact_normal_forces);
     }
 
     // Cache I_world^-1 per body — used by row_body_diagonal /
@@ -801,7 +826,15 @@ pub fn solve_free_bodies(
         }
     }
 
-    wrenches
+    // Per-contact normal FORCE = normal-row impulse / dt. The touch sensor
+    // consumes this to report the actual constraint-computed normal force
+    // rather than the penalty-formula approximation. `per_contact` was
+    // pushed in the same order as `contacts` so the mapping is 1:1.
+    for (i, pc) in per_contact.iter().enumerate() {
+        contact_normal_forces[i] = impulses[pc.start_row as usize] / dt;
+    }
+
+    (wrenches, contact_normal_forces)
 }
 
 /// Per-contact solver bookkeeping shared across all rows of one contact.

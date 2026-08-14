@@ -29,6 +29,7 @@ use crate::geom::{Geom, GeomShape, SolRef};
 use crate::joint::{JointKind, JointLimit};
 use crate::json::{self, Value};
 use crate::math::{Mat3, Quat, Vec3};
+use crate::sensor::{Sensor, SensorAttach, SensorKind, SiteFrame};
 use crate::tree::{Link, Tree, forward_kinematics};
 use crate::world::World;
 
@@ -126,6 +127,11 @@ pub struct Scene {
 
     /// Actuator name → `(tree_idx, actuator_idx_within_tree)`.
     pub actuators_by_name: HashMap<String, (usize, usize)>,
+
+    /// Sensor name → index into `world.sensors.sensors`. Same lookup that
+    /// [`World::sensor`] takes; the field is here purely so callers can
+    /// address sensors by the JSON name.
+    pub sensors_by_name: HashMap<String, usize>,
 }
 
 impl Scene {
@@ -781,6 +787,7 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
             "actuators",
             "contact_pairs",
             "equality",
+            "sensors",
         ],
         path,
     )?;
@@ -975,6 +982,39 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
         }
     }
 
+    // ---- Sensors ----
+    // Parsed AFTER geoms/sites so name resolution has the full universe of
+    // referenceable entities. World.add_sensor validates each spec, so a
+    // bad reference here surfaces at the corresponding JSON path.
+    let mut sensors_by_name: HashMap<String, usize> = HashMap::new();
+    if let Some(v) = optional(root_fields, "sensors") {
+        let arr = get_array(v, "sensors")?;
+        for (i, sv) in arr.iter().enumerate() {
+            let p = format!("sensors[{i}]");
+            let sensor = parse_sensor(
+                sv,
+                &p,
+                &bodies_by_name,
+                &trees_by_name,
+                &links_by_name,
+                &geoms_by_name,
+                &sites,
+                &sites_by_name,
+            )?;
+            if sensors_by_name.contains_key(&sensor.name) {
+                return fail(
+                    &format!("{p}.name"),
+                    format!("duplicate sensor name \"{}\"", sensor.name),
+                );
+            }
+            let name = sensor.name.clone();
+            let idx = world
+                .add_sensor(sensor)
+                .map_err(|e| ModelError::new(p, e.0))?;
+            sensors_by_name.insert(name, idx);
+        }
+    }
+
     // ---- Loader-level pair support check ----
     // Reject any ACTIVE contact pair whose shape combination is not
     // implemented by newt's narrow phase. Loud at load time so users get a
@@ -1003,6 +1043,7 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
         sites,
         sites_by_name,
         actuators_by_name,
+        sensors_by_name,
     })
 }
 
@@ -1861,6 +1902,137 @@ fn parse_actuator(
     servo.target = target;
 
     Ok((name, tidx, servo))
+}
+
+/// Parse one entry in the top-level `"sensors"` array.
+///
+/// Schema (union over the sensor kinds — see `docs/sensors.md`):
+///
+/// ```json
+/// // joint scalars (hinge / slide)
+/// { "name": "hip_q",   "kind": "jointpos",     "tree": "t", "link": "hip" }
+/// { "name": "hip_qd",  "kind": "jointvel",     "tree": "t", "link": "hip" }
+/// // ball joint state
+/// { "name": "sh_quat", "kind": "ballquat",     "tree": "t", "link": "sh" }
+/// { "name": "sh_omg",  "kind": "ballangvel",   "tree": "t", "link": "sh" }
+/// // site frame kinematics
+/// { "name": "tip",     "kind": "framepos",     "site": "tip_site" }
+/// { "name": "tipQ",    "kind": "framequat",    "site": "tip_site" }
+/// { "name": "gyro",    "kind": "gyro",         "site": "imu_site" }
+/// { "name": "accel",   "kind": "accelerometer","site": "imu_site" }
+/// // contact / interaction sensors
+/// { "name": "foot",    "kind": "touch",        "geom": "foot_pad" }
+/// { "name": "elbowF",  "kind": "force",        "tree": "t", "link": "forearm" }
+/// { "name": "elbowT",  "kind": "torque",       "tree": "t", "link": "forearm" }
+/// ```
+///
+/// The `site` field on the site-frame kinds MUST reference a site defined
+/// earlier in the `"sites"` array; the loader inlines the site's parent
+/// attach and local pose into the sensor spec (sensors do not carry a
+/// live reference to the `Site` table).
+#[allow(clippy::too_many_arguments)]
+fn parse_sensor(
+    v: &Value,
+    path: &str,
+    bodies_by_name: &HashMap<String, usize>,
+    trees_by_name: &HashMap<String, usize>,
+    links_by_name: &[HashMap<String, usize>],
+    geoms_by_name: &HashMap<String, usize>,
+    sites: &[Site],
+    sites_by_name: &HashMap<String, usize>,
+) -> Result<Sensor, ModelError> {
+    let fields = get_object(v, path)?;
+    let name = get_str(required(fields, "name", path)?, &format!("{path}.name"))?.to_string();
+    if name.is_empty() {
+        return fail(&format!("{path}.name"), "sensor name must not be empty");
+    }
+    let kind_str = get_str(required(fields, "kind", path)?, &format!("{path}.kind"))?;
+    let _ = bodies_by_name; // site kinds resolve via `sites_by_name`; joint kinds via `trees_by_name`.
+    let kind = match kind_str {
+        "jointpos" | "jointvel" | "ballquat" | "ballangvel" | "force" | "torque" => {
+            reject_unknown(fields, &["name", "kind", "tree", "link"], path)?;
+            let (t, l) = parse_tree_link_ref(fields, path, trees_by_name, links_by_name)?;
+            match kind_str {
+                "jointpos" => SensorKind::JointPos { tree: t, link: l },
+                "jointvel" => SensorKind::JointVel { tree: t, link: l },
+                "ballquat" => SensorKind::BallQuat { tree: t, link: l },
+                "ballangvel" => SensorKind::BallAngVel { tree: t, link: l },
+                "force" => SensorKind::Force { tree: t, link: l },
+                "torque" => SensorKind::Torque { tree: t, link: l },
+                _ => unreachable!(),
+            }
+        }
+        "framepos" | "framequat" | "gyro" | "accelerometer" => {
+            reject_unknown(fields, &["name", "kind", "site"], path)?;
+            let sn = get_str(required(fields, "site", path)?, &format!("{path}.site"))?;
+            let sidx = sites_by_name.get(sn).copied().ok_or_else(|| {
+                ModelError::new(
+                    format!("{path}.site"),
+                    format!("unknown site \"{sn}\" — declare it in the top-level \"sites\" array"),
+                )
+            })?;
+            let frame = site_to_frame(&sites[sidx]);
+            match kind_str {
+                "framepos" => SensorKind::FramePos(frame),
+                "framequat" => SensorKind::FrameQuat(frame),
+                "gyro" => SensorKind::Gyro(frame),
+                "accelerometer" => SensorKind::Accelerometer(frame),
+                _ => unreachable!(),
+            }
+        }
+        "touch" => {
+            reject_unknown(fields, &["name", "kind", "geom"], path)?;
+            let gn = get_str(required(fields, "geom", path)?, &format!("{path}.geom"))?;
+            let gidx = geoms_by_name.get(gn).copied().ok_or_else(|| {
+                ModelError::new(format!("{path}.geom"), format!("unknown geom \"{gn}\""))
+            })?;
+            SensorKind::Touch { geom: gidx }
+        }
+        other => {
+            return fail(
+                &format!("{path}.kind"),
+                format!(
+                    "unknown sensor kind \"{other}\"; expected \
+                     jointpos | jointvel | ballquat | ballangvel | framepos | framequat | \
+                     gyro | accelerometer | touch | force | torque"
+                ),
+            );
+        }
+    };
+    Ok(Sensor { name, kind })
+}
+
+fn parse_tree_link_ref(
+    fields: &[(String, Value)],
+    path: &str,
+    trees_by_name: &HashMap<String, usize>,
+    links_by_name: &[HashMap<String, usize>],
+) -> Result<(usize, usize), ModelError> {
+    let tn = get_str(required(fields, "tree", path)?, &format!("{path}.tree"))?;
+    let tidx = trees_by_name
+        .get(tn)
+        .copied()
+        .ok_or_else(|| ModelError::new(format!("{path}.tree"), format!("unknown tree \"{tn}\"")))?;
+    let ln = get_str(required(fields, "link", path)?, &format!("{path}.link"))?;
+    let lidx = links_by_name[tidx].get(ln).copied().ok_or_else(|| {
+        ModelError::new(
+            format!("{path}.link"),
+            format!("unknown link \"{ln}\" in tree \"{tn}\""),
+        )
+    })?;
+    Ok((tidx, lidx))
+}
+
+fn site_to_frame(site: &Site) -> SiteFrame {
+    let attach = match site.attach {
+        SiteAttach::Body(i) => SensorAttach::Body(i),
+        SiteAttach::Link { tree, link } => SensorAttach::Link(tree, link),
+    };
+    SiteFrame {
+        attach,
+        local_offset: site.local_offset,
+        local_orientation: site.local_orientation,
+    }
 }
 
 /// Parse one entry in the top-level `"equality"` array.
