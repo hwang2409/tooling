@@ -24,6 +24,7 @@ use std::path::Path;
 
 use crate::actuator::PdServo;
 use crate::body::Body;
+use crate::equality::Equality;
 use crate::geom::{Geom, GeomShape, SolRef};
 use crate::joint::{JointKind, JointLimit};
 use crate::json::{self, Value};
@@ -779,6 +780,7 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
             "sites",
             "actuators",
             "contact_pairs",
+            "equality",
         ],
         path,
     )?;
@@ -953,6 +955,24 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
             &world,
             &tree_self_collide,
         ));
+    }
+
+    // ---- Equalities ----
+    if let Some(v) = optional(root_fields, "equality") {
+        let arr = get_array(v, "equality")?;
+        for (i, eq_v) in arr.iter().enumerate() {
+            let p = format!("equality[{i}]");
+            let eq = parse_equality(
+                eq_v,
+                &p,
+                &bodies_by_name,
+                &trees_by_name,
+                &links_by_name,
+                &world,
+            )?;
+            eq.validate().map_err(|m| ModelError::new(p, m))?;
+            world.equalities.push(eq);
+        }
     }
 
     // ---- Loader-level pair support check ----
@@ -1239,6 +1259,8 @@ fn parse_geom(
             "local_offset",
             "local_orientation",
             "friction",
+            "torsional_friction",
+            "rolling_friction",
             "solref",
             "solimp",
             "margin",
@@ -1289,32 +1311,13 @@ fn parse_geom(
         }
         None => 0.5,
     };
-    let solref = match optional(fields, "solref") {
-        Some(v) => {
-            let sf = get_object(v, &format!("{path}.solref"))?;
-            reject_unknown(sf, &["timeconst", "dampratio"], &format!("{path}.solref"))?;
-            let tc = get_f32(
-                required(sf, "timeconst", &format!("{path}.solref"))?,
-                &format!("{path}.solref.timeconst"),
-            )?;
-            let zeta = get_f32(
-                required(sf, "dampratio", &format!("{path}.solref"))?,
-                &format!("{path}.solref.dampratio"),
-            )?;
-            if tc <= 0.0 || zeta < 0.0 {
-                return fail(
-                    &format!("{path}.solref"),
-                    "timeconst must be > 0 and dampratio must be ≥ 0",
-                );
-            }
-            SolRef::new(tc, zeta)
-        }
-        None => SolRef::DEFAULT,
-    };
+    let solref = parse_optional_solref(fields, path)?;
 
     let (margin, gap) = parse_margin_gap(fields, path)?;
-    let solimp = parse_solimp(fields, path)?;
+    let solimp = parse_optional_solimp(fields, path)?;
     let condim = parse_condim(fields, path)?;
+    let torsional_friction = parse_nonneg_float(fields, "torsional_friction", path)?.unwrap_or(0.0);
+    let rolling_friction = parse_nonneg_float(fields, "rolling_friction", path)?.unwrap_or(0.0);
 
     let geom = Geom {
         shape,
@@ -1327,9 +1330,28 @@ fn parse_geom(
         margin,
         gap,
         condim,
+        torsional_friction,
+        rolling_friction,
         solimp,
     };
     Ok((geom, name))
+}
+
+/// Parse an optional non-negative float field on a geom (or wherever). Returns
+/// `None` if absent; `Err` if present and negative or non-finite.
+fn parse_nonneg_float(
+    fields: &[(String, Value)],
+    key: &str,
+    path: &str,
+) -> Result<Option<f32>, ModelError> {
+    let Some(v) = optional(fields, key) else {
+        return Ok(None);
+    };
+    let f = get_f32(v, &format!("{path}.{key}"))?;
+    if f < 0.0 {
+        return fail(&format!("{path}.{key}"), format!("{key} must be ≥ 0"));
+    }
+    Ok(Some(f))
 }
 
 /// Parse the top-level `solver` object. Schema:
@@ -1389,58 +1411,11 @@ fn parse_solver_config(v: &Value, path: &str) -> Result<crate::solver::SolverCon
     Ok(cfg)
 }
 
-/// Parse the optional `solimp` field on a geom object. Returns
-/// [`SolImp::DEFAULT`] when absent. Validates ranges (see
-/// [`SolImp::validate`]).
-fn parse_solimp(
-    fields: &[(String, Value)],
-    path: &str,
-) -> Result<crate::solver::SolImp, ModelError> {
-    let Some(v) = optional(fields, "solimp") else {
-        return Ok(crate::solver::SolImp::DEFAULT);
-    };
-    let sf = get_object(v, &format!("{path}.solimp"))?;
-    reject_unknown(
-        sf,
-        &["dmin", "dmax", "width", "midpoint", "power"],
-        &format!("{path}.solimp"),
-    )?;
-    let dmin = get_f32(
-        required(sf, "dmin", &format!("{path}.solimp"))?,
-        &format!("{path}.solimp.dmin"),
-    )?;
-    let dmax = get_f32(
-        required(sf, "dmax", &format!("{path}.solimp"))?,
-        &format!("{path}.solimp.dmax"),
-    )?;
-    let width = get_f32(
-        required(sf, "width", &format!("{path}.solimp"))?,
-        &format!("{path}.solimp.width"),
-    )?;
-    let midpoint = get_f32(
-        required(sf, "midpoint", &format!("{path}.solimp"))?,
-        &format!("{path}.solimp.midpoint"),
-    )?;
-    let power_f = get_f32(
-        required(sf, "power", &format!("{path}.solimp"))?,
-        &format!("{path}.solimp.power"),
-    )?;
-    if power_f < 1.0 || power_f != power_f.floor() {
-        return fail(
-            &format!("{path}.solimp.power"),
-            format!("power must be a positive integer, got {power_f}"),
-        );
-    }
-    let s = crate::solver::SolImp::new(dmin, dmax, width, midpoint, power_f as u32);
-    s.validate()
-        .map_err(|m| ModelError::new(format!("{path}.solimp"), m))?;
-    Ok(s)
-}
-
 /// Parse the optional `condim` field on a geom object. Defaults to `3`.
-/// v1-tier-4 supports `1` (frictionless) and `3` (sliding friction). Values
-/// `4` and `6` (torsional / rolling) are reserved for the equality-
-/// constraints ticket and rejected here.
+/// Accepts `1` (frictionless), `3` (sliding friction), `4` (adds
+/// torsional friction about the normal), and `6` (adds rolling friction
+/// about the two tangents). condim `≥ 4` also picks up the geom's
+/// [`Geom::torsional_friction`] / [`Geom::rolling_friction`] coefficients.
 fn parse_condim(fields: &[(String, Value)], path: &str) -> Result<u8, ModelError> {
     let Some(v) = optional(fields, "condim") else {
         return Ok(3);
@@ -1454,17 +1429,13 @@ fn parse_condim(fields: &[(String, Value)], path: &str) -> Result<u8, ModelError
     }
     let n_int = n as i32;
     match n_int {
-        1 | 3 => Ok(n_int as u8),
-        4 | 6 => fail(
-            &format!("{path}.condim"),
-            format!(
-                "condim {n_int} (torsional/rolling friction) is deferred to \
-                 the equality-constraints ticket; use 1 or 3 for now"
-            ),
-        ),
+        1 | 3 | 4 | 6 => Ok(n_int as u8),
         _ => fail(
             &format!("{path}.condim"),
-            format!("condim must be 1 (frictionless) or 3 (sliding); got {n_int}"),
+            format!(
+                "condim must be 1 (frictionless), 3 (sliding), 4 (torsional), \
+                 or 6 (rolling); got {n_int}"
+            ),
         ),
     }
 }
@@ -1890,6 +1861,351 @@ fn parse_actuator(
     servo.target = target;
 
     Ok((name, tidx, servo))
+}
+
+/// Parse one entry in the top-level `"equality"` array.
+///
+/// ```json
+/// { "kind": "connect", "body_a": "A", "body_b": "B",
+///   "anchor_a": [x, y, z], "anchor_b": [x, y, z],
+///   "solref": {...}, "solimp": {...} }
+///
+/// { "kind": "weld", ..., "relative_orientation": [x, y, z, w] }
+///
+/// { "kind": "joint", "tree": "t", "joint_a": "a", "joint_b": "b",
+///   "polycoef": [c0, c1, c2] }
+///
+/// { "kind": "distance", ..., "distance": 1.5 }
+/// ```
+///
+/// A `body_*` field of `"world"` (or absent) attaches that side to the
+/// world at the raw `anchor_*` world-frame point. `solref` / `solimp`
+/// share the schema of the geom fields; both are optional (defaults
+/// apply).
+fn parse_equality(
+    v: &Value,
+    path: &str,
+    bodies_by_name: &HashMap<String, usize>,
+    trees_by_name: &HashMap<String, usize>,
+    links_by_name: &[HashMap<String, usize>],
+    world: &World,
+) -> Result<Equality, ModelError> {
+    let fields = get_object(v, path)?;
+    let kind = get_str(required(fields, "kind", path)?, &format!("{path}.kind"))?;
+    match kind {
+        "connect" => {
+            reject_unknown(
+                fields,
+                &[
+                    "kind", "body_a", "body_b", "anchor_a", "anchor_b", "solref", "solimp",
+                ],
+                path,
+            )?;
+            let body_a = parse_optional_body_ref(fields, "body_a", path, bodies_by_name)?;
+            let body_b = parse_optional_body_ref(fields, "body_b", path, bodies_by_name)?;
+            if body_a.is_none() && body_b.is_none() {
+                return fail(
+                    path,
+                    "connect must reference at least one body (not two worlds)",
+                );
+            }
+            let anchor_a = parse_vec3(
+                required(fields, "anchor_a", path)?,
+                &format!("{path}.anchor_a"),
+            )?;
+            let anchor_b = parse_vec3(
+                required(fields, "anchor_b", path)?,
+                &format!("{path}.anchor_b"),
+            )?;
+            let solref = parse_optional_solref(fields, path)?;
+            let solimp = parse_optional_solimp(fields, path)?;
+            Ok(Equality::Connect {
+                body_a,
+                body_b,
+                anchor_a,
+                anchor_b,
+                solref,
+                solimp,
+            })
+        }
+        "weld" => {
+            reject_unknown(
+                fields,
+                &[
+                    "kind",
+                    "body_a",
+                    "body_b",
+                    "anchor_a",
+                    "anchor_b",
+                    "relative_orientation",
+                    "solref",
+                    "solimp",
+                ],
+                path,
+            )?;
+            let body_a = parse_optional_body_ref(fields, "body_a", path, bodies_by_name)?;
+            let body_b = parse_optional_body_ref(fields, "body_b", path, bodies_by_name)?;
+            if body_a.is_none() && body_b.is_none() {
+                return fail(
+                    path,
+                    "weld must reference at least one body (not two worlds)",
+                );
+            }
+            let anchor_a = parse_vec3(
+                required(fields, "anchor_a", path)?,
+                &format!("{path}.anchor_a"),
+            )?;
+            let anchor_b = parse_vec3(
+                required(fields, "anchor_b", path)?,
+                &format!("{path}.anchor_b"),
+            )?;
+            let relative_orientation = match optional(fields, "relative_orientation") {
+                Some(v) => parse_quat(v, &format!("{path}.relative_orientation"))?,
+                None => Quat::IDENTITY,
+            };
+            let solref = parse_optional_solref(fields, path)?;
+            let solimp = parse_optional_solimp(fields, path)?;
+            Ok(Equality::Weld {
+                body_a,
+                body_b,
+                anchor_a,
+                anchor_b,
+                relative_orientation,
+                solref,
+                solimp,
+            })
+        }
+        "joint" => {
+            reject_unknown(
+                fields,
+                &[
+                    "kind", "tree", "joint_a", "joint_b", "polycoef", "solref", "solimp",
+                ],
+                path,
+            )?;
+            let tn = get_str(required(fields, "tree", path)?, &format!("{path}.tree"))?;
+            let tidx = trees_by_name.get(tn).copied().ok_or_else(|| {
+                ModelError::new(format!("{path}.tree"), format!("unknown tree \"{tn}\""))
+            })?;
+            let (link_a, la_name) =
+                resolve_1dof_joint(fields, "joint_a", path, tidx, tn, links_by_name, world)?;
+            let (link_b, lb_name) =
+                resolve_1dof_joint(fields, "joint_b", path, tidx, tn, links_by_name, world)?;
+            if link_a == link_b {
+                return fail(
+                    path,
+                    format!("joint coupling endpoints must be distinct (both are \"{la_name}\")"),
+                );
+            }
+            let _ = lb_name;
+            let polycoef = parse_polycoef(fields, path)?;
+            let solref = parse_optional_solref(fields, path)?;
+            let solimp = parse_optional_solimp(fields, path)?;
+            Ok(Equality::JointCoupling {
+                tree: tidx,
+                link_a,
+                link_b,
+                polycoef,
+                solref,
+                solimp,
+            })
+        }
+        "distance" => {
+            reject_unknown(
+                fields,
+                &[
+                    "kind", "body_a", "body_b", "anchor_a", "anchor_b", "distance", "solref",
+                    "solimp",
+                ],
+                path,
+            )?;
+            let body_a = parse_optional_body_ref(fields, "body_a", path, bodies_by_name)?;
+            let body_b = parse_optional_body_ref(fields, "body_b", path, bodies_by_name)?;
+            if body_a.is_none() && body_b.is_none() {
+                return fail(
+                    path,
+                    "distance must reference at least one body (not two worlds)",
+                );
+            }
+            let anchor_a = parse_vec3(
+                required(fields, "anchor_a", path)?,
+                &format!("{path}.anchor_a"),
+            )?;
+            let anchor_b = parse_vec3(
+                required(fields, "anchor_b", path)?,
+                &format!("{path}.anchor_b"),
+            )?;
+            let distance = get_f32(
+                required(fields, "distance", path)?,
+                &format!("{path}.distance"),
+            )?;
+            if distance < 0.0 {
+                return fail(&format!("{path}.distance"), "distance must be ≥ 0");
+            }
+            let solref = parse_optional_solref(fields, path)?;
+            let solimp = parse_optional_solimp(fields, path)?;
+            Ok(Equality::Distance {
+                body_a,
+                body_b,
+                anchor_a,
+                anchor_b,
+                distance,
+                solref,
+                solimp,
+            })
+        }
+        other => fail(
+            &format!("{path}.kind"),
+            format!(
+                "unknown equality kind \"{other}\"; expected connect | weld | joint | distance"
+            ),
+        ),
+    }
+}
+
+/// Parse a `body_a` / `body_b` field. `None` (missing) or the string
+/// `"world"` returns `None`; a body name resolves to that body's index.
+fn parse_optional_body_ref(
+    fields: &[(String, Value)],
+    key: &str,
+    path: &str,
+    bodies_by_name: &HashMap<String, usize>,
+) -> Result<Option<usize>, ModelError> {
+    let Some(v) = optional(fields, key) else {
+        return Ok(None);
+    };
+    let s = get_str(v, &format!("{path}.{key}"))?;
+    if s == "world" {
+        return Ok(None);
+    }
+    bodies_by_name
+        .get(s)
+        .copied()
+        .map(Some)
+        .ok_or_else(|| ModelError::new(format!("{path}.{key}"), format!("unknown body \"{s}\"")))
+}
+
+/// Resolve a joint reference on a coupling equality to a link index and
+/// enforce that it names a 1-DOF joint (hinge or slide).
+fn resolve_1dof_joint(
+    fields: &[(String, Value)],
+    key: &str,
+    path: &str,
+    tree_idx: usize,
+    tree_name: &str,
+    links_by_name: &[HashMap<String, usize>],
+    world: &World,
+) -> Result<(usize, String), ModelError> {
+    let n = get_str(required(fields, key, path)?, &format!("{path}.{key}"))?;
+    let lidx = links_by_name[tree_idx].get(n).copied().ok_or_else(|| {
+        ModelError::new(
+            format!("{path}.{key}"),
+            format!("unknown link \"{n}\" in tree \"{tree_name}\""),
+        )
+    })?;
+    if !matches!(
+        world.trees[tree_idx].links[lidx].joint,
+        JointKind::Hinge { .. } | JointKind::Slide { .. }
+    ) {
+        return fail(
+            &format!("{path}.{key}"),
+            format!(
+                "joint \"{n}\" must be a hinge or slide (joint coupling is scalar; not supported for free/fixed/ball)"
+            ),
+        );
+    }
+    Ok((lidx, n.to_string()))
+}
+
+/// Parse the required `polycoef` array as `[c0, c1, c2]`. Accepts an
+/// array of length 1, 2, or 3; missing tail entries default to 0.
+fn parse_polycoef(fields: &[(String, Value)], path: &str) -> Result<[f32; 3], ModelError> {
+    let v = required(fields, "polycoef", path)?;
+    let arr = get_array(v, &format!("{path}.polycoef"))?;
+    if arr.is_empty() || arr.len() > 3 {
+        return fail(
+            &format!("{path}.polycoef"),
+            format!("polycoef must have 1, 2, or 3 entries (got {})", arr.len()),
+        );
+    }
+    let mut out = [0.0f32; 3];
+    for (i, entry) in arr.iter().enumerate() {
+        out[i] = get_f32(entry, &format!("{path}.polycoef[{i}]"))?;
+    }
+    Ok(out)
+}
+
+/// Optional `solref` on an equality object. Same schema as geoms — see
+/// [`parse_geom`].
+fn parse_optional_solref(fields: &[(String, Value)], path: &str) -> Result<SolRef, ModelError> {
+    let Some(v) = optional(fields, "solref") else {
+        return Ok(SolRef::DEFAULT);
+    };
+    let sf = get_object(v, &format!("{path}.solref"))?;
+    reject_unknown(sf, &["timeconst", "dampratio"], &format!("{path}.solref"))?;
+    let tc = get_f32(
+        required(sf, "timeconst", &format!("{path}.solref"))?,
+        &format!("{path}.solref.timeconst"),
+    )?;
+    let zeta = get_f32(
+        required(sf, "dampratio", &format!("{path}.solref"))?,
+        &format!("{path}.solref.dampratio"),
+    )?;
+    if tc <= 0.0 || zeta < 0.0 {
+        return fail(
+            &format!("{path}.solref"),
+            "timeconst must be > 0 and dampratio must be ≥ 0",
+        );
+    }
+    Ok(SolRef::new(tc, zeta))
+}
+
+/// Optional `solimp` on a geom or equality object. Returns
+/// [`SolImp::DEFAULT`] when absent. Validates ranges (see
+/// [`SolImp::validate`]).
+fn parse_optional_solimp(
+    fields: &[(String, Value)],
+    path: &str,
+) -> Result<crate::solver::SolImp, ModelError> {
+    let Some(v) = optional(fields, "solimp") else {
+        return Ok(crate::solver::SolImp::DEFAULT);
+    };
+    let sf = get_object(v, &format!("{path}.solimp"))?;
+    reject_unknown(
+        sf,
+        &["dmin", "dmax", "width", "midpoint", "power"],
+        &format!("{path}.solimp"),
+    )?;
+    let dmin = get_f32(
+        required(sf, "dmin", &format!("{path}.solimp"))?,
+        &format!("{path}.solimp.dmin"),
+    )?;
+    let dmax = get_f32(
+        required(sf, "dmax", &format!("{path}.solimp"))?,
+        &format!("{path}.solimp.dmax"),
+    )?;
+    let width = get_f32(
+        required(sf, "width", &format!("{path}.solimp"))?,
+        &format!("{path}.solimp.width"),
+    )?;
+    let midpoint = get_f32(
+        required(sf, "midpoint", &format!("{path}.solimp"))?,
+        &format!("{path}.solimp.midpoint"),
+    )?;
+    let power_f = get_f32(
+        required(sf, "power", &format!("{path}.solimp"))?,
+        &format!("{path}.solimp.power"),
+    )?;
+    if power_f < 1.0 || power_f != power_f.floor() {
+        return fail(
+            &format!("{path}.solimp.power"),
+            format!("power must be a positive integer, got {power_f}"),
+        );
+    }
+    let s = crate::solver::SolImp::new(dmin, dmax, width, midpoint, power_f as u32);
+    s.validate()
+        .map_err(|m| ModelError::new(format!("{path}.solimp"), m))?;
+    Ok(s)
 }
 
 fn parse_contact_pairs(
