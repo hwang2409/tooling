@@ -916,7 +916,7 @@ struct LimitRow {
 /// n_limits` with `A_ij = e_i^T · M^-1 · e_j` (a submatrix of `M^-1`).
 ///
 /// Zero-length return `vec![0.0; nv]` when there are no active limits.
-pub fn solve_tree_limits(tree: &Tree, dt: f32) -> Vec<f32> {
+pub fn solve_tree_limits(tree: &Tree, dt: f32, iterations: u32) -> Vec<f32> {
     let nv = tree.nv();
     let mut qfrc = vec![0.0f32; nv];
     if nv == 0 || dt <= 0.0 {
@@ -1017,9 +1017,9 @@ pub fn solve_tree_limits(tree: &Tree, dt: f32) -> Vec<f32> {
         diag[i] = a_ii + r;
     }
 
-    // PGS: fixed iteration count, sweep in ascending limit index.
+    // PGS: fixed iteration count (from `world.solver.iterations`), sweep
+    // in ascending limit index.
     let mut f = vec![0.0f32; n_limits];
-    let iterations = 30u32;
     for _iter in 0..iterations {
         for i in 0..n_limits {
             // residual = Σ_j A_ij f_j + R_ii f_i + bias_i.

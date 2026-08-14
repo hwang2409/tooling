@@ -440,23 +440,30 @@ impl World {
             // hold it constant across the RK4 stages via qfrc_applied.
             // Preserves the pre-step qfrc_applied so user-set torques
             // remain in effect (the solver term is added on top and
-            // subtracted back after the step).
+            // subtracted back after the step). ALSO: disable the tier-3
+            // penalty limit torque for this step so the PGS constraint
+            // is the sole limit authority — mirrors how contacts already
+            // switch on solver mode.
             let mut solver_qfrc_delta: Vec<f32> = Vec::new();
+            let prior_disable = tree.disable_penalty_limits;
             if self.solver.mode == SolverMode::Pgs {
-                solver_qfrc_delta = crate::solver::solve_tree_limits(&tree, dt);
+                solver_qfrc_delta =
+                    crate::solver::solve_tree_limits(&tree, dt, self.solver.iterations);
                 for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
                     tree.qfrc_applied[slot] += delta;
                 }
+                tree.disable_penalty_limits = true;
             }
             tree_rk4_step(&mut tree, gravity, dt, |t| {
                 tree_wrenches_from_contacts(t, ti, &bodies, &geoms, &meshes, &tree_pairs)
             });
-            // Roll back the ZOH limit torque so it doesn't accumulate
-            // across steps (the solver recomputes it fresh at each step
-            // start).
+            // Roll back the ZOH limit torque + penalty-limit gate so
+            // neither accumulates across steps (the solver recomputes
+            // both fresh at each step start).
             for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
                 tree.qfrc_applied[slot] -= delta;
             }
+            tree.disable_penalty_limits = prior_disable;
             self.trees[ti] = tree;
         }
     }
