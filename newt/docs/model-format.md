@@ -295,9 +295,21 @@ runaway nesting, `1e9999` overflow).
   `arm_json_matches_programmatic_construction_exactly` in
   [`tests/model_load.rs`](../tests/model_load.rs)).
 - [`models/stack.json`](../models/stack.json) — three
-  0.35 m boxes with mixed masses and small yaw offsets so the
-  golden trajectory is symmetry-broken *inside the model file* (per the
-  tier-2 lesson: symmetric boxes hide lever-arm bugs). Golden is
+  0.35 m boxes with mixed masses (1.2 / 0.9 / 1.5), a small +0.02 m
+  x-shift on the middle box, and a `(0, 0.3, 0)` body-frame
+  initial angular velocity on the top box. Same symmetry-break pattern
+  as [`tests/contacts_golden.rs`](../tests/contacts_golden.rs). The
+  earlier draft of stack.json broke symmetry via small yaw rotations
+  on the middle and top boxes — that tickled a **latent tier-2
+  limitation**: [`contact::box_box`](../src/contact.rs) is a
+  vertex-only SAT that misses edge-edge intersections between
+  rotated boxes (any yaw ≥ 5° drops all box-box contact candidates
+  even when the boxes clearly overlap). The tier-2 box-box golden
+  path only exercises axis-aligned boxes, so the bug never surfaced
+  before; the tier-5 round-trip test caught it here. Fixing the
+  box-box narrow phase is a tier-2 follow-up (needs a proper SAT or
+  MPR implementation); until then, rotated free-body-vs-free-body
+  contact is not supported. Golden is
   [`tests/goldens/model_stack.bin`](../tests/goldens/model_stack.bin);
   regen with `cargo test regenerate_stack_golden -- --ignored
   --nocapture` on macOS-aarch64.

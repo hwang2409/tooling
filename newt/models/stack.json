@@ -8,25 +8,20 @@
       "name": "bottom",
       "mass": 1.2,
       "inertia": {"kind": "solid", "shape": {"kind": "box", "half_extents": [0.35, 0.35, 0.35]}},
-      "pose": {"position": [0.02, -0.01, 0.5]}
+      "pose": {"position": [0.0, 0.0, 0.5]}
     },
     {
       "name": "middle",
       "mass": 0.9,
       "inertia": {"kind": "solid", "shape": {"kind": "box", "half_extents": [0.35, 0.35, 0.35]}},
-      "pose": {
-        "position": [-0.03, 0.04, 1.7],
-        "orientation": [0.0, 0.0, 0.25881904, 0.9659258]
-      }
+      "pose": {"position": [0.02, 0.0, 1.7]}
     },
     {
       "name": "top",
       "mass": 1.5,
       "inertia": {"kind": "solid", "shape": {"kind": "box", "half_extents": [0.35, 0.35, 0.35]}},
-      "pose": {
-        "position": [0.05, 0.02, 2.9],
-        "orientation": [0.0, 0.0, -0.19509032, 0.98078525]
-      }
+      "pose": {"position": [0.0, 0.0, 2.9]},
+      "velocity": {"angular_body": [0.0, 0.3, 0.0]}
     }
   ],
 

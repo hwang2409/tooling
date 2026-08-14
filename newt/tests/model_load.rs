@@ -18,6 +18,7 @@ use newt::joint::JointKind;
 use newt::math::{Mat3, Quat, Vec3};
 use newt::model::{Scene, load_from_path};
 use newt::tree::{Link, Tree, rk4_step};
+use newt::world::World;
 
 fn model_path(name: &str) -> std::path::PathBuf {
     let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -183,6 +184,102 @@ fn arm_scene_exposes_expected_names_and_site() {
         "tip z = {}, expected {}",
         pos.z,
         1.6 - 3.0 * ARM_L
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 2b. round-trip: stack.json vs programmatic (mirrors examples/stack.rs)
+// ---------------------------------------------------------------------------
+
+/// Programmatic equivalent of `models/stack.json`. Same masses, same drop
+/// positions, same +0.02 middle-box shift + top-box initial spin (the
+/// tier-2 symmetry break carried across).
+///
+/// Kept side-by-side with `models/stack.json` so a divergence between the
+/// tier-2 free-body path and the loader is caught by the byte-identical
+/// assert below — this is the missing gate that let a broken stack
+/// symmetry-break slip through the first pass on this ticket.
+fn build_stack_programmatic() -> World {
+    let mut world = World::new();
+    world.dt = 0.005;
+    world.gravity = Vec3::new(0.0, 0.0, -9.81);
+    world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.6));
+    let half = Vec3::new(0.35, 0.35, 0.35);
+    let drops: [(f32, Vec3, Vec3); 3] = [
+        (1.2, Vec3::new(0.0, 0.0, 0.5), Vec3::ZERO),
+        (0.9, Vec3::new(0.02, 0.0, 1.7), Vec3::ZERO),
+        (1.5, Vec3::new(0.0, 0.0, 2.9), Vec3::new(0.0, 0.3, 0.0)),
+    ];
+    for (mass, pos, omega_body) in drops {
+        let mut b = Body::solid_box(mass, half, pos, Quat::IDENTITY);
+        b.angular_velocity_body = omega_body;
+        let idx = world.add_body(b);
+        world.add_geom(Geom::r#box(idx, half, Vec3::ZERO, Quat::IDENTITY, 0.6));
+    }
+    world
+}
+
+#[test]
+fn stack_json_matches_programmatic_construction_exactly() {
+    let scene = load_from_path(model_path("stack.json")).expect("stack.json should load");
+    let mut loaded = scene.world;
+    let mut prog = build_stack_programmatic();
+
+    // Every mutable body field must match at step 0.
+    assert_eq!(loaded.bodies.len(), prog.bodies.len());
+    for (i, (a, b)) in loaded.bodies.iter().zip(prog.bodies.iter()).enumerate() {
+        assert_eq!(a.mass, b.mass, "body {i} mass");
+        assert_eq!(a.inertia_body, b.inertia_body, "body {i} inertia");
+        assert_eq!(a.position, b.position, "body {i} position");
+        assert_eq!(a.orientation, b.orientation, "body {i} orientation");
+        assert_eq!(a.linear_velocity, b.linear_velocity, "body {i} v_lin");
+        assert_eq!(
+            a.angular_velocity_body, b.angular_velocity_body,
+            "body {i} omega_body"
+        );
+    }
+    // Every geom must match too (same shapes + attachments) — a mis-mapped
+    // body index in the loader would blow this even before any step.
+    assert_eq!(loaded.geoms.len(), prog.geoms.len());
+    for (i, (a, b)) in loaded.geoms.iter().zip(prog.geoms.iter()).enumerate() {
+        assert_eq!(a.attachment(), b.attachment(), "geom {i} attachment");
+        assert_eq!(a.shape, b.shape, "geom {i} shape");
+        assert_eq!(a.local_offset, b.local_offset, "geom {i} local_offset");
+        assert_eq!(a.friction, b.friction, "geom {i} friction");
+    }
+
+    // Step both worlds 500 steps and require byte-identical body state at
+    // every checkpoint. Box-box contacts DO participate here (the tier-2
+    // reference in `stack.rs` settles the middle and top boxes on top of
+    // the bottom one at z ≈ 1.05 / 1.75); if the loader dropped box-box
+    // pairs while keeping box-plane, all three boxes would collapse onto
+    // the plane at z ≈ 0.35 and this would blow.
+    for step in 0..500 {
+        loaded.step();
+        prog.step();
+        for (i, (a, b)) in loaded.bodies.iter().zip(prog.bodies.iter()).enumerate() {
+            assert_eq!(
+                a.position, b.position,
+                "body {i} position mismatch at step {step}"
+            );
+            assert_eq!(
+                a.linear_velocity, b.linear_velocity,
+                "body {i} v_lin mismatch at step {step}"
+            );
+        }
+    }
+    // Sanity: the middle and top boxes should have landed ABOVE z = 0.5 —
+    // this is the direct positive contradiction to the earlier "all three
+    // fell through each other" failure mode.
+    assert!(
+        loaded.bodies[1].position.z > 0.6,
+        "middle box collapsed to z={}, expected ≈ 1.05",
+        loaded.bodies[1].position.z
+    );
+    assert!(
+        loaded.bodies[2].position.z > 1.3,
+        "top box collapsed to z={}, expected ≈ 1.75",
+        loaded.bodies[2].position.z
     );
 }
 
