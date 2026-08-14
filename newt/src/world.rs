@@ -35,7 +35,7 @@
 //!   [`crate::math`] appear in the compute path.
 
 use crate::body::Body;
-use crate::contact::{Contact, is_pair_supported, narrow_phase};
+use crate::contact::{Contact, is_pair_supported, narrow_phase, narrow_phase_solver};
 use crate::equality::Equality;
 use crate::geom::{
     ConvexMesh, Geom, GeomAttach, GeomPose, GeomShape, combine_solref, geom_world_pose,
@@ -426,8 +426,20 @@ impl World {
                 free_pairs.push((a, b));
             }
         }
-        let free_body_contacts =
-            collect_contacts(&self.bodies, &self.geoms, &self.meshes, &free_pairs);
+        // Match the narrow-phase manifold to the solver mode so sensor
+        // readings (touch, contact forces) see the same contact set the
+        // wrench pathway used this step.
+        let manifold = match self.solver.mode {
+            SolverMode::Pgs => ContactManifold::Full,
+            SolverMode::Penalty => ContactManifold::Legacy,
+        };
+        let free_body_contacts = collect_contacts(
+            &self.bodies,
+            &self.geoms,
+            &self.meshes,
+            &free_pairs,
+            manifold,
+        );
 
         // Body wrenches + per-contact normal forces (touch sensor input).
         let (body_wrenches, free_body_contact_forces): (Vec<(Vec3, Vec3)>, Vec<f32>) =
@@ -710,7 +722,13 @@ impl World {
             }
             free_pairs.push((a, b));
         }
-        let contacts = collect_contacts(state, &self.geoms, &self.meshes, &free_pairs);
+        let contacts = collect_contacts(
+            state,
+            &self.geoms,
+            &self.meshes,
+            &free_pairs,
+            ContactManifold::Full,
+        );
         solve_free_bodies(
             state,
             &self.geoms,
@@ -734,7 +752,13 @@ impl World {
         if self.geoms.is_empty() {
             return out;
         }
-        let contacts = collect_contacts(state, &self.geoms, &self.meshes, pairs);
+        let contacts = collect_contacts(
+            state,
+            &self.geoms,
+            &self.meshes,
+            pairs,
+            ContactManifold::Legacy,
+        );
         for c in &contacts {
             apply_contact_wrench(&mut out, state, &self.geoms, c);
         }
@@ -746,11 +770,24 @@ impl World {
 // contact assembly and force application
 // ---------------------------------------------------------------------------
 
+/// Which narrow-phase dispatch to use when enumerating contacts. Penalty
+/// keeps the legacy vertex-vs-face primary for byte-identical goldens;
+/// [`ContactManifold::Full`] routes box-box through SAT face-clipping so
+/// tilted face-face stacks see the 4-corner manifold instead of the
+/// 2-diagonal degenerate one (see NEWT-14 evidence in
+/// `docs/differential.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContactManifold {
+    Legacy,
+    Full,
+}
+
 fn collect_contacts(
     state: &[Body],
     geoms: &[Geom],
     meshes: &[ConvexMesh],
     pairs: &[(usize, usize)],
+    manifold: ContactManifold,
 ) -> Vec<Contact> {
     let mut out = Vec::new();
     // Pre-compute world poses for every geom in stable index order.
@@ -775,7 +812,14 @@ fn collect_contacts(
         if matches!(att_a, GeomAttach::Link(_, _)) || matches!(att_b, GeomAttach::Link(_, _)) {
             continue;
         }
-        let buf = narrow_phase(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes);
+        let buf = match manifold {
+            ContactManifold::Legacy => {
+                narrow_phase(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes)
+            }
+            ContactManifold::Full => {
+                narrow_phase_solver(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes)
+            }
+        };
         for c in buf.as_slice() {
             out.push(*c);
         }

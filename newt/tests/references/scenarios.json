@@ -50,6 +50,20 @@
       "horizon_note": "3.0 s drop-and-settle; steady-state penetration is the scorecard signal."
     },
     {
+      "name": "sphere_drop_stiff",
+      "mjcf": "sphere_drop_stiff.xml",
+      "n_steps": 1500,
+      "stride": 50,
+      "horizon_note": "3.0 s drop-and-settle at tc=0.010 (stiffer contact); solref-sweep companion to sphere_drop."
+    },
+    {
+      "name": "sphere_drop_soft",
+      "mjcf": "sphere_drop_soft.xml",
+      "n_steps": 1500,
+      "stride": 50,
+      "horizon_note": "3.0 s drop-and-settle at tc=0.050 (softer contact); solref-sweep companion to sphere_drop."
+    },
+    {
       "name": "box_stack",
       "mjcf": "box_stack.xml",
       "n_steps": 2000,

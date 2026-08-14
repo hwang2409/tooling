@@ -121,7 +121,8 @@ The convex dual: solve for impulses `f`, one per row, such that
 A · f + b = 0            (with acceptance-set projections)
 A = J M⁻¹ Jᵀ + R          — regularized system matrix
 R = diag((1 − d) / d) · diag(A)   — MuJoCo regularization
-b = J · qdot_free + d · a_ref · dt   — bias (residual + reference)
+b = J · qdot_free + α_b · (−b·r_dot) · dt + α_k · (−k·r) · dt
+                                  — bias (residual + split-α reference)
 ```
 
 where:
@@ -134,16 +135,30 @@ where:
   RK4" below).
 - `R` sits on the diagonal because it comes from the (1 − d) · f_hard
   "soft split" (a per-constraint linear damping in impulse space).
+- `b = 2·dampratio / timeconst` and `k = 1 / timeconst²` are the
+  reference-response coefficients from [`SolRef`] (see the earlier
+  "reference acceleration" section).
+- `(α_b, α_k)` are the split scalars on the reference term. For
+  **contact-normal rows** they are `(1, 2)` — the NEWT-14 empirical
+  fit derived from a solref sweep against real MuJoCo
+  (`docs/differential.md`, sphere_drop row). For **equality and
+  joint-limit rows** they are the historical `(d(r), d(r))` — the
+  pre-NEWT-14 impedance-scaled reference — because those rows were
+  never surveyed empirically and their tests are calibrated to the
+  old scaling.
 
-**Scaling caveat.** Newt multiplies the reference term by `d`
-(`bias = J qdot_free + d · a_ref · dt`) so the (1 − d) / d
-regularization split is consistent per row. MuJoCo's exact scaling
-(including the `impratio` normal-vs-tangent factor and the compile-
-time `dsbl_efc*` toggles) diverges from this in cases we haven't
-verified — bit-exact parity against real MuJoCo is deferred to the
-differential harness ticket (NEWT-13, biped venv). Do not read the
-`d ·` in the bias line as a claim that newt matches MuJoCo trajectory-
-for-trajectory today; it does not.
+**NEWT-14 derivation.** For a contact-normal row on a sphere at rest,
+the (A + R) f = -b at equilibrium yields a steady-state penetration
+`r_ss = g(1 − d) / (α_k · d · k)`. With the pre-NEWT-14 `α_k = d(r)`
+this is `g(1 − d) / (d² · k)` — approximately `2/d ≈ 2.1×` MuJoCo's
+observed penetration across the sweep. With the NEWT-14 `α_k = 2`
+this is `g(1 − d) / (2 · d · k)`, which matches MuJoCo's steady state
+to within ~10 μm at the stiff and default sweep points and ~24 μm at
+the soft point. The damping-side `α_b` stays at 1 (rather than 2)
+because scaling it up makes the bias multiplier on `v_current`
+(`1 + α_b · b · dt`) large enough at MuJoCo-comparable timesteps
+(dt=5 ms, tc=20 ms → `b·dt = 0.5`) to over-correct the approach
+velocity and turn the contact near-elastic.
 
 For a free body with mass `m` and world-frame inertia
 `I_w = R I_body Rᵀ`, contact at arm `r_arm`:
@@ -297,10 +312,13 @@ arm-cross-force torque plumbing.
 signed raw residual `r_raw` and a natural direction `dir_raw`. We
 store `r = |r_raw|` and flip `dir` so a positive impulse drives `r`
 down: `dir = −sign(r_raw) · dir_raw`. Then `J · qdot = −r_dot` in the
-row's convention, matching the contact-normal escape convention and
-letting the same bias formula
-`b = J·qdot_free + d · a_ref(r, −J·qdot) · dt` reuse the contact-row
-code path unchanged.
+row's convention, matching the contact-normal escape convention.
+Equality rows use the pre-NEWT-14 impedance-scaled reference
+(`b = J·qdot_free + d · a_ref(r, −J·qdot) · dt`) rather than the
+split-α form used by contact-normal rows — the NEWT-14 fit was
+scoped to contact penetration; equality tests
+(`equality_connect_two_bodies_hold_together_under_gravity`) rely on
+the older scaling.
 
 **Distance-at-zero-separation guard.** When `|p_A − p_B| <
 DISTANCE_DEGENERATE_EPS` (currently 1 µm) the row is elided that step:
