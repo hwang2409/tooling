@@ -458,7 +458,7 @@ pub fn box_box(
     if vf.len > 0 {
         return vf;
     }
-    box_box_edge_edge_fallback(
+    box_box_sat_fallback(
         idx_a, pose_a, half_a, idx_b, pose_b, half_b, friction, margin, gap,
     )
 }
@@ -571,16 +571,30 @@ fn box_box_vertex_face(
     out
 }
 
-/// Edge-edge SAT fallback for box-box. Runs when the vertex-vs-face manifold
-/// is empty. Iterates the 9 cross-axis products between A's and B's edges
-/// (which also happen to be their basis vectors), plus the 6 face-normal
-/// axes; if the boxes overlap on ALL 15 axes then they truly intersect, and
-/// the minimum-overlap edge-edge axis (if it is smaller than every
-/// face-normal overlap) identifies the pair of edges producing the contact.
+/// SAT fallback for box-box. Runs when the vertex-vs-face manifold is empty.
 ///
-/// Returns 0 or 1 contact.
+/// Textbook 15-axis OBB SAT: 3 face-normals from A + 3 from B + 9 edge-edge
+/// cross products. If any axis has negative overlap the boxes are separated.
+/// Otherwise the axis with the MINIMUM overlap identifies the separation
+/// direction and picks the manifold-generation strategy:
+///
+/// - **Face-A / Face-B minimum** — the boxes' penetration is dominated by
+///   the perpendicular direction to that face. Emit contacts via reference-
+///   face clipping: the winning box's face is the reference plane; the
+///   opposing box's most-anti-parallel face is the incident polygon; the
+///   incident polygon is Sutherland-Hodgman clipped against the reference
+///   rectangle in 2D, and each surviving clipped vertex becomes a contact
+///   (up to 4 deepest kept). Emits up to 4 contacts.
+/// - **Edge-edge minimum** — the deepest overlap is between two skew edges.
+///   Emit ONE contact at their closest-point pair.
+///
+/// The reference-face branch is what makes yawed stacks work correctly: two
+/// boxes at 45° relative yaw have all corners hanging over their opposite's
+/// face edges, so vertex-vs-face returns nothing and pure edge-edge would
+/// emit a single low-quality contact off an oblique axis. Reference-face
+/// clipping produces the correct 2–8 clipped intersection vertices.
 #[allow(clippy::too_many_arguments)]
-fn box_box_edge_edge_fallback(
+fn box_box_sat_fallback(
     idx_a: usize,
     pose_a: &GeomPose,
     half_a: Vec3,
@@ -606,37 +620,65 @@ fn box_box_edge_edge_fallback(
     let hb = [half_b.x, half_b.y, half_b.z];
     let delta = pose_a.position - pose_b.position;
 
-    // For any candidate axis L (not necessarily unit), the projected half-
-    // extent of a box with basis (u0, u1, u2) and half-extents (h0, h1, h2)
-    // is Σ h_i · |L · u_i|. Overlap along L is
-    //   rA + rB - |delta · L|
-    // measured in units of |L| (all we need is the sign and comparable
-    // magnitudes among axes, but we normalize edge-edge axes so overlap
-    // depths compare fairly to face-normal axes).
+    // For any candidate axis L (unit vector), the projected half-extent of a
+    // box with basis (u0, u1, u2) and half-extents (h0, h1, h2) is
+    //   Σ h_i · |L · u_i|.
+    // Overlap along L is `rA + rB - |delta · L|`. Since every axis we
+    // consider is (or is normalized to) a unit vector, overlaps compare
+    // fairly across face and edge-edge candidates.
     let proj_half = |l: Vec3, u: &[Vec3; 3], h: &[f32; 3]| -> f32 {
         h[0] * crate::math::abs(l.dot(u[0]))
             + h[1] * crate::math::abs(l.dot(u[1]))
             + h[2] * crate::math::abs(l.dot(u[2]))
     };
 
-    // 6 face-normal axes: any negative overlap → separated → no contact.
-    for face in ax.iter().chain(bx.iter()) {
-        let ra = proj_half(*face, &ax, &ha);
-        let rb = proj_half(*face, &bx, &hb);
-        let dist = crate::math::abs(delta.dot(*face));
-        if dist > ra + rb + margin {
-            return ContactBuf::new();
-        }
+    // Track minimum overlap across ALL 15 axes, along with the axis
+    // classification so the manifold generator downstream knows whether to
+    // run reference-face clipping or edge-edge closest-points.
+    #[derive(Clone, Copy)]
+    enum WinningAxis {
+        FaceA(usize),
+        FaceB(usize),
+        EdgeEdge(usize, usize),
     }
-
-    // 9 edge-edge axes: track minimum overlap AND the edge pair that produced
-    // it. If any axis has overlap < -margin, the boxes are separated on that
-    // axis and we can return early. Skip near-parallel edge pairs (whose
-    // cross product norm is ≈ 0) because their axis is degenerate and any
-    // real separation on it will also appear on a face-normal axis.
     let mut best_overlap = f32::INFINITY;
     let mut best_axis = Vec3::Z;
-    let mut best_pair: (usize, usize) = (0, 0);
+    let mut best_kind = WinningAxis::FaceA(0);
+
+    // 3 face-normal axes from A.
+    for (k, &face) in ax.iter().enumerate() {
+        let ra = proj_half(face, &ax, &ha);
+        let rb = proj_half(face, &bx, &hb);
+        let signed = delta.dot(face);
+        let overlap = ra + rb - crate::math::abs(signed);
+        if overlap < -margin {
+            return ContactBuf::new();
+        }
+        if overlap < best_overlap {
+            best_overlap = overlap;
+            // Normal convention: points FROM B INTO A → same sign as `delta`.
+            best_axis = if signed >= 0.0 { face } else { -face };
+            best_kind = WinningAxis::FaceA(k);
+        }
+    }
+    // 3 face-normal axes from B.
+    for (k, &face) in bx.iter().enumerate() {
+        let ra = proj_half(face, &ax, &ha);
+        let rb = proj_half(face, &bx, &hb);
+        let signed = delta.dot(face);
+        let overlap = ra + rb - crate::math::abs(signed);
+        if overlap < -margin {
+            return ContactBuf::new();
+        }
+        if overlap < best_overlap {
+            best_overlap = overlap;
+            best_axis = if signed >= 0.0 { face } else { -face };
+            best_kind = WinningAxis::FaceB(k);
+        }
+    }
+    // 9 edge-edge axes. Skip near-parallel edge pairs (cross ≈ 0) because
+    // their axis is degenerate and any real separation on it will also
+    // appear on a face-normal axis.
     for i in 0..3 {
         for j in 0..3 {
             let raw = ax[i].cross(bx[j]);
@@ -648,26 +690,22 @@ fn box_box_edge_edge_fallback(
             let l = raw / len2.sqrt();
             let ra = proj_half(l, &ax, &ha);
             let rb = proj_half(l, &bx, &hb);
-            let signed_offset = delta.dot(l);
-            let dist = crate::math::abs(signed_offset);
-            let overlap = ra + rb - dist;
+            let signed = delta.dot(l);
+            let overlap = ra + rb - crate::math::abs(signed);
             if overlap < -margin {
                 return ContactBuf::new();
             }
             if overlap < best_overlap {
                 best_overlap = overlap;
-                // Normal convention: from B into A means it should have a
-                // positive component along `delta` (which points B → A).
-                best_axis = if signed_offset >= 0.0 { l } else { -l };
-                best_pair = (i, j);
+                best_axis = if signed >= 0.0 { l } else { -l };
+                best_kind = WinningAxis::EdgeEdge(i, j);
             }
         }
     }
 
     if !best_overlap.is_finite() {
-        // All edge pairs were parallel — the boxes are aligned to within
-        // rotation about some shared axis. Vertex-vs-face would have caught
-        // any real overlap; if it didn't, nothing to add here.
+        // All 9 edge pairs were parallel AND every face-normal was
+        // separating — impossible for boxes that actually overlap.
         return ContactBuf::new();
     }
 
@@ -676,17 +714,52 @@ fn box_box_edge_edge_fallback(
         return ContactBuf::new();
     }
 
-    // Find the mid-line of A's edge along axis ax[i]. The edge lies on the
-    // intersection of A's two other faces closest to B (choose face signs by
-    // the sign of `best_axis · ax[k]` for k ≠ i — pick the sign that pushes
-    // the edge TOWARD B).
-    let (ai, bj) = best_pair;
-    let edge_a_midpoint = edge_midpoint(pose_a.position, &ax, &ha, ai, -best_axis);
-    let edge_b_midpoint = edge_midpoint(pose_b.position, &bx, &hb, bj, best_axis);
-    // Edges' directions in world.
+    match best_kind {
+        WinningAxis::EdgeEdge(ai, bj) => {
+            box_box_edge_edge_contact(
+                idx_a, idx_b, &ax, &bx, &ha, &hb, pose_a.position, pose_b.position, ai, bj,
+                best_axis, pen_shift, friction, gap,
+            )
+        }
+        WinningAxis::FaceA(k) => {
+            // Reference face on A perpendicular to ax[k]. Incident face on B.
+            box_box_face_reference_contacts(
+                idx_a, idx_b, pose_a, &ax, &ha, pose_b, &bx, &hb, k, best_axis, margin, friction,
+                gap, /*reference_is_a=*/ true,
+            )
+        }
+        WinningAxis::FaceB(k) => {
+            // Reference face on B perpendicular to bx[k]. Incident face on A.
+            box_box_face_reference_contacts(
+                idx_a, idx_b, pose_a, &ax, &ha, pose_b, &bx, &hb, k, best_axis, margin, friction,
+                gap, /*reference_is_a=*/ false,
+            )
+        }
+    }
+}
+
+/// Emit one edge-edge closest-points contact for the SAT winning-axis case.
+#[allow(clippy::too_many_arguments)]
+fn box_box_edge_edge_contact(
+    idx_a: usize,
+    idx_b: usize,
+    ax: &[Vec3; 3],
+    bx: &[Vec3; 3],
+    ha: &[f32; 3],
+    hb: &[f32; 3],
+    center_a: Vec3,
+    center_b: Vec3,
+    ai: usize,
+    bj: usize,
+    normal_world: Vec3,
+    pen_shift: f32,
+    friction: f32,
+    gap: f32,
+) -> ContactBuf {
+    let edge_a_midpoint = edge_midpoint(center_a, ax, ha, ai, -normal_world);
+    let edge_b_midpoint = edge_midpoint(center_b, bx, hb, bj, normal_world);
     let edge_a_dir = ax[ai];
     let edge_b_dir = bx[bj];
-    // Endpoints of each edge.
     let a_len = ha[ai];
     let b_len = hb[bj];
     let ea0 = edge_a_midpoint - edge_a_dir * a_len;
@@ -694,18 +767,263 @@ fn box_box_edge_edge_fallback(
     let eb0 = edge_b_midpoint - edge_b_dir * b_len;
     let eb1 = edge_b_midpoint + edge_b_dir * b_len;
     let (_pa, pb) = closest_points_on_segments(ea0, ea1, eb0, eb1);
-    // Contact point on B's surface = pb.
     let mut out = ContactBuf::new();
     out.push(Contact {
         geom_a: idx_a,
         geom_b: idx_b,
         position_world: pb,
-        normal_world: best_axis,
+        normal_world,
         penetration: pen_shift,
         friction,
         gap,
     });
     out
+}
+
+/// Emit up to 4 reference-face-clipped contacts for a face-normal SAT
+/// winner. `winning_face_axis` is the local basis index (0/1/2) of the
+/// reference box's face whose normal produced the min-overlap axis. See the
+/// [`box_box_sat_fallback`] doc for the mechanism.
+#[allow(clippy::too_many_arguments)]
+fn box_box_face_reference_contacts(
+    idx_a: usize,
+    idx_b: usize,
+    pose_a: &GeomPose,
+    ax: &[Vec3; 3],
+    ha: &[f32; 3],
+    pose_b: &GeomPose,
+    bx: &[Vec3; 3],
+    hb: &[f32; 3],
+    winning_face_axis: usize,
+    normal_world: Vec3,
+    margin: f32,
+    friction: f32,
+    gap: f32,
+    reference_is_a: bool,
+) -> ContactBuf {
+    // Split into reference/incident. `winning_face_axis` is the local basis
+    // index of the winning face's normal on the reference box; the other
+    // box is the incident.
+    let (ref_center, ref_basis, ref_half) = if reference_is_a {
+        (pose_a.position, ax, ha)
+    } else {
+        (pose_b.position, bx, hb)
+    };
+    let ref_axis_idx = winning_face_axis;
+    let (inc_center, inc_basis, inc_half) = if reference_is_a {
+        (pose_b.position, bx, hb)
+    } else {
+        (pose_a.position, ax, ha)
+    };
+
+    // Reference face normal points OUTWARD from the reference box, toward
+    // the incident. The `normal_world` computed at SAT time points from B
+    // into A. When A is reference, normal from A into B is `-normal_world`;
+    // when B is reference, normal from B into A is `+normal_world`.
+    let ref_out_normal = if reference_is_a {
+        -normal_world
+    } else {
+        normal_world
+    };
+    // Reference face position = ref_center + ref_out_normal * ref_half.
+    let ref_face_normal_axis = ref_basis[ref_axis_idx];
+    let ref_sign = if ref_out_normal.dot(ref_face_normal_axis) >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+    let ref_face_center = ref_center + ref_face_normal_axis * (ref_sign * ref_half[ref_axis_idx]);
+    // Reference face 2D basis (in-plane basis vectors) are the OTHER two axes.
+    let (ru_idx, rv_idx) = other_two_indices(ref_axis_idx);
+    let ref_u = ref_basis[ru_idx];
+    let ref_v = ref_basis[rv_idx];
+    let ref_half_u = ref_half[ru_idx];
+    let ref_half_v = ref_half[rv_idx];
+
+    // Incident face: pick the face on the incident box whose OUTWARD normal
+    // is most anti-parallel to `ref_out_normal`.
+    let mut inc_axis_idx = 0usize;
+    let mut inc_sign = 1.0f32;
+    let mut inc_dot = f32::INFINITY;
+    for k in 0..3 {
+        for &s in &[1.0f32, -1.0f32] {
+            let dot = (inc_basis[k] * s).dot(ref_out_normal);
+            if dot < inc_dot {
+                inc_dot = dot;
+                inc_axis_idx = k;
+                inc_sign = s;
+            }
+        }
+    }
+    let inc_face_normal_axis = inc_basis[inc_axis_idx];
+    let inc_face_center = inc_center + inc_face_normal_axis * (inc_sign * inc_half[inc_axis_idx]);
+    let (iu_idx, iv_idx) = other_two_indices(inc_axis_idx);
+    let inc_u = inc_basis[iu_idx];
+    let inc_v = inc_basis[iv_idx];
+    let inc_half_u = inc_half[iu_idx];
+    let inc_half_v = inc_half[iv_idx];
+
+    // Incident face 4 corners in world.
+    let inc_corners_world: [Vec3; 4] = [
+        inc_face_center - inc_u * inc_half_u - inc_v * inc_half_v,
+        inc_face_center + inc_u * inc_half_u - inc_v * inc_half_v,
+        inc_face_center + inc_u * inc_half_u + inc_v * inc_half_v,
+        inc_face_center - inc_u * inc_half_u + inc_v * inc_half_v,
+    ];
+    // Project each incident corner into the reference face 2D coordinates
+    // (u, v) plus a depth = distance from ref plane along -ref_out_normal
+    // (positive = into the reference solid).
+    let mut subject: [FaceVertex2D; 4] = [FaceVertex2D::default(); 4];
+    for (i, &corner) in inc_corners_world.iter().enumerate() {
+        let rel = corner - ref_face_center;
+        subject[i] = FaceVertex2D {
+            u: rel.dot(ref_u),
+            v: rel.dot(ref_v),
+            depth: -rel.dot(ref_out_normal),
+        };
+    }
+    // Sutherland-Hodgman clip against the reference face rectangle.
+    let clipped = sutherland_hodgman_axis_rect(&subject, ref_half_u, ref_half_v);
+    // Keep clipped points with positive shifted penetration; up to 4 deepest.
+    let mut candidates: [(f32, Vec3); 8] = [(0.0, Vec3::ZERO); 8];
+    let mut count = 0usize;
+    for cv in clipped.iter() {
+        let pen = cv.depth + margin;
+        if pen <= 0.0 {
+            continue;
+        }
+        // Contact point sits on the reference face (i.e. on the reference
+        // box's surface). By convention `position_world` sits on B — so
+        // when A is reference (`reference_is_a`), we shift the point onto
+        // B's surface by walking `-normal_world * (pen - margin)`
+        // (equivalently the raw penetration in the direction from B into A).
+        let point_on_ref = ref_face_center + ref_u * cv.u + ref_v * cv.v;
+        let pos_on_b = if reference_is_a {
+            // Ref is A. `point_on_ref` sits on A's face. Move along
+            // `-normal_world` (from A toward B) by the raw penetration
+            // (pen − margin) to land on B's surface.
+            point_on_ref - normal_world * (pen - margin)
+        } else {
+            point_on_ref
+        };
+        candidates[count] = (pen, pos_on_b);
+        count += 1;
+        if count == candidates.len() {
+            break;
+        }
+    }
+    // Sort candidates descending by penetration; stable insertion sort.
+    let mut order: [usize; 8] = std::array::from_fn(|i| i);
+    for i in 1..count {
+        let mut j = i;
+        while j > 0 && candidates[order[j]].0 > candidates[order[j - 1]].0 {
+            order.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    let take = if count > 4 { 4 } else { count };
+    let mut out = ContactBuf::new();
+    for &i in &order[..take] {
+        let (pen, pos) = candidates[i];
+        out.push(Contact {
+            geom_a: idx_a,
+            geom_b: idx_b,
+            position_world: pos,
+            normal_world,
+            penetration: pen,
+            friction,
+            gap,
+        });
+    }
+    out
+}
+
+/// Return the two axis indices other than `k`, in ascending order.
+fn other_two_indices(k: usize) -> (usize, usize) {
+    match k {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    }
+}
+
+/// One vertex of a 2D subject polygon during Sutherland-Hodgman clipping,
+/// with a scalar `depth` interpolated alongside the position.
+#[derive(Clone, Copy, Debug, Default)]
+struct FaceVertex2D {
+    u: f32,
+    v: f32,
+    depth: f32,
+}
+
+impl FaceVertex2D {
+    fn lerp(a: FaceVertex2D, b: FaceVertex2D, t: f32) -> FaceVertex2D {
+        FaceVertex2D {
+            u: a.u + (b.u - a.u) * t,
+            v: a.v + (b.v - a.v) * t,
+            depth: a.depth + (b.depth - a.depth) * t,
+        }
+    }
+}
+
+/// Sutherland-Hodgman clip of a convex 2D polygon (`subject`, up to 4 verts)
+/// against an axis-aligned rectangle `u ∈ [-hU, +hU]`, `v ∈ [-hV, +hV]`.
+/// Depth is interpolated linearly along polygon edges.
+///
+/// Returns up to 8 output vertices (4 subject × 4 clip lines can produce at
+/// most 4 + 4 new intersection vertices).
+fn sutherland_hodgman_axis_rect(
+    subject: &[FaceVertex2D; 4],
+    half_u: f32,
+    half_v: f32,
+) -> Vec<FaceVertex2D> {
+    // Represent each clip edge by a "keep predicate" — a point is INSIDE the
+    // clip half-plane iff the predicate returns `true` — plus the linear
+    // constraint value used for the intersection parameter.
+    //
+    // Edge 0: `u >= -half_u`  (inside: `u + half_u >= 0`)
+    // Edge 1: `u <= +half_u`  (inside: `half_u - u >= 0`)
+    // Edge 2: `v >= -half_v`
+    // Edge 3: `v <= +half_v`
+    let signed = |edge: usize, p: FaceVertex2D| -> f32 {
+        match edge {
+            0 => p.u + half_u,
+            1 => half_u - p.u,
+            2 => p.v + half_v,
+            _ => half_v - p.v,
+        }
+    };
+    let mut output: Vec<FaceVertex2D> = subject.iter().copied().collect();
+    for edge in 0..4 {
+        if output.is_empty() {
+            break;
+        }
+        let input = output.clone();
+        output.clear();
+        let n = input.len();
+        for i in 0..n {
+            let curr = input[i];
+            let prev = input[(i + n - 1) % n];
+            let curr_side = signed(edge, curr);
+            let prev_side = signed(edge, prev);
+            let curr_in = curr_side >= 0.0;
+            let prev_in = prev_side >= 0.0;
+            if curr_in {
+                if !prev_in {
+                    // Entering: interpolate crossing point.
+                    let t = prev_side / (prev_side - curr_side);
+                    output.push(FaceVertex2D::lerp(prev, curr, t));
+                }
+                output.push(curr);
+            } else if prev_in {
+                // Leaving: interpolate crossing point only.
+                let t = prev_side / (prev_side - curr_side);
+                output.push(FaceVertex2D::lerp(prev, curr, t));
+            }
+            // else: both outside → drop.
+        }
+    }
+    output
 }
 
 /// Midpoint of a box's edge along basis axis `edge_axis_idx`, chosen as the

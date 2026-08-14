@@ -237,6 +237,73 @@ fn rolling_cylinder_stays_on_its_axis_without_lateral_drift() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn box_box_sat_uses_face_normal_when_it_wins_min_overlap() {
+    // Reviewer's latent-case probe (round 2, SF2): construct an orientation
+    // pair where all 15 SAT axes overlap AND the true min-overlap axis is a
+    // FACE normal, not an edge-edge cross. Assert the emitted normal points
+    // along the face normal direction (not an oblique edge-cross axis).
+    //
+    // Setup: A axis-aligned at (0, 0, 1 − eps). B rotated 45° about world +Z
+    // (so vertex-vs-face is guaranteed empty — every corner hangs over) then
+    // 15° about world +X so edge-edge cross products land at oblique
+    // directions with non-trivial Y components. delta is mostly along +Z,
+    // so the face-normal Z axis (either A's or B's) has the smallest
+    // overlap (≈ eps + something), while edge-edge axes have larger
+    // overlaps because delta has smaller projection onto them.
+    //
+    // Expected normal (hand derivation): world +Z direction (from B into A,
+    // A above B). If SF2 regressed and face-normals were only tested for
+    // separation, the emitted normal would come from an edge-edge axis with
+    // a large Y component — the assertion below would fail with a normal
+    // like (0, ~0.5, ~0.87).
+    use newt::contact::narrow_phase;
+    use newt::geom::geom_world_pose;
+    let eps = 0.02f32;
+    let half = Vec3::splat(0.5);
+    let pose_a = geom_world_pose(
+        &Geom::r#box(0, half, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        Vec3::new(0.0, 0.0, 1.0 - eps),
+        Quat::IDENTITY,
+    );
+    let rot = Quat::from_axis_angle(Vec3::X, 0.26)  // 15°
+        * Quat::from_axis_angle(Vec3::Z, FRAC_PI_4); // 45°
+    let pose_b = geom_world_pose(
+        &Geom::r#box(1, half, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        Vec3::ZERO,
+        rot,
+    );
+    let ga = Geom::r#box(0, half, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let gb = Geom {
+        shape: GeomShape::Box { half_extents: half },
+        body: Some(1),
+        link: None,
+        local_offset: Vec3::ZERO,
+        local_orientation: Quat::IDENTITY,
+        friction: 0.5,
+        solref: newt::geom::SolRef::DEFAULT,
+        margin: 0.0,
+        gap: 0.0,
+    };
+    let buf = narrow_phase(0, &ga, &pose_a, 1, &gb, &pose_b, &[]);
+    assert!(
+        buf.len > 0,
+        "box-box SAT should emit contacts for an overlapping pair"
+    );
+    // The min-overlap axis is a face normal aligned with world Z; the
+    // emitted normal must have `.z` dominant (|nz| > 0.9). An edge-edge
+    // regression would emit a normal with |nz| < 0.9 (Y component from the
+    // oblique cross axis dominates instead).
+    for c in buf.as_slice() {
+        assert!(
+            crate::approx(c.normal_world.z.abs(), 1.0, 0.1),
+            "SF2 latent-case regression: emitted normal {:?} is not aligned with the \
+             face-normal Z axis — a face-normal min was ignored in favor of an edge-edge axis",
+            c.normal_world
+        );
+    }
+}
+
+#[test]
 fn yawed_boxes_stack_and_do_not_collapse_through_each_other() {
     // Two identical boxes, each rotated 45° about world +Z. Upper dropped
     // just above lower. Before the box-box edge-edge fallback landed, the
