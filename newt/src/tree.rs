@@ -62,6 +62,7 @@
 //! contribution accumulations are additive so the child order does not
 //! affect the result.
 
+use crate::actuator::{PdServo, clamp_symmetric};
 use crate::joint::{HingeLimit, JointKind};
 use crate::math::{Mat3, Quat, Vec3};
 use crate::spatial::{Mat6, SpatialForce, SpatialInertia, SpatialMotion, Xform};
@@ -114,6 +115,26 @@ impl Link {
         mass: f32,
         inertia_body: Mat3,
     ) -> Self {
+        // v0 convention for joint-frame anchors: the joint anchor frame in
+        // both parent and child body coords must have IDENTITY orientation.
+        // Non-identity orientations are silently ignored by `xup_for_link`
+        // (it reads only the translation components), so a caller who passes
+        // a rotated offset would get subtly wrong dynamics. The v1 lift will
+        // thread these quats into `Xup` and drop this assert.
+        //
+        // Exemption: for a Free root, `joint_offset_in_parent` doubles as
+        // the root's initial world pose (see `push_link` — its orientation
+        // is written into `q[3..7]`), not a joint-frame offset, so any
+        // orientation is meaningful there.
+        let is_free_root = parent.is_none() && matches!(joint, JointKind::Free);
+        debug_assert!(
+            is_free_root || joint_offset_in_parent.1 == Quat::IDENTITY,
+            "v0: joint_offset_in_parent.orientation must be IDENTITY (v1 will lift this)"
+        );
+        debug_assert!(
+            joint_offset_in_child.1 == Quat::IDENTITY,
+            "v0: joint_offset_in_child.orientation must be IDENTITY (v1 will lift this)"
+        );
         let inertia_body_inverse = inertia_body
             .inverse()
             .expect("link inertia tensor must be invertible");
@@ -151,8 +172,19 @@ pub struct Tree {
     pub q: Vec<f32>,
     /// Generalized velocity vector; layout follows [`JointKind::nv`].
     pub qdot: Vec<f32>,
-    /// User-applied generalized forces; layout matches `qdot`.
+    /// User-applied generalized forces; layout matches `qdot`. Persists
+    /// across steps until the caller changes it — the tier-4 direct-torque
+    /// helpers (see [`Tree::set_joint_torque_clamped`]) write here.
     pub qfrc_applied: Vec<f32>,
+
+    /// PD position servos (tier 4). Persistent; targets settable per step via
+    /// [`Tree::set_actuator_target`]. Each is bound to a hinge link.
+    pub actuators: Vec<PdServo>,
+    /// Per-link user-applied world-frame wrenches at each link's COM,
+    /// `(force_world, torque_world)`. Length equals `links.len()`; grows
+    /// automatically on [`Tree::push_link`]. Sums with contact wrenches
+    /// inside [`aba`] — no special-casing per link kind.
+    pub applied_wrenches: Vec<(Vec3, Vec3)>,
 }
 
 impl Tree {
@@ -165,6 +197,8 @@ impl Tree {
             q: Vec::new(),
             qdot: Vec::new(),
             qfrc_applied: Vec::new(),
+            actuators: Vec::new(),
+            applied_wrenches: Vec::new(),
         }
     }
 
@@ -177,6 +211,15 @@ impl Tree {
             assert!(
                 link.parent.is_none(),
                 "root link (index 0) must have parent = None"
+            );
+            // Only Free / Fixed are valid at the root — hinge or any future
+            // joint kind at the root would reach an `unreachable!` deep inside
+            // `aba`, so reject it here where the failure message points at
+            // the actual bug.
+            assert!(
+                matches!(link.joint, JointKind::Free | JointKind::Fixed),
+                "root joint must be Free or Fixed (got {:?})",
+                link.joint
             );
         } else {
             let parent = link.parent.expect("non-root link must have Some(parent)");
@@ -207,8 +250,72 @@ impl Tree {
         }
         self.qdot.extend(std::iter::repeat_n(0.0, nv));
         self.qfrc_applied.extend(std::iter::repeat_n(0.0, nv));
+        self.applied_wrenches.push((Vec3::ZERO, Vec3::ZERO));
         self.links.push(link);
         idx
+    }
+
+    /// Attach a PD position actuator to a hinge link. Returns the actuator's
+    /// stable index (usable with [`Tree::set_actuator_target`]). Panics if
+    /// `servo.link_idx` is out of range or does not reference a hinge.
+    pub fn add_actuator(&mut self, servo: PdServo) -> usize {
+        assert!(
+            servo.link_idx < self.links.len(),
+            "actuator link out of range"
+        );
+        assert!(
+            matches!(self.links[servo.link_idx].joint, JointKind::Hinge { .. }),
+            "PD servo can only actuate a Hinge joint (link {} is {:?})",
+            servo.link_idx,
+            self.links[servo.link_idx].joint
+        );
+        let idx = self.actuators.len();
+        self.actuators.push(servo);
+        idx
+    }
+
+    /// Set the target angle of a previously-added actuator. Panics on
+    /// out-of-range index.
+    pub fn set_actuator_target(&mut self, actuator_idx: usize, target: f32) {
+        self.actuators[actuator_idx].target = target;
+    }
+
+    /// Directly write a generalized joint torque into `qfrc_applied` for a
+    /// hinge link, symmetric-clamped to `force_range` (pass `0.0` or a
+    /// negative value to disable the clamp). This is the motor-style input
+    /// tier-4 exposes on top of the raw `qfrc_applied` buffer. Persists
+    /// across steps — call again to update, or use
+    /// [`Tree::clear_qfrc_applied`] to zero every slot.
+    ///
+    /// Panics if `link_idx` is not a hinge.
+    pub fn set_joint_torque_clamped(&mut self, link_idx: usize, torque: f32, force_range: f32) {
+        assert!(
+            matches!(self.links[link_idx].joint, JointKind::Hinge { .. }),
+            "set_joint_torque_clamped requires a Hinge link"
+        );
+        self.qfrc_applied[self.v_offset[link_idx]] = clamp_symmetric(torque, force_range);
+    }
+
+    /// Zero every entry of `qfrc_applied`.
+    pub fn clear_qfrc_applied(&mut self) {
+        for x in &mut self.qfrc_applied {
+            *x = 0.0;
+        }
+    }
+
+    /// Set the user-applied external wrench on a link, expressed in world
+    /// coordinates at the link's COM. Overwrites any prior value at that
+    /// link. Persists across steps — call [`Tree::clear_applied_wrenches`]
+    /// to reset every link to zero.
+    pub fn set_link_wrench(&mut self, link_idx: usize, force_world: Vec3, torque_world: Vec3) {
+        self.applied_wrenches[link_idx] = (force_world, torque_world);
+    }
+
+    /// Zero every link's applied wrench.
+    pub fn clear_applied_wrenches(&mut self) {
+        for w in &mut self.applied_wrenches {
+            *w = (Vec3::ZERO, Vec3::ZERO);
+        }
     }
 
     /// Total number of position slots.
@@ -378,9 +485,6 @@ struct AbaWorkspace {
     qddot_joint: Vec<f32>,
     /// Per-link spatial acceleration (computed in pass 3, body frame at COM).
     a: Vec<SpatialMotion>,
-    /// Root spatial acceleration (only meaningful when root is Free). For
-    /// fixed root this stays zero.
-    root_a: SpatialMotion,
 }
 
 impl AbaWorkspace {
@@ -397,7 +501,6 @@ impl AbaWorkspace {
             tau: vec![0.0; n],
             qddot_joint: vec![0.0; n],
             a: vec![SpatialMotion::ZERO; n],
-            root_a: SpatialMotion::ZERO,
         }
     }
 }
@@ -476,10 +579,16 @@ pub fn aba(
         let si = link.spatial_inertia();
         let ia_i = Mat6::from_spatial_inertia(si);
         w.ia[i] = ia_i;
-        // pA = v × I v − f_ext. f_ext includes gravity + external wrench.
-        // All expressed in body frame at COM.
+        // pA = v × I v − f_ext. f_ext includes gravity + external wrench
+        // (contacts) + persistent link-attached wrench (`Tree::applied_wrenches`,
+        // tier-4). All expressed in body frame at COM. Both wrench channels
+        // are world-frame at the link's COM, so they sum trivially before
+        // the frame rotation.
         let (_pos, ori) = poses[i];
-        let (force_world, torque_world) = external_wrenches[i];
+        let (force_world_ext, torque_world_ext) = external_wrenches[i];
+        let (force_world_applied, torque_world_applied) = tree.applied_wrenches[i];
+        let force_world = force_world_ext + force_world_applied;
+        let torque_world = torque_world_ext + torque_world_applied;
         // Add gravity as world-frame force at COM.
         let force_world_total = force_world + gravity * link.mass;
         // Rotate world-frame wrench into body frame.
@@ -521,11 +630,22 @@ pub fn aba(
                 let ia_s = w.ia[i].times_motion(s);
                 // Sᵀ (IA S) + armature = scalar for a hinge.
                 let d_scalar = spatial_dot_ms(s, ia_s) + armature;
-                // τ_effective = qfrc_applied − damping * qdot + limit penalty.
+                // τ_effective = qfrc_applied − damping * qdot + limit penalty
+                //                + Σ actuator torques on this link.
                 let qdot_i = tree.qdot[tree.v_offset[i]];
                 let q_i = tree.q[tree.q_offset[i]];
                 let tau_lim = hinge_limit_torque(q_i, qdot_i, range, limit);
-                let tau_scalar = tree.qfrc_applied[tree.v_offset[i]] - damping * qdot_i + tau_lim;
+                // Sum every PD actuator bound to this link. Small linear scan;
+                // v0 tree sizes are tiny (biped ≈ 10 hinges). Deterministic —
+                // order-independent because it's a sum of scalars.
+                let mut tau_act = 0.0;
+                for act in &tree.actuators {
+                    if act.link_idx == i {
+                        tau_act += act.torque(q_i, qdot_i);
+                    }
+                }
+                let tau_scalar =
+                    tree.qfrc_applied[tree.v_offset[i]] - damping * qdot_i + tau_lim + tau_act;
                 // Featherstone's reduced-inertia form: pA_reduced = pA + I_a c
                 // + U u / D with I_a = IA - U D⁻¹ Uᵀ. Expanding I_a c and
                 // grouping gives the equivalent form we use here (avoids
@@ -573,7 +693,6 @@ pub fn aba(
                 .solve(rhs)
                 .expect("root articulated inertia is singular — degenerate mass distribution?");
             w.a[0] = a0;
-            w.root_a = a0;
             // Store the 6 free-root accelerations (body-frame at COM) into
             // qddot slots 0..6.
             qddot[0] = a0.angular.x;
@@ -585,7 +704,6 @@ pub fn aba(
         }
         JointKind::Fixed => {
             w.a[0] = SpatialMotion::ZERO;
-            w.root_a = SpatialMotion::ZERO;
         }
         JointKind::Hinge { .. } => unreachable!("hinge cannot be root"),
     }
