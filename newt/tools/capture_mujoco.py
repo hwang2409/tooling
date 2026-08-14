@@ -141,11 +141,19 @@ def _load_scenarios(refs_dir: Path) -> list[dict]:
 
 
 def _capture_scenario(mujoco, np, scenario: dict, refs_dir: Path) -> tuple[Path, str]:
-    """Run one scenario and write its fixture. Returns (path, provenance)."""
+    """Run one scenario and write its fixture. Returns (path, provenance).
+
+    If `scenario["check_kind"] == "energy"`, an additional sidecar
+    `<name>_energy.bin` file is written next to the main fixture with
+    per-sample MuJoCo kinetic and potential energies (f64 pairs). The
+    Rust harness reads this to compare long-horizon energy drift.
+    """
     name = scenario["name"]
     mjcf_path = refs_dir / scenario["mjcf"]
     n_steps = int(scenario["n_steps"])
     stride = int(scenario["stride"])
+    check_kind = scenario.get("check_kind", "state")
+    want_energy = check_kind == "energy"
     if stride <= 0 or n_steps <= 0:
         raise ValueError(f"{name}: stride and n_steps must be > 0")
 
@@ -189,8 +197,21 @@ def _capture_scenario(mujoco, np, scenario: dict, refs_dir: Path) -> tuple[Path,
     # with the initial (qpos, qvel) before sampling step 0.
     mujoco.mj_forward(model, data)
 
+    def snap_energy():
+        # MuJoCo layout is `data.energy = [potential, kinetic]` — verified
+        # empirically (zero qvel yields energy[1] == 0). mj_energyPos and
+        # mj_energyVel fill these fields respectively.
+        mujoco.mj_energyPos(model, data)
+        mujoco.mj_energyVel(model, data)
+        pot = float(data.energy[0])
+        kin = float(data.energy[1])
+        return kin, pot
+
     qpos_samples = [data.qpos.copy()]
     qvel_samples = [data.qvel.copy()]
+    energy_samples: list[tuple[float, float]] = []
+    if want_energy:
+        energy_samples.append(snap_energy())
 
     for step in range(1, n_steps + 1):
         if targets is not None:
@@ -199,6 +220,8 @@ def _capture_scenario(mujoco, np, scenario: dict, refs_dir: Path) -> tuple[Path,
         if step % stride == 0:
             qpos_samples.append(data.qpos.copy())
             qvel_samples.append(data.qvel.copy())
+            if want_energy:
+                energy_samples.append(snap_energy())
 
     provenance = (
         f"name={name}|mujoco={mujoco.__version__}"
@@ -213,6 +236,11 @@ def _capture_scenario(mujoco, np, scenario: dict, refs_dir: Path) -> tuple[Path,
     )
     path = refs_dir / f"{name}.bin"
     _write_fixture(path, provenance, stride, n_steps, qpos_samples, qvel_samples)
+    if want_energy:
+        energy_path = refs_dir / f"{name}_energy.bin"
+        with open(energy_path, "wb") as f:
+            for kin, pot in energy_samples:
+                f.write(struct.pack("<dd", kin, pot))
     return path, provenance
 
 

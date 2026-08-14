@@ -1,8 +1,10 @@
 <!-- Differential scenario: 2-hinge chain on a fixed anchor, no contacts.
-  Chaotic dynamics — we compare over a SHORT horizon (see
-  scenarios.json). Beyond ~1 s the trajectories diverge macroscopically
-  and per-sample q-comparison is meaningless; the scorecard uses
-  short-horizon q divergence AND long-horizon energy conservation.
+  Chaotic dynamics — we compare state per-sample over a SHORT horizon
+  (see the `double_pendulum` entry in scenarios.json). Beyond ~1 s the
+  trajectories diverge macroscopically and per-sample q comparison is
+  meaningless. The `double_pendulum_energy` scenario reuses THIS same
+  MJCF for the long-horizon energy-drift check (see
+  docs/differential.md).
 -->
 <mujoco model="double_pendulum">
   <compiler angle="radian"/>

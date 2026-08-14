@@ -54,9 +54,23 @@ those units.
 | tumble             | 1.59e-3           | 4.0e-3     | 2.03e-2           | 5.0e-2     | parity             |
 | double_pendulum    | 1.33e-7           | 5.0e-7     | 6.23e-7           | 2.0e-6     | parity             |
 | servo_arm          | 7.03e-4           | 2.0e-3     | 3.06e-2           | 8.0e-2     | parity             |
+| floating_base      | 2.64e-6           | 6.0e-6     | 2.77e-6           | 6.0e-6     | parity             |
 | sphere_drop        | 4.10e-3           | 1.0e-2     | 1.67e-1           | 3.0e-1     | bounded divergence |
 | box_stack          | 1.45e+0           | 2.0e+0     | 3.89e+0           | 5.0e+0     | OPEN FINDING       |
 | joint_limit_swing  | 1.08e-1           | 1.5e-1     | 9.10e-1           | 1.2e+0     | bounded divergence |
+
+### Energy scorecard (long-horizon)
+
+For chaotic scenarios where component-wise state comparison is not
+meaningful over long horizons, we compare TOTAL mechanical energy
+drift on both sides. `newt_drift` = `max_t |E_newt(t) - E_newt(0)|`;
+`mujoco_drift` = same for MuJoCo's reference trajectory; `gap` =
+`max_t | |ΔE_newt(t)| - |ΔE_mj(t)| |`. All three must sit under
+their per-scenario bounds.
+
+| Scenario                  | Horizon | newt_drift | mujoco_drift | gap      | Bound (each) | Verdict |
+|---------------------------|---------|------------|--------------|----------|--------------|---------|
+| double_pendulum_energy    | 5.0 s   | 2.76e-6    | 3.38e-8      | 2.74e-6  | 6e-6 / 8e-8 / 6e-6 | parity  |
 
 ## Per-scenario notes
 
@@ -84,6 +98,32 @@ Two-hinge chain on a fixed anchor. Horizon is deliberately short
 because the system IS chaotic. Sub-microsecond divergence over this
 short window says the ABA and RK4 paths agree to machine precision
 scaled by f32-vs-f64.
+
+### floating_base (parity)
+
+Free-root base with one hinge child under zero gravity, initial
+`(0.5, -0.2, 0.1)` m/s linear velocity in the WORLD frame,
+`(2.0, 0.5, -1.0)` rad/s body-frame angular velocity, and a
+`3.0 rad/s` hinge rate. This is the coverage scenario for the
+per-joint qpos/qvel remap between MuJoCo's `(qw, qx, qy, qz)` +
+world-frame free-root linear velocity and newt's `(qx, qy, qz, qw)` +
+body-frame free-root linear velocity slot. A wrong quat-slot order
+or a missed frame rotation would drive divergence to the scale of the
+initial velocities themselves (0.5 m/s+); the observed ~1e-6 says the
+remap is empirically correct across all six free-root slots plus the
+hinge scalar.
+
+### double_pendulum_energy (parity, long-horizon)
+
+Same 2-hinge chain as `double_pendulum` but sampled for 5.0 s. Per-
+sample state divergence is not asserted (chaotic beyond ~1 s); the
+assertion is that both engines conserve total mechanical energy over
+the run and by roughly the same amount. MuJoCo's f64 RK4 conserves
+energy to ~3e-8; newt's f32 RK4 with quaternion renormalization at
+stage boundaries drifts to ~3e-6 (both are microscopic on the ~31 J
+scale of the scene). The `gap` metric bounds the difference between
+the two drifts, so a NEWT bug that inflated the drift dramatically
+would fail even if MuJoCo's reference happened to move.
 
 ### servo_arm (parity)
 
@@ -129,13 +169,19 @@ Middle is offset by 2 cm in x to break perfect axial symmetry.
 `friction=0.6` on all surfaces; `iterations=20` on the PGS solver
 matching newt's default.
 
-**Finding: the top block does not stay stacked in newt.** Real MuJoCo
-parks the top box at position ≈ `(-6.7e-5, 2.4e-4, 1.7497)` — a
-clean stack at rest. Newt lets the top block slip and topple; by
-t = 4 s it lands at ≈ `(1.41, 0.44, 1.40)` — a metre-plus off the
-stack. The divergence grows monotonically once the middle block's
-first cycle of settling ends (around t ≈ 1.3 s), i.e. the failure
-mode is stable-stack-vs-collapsing-stack, not a phase drift.
+**Finding: the top block does not stay stacked in newt — the stack
+fully collapses to the ground.** Real MuJoCo parks the top box at
+position ≈ `(-6.7e-5, 2.4e-4, 1.7497)` — a clean stack at rest.
+Newt lets the top block slide off (mostly in −x, some +y) and it
+drops all the way to the ground; by t = 4 s it is at rest at
+≈ `(-1.41, +0.44, +0.35)` — z = 0.35 is the on-ground rest height
+of a 0.35 m half-extent cube on top of the plane. Divergence peaks
+at t ≈ 3.0 s (top box at `(-1.45, +0.44, +0.39)`; qvel component
+peak 3.89 m/s at t ≈ 2.6 s) then converges as the block settles on
+the ground away from the stack. Failure mode is fully-collapsed-
+stack vs stable-stack, NOT a small tip or phase drift — the
+follow-up investigator should hunt a full collapse, not a partial
+lean.
 
 Cause hypotheses (not verified in this ticket; that is follow-up
 work):
@@ -185,12 +231,14 @@ constrained to exactly matching parameters.
 
 ## Open findings (rolled up)
 
-1. **box_stack instability** — newt's three-box stack collapses at
-   the current default settings while real MuJoCo's holds. Reproduced
-   at t ≈ 4 s with top-block drift of ~1.4 m. Not a NEWT-13 fix;
-   filed as an open finding for a follow-up ticket to investigate
-   contact ordering, iteration count, and box-box narrow-phase
-   contact-point placement.
+1. **box_stack instability** — newt's three-box stack fully
+   collapses at the current default settings while real MuJoCo's
+   holds. The top block slides off (mostly −x) and lands on the
+   ground; end state is ≈ `(-1.41, +0.44, +0.35)` vs MuJoCo's
+   `(-6.7e-5, 2.4e-4, 1.7497)`. Peak divergence at t ≈ 3.0 s. Not a
+   NEWT-13 fix; filed as an open finding for a follow-up ticket to
+   investigate contact ordering, iteration count, and box-box
+   narrow-phase contact-point placement.
 2. **sphere_drop steady-state penetration** — newt sits ~180 μm
    shallower than MuJoCo under identical `solref`/`solimp`/
    `iterations`. Consistent with the softened-d-scaling claim in
@@ -210,6 +258,19 @@ python tools/capture_mujoco.py --force               # override mujoco-version g
 python tools/capture_mujoco.py --list                # print scenario names
 ```
 
+## Debugging a failing tolerance
+
+Set `NEWT_DIFFERENTIAL_DUMP=1` when running the tests to print the
+per-sample per-component error tape (qpos and qvel). Useful when a
+tolerance needs to be understood or re-set after a fixture regen:
+
+```bash
+NEWT_DIFFERENTIAL_DUMP=1 cargo test --test differential -- --nocapture
+NEWT_DIFFERENTIAL_DUMP=1 cargo test --test differential sphere_drop -- --nocapture
+```
+
+The dump goes to stderr; combine with `--nocapture` to see it.
+
 If the MuJoCo version in the venv differs from the version recorded
 in any existing fixture's provenance header, the tool refuses to
 overwrite. Add `--force` to overwrite, and mirror the moved numbers
@@ -225,9 +286,13 @@ recording WHY it moved and updating the verdict.
    numbers.
 2. Add an entry to `tests/references/scenarios.json`. `init_qpos`
    and `init_qvel` are optional overrides in MuJoCo layout;
-   `actuator_targets` is a name→ctrl map.
-3. Run `python tools/capture_mujoco.py <name>` to write the fixture.
+   `actuator_targets` is a name→ctrl map. Set `"check_kind":
+   "energy"` for a long-horizon energy-drift scenario instead of the
+   default per-sample state comparison.
+3. Run `python tools/capture_mujoco.py <name>` to write the fixture
+   (and, for energy scenarios, the `<name>_energy.bin` sidecar).
 4. Add a `differential_<name>` test in `tests/differential.rs` and
-   a `Tolerance` entry in the match table. Set the tolerance from
-   the observed max × ~2, print the observed max at test time via
-   the existing `println!`, and add a scorecard row here.
+   a `Tolerance` (or `EnergyTolerance` for energy scenarios) entry
+   in the match table. Set the tolerance from the observed max × ~2
+   for a clean scenario, or a wider ratio with a note if the scenario
+   has a bounded divergence. Add a scorecard row here.

@@ -1,0 +1,30 @@
+<!-- Differential scenario: free-root base + one hinge child.
+
+  Coverage target: the free-root and hinge-in-tree code path with
+  a NONZERO initial free-root orientation, an angular velocity, a
+  linear velocity, and a hinge angle/rate. Any mismapping between
+  MuJoCo's (qw qx qy qz) free-root layout and newt's (qx qy qz qw)
+  layout, or between MuJoCo's world-frame free-root linear velocity
+  and newt's body-frame slot, would show up here as sample-1 drift
+  that a scalar quat/hinge scenario cannot catch.
+
+  Gravity is zeroed so the trajectory is driven entirely by the
+  initial state — a mapping bug is not masked by gravity's dominance.
+-->
+<mujoco model="floating_base">
+  <compiler angle="radian"/>
+  <option timestep="0.002" gravity="0 0 0"
+          integrator="RK4" solver="PGS" cone="pyramidal" iterations="20"/>
+
+  <worldbody>
+    <body name="base" pos="0 0 1.0" quat="0.9238795 0.3826834 0 0">
+      <freejoint name="base_root"/>
+      <inertial pos="0 0 0" mass="1.5" diaginertia="0.03 0.04 0.05"/>
+
+      <body name="arm" pos="0.3 0 0">
+        <joint name="arm_hinge" type="hinge" axis="0 1 0" pos="0 0 0"/>
+        <inertial pos="0 0 0" mass="0.4" diaginertia="0.005 0.005 1e-6"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

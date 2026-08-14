@@ -26,6 +26,15 @@
       "horizon_note": "0.4 s short horizon; long-run divergence is chaotic and expected."
     },
     {
+      "name": "double_pendulum_energy",
+      "mjcf": "double_pendulum.xml",
+      "n_steps": 2500,
+      "stride": 100,
+      "init_qpos": [0.35, -0.15],
+      "check_kind": "energy",
+      "horizon_note": "5.0 s long-horizon total-energy drift. Component-wise qpos check is skipped (chaotic); the assertion is that newt's RK4 drift stays small AND is similar in magnitude to MuJoCo's."
+    },
+    {
       "name": "servo_arm",
       "mjcf": "servo_arm.xml",
       "n_steps": 800,
@@ -46,6 +55,14 @@
       "n_steps": 2000,
       "stride": 100,
       "horizon_note": "4.0 s multi-contact settle; loosest tolerances of the suite."
+    },
+    {
+      "name": "floating_base",
+      "mjcf": "floating_base.xml",
+      "n_steps": 500,
+      "stride": 25,
+      "init_qvel": [0.5, -0.2, 0.1, 2.0, 0.5, -1.0, 3.0],
+      "horizon_note": "1.0 s zero-gravity free-root + hinge to exercise every slot of the free-root remap (quat slot order, linear-vs-angular slot order, body-vs-world linear frame)."
     },
     {
       "name": "joint_limit_swing",
