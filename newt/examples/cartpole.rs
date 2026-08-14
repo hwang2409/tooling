@@ -1,12 +1,20 @@
-//! v1 tier-1 demo: cart on a horizontal slide + pole on a hinge. A PD
-//! position servo on the SLIDE holds the cart near x = 0 while the pole
-//! swings freely. The demo is the visual pin that the slide and hinge
-//! joints cooperate through ABA — a wire-through bug on either joint
-//! would leave the cart drifting or the pole dead.
+//! v1 tier-1 demo: cart on a horizontal slide + pole on a hinge, with
+//! two actuator modes — the visual pin that slide and hinge joints
+//! cooperate through ABA AND that the v2 tier-2 actuator flavors wire
+//! into that path correctly.
+//!
+//! - default (position mode): a PD position servo on the SLIDE holds
+//!   the cart near x = 0 while the pole swings freely.
+//! - `--velocity`: a VELOCITY actuator on the SLIDE tracks a
+//!   sinusoidal velocity profile so the cart wiggles left-right and
+//!   drags the pole through Coriolis coupling. A wire-through bug on
+//!   the velocity flavor (wrong bias sign, gear ignored, act-vs-ctrl
+//!   swap) shows up as either a runaway cart or a dead one.
 //!
 //! Run:
 //! ```text
 //! cargo run --release --example cartpole -- --frames 900 --out /tmp/cartpole.ppm --size 640x360
+//! cargo run --release --example cartpole -- --velocity --frames 900 --out /tmp/cartpole_vel.ppm
 //! sips -s format png /tmp/cartpole.ppm --out /tmp/cartpole.png
 //! ```
 //!
@@ -17,7 +25,7 @@ use chimy2::demo::write_ppm;
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
 
-use newt::actuator::PdServo;
+use newt::actuator::Actuator;
 use newt::joint::JointKind;
 use newt::math::{Mat3, Quat, Vec3};
 use newt::tree::{Link, Tree, forward_kinematics, rk4_step};
@@ -30,27 +38,45 @@ const POLE_L: f32 = 0.9;
 const H: f32 = 1.1; // cart height above the ground plane
 const G: f32 = 9.81;
 
-fn parse_args() -> (usize, PathBuf, (usize, usize)) {
-    let mut frames = 900usize;
-    let mut out = PathBuf::from("newt-cartpole.ppm");
-    let mut size = (640usize, 360usize);
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--frames" => frames = args.next().unwrap().parse().unwrap(),
-            "--out" => out = PathBuf::from(args.next().unwrap()),
-            "--size" => {
-                let s = args.next().unwrap();
-                let (w, h) = s.split_once('x').expect("--size WxH");
-                size = (w.parse().unwrap(), h.parse().unwrap());
-            }
-            _ => panic!("unknown arg: {a}"),
-        }
-    }
-    (frames, out, size)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Position,
+    Velocity,
 }
 
-fn build_cartpole() -> (Tree, usize) {
+struct Args {
+    frames: usize,
+    out: PathBuf,
+    size: (usize, usize),
+    mode: Mode,
+}
+
+fn parse_args() -> Args {
+    let mut a = Args {
+        frames: 900,
+        out: PathBuf::from("newt-cartpole.ppm"),
+        size: (640, 360),
+        mode: Mode::Position,
+    };
+    let mut it = std::env::args().skip(1);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--frames" => a.frames = it.next().unwrap().parse().unwrap(),
+            "--out" => a.out = PathBuf::from(it.next().unwrap()),
+            "--size" => {
+                let s = it.next().unwrap();
+                let (w, h) = s.split_once('x').expect("--size WxH");
+                a.size = (w.parse().unwrap(), h.parse().unwrap());
+            }
+            "--velocity" => a.mode = Mode::Velocity,
+            "--position" => a.mode = Mode::Position,
+            _ => panic!("unknown arg: {arg}"),
+        }
+    }
+    a
+}
+
+fn build_cartpole(mode: Mode) -> (Tree, usize) {
     let mut tree = Tree::new();
     // Fixed root at (0, 0, H).
     tree.push_link(Link::new(
@@ -80,20 +106,29 @@ fn build_cartpole() -> (Tree, usize) {
         POLE_M,
         Mat3::diag(i_perp, i_perp, 1e-6),
     ));
-    // PD servo on the SLIDE: hold cart at x = 0.
-    // Reflected inertia estimate = CART_M (plus a bit for the pole hanging
-    // off it; the pole contributes up to POLE_M of inertia when the pole is
-    // horizontal). Use CART_M + POLE_M to be safely critically damped.
-    let servo_idx = tree.add_actuator(PdServo::from_dampratio(
-        1,
-        60.0,            // kp — N per m of error
-        1.0,             // critical damping
-        CART_M + POLE_M, // reflected inertia estimate (kg)
-        30.0,            // force clamp (N)
-    ));
+    let actuator_idx = match mode {
+        Mode::Position => {
+            // PD position servo on the SLIDE: hold cart at x = 0.
+            // Reflected inertia estimate = CART_M + POLE_M so the pole's
+            // worst-case contribution is folded into the damping choice.
+            tree.add_actuator(Actuator::position_from_dampratio(
+                1,
+                60.0,            // kp — N per m of error
+                1.0,             // critical damping
+                CART_M + POLE_M, // reflected inertia estimate (kg)
+                30.0,            // force clamp (N)
+            ))
+        }
+        Mode::Velocity => {
+            // Velocity actuator on the SLIDE: kv=25 N per m/s of error,
+            // clamped to ±30 N. The main-loop rewrites `ctrl` each step
+            // to a sinusoidal target rate — the actuator tracks it.
+            tree.add_actuator(Actuator::velocity(1, /*kv*/ 25.0, /*clamp*/ 30.0))
+        }
+    };
     // Start pole tilted so the demo has motion out of the gate.
     tree.set_hinge_angle(2, 0.45);
-    (tree, servo_idx)
+    (tree, actuator_idx)
 }
 
 fn draw_line(fb: &mut Framebuffer, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: u32) {
@@ -140,8 +175,9 @@ fn project(camera: Mat4, world_pt: Vec3, width: usize, height: usize) -> Option<
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (frames, out, (width, height)) = parse_args();
-    let (mut tree, _servo_idx) = build_cartpole();
+    let args = parse_args();
+    let (frames, out, (width, height), mode) = (args.frames, args.out, args.size, args.mode);
+    let (mut tree, actuator_idx) = build_cartpole(mode);
     let dt = 0.005f32;
     let g_vec = Vec3::new(0.0, 0.0, -G);
 
@@ -149,7 +185,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut trail: Vec<Vec3> = Vec::with_capacity(frames);
     // Cart-position samples across the run (draws a translucent slide track).
     let mut cart_trail: Vec<Vec3> = Vec::with_capacity(frames);
-    for _ in 0..frames {
+    for step in 0..frames {
+        if let Mode::Velocity = mode {
+            // Track a sinusoidal velocity profile: 0.6·sin(2π·t/1.5s) m/s
+            // — one full cycle every 1.5 s. Deterministic + libm-free:
+            // use the crate's math::sin, not std::f32::sin.
+            let t = step as f32 * dt;
+            let phase = t / 1.5;
+            let target_vel = 0.6 * newt::math::sin(2.0 * std::f32::consts::PI * phase);
+            tree.set_actuator_target(actuator_idx, target_vel);
+        }
         rk4_step(&mut tree, g_vec, dt, |_| vec![(Vec3::ZERO, Vec3::ZERO); 3]);
         let poses = forward_kinematics(&tree);
         let (cart_com, _) = poses[1];
@@ -259,12 +304,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     write_ppm(&out, &fb)?;
+    let mode_str = match mode {
+        Mode::Position => "position",
+        Mode::Velocity => "velocity",
+    };
     println!(
-        "wrote {} ({}x{}) — final cart x = {:.3} m, pole θ = {:.3} rad",
+        "wrote {} ({}x{}, {} mode) — final cart x = {:.3} m, cart_v = {:.3} m/s, pole θ = {:.3} rad",
         out.display(),
         width,
         height,
+        mode_str,
         tree.slide_position(1),
+        tree.slide_rate(1),
         tree.hinge_angle(2)
     );
     Ok(())

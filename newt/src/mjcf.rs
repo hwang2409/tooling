@@ -44,7 +44,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::actuator::PdServo;
+use crate::actuator::{Actuator, BiasType, DynType, GainType};
 use crate::body::Body;
 use crate::equality::Equality;
 use crate::geom::{Geom, GeomShape, SolRef};
@@ -223,6 +223,56 @@ fn parse_vec3_attr(src: &str, path: &str, attr: &str) -> Result<Vec3, MjcfError>
     let nums = parse_f32_list(src, path, attr)?;
     require_len(&nums, 3, path, attr)?;
     Ok(Vec3::new(nums[0], nums[1], nums[2]))
+}
+
+/// Parse a `<general>` prm attribute (`gainprm` / `biasprm`) — a
+/// whitespace-separated list of 1..=3 numbers. Missing tail entries fill
+/// from `default` (matches MuJoCo's compiler behavior: `gainprm="5"` is
+/// treated as `gainprm="5 0 0"`).
+fn parse_prm3_str(
+    src: &str,
+    path: &str,
+    attr: &str,
+    default: [f32; 3],
+) -> Result<[f32; 3], MjcfError> {
+    let nums = parse_f32_list(src, path, attr)?;
+    if nums.is_empty() || nums.len() > 3 {
+        return fail(
+            path,
+            format!(
+                "attribute \"{attr}\": expected 1..=3 numbers, got {}",
+                nums.len()
+            ),
+        );
+    }
+    let mut out = default;
+    for (i, &n) in nums.iter().enumerate() {
+        out[i] = n;
+    }
+    Ok(out)
+}
+
+/// Parse a `"lo hi"` range attribute (ctrlrange / forcerange). Returns
+/// `Ok(Some((lo, hi)))` when the attribute is present and well-formed,
+/// `Ok(None)` when absent, and an error on malformed values (wrong
+/// count, `lo >= hi`, or non-numeric). Shared between the shorthand
+/// actuator loaders so every one enforces the same shape.
+fn parse_lo_hi_range_attr(
+    e: &Element,
+    element_name: &str,
+    attr: &str,
+    dc: &DefaultClass,
+    path: &str,
+) -> Result<Option<(f32, f32)>, MjcfError> {
+    let Some(v) = attr_with_default(e, element_name, attr, dc) else {
+        return Ok(None);
+    };
+    let nums = parse_f32_list(v, path, attr)?;
+    require_len(&nums, 2, path, attr)?;
+    if nums[0] >= nums[1] {
+        return fail(path, format!("{attr} low must be < high"));
+    }
+    Ok(Some((nums[0], nums[1])))
 }
 
 /// Parse a MuJoCo-order `w x y z` quaternion attribute into a
@@ -2081,11 +2131,13 @@ impl Loader {
             match child.name.as_str() {
                 "position" => self.add_position_actuator(child, &subpath)?,
                 "motor" => self.add_motor_actuator(child, &subpath)?,
-                "general" | "velocity" | "cylinder" | "damper" | "muscle" | "intvelocity" => {
+                "velocity" => self.add_velocity_actuator(child, &subpath)?,
+                "general" => self.add_general_actuator(child, &subpath)?,
+                "cylinder" | "damper" | "muscle" | "intvelocity" => {
                     return fail(
                         &subpath,
                         format!(
-                            "<{}> actuator is not supported in the v1 subset",
+                            "<{}> actuator is not supported in the v2 subset",
                             child.name
                         ),
                     );
@@ -2093,7 +2145,10 @@ impl Loader {
                 other => {
                     return fail(
                         &subpath,
-                        format!("unknown <actuator> child <{other}>; supported: position, motor"),
+                        format!(
+                            "unknown <actuator> child <{other}>; supported: position, motor, \
+                             velocity, general"
+                        ),
                     );
                 }
             }
@@ -2149,10 +2204,7 @@ impl Loader {
             }
             None => 0.0,
         };
-        // Accept-and-ignore ctrlrange with a documented note in mjcf.md.
-        if let Some(v) = attr_with_default(e, "position", "ctrlrange", &dc) {
-            let _ = parse_f32_list(v, path, "ctrlrange")?;
-        }
+        let ctrl_range = parse_lo_hi_range_attr(e, "position", "ctrlrange", &dc, path)?;
         // Reject the ctrllimited/forcelimited flags with a clear message —
         // they're valid MJCF but not enforced by our subset.
         if let Some(v) = e.attr("ctrllimited") {
@@ -2170,7 +2222,7 @@ impl Loader {
             Some(v) => parse_f32(v, path, "target")?,
             None => 0.0,
         };
-        let mut servo = if has_kv {
+        let mut actuator = if has_kv {
             let kv = parse_f32(
                 attr_with_default(e, "position", "kv", &dc).unwrap(),
                 path,
@@ -2179,7 +2231,7 @@ impl Loader {
             if kv < 0.0 {
                 return fail(path, "kv must be ≥ 0");
             }
-            PdServo::new(link_idx, kp, kv, clamp, initial_target)
+            Actuator::position(link_idx, kp, kv, clamp, initial_target)
         } else if has_dr {
             let dr = parse_f32(
                 attr_with_default(e, "position", "dampratio", &dc).unwrap(),
@@ -2191,17 +2243,18 @@ impl Loader {
             }
             // Reflected-inertia estimate matches MuJoCo's `meaninertia`
             // approximation for a fresh scene: use unit reflected inertia
-            // and let dampratio scale kd = 2·dr·sqrt(kp·1) = 2·dr·sqrt(kp).
+            // and let dampratio scale kv = 2·dr·sqrt(kp·1) = 2·dr·sqrt(kp).
             // Documented in mjcf.md.
-            PdServo::from_dampratio(link_idx, kp, dr, 1.0, clamp)
+            Actuator::position_from_dampratio(link_idx, kp, dr, 1.0, clamp)
         } else {
             return fail(path, "<position> actuator must specify kv or dampratio");
         };
-        servo.target = initial_target;
+        actuator.ctrl = initial_target;
+        actuator.ctrl_range = ctrl_range;
         if self.actuators_by_name.contains_key(&name) {
             return fail(path, format!("duplicate actuator name \"{name}\""));
         }
-        let act_idx = self.world.trees[tree_idx].add_actuator(servo);
+        let act_idx = self.world.trees[tree_idx].add_actuator(actuator);
         self.actuators_by_name.insert(name, (tree_idx, act_idx));
         Ok(())
     }
@@ -2250,22 +2303,219 @@ impl Loader {
             Some(v) => {
                 let nums = parse_f32_list(v, path, "forcerange")?;
                 require_len(&nums, 2, path, "forcerange")?;
+                if nums[0] >= nums[1] {
+                    return fail(path, "forcerange low must be < high");
+                }
                 nums[0].abs().min(nums[1].abs())
             }
             None => 0.0,
         };
-        // Motor = direct torque. Model as a PD servo with kp=0, kd=0, and
-        // gear folded into the (fixed) target. `target` here is really a
-        // command scale — the caller writes it each step.
-        // For fixed-command demos we keep target=0 and clamp; a caller sets
-        // the effective torque via `set_actuator_target` where target ==
-        // desired torque.
-        let servo = PdServo::new(link_idx, 0.0, 0.0, clamp, 0.0);
-        let _ = gear;
+        let ctrl_range = parse_lo_hi_range_attr(e, "motor", "ctrlrange", &dc, path)?;
+        if let Some(v) = e.attr("ctrllimited") {
+            let _ = parse_bool(v, path, "ctrllimited")?;
+        }
+        if let Some(v) = e.attr("forcelimited") {
+            let _ = parse_bool(v, path, "forcelimited")?;
+        }
+        // Real MuJoCo <motor>: gainprm=[1,0,0], bias=none, gear scales the
+        // output. Torque = gear * ctrl, force-clamped.
+        let mut actuator = Actuator::motor(link_idx, gear, clamp);
+        actuator.ctrl_range = ctrl_range;
         if self.actuators_by_name.contains_key(&name) {
             return fail(path, format!("duplicate actuator name \"{name}\""));
         }
-        let act_idx = self.world.trees[tree_idx].add_actuator(servo);
+        let act_idx = self.world.trees[tree_idx].add_actuator(actuator);
+        self.actuators_by_name.insert(name, (tree_idx, act_idx));
+        Ok(())
+    }
+
+    fn add_velocity_actuator(&mut self, e: &Element, path: &str) -> Result<(), MjcfError> {
+        let class = e.attr("class").unwrap_or(DefaultsTable::MAIN).to_string();
+        let dc = self.defaults.lookup(&class).cloned().unwrap_or_default();
+        for (k, _) in &e.attrs {
+            match k.as_str() {
+                "name" | "joint" | "kv" | "forcerange" | "ctrlrange" | "class" | "ctrllimited"
+                | "forcelimited" => {}
+                other => {
+                    return fail(
+                        path,
+                        format!("<velocity> attribute \"{other}\" not supported"),
+                    );
+                }
+            }
+        }
+        let name = attr_required(e, "name", path)?.to_string();
+        let joint_name = attr_required(e, "joint", path)?;
+        let (tree_idx, link_idx) = self.resolve_1dof_joint_for_actuator(joint_name, path)?;
+        let kv = parse_f32(
+            attr_with_default(e, "velocity", "kv", &dc)
+                .ok_or_else(|| MjcfError::new(path, "<velocity> requires kv"))?,
+            path,
+            "kv",
+        )?;
+        if kv < 0.0 {
+            return fail(path, "kv must be ≥ 0");
+        }
+        let clamp = match attr_with_default(e, "velocity", "forcerange", &dc) {
+            Some(v) => {
+                let nums = parse_f32_list(v, path, "forcerange")?;
+                require_len(&nums, 2, path, "forcerange")?;
+                nums[0].abs().min(nums[1].abs())
+            }
+            None => 0.0,
+        };
+        let ctrl_range = parse_lo_hi_range_attr(e, "velocity", "ctrlrange", &dc, path)?;
+        if let Some(v) = e.attr("ctrllimited") {
+            let _ = parse_bool(v, path, "ctrllimited")?;
+        }
+        if let Some(v) = e.attr("forcelimited") {
+            let _ = parse_bool(v, path, "forcelimited")?;
+        }
+        let mut actuator = Actuator::velocity(link_idx, kv, clamp);
+        actuator.ctrl_range = ctrl_range;
+        if self.actuators_by_name.contains_key(&name) {
+            return fail(path, format!("duplicate actuator name \"{name}\""));
+        }
+        let act_idx = self.world.trees[tree_idx].add_actuator(actuator);
+        self.actuators_by_name.insert(name, (tree_idx, act_idx));
+        Ok(())
+    }
+
+    fn add_general_actuator(&mut self, e: &Element, path: &str) -> Result<(), MjcfError> {
+        let class = e.attr("class").unwrap_or(DefaultsTable::MAIN).to_string();
+        let dc = self.defaults.lookup(&class).cloned().unwrap_or_default();
+        for (k, _) in &e.attrs {
+            match k.as_str() {
+                "name" | "joint" | "gaintype" | "gainprm" | "biastype" | "biasprm" | "gear"
+                | "dyntype" | "dynprm" | "actearly" | "ctrlrange" | "forcerange" | "class"
+                | "ctrllimited" | "forcelimited" => {}
+                other => {
+                    return fail(
+                        path,
+                        format!("<general> attribute \"{other}\" not supported"),
+                    );
+                }
+            }
+        }
+        let name = attr_required(e, "name", path)?.to_string();
+        let joint_name = attr_required(e, "joint", path)?;
+        let (tree_idx, link_idx) = self.resolve_1dof_joint_for_actuator(joint_name, path)?;
+
+        if let Some(v) = e.attr("actearly") {
+            let flag = parse_bool(v, path, "actearly")?;
+            if flag {
+                return fail(
+                    path,
+                    "<general actearly=\"true\"/> is not supported (v2 tier 2 defers this — see \
+                     docs/actuators.md)",
+                );
+            }
+        }
+
+        let gain_type = match attr_with_default(e, "general", "gaintype", &dc).unwrap_or("fixed") {
+            "fixed" => GainType::Fixed,
+            "affine" => GainType::Affine,
+            other => {
+                return fail(
+                    path,
+                    format!("gaintype \"{other}\" not supported (expected fixed or affine)"),
+                );
+            }
+        };
+        let bias_type = match attr_with_default(e, "general", "biastype", &dc).unwrap_or("none") {
+            "none" => BiasType::None,
+            "affine" => BiasType::Affine,
+            other => {
+                return fail(
+                    path,
+                    format!("biastype \"{other}\" not supported (expected none or affine)"),
+                );
+            }
+        };
+        let dyn_type = match attr_with_default(e, "general", "dyntype", &dc).unwrap_or("none") {
+            "none" => DynType::None,
+            "filter" => DynType::Filter,
+            other => {
+                return fail(
+                    path,
+                    format!("dyntype \"{other}\" not supported (expected none or filter)"),
+                );
+            }
+        };
+
+        let gain_prm = match attr_with_default(e, "general", "gainprm", &dc) {
+            Some(v) => parse_prm3_str(v, path, "gainprm", [1.0, 0.0, 0.0])?,
+            None => [1.0, 0.0, 0.0],
+        };
+        let bias_prm = match attr_with_default(e, "general", "biasprm", &dc) {
+            Some(v) => parse_prm3_str(v, path, "biasprm", [0.0, 0.0, 0.0])?,
+            None => [0.0, 0.0, 0.0],
+        };
+        let gear = match attr_with_default(e, "general", "gear", &dc) {
+            Some(v) => {
+                let nums = parse_f32_list(v, path, "gear")?;
+                if nums.is_empty() || nums.len() > 6 {
+                    return fail(
+                        path,
+                        format!("gear must have 1..=6 numbers (got {})", nums.len()),
+                    );
+                }
+                for (i, &g) in nums.iter().enumerate().skip(1) {
+                    if g != 0.0 {
+                        return fail(
+                            path,
+                            format!(
+                                "gear entry {i} = {g} is not supported (only the first scalar \
+                                 is honored for 1-DOF joints)"
+                            ),
+                        );
+                    }
+                }
+                nums[0]
+            }
+            None => 1.0,
+        };
+        // dynprm on <general>: MuJoCo permits up to 3 numbers; we consume the
+        // first for the filter time constant tau and ignore the rest (they
+        // are irrelevant for `filter` dyntype).
+        let dyn_tau = match attr_with_default(e, "general", "dynprm", &dc) {
+            Some(v) => {
+                let nums = parse_f32_list(v, path, "dynprm")?;
+                if nums.is_empty() {
+                    return fail(path, "dynprm must have at least one number");
+                }
+                nums[0]
+            }
+            None => 1.0,
+        };
+        if matches!(dyn_type, DynType::Filter) && dyn_tau <= 0.0 {
+            return fail(path, "filter dyntype requires dynprm (tau) > 0");
+        }
+        let ctrl_range = parse_lo_hi_range_attr(e, "general", "ctrlrange", &dc, path)?;
+        let force_range = parse_lo_hi_range_attr(e, "general", "forcerange", &dc, path)?;
+        if let Some(v) = e.attr("ctrllimited") {
+            let _ = parse_bool(v, path, "ctrllimited")?;
+        }
+        if let Some(v) = e.attr("forcelimited") {
+            let _ = parse_bool(v, path, "forcelimited")?;
+        }
+
+        let actuator = Actuator::general(
+            link_idx,
+            gain_type,
+            gain_prm,
+            bias_type,
+            bias_prm,
+            gear,
+            dyn_type,
+            [dyn_tau],
+            ctrl_range,
+            force_range,
+        );
+        if self.actuators_by_name.contains_key(&name) {
+            return fail(path, format!("duplicate actuator name \"{name}\""));
+        }
+        let act_idx = self.world.trees[tree_idx].add_actuator(actuator);
         self.actuators_by_name.insert(name, (tree_idx, act_idx));
         Ok(())
     }

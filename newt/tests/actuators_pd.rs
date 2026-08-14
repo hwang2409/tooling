@@ -13,7 +13,7 @@
 //! about the hinge axis is `m·L² = 1 kg·m²`. All hinges are about `+x`,
 //! matching the tier-3 pendulum test.
 
-use newt::actuator::PdServo;
+use newt::actuator::Actuator;
 use newt::joint::JointKind;
 use newt::math::{Mat3, Quat, Vec3};
 use newt::tree::{Link, Tree, aba, forward_kinematics, rk4_step};
@@ -57,7 +57,7 @@ fn servo_critical_damping_step_no_overshoot() {
     let mass = 1.0f32;
     let length = 1.0f32;
     let mut tree = build_hinge(mass, length);
-    let servo = PdServo::from_dampratio(
+    let servo = Actuator::position_from_dampratio(
         1, /*kp*/ 100.0, /*ζ*/ 1.0, /*I_ref*/ 1.0, /*clamp*/ 0.0,
     );
     let a = tree.add_actuator(servo);
@@ -95,7 +95,7 @@ fn servo_underdamped_step_overshoots() {
     let mass = 1.0f32;
     let length = 1.0f32;
     let mut tree = build_hinge(mass, length);
-    let servo = PdServo::from_dampratio(
+    let servo = Actuator::position_from_dampratio(
         1, /*kp*/ 100.0, /*ζ*/ 0.2, /*I_ref*/ 1.0, 0.0,
     );
     let a = tree.add_actuator(servo);
@@ -160,10 +160,10 @@ fn servo_p_only_steady_state_error_under_gravity() {
     ));
 
     // P-only servo: kd = 0.
-    let mut servo = PdServo::new(
+    let mut servo = Actuator::position(
         1, /*kp*/ 100.0, /*kd*/ 0.0, /*clamp*/ 0.0, 0.0,
     );
-    servo.target = std::f32::consts::PI / 6.0;
+    servo.ctrl = std::f32::consts::PI / 6.0;
     tree.add_actuator(servo);
 
     let dt = 0.001f32;
@@ -192,8 +192,8 @@ fn servo_clamp_bounds_the_effective_torque() {
     let mut tree = build_hinge(1.0, 1.0);
     // kp=1000, target=1, clamp=2 → unclamped τ = 1000, clamped τ = 2.
     // I = m·L² = 1, so expected α at q=0, qdot=0 is 2 rad/s².
-    let mut servo = PdServo::new(1, 1000.0, 0.0, /*clamp*/ 2.0, 0.0);
-    servo.target = 1.0;
+    let mut servo = Actuator::position(1, 1000.0, 0.0, /*clamp*/ 2.0, 0.0);
+    servo.ctrl = 1.0;
     tree.add_actuator(servo);
     let poses = forward_kinematics(&tree);
     let ext = vec![(Vec3::ZERO, Vec3::ZERO); tree.links.len()];
@@ -206,8 +206,8 @@ fn servo_clamp_bounds_the_effective_torque() {
 
     // Flip the sign: negative target → negative clamped torque → negative α.
     let mut tree = build_hinge(1.0, 1.0);
-    let mut servo = PdServo::new(1, 1000.0, 0.0, 2.0, 0.0);
-    servo.target = -1.0;
+    let mut servo = Actuator::position(1, 1000.0, 0.0, 2.0, 0.0);
+    servo.ctrl = -1.0;
     tree.add_actuator(servo);
     let poses = forward_kinematics(&tree);
     let qddot = aba(&tree, &poses, Vec3::ZERO, &ext);
@@ -232,8 +232,8 @@ fn servo_clamp_binds_on_full_pd_expression_not_p_only() {
     //
     // I = m·L² = 1 → α_correct = +2 rad/s², α_mutant = −18 rad/s².
     let mut tree = build_hinge(1.0, 1.0);
-    let mut servo = PdServo::new(1, 1000.0, 1.0, /*clamp*/ 2.0, 0.0);
-    servo.target = 1.0;
+    let mut servo = Actuator::position(1, 1000.0, 1.0, /*clamp*/ 2.0, 0.0);
+    servo.ctrl = 1.0;
     tree.add_actuator(servo);
     tree.set_hinge_rate(1, 20.0);
     let poses = forward_kinematics(&tree);
@@ -291,7 +291,7 @@ fn servo_holding_pendulum_against_gravity_settles_no_growth() {
     let mass = 1.0f32;
     let length = 1.0f32;
     let mut tree = build_hinge(mass, length);
-    let servo = PdServo::from_dampratio(
+    let servo = Actuator::position_from_dampratio(
         1, /*kp*/ 200.0, /*ζ*/ 0.7, /*I_ref*/ 1.0, 0.0,
     );
     let a = tree.add_actuator(servo);

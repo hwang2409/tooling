@@ -1,0 +1,35 @@
+<!-- Differential scenario: cartpole driven by a VELOCITY actuator on the
+     slide joint. The actuator holds a nonzero rate command (0.4 m/s) so
+     the cart drifts and the pole swings under Coriolis coupling. Purpose:
+     validate the v2 tier-2 velocity-actuator semantics (gain=fixed(kv),
+     bias=affine(0,0,-kv)) against real MuJoCo. No contacts.
+
+     Timestep 5 ms, RK4, PGS solver (matches the other differential
+     scenarios' <option> block). No damping / no armature — actuator kv
+     is the only viscous term. 4 s horizon.
+-->
+<mujoco model="velocity_cartpole">
+  <compiler angle="radian"/>
+  <option timestep="0.005" gravity="0 0 -9.81"
+          integrator="RK4" solver="PGS" cone="pyramidal" iterations="20"/>
+
+  <worldbody>
+    <body name="anchor" pos="0 0 1.1">
+      <inertial pos="0 0 0" mass="1.0" diaginertia="1.0 1.0 1.0"/>
+
+      <body name="cart" pos="0 0 0">
+        <joint name="cart_slide" type="slide" axis="1 0 0"/>
+        <inertial pos="0 0 0" mass="1.5" diaginertia="1e-3 1e-3 1e-3"/>
+
+        <body name="pole" pos="0 0 -0.45">
+          <joint name="pole_hinge" type="hinge" axis="0 1 0" pos="0 0 0.45"/>
+          <inertial pos="0 0 0" mass="0.5" diaginertia="0.03375 0.03375 1e-6"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <velocity name="cart_vel" joint="cart_slide" kv="15" forcerange="-30 30"/>
+  </actuator>
+</mujoco>

@@ -85,6 +85,22 @@
       "stride": 50,
       "init_qvel": [3.5],
       "horizon_note": "2.0 s swing driving the hinge past the ±0.6 rad range limit repeatedly."
+    },
+    {
+      "name": "velocity_cartpole",
+      "mjcf": "velocity_cartpole.xml",
+      "n_steps": 800,
+      "stride": 40,
+      "actuator_targets": {"cart_vel": 0.4},
+      "horizon_note": "4.0 s velocity-actuator holding a target cart rate while the pole swings under Coriolis coupling. Validates v2 tier-2 <velocity> semantics (gain=fixed(kv), bias=affine(0,0,-kv))."
+    },
+    {
+      "name": "filtered_motor_pendulum",
+      "mjcf": "filtered_motor_pendulum.xml",
+      "n_steps": 400,
+      "stride": 20,
+      "actuator_targets": {"filtered_motor": 0.7},
+      "horizon_note": "2.0 s filtered-motor step response (ctrl=0.7 through a tau=0.05 activation filter). Validates v2 tier-2 activation dynamics (dyntype=filter). Bounded divergence expected because newt uses forward Euler on activation vs MuJoCo's RK4."
     }
   ]
 }

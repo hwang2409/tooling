@@ -1,0 +1,40 @@
+<!-- Differential scenario: single-hinge pendulum driven by a
+     filtered MOTOR actuator (general model with dyntype=filter,
+     gaintype=fixed(1), biastype=none, gear=1). The ctrl step from 0 to
+     0.7 N·m gets low-pass filtered through the activation ODE with
+     tau=0.05 s before being applied as torque.
+
+     Purpose: validate the general actuator's activation dynamics
+     against real MuJoCo. Newt uses forward Euler on activation (ZOH at
+     step boundary); MuJoCo integrates activation through the same RK4
+     stages as the mechanical state, so a small residual is expected and
+     the tolerance reflects that.
+
+     Timestep 5 ms, RK4, PGS (matches the other differential scenarios).
+     2 s horizon = 400 steps.
+-->
+<mujoco model="filtered_motor_pendulum">
+  <compiler angle="radian"/>
+  <option timestep="0.005" gravity="0 0 -9.81"
+          integrator="RK4" solver="PGS" cone="pyramidal" iterations="20"/>
+
+  <worldbody>
+    <body name="anchor" pos="0 0 1.0">
+      <inertial pos="0 0 0" mass="1.0" diaginertia="1.0 1.0 1.0"/>
+
+      <body name="rod" pos="0 0 -0.5">
+        <joint name="rod_hinge" type="hinge" axis="1 0 0" pos="0 0 0.5"/>
+        <inertial pos="0 0 0" mass="1.0" diaginertia="0.0833333 0.0833333 1e-6"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <general name="filtered_motor" joint="rod_hinge"
+             gaintype="fixed" gainprm="1 0 0"
+             biastype="none"  biasprm="0 0 0"
+             dyntype="filter" dynprm="0.05"
+             gear="1"
+             forcerange="-5 5"/>
+  </actuator>
+</mujoco>

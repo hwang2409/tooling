@@ -400,16 +400,27 @@ default).
 }
 ```
 
-- **type** — v0 supports only `"position"`; anything else is rejected.
+- **type** — one of `"position"`, `"velocity"`, `"motor"`,
+  `"general"`. Everything else is rejected. See
+  [`docs/actuators.md`](actuators.md) for the model formulas.
 - **tree** / **link** — must reference a hinge OR slide link. Ball and
-  free/fixed targets are rejected at load (PD servos are single-DOF).
-- **kp**, **clamp**, **target** — as in
-  [`newt::actuator::PdServo`](../src/actuator.rs).
-- **kd** — direct velocity gain. Mutually exclusive with
-  `dampratio` / `reflected_inertia`.
-- **dampratio** — critical damping ratio. Requires
-  `reflected_inertia`, from which `kd = 2·ζ·√(kp · I_ref)`. Matches
-  MuJoCo's `<position dampratio="…"/>` idiom.
+  free/fixed targets are rejected at load (actuators are single-DOF).
+- **target** — initial `ctrl` value at load time (all types).
+- **clamp** — symmetric force clamp magnitude; `<= 0` disables (all
+  types except `general`, which uses a `forcerange` array instead).
+
+Type-specific fields:
+
+- **position** — `kp` required. One of `kd` OR (`dampratio` +
+  `reflected_inertia`). `dampratio` derives `kd = 2·ζ·√(kp · I_ref)`
+  — matches MuJoCo's `<position dampratio="…"/>` idiom.
+- **velocity** — `kv` required. Torque = `kv · (ctrl − qdot)`.
+- **motor** — optional `gear` (default `1.0`). Torque = `gear · ctrl`.
+- **general** — `gaintype ∈ {"fixed", "affine"}`, `gainprm` (3-array),
+  `biastype ∈ {"none", "affine"}`, `biasprm` (3-array), `gear`,
+  `dyntype ∈ {"none", "filter"}`, `dynprm` (scalar; filter tau for
+  `dyntype="filter"`), optional `ctrlrange` and `forcerange`
+  (2-arrays `[lo, hi]` with `lo < hi`).
 
 ## contact_pairs
 
