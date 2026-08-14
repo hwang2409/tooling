@@ -852,6 +852,25 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
         ));
     }
 
+    // ---- Loader-level pair support check ----
+    // Reject any ACTIVE contact pair whose shape combination is not
+    // implemented by newt's narrow phase. Loud at load time so users get a
+    // JSON-path error instead of the runtime panic (which is the same
+    // enforcement one level down; see `World::step`).
+    if let Some(unsupported) = world.validate_supported_pairs().into_iter().next() {
+        let ga = &world.geoms[unsupported.geom_a];
+        let gb = &world.geoms[unsupported.geom_b];
+        return fail(
+            "contact_pairs",
+            format!(
+                "contact pair between geom {} ({:?}) and geom {} ({:?}) is not supported \
+                 by newt's narrow phase — see docs/contacts.md support matrix. Restrict \
+                 the pair list or defer this configuration.",
+                unsupported.geom_a, ga.shape, unsupported.geom_b, gb.shape,
+            ),
+        );
+    }
+
     Ok(Scene {
         world,
         bodies_by_name,

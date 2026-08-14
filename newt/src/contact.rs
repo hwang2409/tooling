@@ -715,12 +715,22 @@ fn box_box_sat_fallback(
     }
 
     match best_kind {
-        WinningAxis::EdgeEdge(ai, bj) => {
-            box_box_edge_edge_contact(
-                idx_a, idx_b, &ax, &bx, &ha, &hb, pose_a.position, pose_b.position, ai, bj,
-                best_axis, pen_shift, friction, gap,
-            )
-        }
+        WinningAxis::EdgeEdge(ai, bj) => box_box_edge_edge_contact(
+            idx_a,
+            idx_b,
+            &ax,
+            &bx,
+            &ha,
+            &hb,
+            pose_a.position,
+            pose_b.position,
+            ai,
+            bj,
+            best_axis,
+            pen_shift,
+            friction,
+            gap,
+        ),
         WinningAxis::FaceA(k) => {
             // Reference face on A perpendicular to ax[k]. Incident face on B.
             box_box_face_reference_contacts(
@@ -845,9 +855,9 @@ fn box_box_face_reference_contacts(
     let mut inc_axis_idx = 0usize;
     let mut inc_sign = 1.0f32;
     let mut inc_dot = f32::INFINITY;
-    for k in 0..3 {
+    for (k, basis_k) in inc_basis.iter().enumerate() {
         for &s in &[1.0f32, -1.0f32] {
-            let dot = (inc_basis[k] * s).dot(ref_out_normal);
+            let dot = (*basis_k * s).dot(ref_out_normal);
             if dot < inc_dot {
                 inc_dot = dot;
                 inc_axis_idx = k;
@@ -993,7 +1003,7 @@ fn sutherland_hodgman_axis_rect(
             _ => half_v - p.v,
         }
     };
-    let mut output: Vec<FaceVertex2D> = subject.iter().copied().collect();
+    let mut output: Vec<FaceVertex2D> = subject.to_vec();
     for edge in 0..4 {
         if output.is_empty() {
             break;

@@ -646,6 +646,24 @@ fn build_mixed_scene() -> World {
     let b_b_upper = Body::solid_box(m, hb, Vec3::new(0.02, -0.7, 0.7), Quat::IDENTITY);
     let ibu = world.add_body(b_b_upper);
     world.add_geom(Geom::r#box(ibu, hb, Vec3::ZERO, Quat::IDENTITY, 0.6));
+    // Restrict pair list to supported combinations only — the four dynamic
+    // geoms all touch the ground plane (index 0); the two boxes also touch
+    // each other. Cylinder-vs-ellipsoid etc. are deferred and would trip
+    // the engine-level unsupported-pair panic if auto_pairs enumerated them.
+    let plane = 0;
+    let cyl_g = 1;
+    let ell_g = 2;
+    let mesh_g = 3;
+    let box_lo_g = 4;
+    let box_up_g = 5;
+    world.pair_list = Some(vec![
+        (plane, cyl_g),
+        (plane, ell_g),
+        (plane, mesh_g),
+        (plane, box_lo_g),
+        (plane, box_up_g),
+        (box_lo_g, box_up_g),
+    ]);
     world
 }
 
@@ -672,6 +690,96 @@ fn snapshot(world: &World) -> Vec<u8> {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// SF1: engine-level unsupported-pair enforcement (loud panic + loader reject)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "not supported by newt's narrow phase")]
+fn world_step_panics_on_auto_generated_unsupported_pair() {
+    // Programmatic scene with two cylinders on separate bodies — auto_pairs
+    // enumerates the cylinder-cylinder pair, which is deferred. The first
+    // `step()` after construction must panic; this replaces the tier-2
+    // stack.json silent-no-op class of bug.
+    let mut world = World::new();
+    world.gravity = Vec3::ZERO;
+    let ba = world.add_body(Body::solid_box(
+        1.0,
+        Vec3::splat(0.1),
+        Vec3::new(-0.5, 0.0, 0.5),
+        Quat::IDENTITY,
+    ));
+    let bb = world.add_body(Body::solid_box(
+        1.0,
+        Vec3::splat(0.1),
+        Vec3::new(0.5, 0.0, 0.5),
+        Quat::IDENTITY,
+    ));
+    world.add_geom(Geom::cylinder(
+        ba,
+        0.2,
+        0.2,
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        0.5,
+    ));
+    world.add_geom(Geom::cylinder(
+        bb,
+        0.2,
+        0.2,
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        0.5,
+    ));
+    world.step();
+}
+
+#[test]
+fn pile_scene_all_supported_steps_without_panic() {
+    // The v1-tier-2 pile scene (see examples/pile.rs, and
+    // `build_mixed_scene` above) restricts its pair list to supported
+    // combinations. A `step()` must run without panicking. This is the
+    // "positive" companion to `world_step_panics_on_auto_generated_unsupported_pair`.
+    let mut world = build_mixed_scene();
+    for _ in 0..5 {
+        world.step();
+    }
+}
+
+#[test]
+fn model_loader_rejects_explicit_unsupported_contact_pair() {
+    // The JSON loader must surface an unsupported explicit pair at load
+    // time with a JSON-path error. Scene: two cylinder bodies with an
+    // explicit `contact_pairs` entry between them.
+    let json = r#"{
+        "version": "1",
+        "bodies": [
+            {"name":"a","mass":1,"inertia":{"kind":"diag","values":[0.01,0.01,0.01]}},
+            {"name":"b","mass":1,"inertia":{"kind":"diag","values":[0.01,0.01,0.01]}}
+        ],
+        "geoms": [
+            {"name":"ga","shape":{"kind":"cylinder","radius":0.2,"half_height":0.2},
+             "attach":{"kind":"body","body":"a"}},
+            {"name":"gb","shape":{"kind":"cylinder","radius":0.2,"half_height":0.2},
+             "attach":{"kind":"body","body":"b"}}
+        ],
+        "contact_pairs": {"explicit":[{"a":"ga","b":"gb"}]}
+    }"#;
+    let err = newt::model::load_str(json)
+        .expect_err("expected the loader to reject an explicit unsupported contact pair");
+    let msg = err.to_string();
+    let lower = msg.to_lowercase();
+    assert!(
+        lower.contains("cylinder")
+            && (lower.contains("not supported") || lower.contains("unsupported")),
+        "loader error should mention cylinder + unsupported: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Determinism: repeat a mixed-geom scene twice, byte-compare final state
+// ---------------------------------------------------------------------------
 
 #[test]
 fn mixed_geom_scene_is_deterministic_across_two_runs() {

@@ -37,13 +37,14 @@
 use crate::body::Body;
 use crate::contact::{Contact, is_pair_supported, narrow_phase};
 use crate::geom::{
-    ConvexMesh, Geom, GeomAttach, GeomPose, combine_solref, geom_world_pose, solref_to_kc,
+    ConvexMesh, Geom, GeomAttach, GeomPose, GeomShape, combine_solref, geom_world_pose,
+    solref_to_kc,
 };
 use crate::math::{Quat, Vec3};
 use crate::tree::{Tree, forward_kinematics as tree_forward_kinematics, rk4_step as tree_rk4_step};
 
 /// Simulation world.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct World {
     /// Fixed integration timestep. Default 5 ms (matches biped).
     pub dt: f32,
@@ -65,6 +66,34 @@ pub struct World {
     /// two geoms don't share a body/link and aren't both static; the
     /// resulting order is `(min, max)` lexicographic.
     pub pair_list: Option<Vec<(usize, usize)>>,
+    /// Cached pair-support fingerprint from the last successful validation.
+    /// Encoded as `(geoms.len() << 32) | pair_list_encoded` where
+    /// `pair_list_encoded` is `(pair_list.len() as u32) + 1` when
+    /// `pair_list` is `Some` else `0`. `Cell<u64>::default() == 0` marks
+    /// "never validated" (the empty world has zero geoms and no explicit
+    /// pair list, whose encoding is `(0 << 32) | 0 = 0` — same as the
+    /// default; harmless because that scene has no pairs to fail on).
+    /// This is a cheap change detector so [`Self::step`] is O(1) after
+    /// the first check; it is NOT authoritative — mutating a geom's
+    /// `shape` in place bypasses detection. Callers that do so should
+    /// call [`Self::invalidate_pair_check`].
+    #[doc(hidden)]
+    checked_pairs: std::cell::Cell<u64>,
+}
+
+// Manual PartialEq: the pair-check cache is not part of logical world state.
+// Two worlds with identical bodies/trees/geoms/meshes/pair_list are equal
+// regardless of whether either has run the pair check.
+impl PartialEq for World {
+    fn eq(&self, other: &Self) -> bool {
+        self.dt == other.dt
+            && self.gravity == other.gravity
+            && self.bodies == other.bodies
+            && self.trees == other.trees
+            && self.geoms == other.geoms
+            && self.meshes == other.meshes
+            && self.pair_list == other.pair_list
+    }
 }
 
 /// One entry returned by [`World::validate_supported_pairs`]: a geom index
@@ -92,7 +121,61 @@ impl World {
             geoms: Vec::new(),
             meshes: Vec::new(),
             pair_list: None,
+            checked_pairs: std::cell::Cell::new(0),
         }
+    }
+
+    /// Invalidate the pair-support cache, forcing the next [`Self::step`]
+    /// to re-run [`Self::validate_supported_pairs`]. Call this after any
+    /// in-place mutation of a geom's `shape` field (which the length-based
+    /// change detector cannot see).
+    pub fn invalidate_pair_check(&self) {
+        self.checked_pairs.set(0);
+    }
+
+    /// Encode the current geom/pair fingerprint. Zero encoding is reserved
+    /// for "never validated"; the empty scene has no pairs so a spurious
+    /// match against zero is harmless.
+    fn pair_fingerprint(&self) -> u64 {
+        let g = self.geoms.len() as u64;
+        let p = match &self.pair_list {
+            Some(v) => (v.len() as u64) + 1,
+            None => 0,
+        };
+        (g << 32) | p
+    }
+
+    /// Panic if any ACTIVE contact pair (auto-generated or explicit) targets
+    /// a shape combination not implemented by
+    /// [`crate::contact::narrow_phase`]. The message names the offending
+    /// geom indices and shape kinds so the caller can find the
+    /// misconfiguration. Cached: after the first successful check, this is
+    /// O(1) until the geom count or pair-list length changes (see
+    /// [`Self::invalidate_pair_check`] for the shape-mutation case).
+    ///
+    /// This is the "engine-level, loudest form" enforcement of the
+    /// documented no-silent-no-op rule (see `docs/contacts.md`) and the
+    /// direct response to the tier-2 `stack.json` incident.
+    fn assert_pairs_supported(&self) {
+        let sig = self.pair_fingerprint();
+        if self.checked_pairs.get() == sig {
+            return;
+        }
+        let unsupported = self.validate_supported_pairs();
+        if let Some(bad) = unsupported.first() {
+            let ga = &self.geoms[bad.geom_a];
+            let gb = &self.geoms[bad.geom_b];
+            panic!(
+                "contact pair {:?}(geom {}) x {:?}(geom {}) is not supported by \
+                 newt's narrow phase — see docs/contacts.md support matrix. Restrict \
+                 `world.pair_list` to a supported subset or defer this configuration.",
+                shape_name(ga.shape),
+                bad.geom_a,
+                shape_name(gb.shape),
+                bad.geom_b,
+            );
+        }
+        self.checked_pairs.set(sig);
     }
 
     /// Register a convex mesh asset and return its stable id. Use the id in
@@ -202,6 +285,10 @@ impl World {
     /// geoms, this collapses to tier-1 gravity-only RK4 bit-for-bit, and
     /// the golden `tumbling_3_body.bin` still passes.
     pub fn step(&mut self) {
+        // Loud engine-level enforcement: the first step after any pair-list
+        // or geom-count change panics if any ACTIVE pair falls in the
+        // deferred bucket. Prevents a stack.json-style silent no-op.
+        self.assert_pairs_supported();
         let pairs = match &self.pair_list {
             Some(p) => p.clone(),
             None => self.auto_pairs(),
@@ -782,6 +869,19 @@ pub fn tangent_basis(n: Vec3) -> (Vec3, Vec3) {
     let t1 = reference.cross(n).normalize();
     let t2 = n.cross(t1);
     (t1, t2)
+}
+
+/// Human-readable shape name for panic messages.
+fn shape_name(s: GeomShape) -> &'static str {
+    match s {
+        GeomShape::Plane => "plane",
+        GeomShape::Sphere { .. } => "sphere",
+        GeomShape::Box { .. } => "box",
+        GeomShape::Capsule { .. } => "capsule",
+        GeomShape::Cylinder { .. } => "cylinder",
+        GeomShape::Ellipsoid { .. } => "ellipsoid",
+        GeomShape::Mesh { .. } => "mesh",
+    }
 }
 
 fn clamp_symmetric(x: f32, cap: f32) -> f32 {

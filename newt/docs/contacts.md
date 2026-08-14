@@ -100,13 +100,25 @@ Contacts-per-pair for the implemented primitives:
 | capsule-capsule | `contact::capsule_capsule` | ≤ 1 |
 | box-box | `contact::box_box` (full OBB SAT) | ≤ 4 |
 
-Deferred pairs return no contacts. The world's
-`validate_supported_pairs()` reports them so a caller can either restrict
-`pair_list` to supported pairs (as `examples/pile.rs` does) or, once the
-constraint solver ticket lands, plug in the GJK/support-based fallback
-uniformly. No silent no-op — this is the direct response to the tier-2
-`stack.json` incident where an unsupported box-sphere pair let bodies fall
-through the ground.
+Deferred pairs are ENFORCED at engine level. Two mechanisms make silent
+no-ops impossible:
+
+- `World::step` calls `World::validate_supported_pairs()` on the first
+  step after any pair-list or geom-count change and PANICS if any active
+  pair falls in the deferred bucket. The panic message names the offending
+  geom indices and shape kinds; the check is cached (O(1)) on subsequent
+  steps and re-runs when the fingerprint changes (call
+  `World::invalidate_pair_check()` after in-place mutation of a geom's
+  `shape`).
+- The JSON loader rejects an explicit `contact_pairs` entry with an
+  unsupported shape combination at load time with a JSON-path error
+  pointing at `contact_pairs`.
+
+The scene author's job is to restrict `pair_list` to supported
+combinations (as `examples/pile.rs` does) or plug in the GJK/support-based
+fallback that lands with the v1 constraint solver. This is the direct
+response to the tier-2 `stack.json` incident where an unsupported
+box-sphere pair silently no-op'd, letting bodies fall through the ground.
 
 ### box-box: edge-edge SAT completion (NEWT-5 incident closure)
 
