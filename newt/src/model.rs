@@ -463,16 +463,49 @@ fn parse_solid_inertia(v: &Value, mass: f32, path: &str) -> Result<Mat3, ModelEr
 
 fn parse_pose(v: &Value, path: &str) -> Result<(Vec3, Quat), ModelError> {
     let fields = get_object(v, path)?;
-    reject_unknown(fields, &["position", "orientation"], path)?;
+    reject_unknown(
+        fields,
+        &["position", "orientation", "orientation_axis_angle"],
+        path,
+    )?;
     let pos = match optional(fields, "position") {
         Some(pos) => parse_vec3(pos, &format!("{path}.position"))?,
         None => Vec3::ZERO,
     };
-    let ori = match optional(fields, "orientation") {
-        Some(ori) => parse_quat(ori, &format!("{path}.orientation"))?,
-        None => Quat::IDENTITY,
+    let quat_form = optional(fields, "orientation");
+    let axis_angle_form = optional(fields, "orientation_axis_angle");
+    if quat_form.is_some() && axis_angle_form.is_some() {
+        return fail(
+            path,
+            "provide either `orientation` (quaternion) or `orientation_axis_angle` \
+             (axis + angle), not both",
+        );
+    }
+    let ori = if let Some(ori) = quat_form {
+        parse_quat(ori, &format!("{path}.orientation"))?
+    } else if let Some(aa) = axis_angle_form {
+        parse_orientation_axis_angle(aa, &format!("{path}.orientation_axis_angle"))?
+    } else {
+        Quat::IDENTITY
     };
     Ok((pos, ori))
+}
+
+/// Parse the `orientation_axis_angle` form. Uses `Quat::from_axis_angle`
+/// so a scene author who wants byte-identity with a programmatic
+/// `Quat::from_axis_angle(axis, angle)` construction gets it — the loader
+/// runs the SAME `sin`/`cos` polynomials as the engine. Preferred over
+/// raw quaternion literals for orientations produced by an axis-angle
+/// call.
+fn parse_orientation_axis_angle(v: &Value, path: &str) -> Result<Quat, ModelError> {
+    let fields = get_object(v, path)?;
+    reject_unknown(fields, &["axis", "angle"], path)?;
+    let axis = parse_vec3(required(fields, "axis", path)?, &format!("{path}.axis"))?;
+    if axis.length_squared() == 0.0 {
+        return fail(&format!("{path}.axis"), "axis must be non-zero");
+    }
+    let angle = get_f32(required(fields, "angle", path)?, &format!("{path}.angle"))?;
+    Ok(Quat::from_axis_angle(axis, angle))
 }
 
 // ---------------------------------------------------------------------------

@@ -27,15 +27,17 @@ use newt::world::World;
 
 use std::path::PathBuf;
 
-fn parse_args() -> (usize, PathBuf, (usize, usize)) {
+fn parse_args() -> (usize, PathBuf, (usize, usize), Option<PathBuf>) {
     let mut frames = 800usize;
     let mut out = PathBuf::from("newt-pile.ppm");
     let mut size = (800usize, 480usize);
+    let mut model: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--frames" => frames = args.next().unwrap().parse().unwrap(),
             "--out" => out = PathBuf::from(args.next().unwrap()),
+            "--model" => model = Some(PathBuf::from(args.next().unwrap())),
             "--size" => {
                 let s = args.next().unwrap();
                 let (w, h) = s.split_once('x').expect("--size WxH");
@@ -44,7 +46,7 @@ fn parse_args() -> (usize, PathBuf, (usize, usize)) {
             _ => panic!("unknown arg: {a}"),
         }
     }
-    (frames, out, size)
+    (frames, out, size, model)
 }
 
 // ---------------------------------------------------------------------------
@@ -468,19 +470,19 @@ fn render(world: &World, width: usize, height: usize) -> Framebuffer {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (frames, out, (width, height)) = parse_args();
-    let mut world = build_world();
-    // Sanity: no pair should be flagged as unsupported (we constrained the
-    // pair list to supported combinations). Panic if a change to the scene
-    // introduces an unsupported pair.
-    let unsupported = world.validate_supported_pairs();
-    if !unsupported.is_empty() {
-        panic!(
-            "pile scene contains unsupported pairs: {:?}. Update the scene \
-             or the deferred-pair list.",
-            unsupported
-        );
-    }
+    let (frames, out, (width, height), model_path) = parse_args();
+    // Either load from JSON (--model) or build programmatically. Both paths
+    // produce byte-identical states — pinned by
+    // `tests/model_load.rs::pile_json_matches_programmatic_construction_exactly`.
+    let mut world = if let Some(p) = model_path {
+        let scene = newt::model::load_from_path(&p)?;
+        scene.world
+    } else {
+        build_world()
+    };
+    // `World::step` runs its own engine-level unsupported-pair check on the
+    // first invocation and panics with a specific error; we don't need to
+    // pre-check here.
     for _ in 0..frames {
         world.step();
     }

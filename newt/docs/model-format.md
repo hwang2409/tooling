@@ -70,9 +70,17 @@ zero hinge axes — every branch has a dedicated unit test in
 - **name** — unique within `bodies`.
 - **mass** — kg, must be > 0.
 - **inertia** — see [`inertia`](#inertia) below.
-- **pose** — optional. `position` defaults to `[0,0,0]`, `orientation`
-  to identity. Quaternions are `(x, y, z, w)` and are renormalized on
-  load.
+- **pose** — optional. `position` defaults to `[0,0,0]`. Orientation
+  can be supplied in EITHER (but not both) of two forms:
+    - `"orientation": [x, y, z, w]` — a quaternion literal, renormalized
+      on load. Convenient when the caller has already computed the
+      quaternion.
+    - `"orientation_axis_angle": {"axis": [ax, ay, az], "angle": rad}`
+      — the loader calls `Quat::from_axis_angle(axis, angle)` and gets
+      byte-identical output to a programmatic call. Preferred for
+      round-trip anchors against a programmatic scene (see
+      `tests/model_load.rs::pile_json_matches_programmatic_construction_exactly`).
+  Default is identity.
 - **velocity** — optional. `linear` is in world coordinates, mirroring
   [`Body::linear_velocity`](../src/body.rs); `angular_body` is body-
   frame ω.
