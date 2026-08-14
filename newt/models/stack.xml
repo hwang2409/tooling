@@ -1,0 +1,39 @@
+<!-- MJCF mirror of models/stack.json.
+
+  Byte-identical trajectory anchor against stack.json — see
+  `tests/mjcf_anchor.rs`. Each free body omits <inertial> and lets the
+  loader auto-compute the inertia from the single mass-carrying <geom>
+  via `crate::geom::solid_box_inertia`, which is the same helper the
+  JSON loader's `"inertia":{"kind":"solid",…}` path invokes. Same helper,
+  same numbers, same trajectory.
+
+  The `<velocity angular_body=..>` child on the top block is a newt
+  extension (documented in `docs/mjcf.md`) mirroring the JSON model's
+  initial rotation.
+-->
+<mujoco model="stack">
+  <compiler angle="radian"/>
+  <option timestep="0.005" gravity="0 0 -9.81"/>
+
+  <worldbody>
+    <geom name="ground" type="plane" friction="0.6"/>
+
+    <body name="bottom" pos="0 0 0.5">
+      <freejoint name="bottom_root"/>
+      <geom name="bottom_box" type="box" size="0.35 0.35 0.35" friction="0.6" mass="1.2"/>
+    </body>
+
+    <body name="middle" pos="0.02 0 1.7">
+      <freejoint name="middle_root"/>
+      <geom name="middle_box" type="box" size="0.35 0.35 0.35" friction="0.6" mass="0.9"/>
+    </body>
+
+    <body name="top" pos="0 0 2.9">
+      <freejoint name="top_root"/>
+      <geom name="top_box" type="box" size="0.35 0.35 0.35" friction="0.6" mass="1.5"/>
+      <!-- newt extension: initial body-frame angular velocity mirroring
+           the "velocity" field in stack.json. See docs/mjcf.md. -->
+      <velocity angular_body="0 0.3 0"/>
+    </body>
+  </worldbody>
+</mujoco>
