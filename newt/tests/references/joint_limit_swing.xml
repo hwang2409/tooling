@@ -1,0 +1,20 @@
+<!-- Differential scenario: single hinge pendulum swinging into a
+  range limit. Tests the limit-as-constraint path (PGS on both sides).
+-->
+<mujoco model="joint_limit_swing">
+  <compiler angle="radian"/>
+  <option timestep="0.002" gravity="0 0 -9.81"
+          integrator="RK4" solver="PGS" cone="pyramidal" iterations="20"/>
+
+  <worldbody>
+    <body name="pivot" pos="0 0 1.5">
+      <inertial pos="0 0 0" mass="1.0" diaginertia="1.0 1.0 1.0"/>
+
+      <body name="arm" pos="0 0 -0.5">
+        <joint name="swing" type="hinge" axis="1 0 0" pos="0 0 0.5"
+               range="-0.6 0.6" limited="true"/>
+        <inertial pos="0 0 0" mass="1.0" diaginertia="0.08 0.08 1e-6"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

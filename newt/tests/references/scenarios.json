@@ -1,0 +1,59 @@
+{
+  "_readme": "Shared source of truth for the differential harness. Both newt/tools/capture_mujoco.py and tests/differential.rs iterate this list. Fields: name (string), mjcf (path relative to this file), n_steps (total steps to run), stride (record every Nth step; sample 0 = initial state), init_qvel (optional MuJoCo-layout qvel override applied before stepping), targets (optional per-step actuator control array), horizon_note (free text for the scorecard).",
+  "scenarios": [
+    {
+      "name": "ballistic",
+      "mjcf": "ballistic.xml",
+      "n_steps": 400,
+      "stride": 20,
+      "init_qvel": [3.0, -1.5, 5.0, 0.0, 0.0, 0.0],
+      "horizon_note": "2.0 s free flight, no contacts."
+    },
+    {
+      "name": "tumble",
+      "mjcf": "tumble.xml",
+      "n_steps": 2000,
+      "stride": 100,
+      "init_qvel": [0.0, 0.0, 0.0, 0.1, 8.0, 0.1],
+      "horizon_note": "4.0 s torque-free rotation, intermediate-axis instability."
+    },
+    {
+      "name": "double_pendulum",
+      "mjcf": "double_pendulum.xml",
+      "n_steps": 200,
+      "stride": 10,
+      "init_qpos": [0.35, -0.15],
+      "horizon_note": "0.4 s short horizon; long-run divergence is chaotic and expected."
+    },
+    {
+      "name": "servo_arm",
+      "mjcf": "servo_arm.xml",
+      "n_steps": 800,
+      "stride": 40,
+      "actuator_targets": {"shoulder_servo": 0.6, "elbow_servo": -0.4, "wrist_servo": 0.3},
+      "horizon_note": "4.0 s reaching a fixed pose from rest."
+    },
+    {
+      "name": "sphere_drop",
+      "mjcf": "sphere_drop.xml",
+      "n_steps": 1500,
+      "stride": 50,
+      "horizon_note": "3.0 s drop-and-settle; steady-state penetration is the scorecard signal."
+    },
+    {
+      "name": "box_stack",
+      "mjcf": "box_stack.xml",
+      "n_steps": 2000,
+      "stride": 100,
+      "horizon_note": "4.0 s multi-contact settle; loosest tolerances of the suite."
+    },
+    {
+      "name": "joint_limit_swing",
+      "mjcf": "joint_limit_swing.xml",
+      "n_steps": 1000,
+      "stride": 50,
+      "init_qvel": [3.5],
+      "horizon_note": "2.0 s swing driving the hinge past the ±0.6 rad range limit repeatedly."
+    }
+  ]
+}

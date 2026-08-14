@@ -1,0 +1,26 @@
+<!-- Differential scenario: single sphere dropped onto a plane; settles.
+
+  This is the load-bearing scenario for the arc's integrity standard.
+  NEWT-9's PGS solver uses a softened d-scaling of the effective
+  Baumgarte coefficient (see src/solver.rs docs). If our steady-state
+  penetration differs materially from real MuJoCo's, that IS the
+  scorecard finding — it does not get papered over.
+
+  solref/solimp are left at defaults so both engines pick MuJoCo's
+  standard timeconst=0.02, dampratio=1, dmin=0.9, dmax=0.95, width=1e-3,
+  midpoint=0.5, power=2.
+-->
+<mujoco model="sphere_drop">
+  <compiler angle="radian"/>
+  <option timestep="0.002" gravity="0 0 -9.81"
+          integrator="RK4" solver="PGS" cone="pyramidal" iterations="20"/>
+
+  <worldbody>
+    <geom name="ground" type="plane" size="5 5 0.1" friction="0.8"/>
+    <body name="ball" pos="0 0 0.6">
+      <freejoint name="ball_root"/>
+      <inertial pos="0 0 0" mass="0.5" diaginertia="0.002 0.002 0.002"/>
+      <geom name="ball_sphere" type="sphere" size="0.1" friction="0.8"/>
+    </body>
+  </worldbody>
+</mujoco>

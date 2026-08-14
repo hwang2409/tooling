@@ -1,0 +1,20 @@
+<!-- Differential scenario: torque-free rotating free body with a
+  distinctly asymmetric inertia tensor. Gravity is zeroed so this is
+  pure Euler rotation (the intermediate-axis / Dzhanibekov flip is
+  the anchor). Initial angular velocity is set in scenarios.json.
+
+  Divergence sources here are integrator quantization + how each side
+  renormalizes the free-root quaternion. Both use RK4; drift should be
+  small over a short horizon.
+-->
+<mujoco model="tumble">
+  <compiler angle="radian"/>
+  <option timestep="0.002" gravity="0 0 0"
+          integrator="RK4" solver="PGS" cone="pyramidal" iterations="20"/>
+  <worldbody>
+    <body name="brick" pos="0 0 0">
+      <freejoint name="brick_root"/>
+      <inertial pos="0 0 0" mass="1.0" diaginertia="0.02 0.08 0.09"/>
+    </body>
+  </worldbody>
+</mujoco>

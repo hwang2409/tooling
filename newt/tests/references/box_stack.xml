@@ -1,0 +1,34 @@
+<!-- Differential scenario: three-box stack settling on a plane.
+
+  Multi-contact, box-box + box-plane, pyramidal friction. This gets
+  the LOOSEST tolerances because iteration order and contact ordering
+  differences dominate. Small x/y offset on the middle block breaks
+  perfect symmetry so a rotation drift would surface.
+-->
+<mujoco model="box_stack">
+  <compiler angle="radian"/>
+  <option timestep="0.002" gravity="0 0 -9.81"
+          integrator="RK4" solver="PGS" cone="pyramidal" iterations="20"/>
+
+  <worldbody>
+    <geom name="ground" type="plane" size="5 5 0.1" friction="0.6"/>
+
+    <body name="bottom" pos="0 0 0.5">
+      <freejoint name="bottom_root"/>
+      <inertial pos="0 0 0" mass="1.2" diaginertia="0.098 0.098 0.098"/>
+      <geom name="bottom_box" type="box" size="0.35 0.35 0.35" friction="0.6"/>
+    </body>
+
+    <body name="middle" pos="0.02 0 1.25">
+      <freejoint name="middle_root"/>
+      <inertial pos="0 0 0" mass="0.9" diaginertia="0.0735 0.0735 0.0735"/>
+      <geom name="middle_box" type="box" size="0.35 0.35 0.35" friction="0.6"/>
+    </body>
+
+    <body name="top" pos="0 0 2.0">
+      <freejoint name="top_root"/>
+      <inertial pos="0 0 0" mass="1.5" diaginertia="0.1225 0.1225 0.1225"/>
+      <geom name="top_box" type="box" size="0.35 0.35 0.35" friction="0.6"/>
+    </body>
+  </worldbody>
+</mujoco>
