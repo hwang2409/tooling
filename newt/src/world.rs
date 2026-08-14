@@ -41,7 +41,7 @@ use crate::geom::{
     solref_to_kc,
 };
 use crate::math::{Quat, Vec3};
-use crate::solver::SolverConfig;
+use crate::solver::{SolverConfig, SolverMode, solve_free_bodies};
 use crate::tree::{Tree, forward_kinematics as tree_forward_kinematics, rk4_step as tree_rk4_step};
 
 /// Simulation world.
@@ -337,19 +337,37 @@ impl World {
     fn step_bodies(&mut self, pairs: &[(usize, usize)]) {
         let s0 = self.bodies.clone();
 
-        let ext1 = self.compute_wrenches(&s0, pairs);
+        // Solver mode dispatch:
+        // - `Penalty` recomputes contact wrenches at each RK4 sub-stage
+        //   (the tier-2 path, unchanged).
+        // - `Pgs` solves the constraint system ONCE at s0 and holds those
+        //   per-body wrenches constant (zero-order hold) across all four
+        //   sub-stages. See newt/docs/solver.md, "Once-per-step under RK4",
+        //   for the rationale + tradeoffs.
+        let solver_zoh: Option<Vec<(Vec3, Vec3)>> = match self.solver.mode {
+            SolverMode::Penalty => None,
+            SolverMode::Pgs => Some(self.compute_solver_wrenches(&s0, pairs)),
+        };
+        let sample_wrenches = |state: &[Body], pairs: &[(usize, usize)]| -> Vec<(Vec3, Vec3)> {
+            match &solver_zoh {
+                Some(w) => w.clone(),
+                None => self.compute_wrenches(state, pairs),
+            }
+        };
+
+        let ext1 = sample_wrenches(&s0, pairs);
         let k1 = evaluate_all(&s0, self.gravity, &ext1);
 
         let s1 = advance_all(&s0, &s0, &k1, self.dt * 0.5);
-        let ext2 = self.compute_wrenches(&s1, pairs);
+        let ext2 = sample_wrenches(&s1, pairs);
         let k2 = evaluate_all(&s1, self.gravity, &ext2);
 
         let s2 = advance_all(&s0, &s0, &k2, self.dt * 0.5);
-        let ext3 = self.compute_wrenches(&s2, pairs);
+        let ext3 = sample_wrenches(&s2, pairs);
         let k3 = evaluate_all(&s2, self.gravity, &ext3);
 
         let s3 = advance_all(&s0, &s0, &k3, self.dt);
-        let ext4 = self.compute_wrenches(&s3, pairs);
+        let ext4 = sample_wrenches(&s3, pairs);
         let k4 = evaluate_all(&s3, self.gravity, &ext4);
 
         for i in 0..self.bodies.len() {
@@ -418,9 +436,27 @@ impl World {
             let bodies = self.bodies.clone();
             let geoms = self.geoms.clone();
             let meshes = self.meshes.clone();
+            // Solver mode: compute per-DOF limit force ONCE at s0 and
+            // hold it constant across the RK4 stages via qfrc_applied.
+            // Preserves the pre-step qfrc_applied so user-set torques
+            // remain in effect (the solver term is added on top and
+            // subtracted back after the step).
+            let mut solver_qfrc_delta: Vec<f32> = Vec::new();
+            if self.solver.mode == SolverMode::Pgs {
+                solver_qfrc_delta = crate::solver::solve_tree_limits(&tree, dt);
+                for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
+                    tree.qfrc_applied[slot] += delta;
+                }
+            }
             tree_rk4_step(&mut tree, gravity, dt, |t| {
                 tree_wrenches_from_contacts(t, ti, &bodies, &geoms, &meshes, &tree_pairs)
             });
+            // Roll back the ZOH limit torque so it doesn't accumulate
+            // across steps (the solver recomputes it fresh at each step
+            // start).
+            for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
+                tree.qfrc_applied[slot] -= delta;
+            }
             self.trees[ti] = tree;
         }
     }
@@ -433,6 +469,44 @@ impl World {
             None => self.auto_pairs(),
         };
         collect_contacts_full(&self.bodies, &self.trees, &self.geoms, &self.meshes, &pairs)
+    }
+
+    /// Compute per-body external wrench arrays for solver mode.
+    ///
+    /// Runs the PGS solve at `state` (typically s0 — start of RK4 step) and
+    /// returns per-body `(force_world, torque_world_at_com)` to hold
+    /// constant across all four RK4 sub-stages. Contacts touching tree
+    /// links are dropped (v1-tier-4 scope: cross-tree/body contacts remain
+    /// on the penalty pathway; see newt/docs/solver.md).
+    fn compute_solver_wrenches(
+        &self,
+        state: &[Body],
+        pairs: &[(usize, usize)],
+    ) -> Vec<(Vec3, Vec3)> {
+        let n = state.len();
+        if self.geoms.is_empty() {
+            return vec![(Vec3::ZERO, Vec3::ZERO); n];
+        }
+        // Filter pairs to free-body-only ones (both sides Body or Static).
+        let mut free_pairs: Vec<(usize, usize)> = Vec::with_capacity(pairs.len());
+        for &(a, b) in pairs {
+            let att_a = self.geoms[a].attachment();
+            let att_b = self.geoms[b].attachment();
+            if matches!(att_a, GeomAttach::Link(_, _)) || matches!(att_b, GeomAttach::Link(_, _)) {
+                continue;
+            }
+            free_pairs.push((a, b));
+        }
+        let contacts = collect_contacts(state, &self.geoms, &self.meshes, &free_pairs);
+        solve_free_bodies(
+            state,
+            &self.geoms,
+            &contacts,
+            self.gravity,
+            self.dt,
+            self.solver.cone,
+            self.solver.iterations,
+        )
     }
 
     /// Compute per-body external wrench arrays for a given body-state vector.
