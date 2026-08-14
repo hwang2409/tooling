@@ -1,9 +1,11 @@
-# newt contacts (tier 2)
+# newt contacts (tier 2 + v1 tier 2)
 
 collision geoms, penalty contact forces, and pyramidal friction on top of
 [tier 1's core](core.md). no joints, no actuators (later tiers). the demos in
-this tier are two: **stack** (three spheres piling onto a plane) and **roll**
-(two spheres colliding head-on across a plane).
+this tier are: **stack** (three boxes piling onto a plane), **roll** (two
+spheres colliding head-on across a plane), and **pile** (v1 tier 2 —
+cylinder + ellipsoid + mesh tetra + yawed box stack showcasing the new
+primitives).
 
 design of record: [superpowers/specs/2026-08-13-newt-physics-design.md](superpowers/specs/2026-08-13-newt-physics-design.md).
 
@@ -21,33 +23,125 @@ stiffness parameter.
 | `Sphere { radius }` | origin at center. |
 | `Box { half_extents }` | origin at center, axes along local xyz. |
 | `Capsule { radius, half_height }` | axis along local Z. `half_height` is the cylindrical half-length; tip-to-tip is `2*(half_height + radius)`. |
+| `Cylinder { radius, half_height }` (v1) | solid cylinder, axis along local Z (MuJoCo convention). |
+| `Ellipsoid { semi_axes }` (v1) | 3 semi-axes along body-frame X/Y/Z. |
+| `Mesh { mesh_id }` (v1) | reference into [`World::meshes`]. See "convex mesh trust model" below. |
 
-inertia helpers for uniform-density variants live in `newt::geom` (solid
-sphere, solid box, solid capsule) and are what `Body::solid_sphere`,
-`Body::solid_box`, and `Body::solid_capsule` call. callers with a
-custom mass distribution build the inertia tensor themselves and pass it to
-`Body::new`.
+inertia helpers for uniform-density variants live in `newt::geom`: solid
+sphere, box, capsule, cylinder, ellipsoid. `Body::solid_*` constructors call
+them. Meshes ship with NO inertia helper — the trust model does not extend
+to volume integration; mesh bodies must specify their inertia explicitly.
 
-## narrow-phase coverage (tier 2)
+### convex mesh trust model
+
+`GeomShape::Mesh { mesh_id }` refers to an entry in
+`World::meshes: Vec<ConvexMesh>`, which is a `(vertices, faces)` pair. The
+engine ASSUMES the polyhedron is convex — matching MuJoCo's asset contract.
+`ConvexMesh::validate` (also run by the model loader) checks only the cheap
+structural properties: ≥ 4 vertices, ≥ 4 triangular faces, face indices in
+range, vertex coordinates finite. Convexity itself is NOT verified.
+
+A non-convex mesh will silently produce incorrect contacts against the
+implemented pairs (`plane`, `sphere-mesh`), and always miss internal-cavity
+contacts. The mesh author owns this constraint.
+
+### margin / gap (MuJoCo semantics)
+
+Per-geom `margin` and `gap` fields (default 0.0):
+
+- `pair_margin = max(a.margin, b.margin)` widens the CONTACT ACTIVATION
+  zone: a contact is emitted whenever the raw signed distance is below
+  `pair_margin`. The reported `penetration` on the contact is the shifted
+  quantity `pair_margin - dist`, so it is positive even during near-miss
+  detection.
+- `pair_gap = max(a.gap, b.gap)` is a FORCE-FREE zone: the world zeros the
+  contact's normal and friction force while `penetration <= pair_gap`. Use
+  it for sensing-only contacts, or to model a small clearance between two
+  geoms without applying force until the deeper overlap is reached.
+
+Zero-vs-zero collapses to "detect and force on real overlap" — every
+existing tier-2 golden survives byte-for-byte because `margin = gap = 0` is
+the default.
+
+## narrow-phase coverage
+
+### support matrix
+
+Rows = A shape, columns = B shape. Symmetric — the dispatcher tries a swap
+before giving up. "Impl" = shipping in `contact::narrow_phase`, "Deferred" =
+returns an empty buffer AND is flagged by
+`World::validate_supported_pairs()`.
+
+|              | Plane   | Sphere  | Box     | Capsule | Cylinder | Ellipsoid | Mesh    |
+|--------------|---------|---------|---------|---------|----------|-----------|---------|
+| **Plane**    | —       | Impl    | Impl    | Impl    | Impl     | Impl      | Impl    |
+| **Sphere**   | Impl    | Impl    | Deferred| Impl    | Impl     | Impl      | Impl    |
+| **Box**      | Impl    | Deferred| Impl    | Deferred| Deferred | Deferred  | Deferred|
+| **Capsule**  | Impl    | Impl    | Deferred| Impl    | Deferred | Deferred  | Deferred|
+| **Cylinder** | Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred|
+| **Ellipsoid**| Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred|
+| **Mesh**     | Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred|
+
+Contacts-per-pair for the implemented primitives:
 
 | pair | primitive | contacts per pair |
 |------|-----------|-------------------|
 | sphere-plane | `contact::sphere_plane` | ≤ 1 |
 | box-plane | `contact::box_plane` | ≤ 4 (deepest corners) |
 | capsule-plane | `contact::capsule_plane` | ≤ 2 (axis endpoints) |
+| cylinder-plane | `contact::cylinder_plane` | ≤ 4 (deepest of 10 sampled cap/rim points) |
+| ellipsoid-plane | `contact::ellipsoid_plane` | ≤ 1 (analytical support point) |
+| mesh-plane | `contact::mesh_plane` | ≤ 4 (deepest vertices) |
 | sphere-sphere | `contact::sphere_sphere` | ≤ 1 |
 | sphere-capsule | `contact::sphere_capsule` | ≤ 1 |
+| sphere-cylinder | `contact::sphere_cylinder` | ≤ 1 (closest point) |
+| sphere-ellipsoid | `contact::sphere_ellipsoid` | ≤ 1 (12-iter Newton) |
+| sphere-mesh | `contact::sphere_mesh` | ≤ 1 (closest-point-on-triangle over faces) |
 | capsule-capsule | `contact::capsule_capsule` | ≤ 1 |
-| box-box | `contact::box_box` (vertex-vs-face) | ≤ 4 (deepest of 16 candidates) |
+| box-box | `contact::box_box` (full OBB SAT) | ≤ 4 |
 
-box-sphere and box-capsule are **deferred to a later tier**. box-box ships as
-vertex-vs-face — it emits a contact for every vertex of A that is strictly
-inside B (and vice versa), picks the face aligned with the pose delta as the
-contact normal, and keeps the four deepest. this covers the full stacking
-regime (four bottom corners of the upper box on the top face of the lower).
-what it misses is **edge-vs-edge** — two obliquely oriented boxes clashing on
-edges with no vertex inside the other. that misses along with box-sphere in
-v0-tier-late alongside cylinder/mesh geoms and a real SAT + face clipper.
+Deferred pairs are ENFORCED at engine level. Two mechanisms make silent
+no-ops impossible:
+
+- `World::step` calls `World::validate_supported_pairs()` on the first
+  step after any pair-list or geom-count change and PANICS if any active
+  pair falls in the deferred bucket. The panic message names the offending
+  geom indices and shape kinds; the check is cached (O(1)) on subsequent
+  steps and re-runs when the fingerprint changes (call
+  `World::invalidate_pair_check()` after in-place mutation of a geom's
+  `shape`).
+- The JSON loader rejects an explicit `contact_pairs` entry with an
+  unsupported shape combination at load time with a JSON-path error
+  pointing at `contact_pairs`.
+
+The scene author's job is to restrict `pair_list` to supported
+combinations (as `examples/pile.rs` does) or plug in the GJK/support-based
+fallback that lands with the v1 constraint solver. This is the direct
+response to the tier-2 `stack.json` incident where an unsupported
+box-sphere pair silently no-op'd, letting bodies fall through the ground.
+
+### box-box: edge-edge SAT completion (NEWT-5 incident closure)
+
+Tier 2 shipped box-box as vertex-vs-face only, with the caveat that it
+misses edge-vs-edge intersections. v1 tier 2 closes that gap:
+
+- The vertex-vs-face manifold runs FIRST, unchanged. Axis-aligned +
+  moderate-yaw stacks still produce their manifold contacts, so the
+  `stacking_3_boxes` golden stays byte-identical.
+- If vertex-vs-face returns zero contacts, a 15-axis SAT test
+  (6 face normals + 9 edge-edge cross products) determines whether the
+  boxes actually overlap. If so, we emit one contact at the closest points
+  of the pair of edges producing the minimum-overlap edge-edge axis.
+
+This closes the yawed-stack case: two boxes rotated ≥ 45° relative to each
+other, where every corner of the upper hangs over an edge of the lower,
+now stack (previously the upper collapsed straight through).
+
+### mesh-plane accuracy note
+
+`mesh_plane` iterates VERTICES. This is exact for a convex polyhedron —
+the deepest point on the mesh in any direction is always a vertex — so a
+tetrahedron resting on a face emits contacts at its three "down" vertices.
 
 pair filtering: when `World::pair_list` is `None`, pairs are enumerated as
 `(i, j)` with `i < j` over the geom vector, skipping same-body pairs and
@@ -138,6 +232,19 @@ bit-identical to tier 1 — the tier-1 tumbling golden still passes.
 | `tests/contacts_momentum.rs::head_on_collision_conserves_linear_momentum` | pairwise sphere collision: max `|Σp − Σp₀| < 1e-3` over 400 steps; both spheres exchanged velocity. |
 | `tests/contacts_golden.rs::contacts_golden_trajectory_is_byte_identical` | serialize `(q, qdot)` for the 3-BOX symmetry-broken stacking scene (middle box offset +0.02 m in X, top box spinning at 0.3 rad/s about Y) at steps 0/100/1000; byte-compared against `tests/goldens/stacking_3_boxes.bin`. box-box + box-plane contacts + non-trivial `r × F` are all exercised — a zero-lever-arm mutant flips this golden at snapshot 2. |
 | `tests/contacts_golden.rs::stacked_boxes_stay_near_upright_under_asymmetric_load` | after 2000 steps (10 s) on the same symmetry-broken scene, every box's `1 − |q.w|` under 1e-2 (< ~12°), |x| drift under 15 cm, |y| under 2 cm, top box's initial ω_y decayed to < 1 rad/s, and z-order preserved. This is the lever-arm anchor — verified locally by running with the zero-arm mutant applied (both `r × F` cross products replaced with `Vec3::ZERO`): top box tilts to `1 − |q.w| = 0.93` (~86°). The symmetry break is load-bearing; the perfectly-aligned scene the earlier draft used had corner torques that canceled and did NOT catch this mutant. |
+| `tests/contacts_geoms_v1.rs::cylinder_rests_on_plane_at_predicted_penetration` | cap-flat cylinder rests at `half_h − g / (4·k)` (4 rim contacts share the load); ω settles to < 0.05 rad/s. |
+| `tests/contacts_geoms_v1.rs::ellipsoid_rests_on_plane_at_predicted_penetration` | ellipsoid bottom point sits at `-g / k`; catches an analytic-support-point sign flip. |
+| `tests/contacts_geoms_v1.rs::tetrahedron_mesh_rests_on_a_face` | 4-vertex tetra on a face; three "down" vertices share the load, deepest vertex within tolerance of the closed-form single-contact depth. |
+| `tests/contacts_geoms_v1.rs::rolling_cylinder_stays_on_its_axis_without_lateral_drift` | cylinder rolling under gravity keeps its axis fixed — lateral (perpendicular-to-rolling) drift < 2 cm over 2 s. |
+| `tests/contacts_geoms_v1.rs::yawed_boxes_stack_and_do_not_collapse_through_each_other` | THE NEWT-5 incident closure: two boxes yawed 45° relative to each other, upper dropped just above lower, stack holds. Before edge-edge SAT, the upper collapsed straight through. |
+| `tests/contacts_geoms_v1.rs::sphere_touching_cylinder_side_gives_correct_normal_direction` | sphere adjacent to cylinder side yields normal along +X (from cylinder into sphere) and penetration matching hand calculation. |
+| `tests/contacts_geoms_v1.rs::sphere_touching_ellipsoid_gives_penetration_matching_axial_case` | sphere on the +X support-axis of an anisotropic ellipsoid; catches the Newton-solver convergence and normal orientation. |
+| `tests/contacts_geoms_v1.rs::sphere_touching_mesh_face_gives_correct_penetration` | sphere below a mesh face; catches closest-point-on-triangle bugs. |
+| `tests/contacts_geoms_v1.rs::margin_fires_contact_before_geoms_touch` | plane margin 0.05, sphere just above touch: contact fires with shifted penetration `= margin − dist`. |
+| `tests/contacts_geoms_v1.rs::gap_zeros_the_normal_force_while_penetration_is_below_it` | pen ≤ gap gives free-fall acceleration on the sphere despite an active contact record. |
+| `tests/contacts_geoms_v1.rs::mixed_geom_scene_is_deterministic_across_two_runs` | build the pile scene twice, step 200 times each, byte-compare final state. Guards against non-deterministic iteration order in any of the new primitives (esp. the Newton solver termination). |
+| `tests/contacts_geoms_v1.rs::is_pair_supported_covers_new_and_reject_lists` | direct check that `is_pair_supported` returns the expected implemented/deferred verdicts on representative pairs. |
+| `tests/contacts_geoms_v1.rs::world_validate_supported_pairs_flags_deferred_cylinder_cylinder` | world validator surfaces a cylinder-cylinder pair as unsupported so a caller can't accidentally rely on it. |
 
 the golden was generated on macOS aarch64 (same convention as tier 1).
 regenerate ONLY on the reference host:
@@ -160,6 +267,14 @@ cannot silently swap the reference.
 | combine_solref picks stiffer damping instead of MIN | `contacts_energy.rs` — sphere overdamps and stops bouncing (this is exactly the bug caught during development) |
 | wrong contact-point lever arm in wrench application (e.g. `r_a`/`r_b` zeroed) | `stacked_boxes_stay_near_upright_under_asymmetric_load` — top box tilts to `1 − |q.w| ≈ 0.93` (~86°) within 10 s; the golden also flips at snapshot 2. Verified by local mutant application (documented in the PR body). |
 | box-box nearest-face picks the wrong wall (naive "closest face" instead of pose-delta-aligned) | 3-box demo would collapse to zero-height (upper boxes get pushed DOWN into the lower one); the box golden captures the correct settled height |
+| box-box edge-edge SAT fallback disabled or wrong-signed | `yawed_boxes_stack_and_do_not_collapse_through_each_other` — upper collapses through lower (NEWT-5 regression) |
+| ellipsoid analytical support point sign-flipped | `ellipsoid_rests_on_plane_at_predicted_penetration` — ellipsoid pushed up not settled |
+| cylinder-plane rim sampling too coarse (skip one direction) | `cylinder_rests_on_plane_at_predicted_penetration` — expected 4-contact resting depth becomes 3-contact (33% deeper) |
+| sphere-mesh iterates vertices only instead of triangle closest points | `sphere_touching_mesh_face_gives_correct_penetration` — sphere below face center reports 0 penetration |
+| sphere-ellipsoid Newton solver iteration count varies (non-fixed termination) | `mixed_geom_scene_is_deterministic_across_two_runs` — final state byte-diff between two runs of the same scene |
+| margin shift dropped (raw penetration used instead) | `margin_fires_contact_before_geoms_touch` — no contact fires despite margin > 0 |
+| gap ignored in the force computation | `gap_zeros_the_normal_force_while_penetration_is_below_it` — sphere doesn't free-fall inside the gap zone |
+| unsupported pair silently returns contacts | `world_validate_supported_pairs_flags_deferred_cylinder_cylinder` — expects the pair in the unsupported list; a bogus `is_pair_supported => true` mutant leaves the list empty |
 
 ## running the demos
 
@@ -173,6 +288,15 @@ two spheres rolling and colliding head-on:
 
 ```sh
 cargo run --release --example roll -- --frames 400 --out /tmp/roll.ppm --size 640x360
+```
+
+v1-tier-2 pile — cylinder + ellipsoid + mesh tetra + yawed box stack (each
+object settles onto its own patch of ground; cross-object pairs among
+new-geom pairs are deferred, so the demo restricts its pair list to the
+supported combinations):
+
+```sh
+cargo run --release --example pile -- --frames 800 --out /tmp/pile.ppm --size 800x480
 ```
 
 convert to png on macOS:

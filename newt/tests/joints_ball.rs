@@ -18,7 +18,7 @@
 use newt::body::Body;
 use newt::joint::JointKind;
 use newt::math::{Mat3, Quat, Vec3};
-use newt::tree::{Link, Tree, forward_kinematics, rk4_step};
+use newt::tree::{Link, Tree, aba, forward_kinematics, rk4_step};
 
 fn zero_ext(n: usize) -> impl Fn(&Tree) -> Vec<(Vec3, Vec3)> {
     move |_| vec![(Vec3::ZERO, Vec3::ZERO); n]
@@ -261,4 +261,85 @@ fn ball_joint_with_pivot_at_com_reproduces_torque_free_free_body() {
         dw.length(),
         body.angular_velocity_body
     );
+}
+
+// ---------------------------------------------------------------------------
+// 3. Ball armature anchor (mutation-coverage recipe from NEWT-6 review)
+// ---------------------------------------------------------------------------
+
+/// Ball-joint armature enters ABA's 3x3 articulated-inertia block as
+/// `D = Sᵀ IA S + armature · I₃`. With the joint anchor at the child COM
+/// (`r_jc = 0`), a diagonal `I_com`, and a unit generalized torque on axis
+/// `k`, the closed-form acceleration on that axis is
+/// `qddot_k = 1 / (I_com[k, k] + armature)`.
+///
+/// The reviewer's mutant drops the `+ armature` term from the D diagonal; the
+/// full test suite before this anchor did not catch it because every other
+/// ball anchor either used `armature = 0` or coupled the ball axis to
+/// inertias where a small off-by-one term rounded into noise. This anchor
+/// pins the D-diagonal arithmetic directly.
+#[test]
+fn ball_armature_enters_the_d_diagonal_on_every_axis() {
+    let i_com = Mat3::diag(0.5, 1.3, 0.9);
+    let armature = 0.7f32;
+
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::Ball {
+            damping: 0.0,
+            armature,
+        },
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY), // pivot at child COM: r_jc = 0
+        1.4,                          // child mass; irrelevant with r_jc = 0
+        i_com,
+    ));
+
+    let g = Vec3::ZERO;
+    let ext = vec![(Vec3::ZERO, Vec3::ZERO); 2];
+    let voff = tree.v_offset[1];
+
+    for k in 0..3 {
+        // Reset q, qdot, qfrc; apply a unit torque on axis k only.
+        tree.set_ball_orientation(1, Quat::IDENTITY);
+        tree.set_ball_omega(1, Vec3::ZERO);
+        for slot in tree.qfrc_applied.iter_mut() {
+            *slot = 0.0;
+        }
+        tree.qfrc_applied[voff + k] = 1.0;
+
+        let poses = forward_kinematics(&tree);
+        let qddot = aba(&tree, &poses, g, &ext);
+
+        let expected = 1.0 / (i_com.get(k, k) + armature);
+        let got = qddot[voff + k];
+        assert!(
+            (got - expected).abs() < 1e-6,
+            "ball armature D-diagonal broken on axis {k}: got {got}, expected {expected} \
+             (I_com[{k},{k}] = {}, armature = {armature})",
+            i_com.get(k, k)
+        );
+        // Off-axis accelerations must be zero: with r_jc = 0, ω = 0, no
+        // gravity, and the torque isolated on axis k, cross-axis coupling
+        // vanishes.
+        for j in 0..3 {
+            if j == k {
+                continue;
+            }
+            let off = qddot[voff + j];
+            assert!(
+                off.abs() < 1e-6,
+                "ball unit-τ on axis {k} leaked into axis {j}: qddot = {off}"
+            );
+        }
+    }
 }

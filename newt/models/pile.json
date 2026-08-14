@@ -1,0 +1,110 @@
+{
+  "version": "1",
+  "gravity": [0.0, 0.0, -9.81],
+  "timestep": 0.005,
+
+  "meshes": [
+    {
+      "name": "tetra",
+      "vertices": [
+        [0.0, 0.0, 0.0],
+        [0.5, 0.0, 0.0],
+        [0.0, 0.5, 0.0],
+        [0.0, 0.0, 0.5]
+      ],
+      "faces": [[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]]
+    }
+  ],
+
+  "bodies": [
+    {
+      "name": "cylinder",
+      "mass": 1.0,
+      "inertia": {"kind": "solid", "shape": {"kind": "cylinder", "radius": 0.30, "half_height": 0.35}},
+      "pose": {
+        "position": [-0.9, -0.9, 1.4],
+        "orientation_axis_angle": {"axis": [1.0, 0.0, 0.0], "angle": 0.15}
+      }
+    },
+    {
+      "name": "ellipsoid",
+      "mass": 1.0,
+      "inertia": {"kind": "solid", "shape": {"kind": "ellipsoid", "semi_axes": [0.35, 0.25, 0.40]}},
+      "pose": {
+        "position": [0.9, -0.9, 1.5],
+        "orientation_axis_angle": {"axis": [0.0, 1.0, 0.0], "angle": 0.35}
+      }
+    },
+    {
+      "name": "mesh_tetra",
+      "mass": 1.0,
+      "inertia": {"kind": "diag", "values": [0.02, 0.02, 0.02]},
+      "pose": {"position": [-0.9, 0.9, 1.5]}
+    },
+    {
+      "name": "box_lower",
+      "mass": 1.0,
+      "inertia": {"kind": "solid", "shape": {"kind": "box", "half_extents": [0.25, 0.25, 0.25]}},
+      "pose": {
+        "position": [0.9, 0.9, 0.3],
+        "orientation_axis_angle": {"axis": [0.0, 0.0, 1.0], "angle": 0.7853981633974483}
+      }
+    },
+    {
+      "name": "box_upper",
+      "mass": 1.0,
+      "inertia": {"kind": "solid", "shape": {"kind": "box", "half_extents": [0.25, 0.25, 0.25]}},
+      "pose": {"position": [0.92, 0.91, 1.0]}
+    }
+  ],
+
+  "geoms": [
+    {
+      "name": "ground",
+      "shape": {"kind": "plane"},
+      "attach": {"kind": "static"},
+      "friction": 0.7
+    },
+    {
+      "name": "cyl_geom",
+      "shape": {"kind": "cylinder", "radius": 0.30, "half_height": 0.35},
+      "attach": {"kind": "body", "body": "cylinder"},
+      "friction": 0.7
+    },
+    {
+      "name": "ell_geom",
+      "shape": {"kind": "ellipsoid", "semi_axes": [0.35, 0.25, 0.40]},
+      "attach": {"kind": "body", "body": "ellipsoid"},
+      "friction": 0.7
+    },
+    {
+      "name": "mesh_geom",
+      "shape": {"kind": "mesh", "mesh": "tetra"},
+      "attach": {"kind": "body", "body": "mesh_tetra"},
+      "friction": 0.7
+    },
+    {
+      "name": "box_lo_geom",
+      "shape": {"kind": "box", "half_extents": [0.25, 0.25, 0.25]},
+      "attach": {"kind": "body", "body": "box_lower"},
+      "friction": 0.7
+    },
+    {
+      "name": "box_up_geom",
+      "shape": {"kind": "box", "half_extents": [0.25, 0.25, 0.25]},
+      "attach": {"kind": "body", "body": "box_upper"},
+      "friction": 0.7
+    }
+  ],
+
+  "contact_pairs": {
+    "explicit": [
+      {"a": "ground", "b": "cyl_geom"},
+      {"a": "ground", "b": "ell_geom"},
+      {"a": "ground", "b": "mesh_geom"},
+      {"a": "ground", "b": "box_lo_geom"},
+      {"a": "ground", "b": "box_up_geom"},
+      {"a": "box_lo_geom", "b": "box_up_geom"}
+    ]
+  }
+}

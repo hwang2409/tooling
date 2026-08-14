@@ -1,4 +1,5 @@
-//! Collision geometry: plane, sphere, box, capsule.
+//! Collision geometry: plane, sphere, box, capsule, cylinder, ellipsoid,
+//! convex mesh.
 //!
 //! # Attachment
 //!
@@ -7,6 +8,28 @@
 //! (an infinite half-space is naturally static; dynamic planes are not
 //! meaningful). All other shapes MUST attach to a body — the panic in
 //! [`Geom::sphere`] et al. is a construction-time check.
+//!
+//! # v1 tier 2 additions (cylinder, ellipsoid, mesh)
+//!
+//! [`GeomShape::Cylinder`] and [`GeomShape::Ellipsoid`] are new solid convex
+//! primitives. [`GeomShape::Mesh`] refers by index into a
+//! [`crate::world::World::meshes`] table — this keeps `GeomShape` `Copy`
+//! (vertex vectors live once in the world, not per-geom). Each mesh is a
+//! [`ConvexMesh`] with vertices AND triangular faces; convexity of the hull
+//! is TRUSTED (not validated), matching the MuJoCo `mesh` asset contract.
+//! Solid inertia helpers are provided for cylinder and ellipsoid; mesh
+//! bodies must specify inertia explicitly (the trust model extends to
+//! inertia — no volume integration).
+//!
+//! # Margin / gap (MuJoCo semantics)
+//!
+//! Per-geom [`Geom::margin`] activates contact detection *before* the two
+//! geoms touch: a contact is emitted when the raw signed distance is less
+//! than `pair_margin = max(a.margin, b.margin)`, and the reported
+//! `penetration` is the shifted quantity `pair_margin - dist`. [`Geom::gap`]
+//! is a force-free zone: `pair_gap = max(a.gap, b.gap)` and no force is
+//! applied while `penetration <= pair_gap`. Both default to `0.0`, which
+//! collapses to the tier-2 "detect and force when overlapping" contract.
 //!
 //! # Local pose
 //!
@@ -130,6 +153,94 @@ pub enum GeomShape {
         radius: f32,
         half_height: f32,
     },
+    /// Solid cylinder aligned with local Z (MuJoCo convention). `half_height`
+    /// is half the axial length; the two flat circular caps are at
+    /// `local_z = ±half_height`.
+    Cylinder {
+        radius: f32,
+        half_height: f32,
+    },
+    /// Solid ellipsoid with semi-axes along local (X, Y, Z).
+    Ellipsoid {
+        semi_axes: Vec3,
+    },
+    /// Convex mesh, referenced by index into [`crate::world::World::meshes`].
+    /// The mesh's vertex/face data is TRUSTED to be a convex polyhedron —
+    /// the engine does not validate convexity (matches MuJoCo's asset
+    /// contract).
+    Mesh {
+        mesh_id: usize,
+    },
+}
+
+/// Convex triangular mesh, stored once in [`crate::world::World::meshes`]
+/// and referenced from geoms by index. Vertices are in the mesh's own local
+/// frame; the geom's `local_offset` + `local_orientation` place that frame
+/// relative to the geom's parent.
+///
+/// # Trust model
+///
+/// The vertex-and-face list is trusted to describe a convex polyhedron:
+///
+/// - vertices form the extreme points (any non-extreme vertex just wastes a
+///   support lookup — no correctness issue),
+/// - faces are outward-oriented triangles (CCW when viewed from OUTSIDE the
+///   solid),
+/// - the polyhedron is convex (no re-entrant edges).
+///
+/// The engine does not check any of the above. [`ConvexMesh::validate`]
+/// performs the cheap structural checks the [`crate::model`] loader runs:
+/// non-empty, at least four vertices, at least four faces, every face index
+/// in range, every vertex finite. Convexity itself is expensive to check
+/// (O(V·F)) and is punted to the mesh author — mirroring MuJoCo, which also
+/// trusts `mesh` assets to be convex.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConvexMesh {
+    /// Mesh-local vertex positions.
+    pub vertices: Vec<Vec3>,
+    /// Triangular face list — each entry is three indices into `vertices`,
+    /// in CCW order when viewed from outside the polyhedron. The engine only
+    /// consumes triangle CENTROIDS + NORMALS during narrow-phase (never the
+    /// winding for topological queries), so a mis-wound face degrades
+    /// contact accuracy on that face but does not corrupt other faces.
+    pub faces: Vec<[u32; 3]>,
+}
+
+impl ConvexMesh {
+    /// Cheap structural checks. `Err(msg)` on empty vertices, fewer than 4
+    /// vertices (a mesh must at least span a tetrahedron to enclose any
+    /// volume), fewer than 4 faces, out-of-range face index, or a non-finite
+    /// vertex coordinate.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.vertices.len() < 4 {
+            return Err(format!(
+                "convex mesh needs ≥ 4 vertices to enclose volume, got {}",
+                self.vertices.len()
+            ));
+        }
+        if self.faces.len() < 4 {
+            return Err(format!(
+                "convex mesh needs ≥ 4 triangular faces to close a volume, got {}",
+                self.faces.len()
+            ));
+        }
+        for (i, v) in self.vertices.iter().enumerate() {
+            if !(v.x.is_finite() && v.y.is_finite() && v.z.is_finite()) {
+                return Err(format!("mesh vertex {i} has non-finite coordinate: {v:?}"));
+            }
+        }
+        let n = self.vertices.len() as u32;
+        for (i, face) in self.faces.iter().enumerate() {
+            for (k, &idx) in face.iter().enumerate() {
+                if idx >= n {
+                    return Err(format!(
+                        "mesh face {i} vertex {k} = {idx} out of range (vertex count {n})"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A geom attached to a body, a tree link, or the static world.
@@ -154,6 +265,17 @@ pub struct Geom {
     pub friction: f32,
     /// Contact stiffness parameters. See [`SolRef`] and [`solref_to_kc`].
     pub solref: SolRef,
+    /// MuJoCo-style contact-activation margin (m). A pair fires a contact
+    /// whenever the raw signed distance is below `pair_margin =
+    /// max(a.margin, b.margin)`; the reported penetration is the shifted
+    /// `pair_margin - dist`. Zero (default) collapses to "detect on
+    /// overlap".
+    pub margin: f32,
+    /// MuJoCo-style force-free zone (m). No normal or friction force is
+    /// applied while the (shifted) penetration is `≤ pair_gap =
+    /// max(a.gap, b.gap)`. Zero (default) means every detected contact
+    /// applies force.
+    pub gap: f32,
 }
 
 /// Where a geom is attached. Convenience view over the `body`/`link` fields
@@ -198,6 +320,8 @@ impl Geom {
             local_orientation: orientation,
             friction,
             solref: SolRef::DEFAULT,
+            margin: 0.0,
+            gap: 0.0,
         }
     }
 
@@ -212,6 +336,8 @@ impl Geom {
             local_orientation: Quat::IDENTITY,
             friction,
             solref: SolRef::DEFAULT,
+            margin: 0.0,
+            gap: 0.0,
         }
     }
 
@@ -232,6 +358,8 @@ impl Geom {
             local_orientation: Quat::IDENTITY,
             friction,
             solref: SolRef::DEFAULT,
+            margin: 0.0,
+            gap: 0.0,
         }
     }
 
@@ -252,6 +380,8 @@ impl Geom {
             local_orientation,
             friction,
             solref: SolRef::DEFAULT,
+            margin: 0.0,
+            gap: 0.0,
         }
     }
 
@@ -272,6 +402,8 @@ impl Geom {
             local_orientation,
             friction,
             solref: SolRef::DEFAULT,
+            margin: 0.0,
+            gap: 0.0,
         }
     }
 
@@ -295,6 +427,8 @@ impl Geom {
             local_orientation,
             friction,
             solref: SolRef::DEFAULT,
+            margin: 0.0,
+            gap: 0.0,
         }
     }
 
@@ -320,12 +454,94 @@ impl Geom {
             local_orientation,
             friction,
             solref: SolRef::DEFAULT,
+            margin: 0.0,
+            gap: 0.0,
+        }
+    }
+
+    /// Cylinder attached to a body. Axis along local Z (MuJoCo convention).
+    pub fn cylinder(
+        body: usize,
+        radius: f32,
+        half_height: f32,
+        local_offset: Vec3,
+        local_orientation: Quat,
+        friction: f32,
+    ) -> Self {
+        Self {
+            shape: GeomShape::Cylinder {
+                radius,
+                half_height,
+            },
+            body: Some(body),
+            link: None,
+            local_offset,
+            local_orientation,
+            friction,
+            solref: SolRef::DEFAULT,
+            margin: 0.0,
+            gap: 0.0,
+        }
+    }
+
+    /// Ellipsoid attached to a body. Semi-axes along local (X, Y, Z).
+    pub fn ellipsoid(
+        body: usize,
+        semi_axes: Vec3,
+        local_offset: Vec3,
+        local_orientation: Quat,
+        friction: f32,
+    ) -> Self {
+        Self {
+            shape: GeomShape::Ellipsoid { semi_axes },
+            body: Some(body),
+            link: None,
+            local_offset,
+            local_orientation,
+            friction,
+            solref: SolRef::DEFAULT,
+            margin: 0.0,
+            gap: 0.0,
+        }
+    }
+
+    /// Convex-mesh geom referring to `world.meshes[mesh_id]`. Attach to a
+    /// body; the mesh vertices are consumed in the geom's local frame.
+    pub fn mesh(
+        body: usize,
+        mesh_id: usize,
+        local_offset: Vec3,
+        local_orientation: Quat,
+        friction: f32,
+    ) -> Self {
+        Self {
+            shape: GeomShape::Mesh { mesh_id },
+            body: Some(body),
+            link: None,
+            local_offset,
+            local_orientation,
+            friction,
+            solref: SolRef::DEFAULT,
+            margin: 0.0,
+            gap: 0.0,
         }
     }
 
     /// Override the contact stiffness parameters (builder-style).
     pub fn with_solref(mut self, solref: SolRef) -> Self {
         self.solref = solref;
+        self
+    }
+
+    /// Set the contact activation margin (m). See the module docs.
+    pub fn with_margin(mut self, margin: f32) -> Self {
+        self.margin = margin;
+        self
+    }
+
+    /// Set the contact force-free zone width (m). See the module docs.
+    pub fn with_gap(mut self, gap: f32) -> Self {
+        self.gap = gap;
         self
     }
 }
@@ -453,6 +669,41 @@ pub fn solid_capsule_inertia(mass: f32, radius: f32, half_height: f32) -> Mat3 {
     Mat3::diag(i_xx, i_xx, i_zz)
 }
 
+/// Uniform-density solid cylinder, axis along local Z. `half_height` is half
+/// the axial length. Standard formulas:
+///
+/// - `I_zz = ½ m r²` (about the axis)
+/// - `I_xx = I_yy = (1/12) m (3 r² + 4 h²)` where `h = half_height`.
+///
+/// At `half_height = 0` this collapses to a razor-thin disk with
+/// `I_xx = I_yy = m r² / 4` and `I_zz = m r² / 2` — the [`solid_cylinder_inertia_disk_limit`]
+/// test pins that limit.
+pub fn solid_cylinder_inertia(mass: f32, radius: f32, half_height: f32) -> Mat3 {
+    let r2 = radius * radius;
+    let h2 = half_height * half_height;
+    let i_zz = 0.5 * mass * r2;
+    let i_xx = (1.0 / 12.0) * mass * (3.0 * r2 + 4.0 * h2);
+    Mat3::diag(i_xx, i_xx, i_zz)
+}
+
+/// Uniform-density solid ellipsoid with semi-axes `(a, b, c)` along body-frame
+/// axes. Principal moments about the COM:
+///
+/// - `I_xx = (1/5) m (b² + c²)` and cyclic.
+///
+/// At `a = b = c = r` this collapses to the solid-sphere `(2/5) m r²`
+/// isotropic tensor — the [`solid_ellipsoid_inertia_reduces_to_sphere`] test
+/// pins that limit.
+pub fn solid_ellipsoid_inertia(mass: f32, semi_axes: Vec3) -> Mat3 {
+    let a2 = semi_axes.x * semi_axes.x;
+    let b2 = semi_axes.y * semi_axes.y;
+    let c2 = semi_axes.z * semi_axes.z;
+    let ixx = (1.0 / 5.0) * mass * (b2 + c2);
+    let iyy = (1.0 / 5.0) * mass * (a2 + c2);
+    let izz = (1.0 / 5.0) * mass * (a2 + b2);
+    Mat3::diag(ixx, iyy, izz)
+}
+
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
@@ -546,5 +797,88 @@ mod tests {
         let sphere_i = (2.0 / 5.0) * 1.0 * 0.25;
         assert!(approx(i.get(0, 0), sphere_i, 1e-5));
         assert!(approx(i.get(2, 2), sphere_i, 1e-5));
+    }
+
+    #[test]
+    fn solid_cylinder_inertia_matches_hand_derived() {
+        // m = 2, r = 1, h = 0.5 (full length = 1).
+        // I_zz = ½ * 2 * 1² = 1
+        // I_xx = I_yy = (1/12) * 2 * (3 + 4 * 0.25) = (2/12) * 4 = 8/12 ≈ 0.66667
+        let i = solid_cylinder_inertia(2.0, 1.0, 0.5);
+        assert!(approx(i.get(2, 2), 1.0, 1e-6));
+        assert!(approx(i.get(0, 0), 8.0 / 12.0, 1e-6));
+        assert!(approx(i.get(1, 1), 8.0 / 12.0, 1e-6));
+    }
+
+    #[test]
+    fn solid_cylinder_inertia_disk_limit() {
+        // half_height = 0 → razor-thin disk: I_xx = I_yy = m r² / 4,
+        // I_zz = m r² / 2.
+        let i = solid_cylinder_inertia(3.0, 2.0, 0.0);
+        assert!(approx(i.get(0, 0), 3.0 * 4.0 * 0.25, 1e-6));
+        assert!(approx(i.get(2, 2), 3.0 * 4.0 * 0.5, 1e-6));
+    }
+
+    #[test]
+    fn solid_ellipsoid_inertia_matches_hand_derived() {
+        // m = 5, semi-axes (2, 3, 1). I_xx = (1/5) m (b² + c²) = (5/5)(9+1) = 10.
+        let i = solid_ellipsoid_inertia(5.0, Vec3::new(2.0, 3.0, 1.0));
+        assert!(approx(i.get(0, 0), 10.0, 1e-6));
+        // I_yy = (1/5) m (a² + c²) = (5/5)(4+1) = 5.
+        assert!(approx(i.get(1, 1), 5.0, 1e-6));
+        // I_zz = (1/5) m (a² + b²) = (5/5)(4+9) = 13.
+        assert!(approx(i.get(2, 2), 13.0, 1e-6));
+    }
+
+    #[test]
+    fn solid_ellipsoid_inertia_reduces_to_sphere() {
+        let r = 0.7f32;
+        let m = 1.4f32;
+        let ellipsoid = solid_ellipsoid_inertia(m, Vec3::splat(r));
+        let sphere = solid_sphere_inertia(m, r);
+        for c in 0..3 {
+            for r_idx in 0..3 {
+                assert!(
+                    approx(ellipsoid.get(r_idx, c), sphere.get(r_idx, c), 1e-6),
+                    "ellipsoid/sphere mismatch at ({r_idx},{c})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn convex_mesh_validate_rejects_short_vertex_list() {
+        let m = ConvexMesh {
+            vertices: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            faces: vec![[0, 1, 2]; 4],
+        };
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn convex_mesh_validate_rejects_out_of_range_face_index() {
+        let m = ConvexMesh {
+            vertices: vec![Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::Z],
+            faces: vec![[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 5]],
+        };
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn convex_mesh_validate_rejects_non_finite_vertex() {
+        let m = ConvexMesh {
+            vertices: vec![Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::new(f32::NAN, 0.0, 0.0)],
+            faces: vec![[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]],
+        };
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn convex_mesh_validate_accepts_tetrahedron() {
+        let m = ConvexMesh {
+            vertices: vec![Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::Z],
+            faces: vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
+        };
+        assert!(m.validate().is_ok());
     }
 }

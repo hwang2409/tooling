@@ -149,7 +149,7 @@ fn arm_json_matches_programmatic_construction_exactly() {
 
 #[test]
 fn packaged_models_all_load() {
-    for name in ["arm.json", "pendulum.json", "stack.json"] {
+    for name in ["arm.json", "pendulum.json", "stack.json", "pile.json"] {
         let path = model_path(name);
         let scene =
             load_from_path(&path).unwrap_or_else(|e| panic!("{}: load error {e}", path.display()));
@@ -478,4 +478,366 @@ fn geom_import_kept_alive() {
         let _ = Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5);
         let _: Option<&Scene> = None;
     };
+}
+
+// ---------------------------------------------------------------------------
+// 6. round-trip: pile.json vs programmatic (mirrors examples/pile.rs)
+// ---------------------------------------------------------------------------
+
+/// Programmatic equivalent of `models/pile.json`. Same masses, positions,
+/// orientations, inertias, geoms, and pair list as the demo scene in
+/// `examples/pile.rs`. Kept side-by-side so a divergence between loader and
+/// programmatic paths is caught cross-body by the strict byte-identical
+/// assertion below.
+fn build_pile_programmatic() -> World {
+    use newt::geom::ConvexMesh;
+    use newt::math::FRAC_PI_4;
+    let mut world = World::new();
+    world.dt = 0.005;
+    world.gravity = Vec3::new(0.0, 0.0, -9.81);
+    world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.7));
+
+    // Mesh (must match pile.json's tetra: unit tetra scaled by 0.5).
+    let mesh_id = world.add_mesh(ConvexMesh {
+        vertices: vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.5, 0.0, 0.0),
+            Vec3::new(0.0, 0.5, 0.0),
+            Vec3::new(0.0, 0.0, 0.5),
+        ],
+        faces: vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
+    });
+
+    let cyl_r = 0.30f32;
+    let cyl_h = 0.35f32;
+    let ell_ax = Vec3::new(0.35, 0.25, 0.40);
+    let box_h = Vec3::splat(0.25);
+    let m = 1.0f32;
+
+    // Cylinder
+    let cyl = Body::new(
+        m,
+        newt::geom::solid_cylinder_inertia(m, cyl_r, cyl_h),
+        Vec3::new(-0.9, -0.9, 1.4),
+        Quat::from_axis_angle(Vec3::X, 0.15),
+    );
+    let ic = world.add_body(cyl);
+    world.add_geom(Geom::cylinder(
+        ic,
+        cyl_r,
+        cyl_h,
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        0.7,
+    ));
+
+    // Ellipsoid
+    let ell = Body::new(
+        m,
+        newt::geom::solid_ellipsoid_inertia(m, ell_ax),
+        Vec3::new(0.9, -0.9, 1.5),
+        Quat::from_axis_angle(Vec3::Y, 0.35),
+    );
+    let ie = world.add_body(ell);
+    world.add_geom(Geom::ellipsoid(ie, ell_ax, Vec3::ZERO, Quat::IDENTITY, 0.7));
+
+    // Mesh tetra
+    let tet = Body::new(
+        m,
+        Mat3::diag(0.02, 0.02, 0.02),
+        Vec3::new(-0.9, 0.9, 1.5),
+        Quat::IDENTITY,
+    );
+    let im = world.add_body(tet);
+    world.add_geom(Geom::mesh(im, mesh_id, Vec3::ZERO, Quat::IDENTITY, 0.7));
+
+    // Boxes
+    let lower = Body::new(
+        m,
+        newt::geom::solid_box_inertia(m, box_h),
+        Vec3::new(0.9, 0.9, 0.3),
+        Quat::from_axis_angle(Vec3::Z, FRAC_PI_4),
+    );
+    let ibl = world.add_body(lower);
+    world.add_geom(Geom::r#box(ibl, box_h, Vec3::ZERO, Quat::IDENTITY, 0.7));
+    let upper = Body::new(
+        m,
+        newt::geom::solid_box_inertia(m, box_h),
+        Vec3::new(0.92, 0.91, 1.0),
+        Quat::IDENTITY,
+    );
+    let ibu = world.add_body(upper);
+    world.add_geom(Geom::r#box(ibu, box_h, Vec3::ZERO, Quat::IDENTITY, 0.7));
+
+    // Same restricted pair list as pile.json / examples/pile.rs.
+    world.pair_list = Some(vec![(0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (4, 5)]);
+    world
+}
+
+#[test]
+fn pile_json_matches_programmatic_construction_exactly() {
+    let scene = load_from_path(model_path("pile.json")).expect("pile.json should load");
+    let mut loaded = scene.world;
+    let mut prog = build_pile_programmatic();
+
+    assert_eq!(loaded.bodies.len(), prog.bodies.len());
+    for (i, (a, b)) in loaded.bodies.iter().zip(prog.bodies.iter()).enumerate() {
+        assert_eq!(a.mass, b.mass, "body {i} mass");
+        assert_eq!(a.inertia_body, b.inertia_body, "body {i} inertia");
+        assert_eq!(a.position, b.position, "body {i} position");
+        assert_eq!(a.orientation, b.orientation, "body {i} orientation");
+        assert_eq!(a.linear_velocity, b.linear_velocity, "body {i} v_lin");
+    }
+    assert_eq!(loaded.geoms.len(), prog.geoms.len());
+    for (i, (a, b)) in loaded.geoms.iter().zip(prog.geoms.iter()).enumerate() {
+        assert_eq!(a.shape, b.shape, "geom {i} shape");
+        assert_eq!(a.attachment(), b.attachment(), "geom {i} attachment");
+        assert_eq!(a.friction, b.friction, "geom {i} friction");
+    }
+    assert_eq!(loaded.meshes.len(), prog.meshes.len());
+    for (i, (a, b)) in loaded.meshes.iter().zip(prog.meshes.iter()).enumerate() {
+        assert_eq!(a.vertices, b.vertices, "mesh {i} vertices");
+        assert_eq!(a.faces, b.faces, "mesh {i} faces");
+    }
+    assert_eq!(loaded.pair_list, prog.pair_list, "pair_list");
+
+    // Step both worlds 200 steps and require byte-identical body state each
+    // iteration. The v1-tier-2 primitives (cylinder-plane, ellipsoid-plane,
+    // mesh-plane, sphere-none-here, box-box) all participate; a loader that
+    // dropped one — or reordered pair enumeration — would blow this within
+    // a few steps.
+    for step in 0..200 {
+        loaded.step();
+        prog.step();
+        for (i, (a, b)) in loaded.bodies.iter().zip(prog.bodies.iter()).enumerate() {
+            assert_eq!(
+                a.position, b.position,
+                "body {i} position mismatch at step {step}"
+            );
+            assert_eq!(
+                a.orientation, b.orientation,
+                "body {i} orientation mismatch at step {step}"
+            );
+        }
+    }
+    // Sanity: upper box stayed above lower (yawed edge-edge stacking still
+    // holds when driven from the loader).
+    let lower_z = loaded.bodies[3].position.z;
+    let upper_z = loaded.bodies[4].position.z;
+    assert!(
+        upper_z > lower_z + 0.3,
+        "loaded pile yawed stack collapsed: lower {lower_z}, upper {upper_z}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. loader coverage for v1-tier-2 geoms and margin/gap
+// ---------------------------------------------------------------------------
+
+#[test]
+fn loader_parses_cylinder_and_ellipsoid_geoms_round_trip() {
+    // Include a static ground plane so the auto pair list only enumerates
+    // supported cylinder-plane / ellipsoid-plane combinations — the pure
+    // cylinder-vs-ellipsoid pair is deferred and would trip the loader's
+    // engine-level enforcement.
+    let json = r#"{
+        "version": "1",
+        "bodies": [
+            {"name":"a","mass":1,"inertia":{"kind":"diag","values":[1,1,1]}},
+            {"name":"b","mass":2,"inertia":{"kind":"solid","shape":{"kind":"cylinder","radius":0.5,"half_height":0.4}}},
+            {"name":"c","mass":3,"inertia":{"kind":"solid","shape":{"kind":"ellipsoid","semi_axes":[0.3,0.2,0.4]}}}
+        ],
+        "geoms": [
+            {"name":"ground","shape":{"kind":"plane"},"attach":{"kind":"static"}},
+            {"name":"g1","shape":{"kind":"cylinder","radius":0.5,"half_height":0.4},"attach":{"kind":"body","body":"a"}},
+            {"name":"g2","shape":{"kind":"ellipsoid","semi_axes":[0.3,0.2,0.4]},"attach":{"kind":"body","body":"b"}}
+        ],
+        "contact_pairs": {"explicit":[{"a":"ground","b":"g1"},{"a":"ground","b":"g2"}]}
+    }"#;
+    let scene = newt::model::load_str(json).expect("cylinder+ellipsoid should parse");
+    assert_eq!(scene.world.bodies.len(), 3);
+    // geoms[0] = ground plane; geoms[1] = cylinder; geoms[2] = ellipsoid.
+    assert!(matches!(
+        scene.world.geoms[1].shape,
+        newt::geom::GeomShape::Cylinder {
+            radius: 0.5,
+            half_height: 0.4,
+        }
+    ));
+    assert!(matches!(
+        scene.world.geoms[2].shape,
+        newt::geom::GeomShape::Ellipsoid { .. }
+    ));
+    // Inertia round-trip: body b's solid-cylinder inertia matches the helper.
+    assert_eq!(
+        scene.world.bodies[1].inertia_body,
+        newt::geom::solid_cylinder_inertia(2.0, 0.5, 0.4)
+    );
+    assert_eq!(
+        scene.world.bodies[2].inertia_body,
+        newt::geom::solid_ellipsoid_inertia(3.0, Vec3::new(0.3, 0.2, 0.4))
+    );
+}
+
+#[test]
+fn loader_parses_mesh_geom_and_asset_round_trip() {
+    let json = r#"{
+        "version": "1",
+        "meshes": [
+            {"name":"tetra","vertices":[[0,0,0],[1,0,0],[0,1,0],[0,0,1]],"faces":[[0,2,1],[0,1,3],[0,3,2],[1,2,3]]}
+        ],
+        "bodies": [
+            {"name":"a","mass":1,"inertia":{"kind":"diag","values":[0.02,0.02,0.02]}}
+        ],
+        "geoms": [
+            {"name":"g","shape":{"kind":"mesh","mesh":"tetra"},"attach":{"kind":"body","body":"a"}}
+        ]
+    }"#;
+    let scene = newt::model::load_str(json).expect("mesh asset + geom should parse");
+    assert_eq!(scene.world.meshes.len(), 1);
+    assert_eq!(scene.world.meshes[0].vertices.len(), 4);
+    assert_eq!(scene.world.meshes[0].faces.len(), 4);
+    assert!(matches!(
+        scene.world.geoms[0].shape,
+        newt::geom::GeomShape::Mesh { mesh_id: 0 }
+    ));
+}
+
+#[test]
+fn loader_rejects_mesh_with_fewer_than_four_vertices() {
+    let json = r#"{
+        "version": "1",
+        "meshes": [
+            {"name":"bad","vertices":[[0,0,0],[1,0,0],[0,1,0]],"faces":[[0,1,2],[0,1,2],[0,1,2],[0,1,2]]}
+        ]
+    }"#;
+    let err = newt::model::load_str(json).expect_err("mesh with < 4 vertices should fail");
+    assert!(err.to_string().contains("4 vertices"), "err: {err}");
+}
+
+#[test]
+fn loader_rejects_mesh_with_fewer_than_four_faces() {
+    let json = r#"{
+        "version": "1",
+        "meshes": [
+            {"name":"bad","vertices":[[0,0,0],[1,0,0],[0,1,0],[0,0,1]],"faces":[[0,1,2]]}
+        ]
+    }"#;
+    let err = newt::model::load_str(json).expect_err("mesh with < 4 faces should fail");
+    assert!(err.to_string().contains("4 triangular faces"), "err: {err}");
+}
+
+#[test]
+fn loader_rejects_mesh_face_index_out_of_range() {
+    let json = r#"{
+        "version": "1",
+        "meshes": [
+            {"name":"bad","vertices":[[0,0,0],[1,0,0],[0,1,0],[0,0,1]],"faces":[[0,1,2],[0,1,3],[0,3,2],[1,2,7]]}
+        ]
+    }"#;
+    let err = newt::model::load_str(json).expect_err("mesh face index out of range should fail");
+    assert!(err.to_string().contains("out of range"), "err: {err}");
+}
+
+#[test]
+fn loader_rejects_non_finite_mesh_vertex() {
+    let json = r#"{
+        "version": "1",
+        "meshes": [
+            {"name":"bad","vertices":[[0,0,0],[1,0,0],[0,1,0],[0,0,null]],"faces":[[0,1,2],[0,1,3],[0,3,2],[1,2,3]]}
+        ]
+    }"#;
+    let _ = newt::model::load_str(json).expect_err("null vertex coord should fail");
+    // (The exact error path depends on the underlying JSON scalar parser
+    // rejecting `null` as a number; either message is acceptable.)
+}
+
+#[test]
+fn loader_rejects_cylinder_with_negative_radius() {
+    let json = r#"{
+        "version": "1",
+        "bodies": [
+            {"name":"a","mass":1,"inertia":{"kind":"diag","values":[1,1,1]}}
+        ],
+        "geoms": [
+            {"name":"g","shape":{"kind":"cylinder","radius":-0.5,"half_height":0.4},"attach":{"kind":"body","body":"a"}}
+        ]
+    }"#;
+    let err = newt::model::load_str(json).expect_err("negative cylinder radius should fail");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("cylinder") && msg.contains("radius"),
+        "err: {err}"
+    );
+}
+
+#[test]
+fn loader_rejects_ellipsoid_with_zero_semi_axis() {
+    let json = r#"{
+        "version": "1",
+        "bodies": [
+            {"name":"a","mass":1,"inertia":{"kind":"diag","values":[1,1,1]}}
+        ],
+        "geoms": [
+            {"name":"g","shape":{"kind":"ellipsoid","semi_axes":[0.3,0.0,0.4]},"attach":{"kind":"body","body":"a"}}
+        ]
+    }"#;
+    let err = newt::model::load_str(json).expect_err("zero ellipsoid semi-axis should fail");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("ellipsoid") && msg.contains("axes"),
+        "err: {err}"
+    );
+}
+
+#[test]
+fn loader_parses_margin_and_gap_round_trip() {
+    let json = r#"{
+        "version": "1",
+        "bodies": [
+            {"name":"a","mass":1,"inertia":{"kind":"diag","values":[1,1,1]}}
+        ],
+        "geoms": [
+            {"name":"g","shape":{"kind":"sphere","radius":0.5},"attach":{"kind":"body","body":"a"},
+             "margin":0.02,"gap":0.005}
+        ]
+    }"#;
+    let scene = newt::model::load_str(json).expect("margin+gap should parse");
+    assert_eq!(scene.world.geoms[0].margin, 0.02);
+    assert_eq!(scene.world.geoms[0].gap, 0.005);
+}
+
+#[test]
+fn loader_rejects_negative_margin() {
+    let json = r#"{
+        "version": "1",
+        "bodies": [
+            {"name":"a","mass":1,"inertia":{"kind":"diag","values":[1,1,1]}}
+        ],
+        "geoms": [
+            {"name":"g","shape":{"kind":"sphere","radius":0.5},"attach":{"kind":"body","body":"a"},
+             "margin":-0.01}
+        ]
+    }"#;
+    let err = newt::model::load_str(json).expect_err("negative margin should fail");
+    let msg = err.to_string();
+    assert!(msg.contains("margin") && msg.contains("≥ 0"), "err: {err}");
+}
+
+#[test]
+fn loader_axis_angle_orientation_matches_from_axis_angle_exactly() {
+    // The `orientation_axis_angle` pose form is designed for byte-identity
+    // with a programmatic `Quat::from_axis_angle` call — same sin/cos
+    // polynomials on both sides. Round-trip against the equivalent
+    // programmatic construction.
+    let json = r#"{
+        "version": "1",
+        "bodies": [
+            {"name":"a","mass":1,"inertia":{"kind":"diag","values":[1,1,1]},
+             "pose":{"position":[0,0,0],"orientation_axis_angle":{"axis":[1,0,0],"angle":0.35}}}
+        ]
+    }"#;
+    let scene = newt::model::load_str(json).unwrap();
+    let expected = Quat::from_axis_angle(Vec3::X, 0.35);
+    assert_eq!(scene.world.bodies[0].orientation, expected);
 }

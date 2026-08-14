@@ -35,13 +35,16 @@
 //!   [`crate::math`] appear in the compute path.
 
 use crate::body::Body;
-use crate::contact::{Contact, narrow_phase};
-use crate::geom::{Geom, GeomAttach, GeomPose, combine_solref, geom_world_pose, solref_to_kc};
+use crate::contact::{Contact, is_pair_supported, narrow_phase};
+use crate::geom::{
+    ConvexMesh, Geom, GeomAttach, GeomPose, GeomShape, combine_solref, geom_world_pose,
+    solref_to_kc,
+};
 use crate::math::{Quat, Vec3};
 use crate::tree::{Tree, forward_kinematics as tree_forward_kinematics, rk4_step as tree_rk4_step};
 
 /// Simulation world.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct World {
     /// Fixed integration timestep. Default 5 ms (matches biped).
     pub dt: f32,
@@ -55,11 +58,51 @@ pub struct World {
     /// Geoms. Index-stable. A geom's attachment (body, tree link, or static)
     /// determines which state drives its world pose.
     pub geoms: Vec<Geom>,
+    /// Convex-mesh assets, indexed by [`GeomShape::Mesh::mesh_id`]. Empty
+    /// when no mesh geoms are in play.
+    pub meshes: Vec<ConvexMesh>,
     /// Optional explicit pair list `(geom_a, geom_b)` with `a < b`. When
     /// `None`, contact detection enumerates every unordered geom pair whose
     /// two geoms don't share a body/link and aren't both static; the
     /// resulting order is `(min, max)` lexicographic.
     pub pair_list: Option<Vec<(usize, usize)>>,
+    /// Cached pair-support fingerprint from the last successful validation.
+    /// Encoded as `(geoms.len() << 32) | pair_list_encoded` where
+    /// `pair_list_encoded` is `(pair_list.len() as u32) + 1` when
+    /// `pair_list` is `Some` else `0`. `Cell<u64>::default() == 0` marks
+    /// "never validated" (the empty world has zero geoms and no explicit
+    /// pair list, whose encoding is `(0 << 32) | 0 = 0` — same as the
+    /// default; harmless because that scene has no pairs to fail on).
+    /// This is a cheap change detector so [`Self::step`] is O(1) after
+    /// the first check; it is NOT authoritative — mutating a geom's
+    /// `shape` in place bypasses detection. Callers that do so should
+    /// call [`Self::invalidate_pair_check`].
+    #[doc(hidden)]
+    checked_pairs: std::cell::Cell<u64>,
+}
+
+// Manual PartialEq: the pair-check cache is not part of logical world state.
+// Two worlds with identical bodies/trees/geoms/meshes/pair_list are equal
+// regardless of whether either has run the pair check.
+impl PartialEq for World {
+    fn eq(&self, other: &Self) -> bool {
+        self.dt == other.dt
+            && self.gravity == other.gravity
+            && self.bodies == other.bodies
+            && self.trees == other.trees
+            && self.geoms == other.geoms
+            && self.meshes == other.meshes
+            && self.pair_list == other.pair_list
+    }
+}
+
+/// One entry returned by [`World::validate_supported_pairs`]: a geom index
+/// pair whose shape combination is not implemented by
+/// [`crate::contact::narrow_phase`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnsupportedPair {
+    pub geom_a: usize,
+    pub geom_b: usize,
 }
 
 impl Default for World {
@@ -76,8 +119,106 @@ impl World {
             bodies: Vec::new(),
             trees: Vec::new(),
             geoms: Vec::new(),
+            meshes: Vec::new(),
             pair_list: None,
+            checked_pairs: std::cell::Cell::new(0),
         }
+    }
+
+    /// Invalidate the pair-support cache, forcing the next [`Self::step`]
+    /// to re-run [`Self::validate_supported_pairs`]. Call this after any
+    /// in-place mutation of a geom's `shape` field (which the length-based
+    /// change detector cannot see).
+    pub fn invalidate_pair_check(&self) {
+        self.checked_pairs.set(0);
+    }
+
+    /// Encode the current geom/pair fingerprint. Zero encoding is reserved
+    /// for "never validated"; the empty scene has no pairs so a spurious
+    /// match against zero is harmless.
+    fn pair_fingerprint(&self) -> u64 {
+        let g = self.geoms.len() as u64;
+        let p = match &self.pair_list {
+            Some(v) => (v.len() as u64) + 1,
+            None => 0,
+        };
+        (g << 32) | p
+    }
+
+    /// Panic if any ACTIVE contact pair (auto-generated or explicit) targets
+    /// a shape combination not implemented by
+    /// [`crate::contact::narrow_phase`]. The message names the offending
+    /// geom indices and shape kinds so the caller can find the
+    /// misconfiguration. Cached: after the first successful check, this is
+    /// O(1) until the geom count or pair-list length changes (see
+    /// [`Self::invalidate_pair_check`] for the shape-mutation case).
+    ///
+    /// This is the "engine-level, loudest form" enforcement of the
+    /// documented no-silent-no-op rule (see `docs/contacts.md`) and the
+    /// direct response to the tier-2 `stack.json` incident.
+    fn assert_pairs_supported(&self) {
+        let sig = self.pair_fingerprint();
+        if self.checked_pairs.get() == sig {
+            return;
+        }
+        let unsupported = self.validate_supported_pairs();
+        if let Some(bad) = unsupported.first() {
+            let ga = &self.geoms[bad.geom_a];
+            let gb = &self.geoms[bad.geom_b];
+            panic!(
+                "contact pair {:?}(geom {}) x {:?}(geom {}) is not supported by \
+                 newt's narrow phase — see docs/contacts.md support matrix. Restrict \
+                 `world.pair_list` to a supported subset or defer this configuration.",
+                shape_name(ga.shape),
+                bad.geom_a,
+                shape_name(gb.shape),
+                bad.geom_b,
+            );
+        }
+        self.checked_pairs.set(sig);
+    }
+
+    /// Register a convex mesh asset and return its stable id. Use the id in
+    /// [`GeomShape::Mesh`]. Panics if the mesh fails
+    /// [`ConvexMesh::validate`] — the loader validates model-format meshes;
+    /// programmatic scenes get the same safety net.
+    pub fn add_mesh(&mut self, mesh: ConvexMesh) -> usize {
+        mesh.validate()
+            .expect("convex mesh failed structural validation");
+        let idx = self.meshes.len();
+        self.meshes.push(mesh);
+        idx
+    }
+
+    /// Return the list of geom-index pairs (drawn from `pair_list` if
+    /// present, else the auto-enumerated pairs) whose shape combination is
+    /// NOT implemented by [`crate::contact::narrow_phase`]. Callers should
+    /// treat a non-empty result as a configuration bug: the pair will
+    /// silently produce zero contacts at runtime and the two geoms will
+    /// pass through each other.
+    ///
+    /// This is the "reject or warn at pair-construction time" guarantee
+    /// documented in the v1-tier-2 spec — it prevents the tier-2 stack.json
+    /// incident (an unsupported box-sphere pair silently no-op'd, letting
+    /// bodies fall through the ground) from recurring for the new
+    /// cylinder/ellipsoid/mesh combinations.
+    pub fn validate_supported_pairs(&self) -> Vec<UnsupportedPair> {
+        let pairs = match &self.pair_list {
+            Some(p) => p.clone(),
+            None => self.auto_pairs(),
+        };
+        let mut out = Vec::new();
+        for (a, b) in pairs {
+            let sa = self.geoms[a].shape;
+            let sb = self.geoms[b].shape;
+            if !is_pair_supported(sa, sb) {
+                out.push(UnsupportedPair {
+                    geom_a: a,
+                    geom_b: b,
+                });
+            }
+        }
+        out
     }
 
     /// Adds a free body and returns its stable index.
@@ -144,6 +285,10 @@ impl World {
     /// geoms, this collapses to tier-1 gravity-only RK4 bit-for-bit, and
     /// the golden `tumbling_3_body.bin` still passes.
     pub fn step(&mut self) {
+        // Loud engine-level enforcement: the first step after any pair-list
+        // or geom-count change panics if any ACTIVE pair falls in the
+        // deferred bucket. Prevents a stack.json-style silent no-op.
+        self.assert_pairs_supported();
         let pairs = match &self.pair_list {
             Some(p) => p.clone(),
             None => self.auto_pairs(),
@@ -237,8 +382,9 @@ impl World {
             let mut tree = std::mem::take(&mut self.trees[ti]);
             let bodies = self.bodies.clone();
             let geoms = self.geoms.clone();
+            let meshes = self.meshes.clone();
             tree_rk4_step(&mut tree, gravity, dt, |t| {
-                tree_wrenches_from_contacts(t, ti, &bodies, &geoms, &tree_pairs)
+                tree_wrenches_from_contacts(t, ti, &bodies, &geoms, &meshes, &tree_pairs)
             });
             self.trees[ti] = tree;
         }
@@ -251,7 +397,7 @@ impl World {
             Some(p) => p.clone(),
             None => self.auto_pairs(),
         };
-        collect_contacts_full(&self.bodies, &self.trees, &self.geoms, &pairs)
+        collect_contacts_full(&self.bodies, &self.trees, &self.geoms, &self.meshes, &pairs)
     }
 
     /// Compute per-body external wrench arrays for a given body-state vector.
@@ -265,7 +411,7 @@ impl World {
         if self.geoms.is_empty() {
             return out;
         }
-        let contacts = collect_contacts(state, &self.geoms, pairs);
+        let contacts = collect_contacts(state, &self.geoms, &self.meshes, pairs);
         for c in &contacts {
             apply_contact_wrench(&mut out, state, &self.geoms, c);
         }
@@ -277,7 +423,12 @@ impl World {
 // contact assembly and force application
 // ---------------------------------------------------------------------------
 
-fn collect_contacts(state: &[Body], geoms: &[Geom], pairs: &[(usize, usize)]) -> Vec<Contact> {
+fn collect_contacts(
+    state: &[Body],
+    geoms: &[Geom],
+    meshes: &[ConvexMesh],
+    pairs: &[(usize, usize)],
+) -> Vec<Contact> {
     let mut out = Vec::new();
     // Pre-compute world poses for every geom in stable index order.
     let poses: Vec<GeomPose> = geoms
@@ -301,7 +452,7 @@ fn collect_contacts(state: &[Body], geoms: &[Geom], pairs: &[(usize, usize)]) ->
         if matches!(att_a, GeomAttach::Link(_, _)) || matches!(att_b, GeomAttach::Link(_, _)) {
             continue;
         }
-        let buf = narrow_phase(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b]);
+        let buf = narrow_phase(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes);
         for c in buf.as_slice() {
             out.push(*c);
         }
@@ -315,6 +466,7 @@ fn collect_contacts_full(
     bodies: &[Body],
     trees: &[Tree],
     geoms: &[Geom],
+    meshes: &[ConvexMesh],
     pairs: &[(usize, usize)],
 ) -> Vec<Contact> {
     let mut out = Vec::new();
@@ -335,7 +487,7 @@ fn collect_contacts_full(
         .collect();
 
     for &(a, b) in pairs {
-        let buf = narrow_phase(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b]);
+        let buf = narrow_phase(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes);
         for c in buf.as_slice() {
             out.push(*c);
         }
@@ -354,6 +506,7 @@ fn tree_wrenches_from_contacts(
     tree_idx: usize,
     bodies: &[Body],
     geoms: &[Geom],
+    meshes: &[ConvexMesh],
     pairs: &[(usize, usize)],
 ) -> Vec<(Vec3, Vec3)> {
     let n_links = tree.links.len();
@@ -388,7 +541,7 @@ fn tree_wrenches_from_contacts(
         let gb = &geoms[b];
         let pose_a = pose_of(ga);
         let pose_b = pose_of(gb);
-        let buf = narrow_phase(a, ga, &pose_a, b, gb, &pose_b);
+        let buf = narrow_phase(a, ga, &pose_a, b, gb, &pose_b, meshes);
         for c in buf.as_slice() {
             apply_tree_contact_wrench(&mut out, tree, tree_idx, &link_poses, bodies, geoms, c);
         }
@@ -463,7 +616,14 @@ fn apply_tree_contact_wrench(
     );
     let v_rel = v_a - v_b;
     let v_n = v_rel.dot(normal);
-    let f_n_raw = k * contact.penetration - c * v_n;
+    // Gap subtract: force only applies once the shifted penetration exceeds
+    // the gap; sensing-only contacts (pen ≤ gap) fire in the contact list
+    // but contribute zero wrench.
+    let pen_eff = contact.penetration - contact.gap;
+    if pen_eff <= 0.0 {
+        return;
+    }
+    let f_n_raw = k * pen_eff - c * v_n;
     let f_n = if f_n_raw > 0.0 { f_n_raw } else { 0.0 };
     if f_n <= 0.0 {
         return;
@@ -644,9 +804,15 @@ fn apply_contact_wrench(
     let v_rel = v_a - v_b;
 
     let v_n = v_rel.dot(normal);
+    // Gap subtract: force only applies once the shifted penetration exceeds
+    // the gap. See `Contact::gap` in `contact.rs`.
+    let pen_eff = contact.penetration - contact.gap;
+    if pen_eff <= 0.0 {
+        return;
+    }
     // Normal force magnitude: spring + damping opposing closing motion.
     // Clamped at zero — contacts cannot pull.
-    let f_n_raw = k * contact.penetration - c * v_n;
+    let f_n_raw = k * pen_eff - c * v_n;
     let f_n = if f_n_raw > 0.0 { f_n_raw } else { 0.0 };
     if f_n <= 0.0 {
         return;
@@ -703,6 +869,19 @@ pub fn tangent_basis(n: Vec3) -> (Vec3, Vec3) {
     let t1 = reference.cross(n).normalize();
     let t2 = n.cross(t1);
     (t1, t2)
+}
+
+/// Human-readable shape name for panic messages.
+fn shape_name(s: GeomShape) -> &'static str {
+    match s {
+        GeomShape::Plane => "plane",
+        GeomShape::Sphere { .. } => "sphere",
+        GeomShape::Box { .. } => "box",
+        GeomShape::Capsule { .. } => "capsule",
+        GeomShape::Cylinder { .. } => "cylinder",
+        GeomShape::Ellipsoid { .. } => "ellipsoid",
+        GeomShape::Mesh { .. } => "mesh",
+    }
 }
 
 fn clamp_symmetric(x: f32, cap: f32) -> f32 {

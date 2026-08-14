@@ -208,6 +208,8 @@ works out of the box.
 | `tests/joints_cartpole.rs::cartpole_energy_conservation_no_damping` | mechanical energy drift < 5e-3 over 2 s — catches Coriolis / pA-update sign errors the twin match could hide if both had the same latent bug. |
 | `tests/joints_ball.rs::spherical_pendulum_conserves_energy_and_vertical_angular_momentum` | ball joint under gravity: total energy AND `L_z` about the pivot conserved (gravity torque about the pivot has zero z-component). Non-planar ICs → genuinely 3D motion. |
 | `tests/joints_ball.rs::ball_joint_with_pivot_at_com_reproduces_torque_free_free_body` | ball joint with anchor at child COM, no gravity → pure torque-free rotation. Compared against tier-1 `Body` with identical inertia + ω. |
+| `tests/joints_ball.rs::ball_armature_enters_the_d_diagonal_on_every_axis` | ball armature pin: `r_jc = 0` + diagonal `I_com` + unit torque on axis `k` ⇒ `qddot_k = 1 / (I_com[k, k] + armature)`. Catches the D-diagonal `+ armature` drop directly. |
+| `tests/joints_slide.rs::slide_fk_rotates_displacement_through_parent_orientation` | slide FK pin: parent fixed at `Rot_z(π/2)`, slide axis = parent-X, `q_slide = 0.5` ⇒ child COM at world `(0, 0.5, 0)`. Catches the `parent_ori.rotate` drop in the slide FK path. |
 | `tests/joints_mixed_golden.rs::joints_mixed_golden_is_byte_identical` | Free + Hinge + Slide + Ball in one tree, symmetry broken on every joint; `(q, qdot)` serialized at 0/100/500/1000 steps, byte-compared against `tests/goldens/joints_mixed.bin`. Cross-platform pin for the whole v1 tier-1 joint set. |
 
 ### symmetry-breaking notes (per the tier-2 lesson)
@@ -233,7 +235,9 @@ at least one broken symmetry:
 | flipped hinge axis sign | `joints_pendulum::small_amplitude_...` — measured period would drift + FK arc trace would land in wrong direction |
 | wrong Coriolis bias `c[i]` | `three_link_chain_energy_conserved_...` — drift grows past 5e-3 |
 | missing damping torque | `damped_pendulum_peaks_are_strictly_decreasing` — peaks stop decreasing |
-| armature missing from `d = Sᵀ IA S` | `armature_scales_static_angular_acceleration_by_hand_ratio` — ratio fails |
+| armature missing from `d = Sᵀ IA S` (hinge/slide) | `armature_scales_static_angular_acceleration_by_hand_ratio` — ratio fails |
+| armature missing from ball's `D = Sᵀ IA S + armature·I₃` diagonal | `joints_ball::ball_armature_enters_the_d_diagonal_on_every_axis` — per-axis unit-τ ⇒ 1/(I+A) closed form |
+| slide FK forgets to rotate `axis·q` through `parent_ori` | `joints_slide::slide_fk_rotates_displacement_through_parent_orientation` — rotated parent, slide along parent-X ends at world +Y |
 | range-limit spring on the wrong side | `hinge_range_limit_confines_release_from_outside` — final angle escapes range |
 | any grounded-only bug that dumps momentum "into the wall" | `floating_base_conserves_linear_and_angular_momentum` — direct momentum drift measure |
 | any orientation/normal / Plücker sign issue that flips at snapshot 2 | `joints_golden_trajectory_is_byte_identical` — file mismatch |

@@ -6,12 +6,14 @@
 //!
 //! A [`Tree`] holds an ordered list of [`Link`]s. Link 0 is always the root
 //! (its `parent` is `None`) and carries a [`crate::joint::JointKind::Free`]
-//! or [`crate::joint::JointKind::Fixed`] joint. Non-root links have a
-//! [`crate::joint::JointKind::Hinge`] joint connecting them to a parent
-//! whose index must be strictly less than their own — the tree is stored
-//! topologically sorted so a single pass in the vector order visits the
-//! root before any of its children. Branching is allowed (multiple children
-//! per parent); loops are NOT (no closed kinematic chains in v0).
+//! or [`crate::joint::JointKind::Fixed`] joint. Non-root links carry a
+//! [`crate::joint::JointKind::Hinge`], [`crate::joint::JointKind::Slide`],
+//! [`crate::joint::JointKind::Ball`], or [`crate::joint::JointKind::Fixed`]
+//! joint (v1 tier 1) and reference a parent whose index is strictly less
+//! than their own — the tree is stored topologically sorted so a single pass
+//! in the vector order visits the root before any of its children. Branching
+//! is allowed (multiple children per parent); loops are NOT (no closed
+//! kinematic chains in v0).
 //!
 //! Each link's body frame origin sits at the link's COM (same convention as
 //! tier-1 `Body`), and the inertia tensor `inertia_body` is expressed in
@@ -80,8 +82,9 @@ pub struct Link {
 
     /// Joint connecting this link to its parent (or to the world at the
     /// root). Must be [`JointKind::Free`] or [`JointKind::Fixed`] when
-    /// `parent` is `None`; must be [`JointKind::Hinge`] (or `Fixed`, in
-    /// principle) when `parent` is `Some`.
+    /// `parent` is `None`; must be one of [`JointKind::Hinge`],
+    /// [`JointKind::Slide`], [`JointKind::Ball`], or [`JointKind::Fixed`]
+    /// when `parent` is `Some`.
     pub joint: JointKind,
 
     /// Joint anchor pose in the parent's body frame. For the root with a
