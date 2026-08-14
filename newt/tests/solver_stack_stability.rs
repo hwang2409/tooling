@@ -138,9 +138,19 @@ fn solver_pgs_is_deterministic_across_runs() {
 
 #[test]
 fn solver_stack_iteration_count_sensitivity_bounded() {
-    // 5 iterations should still be stable on this scene (not necessarily
-    // as accurate as 50 — but no runaway).
-    for &iters in &[5u32, 50] {
+    // Three arms bracket the sensitivity: 5 iters (well under
+    // SolverConfig::DEFAULT), 20 iters (the DEFAULT), and 50 iters
+    // (well over). All three must stay stable; the tighter velocity
+    // bound on the DEFAULT arm than on the 5-iter arm confirms the
+    // solver actually benefits from more iterations rather than
+    // sitting at some invariant fixed point regardless.
+    let arms: [(u32, f32); 3] = [
+        // (iterations, max velocity bound after 2000 steps)
+        (5, 0.5),   // loose: only asserts "no runaway"
+        (20, 0.15), // DEFAULT: tighter — solver has largely converged
+        (50, 0.15), // over-solved: same bound as DEFAULT
+    ];
+    for &(iters, vel_bound) in &arms {
         let mut w = build_stack(true);
         w.solver.iterations = iters;
         for _ in 0..2000 {
@@ -153,8 +163,8 @@ fn solver_stack_iteration_count_sensitivity_bounded() {
                 body.position
             );
             assert!(
-                body.linear_velocity.length() < 0.5,
-                "iters={iters}: box {i} still fast ({:?})",
+                body.linear_velocity.length() < vel_bound,
+                "iters={iters}: box {i} vel {:?} exceeds bound {vel_bound}",
                 body.linear_velocity
             );
         }

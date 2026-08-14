@@ -358,15 +358,15 @@ impl World {
         let ext1 = sample_wrenches(&s0, pairs);
         let k1 = evaluate_all(&s0, self.gravity, &ext1);
 
-        let s1 = advance_all(&s0, &s0, &k1, self.dt * 0.5);
+        let s1 = advance_all(&s0, &k1, self.dt * 0.5);
         let ext2 = sample_wrenches(&s1, pairs);
         let k2 = evaluate_all(&s1, self.gravity, &ext2);
 
-        let s2 = advance_all(&s0, &s0, &k2, self.dt * 0.5);
+        let s2 = advance_all(&s0, &k2, self.dt * 0.5);
         let ext3 = sample_wrenches(&s2, pairs);
         let k3 = evaluate_all(&s2, self.gravity, &ext3);
 
-        let s3 = advance_all(&s0, &s0, &k3, self.dt);
+        let s3 = advance_all(&s0, &k3, self.dt);
         let ext4 = sample_wrenches(&s3, pairs);
         let k4 = evaluate_all(&s3, self.gravity, &ext4);
 
@@ -1076,13 +1076,9 @@ fn evaluate_all(states: &[Body], gravity: Vec3, ext: &[(Vec3, Vec3)]) -> Vec<Der
     out
 }
 
-/// Advance a whole slice of bodies by (from_state + deriv * dt). `origin` is
-/// the RK4 stage anchor — always `s0` in our loop.
-fn advance_all(origin: &[Body], _from: &[Body], deriv: &[Deriv], dt: f32) -> Vec<Body> {
-    // NOTE on `_from`: kept for signature symmetry; we always advance from
-    // the anchor `origin` = s0 (standard RK4). The parameter is unused today
-    // but reserved for future integrators that treat the stage state as a
-    // proper linearization point.
+/// Advance a whole slice of bodies by `origin + deriv * dt`. Used at each
+/// RK4 sub-stage with `origin = s0` (the step's start state).
+fn advance_all(origin: &[Body], deriv: &[Deriv], dt: f32) -> Vec<Body> {
     let mut out = Vec::with_capacity(origin.len());
     for (i, &state) in origin.iter().enumerate() {
         let d = deriv[i];

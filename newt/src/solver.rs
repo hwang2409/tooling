@@ -396,6 +396,15 @@ struct ConstraintRow {
 /// Per-body scratch: velocity offset accumulated from constraint impulses.
 /// `dv_lin` in world coords, `dw_body` in body coords (so ω_body_new =
 /// ω_body_start + dw_body + dw_body_from_free_step).
+///
+/// TODO(perf, biped-scale): every PGS-inner apply/read round-trips the
+/// angular delta between body and world coords (see
+/// [`apply_impulse_delta`] and [`row_residual`]). Storing dw in world
+/// frame and computing torque contributions there would trade the
+/// per-update pair of `rotate`/`inverse_rotate` calls for one less
+/// rotation per constraint per iteration. Deferred — revisit before
+/// wiring the biped (v2 tier 6) so the change lands with the workload
+/// that would actually benefit.
 #[derive(Clone, Copy, Debug, Default)]
 struct BodyDelta {
     dv_lin_world: Vec3,
@@ -697,8 +706,12 @@ pub fn solve_free_bodies(
                         }
                     }
                     ConeKind::Elliptic => {
-                        // Do a joint Gauss-Seidel on both tangents, then
-                        // project the pair onto the elliptic cone.
+                        // Jacobi update on both tangents (residuals read
+                        // from the SAME body_delta, no in-between
+                        // application), then a single joint projection
+                        // onto the elliptic cone. Not Gauss-Seidel — a
+                        // per-tangent Gauss-Seidel step would incoherent
+                        // with the cone's coupled geometry.
                         let ri1 = pc.start_row as usize + 1;
                         let ri2 = pc.start_row as usize + 2;
                         let residual1 = row_residual(&rows[ri1], &body_delta, bodies, &inv_i_world)
