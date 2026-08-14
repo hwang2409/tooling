@@ -53,6 +53,12 @@
 //!   (rolling friction about the two tangents), both pyramidal and
 //!   elliptic. See `docs/solver.md` (equality-constraint rows + condim
 //!   4/6 block).
+//! - **v1 tier 6** (`sensor`) — first battery of MuJoCo-parity sensors:
+//!   jointpos/jointvel, ballquat/ballangvel, framepos/framequat, gyro,
+//!   proper-acceleration accelerometer, touch, force/torque. Declared on
+//!   the [`World`], evaluated after each `step` into a flat deterministic
+//!   `sensordata` vector, no perturbation to the simulation state. See
+//!   `docs/sensors.md`.
 
 pub mod actuator;
 pub mod body;
@@ -64,6 +70,7 @@ pub mod joint;
 pub mod json;
 pub mod math;
 pub mod model;
+pub mod sensor;
 pub mod solver;
 pub mod spatial;
 pub mod tree;

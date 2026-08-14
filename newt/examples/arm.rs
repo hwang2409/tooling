@@ -148,6 +148,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let g = scene.world.gravity;
     let per_phase = frames / 3;
 
+    // Sample the sensor bank at ~one line per 300 frames so the terminal
+    // output stays readable. See `docs/sensors.md` for column semantics.
+    let sample_stride = (frames / 6).max(1);
+    let mut sensor_log: Vec<(usize, Vec<f32>)> = Vec::new();
+
     let mut trail: Vec<Vec3> = Vec::with_capacity(frames);
     let mut frame = 0usize;
     for (phase, targets) in WAYPOINTS.iter().enumerate() {
@@ -167,6 +172,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
             trail.push(tip_world(&scene));
             frame += 1;
+            if frame % sample_stride == 0 || frame == frames {
+                // Sensor eval is state-observational only — it does not
+                // perturb the tree, so sampling here leaves the simulation
+                // trajectory bit-identical to the pre-tier-6 golden.
+                scene.world.evaluate_sensors(&[]);
+                sensor_log.push((frame, scene.world.sensors.data.clone()));
+            }
         }
     }
 
@@ -233,5 +245,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tree.hinge_angle(2),
         tree.hinge_angle(3),
     );
+    // Sensor readout table. One row per sample; columns follow the
+    // `sensors` declaration order in `arm.json`. See `docs/sensors.md`.
+    println!();
+    println!(
+        "frame |  shoulder_q  elbow_q   wrist_q   |  shoulder_qd  elbow_qd  wrist_qd  |  tip_pos            |  gyro                |  accel               |  elbow_force         |  elbow_torque"
+    );
+    println!(
+        "------+----------------------------------+---------------------------------+---------------------+----------------------+----------------------+----------------------+----------------------"
+    );
+    for (f, data) in &sensor_log {
+        println!(
+            "{f:5} | {:9.3} {:9.3} {:9.3} | {:9.3} {:9.3} {:9.3} | ({:5.2}, {:5.2}, {:5.2}) | ({:6.2}, {:6.2}, {:6.2}) | ({:6.2}, {:6.2}, {:6.2}) | ({:6.2}, {:6.2}, {:6.2}) | ({:6.3}, {:6.3}, {:6.3})",
+            data[0],
+            data[1],
+            data[2],
+            data[3],
+            data[4],
+            data[5],
+            data[6],
+            data[7],
+            data[8],
+            data[9],
+            data[10],
+            data[11],
+            data[12],
+            data[13],
+            data[14],
+            data[15],
+            data[16],
+            data[17],
+            data[18],
+            data[19],
+            data[20],
+        );
+    }
     Ok(())
 }

@@ -87,6 +87,25 @@
       "name": "tip",
       "attach": {"kind": "link", "tree": "arm", "link": "wrist"},
       "local_offset": [0.0, 0.0, -0.25]
+    },
+    {
+      "name": "tip_imu",
+      "attach": {"kind": "link", "tree": "arm", "link": "wrist"},
+      "local_offset": [0.0, 0.0, -0.25]
     }
+  ],
+
+  "sensors": [
+    {"name": "shoulder_q",     "kind": "jointpos",      "tree": "arm", "link": "shoulder"},
+    {"name": "elbow_q",        "kind": "jointpos",      "tree": "arm", "link": "elbow"},
+    {"name": "wrist_q",        "kind": "jointpos",      "tree": "arm", "link": "wrist"},
+    {"name": "shoulder_qdot",  "kind": "jointvel",      "tree": "arm", "link": "shoulder"},
+    {"name": "elbow_qdot",     "kind": "jointvel",      "tree": "arm", "link": "elbow"},
+    {"name": "wrist_qdot",     "kind": "jointvel",      "tree": "arm", "link": "wrist"},
+    {"name": "tip_pos",        "kind": "framepos",      "site": "tip"},
+    {"name": "tip_imu_gyro",   "kind": "gyro",          "site": "tip_imu"},
+    {"name": "tip_imu_accel",  "kind": "accelerometer", "site": "tip_imu"},
+    {"name": "elbow_force",    "kind": "force",         "tree": "arm", "link": "elbow"},
+    {"name": "elbow_torque",   "kind": "torque",        "tree": "arm", "link": "elbow"}
   ]
 }
