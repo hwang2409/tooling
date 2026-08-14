@@ -110,6 +110,119 @@ fn coupling_scene() -> World {
     w
 }
 
+fn weld_scene() -> World {
+    let mut w = World::new();
+    w.dt = 0.005;
+    w.gravity = Vec3::new(0.0, 0.0, -9.81);
+    w.solver = SolverConfig {
+        mode: SolverMode::Pgs,
+        iterations: 30,
+        cone: ConeKind::Pyramidal,
+    };
+    let solref = SolRef::new(0.01, 1.0);
+    let solimp = SolImp::new(0.99, 0.999, 0.001, 0.5, 2);
+    // Two spheres 0.5 m apart on x, small asymmetric y-offset for
+    // symmetry break; body_b spun about +y so weld angular rows must
+    // pick up the transfer.
+    let ba = w.add_body(Body::solid_sphere(
+        1.0,
+        0.1,
+        Vec3::new(-0.25, 0.01, 1.0),
+        Quat::IDENTITY,
+    ));
+    let bb = w.add_body(Body::solid_sphere(
+        1.0,
+        0.1,
+        Vec3::new(0.25, -0.01, 1.0),
+        Quat::IDENTITY,
+    ));
+    w.bodies[bb].angular_velocity_body = Vec3::new(0.0, 1.5, 0.0);
+    w.equalities.push(Equality::Weld {
+        body_a: Some(ba),
+        body_b: Some(bb),
+        anchor_a: Vec3::new(0.25, 0.0, 0.0),
+        anchor_b: Vec3::new(-0.25, 0.0, 0.0),
+        relative_orientation: Quat::IDENTITY,
+        solref,
+        solimp,
+    });
+    w
+}
+
+fn distance_scene() -> World {
+    let mut w = World::new();
+    w.dt = 0.005;
+    w.gravity = Vec3::ZERO;
+    w.solver = SolverConfig {
+        mode: SolverMode::Pgs,
+        iterations: 40,
+        cone: ConeKind::Pyramidal,
+    };
+    // Orbiting-pair scene with asymmetric tangential velocities to
+    // break any spin-symmetric bug.
+    let ba = w.add_body(Body::solid_sphere(
+        1.0,
+        0.1,
+        Vec3::new(-0.5, 0.01, 0.0),
+        Quat::IDENTITY,
+    ));
+    let bb = w.add_body(Body::solid_sphere(
+        1.0,
+        0.1,
+        Vec3::new(0.5, -0.01, 0.0),
+        Quat::IDENTITY,
+    ));
+    w.bodies[ba].linear_velocity = Vec3::new(0.0, 0.3, 0.02);
+    w.bodies[bb].linear_velocity = Vec3::new(0.0, -0.3, -0.02);
+    w.equalities.push(Equality::Distance {
+        body_a: Some(ba),
+        body_b: Some(bb),
+        anchor_a: Vec3::ZERO,
+        anchor_b: Vec3::ZERO,
+        distance: 1.0,
+        solref: SolRef::new(0.01, 1.0),
+        solimp: SolImp::new(0.99, 0.999, 0.001, 0.5, 2),
+    });
+    w
+}
+
+fn condim_rolling_scene() -> World {
+    let mut w = World::new();
+    w.dt = 0.005;
+    w.gravity = Vec3::new(0.0, 0.0, -9.81);
+    w.solver = SolverConfig {
+        mode: SolverMode::Pgs,
+        iterations: 30,
+        cone: ConeKind::Pyramidal,
+    };
+    let solref = SolRef::new(0.02, 1.0);
+    let solimp = SolImp::DEFAULT;
+    let mut plane = Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.9);
+    plane.solref = solref;
+    plane.solimp = solimp;
+    plane.condim = 6;
+    plane.rolling_friction = 0.1;
+    w.add_geom(plane);
+    let radius = 0.1;
+    // 1 cm y-offset for symmetry break.
+    let bi = w.add_body(Body::solid_sphere(
+        1.0,
+        radius,
+        Vec3::new(0.0, 0.01, radius),
+        Quat::IDENTITY,
+    ));
+    // Rolling without slipping: v = ω × r → v_x = 1, ω_y = 10.
+    w.bodies[bi].linear_velocity = Vec3::new(1.0, 0.0, 0.0);
+    w.bodies[bi].angular_velocity_body = Vec3::new(0.0, 10.0, 0.0);
+    let mut sphere = Geom::sphere(bi, radius, Vec3::ZERO, 0.9);
+    sphere.solref = solref;
+    sphere.solimp = solimp;
+    sphere.condim = 6;
+    sphere.rolling_friction = 0.1;
+    w.add_geom(sphere);
+    w
+}
+
 fn condim_torsional_scene() -> World {
     let mut w = World::new();
     w.dt = 0.005;
@@ -227,6 +340,18 @@ const TORSIONAL_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/goldens/condim_torsional.bin"
 );
+const WELD_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/goldens/equality_weld.bin"
+);
+const DISTANCE_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/goldens/equality_distance.bin"
+);
+const ROLLING_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/goldens/condim_rolling.bin"
+);
 
 fn assert_golden(path: &str, actual: &[u8]) {
     let expected = std::fs::read(path).unwrap_or_else(|e| {
@@ -273,7 +398,28 @@ fn condim_torsional_golden_byte_identical() {
     assert_golden(TORSIONAL_PATH, &bytes);
 }
 
-/// Regenerate all three v1-tier-5 goldens. Ignored so it does not run
+#[test]
+fn weld_golden_byte_identical() {
+    let mut w = weld_scene();
+    let bytes = record_bodies(&mut w);
+    assert_golden(WELD_PATH, &bytes);
+}
+
+#[test]
+fn distance_golden_byte_identical() {
+    let mut w = distance_scene();
+    let bytes = record_bodies(&mut w);
+    assert_golden(DISTANCE_PATH, &bytes);
+}
+
+#[test]
+fn condim_rolling_golden_byte_identical() {
+    let mut w = condim_rolling_scene();
+    let bytes = record_bodies(&mut w);
+    assert_golden(ROLLING_PATH, &bytes);
+}
+
+/// Regenerate all six v1-tier-5 goldens. Ignored so it does not run
 /// in CI. macOS-aarch64 only — see the panic in the standing
 /// `regenerate_golden` test for the rationale.
 #[test]
@@ -292,6 +438,9 @@ fn regenerate_equality_goldens() {
         (CONNECT_PATH, record_bodies(&mut connect_pair_scene())),
         (COUPLING_PATH, record_trees(&mut coupling_scene())),
         (TORSIONAL_PATH, record_bodies(&mut condim_torsional_scene())),
+        (WELD_PATH, record_bodies(&mut weld_scene())),
+        (DISTANCE_PATH, record_bodies(&mut distance_scene())),
+        (ROLLING_PATH, record_bodies(&mut condim_rolling_scene())),
     ] {
         let dir = std::path::Path::new(path).parent().unwrap();
         std::fs::create_dir_all(dir).unwrap();

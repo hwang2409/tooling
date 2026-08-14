@@ -78,16 +78,16 @@ fn distance_pair_orbits_without_drift() {
 fn distance_no_op_mutant_flies_apart() {
     let mut w = build_pair(false);
     // Without a distance equality, tangential velocities carry the two
-    // bodies away from each other at 0.6 m/s (relative). After 200
-    // steps (1 s), separation should be well above 1 m — grows by
-    // sqrt(1² + 0.6²) − 1 ≈ 0.17 m in the linear limit; drifts further
-    // with no restoring force.
-    for _ in 0..200 {
+    // bodies apart at 0.6 m/s (relative). After 600 steps (3 s),
+    // separation should grow well past 1.5 m — no restoring force,
+    // linear drift dominates. Wider margin (3 s + 1.5 m) so minor
+    // drift from a partially-broken constraint can't sneak past.
+    for _ in 0..600 {
         w.step();
     }
     let sep = (w.bodies[0].position - w.bodies[1].position).length();
     assert!(
-        sep > 1.1,
-        "no-op mutant should let bodies drift apart: sep = {sep}"
+        sep > 1.5,
+        "no-op mutant should let bodies drift apart to sep > 1.5 over 3 s: got {sep}"
     );
 }

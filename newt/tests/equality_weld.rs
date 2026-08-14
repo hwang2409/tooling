@@ -61,10 +61,33 @@ fn build_pair(with_equality: bool) -> World {
 
 #[test]
 fn weld_pair_falls_as_composite_and_orientations_stay_locked() {
+    // Hand-derived composite:
+    //   Each sphere: m = 1 kg, r = 0.1, I_sphere = 2/5·m·r² = 0.004 kg·m²
+    //   (isotropic).
+    //   Sphere COMs at (∓0.25, 0, 1) in world; composite COM at
+    //   (0, 0, 1). Distance from composite COM to each sphere COM along
+    //   +x is d = 0.25 m.
+    //   Composite inertia about world +y axis (perpendicular to x, the
+    //   axis connecting the sphere COMs) via parallel-axis theorem:
+    //     I_composite_yy = 2 · (I_sphere_yy + m · d²)
+    //                    = 2 · (0.004 + 1 · 0.0625)
+    //                    = 0.133 kg·m².
+    //   Initial angular momentum about composite COM:
+    //     body_a: ω = 0 → L_a = 0.
+    //     body_b: ω_body = (0, 1.5, 0), lin_vel = 0.
+    //       body_b's I_body = 0.004·I₃; r_from_composite_com = (0.25,0,0).
+    //       L_b = I_body · ω_b + m · r × v = (0, 0.006, 0) + 0 =
+    //             (0, 0.006, 0) N·m·s.
+    //   Total L about composite COM = (0, 0.006, 0) N·m·s. Gravity is
+    //   uniform → net torque about composite COM = 0 → angular
+    //   momentum conserved through the fall AND through the weld's
+    //   internal impulses (equal-opposite pair at a single anchor
+    //   point → zero net torque). Expected steady composite angular
+    //   velocity:
+    //     ω_composite_y = L_y / I_composite_yy = 0.006 / 0.133
+    //                   ≈ 0.04511 rad/s.
     let mut w = build_pair(true);
-    // Compound COM (2 bodies, each 1 kg) starts at world (0, 0, 1).
     let com0_z = 1.0;
-    // Fall for 200 steps (1 s).
     for _ in 0..200 {
         w.step();
     }
@@ -75,21 +98,40 @@ fn weld_pair_falls_as_composite_and_orientations_stay_locked() {
         (com_z - expected_com_z).abs() < 0.02,
         "compound COM z = {com_z}, expected {expected_com_z}"
     );
-    // Relative angular velocity should be tiny (weld drives them to the
-    // same body-frame angular velocity — at IDENTITY relative
-    // orientation the world-frame ω's must also agree).
+    // Analytic steady composite ω about +y from the derivation above.
+    let expected_omega_y = 0.006 / 0.133_f32;
     let w_a_world = w.bodies[0]
         .orientation
         .rotate(w.bodies[0].angular_velocity_body);
     let w_b_world = w.bodies[1]
         .orientation
         .rotate(w.bodies[1].angular_velocity_body);
+    // Both bodies rotate at the composite ω (weld drives them to the
+    // same rigid-body twist).
+    assert!(
+        (w_a_world.y - expected_omega_y).abs() < 0.01,
+        "body_a ω_y at composite steady state: {}, expected {expected_omega_y}",
+        w_a_world.y
+    );
+    assert!(
+        (w_b_world.y - expected_omega_y).abs() < 0.01,
+        "body_b ω_y at composite steady state: {}, expected {expected_omega_y}",
+        w_b_world.y
+    );
+    // Off-axis ω components should stay near zero (initial L has only
+    // a y component; angular momentum conservation keeps the ω vector
+    // parallel to +y since I_composite is diagonal about +y).
+    assert!(
+        w_a_world.x.abs() < 0.02 && w_a_world.z.abs() < 0.02,
+        "body_a off-axis ω: x={}, z={}",
+        w_a_world.x,
+        w_a_world.z
+    );
     let rel_w = (w_a_world - w_b_world).length();
     assert!(
         rel_w < 0.1,
         "welded pair relative ω after 1 s: {rel_w} rad/s"
     );
-    // Anchor coincidence.
     let anchor_a_world =
         w.bodies[0].position + w.bodies[0].orientation.rotate(Vec3::new(0.25, 0.0, 0.0));
     let anchor_b_world =

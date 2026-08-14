@@ -121,6 +121,130 @@ fn connect_two_bodies_hold_together_under_gravity() {
     );
 }
 
+/// Bar body, 1 m long (half-extent 0.5 m on x), 1 kg. Solid-box
+/// inertia. Anchored via one connect equality at ONE END so gravity
+/// creates torque about the anchor — the bar swings and settles
+/// hanging with its COM directly below the anchor.
+fn build_hanging_bar(anchor_at_end: bool) -> World {
+    let mut w = World::new();
+    w.dt = 0.005;
+    w.gravity = Vec3::new(0.0, 0.0, -9.81);
+    w.solver = SolverConfig {
+        mode: SolverMode::Pgs,
+        iterations: 40,
+        cone: ConeKind::Pyramidal,
+    };
+    let bar_half = Vec3::new(0.5, 0.03, 0.03);
+    let inertia = newt::geom::solid_box_inertia(1.0, bar_half);
+    // Bar's COM at world (0, 0, 1); a 1 cm y-offset breaks symmetry
+    // so any bug that reflects x→-x still shows a byte-level diff.
+    let bi = w.add_body(Body::new(
+        1.0,
+        inertia,
+        Vec3::new(0.0, 0.01, 1.0),
+        Quat::IDENTITY,
+    ));
+    // World anchor: one bar-length above the far end when bar is
+    // horizontal — i.e., the bar's +x tip in world coords, which sits
+    // at world (0.5, 0.01, 1.0) at t=0.
+    let world_anchor = Vec3::new(0.5, 0.01, 1.0);
+    // Body-local anchor: which end of the bar the equality pins.
+    // `anchor_at_end = true` uses the +x tip (offset 0.5 m from COM);
+    // `false` uses the COM (offset ZERO) — the reviewer-flagged
+    // lever-arm-zeroing mutant.
+    let anchor_b_local = if anchor_at_end {
+        Vec3::new(0.5, 0.0, 0.0)
+    } else {
+        Vec3::ZERO
+    };
+    w.equalities.push(Equality::Connect {
+        body_a: None,
+        body_b: Some(bi),
+        anchor_a: world_anchor,
+        anchor_b: anchor_b_local,
+        solref: SolRef::new(0.01, 1.0),
+        solimp: SolImp::new(0.99, 0.999, 0.001, 0.5, 2),
+    });
+    w
+}
+
+#[test]
+fn connect_bar_end_anchor_swings_bar_under_gravity() {
+    // Reviewer's lever-arm mutant catch: a bar with the connect anchor
+    // at ONE END is rotationally asymmetric — gravity produces a torque
+    // about the anchor, so the bar swings. If the connect row's arm
+    // term is zeroed out (mutant that applies the force at the COM
+    // instead of at the anchor), the bar receives zero torque and does
+    // not swing at all — its orientation stays at identity for the
+    // full window. The undamped pendulum keeps swinging in the correct
+    // code path, so we track the MAX rotation reached over the run
+    // rather than an equilibrium value. The paired
+    // `connect_bar_com_anchor_mutant_does_not_swing` test flips the
+    // anchor to the COM and asserts the opposite behaviour.
+    let mut w = build_hanging_bar(/*anchor_at_end=*/ true);
+    let mut max_swing_angle: f32 = 0.0;
+    let mut min_com_z: f32 = f32::INFINITY;
+    for _ in 0..2000 {
+        w.step();
+        let bar = &w.bodies[0];
+        // Body-x axis in world coords: initially (1, 0, 0). After a
+        // swing, it rotates so its z component grows (toward +z if
+        // the +x tip is pulling up to the anchor with COM hanging
+        // below).
+        let body_x_world = bar.orientation.rotate(Vec3::X);
+        let angle_from_horizontal = body_x_world.z.abs();
+        if angle_from_horizontal > max_swing_angle {
+            max_swing_angle = angle_from_horizontal;
+        }
+        if bar.position.z < min_com_z {
+            min_com_z = bar.position.z;
+        }
+    }
+    // Correct code: bar swings far enough that body-x's z component
+    // reaches close to ±1 at some point.
+    assert!(
+        max_swing_angle > 0.7,
+        "bar must swing far enough for body-x z-component to exceed \
+         0.7 at some point; max reached = {max_swing_angle}"
+    );
+    // Correct code: COM drops well below the anchor at some point
+    // during the swing (anchor is at z = 1.0; a fully-hanging COM
+    // sits at z = 0.5).
+    assert!(
+        min_com_z < 0.6,
+        "COM must swing down below the anchor during pendulum motion; \
+         min COM z reached = {min_com_z}"
+    );
+}
+
+#[test]
+fn connect_bar_com_anchor_mutant_does_not_swing() {
+    // Discriminating mutant: force the same scene with the connect
+    // anchor at the COM (equivalent to zeroing the lever arm). The
+    // constraint pins the COM directly at the world anchor — with no
+    // arm, gravity produces no torque about the constraint force
+    // application point, so the bar doesn't rotate.
+    let mut w = build_hanging_bar(/*anchor_at_end=*/ false);
+    for _ in 0..2000 {
+        w.step();
+    }
+    let bar = &w.bodies[0];
+    // COM should stay pinned near the world anchor (0.5, 0.01, 1.0),
+    // NOT settle 0.5 m below. Bar orientation should stay near
+    // identity — no torque, no rotation.
+    let com = bar.position;
+    let anchor_world = Vec3::new(0.5, 0.01, 1.0);
+    assert!(
+        (com - anchor_world).length() < 0.05,
+        "COM-anchored bar's COM should stay near world anchor: got {com:?}"
+    );
+    let body_x_world = bar.orientation.rotate(Vec3::X);
+    assert!(
+        body_x_world.x > 0.9,
+        "COM-anchored bar should not rotate; body_x_world = {body_x_world:?}"
+    );
+}
+
 #[test]
 fn connect_no_op_mutant_separates_freely() {
     // Same scene, no equalities. Both bodies free-fall; connection error
