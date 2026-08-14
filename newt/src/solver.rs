@@ -1448,37 +1448,75 @@ impl TreeRow {
     }
 }
 
-/// Solve per-tree constraints (joint-range limits + joint-coupling
-/// equalities) in PGS. Returns a per-DOF generalized force delta
-/// (`nv`-length) that the caller adds to `tree.qfrc_applied` for the step
-/// (ZOH under RK4).
-///
-/// We build the tree's mass matrix `M`, factor it once via Cholesky, then
-/// solve `M^-1 · e_j` per row to get each row's velocity-response
-/// direction. `A` is dense `n_rows × n_rows` with
-/// `A_ij = e_i^T · M^-1 · e_j`. Limit rows project to `f ≥ 0`; coupling
-/// rows use the bilateral (no-clamp) update.
-///
-/// `equalities` is the world's equality list; only entries whose
-/// `tree_index() == Some(tree_idx)` are consumed here. Passing the whole
-/// list keeps the API symmetric with the free-body solver — the tree
-/// index tells the function which tree to filter for.
-///
-/// Zero-length return `vec![0.0; nv]` when neither limits nor couplings
-/// are active.
-pub fn solve_tree_limits(
+/// One joint-coupling row's Jacobian, as the solver assembles it —
+/// exposed for tests so hand-derivations can pin the chain-rule
+/// coefficient `k = c1 + 2·c2·q_b` directly (dynamic tracking tests
+/// alone can mask a wrong Jacobian at steady state, per NEWT-10 R2
+/// reviewer note). The two coefficients correspond to `link_a` and
+/// `link_b` respectively; the escape-convention sign flip is applied
+/// exactly as in the live solver.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CouplingRowProbe {
+    /// `v_offset` slot for the coupling's `link_a`.
+    pub slot_a: u32,
+    /// `v_offset` slot for the coupling's `link_b`.
+    pub slot_b: u32,
+    /// Row coefficient on `slot_a` (row's `J` entry there). Post
+    /// escape-convention flip.
+    pub coeff_a: f32,
+    /// Row coefficient on `slot_b`. Equals `-(c1 + 2·c2·q_b)` under
+    /// the correct chain rule (post escape flip).
+    pub coeff_b: f32,
+    /// Signed polynomial residual `q_a − (c0 + c1·q_b + c2·q_b²)` at
+    /// the tree's current state.
+    pub violation_signed: f32,
+}
+
+/// Return one [`CouplingRowProbe`] per `JointCoupling` equality on
+/// `tree` (in declaration order). The rows are built by
+/// [`build_tree_solver_rows`] — the SAME code path the live solver
+/// uses — so a mutation to the row-building propagates here too and
+/// the test comparison against a hand-derived `c1 + 2·c2·q_b`
+/// discriminates.
+pub fn tree_coupling_jacobian_probe(
     tree: &Tree,
     tree_idx: usize,
     equalities: &[Equality],
-    dt: f32,
-    iterations: u32,
-) -> Vec<f32> {
-    let nv = tree.nv();
-    let mut qfrc = vec![0.0f32; nv];
-    if nv == 0 || dt <= 0.0 {
-        return qfrc;
-    }
+) -> Vec<CouplingRowProbe> {
+    build_tree_solver_rows(tree, tree_idx, equalities)
+        .into_iter()
+        .filter(|row| row.projection == TreeRowProjection::Bilateral)
+        .map(|row| {
+            let (s0, c0) = row.sparse_coeffs[0];
+            let (s1, c1) = row.sparse_coeffs[1];
+            CouplingRowProbe {
+                slot_a: s0,
+                slot_b: s1,
+                coeff_a: c0,
+                coeff_b: c1,
+                // Violation stored in the row is |r_signed|; reconstruct
+                // the sign from the row's flip (coeff_a is +1 pre-flip;
+                // negative here means r_signed >= 0).
+                violation_signed: if c0 < 0.0 {
+                    row.violation
+                } else {
+                    -row.violation
+                },
+            }
+        })
+        .collect()
+}
 
+/// Assemble the tree-space PGS rows for one tree: active hinge / slide
+/// range limits, followed by joint-coupling equalities in declaration
+/// order. The row structure (sparse coefficients, signed-residual
+/// convention, escape-convention sign flip on coupling rows) lives
+/// here so [`solve_tree_limits`] and [`tree_coupling_jacobian_probe`]
+/// share it — any mutation to the coefficient formula (e.g., dropping
+/// the chain-rule `2·c2·q_b` term) propagates to both the live
+/// solver and the probe, and the probe-based test discriminates it
+/// against the hand-derived expression.
+fn build_tree_solver_rows(tree: &Tree, tree_idx: usize, equalities: &[Equality]) -> Vec<TreeRow> {
     let mut rows: Vec<TreeRow> = Vec::new();
     // Enumerate active hinge/slide limits — same ordering as before
     // (ascending link index, low-side before high-side never triggers on
@@ -1572,6 +1610,41 @@ pub fn solve_tree_limits(
             projection: TreeRowProjection::Bilateral,
         });
     }
+    rows
+}
+
+/// Solve per-tree constraints (joint-range limits + joint-coupling
+/// equalities) in PGS. Returns a per-DOF generalized force delta
+/// (`nv`-length) that the caller adds to `tree.qfrc_applied` for the step
+/// (ZOH under RK4).
+///
+/// We build the tree's mass matrix `M`, factor it once via Cholesky, then
+/// solve `M^-1 · e_j` per row to get each row's velocity-response
+/// direction. `A` is dense `n_rows × n_rows` with
+/// `A_ij = e_i^T · M^-1 · e_j`. Limit rows project to `f ≥ 0`; coupling
+/// rows use the bilateral (no-clamp) update.
+///
+/// `equalities` is the world's equality list; only entries whose
+/// `tree_index() == Some(tree_idx)` are consumed here. Passing the whole
+/// list keeps the API symmetric with the free-body solver — the tree
+/// index tells the function which tree to filter for.
+///
+/// Zero-length return `vec![0.0; nv]` when neither limits nor couplings
+/// are active.
+pub fn solve_tree_limits(
+    tree: &Tree,
+    tree_idx: usize,
+    equalities: &[Equality],
+    dt: f32,
+    iterations: u32,
+) -> Vec<f32> {
+    let nv = tree.nv();
+    let mut qfrc = vec![0.0f32; nv];
+    if nv == 0 || dt <= 0.0 {
+        return qfrc;
+    }
+
+    let rows: Vec<TreeRow> = build_tree_solver_rows(tree, tree_idx, equalities);
     if rows.is_empty() {
         return qfrc;
     }

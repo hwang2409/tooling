@@ -57,9 +57,13 @@ pub enum Equality {
     },
     /// Pose lock between two bodies: anchor points coincide AND relative
     /// orientation stays at `relative_orientation` (child-B-in-A frame).
-    /// Six rows: three linear (the anchor equation, same as `Connect`) then
-    /// three angular (the small-angle orientation error, MuJoCo's
-    /// `2 · imag(q_A_conj · q_B · q_lock_conj)` parameterization).
+    /// Six rows: three linear (the anchor equation, same as `Connect`)
+    /// then three angular. The orientation error is
+    /// `2 · imag(q_err)` in world coordinates, with
+    /// `q_err = q_A · q_target · q_B_conj` (chosen so `q_err = identity`
+    /// when the target relative pose is met, i.e.
+    /// `q_B = q_A · q_target`), sign-canonicalized (multiply by −1 when
+    /// `q_err.w < 0` to take the shortest rotation).
     ///
     /// A `body_a = None` means the world; then `q_A` is treated as
     /// identity. When both bodies are `None` the constraint is degenerate

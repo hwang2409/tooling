@@ -381,7 +381,7 @@ world.solver = SolverConfig {
 
 ```rust
 let mut g = Geom::r#box(body_idx, half, ...);
-g.condim = 3;                       // 1 or 3 (default 3); 4/6 rejected
+g.condim = 3;                       // 1, 3, 4, or 6 (default 3)
 g.solimp = SolImp::new(0.9, 0.99, 0.001, 0.5, 2);
 g.solref = SolRef::new(0.05, 1.5);  // (timeconst, dampratio)
 ```
