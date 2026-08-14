@@ -21,6 +21,8 @@
 //! Rendering: chimy2 wireframe on a Framebuffer. The camera sits on +Y
 //! looking at the swing plane so +X → image right, +Z → image up.
 
+mod showcase_support;
+
 use chimy2::demo::write_ppm;
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
@@ -49,6 +51,8 @@ struct Args {
     out: PathBuf,
     size: (usize, usize),
     mode: Mode,
+    frames_dir: Option<PathBuf>,
+    wireframe: bool,
 }
 
 fn parse_args() -> Args {
@@ -57,6 +61,8 @@ fn parse_args() -> Args {
         out: PathBuf::from("newt-cartpole.ppm"),
         size: (640, 360),
         mode: Mode::Position,
+        frames_dir: None,
+        wireframe: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -70,6 +76,8 @@ fn parse_args() -> Args {
             }
             "--velocity" => a.mode = Mode::Velocity,
             "--position" => a.mode = Mode::Position,
+            "--frames-dir" => a.frames_dir = Some(PathBuf::from(it.next().unwrap())),
+            "--wireframe" => a.wireframe = true,
             _ => panic!("unknown arg: {arg}"),
         }
     }
@@ -129,6 +137,13 @@ fn build_cartpole(mode: Mode) -> (Tree, usize) {
     // Start pole tilted so the demo has motion out of the gate.
     tree.set_hinge_angle(2, 0.45);
     (tree, actuator_idx)
+}
+
+fn mode_str(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Position => "position",
+        Mode::Velocity => "velocity",
+    }
 }
 
 fn draw_line(fb: &mut Framebuffer, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: u32) {
@@ -202,6 +217,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pole_tip = pole_com + pole_ori.rotate(Vec3::new(0.0, 0.0, -POLE_L * 0.5));
         trail.push(pole_tip);
         cart_trail.push(cart_com);
+    }
+
+    if !args.wireframe {
+        let poses = forward_kinematics(&tree);
+        let (cart_com, _) = poses[1];
+        let (pole_com, pole_ori) = poses[2];
+        let pole_tip = pole_com + pole_ori.rotate(Vec3::new(0.0, 0.0, -POLE_L * 0.5));
+        let mut items = vec![showcase_support::item(
+            showcase_support::cuboid_mesh(chimy2::math::Vec3::new(3.0, 2.0, 0.04)),
+            chimy2::math::Mat4::translate(chimy2::math::Vec3::new(0.0, 0.0, -0.04)),
+            showcase_support::Material::new(chimy2::math::Vec3::new(0.04, 0.05, 0.07), 0.0, 0.9),
+        )];
+        items.push(showcase_support::item(
+            showcase_support::cuboid_mesh(chimy2::math::Vec3::new(0.28, 0.22, 0.09)),
+            chimy2::math::Mat4::translate(showcase_support::to_cvec(cart_com)),
+            showcase_support::Material::new(chimy2::math::Vec3::new(0.12, 0.48, 0.78), 0.45, 0.25),
+        ));
+        showcase_support::add_capsule(
+            &mut items,
+            cart_com,
+            pole_tip,
+            0.045,
+            showcase_support::Material::new(chimy2::math::Vec3::new(0.92, 0.42, 0.08), 0.5, 0.2),
+        );
+        showcase_support::add_marker(
+            &mut items,
+            cart_com,
+            0.08,
+            showcase_support::Material::new(chimy2::math::Vec3::new(0.95, 0.75, 0.16), 0.35, 0.18),
+        );
+        let path = args
+            .frames_dir
+            .as_ref()
+            .map_or_else(|| out.clone(), |directory| directory.join("frame-00.ppm"));
+        showcase_support::write_frame(
+            &items,
+            showcase_support::composition("cartpole"),
+            width,
+            height,
+            &format!("cartpole  |  step {frames}  |  {} mode", mode_str(mode)),
+            path,
+        )?;
+        return Ok(());
     }
 
     let mut fb = Framebuffer::new(width, height);

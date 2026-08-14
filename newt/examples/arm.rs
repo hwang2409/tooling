@@ -24,6 +24,8 @@
 //! sips -s format png /tmp/arm.ppm --out /tmp/arm.png
 //! ```
 
+mod showcase_support;
+
 use chimy2::demo::write_ppm;
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
@@ -35,11 +37,22 @@ use newt::tree::{forward_kinematics, rk4_step};
 
 use std::path::PathBuf;
 
-fn parse_args() -> (usize, PathBuf, (usize, usize), PathBuf) {
+struct Args {
+    frames: usize,
+    out: PathBuf,
+    size: (usize, usize),
+    model: PathBuf,
+    frames_dir: Option<PathBuf>,
+    wireframe: bool,
+}
+
+fn parse_args() -> Args {
     let mut frames = 1800usize;
     let mut out = PathBuf::from("newt-arm.ppm");
     let mut size = (640usize, 360usize);
     let mut model = PathBuf::from("models/arm.json");
+    let mut frames_dir = None;
+    let mut wireframe = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -51,10 +64,19 @@ fn parse_args() -> (usize, PathBuf, (usize, usize), PathBuf) {
                 let (w, h) = s.split_once('x').expect("--size WxH");
                 size = (w.parse().unwrap(), h.parse().unwrap());
             }
+            "--frames-dir" => frames_dir = Some(PathBuf::from(args.next().unwrap())),
+            "--wireframe" => wireframe = true,
             _ => panic!("unknown arg: {a}"),
         }
     }
-    (frames, out, size, model)
+    Args {
+        frames,
+        out,
+        size,
+        model,
+        frames_dir,
+        wireframe,
+    }
 }
 
 /// The three-waypoint reach sequence (shoulder / elbow / wrist, radians).
@@ -121,7 +143,8 @@ fn tip_world(scene: &Scene) -> Vec3 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (frames, out, (width, height), model_path) = parse_args();
+    let args = parse_args();
+    let (frames, out, (width, height), model_path) = (args.frames, args.out, args.size, args.model);
 
     let mut scene = load_from_path(&model_path)
         .unwrap_or_else(|e| panic!("load {}: {e}", model_path.display()));
@@ -207,6 +230,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sensor_log.push((frame, scene.world.sensors.data.clone()));
             }
         }
+    }
+
+    if !args.wireframe {
+        let poses = forward_kinematics(&scene.world.trees[arm_idx]);
+        let mut items = showcase_support::world_items(&scene.world);
+        for link in 1..poses.len() {
+            if let Some(parent) = scene.world.trees[arm_idx].links[link].parent {
+                showcase_support::add_capsule(
+                    &mut items,
+                    poses[parent].0,
+                    poses[link].0,
+                    0.06,
+                    showcase_support::Material::new(
+                        chimy2::math::Vec3::new(0.12 + link as f32 * 0.1, 0.4, 0.75),
+                        0.35,
+                        0.3,
+                    ),
+                );
+            }
+        }
+        let path = args
+            .frames_dir
+            .as_ref()
+            .map_or_else(|| out.clone(), |directory| directory.join("frame-00.ppm"));
+        showcase_support::write_frame(
+            &items,
+            showcase_support::composition("arm"),
+            width,
+            height,
+            &format!("arm  |  step {frames}  |  waypoint servo"),
+            path,
+        )?;
+        return Ok(());
     }
 
     let mut fb = Framebuffer::new(width, height);

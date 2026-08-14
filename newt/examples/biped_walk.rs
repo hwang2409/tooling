@@ -5,6 +5,7 @@
 //! integration tests.
 
 mod biped_walk_support;
+mod showcase_support;
 
 use std::path::PathBuf;
 
@@ -20,6 +21,7 @@ struct Args {
     steps: usize,
     assist_scale: f32,
     out_dir: PathBuf,
+    wireframe: bool,
 }
 
 fn parse_args() -> Args {
@@ -27,13 +29,17 @@ fn parse_args() -> Args {
         steps: 5000,
         assist_scale: 0.8,
         out_dir: PathBuf::from("/tmp/newt-biped-walk-frames"),
+        wireframe: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--steps" => args.steps = it.next().expect("--steps value").parse().unwrap(),
             "--no-assist" => args.assist_scale = 0.0,
-            "--out-dir" => args.out_dir = PathBuf::from(it.next().expect("--out-dir value")),
+            "--out-dir" | "--frames-dir" => {
+                args.out_dir = PathBuf::from(it.next().expect("output directory value"))
+            }
+            "--wireframe" => args.wireframe = true,
             _ => panic!("unknown argument: {arg}"),
         }
     }
@@ -65,7 +71,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if step % frame_stride == 0 || step == args.steps {
             let frame = (step / frame_stride).min(8);
             let path = out_dir.join(format!("frame-{frame:02}.ppm"));
-            render_frame(scene, &path).expect("write PPM frame");
+            if args.wireframe {
+                render_wireframe(scene, &path).expect("write PPM frame");
+            } else {
+                render_frame(scene, &path).expect("write PPM frame");
+            }
             println!(
                 "frame {frame:02}: steps={} assist_scale={:.1} window_distance={:.4} window_clearance={:.4} root_x={:.4} root_z={:.4} speed={:.4} contacts=({},{})",
                 step - window_start_step,
@@ -102,7 +112,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn render_frame(scene: &Scene, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+fn render_wireframe(
+    scene: &Scene,
+    path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let width = 800;
     let height = 500;
     let mut fb = Framebuffer::new(width, height);
@@ -188,6 +201,24 @@ fn render_frame(scene: &Scene, path: &std::path::Path) -> Result<(), Box<dyn std
     }
     write_ppm(path, &fb)?;
     Ok(())
+}
+
+fn render_frame(scene: &Scene, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let poses = forward_kinematics(&scene.world.trees[0]);
+    let root = poses[0].0;
+    let items = showcase_support::world_items(&scene.world);
+    showcase_support::write_frame(
+        &items,
+        showcase_support::Composition::new(
+            showcase_support::to_cvec(root + Vec3::new(0.0, 0.0, 0.45)),
+            showcase_support::to_cvec(root + Vec3::new(2.4, -3.4, 2.0)),
+            chimy2::math::Vec3::new(0.1, 0.55, 1.0),
+        ),
+        960,
+        640,
+        "biped walk  |  follow camera  |  PBR / SSAO / bloom / ACES",
+        path,
+    )
 }
 
 fn project(camera: Mat4, point: Vec3, width: usize, height: usize) -> Option<(i32, i32)> {

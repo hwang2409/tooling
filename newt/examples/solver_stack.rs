@@ -14,6 +14,8 @@
 //!
 //! Wireframe PPM via chimy2, same rendering plumbing as `stack.rs`.
 
+mod showcase_support;
+
 use chimy2::demo::write_ppm;
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
@@ -26,10 +28,20 @@ use newt::world::World;
 
 use std::path::PathBuf;
 
-fn parse_args() -> (usize, PathBuf, (usize, usize)) {
+struct Args {
+    frames: usize,
+    out: PathBuf,
+    size: (usize, usize),
+    frames_dir: Option<PathBuf>,
+    wireframe: bool,
+}
+
+fn parse_args() -> Args {
     let mut frames = 800usize;
     let mut out = PathBuf::from("newt-solver-stack.ppm");
     let mut size = (640usize, 360usize);
+    let mut frames_dir = None;
+    let mut wireframe = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -40,10 +52,18 @@ fn parse_args() -> (usize, PathBuf, (usize, usize)) {
                 let (w, h) = s.split_once('x').expect("--size WxH");
                 size = (w.parse().unwrap(), h.parse().unwrap());
             }
+            "--frames-dir" => frames_dir = Some(PathBuf::from(args.next().unwrap())),
+            "--wireframe" => wireframe = true,
             _ => panic!("unknown arg: {a}"),
         }
     }
-    (frames, out, size)
+    Args {
+        frames,
+        out,
+        size,
+        frames_dir,
+        wireframe,
+    }
 }
 
 const HALF: Vec3 = Vec3::new(0.3, 0.3, 0.3);
@@ -235,13 +255,30 @@ fn render(world: &World, width: usize, height: usize) -> Framebuffer {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (frames, out, (width, height)) = parse_args();
+    let args = parse_args();
+    let (frames, out, (width, height)) = (args.frames, args.out, args.size);
     let mut world = build_world();
     for _ in 0..frames {
         world.step();
     }
-    let fb = render(&world, width, height);
-    write_ppm(&out, &fb)?;
+    if args.wireframe {
+        let fb = render(&world, width, height);
+        write_ppm(&out, &fb)?;
+    } else {
+        let path = args
+            .frames_dir
+            .as_ref()
+            .map_or_else(|| out.clone(), |directory| directory.join("frame-00.ppm"));
+        let items = showcase_support::world_items(&world);
+        showcase_support::write_frame(
+            &items,
+            showcase_support::composition("stack"),
+            width,
+            height,
+            &format!("solver stack  |  step {frames}"),
+            path,
+        )?;
+    }
     println!(
         "wrote {} ({}x{}) — final positions:",
         out.display(),

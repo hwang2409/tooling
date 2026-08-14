@@ -16,6 +16,8 @@
 //!   - mesh: face edges (the tetrahedron has 6 edges).
 //!   - box: 12 edges.
 
+mod showcase_support;
+
 use chimy2::demo::write_ppm;
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
@@ -27,11 +29,22 @@ use newt::world::World;
 
 use std::path::PathBuf;
 
-fn parse_args() -> (usize, PathBuf, (usize, usize), Option<PathBuf>) {
+struct Args {
+    frames: usize,
+    out: PathBuf,
+    size: (usize, usize),
+    model: Option<PathBuf>,
+    frames_dir: Option<PathBuf>,
+    wireframe: bool,
+}
+
+fn parse_args() -> Args {
     let mut frames = 800usize;
     let mut out = PathBuf::from("newt-pile.ppm");
     let mut size = (800usize, 480usize);
     let mut model: Option<PathBuf> = None;
+    let mut frames_dir = None;
+    let mut wireframe = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -43,10 +56,19 @@ fn parse_args() -> (usize, PathBuf, (usize, usize), Option<PathBuf>) {
                 let (w, h) = s.split_once('x').expect("--size WxH");
                 size = (w.parse().unwrap(), h.parse().unwrap());
             }
+            "--frames-dir" => frames_dir = Some(PathBuf::from(args.next().unwrap())),
+            "--wireframe" => wireframe = true,
             _ => panic!("unknown arg: {a}"),
         }
     }
-    (frames, out, size, model)
+    Args {
+        frames,
+        out,
+        size,
+        model,
+        frames_dir,
+        wireframe,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -470,7 +492,8 @@ fn render(world: &World, width: usize, height: usize) -> Framebuffer {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (frames, out, (width, height), model_path) = parse_args();
+    let args = parse_args();
+    let (frames, out, (width, height), model_path) = (args.frames, args.out, args.size, args.model);
     // Either load from JSON (--model) or build programmatically. Both paths
     // produce byte-identical states — pinned by
     // `tests/model_load.rs::pile_json_matches_programmatic_construction_exactly`.
@@ -486,8 +509,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..frames {
         world.step();
     }
-    let fb = render(&world, width, height);
-    write_ppm(&out, &fb)?;
+    if args.wireframe {
+        let fb = render(&world, width, height);
+        write_ppm(&out, &fb)?;
+    } else {
+        let path = args
+            .frames_dir
+            .as_ref()
+            .map_or_else(|| out.clone(), |directory| directory.join("frame-00.ppm"));
+        let items = showcase_support::world_items(&world);
+        showcase_support::write_frame(
+            &items,
+            showcase_support::composition("pile"),
+            width,
+            height,
+            &format!("mixed geom pile  |  step {frames}"),
+            path,
+        )?;
+    }
     // Report final positions so the human running the demo can eyeball
     // whether everything settled (no NaN, no negative z, boxes stacked).
     println!(
