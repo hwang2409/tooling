@@ -385,16 +385,28 @@ impl World {
     /// wanting a snapshot before the first integration) can force an
     /// evaluation.
     pub fn evaluate_sensors(&mut self, pairs: &[(usize, usize)]) {
-        // Take the sensor bank out temporarily so `build_sensor_inputs` can
-        // borrow `self` immutably without conflicting with the &mut we need
-        // for the sensor writeback. `std::mem::take` swaps in the default
-        // (empty) SensorBank; we restore the original at the end.
-        let mut bank = std::mem::take(&mut self.sensors);
-        {
-            let inputs = self.build_sensor_inputs(pairs);
-            crate::sensor::evaluate(&mut bank, &inputs);
+        // Take the sensor bank out temporarily so `build_sensor_inputs`
+        // can borrow the rest of `self` immutably without conflicting
+        // with the &mut we need for the writeback. A scope guard restores
+        // the bank on Drop so a panic inside `evaluate` doesn't leave the
+        // world with an empty SensorBank.
+        struct Restore<'w> {
+            world: &'w mut World,
+            bank: SensorBank,
         }
-        self.sensors = bank;
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                std::mem::swap(&mut self.world.sensors, &mut self.bank);
+            }
+        }
+        let bank_taken = std::mem::take(&mut self.sensors);
+        let mut guard = Restore {
+            world: self,
+            bank: bank_taken,
+        };
+        let inputs = guard.world.build_sensor_inputs(pairs);
+        crate::sensor::evaluate(&mut guard.bank, &inputs);
+        // Guard's Drop restores the bank into `self.sensors`.
     }
 
     /// Build the [`SensorInputs`] bundle for the post-step state. Uses the
@@ -424,7 +436,7 @@ impl World {
                     let w = self.compute_wrenches(&self.bodies, pairs);
                     let f: Vec<f32> = free_body_contacts
                         .iter()
-                        .map(|c| penalty_normal_force(c, &self.bodies, &self.geoms))
+                        .map(|c| penalty_normal_force(c, &self.bodies, &self.trees, &self.geoms))
                         .collect();
                     (w, f)
                 }
@@ -470,7 +482,12 @@ impl World {
             let cts =
                 collect_contacts_full(&self.bodies, &self.trees, &self.geoms, &self.meshes, &tp);
             for c in &cts {
-                tree_contact_forces.push(penalty_normal_force(c, &self.bodies, &self.geoms));
+                tree_contact_forces.push(penalty_normal_force(
+                    c,
+                    &self.bodies,
+                    &self.trees,
+                    &self.geoms,
+                ));
             }
             tree_contacts.extend(cts);
         }
@@ -487,7 +504,6 @@ impl World {
             trees: &self.trees,
             geoms: &self.geoms,
             meshes: &self.meshes,
-            pairs,
             gravity: self.gravity,
             dt: self.dt,
             body_wrenches,
@@ -1196,17 +1212,23 @@ fn shape_name(s: GeomShape) -> &'static str {
 /// contact wrenches under [`SolverMode::Penalty`]. Used by the touch
 /// sensor input assembly so a touch reading in Penalty mode reports the
 /// force the world would actually apply at this contact.
-fn penalty_normal_force(c: &Contact, bodies: &[Body], geoms: &[Geom]) -> f32 {
+fn penalty_normal_force(c: &Contact, bodies: &[Body], trees: &[Tree], geoms: &[Geom]) -> f32 {
     let ga = &geoms[c.geom_a];
     let gb = &geoms[c.geom_b];
-    let ma = match ga.attachment() {
-        GeomAttach::Body(i) => bodies[i].mass,
-        _ => 0.0,
+    // Mass resolution mirrors `apply_tree_contact_wrench`: body geoms use
+    // their body mass; link geoms use their link mass; static geoms count
+    // as infinite (treated as zero here so the pair reduces to the
+    // dynamic side alone). Missing the link branch was the touch-on-link
+    // blocker: link-attached feet always read 0 N.
+    let mass_for = |att: GeomAttach| -> f32 {
+        match att {
+            GeomAttach::Body(i) => bodies[i].mass,
+            GeomAttach::Link(t, l) => trees[t].links[l].mass,
+            GeomAttach::Static => 0.0,
+        }
     };
-    let mb = match gb.attachment() {
-        GeomAttach::Body(i) => bodies[i].mass,
-        _ => 0.0,
-    };
+    let ma = mass_for(ga.attachment());
+    let mb = mass_for(gb.attachment());
     let m_eff = if ma > 0.0 && mb > 0.0 {
         ma * mb / (ma + mb)
     } else if ma > 0.0 {
@@ -1222,24 +1244,32 @@ fn penalty_normal_force(c: &Contact, bodies: &[Body], geoms: &[Geom]) -> f32 {
     if pen_eff <= 0.0 {
         return 0.0;
     }
-    // Approximate v_n from body linear velocities projected onto the
-    // contact normal at the contact point.
-    let v_a = match ga.attachment() {
-        GeomAttach::Body(i) => {
-            let b = &bodies[i];
-            let r = c.position_world - b.position;
-            b.linear_velocity + b.angular_velocity_world().cross(r)
+    // World-frame point velocity at the contact for each side. Body geoms
+    // read directly from `Body`; link geoms walk the tree's velocity
+    // recursion via the sensor helper (avoids duplicating the ω → v_world
+    // machinery). Static geoms contribute zero.
+    let point_v = |att: GeomAttach| -> Vec3 {
+        match att {
+            GeomAttach::Static => Vec3::ZERO,
+            GeomAttach::Body(i) => {
+                let b = &bodies[i];
+                let r = c.position_world - b.position;
+                b.linear_velocity + b.angular_velocity_world().cross(r)
+            }
+            GeomAttach::Link(t, l) => {
+                let tree = &trees[t];
+                let poses = tree_forward_kinematics(tree);
+                let (com, ori) = poses[l];
+                let (v_lin_body, omega_body) = crate::sensor::link_body_frame_vw_at_rest(tree, l);
+                let v_com_world = ori.rotate(v_lin_body);
+                let omega_world = ori.rotate(omega_body);
+                let r = c.position_world - com;
+                v_com_world + omega_world.cross(r)
+            }
         }
-        _ => Vec3::ZERO,
     };
-    let v_b = match gb.attachment() {
-        GeomAttach::Body(i) => {
-            let b = &bodies[i];
-            let r = c.position_world - b.position;
-            b.linear_velocity + b.angular_velocity_world().cross(r)
-        }
-        _ => Vec3::ZERO,
-    };
+    let v_a = point_v(ga.attachment());
+    let v_b = point_v(gb.attachment());
     let v_n = (v_a - v_b).dot(c.normal_world);
     let f = k * pen_eff - c_damp * v_n;
     if f > 0.0 { f } else { 0.0 }

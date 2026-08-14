@@ -151,6 +151,153 @@ fn accelerometer_at_offset_under_constant_spin_reads_centripetal() {
 }
 
 // ---------------------------------------------------------------------------
+// LINK-ATTACHED accelerometer coverage. The reviewer's blocker-1 probe: a
+// free-root LINK (single-link tree with a free root) spinning AND
+// translating under gravity-only has proper acceleration = 0 everywhere,
+// including at any offset site — because the whole body is in free fall.
+// Before the spatial-to-classical `+ ω × v` correction, this reading was
+// nonzero and matched the missing term exactly.
+// ---------------------------------------------------------------------------
+
+fn free_root_link_scene() -> World {
+    let mut w = World::new();
+    w.dt = 0.005;
+    w.gravity = Vec3::new(0.0, 0.0, -9.81);
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Free,
+        (
+            Vec3::new(0.5, -0.3, 2.0),
+            Quat::from_axis_angle(Vec3::new(1.0, 0.4, -0.2), 0.6),
+        ),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.5,
+        Mat3::diag(0.4, 0.6, 0.5),
+    ));
+    // Spinning AND translating so the ω × v term is nonzero — that's what
+    // the missing correction hides.
+    let twist =
+        newt::spatial::SpatialMotion::new(Vec3::new(1.2, -0.7, 0.9), Vec3::new(0.4, 0.6, -0.3));
+    tree.set_free_root_velocity(twist);
+    w.add_tree(tree);
+    w
+}
+
+#[test]
+fn accelerometer_on_free_root_link_under_gravity_reads_zero() {
+    let mut w = free_root_link_scene();
+    // Site AT COM (offset = 0) — the only site where physical proper
+    // acceleration is EXACTLY zero for a freely-falling body regardless
+    // of its rotation. Any nonzero offset picks up the real centripetal
+    // + Euler terms `ω × (ω × r) + α × r`. This isolates the bug: the
+    // pre-fix reading here would be `−R · (ω_body × v_body)` (the
+    // missing spatial-to-classical correction), matching the reviewer's
+    // (-0.96, -0.51, 0.39) probe order of magnitude for the chosen
+    // twist. After the fix it is bit-close to zero.
+    w.add_sensor(Sensor {
+        name: "imu".into(),
+        kind: SensorKind::Accelerometer(SiteFrame {
+            attach: SensorAttach::Link(0, 0),
+            local_offset: Vec3::ZERO,
+            local_orientation: Quat::from_axis_angle(Vec3::Y, PI / 6.0),
+        }),
+    })
+    .unwrap();
+    w.step();
+    let r = w.sensor(0).unwrap();
+    assert!(
+        r[0].abs() < 5e-3 && r[1].abs() < 5e-3 && r[2].abs() < 5e-3,
+        "free-fall link accelerometer at COM must read (0, 0, 0), got ({}, {}, {}) — \
+         the spatial-to-classical + ω × v correction is missing?",
+        r[0],
+        r[1],
+        r[2],
+    );
+}
+
+#[test]
+fn accelerometer_link_and_body_paths_agree_in_matching_state() {
+    // Two worlds in the same physical state — one with a free body, one
+    // with a single-link free-root tree — must report the same
+    // accelerometer reading at the same offset site. This pins that the
+    // Link path shares the Body path's semantics after the spatial-to-
+    // classical fix.
+    let position = Vec3::new(1.3, -0.5, 4.0);
+    let orientation = Quat::from_axis_angle(Vec3::new(0.4, 1.0, -0.3), 0.7);
+    let omega_body = Vec3::new(0.8, -0.4, 1.1);
+    let linear_v_world = Vec3::new(0.3, 0.4, -0.5);
+    let inertia = Mat3::diag(0.4, 0.6, 0.5);
+    let mass = 1.5;
+    let offset = Vec3::new(0.15, -0.1, 0.2);
+    let local_orientation = Quat::from_axis_angle(Vec3::Y, PI / 6.0);
+
+    // Body-attached world.
+    let mut wb = World::new();
+    wb.dt = 0.005;
+    wb.gravity = Vec3::new(0.0, 0.0, -9.81);
+    let mut b = Body::new(mass, inertia, position, orientation);
+    b.angular_velocity_body = omega_body;
+    b.linear_velocity = linear_v_world;
+    wb.add_body(b);
+    wb.add_sensor(Sensor {
+        name: "imu".into(),
+        kind: SensorKind::Accelerometer(SiteFrame {
+            attach: SensorAttach::Body(0),
+            local_offset: offset,
+            local_orientation,
+        }),
+    })
+    .unwrap();
+
+    // Link-attached world — free-root link with identical state.
+    let mut wl = World::new();
+    wl.dt = 0.005;
+    wl.gravity = Vec3::new(0.0, 0.0, -9.81);
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Free,
+        (position, orientation),
+        (Vec3::ZERO, Quat::IDENTITY),
+        mass,
+        inertia,
+    ));
+    // Free-root twist is body-frame at COM: angular then linear.
+    // linear_body = R^T · linear_world.
+    let linear_body = orientation.inverse_rotate(linear_v_world);
+    let twist = newt::spatial::SpatialMotion::new(omega_body, linear_body);
+    tree.set_free_root_velocity(twist);
+    wl.add_tree(tree);
+    wl.add_sensor(Sensor {
+        name: "imu".into(),
+        kind: SensorKind::Accelerometer(SiteFrame {
+            attach: SensorAttach::Link(0, 0),
+            local_offset: offset,
+            local_orientation,
+        }),
+    })
+    .unwrap();
+
+    // Evaluate both — no step needed (posed).
+    wb.evaluate_sensors(&[]);
+    wl.evaluate_sensors(&[]);
+    let rb = wb.sensor(0).unwrap();
+    let rl = wl.sensor(0).unwrap();
+    let tol = 1e-3;
+    assert!(
+        (rb[0] - rl[0]).abs() < tol && (rb[1] - rl[1]).abs() < tol && (rb[2] - rl[2]).abs() < tol,
+        "body vs link accelerometer disagree: body = ({}, {}, {}), link = ({}, {}, {})",
+        rb[0],
+        rb[1],
+        rb[2],
+        rl[0],
+        rl[1],
+        rl[2],
+    );
+}
+
+// ---------------------------------------------------------------------------
 // gyro on a spinning free body: reading equals body-frame ω, rotated into
 // site frame. Independent code path from `Body::angular_velocity_body`
 // because gyro goes through the site-frame transform.
@@ -375,14 +522,96 @@ fn framepos_framequat_on_end_of_posed_2link_arm() {
     // Rod-2 world orientation = Rot_x(π). Quaternion (x=1, y=0, z=0, w=0)
     // up to sign. Site local_orientation = IDENTITY so site orientation
     // matches parent's.
-    let ax = q[0].abs();
-    let ay = q[1].abs();
-    let az = q[2].abs();
-    let aw = q[3].abs();
-    assert!(approx(ax, 1.0, 1e-4), "|x| = {} (expected 1)", ax);
-    assert!(approx(ay, 0.0, 1e-4), "|y| = {}", ay);
-    assert!(approx(az, 0.0, 1e-4), "|z| = {}", az);
-    assert!(approx(aw, 0.0, 1e-4), "|w| = {}", aw);
+    //
+    // A unit quaternion is only unique up to a global sign (q and -q
+    // represent the same rotation), so we compare against `q_expected`
+    // AND `-q_expected` and require exact match to one of them. A test
+    // that only checked component absolute values would silently accept
+    // a conjugate mutant (x → -x, y → -y, z → -z while w stays) because
+    // magnitudes would still line up.
+    let expected = Quat::new(1.0, 0.0, 0.0, 0.0);
+    let mine = Quat::new(q[0], q[1], q[2], q[3]);
+    let match_pos = (mine.x - expected.x).abs() < 1e-4
+        && (mine.y - expected.y).abs() < 1e-4
+        && (mine.z - expected.z).abs() < 1e-4
+        && (mine.w - expected.w).abs() < 1e-4;
+    let match_neg = (mine.x + expected.x).abs() < 1e-4
+        && (mine.y + expected.y).abs() < 1e-4
+        && (mine.z + expected.z).abs() < 1e-4
+        && (mine.w + expected.w).abs() < 1e-4;
+    assert!(
+        match_pos || match_neg,
+        "framequat = ({}, {}, {}, {}); expected ±(1, 0, 0, 0)",
+        q[0],
+        q[1],
+        q[2],
+        q[3]
+    );
+}
+
+/// Discriminating anchor: a non-180° rotation whose framequat cannot
+/// coincide with its own conjugate (a conjugate mutant `(x, y, z) → (-x,
+/// -y, -z)` produces a physically DIFFERENT rotation for θ ≠ π, and the
+/// sign-canonical `±q` comparison catches it).
+#[test]
+fn framequat_rejects_conjugate_mutant_at_non_180_rotation() {
+    let mut w = World::new();
+    w.gravity = Vec3::ZERO;
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    // Hinge about +x, angle = π/4 → child quat = (sin(π/8), 0, 0, cos(π/8))
+    //                              ≈ (0.383, 0, 0, 0.924).
+    // The conjugate would be (-0.383, 0, 0, 0.924) — a different rotation.
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::hinge(Vec3::X),
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1e-3, 1e-3, 1e-3),
+    ));
+    tree.set_hinge_angle(1, PI / 4.0);
+    let ti = w.add_tree(tree);
+    w.add_sensor(Sensor {
+        name: "q".into(),
+        kind: SensorKind::FrameQuat(SiteFrame {
+            attach: SensorAttach::Link(ti, 1),
+            local_offset: Vec3::ZERO,
+            local_orientation: Quat::IDENTITY,
+        }),
+    })
+    .unwrap();
+    w.evaluate_sensors(&[]);
+    let r = w.sensor(0).unwrap();
+    let expected = Quat::from_axis_angle(Vec3::X, PI / 4.0);
+    let mine = Quat::new(r[0], r[1], r[2], r[3]);
+    let match_pos = (mine.x - expected.x).abs() < 1e-4
+        && (mine.y - expected.y).abs() < 1e-4
+        && (mine.z - expected.z).abs() < 1e-4
+        && (mine.w - expected.w).abs() < 1e-4;
+    let match_neg = (mine.x + expected.x).abs() < 1e-4
+        && (mine.y + expected.y).abs() < 1e-4
+        && (mine.z + expected.z).abs() < 1e-4
+        && (mine.w + expected.w).abs() < 1e-4;
+    assert!(
+        match_pos || match_neg,
+        "framequat = ({}, {}, {}, {}); expected ±({}, {}, {}, {})",
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        expected.x,
+        expected.y,
+        expected.z,
+        expected.w,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +637,56 @@ fn touch_on_resting_sphere_penalty_mode_reads_mg() {
     assert!(
         approx(r[0], mg, 0.6),
         "penalty touch = {} (expected {})",
+        r[0],
+        mg
+    );
+}
+
+#[test]
+fn touch_on_link_attached_sphere_resting_on_plane_reads_mg() {
+    // Blocker-2 anchor: a link-attached sphere sitting on a static plane
+    // must read ≈ link.mass · g. Before the fix `penalty_normal_force`
+    // resolved mass only for `GeomAttach::Body` — link geoms fell through
+    // to `m_eff = 0` and the touch sensor silently reported zero.
+    let mut w = World::new();
+    w.dt = 0.005;
+    w.gravity = Vec3::new(0.0, 0.0, -9.81);
+    let mut tree = Tree::new();
+    let mass = 1.25;
+    let radius = 0.4;
+    // Free-root link whose sphere geom will settle on the ground.
+    tree.push_link(Link::new(
+        None,
+        JointKind::Free,
+        (Vec3::new(0.0, 0.0, radius + 0.01), Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        mass,
+        newt::geom::solid_sphere_inertia(mass, radius),
+    ));
+    let tree_idx = w.add_tree(tree);
+    // Static plane at z=0 + link-attached sphere.
+    w.add_geom(newt::geom::Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5));
+    w.add_geom(newt::geom::Geom::sphere_on_link(
+        tree_idx,
+        0,
+        radius,
+        Vec3::ZERO,
+        0.5,
+    ));
+    // Sphere geom is index 1 (plane is 0).
+    w.add_sensor(Sensor {
+        name: "foot".into(),
+        kind: SensorKind::Touch { geom: 1 },
+    })
+    .unwrap();
+    for _ in 0..800 {
+        w.step();
+    }
+    let r = w.sensor(0).unwrap();
+    let mg = mass * 9.81;
+    assert!(
+        approx(r[0], mg, 0.8),
+        "link-attached sphere touch = {} (expected {} = m·g)",
         r[0],
         mg
     );
@@ -637,6 +916,101 @@ fn body_state_bytes(w: &World) -> Vec<u8> {
         }
     }
     bytes
+}
+
+fn resting_sphere_scene() -> World {
+    let mut w = World::new();
+    w.dt = 0.005;
+    w.gravity = Vec3::new(0.0, 0.0, -9.81);
+    let radius = 0.5;
+    // A body dropped with some sideways drift so contact wrenches are
+    // dynamically nontrivial across the step window.
+    let mut b = Body::solid_sphere(
+        1.2,
+        radius,
+        Vec3::new(0.0, 0.0, radius + 0.05),
+        Quat::IDENTITY,
+    );
+    b.linear_velocity = Vec3::new(0.15, -0.1, 0.0);
+    b.angular_velocity_body = Vec3::new(0.2, -0.3, 0.05);
+    w.add_body(b);
+    w.add_geom(newt::geom::Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5));
+    w.add_geom(newt::geom::Geom::sphere(0, radius, Vec3::ZERO, 0.5));
+    w
+}
+
+#[test]
+fn stepping_with_sensors_matches_without_under_penalty_contacts() {
+    // Same physical trajectory whether or not sensors run: for a
+    // contact-heavy scene under `Penalty` the sensor pipeline recomputes
+    // wrenches, but MUST NOT mutate world state. Byte-compared over
+    // 400 steps.
+    let mut plain = resting_sphere_scene();
+    let mut instrumented = resting_sphere_scene();
+    instrumented
+        .add_sensor(Sensor {
+            name: "foot".into(),
+            kind: SensorKind::Touch { geom: 1 },
+        })
+        .unwrap();
+    instrumented
+        .add_sensor(Sensor {
+            name: "imu".into(),
+            kind: SensorKind::Accelerometer(SiteFrame {
+                attach: SensorAttach::Body(0),
+                local_offset: Vec3::new(0.1, 0.0, 0.0),
+                local_orientation: Quat::IDENTITY,
+            }),
+        })
+        .unwrap();
+    for _ in 0..400 {
+        plain.step();
+        instrumented.step();
+    }
+    assert_eq!(
+        body_state_bytes(&plain),
+        body_state_bytes(&instrumented),
+        "penalty-contact scene: sensor evaluation perturbed the simulation state"
+    );
+}
+
+#[test]
+fn stepping_with_sensors_matches_without_under_pgs_contacts() {
+    // Same as above but with `SolverMode::Pgs` — the PGS re-solve inside
+    // the sensor pipeline must not touch world state.
+    let mut plain = resting_sphere_scene();
+    let mut instrumented = resting_sphere_scene();
+    plain.solver = SolverConfig {
+        mode: SolverMode::Pgs,
+        iterations: 30,
+        ..SolverConfig::DEFAULT
+    };
+    instrumented.solver = plain.solver;
+    instrumented
+        .add_sensor(Sensor {
+            name: "foot".into(),
+            kind: SensorKind::Touch { geom: 1 },
+        })
+        .unwrap();
+    instrumented
+        .add_sensor(Sensor {
+            name: "imu".into(),
+            kind: SensorKind::Accelerometer(SiteFrame {
+                attach: SensorAttach::Body(0),
+                local_offset: Vec3::new(0.1, 0.0, 0.0),
+                local_orientation: Quat::IDENTITY,
+            }),
+        })
+        .unwrap();
+    for _ in 0..400 {
+        plain.step();
+        instrumented.step();
+    }
+    assert_eq!(
+        body_state_bytes(&plain),
+        body_state_bytes(&instrumented),
+        "PGS-contact scene: sensor evaluation perturbed the simulation state"
+    );
 }
 
 #[test]

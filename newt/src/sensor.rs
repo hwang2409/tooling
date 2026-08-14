@@ -19,8 +19,8 @@
 //! | [`SensorKind::Gyro`] | 3 | Site-frame angular velocity of the site's parent link. |
 //! | [`SensorKind::Accelerometer`] | 3 | Proper acceleration in the site frame (linear specific force). |
 //! | [`SensorKind::Touch`] | 1 | Sum of penalty normal-force magnitudes on the designated geom. |
-//! | [`SensorKind::Force`] | 3 | Force transmitted through a link's parent joint, in child body frame at COM. |
-//! | [`SensorKind::Torque`] | 3 | Torque transmitted through a link's parent joint, in child body frame at COM. |
+//! | [`SensorKind::Force`] | 3 | Force transmitted through a link's parent joint, in the child body frame. |
+//! | [`SensorKind::Torque`] | 3 | Torque transmitted through a link's parent joint, at the joint anchor, in the child body frame. |
 //!
 //! # Evaluation timing (no perturbation)
 //!
@@ -65,9 +65,10 @@
 //! [`SensorKind::Force`] and [`SensorKind::Torque`] report the interaction
 //! wrench that the parent link must exert on the specified child link
 //! through the joint to produce the observed acceleration. Both are
-//! expressed in the child's body frame at the child COM — the same
-//! convention as RNE's per-link accumulated wrench (`w.f[i]` in
-//! [`crate::dynamics::inverse_dynamics`]). The sensor recomputes this
+//! expressed in the child's body frame. Force is translation-invariant
+//! (same value at COM and at the joint anchor); torque is reported AT
+//! THE JOINT ANCHOR, translated from RNE's per-link COM torque via
+//! `τ_joint = τ_com − r_com_to_joint × F`. The sensor recomputes this
 //! via RNE on the post-step `(q, qdot, qddot)`.
 //!
 //! # Touch semantics
@@ -168,10 +169,10 @@ pub enum SensorKind {
     /// Sum of penalty normal-force magnitudes on this geom.
     Touch { geom: usize },
     /// Interaction force at the child link's parent-joint connection,
-    /// in the child body frame at COM.
+    /// in the child body frame (translation-invariant).
     Force { tree: usize, link: usize },
     /// Interaction torque at the child link's parent-joint connection,
-    /// in the child body frame at COM.
+    /// reported at the joint anchor in the child body frame.
     Torque { tree: usize, link: usize },
 }
 
@@ -369,7 +370,6 @@ pub struct SensorInputs<'a> {
     pub trees: &'a [Tree],
     pub geoms: &'a [Geom],
     pub meshes: &'a [crate::geom::ConvexMesh],
-    pub pairs: &'a [(usize, usize)],
     pub gravity: Vec3,
     pub dt: f32,
     /// Per-free-body external world-frame wrench `(force, torque_about_com)`.
@@ -848,10 +848,19 @@ fn accelerometer_reading(
             let (v_body, a_body) = tree_va[t][l];
             let omega_world = ori.rotate(v_body.angular);
             let alpha_world = ori.rotate(a_body.angular);
-            // In Featherstone's spatial notation the "linear" of a spatial
-            // motion at the COM is the inertial-frame linear velocity /
-            // acceleration expressed in body coords. Rotate into world.
-            let a_com_world = ori.rotate(a_body.linear);
+            // Featherstone's spatial `a` is the body-frame derivative of
+            // the spatial velocity, NOT the classical inertial-frame COM
+            // acceleration. The two differ by the frame-carrying
+            // `ω × v_body` term:
+            //   a_com_body_classical = a_body.linear + ω_body × v_body.linear
+            // Rotating that into world gives the world-frame COM
+            // acceleration the site formula needs. Missing this term made
+            // link-attached accelerometers overreport by exactly that
+            // correction (reviewer probe: gravity-only spinning +
+            // translating free-root link read (-0.96, -0.51, 0.39) instead
+            // of the true (0, 0, 0)).
+            let a_com_body_classical = a_body.linear + v_body.angular.cross(v_body.linear);
+            let a_com_world = ori.rotate(a_com_body_classical);
             (com, ori, omega_world, alpha_world, a_com_world)
         }
     };
@@ -868,6 +877,18 @@ fn accelerometer_reading(
     // Rotate into site frame. Site orientation in world = parent_ori · local_orientation.
     let site_ori_world = parent_ori * s.local_orientation;
     site_ori_world.inverse_rotate(a_proper)
+}
+
+/// World-frame `(v_com_body, ω_body)` for a link at its current `(q, qdot)`,
+/// treating the tree as if `qddot = 0` (only `v` matters — `a` is discarded).
+/// Consumed by [`crate::world::penalty_normal_force`] so link-attached
+/// contact touch readings pick up the same point velocity the world's own
+/// wrench assembly uses.
+pub fn link_body_frame_vw_at_rest(tree: &Tree, target: usize) -> (Vec3, Vec3) {
+    let qddot = vec![0.0f32; tree.nv()];
+    let va = compute_link_va(tree, &qddot);
+    let (v, _) = va[target];
+    (v.linear, v.angular)
 }
 
 /// Sum per-contact normal-force magnitudes over every contact that
