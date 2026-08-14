@@ -1159,6 +1159,15 @@ impl Loader {
         } else {
             (JointKind::Fixed, Vec3::ZERO, None)
         };
+        let mut ancestor = Some(parent_link_idx);
+        while let Some(index) = ancestor {
+            if self.world.trees[tree_idx].links[index].mocap
+                && !matches!(joint_kind, JointKind::Fixed)
+            {
+                return fail(path, "mocap root cannot have movable descendants");
+            }
+            ancestor = self.world.trees[tree_idx].links[index].parent;
+        }
 
         // Map MJCF body.pos + joint.pos into newt joint offsets.
         let joint_offset_in_parent = (body_pos + joint_pos_in_body, Quat::IDENTITY);
@@ -2521,11 +2530,18 @@ impl Loader {
                     None => Ok(vec![0.0; count]),
                 }
             };
+            let qpos = read("qpos", q_count)?;
+            let qvel = read("qvel", qdot_count)?;
+            let key_path_for_state = key_path.clone();
+            let (q, qdot) = self
+                .world
+                .mujoco_tree_keyframe_state(&qpos, &qvel)
+                .map_err(|error| MjcfError::new(key_path_for_state, error.0))?;
             self.world
                 .add_keyframe(
                     name,
-                    read("qpos", q_count)?,
-                    read("qvel", qdot_count)?,
+                    q,
+                    qdot,
                     read("act", actuator_count)?,
                     read("ctrl", actuator_count)?,
                 )

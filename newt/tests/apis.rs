@@ -1,4 +1,4 @@
-use newt::actuator::Actuator;
+use newt::actuator::{Actuator, BiasType, DynType, GainType};
 use newt::body::Body;
 use newt::geom::Geom;
 use newt::joint::JointKind;
@@ -59,17 +59,28 @@ fn inverse_dynamics_at_uses_explicit_state_without_mutating_tree() {
 fn keyframe_reset_then_step_matches_fresh_state() {
     let mut world = World::new();
     let mut tree = hinge_tree();
-    let actuator = tree.add_actuator(Actuator::motor(1, 1.0, 0.0));
+    let actuator = tree.add_actuator(Actuator::general(
+        1,
+        GainType::Fixed,
+        [1.0, 0.0, 0.0],
+        BiasType::None,
+        [0.0, 0.0, 0.0],
+        1.0,
+        DynType::Filter,
+        [0.1],
+        None,
+        None,
+    ));
     world.add_tree(tree);
     world
-        .add_keyframe("pose", vec![0.35], vec![-0.2], vec![0.0], vec![0.6])
+        .add_keyframe("pose", vec![0.35], vec![-0.2], vec![0.25], vec![0.6])
         .unwrap();
 
     let mut fresh = world.clone();
     fresh.keyframes.clear();
     fresh.trees[0].q[0] = 0.35;
     fresh.trees[0].qdot[0] = -0.2;
-    fresh.trees[0].actuators[actuator].act = 0.0;
+    fresh.trees[0].actuators[actuator].act = 0.25;
     fresh.trees[0].actuators[actuator].ctrl = 0.6;
 
     world.reset_to_keyframe("pose").unwrap();
@@ -120,13 +131,35 @@ fn rangefinder_and_magnetometer_use_site_frame() {
 #[test]
 fn mocap_root_pose_is_not_integrated_under_force() {
     let mut world = World::new();
-    let mut tree = hinge_tree();
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
     tree.set_mocap(0, true);
     tree.set_link_wrench(0, Vec3::new(100.0, 0.0, 0.0), Vec3::ZERO);
     world.add_tree(tree);
     world.set_mocap_pose(0, Vec3::new(2.0, 0.0, 0.0), Quat::IDENTITY);
     world.step();
     assert_eq!(world.tree_link_pose(0, 0).0, Vec3::new(2.0, 0.0, 0.0));
+}
+
+#[test]
+fn mocap_root_restore_does_not_freeze_descendant_slots() {
+    let mut world = World::new();
+    world.gravity = Vec3::new(0.0, -9.81, 0.0);
+    let mut tree = hinge_tree();
+    tree.links[0].mocap = true;
+    world.add_tree(tree);
+    let initial = world.trees[0].q[0];
+    for _ in 0..10 {
+        world.step();
+    }
+    assert!((world.trees[0].q[0] - initial).abs() > 1e-5);
 }
 
 #[test]

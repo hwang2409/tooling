@@ -41,6 +41,7 @@ use crate::geom::{
     ConvexMesh, Geom, GeomAttach, GeomPose, GeomShape, combine_solref, geom_world_pose,
     solref_to_kc,
 };
+use crate::joint::JointKind;
 use crate::math::{Quat, Vec3};
 use crate::sensor::{Sensor, SensorBank, SensorError, SensorInputs};
 use crate::solver::{SolverConfig, SolverMode, solve_free_bodies};
@@ -261,6 +262,141 @@ impl World {
             }
         }
         Ok(())
+    }
+
+    /// Apply MuJoCo's qpos layout to this world's state.
+    ///
+    /// This is shared by the differential harness and the MJCF keyframe
+    /// loader. MuJoCo stores quaternions as `(w, x, y, z)`; free-root qvel
+    /// stores world-frame linear velocity before body-frame angular velocity.
+    pub fn apply_mujoco_qpos(&mut self, qpos: &[f32]) {
+        let mut cursor = 0usize;
+        for body in &mut self.bodies {
+            body.position = Vec3::new(qpos[cursor], qpos[cursor + 1], qpos[cursor + 2]);
+            body.orientation = Quat::new(
+                qpos[cursor + 4],
+                qpos[cursor + 5],
+                qpos[cursor + 6],
+                qpos[cursor + 3],
+            )
+            .renormalize();
+            cursor += 7;
+        }
+        for tree in &mut self.trees {
+            for i in 0..tree.links.len() {
+                let q_off = tree.q_offset[i];
+                match tree.links[i].joint {
+                    JointKind::Free => {
+                        tree.q[q_off..q_off + 3].copy_from_slice(&qpos[cursor..cursor + 3]);
+                        let q = Quat::new(
+                            qpos[cursor + 4],
+                            qpos[cursor + 5],
+                            qpos[cursor + 6],
+                            qpos[cursor + 3],
+                        )
+                        .renormalize();
+                        tree.q[q_off + 3..q_off + 7].copy_from_slice(&[q.x, q.y, q.z, q.w]);
+                        cursor += 7;
+                    }
+                    JointKind::Ball { .. } => {
+                        let q = Quat::new(
+                            qpos[cursor + 1],
+                            qpos[cursor + 2],
+                            qpos[cursor + 3],
+                            qpos[cursor],
+                        )
+                        .renormalize();
+                        tree.q[q_off..q_off + 4].copy_from_slice(&[q.x, q.y, q.z, q.w]);
+                        cursor += 4;
+                    }
+                    JointKind::Hinge { .. } | JointKind::Slide { .. } => {
+                        tree.q[q_off] = qpos[cursor];
+                        cursor += 1;
+                    }
+                    JointKind::Fixed => {}
+                }
+            }
+        }
+        assert_eq!(cursor, qpos.len(), "MuJoCo qpos has trailing values");
+    }
+
+    /// Apply MuJoCo's qvel layout to this world's state.
+    pub fn apply_mujoco_qvel(&mut self, qvel: &[f32]) {
+        let mut cursor = 0usize;
+        for body in &mut self.bodies {
+            body.linear_velocity = Vec3::new(qvel[cursor], qvel[cursor + 1], qvel[cursor + 2]);
+            body.angular_velocity_body =
+                Vec3::new(qvel[cursor + 3], qvel[cursor + 4], qvel[cursor + 5]);
+            cursor += 6;
+        }
+        for tree in &mut self.trees {
+            for i in 0..tree.links.len() {
+                let v_off = tree.v_offset[i];
+                match tree.links[i].joint {
+                    JointKind::Free => {
+                        let q_off = tree.q_offset[i];
+                        let orientation = Quat::new(
+                            tree.q[q_off + 3],
+                            tree.q[q_off + 4],
+                            tree.q[q_off + 5],
+                            tree.q[q_off + 6],
+                        );
+                        let v_body = orientation.inverse_rotate(Vec3::new(
+                            qvel[cursor],
+                            qvel[cursor + 1],
+                            qvel[cursor + 2],
+                        ));
+                        tree.qdot[v_off..v_off + 6].copy_from_slice(&[
+                            qvel[cursor + 3],
+                            qvel[cursor + 4],
+                            qvel[cursor + 5],
+                            v_body.x,
+                            v_body.y,
+                            v_body.z,
+                        ]);
+                        cursor += 6;
+                    }
+                    JointKind::Ball { .. } => {
+                        tree.qdot[v_off..v_off + 3].copy_from_slice(&qvel[cursor..cursor + 3]);
+                        cursor += 3;
+                    }
+                    JointKind::Hinge { .. } | JointKind::Slide { .. } => {
+                        tree.qdot[v_off] = qvel[cursor];
+                        cursor += 1;
+                    }
+                    JointKind::Fixed => {}
+                }
+            }
+        }
+        assert_eq!(cursor, qvel.len(), "MuJoCo qvel has trailing values");
+    }
+
+    /// Convert a tree-only MuJoCo keyframe into newt's dense tree state.
+    /// Free bodies are not part of the current keyframe vector contract.
+    pub fn mujoco_tree_keyframe_state(
+        &self,
+        qpos: &[f32],
+        qvel: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>), KeyframeError> {
+        if !self.bodies.is_empty() {
+            return Err(KeyframeError(
+                "MJCF keyframes with free bodies are deferred; use tree state only".into(),
+            ));
+        }
+        let mut state = self.clone();
+        state.apply_mujoco_qpos(qpos);
+        state.apply_mujoco_qvel(qvel);
+        let q = state
+            .trees
+            .iter()
+            .flat_map(|tree| tree.q.iter().copied())
+            .collect();
+        let qdot = state
+            .trees
+            .iter()
+            .flat_map(|tree| tree.qdot.iter().copied())
+            .collect();
+        Ok((q, qdot))
     }
 
     fn keyframe_dimensions(&self) -> (usize, usize, usize) {

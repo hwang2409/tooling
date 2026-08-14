@@ -1201,6 +1201,18 @@ fn parse_tree(
         link_names.insert(name, i);
         tree.push_link(link);
     }
+    if tree.links[0].mocap
+        && tree
+            .links
+            .iter()
+            .skip(1)
+            .any(|link| !matches!(link.joint, JointKind::Fixed))
+    {
+        return fail(
+            &format!("{path}.links[0].mocap"),
+            "mocap root cannot have movable descendants",
+        );
+    }
     Ok((tree, name, link_names, self_collide))
 }
 

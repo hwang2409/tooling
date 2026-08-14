@@ -69,7 +69,7 @@ fn keyframe_and_mocap_load_from_json() {
     {
       "trees":[{"name":"t","links":[
         {"name":"root","joint":{"kind":"fixed"},"mass":1,
-         "inertia":{"kind":"diag","values":[1,1,1]},"mocap":true},
+         "inertia":{"kind":"diag","values":[1,1,1]}},
         {"name":"hip","parent":"root","joint":{"kind":"hinge","axis":[0,0,1]},"mass":1,
          "inertia":{"kind":"diag","values":[1,1,1]}}
       ]}],
@@ -77,10 +77,29 @@ fn keyframe_and_mocap_load_from_json() {
     }
     "#;
     let mut scene = load_str(src).unwrap();
-    assert!(scene.world.trees[0].links[0].mocap);
     scene.world.reset_to_keyframe("ready").unwrap();
     assert_eq!(scene.world.trees[0].q, vec![0.2]);
     assert_eq!(scene.world.trees[0].qdot, vec![-0.1]);
+}
+
+#[test]
+fn mocap_movable_descendant_rejected_from_json() {
+    let src = r#"
+    {
+      "trees":[{"name":"t","links":[
+        {"name":"root","joint":{"kind":"fixed"},"mass":1,
+         "inertia":{"kind":"diag","values":[1,1,1]},"mocap":true},
+        {"name":"hip","parent":"root","joint":{"kind":"hinge","axis":[0,0,1]},"mass":1,
+         "inertia":{"kind":"diag","values":[1,1,1]}}
+      ]}]
+    }
+    "#;
+    let error = load_str(src).expect_err("mocap movable descendant must be rejected");
+    assert!(
+        error
+            .message
+            .contains("mocap root cannot have movable descendants")
+    );
 }
 
 #[test]

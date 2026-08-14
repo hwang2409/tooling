@@ -501,135 +501,13 @@ fn expect_f64_vec(v: Value) -> Vec<f64> {
 // `floating_base` proves the remap works.
 
 fn apply_init_qpos(world: &mut World, qpos: &[f64]) {
-    let mut cursor = 0usize;
-    for body in world.bodies.iter_mut() {
-        // MuJoCo layout for a freejoint body: (px, py, pz, qw, qx, qy, qz).
-        body.position = Vec3::new(
-            qpos[cursor] as f32,
-            qpos[cursor + 1] as f32,
-            qpos[cursor + 2] as f32,
-        );
-        let qw = qpos[cursor + 3] as f32;
-        let qx = qpos[cursor + 4] as f32;
-        let qy = qpos[cursor + 5] as f32;
-        let qz = qpos[cursor + 6] as f32;
-        assert_unit_quat(qw, qx, qy, qz, "world.bodies free-body init_qpos");
-        body.orientation = Quat::new(qx, qy, qz, qw).renormalize();
-        cursor += 7;
-    }
-    for tree in world.trees.iter_mut() {
-        let n_links = tree.links.len();
-        for i in 0..n_links {
-            let q_off = tree.q_offset[i];
-            match tree.links[i].joint {
-                JointKind::Free => {
-                    tree.q[q_off] = qpos[cursor] as f32;
-                    tree.q[q_off + 1] = qpos[cursor + 1] as f32;
-                    tree.q[q_off + 2] = qpos[cursor + 2] as f32;
-                    let qw = qpos[cursor + 3] as f32;
-                    let qx = qpos[cursor + 4] as f32;
-                    let qy = qpos[cursor + 5] as f32;
-                    let qz = qpos[cursor + 6] as f32;
-                    assert_unit_quat(qw, qx, qy, qz, "tree free-root init_qpos");
-                    let renorm = Quat::new(qx, qy, qz, qw).renormalize();
-                    tree.q[q_off + 3] = renorm.x;
-                    tree.q[q_off + 4] = renorm.y;
-                    tree.q[q_off + 5] = renorm.z;
-                    tree.q[q_off + 6] = renorm.w;
-                    cursor += 7;
-                }
-                JointKind::Ball { .. } => {
-                    let qw = qpos[cursor] as f32;
-                    let qx = qpos[cursor + 1] as f32;
-                    let qy = qpos[cursor + 2] as f32;
-                    let qz = qpos[cursor + 3] as f32;
-                    assert_unit_quat(qw, qx, qy, qz, "tree ball init_qpos");
-                    let renorm = Quat::new(qx, qy, qz, qw).renormalize();
-                    tree.q[q_off] = renorm.x;
-                    tree.q[q_off + 1] = renorm.y;
-                    tree.q[q_off + 2] = renorm.z;
-                    tree.q[q_off + 3] = renorm.w;
-                    cursor += 4;
-                }
-                JointKind::Hinge { .. } | JointKind::Slide { .. } => {
-                    tree.q[q_off] = qpos[cursor] as f32;
-                    cursor += 1;
-                }
-                JointKind::Fixed => {}
-            }
-        }
-    }
-    assert_eq!(cursor, qpos.len(), "init_qpos leftover data");
+    let values = qpos.iter().map(|value| *value as f32).collect::<Vec<_>>();
+    world.apply_mujoco_qpos(&values);
 }
 
 fn apply_init_qvel(world: &mut World, qvel: &[f64]) {
-    let mut cursor = 0usize;
-    for body in world.bodies.iter_mut() {
-        // MuJoCo freejoint qvel: (vx, vy, vz world, ωx, ωy, ωz body).
-        body.linear_velocity = Vec3::new(
-            qvel[cursor] as f32,
-            qvel[cursor + 1] as f32,
-            qvel[cursor + 2] as f32,
-        );
-        body.angular_velocity_body = Vec3::new(
-            qvel[cursor + 3] as f32,
-            qvel[cursor + 4] as f32,
-            qvel[cursor + 5] as f32,
-        );
-        cursor += 6;
-    }
-    for tree in world.trees.iter_mut() {
-        let n_links = tree.links.len();
-        for i in 0..n_links {
-            let v_off = tree.v_offset[i];
-            match tree.links[i].joint {
-                JointKind::Free => {
-                    // MJ layout: (vx, vy, vz world, ωx, ωy, ωz body).
-                    // Newt layout: (ωx, ωy, ωz body, vx, vy, vz BODY).
-                    // Convert world linear to body: v_body = R^T * v_world,
-                    // where R is the free-root orientation from newt's q.
-                    let q_off = tree.q_offset[i];
-                    let root_ori = Quat::new(
-                        tree.q[q_off + 3],
-                        tree.q[q_off + 4],
-                        tree.q[q_off + 5],
-                        tree.q[q_off + 6],
-                    );
-                    let v_world = Vec3::new(
-                        qvel[cursor] as f32,
-                        qvel[cursor + 1] as f32,
-                        qvel[cursor + 2] as f32,
-                    );
-                    let v_body = root_ori.inverse_rotate(v_world);
-                    let omega_body = Vec3::new(
-                        qvel[cursor + 3] as f32,
-                        qvel[cursor + 4] as f32,
-                        qvel[cursor + 5] as f32,
-                    );
-                    tree.qdot[v_off] = omega_body.x;
-                    tree.qdot[v_off + 1] = omega_body.y;
-                    tree.qdot[v_off + 2] = omega_body.z;
-                    tree.qdot[v_off + 3] = v_body.x;
-                    tree.qdot[v_off + 4] = v_body.y;
-                    tree.qdot[v_off + 5] = v_body.z;
-                    cursor += 6;
-                }
-                JointKind::Ball { .. } => {
-                    // Both sides angular body.
-                    tree.qdot[v_off] = qvel[cursor] as f32;
-                    tree.qdot[v_off + 1] = qvel[cursor + 1] as f32;
-                    tree.qdot[v_off + 2] = qvel[cursor + 2] as f32;
-                    cursor += 3;
-                }
-                JointKind::Hinge { .. } | JointKind::Slide { .. } => {
-                    tree.qdot[v_off] = qvel[cursor] as f32;
-                    cursor += 1;
-                }
-                JointKind::Fixed => {}
-            }
-        }
-    }
-    assert_eq!(cursor, qvel.len(), "init_qvel leftover data");
+    let values = qvel.iter().map(|value| *value as f32).collect::<Vec<_>>();
+    world.apply_mujoco_qvel(&values);
 }
 
 fn extract_qpos(world: &World) -> Vec<f64> {
@@ -723,19 +601,6 @@ fn extract_qvel(world: &World) -> Vec<f64> {
         }
     }
     out
-}
-
-/// Panic if `(qw, qx, qy, qz)` is not close to unit length. Catches the
-/// zero-quat trap the reviewer flagged: `Quat::renormalize` silently
-/// turns a zero into identity, which is a legal-looking but wrong
-/// starting orientation.
-fn assert_unit_quat(qw: f32, qx: f32, qy: f32, qz: f32, ctx: &str) {
-    let n2 = qw * qw + qx * qx + qy * qy + qz * qz;
-    assert!(
-        (n2 - 1.0).abs() < 1.0e-3,
-        "{ctx}: quaternion norm^2 = {n2} (want ~1); \
-         either the input is not a unit quaternion or the layout was reordered wrong"
-    );
 }
 
 // ---------------------------------------------------------------------------

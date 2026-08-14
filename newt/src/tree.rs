@@ -566,11 +566,20 @@ impl Tree {
     /// a movable child chain in this tier.
     pub fn set_mocap(&mut self, link: usize, mocap: bool) {
         assert_eq!(link, 0, "only a tree root can be mocap in this tier");
-        self.links[link].mocap = mocap;
         assert!(
             matches!(self.links[link].joint, JointKind::Free | JointKind::Fixed),
             "mocap root must use a free or fixed joint"
         );
+        if mocap
+            && self
+                .links
+                .iter()
+                .skip(1)
+                .any(|child| !matches!(child.joint, JointKind::Fixed))
+        {
+            panic!("mocap root cannot have movable descendants");
+        }
+        self.links[link].mocap = mocap;
     }
 
     /// Set the world pose of a mocap root. A free root stores the pose in q;
@@ -1426,8 +1435,10 @@ where
         tree.qdot[j] = s0.qdot[j] + (dv1[j] + 2.0 * dv2[j] + 2.0 * dv3[j] + dv4[j]) * (dt * sixth);
     }
     if s0.links.first().is_some_and(|link| link.mocap) {
-        tree.q[..s0.q.len()].copy_from_slice(&s0.q);
-        tree.qdot[..s0.qdot.len()].copy_from_slice(&s0.qdot);
+        let root_nq = s0.links[0].joint.nq();
+        let root_nv = s0.links[0].joint.nv();
+        tree.q[..root_nq].copy_from_slice(&s0.q[..root_nq]);
+        tree.qdot[..root_nv].copy_from_slice(&s0.qdot[..root_nv]);
     }
     // Renormalize free-root and ball-joint quaternions once at step end
     // (mirrors tier 1; mid-RK4 renormalization would break the linearity the
