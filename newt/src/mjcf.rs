@@ -252,6 +252,29 @@ fn parse_prm3_str(
     Ok(out)
 }
 
+/// Parse a `"lo hi"` range attribute (ctrlrange / forcerange). Returns
+/// `Ok(Some((lo, hi)))` when the attribute is present and well-formed,
+/// `Ok(None)` when absent, and an error on malformed values (wrong
+/// count, `lo >= hi`, or non-numeric). Shared between the shorthand
+/// actuator loaders so every one enforces the same shape.
+fn parse_lo_hi_range_attr(
+    e: &Element,
+    element_name: &str,
+    attr: &str,
+    dc: &DefaultClass,
+    path: &str,
+) -> Result<Option<(f32, f32)>, MjcfError> {
+    let Some(v) = attr_with_default(e, element_name, attr, dc) else {
+        return Ok(None);
+    };
+    let nums = parse_f32_list(v, path, attr)?;
+    require_len(&nums, 2, path, attr)?;
+    if nums[0] >= nums[1] {
+        return fail(path, format!("{attr} low must be < high"));
+    }
+    Ok(Some((nums[0], nums[1])))
+}
+
 /// Parse a MuJoCo-order `w x y z` quaternion attribute into a
 /// newt `(x, y, z, w)` Quat.
 fn parse_quat_wxyz(src: &str, path: &str, attr: &str) -> Result<Quat, MjcfError> {
@@ -2181,10 +2204,7 @@ impl Loader {
             }
             None => 0.0,
         };
-        // Accept-and-ignore ctrlrange with a documented note in mjcf.md.
-        if let Some(v) = attr_with_default(e, "position", "ctrlrange", &dc) {
-            let _ = parse_f32_list(v, path, "ctrlrange")?;
-        }
+        let ctrl_range = parse_lo_hi_range_attr(e, "position", "ctrlrange", &dc, path)?;
         // Reject the ctrllimited/forcelimited flags with a clear message —
         // they're valid MJCF but not enforced by our subset.
         if let Some(v) = e.attr("ctrllimited") {
@@ -2230,6 +2250,7 @@ impl Loader {
             return fail(path, "<position> actuator must specify kv or dampratio");
         };
         actuator.ctrl = initial_target;
+        actuator.ctrl_range = ctrl_range;
         if self.actuators_by_name.contains_key(&name) {
             return fail(path, format!("duplicate actuator name \"{name}\""));
         }
@@ -2282,13 +2303,24 @@ impl Loader {
             Some(v) => {
                 let nums = parse_f32_list(v, path, "forcerange")?;
                 require_len(&nums, 2, path, "forcerange")?;
+                if nums[0] >= nums[1] {
+                    return fail(path, "forcerange low must be < high");
+                }
                 nums[0].abs().min(nums[1].abs())
             }
             None => 0.0,
         };
+        let ctrl_range = parse_lo_hi_range_attr(e, "motor", "ctrlrange", &dc, path)?;
+        if let Some(v) = e.attr("ctrllimited") {
+            let _ = parse_bool(v, path, "ctrllimited")?;
+        }
+        if let Some(v) = e.attr("forcelimited") {
+            let _ = parse_bool(v, path, "forcelimited")?;
+        }
         // Real MuJoCo <motor>: gainprm=[1,0,0], bias=none, gear scales the
         // output. Torque = gear * ctrl, force-clamped.
-        let actuator = Actuator::motor(link_idx, gear, clamp);
+        let mut actuator = Actuator::motor(link_idx, gear, clamp);
+        actuator.ctrl_range = ctrl_range;
         if self.actuators_by_name.contains_key(&name) {
             return fail(path, format!("duplicate actuator name \"{name}\""));
         }
@@ -2332,16 +2364,15 @@ impl Loader {
             }
             None => 0.0,
         };
-        if let Some(v) = attr_with_default(e, "velocity", "ctrlrange", &dc) {
-            let _ = parse_f32_list(v, path, "ctrlrange")?;
-        }
+        let ctrl_range = parse_lo_hi_range_attr(e, "velocity", "ctrlrange", &dc, path)?;
         if let Some(v) = e.attr("ctrllimited") {
             let _ = parse_bool(v, path, "ctrllimited")?;
         }
         if let Some(v) = e.attr("forcelimited") {
             let _ = parse_bool(v, path, "forcelimited")?;
         }
-        let actuator = Actuator::velocity(link_idx, kv, clamp);
+        let mut actuator = Actuator::velocity(link_idx, kv, clamp);
+        actuator.ctrl_range = ctrl_range;
         if self.actuators_by_name.contains_key(&name) {
             return fail(path, format!("duplicate actuator name \"{name}\""));
         }
@@ -2460,28 +2491,8 @@ impl Loader {
         if matches!(dyn_type, DynType::Filter) && dyn_tau <= 0.0 {
             return fail(path, "filter dyntype requires dynprm (tau) > 0");
         }
-        let ctrl_range = match attr_with_default(e, "general", "ctrlrange", &dc) {
-            Some(v) => {
-                let nums = parse_f32_list(v, path, "ctrlrange")?;
-                require_len(&nums, 2, path, "ctrlrange")?;
-                if nums[0] >= nums[1] {
-                    return fail(path, "ctrlrange low must be < high");
-                }
-                Some((nums[0], nums[1]))
-            }
-            None => None,
-        };
-        let force_range = match attr_with_default(e, "general", "forcerange", &dc) {
-            Some(v) => {
-                let nums = parse_f32_list(v, path, "forcerange")?;
-                require_len(&nums, 2, path, "forcerange")?;
-                if nums[0] >= nums[1] {
-                    return fail(path, "forcerange low must be < high");
-                }
-                Some((nums[0], nums[1]))
-            }
-            None => None,
-        };
+        let ctrl_range = parse_lo_hi_range_attr(e, "general", "ctrlrange", &dc, path)?;
+        let force_range = parse_lo_hi_range_attr(e, "general", "forcerange", &dc, path)?;
         if let Some(v) = e.attr("ctrllimited") {
             let _ = parse_bool(v, path, "ctrllimited")?;
         }

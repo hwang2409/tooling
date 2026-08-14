@@ -1826,7 +1826,7 @@ fn parse_actuator(
         .transpose()?
         .unwrap_or(0.0);
 
-    let mut actuator = match ty {
+    let actuator = match ty {
         "position" => {
             reject_unknown(
                 fields,
@@ -1885,7 +1885,6 @@ fn parse_actuator(
             );
         }
     };
-    actuator.link_idx = lidx;
     Ok((name, tidx, actuator))
 }
 

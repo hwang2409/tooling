@@ -97,21 +97,24 @@
 //! The caller supplies `I_ref` because the actuator does not have access
 //! to the tree's articulated-inertia block — same rationale as v0.
 
-/// Which side of the general model the gain samples on.
+/// Which side of the general model the gain samples on. Affine sampling
+/// uses TRANSMISSION-space coordinates `(len, vel) = (gear*q, gear*qdot)`
+/// (MuJoCo convention).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GainType {
     /// `g = gainprm[0]`.
     Fixed,
-    /// `g = gainprm[0] + gainprm[1]*len + gainprm[2]*vel`.
+    /// `g = gainprm[0] + gainprm[1]*(gear*q) + gainprm[2]*(gear*qdot)`.
     Affine,
 }
 
-/// Which side of the general model the bias samples on.
+/// Which side of the general model the bias samples on. Affine sampling
+/// uses TRANSMISSION-space coordinates (see [`GainType::Affine`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BiasType {
     /// `b = 0`.
     None,
-    /// `b = biasprm[0] + biasprm[1]*len + biasprm[2]*vel`.
+    /// `b = biasprm[0] + biasprm[1]*(gear*q) + biasprm[2]*(gear*qdot)`.
     Affine,
 }
 
@@ -334,13 +337,28 @@ impl Actuator {
                     DynType::None => self.clamped_ctrl(),
                     DynType::Filter => self.act,
                 };
+                // MuJoCo transmission-space sampling: for a joint
+                // transmission with scalar gear, `actuator_length = gear*q`
+                // and `actuator_velocity = gear*qdot`. Affine gain/bias
+                // MUST evaluate at the transmission-space coordinates,
+                // not the raw joint values, or a gear!=1 actuator
+                // reads its own state wrong. See the reviewer's worked
+                // example and `tests/actuators_general.rs::
+                // general_affine_bias_samples_transmission_space`.
+                //
+                // Fixed gain and BiasType::None don't sample len/vel,
+                // so this factor is dead for them — but the closures
+                // below stay unconditional to keep the branch shape
+                // uniform. Cost is two f32 multiplies.
+                let len_tr = len * gear;
+                let vel_tr = vel * gear;
                 let g = match gain_type {
                     GainType::Fixed => gain_prm[0],
-                    GainType::Affine => gain_prm[0] + gain_prm[1] * len + gain_prm[2] * vel,
+                    GainType::Affine => gain_prm[0] + gain_prm[1] * len_tr + gain_prm[2] * vel_tr,
                 };
                 let b = match bias_type {
                     BiasType::None => 0.0,
-                    BiasType::Affine => bias_prm[0] + bias_prm[1] * len + bias_prm[2] * vel,
+                    BiasType::Affine => bias_prm[0] + bias_prm[1] * len_tr + bias_prm[2] * vel_tr,
                 };
                 (g * signal + b) * gear
             }

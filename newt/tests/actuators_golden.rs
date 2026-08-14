@@ -1,6 +1,7 @@
-//! Byte-identical golden trajectory for the tier-4 arm: three hinges,
-//! three PD servos following a two-waypoint target sequence, plus a
-//! constant motor-torque injection and a persistent world-frame wrench —
+//! Byte-identical golden trajectory for the v2 tier 2 arm: three hinges,
+//! three PD servos following a target sequence, a filter actuator sharing
+//! the shoulder hinge (activation state integrated per step), a
+//! constant motor-torque injection, and a persistent world-frame wrench —
 //! every actuation channel active at once. Snapshotted at steps 0, 500,
 //! 1000, and 1500. Same macOS-aarch64 reference convention as the tier-3
 //! golden (`tests/joints_golden.rs`).
@@ -10,22 +11,34 @@
 //!   • middle hinge axis `(1, 0.2, 0).normalize()` — not principal
 //!   • target sequence is asymmetric across the two waypoints
 //!   • persistent wrench is non-axis-aligned; direct torque non-zero
+//!   • filter actuator ctrl steps mid-run — its `act` bytes discriminate
+//!     an activation-integration mutation (wrong tau, wrong sign, skipped
+//!     step-end update)
 //!
-//! A zero-lever-arm, wrong-axis, or wrong-channel mutant flips this
-//! golden at snapshot 2 or later.
+//! A zero-lever-arm, wrong-axis, wrong-channel, or activation-integration
+//! mutant flips this golden at snapshot 2 or later.
 
-use newt::actuator::Actuator;
+use newt::actuator::{Actuator, BiasType, DynType, GainType};
 use newt::joint::JointKind;
 use newt::math::{Mat3, Quat, Vec3};
 use newt::tree::{Link, Tree, rk4_step};
 
-/// Serialize (q, qdot, qfrc_applied) as little-endian f32 bytes. The
-/// applied wrench and actuator targets are STATIC across a snapshot
-/// window (they're user inputs, not part of the integrated state), so
-/// they're not serialized — the state after N steps IS the discriminator.
+/// Serialize (q, qdot, qfrc_applied, [actuator.act ...]) as little-endian
+/// f32 bytes. Layout:
+///
+///   q            nq f32   integrated joint state
+///   qdot         nv f32   integrated joint rates
+///   qfrc_applied nv f32   user forces (ZOH each step)
+///   act          na f32   activation state for every actuator (0.0 for
+///                         non-filter actuators; pins the layout so a
+///                         change to activation storage cannot silently
+///                         land)
+///
+/// Applied wrenches and actuator ctrl values are STATIC user inputs
+/// across a snapshot window; the integrated state IS the discriminator.
 fn snapshot(tree: &Tree) -> Vec<u8> {
-    let mut out =
-        Vec::with_capacity((tree.q.len() + tree.qdot.len() + tree.qfrc_applied.len()) * 4);
+    let n = tree.q.len() + tree.qdot.len() + tree.qfrc_applied.len() + tree.actuators.len();
+    let mut out = Vec::with_capacity(n * 4);
     for v in tree
         .q
         .iter()
@@ -33,6 +46,9 @@ fn snapshot(tree: &Tree) -> Vec<u8> {
         .chain(tree.qfrc_applied.iter())
     {
         out.extend_from_slice(&v.to_le_bytes());
+    }
+    for a in &tree.actuators {
+        out.extend_from_slice(&a.act.to_le_bytes());
     }
     out
 }
@@ -85,6 +101,27 @@ fn produce_golden_bytes() -> Vec<u8> {
     let a2 = tree.add_actuator(s2);
     let a3 = tree.add_actuator(s3);
 
+    // Filter actuator sharing the shoulder hinge (link 1): a general
+    // motor-shape with a first-order activation filter (tau=0.15 s) so
+    // its `act` state evolves each step. Small gain so the extra torque
+    // doesn't overwhelm the PD servo above — the point is to pin the
+    // ACTIVATION LAYOUT byte-identically, not to change the arm's gross
+    // motion. `ctrl` gets rewritten each waypoint (below) so the
+    // activation transient is visible in every post-step-0 snapshot.
+    let filter = Actuator::general(
+        1,
+        GainType::Fixed,
+        [0.5, 0.0, 0.0],
+        BiasType::None,
+        [0.0, 0.0, 0.0],
+        1.0,
+        DynType::Filter,
+        [0.15],
+        None,
+        None,
+    );
+    let af = tree.add_actuator(filter);
+
     // Persistent world-frame wrench on the tip link (link 3): small +y
     // force + small -x torque. Non-axis-aligned to break symmetry.
     tree.set_link_wrench(3, Vec3::new(0.0, 0.4, 0.0), Vec3::new(-0.05, 0.0, 0.02));
@@ -99,20 +136,25 @@ fn produce_golden_bytes() -> Vec<u8> {
     // Snapshot 0: initial state.
     bytes.extend_from_slice(&snapshot(&tree));
 
-    // Waypoint 1: reach positions (0.3, -0.4, 0.5).
+    // Waypoint 1: reach positions (0.3, -0.4, 0.5). Filter ctrl steps
+    // to 0.8 so its `act` state ramps in over ~5·tau = 0.75 s.
     tree.set_actuator_target(a1, 0.3);
     tree.set_actuator_target(a2, -0.4);
     tree.set_actuator_target(a3, 0.5);
+    tree.set_actuator_target(af, 0.8);
     for _ in 0..500 {
         rk4_step(&mut tree, g, dt, |_| vec![(Vec3::ZERO, Vec3::ZERO); 4]);
     }
     // Snapshot 1: after 500 steps at waypoint 1.
     bytes.extend_from_slice(&snapshot(&tree));
 
-    // Waypoint 2: switch targets.
+    // Waypoint 2: switch targets. Filter ctrl steps to -0.4 so its `act`
+    // has to cross zero — asymmetric transient a sign-flipped
+    // integrator would blow.
     tree.set_actuator_target(a1, 0.1);
     tree.set_actuator_target(a2, 0.6);
     tree.set_actuator_target(a3, -0.3);
+    tree.set_actuator_target(af, -0.4);
     for _ in 0..500 {
         rk4_step(&mut tree, g, dt, |_| vec![(Vec3::ZERO, Vec3::ZERO); 4]);
     }
@@ -123,6 +165,7 @@ fn produce_golden_bytes() -> Vec<u8> {
     tree.set_actuator_target(a1, 0.0);
     tree.set_actuator_target(a2, 0.0);
     tree.set_actuator_target(a3, 0.0);
+    tree.set_actuator_target(af, 0.0);
     for _ in 0..500 {
         rk4_step(&mut tree, g, dt, |_| vec![(Vec3::ZERO, Vec3::ZERO); 4]);
     }
@@ -159,8 +202,9 @@ fn actuators_golden_trajectory_is_byte_identical() {
             .unwrap_or(0);
         panic!(
             "golden trajectory mismatch; first byte diff at offset {first_diff}. \
-             Layout: (q(3) + qdot(3) + qfrc_applied(3)) f32 per snapshot × 4 snapshots \
-             = 9 f32 × 4 = 36 f32 = 144 bytes."
+             Layout: (q(3) + qdot(3) + qfrc_applied(3) + act(4)) f32 per snapshot × 4 \
+             snapshots = 13 f32 × 4 = 52 f32 = 208 bytes. The 4 actuators are \
+             (shoulder PD, elbow PD, wrist PD, shoulder filter)."
         );
     }
 }

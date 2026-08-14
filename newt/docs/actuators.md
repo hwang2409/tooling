@@ -24,9 +24,16 @@ F_raw  = gain * signal + bias                            (4)
 τ      = clamp(F_raw * gear, force_range)                (5)
 ```
 
-`len` and `vel` are the transmission-space position and rate. This
-tier's transmission is `joint` with a scalar `gear` for a 1-DOF joint,
-so `len = q` (angle or displacement) and `vel = qdot`.
+`(len, vel)` are the **transmission-space** position and rate — for a
+joint transmission with scalar `gear`, `len = gear · q` and
+`vel = gear · qdot`. This matches MuJoCo's `actuator_length` /
+`actuator_velocity` semantics: a `gear!=1` actuator reads its own
+scaled state, not the raw joint coordinate. `Fixed` gain and
+`None` bias do not sample `(len, vel)` and so are unaffected by
+`gear`, but the affine branches DO — a bug there would silently
+under- or over-drive the actuator by a factor of `gear` on the
+sampled term. Anchor:
+`tests/actuators_general.rs::general_affine_bias_samples_transmission_space`.
 
 Clamping order (ordered because the two clamps are different constraint
 kinds and MuJoCo defines this):
@@ -138,16 +145,19 @@ fixtures.
 Attributes accepted per element (v2 tier 2 subset):
 
 - **`<position>`** — `kp` (required), one of `kv | dampratio`,
-  `forcerange`, `ctrlrange` (parsed then accepted; ctrl clamp lives on
-  general only), `class`, `ctrllimited`/`forcelimited` (parsed then
-  accepted), `target` (newt extension — initial ctrl at load time).
-  `dampratio` derives `kv = 2·dr·√(kp·1)` — see [the derivation
-  below](#deriving-kv-from-a-damping-ratio-dampratio).
+  `forcerange`, `ctrlrange` (enforced — clamps `ctrl` before torque
+  eval, MuJoCo parity), `class`, `ctrllimited`/`forcelimited`
+  (parsed then accepted), `target` (newt extension — initial ctrl at
+  load time). `dampratio` derives `kv = 2·dr·√(kp·1)` — see [the
+  derivation below](#deriving-kv-from-a-damping-ratio-dampratio).
 - **`<velocity>`** — `kv` (required), `forcerange`, `ctrlrange`
-  (parsed then accepted), `class`, `ctrllimited`/`forcelimited`.
+  (enforced — clamps `ctrl` before torque eval), `class`,
+  `ctrllimited`/`forcelimited`.
 - **`<motor>`** — `gear` (scalar; MuJoCo 6-vector accepted, only the
   first entry honored for 1-DOF joints), `forcerange`, `ctrlrange`
-  (accepted), `class`, `ctrllimited`/`forcelimited`.
+  (enforced — clamps `ctrl` before torque eval), `class`,
+  `ctrllimited`/`forcelimited`. Malformed `ctrlrange`/`forcerange`
+  values (wrong count, `lo >= hi`) are rejected at load.
 - **`<general>`** — `gaintype ∈ {fixed, affine}`, `gainprm` (1..=3
   numbers; missing tail defaults `[1,0,0]`), `biastype ∈ {none,
   affine}`, `biasprm` (1..=3 numbers; missing tail defaults `[0,0,0]`),

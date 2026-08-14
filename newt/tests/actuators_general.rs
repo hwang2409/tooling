@@ -11,7 +11,7 @@
 //!     (forward Euler with `alpha = dt/tau`).
 //!   * clamp ordering (ctrl clamp first, force clamp last).
 
-use newt::actuator::{Actuator, BiasType, DynType, GainType};
+use newt::actuator::{Actuator, ActuatorFlavor, BiasType, DynType, GainType};
 use newt::joint::JointKind;
 use newt::math::{Mat3, Quat, Vec3};
 use newt::tree::{Link, Tree, rk4_step};
@@ -131,30 +131,37 @@ fn general_position_shape_matches_shorthand_arm() {
     let dt = 0.005f32;
     let g = Vec3::new(0.0, 0.0, -9.81);
 
-    // Waypoint 1.
-    for a in 0..3 {
-        baseline.set_actuator_target(a, [0.3, -0.4, 0.5][a]);
-        general.set_actuator_target(a, [0.3, -0.4, 0.5][a]);
-    }
-    for _ in 0..500 {
-        rk4_step(&mut baseline, g, dt, zero_wrenches(4));
-        rk4_step(&mut general, g, dt, zero_wrenches(4));
-    }
-    // Max component divergence in q + qdot across the whole state.
+    // Sample divergence per-step (not just at the end). Transient blooms
+    // — the moment right after a target flip, when the PD error is
+    // largest and the clamp engages — must stay bounded too, or a
+    // semantic mismatch that self-cancels at steady state would slip
+    // through. Two target flips exercise both the initial acceleration
+    // burst AND clamp engagement mid-run.
     let mut max_err = 0.0f32;
-    for (a, b) in baseline.q.iter().zip(general.q.iter()) {
-        max_err = max_err.max((a - b).abs());
+    let targets: [[f32; 3]; 2] = [[0.3, -0.4, 0.5], [-0.5, 0.6, -0.2]];
+    for flip in targets.iter() {
+        for (a, &ctrl) in flip.iter().enumerate() {
+            baseline.set_actuator_target(a, ctrl);
+            general.set_actuator_target(a, ctrl);
+        }
+        for _ in 0..500 {
+            rk4_step(&mut baseline, g, dt, zero_wrenches(4));
+            rk4_step(&mut general, g, dt, zero_wrenches(4));
+            for (a, b) in baseline.q.iter().zip(general.q.iter()) {
+                max_err = max_err.max((a - b).abs());
+            }
+            for (a, b) in baseline.qdot.iter().zip(general.qdot.iter()) {
+                max_err = max_err.max((a - b).abs());
+            }
+        }
     }
-    for (a, b) in baseline.qdot.iter().zip(general.qdot.iter()) {
-        max_err = max_err.max((a - b).abs());
-    }
-    // f32 associativity residual over 500 RK4 steps × 4 stages × 3
+    // f32 associativity residual over 1000 RK4 steps × 4 stages × 3
     // actuators × ~5 float ops per eval sits comfortably under 1e-4 —
     // this bound catches a semantic mismatch (wrong sign, wrong
     // parameter mapping) which would blow to ~kp * ctrl scale (~10).
     assert!(
         max_err < 1.0e-4,
-        "general vs position divergence too large after 500 steps: {max_err}"
+        "general vs position divergence too large across per-step samples: {max_err}"
     );
 }
 
@@ -349,9 +356,116 @@ fn ctrl_clamp_binds_before_force_clamp() {
     );
 }
 
+/// Transmission-space affine sampling (reviewer's worked example).
+///
+/// MuJoCo joint transmission with scalar gear: `len = gear·q`,
+/// `vel = gear·qdot`. Affine gain and bias MUST evaluate at those
+/// transmission-space coordinates, not at the raw joint state — otherwise
+/// a `gear!=1` actuator reads its own state wrong.
+///
+/// Params (hand-tuned so the pre-fix code returns a different, wrong
+/// number and the fixed code returns the MuJoCo-correct number):
+///
+/// ```text
+/// gain      = Fixed(2)
+/// bias      = Affine(0, -1, 0)   →  b = -1 · len
+/// gear      = 2
+/// ctrl      = 1
+/// q, qdot   = (0.5, 0)
+/// ```
+///
+/// Correct (transmission space): `len = 2·0.5 = 1`, `b = -1`,
+/// `F_raw = 2·1 + (-1) = 1`, `τ = F_raw · gear = 2`.
+/// Pre-fix (raw space):          `len = 0.5`,    `b = -0.5`,
+/// `F_raw = 2·1 + (-0.5) = 1.5`, `τ = 1.5 · 2 = 3`.
+///
+/// So the assertion is `τ = 2`, and reverting the transmission fix
+/// (sampling raw q instead of gear·q) produces τ = 3 — a 50 % force
+/// error at the same q. The reviewer verified this by re-mutating the
+/// General branch back to raw sampling; this anchor fails immediately
+/// under that mutation.
+#[test]
+fn general_affine_bias_samples_transmission_space() {
+    let mut a = Actuator::general(
+        0,
+        GainType::Fixed,
+        [2.0, 0.0, 0.0],
+        BiasType::Affine,
+        [0.0, -1.0, 0.0],
+        2.0, // gear
+        DynType::None,
+        [1.0],
+        None,
+        None,
+    );
+    a.ctrl = 1.0;
+    let t = a.torque(0.5, 0.0);
+    assert!(
+        (t - 2.0).abs() < 1e-6,
+        "transmission-space affine: expected τ = 2, got {t} \
+         (pre-fix raw-sampling code returns 3.0 — this test is the mutant guard)"
+    );
+
+    // Also verify the affine gain path (the other affine slot the fix
+    // covers). `gain = Affine(1, 1, 0)` samples len → transmission-space
+    // must give len=1 at q=0.5, gear=2.
+    let mut a = Actuator::general(
+        0,
+        GainType::Fixed, // set to Affine below
+        [0.0, 0.0, 0.0],
+        BiasType::None,
+        [0.0, 0.0, 0.0],
+        2.0,
+        DynType::None,
+        [1.0],
+        None,
+        None,
+    );
+    if let ActuatorFlavor::General {
+        ref mut gain_type,
+        ref mut gain_prm,
+        ..
+    } = a.flavor
+    {
+        *gain_type = GainType::Affine;
+        *gain_prm = [1.0, 1.0, 0.0];
+    }
+    a.ctrl = 1.0;
+    // Correct: len=1, g = 1 + 1 = 2, F = 2·1 = 2, τ = 2·2 = 4.
+    // Pre-fix: len=q=0.5, g = 1 + 0.5 = 1.5, F = 1.5, τ = 3.
+    let t = a.torque(0.5, 0.0);
+    assert!(
+        (t - 4.0).abs() < 1e-6,
+        "affine gain must sample transmission len: expected 4, got {t} (pre-fix: 3)"
+    );
+
+    // vel branch: affine gain sampling vel · gear.
+    let mut a = Actuator::general(
+        0,
+        GainType::Affine,
+        [0.0, 0.0, 1.0], // g = vel_tr
+        BiasType::None,
+        [0.0, 0.0, 0.0],
+        3.0,
+        DynType::None,
+        [1.0],
+        None,
+        None,
+    );
+    a.ctrl = 1.0;
+    // Correct: vel=3·0.4=1.2, g=1.2, F=1.2, τ=1.2·3=3.6.
+    // Pre-fix: vel=0.4, g=0.4, F=0.4, τ=1.2.
+    let t = a.torque(0.0, 0.4);
+    assert!(
+        (t - 3.6).abs() < 1e-5,
+        "affine gain vel term must sample transmission vel: expected 3.6, got {t}"
+    );
+}
+
 /// Affine bias in the general model produces a zero at a hand-derived
 /// equilibrium `len`. Setup: `gain=Fixed(0)`, `bias=Affine(k, -k, 0)`,
-/// `ctrl=0`. Torque = `k - k*len = k*(1 - len)`. Zero at `len = 1`.
+/// `ctrl=0`, `gear=1` (so transmission-space `len` equals raw `q`).
+/// Torque = `k - k*len = k*(1 - len)`. Zero at `len = 1`.
 #[test]
 fn affine_bias_zero_at_hand_derived_equilibrium() {
     let mut a = Actuator::general(
@@ -408,4 +522,171 @@ fn activation_integrates_once_per_rk4_step() {
         (observed - expected).abs() < 5e-3,
         "act={observed} expected≈{expected}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// MJCF ctrlrange plumbing (shorthand actuators) — per-shorthand tests
+// ---------------------------------------------------------------------------
+
+/// Load a one-hinge MJCF with the given shorthand + attributes and return
+/// the loaded scene. Kept local so each per-shorthand test can inline its
+/// own MJCF and read out the resulting actuator directly.
+fn load_actuator_scene(actuator_xml: &str) -> newt::model::Scene {
+    let src = format!(
+        r#"<mujoco model="t">
+          <compiler angle="radian"/>
+          <option timestep="0.005"/>
+          <worldbody>
+            <body name="anchor">
+              <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+              <body name="link" pos="0 0 -0.5">
+                <joint name="j" type="hinge" axis="1 0 0"/>
+                <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+              </body>
+            </body>
+          </worldbody>
+          <actuator>{actuator_xml}</actuator>
+        </mujoco>"#
+    );
+    newt::mjcf::load_mjcf_str(&src).unwrap_or_else(|e| panic!("MJCF load failed: {e}"))
+}
+
+/// `<position ctrlrange>` populates `ctrl_range` and the actuator torque
+/// evaluates with the clamped ctrl (hand-computed both bind cases).
+#[test]
+fn position_ctrlrange_wires_into_actuator_and_clamps_torque() {
+    let scene = load_actuator_scene(
+        r#"<position name="s" joint="j" kp="10" kv="0"
+                   ctrlrange="-0.5 0.5" forcerange="-100 100"/>"#,
+    );
+    let (t, a) = scene.actuators_by_name["s"];
+    let mut actuator = scene.world.trees[t].actuators[a];
+    assert_eq!(
+        actuator.ctrl_range,
+        Some((-0.5, 0.5)),
+        "ctrl_range not wired from <position ctrlrange>"
+    );
+    // ctrl = 5 → clamps to 0.5 → τ = 10 · (0.5 - 0) - 0 = 5.
+    actuator.ctrl = 5.0;
+    assert!((actuator.torque(0.0, 0.0) - 5.0).abs() < 1e-6);
+    // ctrl = -5 → clamps to -0.5 → τ = -5.
+    actuator.ctrl = -5.0;
+    assert!((actuator.torque(0.0, 0.0) - (-5.0)).abs() < 1e-6);
+    // ctrl inside range: no clamp, exact PD.
+    actuator.ctrl = 0.3;
+    assert!((actuator.torque(0.1, 0.0) - 10.0 * 0.2).abs() < 1e-6);
+}
+
+/// `<velocity ctrlrange>` same wiring; ctrl clamps before torque eval.
+#[test]
+fn velocity_ctrlrange_wires_into_actuator_and_clamps_torque() {
+    let scene = load_actuator_scene(
+        r#"<velocity name="v" joint="j" kv="4" ctrlrange="-2 2" forcerange="-1000 1000"/>"#,
+    );
+    let (t, a) = scene.actuators_by_name["v"];
+    let mut actuator = scene.world.trees[t].actuators[a];
+    assert_eq!(actuator.ctrl_range, Some((-2.0, 2.0)));
+    // ctrl = 10 → u = 2 → τ = 4·(2 - 0.5) = 6
+    actuator.ctrl = 10.0;
+    assert!((actuator.torque(0.0, 0.5) - 6.0).abs() < 1e-6);
+    // ctrl = -10 → u = -2 → τ = 4·(-2 - (-0.5)) = -6
+    actuator.ctrl = -10.0;
+    assert!((actuator.torque(0.0, -0.5) - (-6.0)).abs() < 1e-6);
+}
+
+/// `<motor ctrlrange>` — plumbing lit up in round 2 (motor was silently
+/// dropping ctrlrange in the round-1 impl).
+#[test]
+fn motor_ctrlrange_wires_into_actuator_and_clamps_torque() {
+    let scene = load_actuator_scene(
+        r#"<motor name="m" joint="j" gear="5" ctrlrange="-1 1" forcerange="-100 100"/>"#,
+    );
+    let (t, a) = scene.actuators_by_name["m"];
+    let mut actuator = scene.world.trees[t].actuators[a];
+    assert_eq!(actuator.ctrl_range, Some((-1.0, 1.0)));
+    // ctrl = 3 → u = 1 → τ = 5·1 = 5 (well under forcerange).
+    actuator.ctrl = 3.0;
+    assert!((actuator.torque(0.0, 0.0) - 5.0).abs() < 1e-6);
+    // ctrl = -3 → u = -1 → τ = -5.
+    actuator.ctrl = -3.0;
+    assert!((actuator.torque(0.0, 0.0) - (-5.0)).abs() < 1e-6);
+    // ctrl in range → gear·ctrl direct.
+    actuator.ctrl = 0.4;
+    assert!((actuator.torque(0.0, 0.0) - 2.0).abs() < 1e-6);
+}
+
+/// Round-2 finding 4: `<motor>` must validate `ctrlrange` / `forcerange`
+/// like its siblings. Malformed values (wrong count, `lo >= hi`) must
+/// error — round-1 silently accepted them.
+#[test]
+fn motor_malformed_ctrlrange_errors() {
+    let cases = [
+        (
+            r#"<motor name="m" joint="j" gear="1" ctrlrange="1 0"/>"#,
+            "ctrlrange low must be < high",
+        ),
+        (
+            r#"<motor name="m" joint="j" gear="1" ctrlrange="1 1"/>"#,
+            "ctrlrange low must be < high",
+        ),
+        (
+            r#"<motor name="m" joint="j" gear="1" ctrlrange="1"/>"#,
+            "expected 2 numbers",
+        ),
+    ];
+    for (xml, needle) in cases {
+        let src = format!(
+            r#"<mujoco model="t">
+              <compiler angle="radian"/>
+              <option timestep="0.005"/>
+              <worldbody>
+                <body name="anchor">
+                  <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+                  <body name="link" pos="0 0 -0.5">
+                    <joint name="j" type="hinge" axis="1 0 0"/>
+                    <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+                  </body>
+                </body>
+              </worldbody>
+              <actuator>{xml}</actuator>
+            </mujoco>"#
+        );
+        match newt::mjcf::load_mjcf_str(&src) {
+            Ok(_) => panic!("expected error containing {needle:?}, got Ok for {xml}"),
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains(needle),
+                    "expected error containing {needle:?}, got: {msg} (input {xml})"
+                );
+            }
+        }
+    }
+
+    // Same shape for forcerange (round-1 motor also let malformed
+    // forcerange through — the finding folds them together).
+    let src = r#"<mujoco model="t">
+      <compiler angle="radian"/>
+      <option timestep="0.005"/>
+      <worldbody>
+        <body name="anchor">
+          <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+          <body name="link" pos="0 0 -0.5">
+            <joint name="j" type="hinge" axis="1 0 0"/>
+            <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+          </body>
+        </body>
+      </worldbody>
+      <actuator><motor name="m" joint="j" gear="1" forcerange="2 1"/></actuator>
+    </mujoco>"#;
+    match newt::mjcf::load_mjcf_str(src) {
+        Ok(_) => panic!("expected error for forcerange low >= high, got Ok"),
+        Err(e) => {
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("forcerange low must be < high"),
+                "expected forcerange error, got: {msg}"
+            );
+        }
+    }
 }
