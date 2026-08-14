@@ -41,6 +41,7 @@ zero hinge axes — every branch has a dedicated unit test in
   "timestep": 0.005,
   "bodies":   [ ... ],
   "trees":    [ ... ],
+  "meshes":   [ ... ],
   "geoms":    [ ... ],
   "sites":    [ ... ],
   "actuators":[ ... ],
@@ -164,9 +165,11 @@ COM.
 ```json
 {"kind": "diag",   "values": [Ixx, Iyy, Izz]}
 {"kind": "tensor", "values": [Ixx, Iyy, Izz, Ixy, Ixz, Iyz]}
-{"kind": "solid",  "shape":  {"kind": "box",     "half_extents": [hx, hy, hz]}}
-{"kind": "solid",  "shape":  {"kind": "sphere",  "radius": r}}
-{"kind": "solid",  "shape":  {"kind": "capsule", "radius": r, "half_height": h}}
+{"kind": "solid",  "shape":  {"kind": "box",       "half_extents": [hx, hy, hz]}}
+{"kind": "solid",  "shape":  {"kind": "sphere",    "radius": r}}
+{"kind": "solid",  "shape":  {"kind": "capsule",   "radius": r, "half_height": h}}
+{"kind": "solid",  "shape":  {"kind": "cylinder",  "radius": r, "half_height": h}}
+{"kind": "solid",  "shape":  {"kind": "ellipsoid", "semi_axes": [ax, ay, az]}}
 ```
 
 - Diagonal moments must be > 0.
@@ -174,8 +177,30 @@ COM.
   sign. Rejected if singular.
 - Solid delegates to
   [`geom::solid_box_inertia`](../src/geom.rs) et al., using the same
-  formulas the engine tests pin. Rod inertia isn't a builtin — write it
-  by hand with `diag`.
+  formulas the engine tests pin. Mesh bodies do NOT have a solid variant
+  (no volume integration) — use `diag` / `tensor` explicitly.
+
+## meshes (v1 tier 2)
+
+Convex-mesh assets referenced by `Mesh { mesh: NAME }` geoms. A geom
+lookup by name resolves to a mesh id used at runtime.
+
+```json
+{
+  "name": "tetra",
+  "vertices": [[0,0,0], [1,0,0], [0,1,0], [0,0,1]],
+  "faces":    [[0,2,1], [0,1,3], [0,3,2], [1,2,3]]
+}
+```
+
+- **vertices** — array of `[x, y, z]` triples, ≥ 4, all coordinates
+  finite.
+- **faces** — array of `[i, j, k]` vertex-index triples, ≥ 4. Each face
+  is a CCW-outward triangle. Indices must be non-negative integers in
+  range.
+- The mesh's convex hull is TRUSTED — see the "convex mesh trust model"
+  section in [`docs/contacts.md`](contacts.md). The loader runs only
+  structural checks; convexity itself is not verified.
 
 ## geoms
 
@@ -187,12 +212,21 @@ COM.
   "local_offset": [0, 0, 0],
   "local_orientation": [0, 0, 0, 1],
   "friction": 0.6,
-  "solref": {"timeconst": 0.02, "dampratio": 1.0}
+  "solref": {"timeconst": 0.02, "dampratio": 1.0},
+  "margin": 0.0,
+  "gap":    0.0
 }
 ```
 
-- **shape** — one of `plane`, `sphere` (`radius`), `box`
-  (`half_extents`), `capsule` (`radius`, `half_height`).
+- **shape** — one of:
+    - `{"kind":"plane"}`
+    - `{"kind":"sphere","radius":r}`
+    - `{"kind":"box","half_extents":[hx,hy,hz]}`
+    - `{"kind":"capsule","radius":r,"half_height":h}`
+    - `{"kind":"cylinder","radius":r,"half_height":h}` (v1)
+    - `{"kind":"ellipsoid","semi_axes":[ax,ay,az]}` (v1)
+    - `{"kind":"mesh","mesh":"NAME"}` (v1 — references the top-level
+      `meshes` asset table)
 - **attach** — one of:
     - `{"kind":"static"}` — only plane geoms may be static.
     - `{"kind":"body","body":"NAME"}` — attaches to a free body.
@@ -204,6 +238,9 @@ COM.
 - **solref** — MuJoCo-style `(timeconst, dampratio)`. Optional; default
   is `SolRef::DEFAULT` (`timeconst = 0.02`, critical damping). See
   [`docs/contacts.md`](contacts.md).
+- **margin** — MuJoCo-style contact activation zone (m), ≥ 0. Default `0`.
+  See [`docs/contacts.md`](contacts.md) for semantics.
+- **gap** — MuJoCo-style force-free zone (m), ≥ 0. Default `0`.
 
 ## sites
 

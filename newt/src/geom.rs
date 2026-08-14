@@ -867,12 +867,7 @@ mod tests {
     #[test]
     fn convex_mesh_validate_rejects_non_finite_vertex() {
         let m = ConvexMesh {
-            vertices: vec![
-                Vec3::ZERO,
-                Vec3::X,
-                Vec3::Y,
-                Vec3::new(f32::NAN, 0.0, 0.0),
-            ],
+            vertices: vec![Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::new(f32::NAN, 0.0, 0.0)],
             faces: vec![[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]],
         };
         assert!(m.validate().is_err());

@@ -925,8 +925,9 @@ pub fn ellipsoid_plane(
     let a = semi_axes.x;
     let b = semi_axes.y;
     let c = semi_axes.z;
-    let denom_sq =
-        (a * d_local.x) * (a * d_local.x) + (b * d_local.y) * (b * d_local.y) + (c * d_local.z) * (c * d_local.z);
+    let denom_sq = (a * d_local.x) * (a * d_local.x)
+        + (b * d_local.y) * (b * d_local.y)
+        + (c * d_local.z) * (c * d_local.z);
     if denom_sq <= 0.0 {
         return ContactBuf::new();
     }
@@ -1207,11 +1208,7 @@ pub fn sphere_ellipsoid(
     // Normal: outward ellipsoid normal at q is proportional to
     // `(q.x/a², q.y/b², q.z/c²)`; but it's equivalent to `delta / dist` when
     // p is outside (up to sign). Use delta/dist for numerical robustness.
-    let normal_local = if dist > 1.0e-9 {
-        delta / dist
-    } else {
-        Vec3::Z
-    };
+    let normal_local = if dist > 1.0e-9 { delta / dist } else { Vec3::Z };
     let normal_world = ell_pose.rotate(normal_local);
     let contact_world = ell_pose.point_to_world(q_local);
     let mut out = ContactBuf::new();
@@ -1536,9 +1533,9 @@ fn try_narrow_phase(
             geom_b,
             pose_b,
         ),
-        (GeomShape::Sphere { radius: ra }, GeomShape::Sphere { radius: rb }) => sphere_sphere(
-            idx_a, pose_a, ra, idx_b, pose_b, rb, friction, margin, gap,
-        ),
+        (GeomShape::Sphere { radius: ra }, GeomShape::Sphere { radius: rb }) => {
+            sphere_sphere(idx_a, pose_a, ra, idx_b, pose_b, rb, friction, margin, gap)
+        }
         (
             GeomShape::Sphere { radius: rs },
             GeomShape::Capsule {
@@ -1753,7 +1750,17 @@ mod tests {
             position: Vec3::ZERO,
             orientation: Quat::IDENTITY,
         };
-        let buf = box_box(0, &a, Vec3::splat(0.5), 1, &b, Vec3::splat(0.5), 0.5, 0.0, 0.0);
+        let buf = box_box(
+            0,
+            &a,
+            Vec3::splat(0.5),
+            1,
+            &b,
+            Vec3::splat(0.5),
+            0.5,
+            0.0,
+            0.0,
+        );
         assert_eq!(buf.len, 0);
     }
 
@@ -1768,7 +1775,18 @@ mod tests {
         };
         // Radius 0.5, half_height 1.0. Both endpoints at z=0.3, penetration
         // 0.5-0.3 = 0.2 each.
-        let buf = capsule_plane(0, &capsule_pose, 0.5, 1.0, 1.0, 0.0, 0.0, 1, &plane, &plane_pose);
+        let buf = capsule_plane(
+            0,
+            &capsule_pose,
+            0.5,
+            1.0,
+            1.0,
+            0.0,
+            0.0,
+            1,
+            &plane,
+            &plane_pose,
+        );
         assert_eq!(buf.len, 2);
         for c in buf.as_slice() {
             assert!(approx(c.penetration, 0.2, 1e-5));

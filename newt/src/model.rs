@@ -1218,7 +1218,10 @@ fn parse_geom(
 /// structural checks in [`crate::geom::ConvexMesh::validate`] (vertex
 /// count, face count, index range, finite coordinates). Non-convex meshes
 /// silently produce incorrect contacts.
-fn parse_mesh_asset(v: &Value, path: &str) -> Result<(crate::geom::ConvexMesh, String), ModelError> {
+fn parse_mesh_asset(
+    v: &Value,
+    path: &str,
+) -> Result<(crate::geom::ConvexMesh, String), ModelError> {
     let fields = get_object(v, path)?;
     reject_unknown(fields, &["name", "vertices", "faces"], path)?;
     let name = get_str(required(fields, "name", path)?, &format!("{path}.name"))?.to_string();
