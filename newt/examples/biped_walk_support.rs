@@ -253,7 +253,6 @@ pub struct JointWalkController {
     contacts: ContactEvents,
     touch_sensors: [usize; 2],
     initial_root_x: f32,
-    min_signed_distance: f32,
 }
 
 impl JointWalkController {
@@ -322,7 +321,6 @@ impl JointWalkController {
             },
             touch_sensors: [left, right],
             initial_root_x,
-            min_signed_distance: 0.0,
         }
     }
 
@@ -651,8 +649,6 @@ where
         scene.world.step();
         controller.observe_contacts(&scene);
         let tree = &scene.world.trees[0];
-        let signed_distance = tree.q[0] - controller.initial_root_x;
-        controller.min_signed_distance = controller.min_signed_distance.min(signed_distance);
         let left_clearance = foot_clearance(&scene, "left");
         let right_clearance = foot_clearance(&scene, "right");
         let left_x = foot_center_x(&scene, "left");
