@@ -311,6 +311,19 @@ impl Tendon {
                                     "spatial tendon segment {i} wrap: link {l} out of range"
                                 ));
                             }
+                            let mut ancestor = Some(l);
+                            while let Some(link_idx) = ancestor {
+                                if !matches!(tree.links[link_idx].joint, JointKind::Fixed) {
+                                    return Err(
+                                        "sphere wrap attached to a link whose ancestor chain "
+                                            .to_string()
+                                            + "contains non-Fixed DOFs is deferred in v2 tier 3 "
+                                            + "(see docs/tendons.md); attach the wrap to a "
+                                            + "fixed chain",
+                                    );
+                                }
+                                ancestor = tree.links[link_idx].parent;
+                            }
                         }
                         if w.radius <= 0.0 {
                             return Err(format!(
@@ -1030,6 +1043,10 @@ mod tests {
         assert!(
             (len_wrap - len_straight).abs() < 1e-3,
             "wrap engage jumped: {len_straight} → {len_wrap}"
+        );
+        assert!(
+            len_wrap >= 4.0 - 1e-5 && len_straight >= 4.0 - 1e-5,
+            "engaged and straight paths must respect the endpoint lower bound: straight={len_straight}, wrap={len_wrap}"
         );
     }
 

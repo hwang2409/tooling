@@ -782,6 +782,7 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
         &[
             "version",
             "gravity",
+            "magnetic_field",
             "timestep",
             "solver",
             "bodies",
@@ -794,6 +795,7 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
             "equality",
             "sensors",
             "tendons",
+            "keyframes",
         ],
         path,
     )?;
@@ -813,6 +815,9 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
     let mut world = World::new();
     if let Some(v) = optional(root_fields, "gravity") {
         world.gravity = parse_vec3(v, "gravity")?;
+    }
+    if let Some(v) = optional(root_fields, "magnetic_field") {
+        world.magnetic_field = parse_vec3(v, "magnetic_field")?;
     }
     if let Some(v) = optional(root_fields, "timestep") {
         let dt = get_f32(v, "timestep")?;
@@ -976,6 +981,28 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
             }
             let act_idx = world.trees[tree_idx].add_actuator(servo);
             actuators_by_name.insert(name, (tree_idx, act_idx));
+        }
+    }
+
+    // ---- Keyframes ----
+    if let Some(v) = optional(root_fields, "keyframes") {
+        let arr = get_array(v, "keyframes")?;
+        for (i, key_v) in arr.iter().enumerate() {
+            let p = format!("keyframes[{i}]");
+            let fields = get_object(key_v, &p)?;
+            reject_unknown(fields, &["name", "q", "qdot", "act", "ctrl"], &p)?;
+            let name = get_str(required(fields, "name", &p)?, &format!("{p}.name"))?;
+            let read = |field: &str| -> Result<Vec<f32>, ModelError> {
+                let values = get_array(required(fields, field, &p)?, &format!("{p}.{field}"))?;
+                values
+                    .iter()
+                    .enumerate()
+                    .map(|(j, value)| get_f32(value, &format!("{p}.{field}[{j}]")))
+                    .collect()
+            };
+            world
+                .add_keyframe(name, read("q")?, read("qdot")?, read("act")?, read("ctrl")?)
+                .map_err(|error| ModelError::new(p, error.0))?;
         }
     }
 
@@ -1174,6 +1201,18 @@ fn parse_tree(
         link_names.insert(name, i);
         tree.push_link(link);
     }
+    if tree.links[0].mocap
+        && tree
+            .links
+            .iter()
+            .skip(1)
+            .any(|link| !matches!(link.joint, JointKind::Fixed))
+    {
+        return fail(
+            &format!("{path}.links[0].mocap"),
+            "mocap root cannot have movable descendants",
+        );
+    }
     Ok((tree, name, link_names, self_collide))
 }
 
@@ -1192,6 +1231,7 @@ fn parse_link(
             "joint",
             "joint_offset_in_parent",
             "joint_offset_in_child",
+            "mocap",
             "mass",
             "inertia",
         ],
@@ -1299,7 +1339,7 @@ fn parse_link(
         &format!("{path}.inertia"),
     )?;
 
-    let link = Link::new(
+    let mut link = Link::new(
         parent,
         joint,
         joint_offset_in_parent,
@@ -1307,6 +1347,18 @@ fn parse_link(
         mass,
         inertia,
     );
+    if let Some(mocap) = optional(fields, "mocap") {
+        link.mocap = get_bool(mocap, &format!("{path}.mocap"))?;
+        if link.mocap && index != 0 {
+            return fail(&format!("{path}.mocap"), "only a root link may be mocap");
+        }
+        if link.mocap && !matches!(link.joint, JointKind::Free | JointKind::Fixed) {
+            return fail(
+                &format!("{path}.mocap"),
+                "mocap root must use a free or fixed joint",
+            );
+        }
+    }
     Ok((link, name))
 }
 
@@ -2243,7 +2295,8 @@ fn parse_sensor(
                 _ => unreachable!(),
             }
         }
-        "framepos" | "framequat" | "gyro" | "accelerometer" => {
+        "framepos" | "framequat" | "gyro" | "accelerometer" | "velocimeter" | "magnetometer"
+        | "rangefinder" | "framelinvel" | "frameangvel" => {
             reject_unknown(fields, &["name", "kind", "site"], path)?;
             let sn = get_str(required(fields, "site", path)?, &format!("{path}.site"))?;
             let sidx = sites_by_name.get(sn).copied().ok_or_else(|| {
@@ -2258,8 +2311,18 @@ fn parse_sensor(
                 "framequat" => SensorKind::FrameQuat(frame),
                 "gyro" => SensorKind::Gyro(frame),
                 "accelerometer" => SensorKind::Accelerometer(frame),
+                "velocimeter" => SensorKind::Velocimeter(frame),
+                "magnetometer" => SensorKind::Magnetometer(frame),
+                "rangefinder" => SensorKind::Rangefinder(frame),
+                "framelinvel" => SensorKind::FrameLinVel(frame),
+                "frameangvel" => SensorKind::FrameAngVel(frame),
                 _ => unreachable!(),
             }
+        }
+        "subtreecom" => {
+            reject_unknown(fields, &["name", "kind", "tree", "link"], path)?;
+            let (t, l) = parse_tree_link_ref(fields, path, trees_by_name, links_by_name)?;
+            SensorKind::SubtreeCom { tree: t, link: l }
         }
         "touch" => {
             reject_unknown(fields, &["name", "kind", "geom"], path)?;
@@ -2293,7 +2356,9 @@ fn parse_sensor(
                 format!(
                     "unknown sensor kind \"{other}\"; expected \
                      jointpos | jointvel | ballquat | ballangvel | framepos | framequat | \
-                     gyro | accelerometer | touch | force | torque | tendonpos | tendonvel"
+                    gyro | accelerometer | velocimeter | magnetometer | rangefinder | \
+                    subtreecom | framelinvel | frameangvel | touch | force | torque | \
+                    tendonpos | tendonvel"
                 ),
             );
         }

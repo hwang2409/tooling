@@ -9,7 +9,7 @@ use newt::joint::{JointKind, JointLimit};
 use newt::math::{Mat3, Quat, Vec3};
 use newt::solver::{SolImp, SolverConfig, SolverMode};
 use newt::tendon::{FixedTendonJoint, SpatialTendonSite, Tendon};
-use newt::tree::Link;
+use newt::tree::{Link, aba, forward_kinematics};
 use newt::world::World;
 
 fn approx(a: f32, b: f32, tol: f32, ctx: &str) {
@@ -18,6 +18,81 @@ fn approx(a: f32, b: f32, tol: f32, ctx: &str) {
         "{ctx}: expected {a} ≈ {b} (tol {tol}, actual diff {})",
         (a - b).abs()
     );
+}
+
+#[test]
+fn tendon_actuator_link_index_does_not_double_count_torque() {
+    fn make(link_idx: usize) -> (newt::tree::Tree, Vec<f32>) {
+        let mut tree = newt::tree::Tree::new();
+        tree.push_link(Link::new(
+            None,
+            JointKind::Fixed,
+            (Vec3::ZERO, Quat::IDENTITY),
+            (Vec3::ZERO, Quat::IDENTITY),
+            1.0,
+            Mat3::diag(1.0, 1.0, 1.0),
+        ));
+        tree.push_link(Link::new(
+            Some(0),
+            JointKind::hinge(Vec3::Y),
+            (Vec3::ZERO, Quat::IDENTITY),
+            (Vec3::new(0.0, 0.0, 1.0), Quat::IDENTITY),
+            1.0,
+            Mat3::diag(1.0, 1.0, 1.0),
+        ));
+        let tendon = Tendon::fixed(vec![FixedTendonJoint { link: 1, coef: 1.0 }]);
+        let tendon_idx = tree.add_tendon(tendon);
+        let actuator = Actuator::motor(link_idx, 1.0, 0.0).on_tendon(tendon_idx);
+        let actuator_idx = tree.add_actuator(actuator);
+        tree.set_actuator_target(actuator_idx, 1.0);
+        let poses = forward_kinematics(&tree);
+        let qddot = aba(
+            &tree,
+            &poses,
+            Vec3::ZERO,
+            &vec![(Vec3::ZERO, Vec3::ZERO); 2],
+        );
+        (tree, qddot)
+    }
+
+    let (_, expected) = make(0);
+    let (_, observed) = make(1);
+    approx(
+        observed[0],
+        expected[0],
+        1e-6,
+        "tendon actuator must not also use link_idx as a joint transmission",
+    );
+}
+
+#[test]
+fn json_rejects_wrap_sphere_on_dof_ancestor_chain() {
+    let src = r#"{
+        "trees": [{
+            "name": "t",
+            "links": [
+                {"name":"root","joint":{"kind":"fixed"},"mass":1,
+                 "inertia":{"kind":"diag","values":[1,1,1]}},
+                {"name":"hinge","parent":"root","joint":{"kind":"hinge","axis":[0,1,0]},"mass":1,
+                 "inertia":{"kind":"diag","values":[1,1,1]}}
+            ]
+        }],
+        "tendons": [{
+            "name":"cable", "tree":"t", "kind":"spatial",
+            "sites":[
+                {"link":"root","position":[-1,0,0]},
+                {"link":"root","position":[1,0,0]}
+            ],
+            "wraps":[{"segment":0,"link":"hinge","center":[0,0,0],"radius":0.1}]
+        }]
+    }"#;
+    let err = newt::model::load_str(src).expect_err("moving wrap must be rejected");
+    let message = format!("{err}");
+    assert!(
+        message.contains("sphere wrap attached to a link"),
+        "{message}"
+    );
+    assert!(message.contains("deferred in v2 tier 3"), "{message}");
 }
 
 // ---------------------------------------------------------------------------

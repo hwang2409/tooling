@@ -10,11 +10,11 @@
 //!
 //! Supported top-level elements (children of `<mujoco>`):
 //! `<compiler>`, `<option>`, `<default>`, `<worldbody>`, `<actuator>`,
-//! `<sensor>`, `<equality>`, `<contact>`. Anything else (e.g. `<asset>`,
-//! `<tendon>`, `<keyframe>`, `<visual>`) is rejected with a clear
-//! `unsupported in v1 subset` error naming the element.
+//! `<sensor>`, `<equality>`, `<contact>`, and `<keyframe>`. Anything else
+//! (e.g. `<asset>`, `<tendon>`, `<visual>`) is rejected with a clear
+//! `unsupported in v2 tier 4` error naming the element.
 //!
-//! Body attributes: `name`, `pos`, `quat`, `euler`, `childclass`.
+//! Body attributes: `name`, `pos`, `quat`, `euler`, `childclass`, `mocap`.
 //! Joint attributes: `name`, `type` (`hinge`|`slide`|`ball`|`free`),
 //! `pos`, `axis`, `range`, `damping`, `armature`, `limited`, `class`.
 //! Geom attributes: `name`, `type` (`plane`|`sphere`|`box`|`capsule`|
@@ -29,16 +29,17 @@
 //! `kv` OR `dampratio` (position), `forcerange`, `ctrlrange` (accepted
 //! but not enforced; documented), `gear` (motor: scalar only), `class`.
 //! Sensor: `jointpos`, `jointvel`, `ballquat`, `ballangvel`, `framepos`,
-//! `framequat`, `gyro`, `accelerometer`, `touch`, `force`, `torque` — same
-//! set the JSON loader knows.
+//! `framequat`, `gyro`, `accelerometer`, `velocimeter`, `magnetometer`,
+//! `rangefinder`, `framelinvel`, `frameangvel`, `subtreecom`, `touch`,
+//! `force`, `torque` — same set the JSON loader knows.
 //! Equality: `connect`, `weld`, `joint`. Contact: `pair`, `exclude`.
 //!
 //! # Rejection doctrine (no silent ignore)
 //!
 //! Every unknown attribute or child element on a supported node produces
 //! an error naming the offender. Every known-but-unsupported feature
-//! (mesh geom, tendon, keyframe, texture, etc.) produces a
-//! `unsupported in v1 subset` error naming the feature. Silent ignoring
+//! (mesh geom, tendon, texture, etc.) produces a
+//! `unsupported in v2 tier 4` error naming the feature. Silent ignoring
 //! is the loader-silence incident class the ticket calls out.
 
 use std::collections::HashMap;
@@ -567,9 +568,8 @@ impl Loader {
                 "compiler" | "option" | "default" => {}
                 "worldbody" => self.walk_worldbody(child, &subpath)?,
                 "tendon" => self.walk_tendon(child, &subpath)?,
-                "actuator" | "sensor" | "equality" | "contact" => {}
-                "asset" | "keyframe" | "custom" | "visual" | "size" | "statistic" | "extension"
-                | "include" => {
+                "actuator" | "sensor" | "equality" | "contact" | "keyframe" => {}
+                "asset" | "custom" | "visual" | "size" | "statistic" | "extension" | "include" => {
                     return fail(
                         &subpath,
                         format!(
@@ -584,7 +584,7 @@ impl Loader {
                         format!(
                             "unknown top-level element <{other}> under <mujoco>; supported: \
                              compiler, option, default, worldbody, tendon, actuator, sensor, \
-                             equality, contact"
+                             equality, contact, keyframe"
                         ),
                     );
                 }
@@ -598,6 +598,12 @@ impl Loader {
                 "equality" => self.walk_equality(child, &subpath)?,
                 "contact" => self.walk_contact(child, &subpath)?,
                 _ => {}
+            }
+        }
+        for child in root.child_elements() {
+            if child.name == "keyframe" {
+                let subpath = child_path(&path, "keyframe", None);
+                self.walk_keyframe(child, &subpath)?;
             }
         }
         // Apply the JSON loader's auto pair-list filter for the same-tree /
@@ -707,6 +713,9 @@ impl Loader {
                 "gravity" => {
                     self.world.gravity = parse_vec3_attr(v, path, "gravity")?;
                 }
+                "magnetic" => {
+                    self.world.magnetic_field = parse_vec3_attr(v, path, "magnetic")?;
+                }
                 "integrator" => {
                     if v != "RK4" && v != "rk4" {
                         return fail(
@@ -751,10 +760,10 @@ impl Loader {
                         }
                     }
                 }
-                "wind" | "magnetic" | "density" | "viscosity" | "impratio" | "o_margin"
-                | "o_solref" | "o_solimp" | "tolerance" | "noslip_iterations"
-                | "noslip_tolerance" | "mpr_iterations" | "mpr_tolerance" | "collision"
-                | "jacobian" | "integrator_stage" | "apirate" => {
+                "wind" | "density" | "viscosity" | "impratio" | "o_margin" | "o_solref"
+                | "o_solimp" | "tolerance" | "noslip_iterations" | "noslip_tolerance"
+                | "mpr_iterations" | "mpr_tolerance" | "collision" | "jacobian"
+                | "integrator_stage" | "apirate" => {
                     return fail(
                         path,
                         format!("option attribute \"{k}\" is not supported in the v1 subset"),
@@ -1039,7 +1048,7 @@ impl Loader {
         // is important for byte-identity.
         let joint_offset_in_parent = (body_pos, body_ori);
         let joint_offset_in_child = (Vec3::ZERO, Quat::IDENTITY);
-        let link = Link::new(
+        let mut link = Link::new(
             None,
             joint_kind,
             joint_offset_in_parent,
@@ -1047,6 +1056,12 @@ impl Loader {
             mass,
             inertia,
         );
+        if let Some(value) = e.attr("mocap") {
+            link.mocap = parse_bool(value, path, "mocap")?;
+            if link.mocap && !matches!(link.joint, JointKind::Free | JointKind::Fixed) {
+                return fail(path, "mocap root must use a free or fixed joint");
+            }
+        }
         Ok((link, name))
     }
 
@@ -1144,6 +1159,15 @@ impl Loader {
         } else {
             (JointKind::Fixed, Vec3::ZERO, None)
         };
+        let mut ancestor = Some(parent_link_idx);
+        while let Some(index) = ancestor {
+            if self.world.trees[tree_idx].links[index].mocap
+                && !matches!(joint_kind, JointKind::Fixed)
+            {
+                return fail(path, "mocap root cannot have movable descendants");
+            }
+            ancestor = self.world.trees[tree_idx].links[index].parent;
+        }
 
         // Map MJCF body.pos + joint.pos into newt joint offsets.
         let joint_offset_in_parent = (body_pos + joint_pos_in_body, Quat::IDENTITY);
@@ -1156,6 +1180,11 @@ impl Loader {
             mass,
             inertia,
         );
+        if let Some(value) = e.attr("mocap") {
+            if parse_bool(value, path, "mocap")? {
+                return fail(path, "only a root link may be mocap");
+            }
+        }
         self.world.trees[tree_idx].push_link(link);
         let new_idx = self.world.trees[tree_idx].links.len() - 1;
         link_names.insert(name.clone(), new_idx);
@@ -2454,6 +2483,73 @@ impl Loader {
         Ok(())
     }
 
+    fn walk_keyframe(&mut self, e: &Element, path: &str) -> Result<(), MjcfError> {
+        if !e.attrs.is_empty() {
+            return fail(path, "<keyframe> takes no attributes");
+        }
+        for key in e.child_elements() {
+            if key.name != "key" {
+                return fail(
+                    path,
+                    format!("<{0}> is not supported inside <keyframe>", key.name),
+                );
+            }
+            let key_path = child_path(path, "key", key.attr("name"));
+            for (name, _) in &key.attrs {
+                if !matches!(name.as_str(), "name" | "qpos" | "qvel" | "act" | "ctrl") {
+                    return fail(
+                        &key_path,
+                        format!("<key> attribute \"{name}\" is not supported"),
+                    );
+                }
+            }
+            let name = attr_required(key, "name", &key_path)?.to_string();
+            let q_count: usize = self.world.trees.iter().map(|tree| tree.nq()).sum();
+            let qdot_count: usize = self.world.trees.iter().map(|tree| tree.nv()).sum();
+            let actuator_count: usize = self
+                .world
+                .trees
+                .iter()
+                .map(|tree| tree.actuators.len())
+                .sum();
+            let read = |attr: &str, count: usize| -> Result<Vec<f32>, MjcfError> {
+                match key.attr(attr) {
+                    Some(value) => {
+                        let values = parse_f32_list(value, &key_path, attr)?;
+                        if values.len() != count {
+                            return fail(
+                                &key_path,
+                                format!(
+                                    "keyframe {attr} dimension mismatch: expected {count}, got {}",
+                                    values.len()
+                                ),
+                            );
+                        }
+                        Ok(values)
+                    }
+                    None => Ok(vec![0.0; count]),
+                }
+            };
+            let qpos = read("qpos", q_count)?;
+            let qvel = read("qvel", qdot_count)?;
+            let key_path_for_state = key_path.clone();
+            let (q, qdot) = self
+                .world
+                .mujoco_tree_keyframe_state(&qpos, &qvel)
+                .map_err(|error| MjcfError::new(key_path_for_state, error.0))?;
+            self.world
+                .add_keyframe(
+                    name,
+                    q,
+                    qdot,
+                    read("act", actuator_count)?,
+                    read("ctrl", actuator_count)?,
+                )
+                .map_err(|error| MjcfError::new(key_path, error.0))?;
+        }
+        Ok(())
+    }
+
     // ---------- actuator ------------------------------------------------
 
     fn walk_actuator(&mut self, e: &Element, path: &str) -> Result<(), MjcfError> {
@@ -3036,6 +3132,34 @@ impl Loader {
                 attrs_ok(&["name", "site"])?;
                 SensorKind::Accelerometer(site_ref(self, "site")?)
             }
+            "velocimeter" => {
+                attrs_ok(&["name", "site"])?;
+                SensorKind::Velocimeter(site_ref(self, "site")?)
+            }
+            "magnetometer" => {
+                attrs_ok(&["name", "site"])?;
+                SensorKind::Magnetometer(site_ref(self, "site")?)
+            }
+            "rangefinder" => {
+                attrs_ok(&["name", "site"])?;
+                SensorKind::Rangefinder(site_ref(self, "site")?)
+            }
+            "framelinvel" => {
+                attrs_ok(&["name", "site"])?;
+                SensorKind::FrameLinVel(site_ref(self, "site")?)
+            }
+            "frameangvel" => {
+                attrs_ok(&["name", "site"])?;
+                SensorKind::FrameAngVel(site_ref(self, "site")?)
+            }
+            "subtreecom" => {
+                attrs_ok(&["name", "body"])?;
+                let (t, l) = body_or_link_ref(self, "body")?;
+                if t == usize::MAX {
+                    return fail(path, "subtreecom requires a tree body");
+                }
+                SensorKind::SubtreeCom { tree: t, link: l }
+            }
             "touch" => {
                 attrs_ok(&["name", "site", "geom"])?;
                 // MuJoCo `touch` associates with a site; ours takes a geom.
@@ -3095,7 +3219,8 @@ impl Loader {
                         "sensor kind <{other}> is not supported in the v1 subset \
                          (supported: jointpos, jointvel, ballquat, ballangvel, \
                          framepos, framequat, gyro, accelerometer, touch, force, torque, \
-                         tendonpos, tendonvel)"
+                         tendonpos, tendonvel, velocimeter, magnetometer, rangefinder, \
+                         subtreecom, framelinvel, frameangvel)"
                     ),
                 );
             }
@@ -3424,7 +3549,7 @@ fn find_free_joint(e: &Element) -> Option<&Element> {
 fn validate_body_attrs(e: &Element, path: &str) -> Result<(), MjcfError> {
     for (k, _) in &e.attrs {
         match k.as_str() {
-            "name" | "pos" | "quat" | "euler" | "axisangle" | "childclass" => {}
+            "name" | "pos" | "quat" | "euler" | "axisangle" | "childclass" | "mocap" => {}
             other => {
                 return fail(
                     path,

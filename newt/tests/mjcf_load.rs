@@ -40,8 +40,85 @@ fn tendon_unknown_child_rejected() {
 }
 
 #[test]
-fn keyframe_top_level_rejected() {
-    expect_err(r#"<mujoco><keyframe/></mujoco>"#, "<keyframe>");
+fn keyframe_top_level_accepted() {
+    let scene = newt::mjcf::load_mjcf_str(r#"<mujoco><keyframe/></mujoco>"#).unwrap();
+    assert!(scene.world.keyframes.is_empty());
+}
+
+#[test]
+fn keyframe_and_mocap_load_from_mjcf() {
+    let scene = newt::mjcf::load_mjcf_str(
+        r#"<mujoco><worldbody>
+          <body name="root"><inertial mass="1" diaginertia="1 1 1"/>
+            <body name="hinge"><joint name="h" axis="0 0 1"/>
+              <inertial mass="1" diaginertia="1 1 1"/>
+            </body>
+          </body>
+        </worldbody><keyframe><key name="ready" qpos="0.2" qvel="-0.1"/></keyframe></mujoco>"#,
+    )
+    .unwrap();
+    assert_eq!(scene.world.keyframes[0].q, vec![0.2]);
+    assert_eq!(scene.world.keyframes[0].qdot, vec![-0.1]);
+}
+
+#[test]
+fn mocap_movable_descendant_rejected_from_mjcf() {
+    expect_err(
+        r#"<mujoco><worldbody>
+          <body name="root" mocap="true"><inertial mass="1" diaginertia="1 1 1"/>
+            <body name="hinge"><joint name="h" axis="0 0 1"/>
+              <inertial mass="1" diaginertia="1 1 1"/>
+            </body>
+          </body>
+        </worldbody></mujoco>"#,
+        "mocap root cannot have movable descendants",
+    );
+}
+
+#[test]
+fn keyframe_remaps_free_root_qpos_and_qvel() {
+    let scene = load_mjcf_str(
+        r#"<mujoco><worldbody>
+          <body name="root"><freejoint/><inertial mass="1" diaginertia="1 1 1"/>
+            <body name="fixed"><inertial mass="1" diaginertia="1 1 1"/></body>
+          </body>
+        </worldbody><keyframe>
+          <key name="pose" qpos="0 0 0 1 0 0 0" qvel="1 2 3 4 5 6"/>
+        </keyframe></mujoco>"#,
+    )
+    .unwrap();
+    assert_eq!(
+        scene.world.keyframes[0].q,
+        vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    );
+    assert_eq!(
+        scene.world.keyframes[0].qdot,
+        vec![4.0, 5.0, 6.0, 1.0, 2.0, 3.0]
+    );
+}
+
+#[test]
+fn keyframe_remaps_ball_quaternion_order() {
+    let scene = load_mjcf_str(
+        r#"<mujoco><worldbody>
+          <body name="root"><inertial mass="1" diaginertia="1 1 1"/>
+            <body name="ball"><joint name="b" type="ball"/>
+              <inertial mass="1" diaginertia="1 1 1"/>
+            </body>
+          </body>
+        </worldbody><keyframe>
+          <key name="pose" qpos="1 2 3 4" qvel="0.1 0.2 0.3"/>
+        </keyframe></mujoco>"#,
+    )
+    .unwrap();
+    let norm = (30.0_f32).sqrt();
+    let q = &scene.world.keyframes[0].q;
+    assert_eq!(q.len(), 4);
+    assert!((q[0] - 2.0 / norm).abs() < 1e-6);
+    assert!((q[1] - 3.0 / norm).abs() < 1e-6);
+    assert!((q[2] - 4.0 / norm).abs() < 1e-6);
+    assert!((q[3] - 1.0 / norm).abs() < 1e-6);
+    assert_eq!(scene.world.keyframes[0].qdot, vec![0.1, 0.2, 0.3]);
 }
 
 #[test]

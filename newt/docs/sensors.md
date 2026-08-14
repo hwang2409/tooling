@@ -1,4 +1,4 @@
-# Sensors (v1 tier 6)
+# Sensors (v2 tier 4)
 
 Sensors let a scene observe its own state without perturbing it. Each
 sensor produces a fixed-width contribution to a flat `sensordata: Vec<f32>`
@@ -24,12 +24,27 @@ bit-for-bit unchanged.
 | `touch` | 1 | geom | scalar | Σ normal-force magnitudes on the geom |
 | `force` | 3 | non-root link | child body at joint | force parent joint transmits to child |
 | `torque` | 3 | non-root link | child body at joint | torque parent joint transmits to child |
+| `velocimeter` | 3 | site | site | site linear velocity rotated into the site frame |
+| `magnetometer` | 3 | site | site | global magnetic field rotated into the site frame |
+| `rangefinder` | 1 | site | scalar | nearest hit along site +Z, or `-1` |
+| `subtreecom` | 3 | tree link | world | mass-weighted COM of the link subtree |
+| `framelinvel` | 3 | site | world | site linear velocity |
+| `frameangvel` | 3 | site | world | parent angular velocity |
 
 For the site-frame kinds, `local_orientation` is the child-in-parent
 quaternion: a vector expressed in the site's local frame maps to the
 parent body frame via `v_body = local_orientation · v_site`. This is the
 same convention [`crate::model::Site`] uses, so a scene loaded from JSON
 can hand a `Site` straight into a sensor.
+
+`World::magnetic_field` sets the global field. The default is
+`[0, -0.5, 0]`, matching MuJoCo's default option field.
+
+`rangefinder` casts a normalized ray from the site origin along local +Z.
+It tests plane, sphere, box, capsule, cylinder, ellipsoid, and convex-mesh
+surfaces. It returns the nearest non-negative distance, or `-1` when no
+surface is hit. Geoms are visited in declaration order, so equal distances
+use the lowest geom index.
 
 ### Accelerometer
 
@@ -127,7 +142,11 @@ reference host, matching the existing golden regeneration policy.
     {"name": "tip_accel",     "kind": "accelerometer","site": "tip_imu"},
     {"name": "foot_touch",    "kind": "touch",        "geom": "foot_pad"},
     {"name": "elbow_force",   "kind": "force",        "tree": "arm", "link": "elbow"},
-    {"name": "elbow_torque",  "kind": "torque",       "tree": "arm", "link": "elbow"}
+    {"name": "elbow_torque",  "kind": "torque",       "tree": "arm", "link": "elbow"},
+    {"name": "tip_vel",       "kind": "velocimeter",  "site": "tip_imu"},
+    {"name": "tip_mag",       "kind": "magnetometer", "site": "tip_imu"},
+    {"name": "tip_range",     "kind": "rangefinder",  "site": "tip_imu"},
+    {"name": "tip_com",       "kind": "subtreecom",   "tree": "arm", "link": "wrist"}
   ]
 }
 ```
@@ -140,6 +159,8 @@ Field rules (loader in `model.rs`):
   `ballangvel` require a ball link. `force` / `torque` require a non-root
   link (needs a parent joint).
 - `touch` requires a valid geom name.
+- `subtreecom` requires a tree and link. All remaining v2 site sensors
+  require a valid site name.
 - Every unknown field is rejected with a JSON-path error, same as the
   rest of the loader.
 

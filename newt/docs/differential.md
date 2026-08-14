@@ -64,6 +64,12 @@ those units.
 | joint_limit_swing  | 1.08e-1           | 1.5e-1     | 9.10e-1           | 1.2e+0     | bounded divergence |
 | velocity_cartpole  | 2.70e-7           | 1.0e-6     | 5.77e-7           | 2.0e-6     | parity             |
 | filtered_motor_pendulum | 2.56e-4      | 6.0e-4     | 1.34e-3           | 3.0e-3     | bounded divergence |
+| mocap_rangefinder | 0                  | 1.0e-6     | 0                  | 1.0e-6     | parity; sensors 2.4e-8 |
+
+`mocap_rangefinder` also compares all seven `sensordata` values at each
+sample. The maximum direct sensor error is `2.4e-8`, below the `2.0e-6`
+sensor bound. It covers rangefinder ray casting, mocap site attachment,
+velocimeter output, and magnetic-field frame conversion.
 
 ### sphere_drop solref sweep (steady-state penetration)
 
@@ -411,7 +417,8 @@ recording WHY it moved and updating the verdict.
    "energy"` for a long-horizon energy-drift scenario instead of the
    default per-sample state comparison.
 3. Run `python tools/capture_mujoco.py <name>` to write the fixture
-   (and, for energy scenarios, the `<name>_energy.bin` sidecar).
+   (and, for energy scenarios, the `<name>_energy.bin` sidecar). Set
+   `"compare_sensors": true` to also write `<name>_sensors.bin`.
 4. Add a `differential_<name>` test in `tests/differential.rs` and
    a `Tolerance` (or `EnergyTolerance` for energy scenarios) entry
    in the match table. Set the tolerance from the observed max × ~2

@@ -117,6 +117,14 @@
       "stride": 20,
       "init_qpos": [0.4],
       "horizon_note": "2.0 s hanging mass on a spatial tendon wrapping a sphere. Validates v2 tier-3 site position Jacobian + sphere-wrap tangent-arc geometry + envelope-theorem force distribution."
+    },
+    {
+      "name": "mocap_rangefinder",
+      "mjcf": "mocap_rangefinder.xml",
+      "n_steps": 100,
+      "stride": 10,
+      "compare_sensors": true,
+      "horizon_note": "0.5 s direct rangefinder, velocimeter, and magnetometer comparison on a mocap body."
     }
   ]
 }
