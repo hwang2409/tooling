@@ -1,0 +1,21 @@
+<!-- Differential scenario: free body under gravity, no contacts.
+
+  Purely integrator comparison. This is the tightest tolerance case
+  because the ODE is exact and both engines use RK4 with the same
+  timestep. Any divergence here is f32-vs-f64 quantization plus
+  quaternion renormalization drift.
+
+  Initial linear velocity comes from scenarios.json (nonzero to
+  break symmetry so a bug that zeros a component would be caught).
+-->
+<mujoco model="ballistic">
+  <compiler angle="radian"/>
+  <option timestep="0.005" gravity="0 0 -9.81"
+          integrator="RK4" solver="PGS" cone="pyramidal" iterations="20"/>
+  <worldbody>
+    <body name="proj" pos="0.1 -0.2 3.0">
+      <freejoint name="proj_root"/>
+      <inertial pos="0 0 0" mass="1.0" diaginertia="0.05 0.06 0.07"/>
+    </body>
+  </worldbody>
+</mujoco>

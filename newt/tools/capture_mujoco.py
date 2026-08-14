@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""Capture reference MuJoCo trajectories for the newt differential harness.
+
+This script is TOOLING, not part of the engine. It lives outside newt/src so
+the engine's zero-dependency, libm-free rule is unaffected. The Rust
+comparison suite reads the fixtures this script writes; regenerating them
+is a manual step done on a machine that has the biped venv (real MuJoCo)
+installed.
+
+USAGE
+-----
+
+  python capture_mujoco.py                    # capture ALL scenarios
+  python capture_mujoco.py sphere_drop        # capture one scenario
+  python capture_mujoco.py --force            # ignore mujoco-version mismatch
+  python capture_mujoco.py --list             # print scenarios and exit
+  python capture_mujoco.py --venv PATH        # bootstrap check against a venv
+
+The default venv is ~/me/fun/biped/.venv/bin/python; if you invoke this
+script under a different Python (e.g. the venv's own), the venv check is
+skipped (`sys.executable` already IS the venv).
+
+FIXTURE FORMAT
+--------------
+
+Binary little-endian:
+
+    magic         8 bytes  "NEWTDIF1"
+    prov_len      u32      length of provenance line
+    provenance    utf8     one line: name|mujoco=X.Y.Z|dt=..|integ=..|
+                           solver=..|cone=..|iters=..|nq=..|nv=..|stride=..
+                           |n_steps=..|date=YYYY-MM-DD
+    nq            u32
+    nv            u32
+    stride        u32      (samples come every `stride` steps)
+    n_samples     u32      (== 1 + n_steps // stride; sample 0 = initial)
+    n_steps       u32      (total steps run)
+    -- per sample --
+    step          u32
+    qpos          f64 * nq
+    qvel          f64 * nv
+
+Ints are unsigned LE; floats are IEEE 754 f64 LE. Values come from MuJoCo
+as f64 and are stored as f64. The Rust reader widens newt's f32 output to
+f64 for the comparison.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import struct
+import sys
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# venv guard
+# ---------------------------------------------------------------------------
+
+DEFAULT_VENV_PYTHON = Path.home() / "me/fun/biped/.venv/bin/python"
+
+
+def _reexec_under_venv(venv_python: Path, argv: list[str]) -> None:
+    """If the current interpreter is not the biped venv, re-exec under it.
+
+    Only triggers when the venv actually exists. Comparison is by
+    (unresolved) path string because a venv's `python` is typically a
+    symlink into the base install — resolving both sides would falsely
+    mark them equal even when the venv's site-packages is what we want.
+    """
+    if not venv_python.is_file():
+        return
+    if str(Path(sys.executable)) == str(venv_python):
+        return
+    # Re-execute with the venv's Python, keeping the same argv.
+    os.execv(str(venv_python), [str(venv_python), *argv])
+
+
+# ---------------------------------------------------------------------------
+# fixture writer
+# ---------------------------------------------------------------------------
+
+MAGIC = b"NEWTDIF1"
+
+
+def _write_fixture(
+    path: Path,
+    provenance: str,
+    stride: int,
+    n_steps: int,
+    qpos_samples: list,  # list[np.ndarray]  (avoiding numpy import at top)
+    qvel_samples: list,
+) -> None:
+    assert len(qpos_samples) == len(qvel_samples)
+    assert len(qpos_samples) >= 1
+    nq = int(qpos_samples[0].shape[0])
+    nv = int(qvel_samples[0].shape[0])
+    prov_bytes = provenance.encode("utf-8")
+    with open(path, "wb") as f:
+        f.write(MAGIC)
+        f.write(struct.pack("<I", len(prov_bytes)))
+        f.write(prov_bytes)
+        f.write(struct.pack("<IIIII", nq, nv, stride, len(qpos_samples), n_steps))
+        for i, (qp, qv) in enumerate(zip(qpos_samples, qvel_samples)):
+            step = i * stride
+            f.write(struct.pack("<I", step))
+            f.write(struct.pack(f"<{nq}d", *qp.astype("float64").tolist()))
+            f.write(struct.pack(f"<{nv}d", *qv.astype("float64").tolist()))
+
+
+def _read_provenance(path: Path) -> str | None:
+    """Read the provenance line from an existing fixture, or None on any
+    mismatch / IO error. Used by the version guard."""
+    try:
+        with open(path, "rb") as f:
+            magic = f.read(8)
+            if magic != MAGIC:
+                return None
+            (n,) = struct.unpack("<I", f.read(4))
+            return f.read(n).decode("utf-8")
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# scenario loader
+# ---------------------------------------------------------------------------
+
+
+def _load_scenarios(refs_dir: Path) -> list[dict]:
+    with open(refs_dir / "scenarios.json", "r", encoding="utf-8") as f:
+        doc = json.load(f)
+    return doc["scenarios"]
+
+
+# ---------------------------------------------------------------------------
+# capture
+# ---------------------------------------------------------------------------
+
+
+def _capture_scenario(mujoco, np, scenario: dict, refs_dir: Path) -> tuple[Path, str]:
+    """Run one scenario and write its fixture. Returns (path, provenance).
+
+    If `scenario["check_kind"] == "energy"`, an additional sidecar
+    `<name>_energy.bin` file is written next to the main fixture with
+    per-sample MuJoCo kinetic and potential energies (f64 pairs). The
+    Rust harness reads this to compare long-horizon energy drift.
+    """
+    name = scenario["name"]
+    mjcf_path = refs_dir / scenario["mjcf"]
+    n_steps = int(scenario["n_steps"])
+    stride = int(scenario["stride"])
+    check_kind = scenario.get("check_kind", "state")
+    want_energy = check_kind == "energy"
+    if stride <= 0 or n_steps <= 0:
+        raise ValueError(f"{name}: stride and n_steps must be > 0")
+
+    model = mujoco.MjModel.from_xml_path(str(mjcf_path))
+    data = mujoco.MjData(model)
+
+    # Apply overrides. Both are applied in MuJoCo layout — the scenarios.json
+    # file is authored to that layout by design.
+    if "init_qpos" in scenario:
+        init = np.asarray(scenario["init_qpos"], dtype="float64")
+        if init.shape[0] != model.nq:
+            raise ValueError(
+                f"{name}: init_qpos length {init.shape[0]} != model.nq {model.nq}"
+            )
+        data.qpos[:] = init
+    if "init_qvel" in scenario:
+        init = np.asarray(scenario["init_qvel"], dtype="float64")
+        if init.shape[0] != model.nv:
+            raise ValueError(
+                f"{name}: init_qvel length {init.shape[0]} != model.nv {model.nv}"
+            )
+        data.qvel[:] = init
+
+    # Actuator targets: if present (name -> ctrl value), apply on every step.
+    targets: "np.ndarray | None" = None
+    if "actuator_targets" in scenario:
+        by_name = scenario["actuator_targets"]
+        arr = np.zeros(model.nu, dtype="float64")
+        for act_name, ctrl in by_name.items():
+            act_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_ACTUATOR, act_name
+            )
+            if act_id < 0:
+                raise ValueError(
+                    f"{name}: actuator_targets references unknown actuator {act_name!r}"
+                )
+            arr[act_id] = float(ctrl)
+        targets = arr
+
+    # Forward once so any derived quantities (qacc etc) are consistent
+    # with the initial (qpos, qvel) before sampling step 0.
+    mujoco.mj_forward(model, data)
+
+    def snap_energy():
+        # MuJoCo layout is `data.energy = [potential, kinetic]` — verified
+        # empirically (zero qvel yields energy[1] == 0). mj_energyPos and
+        # mj_energyVel fill these fields respectively.
+        mujoco.mj_energyPos(model, data)
+        mujoco.mj_energyVel(model, data)
+        pot = float(data.energy[0])
+        kin = float(data.energy[1])
+        return kin, pot
+
+    qpos_samples = [data.qpos.copy()]
+    qvel_samples = [data.qvel.copy()]
+    energy_samples: list[tuple[float, float]] = []
+    if want_energy:
+        energy_samples.append(snap_energy())
+
+    for step in range(1, n_steps + 1):
+        if targets is not None:
+            data.ctrl[:] = targets
+        mujoco.mj_step(model, data)
+        if step % stride == 0:
+            qpos_samples.append(data.qpos.copy())
+            qvel_samples.append(data.qvel.copy())
+            if want_energy:
+                energy_samples.append(snap_energy())
+
+    provenance = (
+        f"name={name}|mujoco={mujoco.__version__}"
+        f"|dt={model.opt.timestep:.9g}"
+        f"|integ={int(model.opt.integrator)}"
+        f"|solver={int(model.opt.solver)}"
+        f"|cone={int(model.opt.cone)}"
+        f"|iters={model.opt.iterations}"
+        f"|nq={model.nq}|nv={model.nv}"
+        f"|stride={stride}|n_steps={n_steps}"
+        f"|date={_dt.date.today().isoformat()}"
+    )
+    path = refs_dir / f"{name}.bin"
+    _write_fixture(path, provenance, stride, n_steps, qpos_samples, qvel_samples)
+    if want_energy:
+        energy_path = refs_dir / f"{name}_energy.bin"
+        with open(energy_path, "wb") as f:
+            for kin, pot in energy_samples:
+                f.write(struct.pack("<dd", kin, pot))
+    return path, provenance
+
+
+# ---------------------------------------------------------------------------
+# version guard
+# ---------------------------------------------------------------------------
+
+
+def _extract_mujoco_version(prov: str) -> str | None:
+    for tok in prov.split("|"):
+        if tok.startswith("mujoco="):
+            return tok[len("mujoco=") :]
+    return None
+
+
+def _check_version_guard(
+    refs_dir: Path, scenarios: list[dict], live_version: str, force: bool
+) -> None:
+    """Compare the MuJoCo version in every existing fixture against the
+    running interpreter's MuJoCo version. Refuses to overwrite fixtures
+    captured under a different version unless `--force` is set."""
+    mismatches = []
+    for scenario in scenarios:
+        path = refs_dir / f"{scenario['name']}.bin"
+        if not path.is_file():
+            continue
+        prov = _read_provenance(path)
+        if prov is None:
+            continue
+        old_version = _extract_mujoco_version(prov)
+        if old_version is None:
+            continue
+        if old_version != live_version:
+            mismatches.append((scenario["name"], old_version))
+    if mismatches and not force:
+        print("REFUSING TO CAPTURE — mujoco version drift:", file=sys.stderr)
+        for name, old in mismatches:
+            print(f"  {name}.bin was captured with mujoco {old}", file=sys.stderr)
+        print(
+            f"  live interpreter has mujoco {live_version}",
+            file=sys.stderr,
+        )
+        print(
+            "  pass --force to overwrite (and update the scorecard's known-cause "
+            "notes if divergences move)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Capture reference MuJoCo trajectories for newt's differential harness."
+    )
+    parser.add_argument(
+        "scenarios",
+        nargs="*",
+        help="Scenario names to capture. Empty = capture ALL scenarios in scenarios.json.",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List scenario names and exit.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite fixtures even if they were captured with a different mujoco version.",
+    )
+    parser.add_argument(
+        "--venv",
+        default=str(DEFAULT_VENV_PYTHON),
+        help="Path to the venv Python to re-exec under (default: biped venv). "
+        "Pass --venv '' to disable re-exec.",
+    )
+    args = parser.parse_args(argv[1:])
+
+    # Re-exec under the venv if we're not already in one that has mujoco.
+    if args.venv:
+        _reexec_under_venv(Path(args.venv), argv)
+
+    # Import after any re-exec.
+    try:
+        import mujoco  # type: ignore[import-not-found]
+        import numpy as np  # type: ignore[import-not-found]
+    except ImportError as e:
+        print(
+            "ERROR: mujoco/numpy not importable. Run under the biped venv:",
+            file=sys.stderr,
+        )
+        print(f"  {DEFAULT_VENV_PYTHON} {' '.join(argv)}", file=sys.stderr)
+        print(f"  underlying: {e}", file=sys.stderr)
+        return 1
+
+    refs_dir = Path(__file__).resolve().parent.parent / "tests" / "references"
+    scenarios = _load_scenarios(refs_dir)
+
+    if args.list:
+        for s in scenarios:
+            print(s["name"])
+        return 0
+
+    if args.scenarios:
+        wanted = set(args.scenarios)
+        known = {s["name"] for s in scenarios}
+        unknown = wanted - known
+        if unknown:
+            print(f"unknown scenarios: {sorted(unknown)}", file=sys.stderr)
+            return 1
+        scenarios = [s for s in scenarios if s["name"] in wanted]
+
+    _check_version_guard(refs_dir, scenarios, mujoco.__version__, args.force)
+
+    for scenario in scenarios:
+        path, prov = _capture_scenario(mujoco, np, scenario, refs_dir)
+        print(f"wrote {path.name} :: {prov}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

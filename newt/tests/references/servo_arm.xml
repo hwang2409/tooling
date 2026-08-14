@@ -1,0 +1,42 @@
+<!-- Differential scenario: 3-hinge arm driven by position servos.
+
+  Actuator model comparison. Kv values are precomputed from
+  (dampratio=1, kp, reflected_inertia) as documented in models/arm.xml
+  so both loaders arrive at the same PD gains. Actuator targets are
+  applied per-step by both harnesses (see scenarios.json).
+-->
+<mujoco model="servo_arm">
+  <compiler angle="radian"/>
+  <option timestep="0.005" gravity="0 0 -9.81"
+          integrator="RK4" solver="PGS" cone="pyramidal" iterations="20"/>
+
+  <worldbody>
+    <body name="anchor" pos="0 0 1.6">
+      <inertial pos="0 0 0" mass="1.0" diaginertia="1.0 1.0 1.0"/>
+
+      <body name="shoulder" pos="0 0 -0.25">
+        <joint name="shoulder_hinge" type="hinge" axis="1 0 0" pos="0 0 0.25"/>
+        <inertial pos="0 0 0" mass="1.0" diaginertia="0.020833334 0.020833334 1e-6"/>
+
+        <body name="elbow" pos="0 0 -0.5">
+          <joint name="elbow_hinge" type="hinge" axis="1 0 0" pos="0 0 0.25"/>
+          <inertial pos="0 0 0" mass="0.8" diaginertia="0.016666668 0.016666668 1e-6"/>
+
+          <body name="wrist" pos="0 0 -0.5">
+            <joint name="wrist_hinge" type="hinge" axis="1 0 0" pos="0 0 0.25"/>
+            <inertial pos="0 0 0" mass="0.6" diaginertia="0.012500001 0.012500001 1e-6"/>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <position name="shoulder_servo" joint="shoulder_hinge"
+              kp="200" kv="14.14213562373095" forcerange="-60 60"/>
+    <position name="elbow_servo" joint="elbow_hinge"
+              kp="150" kv="10.95445115010332" forcerange="-40 40"/>
+    <position name="wrist_servo" joint="wrist_hinge"
+              kp="100" kv="7.745966692414834" forcerange="-30 30"/>
+  </actuator>
+</mujoco>

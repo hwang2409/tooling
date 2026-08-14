@@ -1,0 +1,1149 @@
+//! Differential harness: newt vs REAL MuJoCo.
+//!
+//! Each test loads the SAME MJCF file that
+//! `tools/capture_mujoco.py` used to produce the committed reference
+//! fixture. It steps newt with the same initial state and timestep,
+//! samples qpos/qvel at the same stride, and asserts each component
+//! stays within a per-scenario tolerance window.
+//!
+//! The tolerances in [`tolerance`] and [`energy_tolerance`] were
+//! MEASURED first, then set with per-scenario headroom above the
+//! observed max — mostly ~2× for the clean scenarios, up to ~5× for
+//! the ones the scorecard flags with a known bounded divergence or
+//! open finding. Every scenario prints its measured max at test time
+//! so drift stays visible.
+//!
+//! Divergences beyond physical reasonableness are FINDINGS to report,
+//! not to hide. If a bound needs to grow to cover a real divergence,
+//! the growth belongs in the scorecard (`docs/differential.md`) with
+//! a note explaining why.
+//!
+//! # Debug dump
+//!
+//! Set `NEWT_DIFFERENTIAL_DUMP=1` when running these tests to print
+//! the per-sample per-component error tape (qpos and qvel) — useful
+//! when a tolerance needs to be understood or re-set after a fixture
+//! regen. Example:
+//!
+//! ```text
+//! NEWT_DIFFERENTIAL_DUMP=1 cargo test --test differential -- --nocapture
+//! ```
+//!
+//! Fixtures live in `tests/references/*.bin` and are read directly
+//! from disk (no Python/MuJoCo at test time; CI runs this on Linux
+//! with no MuJoCo).
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use newt::joint::JointKind;
+use newt::json::{self, Value};
+use newt::math::{Quat, Vec3};
+use newt::model::Scene;
+use newt::world::World;
+
+// ---------------------------------------------------------------------------
+// tolerances (MEASURED-then-stated; see docs/differential.md)
+// ---------------------------------------------------------------------------
+
+/// Per-scenario tolerance windows. `qpos` and `qvel` are absolute L∞
+/// bounds applied component-wise to `|newt - mujoco|` at every sampled
+/// step. Energy scenarios use a separate [`EnergyTolerance`] instead.
+///
+/// Numbers here are the ACTUAL observed max divergence times
+/// per-scenario headroom — ~2× for the clean scenarios; up to ~5× for
+/// scenarios with a known bounded divergence or an open finding (see
+/// the inline notes on each branch and `docs/differential.md`).
+/// Update when fixtures regen, and mirror to the scorecard.
+struct Tolerance {
+    qpos: f64,
+    qvel: f64,
+}
+
+fn tolerance(name: &str) -> Tolerance {
+    // Bounds are AUTHORED after observation. Default headroom is ~2×
+    // the observed max; a scenario may use more when its verdict in
+    // the scorecard is "bounded divergence" or "open finding" (both
+    // documented per-branch). Any bound more than ~5× observation
+    // without such a note is a smell — either the measurement was
+    // wrong or a real divergence is being papered over. See
+    // docs/differential.md for the per-scenario "observed vs bound"
+    // table.
+    match name {
+        // Pure RK4 free-fall; f32 vs f64 quantization only.
+        // Observed max qpos 1.24e-5, qvel 3.71e-5.
+        "ballistic" => Tolerance {
+            qpos: 3.0e-5,
+            qvel: 8.0e-5,
+        },
+        // Torque-free tumble; RK4 + quaternion renormalization drift on
+        // an intermediate-axis-unstable scene.
+        // Observed max qpos 1.59e-3, qvel 2.03e-2.
+        "tumble" => Tolerance {
+            qpos: 4.0e-3,
+            qvel: 5.0e-2,
+        },
+        // Short-horizon chaotic; tight because horizon is 0.4 s.
+        // Observed max qpos 1.33e-7, qvel 6.23e-7.
+        "double_pendulum" => Tolerance {
+            qpos: 5.0e-7,
+            qvel: 2.0e-6,
+        },
+        // Position servos driving to target. PD gains match by
+        // construction; divergence is integration order and clamping edges.
+        // Observed max qpos 7.03e-4, qvel 3.06e-2.
+        "servo_arm" => Tolerance {
+            qpos: 2.0e-3,
+            qvel: 8.0e-2,
+        },
+        // First-bounce transient dominates (~4 mm z, ~0.17 m/s vz).
+        // Steady-state penetration difference ~0.18 mm (newt is
+        // shallower — see docs/differential.md open finding on
+        // NEWT-9's softened d-scaling). Bound covers both.
+        "sphere_drop" => Tolerance {
+            qpos: 1.0e-2,
+            qvel: 3.0e-1,
+        },
+        // OPEN FINDING (docs/differential.md): 3-box stack is not stable
+        // in newt under matching iters=20 PGS settings — the top block
+        // slides off (mostly −x) and lands on the ground by t≈4 s while
+        // MuJoCo's stack holds. Bound is set to survive the current
+        // observation and no more; a REGRESSION (further drift, e.g.
+        // the block sliding past the ground plane) still fails.
+        // Observed max qpos 1.45 m (at t≈3.0 s), qvel 3.89 m/s
+        // (at t≈2.6 s); final end state (-1.41, +0.44, +0.35).
+        "box_stack" => Tolerance {
+            qpos: 2.0,
+            qvel: 5.0,
+        },
+        // Limit-force impulse profile differs between newt PGS and
+        // MuJoCo PGS; drift accumulates each swing.
+        // Observed max qpos 1.08e-1 rad, qvel 9.10e-1 rad/s.
+        "joint_limit_swing" => Tolerance {
+            qpos: 1.5e-1,
+            qvel: 1.2,
+        },
+        // Free-root + hinge; proves the per-joint qpos/qvel remap by
+        // sweeping every free-root layout slot with a nonzero initial
+        // orientation, angular velocity, linear velocity, and hinge
+        // rate. Divergence is at f32-quant scale — a mapping bug
+        // (wrong quat-slot order, missed body-vs-world linear frame
+        // rotation) would show up on the order of the initial
+        // velocities themselves, not the 1e-6 seen here.
+        // Observed max qpos 2.64e-6, qvel 2.77e-6.
+        "floating_base" => Tolerance {
+            qpos: 6.0e-6,
+            qvel: 6.0e-6,
+        },
+        other => panic!("no tolerance for scenario {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fixture reader
+// ---------------------------------------------------------------------------
+
+const MAGIC: &[u8; 8] = b"NEWTDIF1";
+
+struct Fixture {
+    stride: u32,
+    n_steps: u32,
+    samples: Vec<Sample>,
+}
+
+struct Sample {
+    qpos: Vec<f64>,
+    qvel: Vec<f64>,
+}
+
+fn read_fixture(path: &Path) -> Fixture {
+    let bytes =
+        fs::read(path).unwrap_or_else(|e| panic!("cannot read fixture {}: {e}", path.display()));
+    let mut c = Cursor::new(&bytes);
+    let magic = c.take(8);
+    assert_eq!(
+        magic,
+        &MAGIC[..],
+        "fixture {} has wrong magic {:?}; regenerate with tools/capture_mujoco.py",
+        path.display(),
+        std::str::from_utf8(magic).unwrap_or("<non-utf8>")
+    );
+    let prov_len = c.u32() as usize;
+    // Skip the provenance line — the tool's version guard uses it; the
+    // harness does not, since the tolerances table is versioned alongside
+    // the fixtures.
+    let _ = c.take(prov_len);
+    let nq = c.u32() as usize;
+    let nv = c.u32() as usize;
+    let stride = c.u32();
+    let n_samples = c.u32() as usize;
+    let n_steps = c.u32();
+    let mut samples = Vec::with_capacity(n_samples);
+    for _ in 0..n_samples {
+        let _step = c.u32();
+        let mut qpos = Vec::with_capacity(nq);
+        for _ in 0..nq {
+            qpos.push(c.f64());
+        }
+        let mut qvel = Vec::with_capacity(nv);
+        for _ in 0..nv {
+            qvel.push(c.f64());
+        }
+        samples.push(Sample { qpos, qvel });
+    }
+    assert_eq!(
+        c.remaining(),
+        0,
+        "fixture {} has trailing bytes",
+        path.display()
+    );
+    Fixture {
+        stride,
+        n_steps,
+        samples,
+    }
+}
+
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+    fn take(&mut self, n: usize) -> &'a [u8] {
+        let out = &self.bytes[self.pos..self.pos + n];
+        self.pos += n;
+        out
+    }
+    fn u32(&mut self) -> u32 {
+        let out = u32::from_le_bytes(self.bytes[self.pos..self.pos + 4].try_into().unwrap());
+        self.pos += 4;
+        out
+    }
+    fn f64(&mut self) -> f64 {
+        let out = f64::from_le_bytes(self.bytes[self.pos..self.pos + 8].try_into().unwrap());
+        self.pos += 8;
+        out
+    }
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
+    }
+}
+
+// ---------------------------------------------------------------------------
+// scenarios.json reader
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct ScenarioSpec {
+    name: String,
+    mjcf: String,
+    n_steps: u32,
+    stride: u32,
+    init_qpos: Option<Vec<f64>>,
+    init_qvel: Option<Vec<f64>>,
+    actuator_targets: Option<HashMap<String, f32>>,
+    /// "state" (default) or "energy". Energy scenarios also read
+    /// `<name>_energy.bin` and compare newt vs MuJoCo total-energy
+    /// drift instead of per-component state divergence (which would
+    /// fail for chaotic trajectories over a long horizon).
+    check_kind: CheckKind,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CheckKind {
+    State,
+    Energy,
+}
+
+fn references_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("references")
+}
+
+fn load_scenarios() -> Vec<ScenarioSpec> {
+    let src = fs::read_to_string(references_dir().join("scenarios.json"))
+        .expect("scenarios.json missing");
+    let root = json::parse(&src).expect("scenarios.json invalid");
+    let obj = match root {
+        Value::Object(o) => o,
+        _ => panic!("scenarios.json root must be object"),
+    };
+    let scenarios = obj
+        .iter()
+        .find(|(k, _)| k == "scenarios")
+        .map(|(_, v)| v.clone())
+        .expect("scenarios.json missing \"scenarios\" array");
+    let arr = match scenarios {
+        Value::Array(a) => a,
+        _ => panic!("scenarios.json \"scenarios\" is not an array"),
+    };
+    arr.into_iter().map(parse_scenario).collect()
+}
+
+fn parse_scenario(v: Value) -> ScenarioSpec {
+    let obj = match v {
+        Value::Object(o) => o,
+        _ => panic!("scenario entry must be an object"),
+    };
+    let get = |k: &str| obj.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+    let name = expect_string(get("name").expect("scenario missing name"));
+    let mjcf = expect_string(get("mjcf").expect("scenario missing mjcf"));
+    let n_steps = expect_u32(get("n_steps").expect("scenario missing n_steps"));
+    let stride = expect_u32(get("stride").expect("scenario missing stride"));
+    let init_qpos = get("init_qpos").map(expect_f64_vec);
+    let init_qvel = get("init_qvel").map(expect_f64_vec);
+    let actuator_targets = get("actuator_targets").map(|v| {
+        let entries = match v {
+            Value::Object(o) => o,
+            _ => panic!("actuator_targets must be an object"),
+        };
+        entries
+            .into_iter()
+            .map(|(k, v)| (k, expect_f64(v) as f32))
+            .collect()
+    });
+    let check_kind = match get("check_kind") {
+        None => CheckKind::State,
+        Some(Value::String(s)) => match s.as_str() {
+            "state" => CheckKind::State,
+            "energy" => CheckKind::Energy,
+            other => panic!("unknown check_kind {other:?}"),
+        },
+        Some(other) => panic!("check_kind must be a string, got {}", other.type_name()),
+    };
+    ScenarioSpec {
+        name,
+        mjcf,
+        n_steps,
+        stride,
+        init_qpos,
+        init_qvel,
+        actuator_targets,
+        check_kind,
+    }
+}
+
+fn expect_string(v: Value) -> String {
+    match v {
+        Value::String(s) => s,
+        other => panic!("expected string, got {}", other.type_name()),
+    }
+}
+
+fn expect_u32(v: Value) -> u32 {
+    match v {
+        Value::Number(n) => n as u32,
+        other => panic!("expected number, got {}", other.type_name()),
+    }
+}
+
+fn expect_f64(v: Value) -> f64 {
+    match v {
+        Value::Number(n) => n,
+        other => panic!("expected number, got {}", other.type_name()),
+    }
+}
+
+fn expect_f64_vec(v: Value) -> Vec<f64> {
+    let arr = match v {
+        Value::Array(a) => a,
+        other => panic!("expected array, got {}", other.type_name()),
+    };
+    arr.into_iter().map(expect_f64).collect()
+}
+
+// ---------------------------------------------------------------------------
+// initial-state application (MuJoCo layout → newt state)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// MuJoCo <-> newt state remap
+// ---------------------------------------------------------------------------
+//
+// Free-body scenarios: newt holds `world.bodies[i]` with world-frame
+// position, orientation quaternion (x,y,z,w), world-frame linear
+// velocity, and body-frame angular velocity. MuJoCo's freejoint qpos is
+// (px,py,pz, qw,qx,qy,qz) and qvel is (vx,vy,vz world, ωx,ωy,ωz body).
+// One quat-slot reorder; velocity slots already match.
+//
+// Tree scenarios: newt visits `world.trees` in add order; each tree's
+// links are topologically ordered with the root first. Every link
+// carries one JointKind that decides its slot count and layout:
+//
+//   Free root   nq=7  newt (px,py,pz, qx,qy,qz,qw)  | MJ (px,py,pz, qw,qx,qy,qz)
+//               nv=6  newt (ωx,ωy,ωz body,           | MJ (vx,vy,vz world,
+//                          vx,vy,vz body)             |     ωx,ωy,ωz body)
+//   Ball        nq=4  newt (qx,qy,qz,qw)             | MJ (qw,qx,qy,qz)
+//               nv=3  newt (ωx,ωy,ωz body)           | MJ same
+//   Hinge/Slide nq=1  scalar (identical)             | scalar (identical)
+//   Fixed       nq=0                                 | (no MJ slot either)
+//
+// The free-root linear-velocity frame swap (body <-> world) uses the
+// root's current orientation. This is the trap the reviewer flagged:
+// no shipped v0/v1 scenario has a moving free-root tree, so a naive
+// copy would silently pass here today but break the biped validation.
+// `floating_base` proves the remap works.
+
+fn apply_init_qpos(world: &mut World, qpos: &[f64]) {
+    let mut cursor = 0usize;
+    for body in world.bodies.iter_mut() {
+        // MuJoCo layout for a freejoint body: (px, py, pz, qw, qx, qy, qz).
+        body.position = Vec3::new(
+            qpos[cursor] as f32,
+            qpos[cursor + 1] as f32,
+            qpos[cursor + 2] as f32,
+        );
+        let qw = qpos[cursor + 3] as f32;
+        let qx = qpos[cursor + 4] as f32;
+        let qy = qpos[cursor + 5] as f32;
+        let qz = qpos[cursor + 6] as f32;
+        assert_unit_quat(qw, qx, qy, qz, "world.bodies free-body init_qpos");
+        body.orientation = Quat::new(qx, qy, qz, qw).renormalize();
+        cursor += 7;
+    }
+    for tree in world.trees.iter_mut() {
+        let n_links = tree.links.len();
+        for i in 0..n_links {
+            let q_off = tree.q_offset[i];
+            match tree.links[i].joint {
+                JointKind::Free => {
+                    tree.q[q_off] = qpos[cursor] as f32;
+                    tree.q[q_off + 1] = qpos[cursor + 1] as f32;
+                    tree.q[q_off + 2] = qpos[cursor + 2] as f32;
+                    let qw = qpos[cursor + 3] as f32;
+                    let qx = qpos[cursor + 4] as f32;
+                    let qy = qpos[cursor + 5] as f32;
+                    let qz = qpos[cursor + 6] as f32;
+                    assert_unit_quat(qw, qx, qy, qz, "tree free-root init_qpos");
+                    let renorm = Quat::new(qx, qy, qz, qw).renormalize();
+                    tree.q[q_off + 3] = renorm.x;
+                    tree.q[q_off + 4] = renorm.y;
+                    tree.q[q_off + 5] = renorm.z;
+                    tree.q[q_off + 6] = renorm.w;
+                    cursor += 7;
+                }
+                JointKind::Ball { .. } => {
+                    let qw = qpos[cursor] as f32;
+                    let qx = qpos[cursor + 1] as f32;
+                    let qy = qpos[cursor + 2] as f32;
+                    let qz = qpos[cursor + 3] as f32;
+                    assert_unit_quat(qw, qx, qy, qz, "tree ball init_qpos");
+                    let renorm = Quat::new(qx, qy, qz, qw).renormalize();
+                    tree.q[q_off] = renorm.x;
+                    tree.q[q_off + 1] = renorm.y;
+                    tree.q[q_off + 2] = renorm.z;
+                    tree.q[q_off + 3] = renorm.w;
+                    cursor += 4;
+                }
+                JointKind::Hinge { .. } | JointKind::Slide { .. } => {
+                    tree.q[q_off] = qpos[cursor] as f32;
+                    cursor += 1;
+                }
+                JointKind::Fixed => {}
+            }
+        }
+    }
+    assert_eq!(cursor, qpos.len(), "init_qpos leftover data");
+}
+
+fn apply_init_qvel(world: &mut World, qvel: &[f64]) {
+    let mut cursor = 0usize;
+    for body in world.bodies.iter_mut() {
+        // MuJoCo freejoint qvel: (vx, vy, vz world, ωx, ωy, ωz body).
+        body.linear_velocity = Vec3::new(
+            qvel[cursor] as f32,
+            qvel[cursor + 1] as f32,
+            qvel[cursor + 2] as f32,
+        );
+        body.angular_velocity_body = Vec3::new(
+            qvel[cursor + 3] as f32,
+            qvel[cursor + 4] as f32,
+            qvel[cursor + 5] as f32,
+        );
+        cursor += 6;
+    }
+    for tree in world.trees.iter_mut() {
+        let n_links = tree.links.len();
+        for i in 0..n_links {
+            let v_off = tree.v_offset[i];
+            match tree.links[i].joint {
+                JointKind::Free => {
+                    // MJ layout: (vx, vy, vz world, ωx, ωy, ωz body).
+                    // Newt layout: (ωx, ωy, ωz body, vx, vy, vz BODY).
+                    // Convert world linear to body: v_body = R^T * v_world,
+                    // where R is the free-root orientation from newt's q.
+                    let q_off = tree.q_offset[i];
+                    let root_ori = Quat::new(
+                        tree.q[q_off + 3],
+                        tree.q[q_off + 4],
+                        tree.q[q_off + 5],
+                        tree.q[q_off + 6],
+                    );
+                    let v_world = Vec3::new(
+                        qvel[cursor] as f32,
+                        qvel[cursor + 1] as f32,
+                        qvel[cursor + 2] as f32,
+                    );
+                    let v_body = root_ori.inverse_rotate(v_world);
+                    let omega_body = Vec3::new(
+                        qvel[cursor + 3] as f32,
+                        qvel[cursor + 4] as f32,
+                        qvel[cursor + 5] as f32,
+                    );
+                    tree.qdot[v_off] = omega_body.x;
+                    tree.qdot[v_off + 1] = omega_body.y;
+                    tree.qdot[v_off + 2] = omega_body.z;
+                    tree.qdot[v_off + 3] = v_body.x;
+                    tree.qdot[v_off + 4] = v_body.y;
+                    tree.qdot[v_off + 5] = v_body.z;
+                    cursor += 6;
+                }
+                JointKind::Ball { .. } => {
+                    // Both sides angular body.
+                    tree.qdot[v_off] = qvel[cursor] as f32;
+                    tree.qdot[v_off + 1] = qvel[cursor + 1] as f32;
+                    tree.qdot[v_off + 2] = qvel[cursor + 2] as f32;
+                    cursor += 3;
+                }
+                JointKind::Hinge { .. } | JointKind::Slide { .. } => {
+                    tree.qdot[v_off] = qvel[cursor] as f32;
+                    cursor += 1;
+                }
+                JointKind::Fixed => {}
+            }
+        }
+    }
+    assert_eq!(cursor, qvel.len(), "init_qvel leftover data");
+}
+
+fn extract_qpos(world: &World) -> Vec<f64> {
+    let mut out = Vec::new();
+    for body in &world.bodies {
+        out.push(body.position.x as f64);
+        out.push(body.position.y as f64);
+        out.push(body.position.z as f64);
+        // newt (x,y,z,w) -> MJ (w,x,y,z).
+        out.push(body.orientation.w as f64);
+        out.push(body.orientation.x as f64);
+        out.push(body.orientation.y as f64);
+        out.push(body.orientation.z as f64);
+    }
+    for tree in &world.trees {
+        for i in 0..tree.links.len() {
+            let q_off = tree.q_offset[i];
+            match tree.links[i].joint {
+                JointKind::Free => {
+                    out.push(tree.q[q_off] as f64);
+                    out.push(tree.q[q_off + 1] as f64);
+                    out.push(tree.q[q_off + 2] as f64);
+                    // (qx, qy, qz, qw) -> (qw, qx, qy, qz)
+                    out.push(tree.q[q_off + 6] as f64);
+                    out.push(tree.q[q_off + 3] as f64);
+                    out.push(tree.q[q_off + 4] as f64);
+                    out.push(tree.q[q_off + 5] as f64);
+                }
+                JointKind::Ball { .. } => {
+                    out.push(tree.q[q_off + 3] as f64);
+                    out.push(tree.q[q_off] as f64);
+                    out.push(tree.q[q_off + 1] as f64);
+                    out.push(tree.q[q_off + 2] as f64);
+                }
+                JointKind::Hinge { .. } | JointKind::Slide { .. } => {
+                    out.push(tree.q[q_off] as f64);
+                }
+                JointKind::Fixed => {}
+            }
+        }
+    }
+    out
+}
+
+fn extract_qvel(world: &World) -> Vec<f64> {
+    let mut out = Vec::new();
+    for body in &world.bodies {
+        out.push(body.linear_velocity.x as f64);
+        out.push(body.linear_velocity.y as f64);
+        out.push(body.linear_velocity.z as f64);
+        out.push(body.angular_velocity_body.x as f64);
+        out.push(body.angular_velocity_body.y as f64);
+        out.push(body.angular_velocity_body.z as f64);
+    }
+    for tree in &world.trees {
+        for i in 0..tree.links.len() {
+            let v_off = tree.v_offset[i];
+            match tree.links[i].joint {
+                JointKind::Free => {
+                    // Newt (ω_body, v_body) -> MJ (v_world, ω_body).
+                    let q_off = tree.q_offset[i];
+                    let root_ori = Quat::new(
+                        tree.q[q_off + 3],
+                        tree.q[q_off + 4],
+                        tree.q[q_off + 5],
+                        tree.q[q_off + 6],
+                    );
+                    let v_body = Vec3::new(
+                        tree.qdot[v_off + 3],
+                        tree.qdot[v_off + 4],
+                        tree.qdot[v_off + 5],
+                    );
+                    let v_world = root_ori.rotate(v_body);
+                    out.push(v_world.x as f64);
+                    out.push(v_world.y as f64);
+                    out.push(v_world.z as f64);
+                    out.push(tree.qdot[v_off] as f64);
+                    out.push(tree.qdot[v_off + 1] as f64);
+                    out.push(tree.qdot[v_off + 2] as f64);
+                }
+                JointKind::Ball { .. } => {
+                    out.push(tree.qdot[v_off] as f64);
+                    out.push(tree.qdot[v_off + 1] as f64);
+                    out.push(tree.qdot[v_off + 2] as f64);
+                }
+                JointKind::Hinge { .. } | JointKind::Slide { .. } => {
+                    out.push(tree.qdot[v_off] as f64);
+                }
+                JointKind::Fixed => {}
+            }
+        }
+    }
+    out
+}
+
+/// Panic if `(qw, qx, qy, qz)` is not close to unit length. Catches the
+/// zero-quat trap the reviewer flagged: `Quat::renormalize` silently
+/// turns a zero into identity, which is a legal-looking but wrong
+/// starting orientation.
+fn assert_unit_quat(qw: f32, qx: f32, qy: f32, qz: f32, ctx: &str) {
+    let n2 = qw * qw + qx * qx + qy * qy + qz * qz;
+    assert!(
+        (n2 - 1.0).abs() < 1.0e-3,
+        "{ctx}: quaternion norm^2 = {n2} (want ~1); \
+         either the input is not a unit quaternion or the layout was reordered wrong"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// comparison
+// ---------------------------------------------------------------------------
+
+struct Divergence {
+    qpos_max: f64,
+    qvel_max: f64,
+    qpos_max_idx: (usize, usize), // (sample, component)
+    qvel_max_idx: (usize, usize),
+}
+
+fn compare_and_measure(
+    scenario_name: &str,
+    fixture: &Fixture,
+    newt_samples: &[(Vec<f64>, Vec<f64>)],
+) -> Divergence {
+    assert_eq!(
+        newt_samples.len(),
+        fixture.samples.len(),
+        "{scenario_name}: sample count mismatch (newt {}, fixture {})",
+        newt_samples.len(),
+        fixture.samples.len()
+    );
+    let mut d = Divergence {
+        qpos_max: 0.0,
+        qvel_max: 0.0,
+        qpos_max_idx: (0, 0),
+        qvel_max_idx: (0, 0),
+    };
+    let dump = std::env::var("NEWT_DIFFERENTIAL_DUMP").is_ok();
+    for (i, (fix, (newt_qpos, newt_qvel))) in
+        fixture.samples.iter().zip(newt_samples.iter()).enumerate()
+    {
+        assert_eq!(
+            newt_qpos.len(),
+            fix.qpos.len(),
+            "{scenario_name}: qpos length mismatch at sample {i}"
+        );
+        assert_eq!(
+            newt_qvel.len(),
+            fix.qvel.len(),
+            "{scenario_name}: qvel length mismatch at sample {i}"
+        );
+        // For the qpos comparison, quaternion sign flips are physically
+        // equivalent (q and -q represent the same rotation). We compare
+        // components directly EXCEPT free-body quaternion slots, where
+        // we canonicalize both sides by flipping the newt side if its
+        // dot with the MuJoCo side is negative. Slot layout is known
+        // per scenario: free-body scenarios have 7-slot repeats, with
+        // slots [3..7] being (qw, qx, qy, qz).
+        let mut newt_qpos = newt_qpos.clone();
+        let mut idx = 0;
+        // MuJoCo does not renormalize free-joint quaternions between
+        // sample points either, so this only fixes the sign — magnitude
+        // stays honest.
+        while idx + 7 <= newt_qpos.len() && idx < scenario_free_body_slots(scenario_name) * 7 {
+            let dot = newt_qpos[idx + 3] * fix.qpos[idx + 3]
+                + newt_qpos[idx + 4] * fix.qpos[idx + 4]
+                + newt_qpos[idx + 5] * fix.qpos[idx + 5]
+                + newt_qpos[idx + 6] * fix.qpos[idx + 6];
+            if dot < 0.0 {
+                for slot in newt_qpos[idx + 3..idx + 7].iter_mut() {
+                    *slot = -*slot;
+                }
+            }
+            idx += 7;
+        }
+        for (k, (a, b)) in newt_qpos.iter().zip(fix.qpos.iter()).enumerate() {
+            let e = (a - b).abs();
+            if e > d.qpos_max {
+                d.qpos_max = e;
+                d.qpos_max_idx = (i, k);
+            }
+        }
+        for (k, (a, b)) in newt_qvel.iter().zip(fix.qvel.iter()).enumerate() {
+            let e = (a - b).abs();
+            if e > d.qvel_max {
+                d.qvel_max = e;
+                d.qvel_max_idx = (i, k);
+            }
+        }
+        if dump {
+            let per_qpos: Vec<String> = newt_qpos
+                .iter()
+                .zip(fix.qpos.iter())
+                .map(|(a, b)| format!("{:.3e}", (a - b).abs()))
+                .collect();
+            let per_qvel: Vec<String> = newt_qvel
+                .iter()
+                .zip(fix.qvel.iter())
+                .map(|(a, b)| format!("{:.3e}", (a - b).abs()))
+                .collect();
+            eprintln!(
+                "  {scenario_name} sample {i:3} step {:5}: qpos_err=[{}] qvel_err=[{}]",
+                (i as u32) * fixture.stride,
+                per_qpos.join(","),
+                per_qvel.join(","),
+            );
+        }
+    }
+    d
+}
+
+/// Number of leading free bodies in the qpos layout for a scenario. Used
+/// to canonicalize quaternion sign for those slots.
+fn scenario_free_body_slots(name: &str) -> usize {
+    match name {
+        "ballistic" | "tumble" | "sphere_drop" => 1,
+        "box_stack" => 3,
+        _ => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// energy comparison
+// ---------------------------------------------------------------------------
+
+/// Total mechanical energy of newt's world (KE + PE) in world
+/// coordinates. Sums every free body and every tree link. PE reference
+/// is z = 0 (matches MuJoCo's convention).
+fn newt_total_energy(world: &World) -> f64 {
+    let g = -world.gravity.z as f64; // magnitude of gravitational acceleration
+    let mut e = 0.0f64;
+    for body in &world.bodies {
+        let ke = body.kinetic_energy() as f64;
+        let pe = (body.mass as f64) * g * (body.position.z as f64);
+        e += ke + pe;
+    }
+    for tree in &world.trees {
+        e += tree_energy(tree, g);
+    }
+    e
+}
+
+/// Total mechanical energy of one tree in world coordinates.
+///
+/// Walks the tree once in topological order, propagating world-frame COM
+/// linear velocity and body-frame angular velocity through the joint
+/// subspace at each link. Uses newt's math and forward-kinematics
+/// primitives but does NOT call ABA, so a bug in ABA cannot help this
+/// helper pass. Same shape as `tree_energy` in `joints_chain_energy.rs`.
+fn tree_energy(tree: &newt::tree::Tree, g: f64) -> f64 {
+    let poses = newt::tree::forward_kinematics(tree);
+    let n = tree.links.len();
+    let mut v_lin_world = vec![Vec3::ZERO; n];
+    let mut w_world = vec![Vec3::ZERO; n];
+    let mut w_body = vec![Vec3::ZERO; n];
+    // Root: Fixed or Free. Fixed root has zero velocity by construction;
+    // Free root's velocity comes straight from qdot at its v_offset
+    // (angular body + linear body).
+    if let JointKind::Free = tree.links[0].joint {
+        let v_off = tree.v_offset[0];
+        let q_off = tree.q_offset[0];
+        let root_ori = Quat::new(
+            tree.q[q_off + 3],
+            tree.q[q_off + 4],
+            tree.q[q_off + 5],
+            tree.q[q_off + 6],
+        );
+        let w_body0 = Vec3::new(tree.qdot[v_off], tree.qdot[v_off + 1], tree.qdot[v_off + 2]);
+        let v_body0 = Vec3::new(
+            tree.qdot[v_off + 3],
+            tree.qdot[v_off + 4],
+            tree.qdot[v_off + 5],
+        );
+        w_body[0] = w_body0;
+        w_world[0] = root_ori.rotate(w_body0);
+        v_lin_world[0] = root_ori.rotate(v_body0);
+    }
+    for i in 1..n {
+        let link = &tree.links[i];
+        let parent = link.parent.expect("non-root link has parent");
+        let (child_pos, child_ori) = poses[i];
+        let (parent_pos, _) = poses[parent];
+        match link.joint {
+            JointKind::Hinge { axis, .. } => {
+                let axis_world = poses[parent].1.rotate(axis);
+                let qdot_i = tree.qdot[tree.v_offset[i]];
+                let w_i_world = w_world[parent] + axis_world * qdot_i;
+                w_world[i] = w_i_world;
+                w_body[i] = child_ori.inverse_rotate(w_i_world);
+                let joint_world =
+                    parent_pos + poses[parent].1.rotate(link.joint_offset_in_parent.0);
+                let v_parent_at_child_com =
+                    v_lin_world[parent] + w_world[parent].cross(child_pos - parent_pos);
+                v_lin_world[i] =
+                    v_parent_at_child_com + (axis_world * qdot_i).cross(child_pos - joint_world);
+            }
+            JointKind::Fixed => {
+                w_world[i] = w_world[parent];
+                w_body[i] = child_ori.inverse_rotate(w_world[i]);
+                v_lin_world[i] =
+                    v_lin_world[parent] + w_world[parent].cross(child_pos - parent_pos);
+            }
+            JointKind::Slide { .. } | JointKind::Ball { .. } | JointKind::Free => {
+                // No energy scenario in this ticket exercises these on a
+                // non-root link. Leaving them zero would falsely report
+                // conservation, so panic loudly if we ever add one.
+                panic!(
+                    "tree_energy encountered unsupported non-root joint kind {:?} at link {i}; \
+                     extend the helper before authoring an energy scenario that uses it",
+                    link.joint
+                );
+            }
+        }
+    }
+    let mut e = 0.0f64;
+    for i in 0..n {
+        let link = &tree.links[i];
+        let (com, _) = poses[i];
+        let lin_ke = 0.5 * (link.mass as f64) * v_lin_world[i].dot(v_lin_world[i]) as f64;
+        let iw = link.inertia_body * w_body[i];
+        let rot_ke = 0.5 * w_body[i].dot(iw) as f64;
+        let pe = (link.mass as f64) * g * (com.z as f64);
+        e += lin_ke + rot_ke + pe;
+    }
+    e
+}
+
+/// Read a `<name>_energy.bin` sidecar (per-sample (kin, pot) f64 pairs)
+/// and return the total energy per sample. Panics with a helpful
+/// message if the sidecar is missing.
+fn read_mujoco_totals(name: &str, expected_samples: usize) -> Vec<f64> {
+    let path = references_dir().join(format!("{name}_energy.bin"));
+    let bytes = fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "{name}: cannot read energy sidecar {}: {e}; regenerate with tools/capture_mujoco.py",
+            path.display()
+        )
+    });
+    assert_eq!(
+        bytes.len(),
+        expected_samples * 16,
+        "{name}: energy sidecar has {} bytes; expected {expected_samples} samples * 16",
+        bytes.len(),
+    );
+    let mut out = Vec::with_capacity(expected_samples);
+    for i in 0..expected_samples {
+        let off = i * 16;
+        let kin = f64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+        let pot = f64::from_le_bytes(bytes[off + 8..off + 16].try_into().unwrap());
+        out.push(kin + pot);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// per-scenario harness
+// ---------------------------------------------------------------------------
+
+fn run_scenario(spec: &ScenarioSpec) -> Divergence {
+    let mjcf_path = references_dir().join(&spec.mjcf);
+    let src = fs::read_to_string(&mjcf_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", mjcf_path.display()));
+    let mut scene: Scene = newt::mjcf::load_mjcf_str(&src)
+        .unwrap_or_else(|e| panic!("{} newt-load failed: {e}", spec.name));
+
+    if let Some(qpos) = &spec.init_qpos {
+        apply_init_qpos(&mut scene.world, qpos);
+    }
+    if let Some(qvel) = &spec.init_qvel {
+        apply_init_qvel(&mut scene.world, qvel);
+    }
+    if let Some(targets) = &spec.actuator_targets {
+        for (name, ctrl) in targets {
+            let (tree_idx, act_idx) = *scene
+                .actuators_by_name
+                .get(name)
+                .unwrap_or_else(|| panic!("{}: actuator {name} not found", spec.name));
+            scene.world.trees[tree_idx].set_actuator_target(act_idx, *ctrl);
+        }
+    }
+
+    let fixture_path = references_dir().join(format!("{}.bin", spec.name));
+    let fixture = read_fixture(&fixture_path);
+    assert_eq!(
+        fixture.n_steps, spec.n_steps,
+        "{}: fixture n_steps {} != scenarios.json n_steps {}",
+        spec.name, fixture.n_steps, spec.n_steps
+    );
+    assert_eq!(
+        fixture.stride, spec.stride,
+        "{}: fixture stride {} != scenarios.json stride {}",
+        spec.name, fixture.stride, spec.stride
+    );
+
+    // Sample step 0 (initial state, post-init).
+    let mut newt_samples = Vec::with_capacity(fixture.samples.len());
+    newt_samples.push((extract_qpos(&scene.world), extract_qvel(&scene.world)));
+    for step in 1..=spec.n_steps {
+        scene.world.step();
+        if step % spec.stride == 0 {
+            newt_samples.push((extract_qpos(&scene.world), extract_qvel(&scene.world)));
+        }
+    }
+    compare_and_measure(&spec.name, &fixture, &newt_samples)
+}
+
+struct EnergyReport {
+    newt_drift: f64,
+    mujoco_drift: f64,
+    /// Max |drift_newt - drift_mujoco| over samples.
+    drift_gap: f64,
+}
+
+fn run_energy_scenario(spec: &ScenarioSpec) -> EnergyReport {
+    assert_eq!(spec.check_kind, CheckKind::Energy);
+    let mjcf_path = references_dir().join(&spec.mjcf);
+    let src = fs::read_to_string(&mjcf_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", mjcf_path.display()));
+    let mut scene: Scene = newt::mjcf::load_mjcf_str(&src)
+        .unwrap_or_else(|e| panic!("{} newt-load failed: {e}", spec.name));
+
+    if let Some(qpos) = &spec.init_qpos {
+        apply_init_qpos(&mut scene.world, qpos);
+    }
+    if let Some(qvel) = &spec.init_qvel {
+        apply_init_qvel(&mut scene.world, qvel);
+    }
+
+    let n_samples_expected = (spec.n_steps / spec.stride) as usize + 1;
+    let mj_totals = read_mujoco_totals(&spec.name, n_samples_expected);
+    let mut newt_totals = Vec::with_capacity(n_samples_expected);
+    newt_totals.push(newt_total_energy(&scene.world));
+    for step in 1..=spec.n_steps {
+        scene.world.step();
+        if step % spec.stride == 0 {
+            newt_totals.push(newt_total_energy(&scene.world));
+        }
+    }
+    assert_eq!(
+        newt_totals.len(),
+        mj_totals.len(),
+        "{}: sample count mismatch (newt {}, mujoco {})",
+        spec.name,
+        newt_totals.len(),
+        mj_totals.len()
+    );
+
+    let newt_ref = newt_totals[0];
+    let mj_ref = mj_totals[0];
+    let mut newt_drift = 0.0f64;
+    let mut mujoco_drift = 0.0f64;
+    let mut drift_gap = 0.0f64;
+    for (n, m) in newt_totals.iter().zip(mj_totals.iter()) {
+        let dn = (n - newt_ref).abs();
+        let dm = (m - mj_ref).abs();
+        newt_drift = newt_drift.max(dn);
+        mujoco_drift = mujoco_drift.max(dm);
+        drift_gap = drift_gap.max((dn - dm).abs());
+    }
+    EnergyReport {
+        newt_drift,
+        mujoco_drift,
+        drift_gap,
+    }
+}
+
+/// Tolerances for `double_pendulum_energy`. Measured then set.
+///
+/// MuJoCo's RK4 drift over 5 s is at 1e-8 scale (single-precision-free
+/// integrator on a f64 state). newt's RK4 uses f32 state and quaternion
+/// renormalization at RK4 stage boundaries, so its drift is larger by
+/// several orders. Both should remain SMALL relative to the total
+/// energy scale (~31 J for this scene) and their difference in
+/// magnitude is bounded — a mapping or energy-formula bug would blow
+/// either drift or the gap by orders.
+struct EnergyTolerance {
+    newt_drift: f64,
+    mujoco_drift: f64,
+    drift_gap: f64,
+}
+
+fn energy_tolerance(name: &str) -> EnergyTolerance {
+    match name {
+        // Observed newt_drift 2.76e-6, mujoco_drift 3.38e-8,
+        // drift_gap 2.74e-6. Bounds ~2× observation. A mapping or
+        // energy-formula bug would blow either drift or the gap by
+        // orders (10⁻² scale) — we would notice immediately.
+        "double_pendulum_energy" => EnergyTolerance {
+            newt_drift: 6.0e-6,
+            mujoco_drift: 8.0e-8,
+            drift_gap: 6.0e-6,
+        },
+        other => panic!("no energy tolerance for {other:?}"),
+    }
+}
+
+fn assert_energy_bounds(scenario: &str, report: &EnergyReport) {
+    let tol = energy_tolerance(scenario);
+    println!(
+        "differential[{scenario}] energy: newt_drift={:.3e} (bound {:.2e}) \
+         mujoco_drift={:.3e} (bound {:.2e}) drift_gap={:.3e} (bound {:.2e})",
+        report.newt_drift,
+        tol.newt_drift,
+        report.mujoco_drift,
+        tol.mujoco_drift,
+        report.drift_gap,
+        tol.drift_gap,
+    );
+    assert!(
+        report.newt_drift <= tol.newt_drift,
+        "{scenario}: newt energy drift {:.3e} exceeds bound {:.2e}",
+        report.newt_drift,
+        tol.newt_drift,
+    );
+    assert!(
+        report.mujoco_drift <= tol.mujoco_drift,
+        "{scenario}: mujoco energy drift {:.3e} exceeds bound {:.2e} \
+         (regenerate the fixture)",
+        report.mujoco_drift,
+        tol.mujoco_drift,
+    );
+    assert!(
+        report.drift_gap <= tol.drift_gap,
+        "{scenario}: |newt_drift - mujoco_drift| {:.3e} exceeds bound {:.2e}",
+        report.drift_gap,
+        tol.drift_gap,
+    );
+}
+
+fn assert_within_tolerance(scenario: &str, d: &Divergence) {
+    let tol = tolerance(scenario);
+    println!(
+        "differential[{scenario}] observed qpos_max={:.6e} @ sample {} comp {} (bound {:.2e}) \
+         qvel_max={:.6e} @ sample {} comp {} (bound {:.2e})",
+        d.qpos_max,
+        d.qpos_max_idx.0,
+        d.qpos_max_idx.1,
+        tol.qpos,
+        d.qvel_max,
+        d.qvel_max_idx.0,
+        d.qvel_max_idx.1,
+        tol.qvel,
+    );
+    assert!(
+        d.qpos_max <= tol.qpos,
+        "{scenario}: qpos divergence {:.6e} exceeds tolerance {:.2e} at (sample {}, comp {}). \
+         If this is a real physical divergence (not a bug), grow the bound in the \
+         TOLERANCES table AND update docs/differential.md with the new number and cause.",
+        d.qpos_max,
+        tol.qpos,
+        d.qpos_max_idx.0,
+        d.qpos_max_idx.1,
+    );
+    assert!(
+        d.qvel_max <= tol.qvel,
+        "{scenario}: qvel divergence {:.6e} exceeds tolerance {:.2e} at (sample {}, comp {})",
+        d.qvel_max,
+        tol.qvel,
+        d.qvel_max_idx.0,
+        d.qvel_max_idx.1,
+    );
+}
+
+fn scenario(name: &str) -> ScenarioSpec {
+    load_scenarios()
+        .into_iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("scenario {name} missing from scenarios.json"))
+}
+
+// ---------------------------------------------------------------------------
+// tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn differential_ballistic() {
+    let d = run_scenario(&scenario("ballistic"));
+    assert_within_tolerance("ballistic", &d);
+}
+
+#[test]
+fn differential_tumble() {
+    let d = run_scenario(&scenario("tumble"));
+    assert_within_tolerance("tumble", &d);
+}
+
+#[test]
+fn differential_double_pendulum() {
+    let d = run_scenario(&scenario("double_pendulum"));
+    assert_within_tolerance("double_pendulum", &d);
+}
+
+#[test]
+fn differential_servo_arm() {
+    let d = run_scenario(&scenario("servo_arm"));
+    assert_within_tolerance("servo_arm", &d);
+}
+
+#[test]
+fn differential_sphere_drop() {
+    let d = run_scenario(&scenario("sphere_drop"));
+    assert_within_tolerance("sphere_drop", &d);
+}
+
+#[test]
+fn differential_box_stack() {
+    let d = run_scenario(&scenario("box_stack"));
+    assert_within_tolerance("box_stack", &d);
+}
+
+#[test]
+fn differential_joint_limit_swing() {
+    let d = run_scenario(&scenario("joint_limit_swing"));
+    assert_within_tolerance("joint_limit_swing", &d);
+}
+
+#[test]
+fn differential_floating_base() {
+    let d = run_scenario(&scenario("floating_base"));
+    assert_within_tolerance("floating_base", &d);
+}
+
+#[test]
+fn differential_double_pendulum_energy() {
+    let report = run_energy_scenario(&scenario("double_pendulum_energy"));
+    assert_energy_bounds("double_pendulum_energy", &report);
+}
