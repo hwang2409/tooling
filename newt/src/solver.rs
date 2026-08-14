@@ -304,6 +304,55 @@ pub fn reference_accel(violation: f32, violation_dot: f32, solref: crate::geom::
     -(2.0 * z / tc) * violation_dot - (1.0 / (tc * tc)) * violation
 }
 
+/// Same shape as [`reference_accel`] but the two terms carry independent
+/// scalars — `α_b` on the damping (velocity) term and `α_k` on the
+/// stiffness (position) term. Used by the PGS bias assembly with
+/// (`α_b`, `α_k`) = ([`AREF_BIAS_ALPHA_DAMPING`],
+/// [`AREF_BIAS_ALPHA_STIFFNESS`]).
+pub fn reference_accel_scaled(
+    violation: f32,
+    violation_dot: f32,
+    solref: crate::geom::SolRef,
+    alpha_b: f32,
+    alpha_k: f32,
+) -> f32 {
+    let tc = solref.timeconst;
+    let z = solref.dampratio;
+    // -α_b · (2 z / tc) r_dot  −  α_k · (1 / tc²) r
+    -alpha_b * (2.0 * z / tc) * violation_dot - alpha_k * (1.0 / (tc * tc)) * violation
+}
+
+/// Damping-term scalar `α_b` on the contact-normal reference term
+/// in the PGS bias assembly (see [`reference_accel_scaled`]). Kept
+/// at 1 because scaling this term past 1 makes the bias multiplier
+/// on `v_current` (namely `1 + α_b · b · dt`) large enough at
+/// MuJoCo-comparable timesteps (dt=5ms, tc=20ms → b·dt = 0.5) that
+/// the constraint over-corrects the approach velocity and the
+/// contact bounces near-elastically.
+pub const CONTACT_AREF_ALPHA_DAMPING: f32 = 1.0;
+
+/// Stiffness-term scalar `α_k` on the contact-normal reference term
+/// in the PGS bias assembly (see [`reference_accel_scaled`]).
+/// Empirical fit from the NEWT-14 solref sweep against real MuJoCo
+/// (`docs/differential.md`, sphere_drop row): 2 matches MuJoCo's
+/// steady-state penetration formula `r_ss = g(1−d) / (2·d·k)`
+/// **only within the fitted window `tc ∈ [0.010, 0.050]` at
+/// dampratio = 1**. Out-of-window probes at tc = 0.005, 0.070,
+/// 0.100 show newt over-penetrating by 0.5–1.2 mm (see the "new
+/// open finding" section in `docs/differential.md`) — the true
+/// MuJoCo `k_impedance` functional form outside the window is
+/// unknown and NOT captured by this constant. The pre-NEWT-14
+/// code used `α_k = d(r)` here (impedance-scaled reference),
+/// which put newt's in-window steady-state penetration at
+/// roughly `2/d ≈ 2.1×` MuJoCo's — that v1 signal is what this
+/// constant closes.
+///
+/// Scoping: applied only on CONTACT normal rows. We have NOT
+/// fitted equality or joint-limit rows against MuJoCo; they keep
+/// the pre-NEWT-14 impedance-scaled reference until a future
+/// ticket does the same measurement for those row types.
+pub const CONTACT_AREF_ALPHA_STIFFNESS: f32 = 2.0;
+
 // ---------------------------------------------------------------------------
 // Elliptic-cone projection (public helper — the ticket lists it as a test
 // anchor; keep it here so both PGS and standalone tests share one impl)
@@ -386,7 +435,9 @@ struct ConstraintRow {
     reg: f32,
     /// Diagonal `A_ii + R_ii`. Populated during assembly.
     diag: f32,
-    /// Bias `b_i = J_i · qdot_free + d · a_ref * dt`.
+    /// Bias `b_i = J_i · qdot_free + a_ref_scaled · dt`, where the two
+    /// terms of `a_ref` carry independent scalars
+    /// ([`AREF_BIAS_ALPHA_DAMPING`], [`AREF_BIAS_ALPHA_STIFFNESS`]).
     bias: f32,
     /// Row geometry.
     geom: RowGeom,
@@ -647,11 +698,23 @@ pub fn solve_free_bodies_diag(
             rows[ri].reg = reg;
             rows[ri].diag = a_ii + reg;
         }
-        // Normal row bias includes the impedance-scaled reference accel.
+        // Contact-normal row bias uses the split-alpha scaling from
+        // the NEWT-14 sphere_drop fix: damping term stays at α_b=1
+        // (avoids over-correction at large dt·b), stiffness term
+        // uses α_k=2 (matches MuJoCo's steady-state penetration
+        // formula — see docs on the CONTACT_AREF_ALPHA_* constants).
+        // Scoped to contact-normal rows only; equality / joint-limit
+        // rows below continue to use the pre-NEWT-14 impedance-scaled
+        // reference.
         let r = pc.pen_active;
         let r_dot = -pc.v_n_current;
-        let a_ref = reference_accel(r, r_dot, pc.solref);
-        let d = impedance(pc.pen_active, pc.solimp);
+        let a_ref = reference_accel_scaled(
+            r,
+            r_dot,
+            pc.solref,
+            CONTACT_AREF_ALPHA_DAMPING,
+            CONTACT_AREF_ALPHA_STIFFNESS,
+        );
         let n_row = pc.start_row as usize;
         rows[n_row].bias = pc.v_n_current
             + row_free_step_velocity(
@@ -660,7 +723,7 @@ pub fn solve_free_bodies_diag(
                 &dw_body_free_per_body,
                 bodies,
             )
-            + d * a_ref * dt;
+            + a_ref * dt;
         // All non-normal rows in a contact block have a "target velocity =
         // 0" reference (stick / no spin / no roll). Bias = current
         // constraint velocity + free-step delta.
@@ -699,6 +762,13 @@ pub fn solve_free_bodies_diag(
                 &dw_body_free_per_body,
                 bodies,
             );
+            // We have only FIT contact-normal rows against MuJoCo
+            // (the NEWT-14 sphere_drop sweep). Equality rows keep the
+            // pre-NEWT-14 impedance-scaled reference until a future
+            // ticket does the same measurement for equality
+            // constraints. This is engineering scope, not a physics
+            // claim: the old formula is what our equality tests
+            // (e.g. `equality_connect`) were calibrated against.
             let r_dot = -v_cur;
             let a_ref = reference_accel(r, r_dot, pe.solref);
             rows[ri].bias = v_cur + dv_free + d * a_ref * dt;
@@ -1725,6 +1795,12 @@ pub fn solve_tree_limits(
         // Limit rows: sign chosen so v_row = sign · qdot[v_slot] = escape
         // velocity (positive when escaping). Coupling rows: flipped at
         // construction so `+f` reduces |signed residual|.
+        // We have only FIT contact-normal rows against MuJoCo.
+        // Joint-limit / joint-coupling rows keep the pre-NEWT-14
+        // impedance-scaled reference until a future ticket does the
+        // same measurement for these row types. Engineering scope,
+        // not a physics claim: `joint_limit_swing` and the coupling
+        // tests were calibrated to the old formula.
         let r_dot = -v_row;
         let a_ref = reference_accel(row.violation, r_dot, row.solref);
         let d = impedance(row.violation, row.solimp);

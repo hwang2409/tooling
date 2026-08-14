@@ -1,0 +1,30 @@
+<!-- Differential scenario: sphere_drop with tc=0.010 solref (stiffer contact).
+
+  Together with sphere_drop.xml (tc=0.020, default) and
+  sphere_drop_soft.xml (tc=0.050), these three points cover the
+  solref sweep that validates newt's NEWT-14 penetration-formula fix
+  against real MuJoCo. See docs/differential.md, "sphere_drop
+  (bounded divergence)" and the sweep table.
+
+  The rest of the setup mirrors sphere_drop.xml exactly (mass, radius,
+  friction, timestep) so only the solref timeconst varies across the
+  three fixtures.
+-->
+<mujoco model="sphere_drop_stiff">
+  <compiler angle="radian"/>
+  <option timestep="0.002" gravity="0 0 -9.81"
+          integrator="RK4" solver="PGS" cone="pyramidal" iterations="20"/>
+
+  <default>
+    <geom solref="0.010 1.0"/>
+  </default>
+
+  <worldbody>
+    <geom name="ground" type="plane" size="5 5 0.1" friction="0.8"/>
+    <body name="ball" pos="0 0 0.6">
+      <freejoint name="ball_root"/>
+      <inertial pos="0 0 0" mass="0.5" diaginertia="0.002 0.002 0.002"/>
+      <geom name="ball_sphere" type="sphere" size="0.1" friction="0.8"/>
+    </body>
+  </worldbody>
+</mujoco>

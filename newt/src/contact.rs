@@ -440,6 +440,18 @@ pub fn sphere_capsule(
 ///   lower, the actual intersection is edge-vs-edge, not vertex-vs-face.
 ///
 /// The fallback is intentionally additive so existing goldens survive.
+///
+/// # Solver-mode variant
+///
+/// [`box_box_full_manifold`] skips the vertex-vs-face primary and always
+/// runs the SAT face-clipping manifold. That path emits 4 corner contacts
+/// for a face-face stack while vertex-vs-face degenerates to 2 diagonal
+/// contacts as soon as the top block tilts even microradians and its
+/// two lifted corners fail the "vertex inside the other box" test — the
+/// root cause of the v1 box_stack differential finding
+/// (docs/differential.md). Only the PGS pipeline routes through the
+/// full-manifold variant; the penalty pipeline continues to use
+/// [`box_box`] so its trajectories stay bit-identical.
 #[allow(clippy::too_many_arguments)]
 pub fn box_box(
     idx_a: usize,
@@ -458,6 +470,35 @@ pub fn box_box(
     if vf.len > 0 {
         return vf;
     }
+    box_box_sat_fallback(
+        idx_a, pose_a, half_a, idx_b, pose_b, half_b, friction, margin, gap,
+    )
+}
+
+/// Box vs box for the PGS solver pipeline: always run SAT face-clipping
+/// (or edge-edge closest-points when SAT identifies an edge-edge minimum).
+///
+/// Skips the vertex-vs-face primary because for aligned face-face stacks
+/// that path emits only the 2 corners still inside the other box after
+/// microradian-scale tilt, leaving the friction moment underdetermined
+/// (only diagonal contact points → the block rotates and slides). SAT
+/// face-clipping emits up to 4 clipped-polygon corners of the actual
+/// overlap rectangle regardless of tilt, matching what MuJoCo's MPR
+/// produces for the same configuration. See docs/differential.md
+/// (box_stack row, NEWT-14 evidence) for the per-step manifold diff
+/// that drove this split.
+#[allow(clippy::too_many_arguments)]
+pub fn box_box_full_manifold(
+    idx_a: usize,
+    pose_a: &GeomPose,
+    half_a: Vec3,
+    idx_b: usize,
+    pose_b: &GeomPose,
+    half_b: Vec3,
+    friction: f32,
+    margin: f32,
+    gap: f32,
+) -> ContactBuf {
     box_box_sat_fallback(
         idx_a, pose_a, half_a, idx_b, pose_b, half_b, friction, margin, gap,
     )
@@ -903,16 +944,27 @@ fn box_box_face_reference_contacts(
             continue;
         }
         // Contact point sits on the reference face (i.e. on the reference
-        // box's surface). By convention `position_world` sits on B — so
-        // when A is reference (`reference_is_a`), we shift the point onto
-        // B's surface by walking `-normal_world * (pen - margin)`
-        // (equivalently the raw penetration in the direction from B into A).
+        // box's surface). By convention `position_world` sits on B, so
+        // when A is reference (`reference_is_a`), we must shift the
+        // point off A's face onto B's surface.
+        //
+        // In the interpenetrating regime A's face has crossed into B, so
+        // B's surface is on the OPPOSITE side of A's face from A's
+        // interior — the direction from A INTO B. `normal_world` points
+        // from B into A by convention; the direction from A into B is
+        // therefore `+normal_world` for the shift here (do not confuse
+        // "from A toward B's centre" with the direction that lands on
+        // B's surface starting from an already-penetrating point on A's
+        // face). The shift magnitude is the raw penetration depth
+        // `pen − margin`.
+        //
+        // Sanity: axis-aligned A(0,0,1.98) on B(0,0,0) at half=1 gives
+        // A_bottom=0.98, B_top=1.0, pen=0.02 (post shift). With A as
+        // reference the contact must land on z=1.0 — reached from
+        // z=0.98 by `+normal_world · 0.02` with normal_world = +Z.
         let point_on_ref = ref_face_center + ref_u * cv.u + ref_v * cv.v;
         let pos_on_b = if reference_is_a {
-            // Ref is A. `point_on_ref` sits on A's face. Move along
-            // `-normal_world` (from A toward B) by the raw penetration
-            // (pen − margin) to land on B's surface.
-            point_on_ref - normal_world * (pen - margin)
+            point_on_ref + normal_world * (pen - margin)
         } else {
             point_on_ref
         };
@@ -1774,6 +1826,71 @@ pub fn narrow_phase(
     pose_b: &GeomPose,
     meshes: &[ConvexMesh],
 ) -> ContactBuf {
+    dispatch_narrow_phase(
+        idx_a,
+        geom_a,
+        pose_a,
+        idx_b,
+        geom_b,
+        pose_b,
+        meshes,
+        NarrowPhaseMode::LegacyPenalty,
+    )
+}
+
+/// Same shape-pair dispatch as [`narrow_phase`] but requests the
+/// full-manifold box-box variant ([`box_box_full_manifold`]). Used by the
+/// PGS solver pipeline so tilted face-face stacks receive the 4-corner
+/// clipped polygon MuJoCo emits, instead of the 2-diagonal-corner
+/// manifold the vertex-vs-face path returns as soon as microradian tilt
+/// lifts two of the four corners above the reference face. Every other
+/// shape pair dispatches to the same primitive [`narrow_phase`] uses —
+/// the split is scoped to box-box on purpose (see docs/differential.md,
+/// box_stack row).
+pub fn narrow_phase_solver(
+    idx_a: usize,
+    geom_a: &Geom,
+    pose_a: &GeomPose,
+    idx_b: usize,
+    geom_b: &Geom,
+    pose_b: &GeomPose,
+    meshes: &[ConvexMesh],
+) -> ContactBuf {
+    dispatch_narrow_phase(
+        idx_a,
+        geom_a,
+        pose_a,
+        idx_b,
+        geom_b,
+        pose_b,
+        meshes,
+        NarrowPhaseMode::FullManifold,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NarrowPhaseMode {
+    /// Legacy dispatch used by the penalty pipeline (box-box uses
+    /// vertex-vs-face primary + edge-edge fallback). Keeps every pre-
+    /// NEWT-14 penalty golden byte-for-byte.
+    LegacyPenalty,
+    /// PGS-pipeline dispatch: box-box always runs the SAT face-clipping
+    /// manifold ([`box_box_full_manifold`]). Fixes the box_stack
+    /// differential finding.
+    FullManifold,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_narrow_phase(
+    idx_a: usize,
+    geom_a: &Geom,
+    pose_a: &GeomPose,
+    idx_b: usize,
+    geom_b: &Geom,
+    pose_b: &GeomPose,
+    meshes: &[ConvexMesh],
+    mode: NarrowPhaseMode,
+) -> ContactBuf {
     let friction = combine_friction(geom_a.friction, geom_b.friction);
     let margin = combine_max(geom_a.margin, geom_b.margin);
     let gap = combine_max(geom_a.gap, geom_b.gap);
@@ -1791,13 +1908,14 @@ pub fn narrow_phase(
     // debug_assert on the first arm guards against that regression for
     // asymmetric callers.
     let first = try_narrow_phase(
-        idx_a, geom_a, pose_a, idx_b, geom_b, pose_b, friction, margin, gap, meshes,
+        idx_a, geom_a, pose_a, idx_b, geom_b, pose_b, friction, margin, gap, meshes, mode,
     );
     if let Some(buf) = first {
         debug_assert!(
             std::mem::discriminant(&geom_a.shape) == std::mem::discriminant(&geom_b.shape)
                 || try_narrow_phase(
                     idx_b, geom_b, pose_b, idx_a, geom_a, pose_a, friction, margin, gap, meshes,
+                    mode,
                 )
                 .is_none(),
             "narrow_phase invariant violated: an asymmetric shape pair matched a primitive \
@@ -1807,7 +1925,7 @@ pub fn narrow_phase(
         return buf;
     }
     if let Some(mut buf) = try_narrow_phase(
-        idx_b, geom_b, pose_b, idx_a, geom_a, pose_a, friction, margin, gap, meshes,
+        idx_b, geom_b, pose_b, idx_a, geom_a, pose_a, friction, margin, gap, meshes, mode,
     ) {
         for c in buf.contacts.iter_mut().take(buf.len) {
             std::mem::swap(&mut c.geom_a, &mut c.geom_b);
@@ -1832,6 +1950,7 @@ fn try_narrow_phase(
     margin: f32,
     gap: f32,
     meshes: &[ConvexMesh],
+    mode: NarrowPhaseMode,
 ) -> Option<ContactBuf> {
     Some(match (geom_a.shape, geom_b.shape) {
         (GeomShape::Sphere { radius }, GeomShape::Plane) => sphere_plane(
@@ -1961,9 +2080,14 @@ fn try_narrow_phase(
             GeomShape::Box {
                 half_extents: half_b,
             },
-        ) => box_box(
-            idx_a, pose_a, half_a, idx_b, pose_b, half_b, friction, margin, gap,
-        ),
+        ) => match mode {
+            NarrowPhaseMode::LegacyPenalty => box_box(
+                idx_a, pose_a, half_a, idx_b, pose_b, half_b, friction, margin, gap,
+            ),
+            NarrowPhaseMode::FullManifold => box_box_full_manifold(
+                idx_a, pose_a, half_a, idx_b, pose_b, half_b, friction, margin, gap,
+            ),
+        },
         // Deferred (see is_pair_supported): box-sphere, box-capsule,
         // cylinder-cylinder, cylinder-{box,capsule,ellipsoid,mesh},
         // ellipsoid-{box,capsule,ellipsoid,mesh},
