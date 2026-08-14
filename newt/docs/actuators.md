@@ -76,6 +76,26 @@ once, plug in, iterate on `kp` and `ζ` from there. the biped model uses
 `kp` 45–80, `ζ` ≈ 1, `force_range` 45–80 N — plugged into the same
 formulas.
 
+### timing: ZOH-per-step target, re-evaluated per RK4 stage
+
+each PD servo's `target` is a **zero-order hold** across a whole
+[`rk4_step`](../src/tree.rs): the value at step start is what every
+sub-stage of that step sees. write a new `target` between steps via
+[`Tree::set_actuator_target`](../src/tree.rs) — the change takes effect
+on the NEXT step, matching MuJoCo's discrete-time control convention.
+
+each servo's **torque**, on the other hand, is **re-evaluated at every
+RK4 sub-stage** using that stage's interpolated `(q, qdot)`. this is
+what makes the PD term act as a genuine continuous-time forcing
+function rather than an explicit-Euler kick at step start, and is what
+lets `ζ = 1` actually match the analytic critical-damping response of
+the underlying second-order ODE — see
+`servo_critical_damping_step_no_overshoot`. the same applies to the
+motor-style direct torque path (`qfrc_applied` is ZOH-per-step; ABA
+reads it at every sub-stage) and to persistent link wrenches
+(`applied_wrenches` is ZOH-per-step; ABA rotates and applies them at
+every sub-stage).
+
 ## direct joint torque (motor-style)
 
 when the outer loop wants to inject a raw torque (feedforward, gravity
@@ -136,11 +156,13 @@ verified by
 |----------|----------------------|
 | sign flip on actuator torque | `servo_holding_pendulum_against_gravity_settles_no_growth` — unstable pole, amplitude grows |
 | clamp dropped or wrong sign | `servo_clamp_bounds_the_effective_torque` — α wrong |
+| clamp binds on P only, not full P+D | `servo_clamp_binds_on_full_pd_expression_not_p_only` — with `qdot ≠ 0`, α splits +2 (correct) vs −18 (mutant) |
 | wrong `qdot` in servo (e.g. positional) | `servo_critical_damping_step_no_overshoot` — kd term dead → overshoots for ζ=1 |
 | `dampratio` formula off by a factor | `servo_underdamped_step_overshoots` — peak in wrong bracket |
 | actuator routed to wrong link | `actuators_golden_trajectory_is_byte_identical` — snapshot 1+ shifts |
 | wrench summed into wrong body / dropped for articulated links | `constant_wrench_on_tip_link_produces_hand_derived_static_deflection` — angle blows |
 | wrench applied only to free-root (not articulated) | same, plus `actuators_golden_trajectory_is_byte_identical` — snapshot bytes shift |
+| wrench transformed with `ori.rotate` instead of `ori.inverse_rotate` (world↔body swap) | `hinge_z_at_prerotated_pose_catches_world_vs_body_frame_mutant` — α sign flips at `q₀ = π/4` (hinge_x + world_y at `q₀ = 0` cannot see this because `cos` is even in q) |
 | direct-torque clamp missing | `direct_joint_torque_and_clamp_flow_into_aba` — mismatch vs hand-clamped |
 
 ## running the demo

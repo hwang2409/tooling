@@ -98,8 +98,18 @@ fn build_arm() -> Tree {
 }
 
 fn attach_servos(tree: &mut Tree) -> [usize; 3] {
-    // Reflected inertia estimates: m·L² for the point-mass-on-rod pattern.
-    // Force clamp scales with the link's mass — biped-style bounds.
+    // Reflected inertia estimates: we pass `m·L²`, i.e. the point-mass-on-
+    // rod estimate at full length `L`. The rods here are UNIFORM (not point
+    // masses), so the true reflected inertia about each hinge is
+    // `I_pivot = m·L²/3` (see `actuator.rs::reflected_inertia_point_mass`
+    // — for a uniform rod pivoted at one end, pass `length = L/√3`).
+    // Passing `m·L²` overestimates the reflected inertia by a factor of 3,
+    // which makes `kd = 2·√(kp·I_ref)` a factor of √3 too large — so
+    // `ζ = 1` here is effectively `ζ ≈ 1.73` (overdamped, no overshoot).
+    // Overdamped is fine for a visual demo of a three-waypoint reach; if
+    // this ever becomes a control anchor rather than a demo, swap to the
+    // rod formula. Force clamp scales with the link's mass — biped-style
+    // bounds.
     let s1 = PdServo::from_dampratio(
         1,
         /*kp*/ 200.0,
