@@ -250,8 +250,8 @@ or
   suppressed).
 - **disable** — start from the auto list (including the `self_collide`
   filter per tree) and subtract the listed pairs.
-- The two are mutually exclusive; a single object cannot mix them
-  through the current v0 grammar (specify one or the other).
+- The two are mutually exclusive: passing both is a load-time error
+  (`contact_pairs: "explicit" and "disable" are mutually exclusive`).
 
 ## validation coverage
 
@@ -280,6 +280,7 @@ Every branch below is asserted by a dedicated test in
 | non-positive timestep                                         | `negative_timestep_rejected`                         |
 | unsupported version string                                    | `version_mismatch_rejected`                          |
 | contact pair referencing a missing geom                       | `contact_pair_unknown_geom_rejected`                 |
+| contact_pairs with both `explicit` and `disable`              | `contact_pairs_explicit_and_disable_together_rejected` |
 
 Plus the parser's own layer:
 [`newt/src/json.rs::tests`](../src/json.rs) pins malformed inputs
@@ -303,8 +304,9 @@ runaway nesting, `1e9999` overflow).
   on the middle and top boxes — that tickled a **latent tier-2
   limitation**: [`contact::box_box`](../src/contact.rs) is a
   vertex-only SAT that misses edge-edge intersections between
-  rotated boxes (any yaw ≥ 5° drops all box-box contact candidates
-  even when the boxes clearly overlap). The tier-2 box-box golden
+  rotated boxes (any nonzero yaw drops all box-box contact
+  candidates even when the boxes clearly overlap; the collapse is
+  continuous with yaw, not gated at any particular angle). The tier-2 box-box golden
   path only exercises axis-aligned boxes, so the bug never surfaced
   before; the tier-5 round-trip test caught it here. Fixing the
   box-box narrow phase is a tier-2 follow-up (needs a proper SAT or

@@ -1336,6 +1336,14 @@ fn parse_contact_pairs(
 ) -> Result<Vec<(usize, usize)>, ModelError> {
     let fields = get_object(v, path)?;
     reject_unknown(fields, &["explicit", "disable"], path)?;
+    let has_explicit = optional(fields, "explicit").is_some();
+    let has_disable = optional(fields, "disable").is_some();
+    if has_explicit && has_disable {
+        return fail(
+            path,
+            "\"explicit\" and \"disable\" are mutually exclusive; pass one or the other",
+        );
+    }
     if let Some(v) = optional(fields, "explicit") {
         let arr = get_array(v, &format!("{path}.explicit"))?;
         let mut out: Vec<(usize, usize)> = Vec::new();
@@ -1630,6 +1638,27 @@ mod tests {
     fn version_mismatch_rejected() {
         let e = err(r#"{"version":"2"}"#);
         assert!(e.message.contains("version"), "{}", e.message);
+    }
+
+    #[test]
+    fn contact_pairs_explicit_and_disable_together_rejected() {
+        let src = r#"{
+            "geoms":[
+              {"name":"a","shape":{"kind":"plane"},"attach":{"kind":"static"}},
+              {"name":"b","shape":{"kind":"plane"},"attach":{"kind":"static"}}
+            ],
+            "contact_pairs":{
+              "explicit":[{"a":"a","b":"b"}],
+              "disable" :[{"a":"a","b":"b"}]
+            }
+        }"#;
+        let e = err(src);
+        assert!(
+            e.message.contains("mutually exclusive"),
+            "message: {}",
+            e.message
+        );
+        assert_eq!(e.path, "contact_pairs");
     }
 
     #[test]

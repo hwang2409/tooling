@@ -7,9 +7,9 @@
 //!
 //! The [`Value`] tree uses an insertion-ordered `Vec<(String, Value)>` for
 //! objects. Duplicate keys are preserved (last-write-wins is the loader's
-//! problem, not the parser's); the [`Value::field`] helper returns the FIRST
-//! occurrence. Object iteration order is stable — the same document parses to
-//! the same tree byte-for-byte.
+//! problem, not the parser's); the loader walks the field list directly and
+//! rejects duplicates. Object iteration order is stable — the same document
+//! parses to the same tree byte-for-byte.
 //!
 //! # Style match
 //!
@@ -46,16 +46,6 @@ impl Value {
             Value::String(_) => "string",
             Value::Array(_) => "array",
             Value::Object(_) => "object",
-        }
-    }
-
-    /// Look up an object field by name. Returns `None` if the value is not an
-    /// object or the field is absent. Returns the FIRST occurrence when
-    /// duplicate keys are present.
-    pub fn field(&self, name: &str) -> Option<&Value> {
-        match self {
-            Value::Object(fields) => fields.iter().find(|(k, _)| k == name).map(|(_, v)| v),
-            _ => None,
         }
     }
 }
@@ -468,13 +458,19 @@ mod tests {
     }
 
     #[test]
-    fn field_returns_first_occurrence() {
+    fn duplicate_keys_preserved_in_parse_order() {
+        // The parser records both entries in order; the loader is responsible
+        // for rejecting duplicates (see `reject_unknown`).
         let v = parse(r#"{"a":1,"a":2,"b":3}"#).unwrap();
-        // First-write-wins in the parser; last-write-wins would be a loader
-        // policy decision (we reject duplicates in the loader anyway).
-        assert_eq!(v.field("a"), Some(&Value::Number(1.0)));
-        assert_eq!(v.field("b"), Some(&Value::Number(3.0)));
-        assert_eq!(v.field("missing"), None);
+        let Value::Object(fields) = v else {
+            panic!("expected object");
+        };
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].0, "a");
+        assert_eq!(fields[0].1, Value::Number(1.0));
+        assert_eq!(fields[1].0, "a");
+        assert_eq!(fields[1].1, Value::Number(2.0));
+        assert_eq!(fields[2].0, "b");
     }
 
     #[test]

@@ -378,32 +378,91 @@ fn regenerate_stack_golden() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. pendulum.json steady swing matches double-pendulum reference
+// 4. pendulum.json round-trip: byte-identical to a programmatic twin
 // ---------------------------------------------------------------------------
 
+/// Programmatic equivalent of `models/pendulum.json`. Same masses / inertias
+/// / anchor offsets — a hidden loader mis-wiring (swapped joint offset,
+/// wrong hinge axis, dropped mass) would diverge from this reference within
+/// a handful of RK4 steps once the pendulum starts swinging.
+fn build_pendulum_programmatic() -> Tree {
+    let mut tree = Tree::new();
+    // Pivot: fixed root at (0, 0, 1.5), unit inertia (matches the json).
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::new(0.0, 0.0, 1.5), Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    // Upper: 0.9 m rod, mass 1.3, hinge about x, joint_offset_in_child at
+    // (0, 0, 0.45) so the COM sits 0.45 m below the pivot.
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::hinge(Vec3::X),
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::new(0.0, 0.0, 0.45), Quat::IDENTITY),
+        1.3,
+        Mat3::diag(0.087_75, 0.087_75, 1e-6),
+    ));
+    // Lower: 0.6 m rod, mass 0.7, joint_offset_in_parent at (0, 0, -0.45)
+    // (bottom of upper rod), joint_offset_in_child at (0, 0, 0.3).
+    tree.push_link(Link::new(
+        Some(1),
+        JointKind::hinge(Vec3::X),
+        (Vec3::new(0.0, 0.0, -0.45), Quat::IDENTITY),
+        (Vec3::new(0.0, 0.0, 0.3), Quat::IDENTITY),
+        0.7,
+        Mat3::diag(0.021, 0.021, 1e-6),
+    ));
+    tree
+}
+
 #[test]
-fn pendulum_json_hanging_at_rest_stays_at_rest() {
-    // With every hinge at q = 0, the double pendulum hangs straight down.
-    // Gravity torque about every hinge is exactly zero → the joint angles
-    // should stay at zero after any number of steps. If the loader wired
-    // an offset wrong, the second link's COM would sit off-axis and the
-    // pendulum would fall.
+fn pendulum_json_matches_programmatic_construction_exactly() {
     let scene = load_from_path(model_path("pendulum.json")).unwrap();
-    let mut tree = scene.world.trees[0].clone();
-    let dt = 0.005f32;
-    for _ in 0..200 {
-        rk4_step(&mut tree, Vec3::new(0.0, 0.0, -9.81), dt, zero_ext(3));
+    let pendulum_idx = scene.trees_by_name["pendulum"];
+    let mut loaded = scene.world.trees[pendulum_idx].clone();
+    let mut prog = build_pendulum_programmatic();
+
+    // Non-trivial initial angles + rates so the trajectory exercises both
+    // hinges under chaos-adjacent dynamics — a mis-wired offset or axis
+    // will diverge within a few steps.
+    for tree in [&mut loaded, &mut prog] {
+        tree.set_hinge_angle(1, 1.2);
+        tree.set_hinge_angle(2, -0.6);
+        tree.set_hinge_rate(1, 0.4);
+        tree.set_hinge_rate(2, -0.2);
     }
-    assert!(
-        tree.hinge_angle(1).abs() < 1e-4,
-        "hinge 1 should stay at 0, got {}",
-        tree.hinge_angle(1)
-    );
-    assert!(
-        tree.hinge_angle(2).abs() < 1e-4,
-        "hinge 2 should stay at 0, got {}",
-        tree.hinge_angle(2)
-    );
+
+    // Link-level match before stepping — catches inertia/offset/axis errors
+    // even if they happen to produce the same trajectory in early steps.
+    assert_eq!(loaded.links.len(), prog.links.len());
+    for (i, (a, b)) in loaded.links.iter().zip(prog.links.iter()).enumerate() {
+        assert_eq!(a.mass, b.mass, "link {i} mass");
+        assert_eq!(a.inertia_body, b.inertia_body, "link {i} inertia");
+        assert_eq!(
+            a.joint_offset_in_parent, b.joint_offset_in_parent,
+            "link {i} joint_offset_in_parent"
+        );
+        assert_eq!(
+            a.joint_offset_in_child, b.joint_offset_in_child,
+            "link {i} joint_offset_in_child"
+        );
+        assert_eq!(a.joint, b.joint, "link {i} joint kind");
+    }
+    assert_eq!(loaded.q, prog.q, "initial q mismatch");
+    assert_eq!(loaded.qdot, prog.qdot, "initial qdot mismatch");
+
+    let dt = 0.005f32;
+    let g = Vec3::new(0.0, 0.0, -9.81);
+    for step in 0..500 {
+        rk4_step(&mut loaded, g, dt, zero_ext(3));
+        rk4_step(&mut prog, g, dt, zero_ext(3));
+        assert_eq!(loaded.q, prog.q, "q mismatch at step {step}");
+        assert_eq!(loaded.qdot, prog.qdot, "qdot mismatch at step {step}");
+    }
 }
 
 // ---------------------------------------------------------------------------
