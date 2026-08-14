@@ -1,7 +1,6 @@
 //! Tier 4 demo, tier-5 upgrade: a 3-link commanded arm follows a
-//! three-waypoint target sequence (reach up → reach sideways → settle)
-//! driven by PD position servos. Wireframe PPM via chimy2, same rendering
-//! plumbing as `pendulum.rs`.
+//! three-waypoint target sequence (reach up, reach sideways, settle) driven by
+//! PD position servos. The default output is a full-run mp4.
 //!
 //! # What changed in tier 5
 //!
@@ -20,8 +19,8 @@
 //!
 //! Run:
 //! ```text
-//! cargo run --release --example arm -- --frames 1800 --out /tmp/arm.ppm --size 640x360
-//! sips -s format png /tmp/arm.ppm --out /tmp/arm.png
+//! cargo run --release --example arm -- --frames 1800 --out /tmp/arm.mp4
+//! cargo run --release --example arm -- --frames 1800 --still /tmp/arm.ppm
 //! ```
 
 mod showcase_support;
@@ -43,15 +42,17 @@ struct Args {
     size: (usize, usize),
     model: PathBuf,
     frames_dir: Option<PathBuf>,
+    still: Option<PathBuf>,
     wireframe: bool,
 }
 
 fn parse_args() -> Args {
     let mut frames = 1800usize;
-    let mut out = PathBuf::from("newt-arm.ppm");
+    let mut out = PathBuf::from("newt-arm.mp4");
     let mut size = (640usize, 360usize);
     let mut model = PathBuf::from("models/arm.json");
     let mut frames_dir = None;
+    let mut still = None;
     let mut wireframe = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -65,6 +66,7 @@ fn parse_args() -> Args {
                 size = (w.parse().unwrap(), h.parse().unwrap());
             }
             "--frames-dir" => frames_dir = Some(PathBuf::from(args.next().unwrap())),
+            "--still" => still = Some(PathBuf::from(args.next().unwrap())),
             "--wireframe" => wireframe = true,
             _ => panic!("unknown arg: {a}"),
         }
@@ -75,6 +77,7 @@ fn parse_args() -> Args {
         size,
         model,
         frames_dir,
+        still,
         wireframe,
     }
 }
@@ -142,6 +145,39 @@ fn tip_world(scene: &Scene) -> Vec3 {
         .0
 }
 
+fn render_arm_frame(
+    scene: &Scene,
+    arm_idx: usize,
+    width: usize,
+    height: usize,
+    step: usize,
+) -> Framebuffer {
+    let poses = forward_kinematics(&scene.world.trees[arm_idx]);
+    let mut items = showcase_support::world_items(&scene.world);
+    for link in 1..poses.len() {
+        if let Some(parent) = scene.world.trees[arm_idx].links[link].parent {
+            showcase_support::add_capsule(
+                &mut items,
+                poses[parent].0,
+                poses[link].0,
+                0.06,
+                showcase_support::Material::new(
+                    chimy2::math::Vec3::new(0.12 + link as f32 * 0.1, 0.4, 0.75),
+                    0.35,
+                    0.3,
+                ),
+            );
+        }
+    }
+    showcase_support::render_items(
+        &items,
+        showcase_support::composition("arm"),
+        width,
+        height,
+        &format!("arm  |  step {step}  |  waypoint servo"),
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
     let (frames, out, (width, height), model_path) = (args.frames, args.out, args.size, args.model);
@@ -192,6 +228,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut trail: Vec<Vec3> = Vec::with_capacity(frames);
     let mut frame = 0usize;
+    let video_mode = !args.wireframe && args.still.is_none() && args.frames_dir.is_none();
+    let mut video = video_mode
+        .then(|| showcase_support::VideoWriter::new(&out))
+        .transpose()?;
     for (phase, targets) in WAYPOINTS.iter().enumerate() {
         for (i, &t) in targets.iter().enumerate() {
             let (t_idx, a_idx) = servo_ids[i];
@@ -209,6 +249,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
             trail.push(tip_world(&scene));
             frame += 1;
+            if let Some(writer) = video.as_mut()
+                && (frame % showcase_support::SIM_STEPS_PER_VIDEO_FRAME == 0 || frame == frames)
+            {
+                writer.push(&render_arm_frame(&scene, arm_idx, width, height, frame))?;
+            }
             if frame % sample_stride == 0 || frame == frames {
                 // Sensor eval is state-observational only — it does not
                 // perturb the tree, so sampling here leaves the simulation
@@ -232,35 +277,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if !args.wireframe {
-        let poses = forward_kinematics(&scene.world.trees[arm_idx]);
-        let mut items = showcase_support::world_items(&scene.world);
-        for link in 1..poses.len() {
-            if let Some(parent) = scene.world.trees[arm_idx].links[link].parent {
-                showcase_support::add_capsule(
-                    &mut items,
-                    poses[parent].0,
-                    poses[link].0,
-                    0.06,
-                    showcase_support::Material::new(
-                        chimy2::math::Vec3::new(0.12 + link as f32 * 0.1, 0.4, 0.75),
-                        0.35,
-                        0.3,
-                    ),
-                );
-            }
-        }
-        let path = args
-            .frames_dir
-            .as_ref()
-            .map_or_else(|| out.clone(), |directory| directory.join("frame-00.ppm"));
-        showcase_support::write_frame(
-            &items,
-            showcase_support::composition("arm"),
+    if let Some(writer) = video {
+        writer.finish()?;
+        println!(
+            "wrote {} ({}x{}, {} fps)",
+            out.display(),
             width,
             height,
-            &format!("arm  |  step {frames}  |  waypoint servo"),
+            showcase_support::VIDEO_FPS
+        );
+        return Ok(());
+    }
+
+    if !args.wireframe {
+        let path = args
+            .still
+            .or_else(|| {
+                args.frames_dir
+                    .map(|directory| directory.join("frame-00.ppm"))
+            })
+            .unwrap_or(out.clone());
+        chimy2::demo::write_ppm(
             path,
+            &render_arm_frame(&scene, arm_idx, width, height, frames),
         )?;
         return Ok(());
     }

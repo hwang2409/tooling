@@ -4,7 +4,8 @@
 //!
 //! Run:
 //! ```text
-//! cargo run --release --example tendon_lift -- --frames 900 --out /tmp/tendon_lift.ppm
+//! cargo run --release --example tendon_lift -- --frames 900 --out /tmp/tendon_lift.mp4
+//! cargo run --release --example tendon_lift -- --frames 900 --still /tmp/tendon_lift.ppm
 //! ```
 
 mod showcase_support;
@@ -34,14 +35,16 @@ struct Args {
     out: PathBuf,
     size: (usize, usize),
     frames_dir: Option<PathBuf>,
+    still: Option<PathBuf>,
     wireframe: bool,
 }
 
 fn parse_args() -> Args {
     let mut frames = 900usize;
-    let mut out = PathBuf::from("newt-tendon-lift.ppm");
+    let mut out = PathBuf::from("newt-tendon-lift.mp4");
     let mut size = (640usize, 360usize);
     let mut frames_dir = None;
+    let mut still = None;
     let mut wireframe = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -54,6 +57,7 @@ fn parse_args() -> Args {
                 size = (w.parse().unwrap(), h.parse().unwrap());
             }
             "--frames-dir" => frames_dir = Some(PathBuf::from(args.next().unwrap())),
+            "--still" => still = Some(PathBuf::from(args.next().unwrap())),
             "--wireframe" => wireframe = true,
             _ => panic!("unknown arg: {a}"),
         }
@@ -63,6 +67,7 @@ fn parse_args() -> Args {
         out,
         size,
         frames_dir,
+        still,
         wireframe,
     }
 }
@@ -335,121 +340,127 @@ fn draw_tendon_path(
     }
 }
 
+fn render_tendon_frame(world: &World, width: usize, height: usize, step: usize) -> Framebuffer {
+    let poses = forward_kinematics(&world.trees[0]);
+    let box_com = poses[1].0;
+    let mut items = vec![showcase_support::item(
+        showcase_support::cuboid_mesh(chimy2::math::Vec3::new(6.0, 6.0, 0.04)),
+        chimy2::math::Mat4::translate(chimy2::math::Vec3::new(0.0, 0.0, -1.2)),
+        showcase_support::Material::new(chimy2::math::Vec3::new(0.04, 0.05, 0.07), 0.0, 0.9),
+    )];
+    items.push(showcase_support::item(
+        showcase_support::sphere_mesh(20, 12),
+        chimy2::math::Mat4::translate(showcase_support::to_cvec(SPHERE_CENTER))
+            * chimy2::math::Mat4::scale(chimy2::math::Vec3::new(
+                SPHERE_RADIUS,
+                SPHERE_RADIUS,
+                SPHERE_RADIUS,
+            )),
+        showcase_support::Material::new(chimy2::math::Vec3::new(0.08, 0.24, 0.5), 0.55, 0.2),
+    ));
+    items.push(showcase_support::item(
+        showcase_support::cuboid_mesh(chimy2::math::Vec3::new(BOX_SIZE, BOX_SIZE, BOX_SIZE)),
+        chimy2::math::Mat4::translate(showcase_support::to_cvec(box_com)),
+        showcase_support::Material::new(chimy2::math::Vec3::new(0.78, 0.32, 0.08), 0.1, 0.34),
+    ));
+    let cable = showcase_support::Material::new(chimy2::math::Vec3::new(0.05, 0.75, 0.9), 0.3, 0.2);
+    let wrap_point = SPHERE_CENTER + Vec3::new(-SPHERE_RADIUS * 0.7, 0.0, SPHERE_RADIUS * 0.7);
+    showcase_support::add_capsule(&mut items, ANCHOR_WORLD, wrap_point, 0.018, cable);
+    showcase_support::add_capsule(&mut items, wrap_point, box_com, 0.018, cable);
+    showcase_support::render_items(
+        &items,
+        showcase_support::composition("tendon"),
+        width,
+        height,
+        &format!("tendon lift  |  step {step}  |  wrap arc highlighted"),
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
     let (frames, out, (width, height)) = (args.frames, args.out, args.size);
     let mut world = build_world();
-    for _ in 0..frames {
-        world.step();
-    }
-    let poses = forward_kinematics(&world.trees[0]);
-    if args.wireframe {
-        let mut fb = Framebuffer::new(width, height);
-        fb.clear(argb8888(0xff, 12, 14, 22));
-        let camera = Mat4::perspective(
-            std::f32::consts::FRAC_PI_4,
-            (width as f32) / (height as f32).max(1.0),
-            0.05,
-            100.0,
-        ) * Mat4::look_at(
-            CVec3::new(3.0, -3.5, 1.2),
-            CVec3::new(0.5, 0.0, -0.5),
-            CVec3::new(0.0, 0.0, 1.0),
-        );
-        // Sphere obstacle.
-        draw_sphere_wire(
-            &mut fb,
-            camera,
-            width,
-            height,
-            SPHERE_CENTER,
-            SPHERE_RADIUS,
-            argb8888(0xff, 90, 90, 140),
-        );
-        // Anchor point (small crosshair).
-        if let Some(p) = project(camera, ANCHOR_WORLD, width, height) {
-            for d in -4..=4 {
-                let color = argb8888(0xff, 240, 240, 240);
-                if p.0 + d >= 0 && p.0 + d < width as i32 && p.1 >= 0 && p.1 < height as i32 {
-                    fb.put_pixel((p.0 + d) as usize, p.1 as usize, color);
-                }
-                if p.1 + d >= 0 && p.1 + d < height as i32 && p.0 >= 0 && p.0 < width as i32 {
-                    fb.put_pixel(p.0 as usize, (p.1 + d) as usize, color);
+    let still_path = args.still.or_else(|| {
+        args.frames_dir
+            .map(|directory| directory.join("frame-00.ppm"))
+    });
+    if args.wireframe || still_path.is_some() {
+        for _ in 0..frames {
+            world.step();
+        }
+        let path = still_path.unwrap_or(out.clone());
+        if !args.wireframe {
+            let frame = render_tendon_frame(&world, width, height, frames);
+            chimy2::demo::write_ppm(path, &frame)?;
+        } else {
+            let mut fb = Framebuffer::new(width, height);
+            fb.clear(argb8888(0xff, 12, 14, 22));
+            let camera = Mat4::perspective(
+                std::f32::consts::FRAC_PI_4,
+                (width as f32) / (height as f32).max(1.0),
+                0.05,
+                100.0,
+            ) * Mat4::look_at(
+                CVec3::new(3.0, -3.5, 1.2),
+                CVec3::new(0.5, 0.0, -0.5),
+                CVec3::new(0.0, 0.0, 1.0),
+            );
+            // Sphere obstacle.
+            draw_sphere_wire(
+                &mut fb,
+                camera,
+                width,
+                height,
+                SPHERE_CENTER,
+                SPHERE_RADIUS,
+                argb8888(0xff, 90, 90, 140),
+            );
+            // Anchor point (small crosshair).
+            if let Some(p) = project(camera, ANCHOR_WORLD, width, height) {
+                for d in -4..=4 {
+                    let color = argb8888(0xff, 240, 240, 240);
+                    if p.0 + d >= 0 && p.0 + d < width as i32 && p.1 >= 0 && p.1 < height as i32 {
+                        fb.put_pixel((p.0 + d) as usize, p.1 as usize, color);
+                    }
+                    if p.1 + d >= 0 && p.1 + d < height as i32 && p.0 >= 0 && p.0 < width as i32 {
+                        fb.put_pixel(p.0 as usize, (p.1 + d) as usize, color);
+                    }
                 }
             }
+            // Box.
+            let poses = forward_kinematics(&world.trees[0]);
+            let box_com = poses[1].0;
+            draw_box(
+                &mut fb,
+                camera,
+                width,
+                height,
+                box_com,
+                BOX_SIZE,
+                argb8888(0xff, 240, 200, 90),
+            );
+            // Tendon path.
+            draw_tendon_path(
+                &mut fb,
+                camera,
+                width,
+                height,
+                &world,
+                argb8888(0xff, 90, 220, 240),
+            );
+            write_ppm(path, &fb)?;
         }
-        // Box.
-        let poses = forward_kinematics(&world.trees[0]);
-        let box_com = poses[1].0;
-        draw_box(
-            &mut fb,
-            camera,
-            width,
-            height,
-            box_com,
-            BOX_SIZE,
-            argb8888(0xff, 240, 200, 90),
-        );
-        // Tendon path.
-        draw_tendon_path(
-            &mut fb,
-            camera,
-            width,
-            height,
-            &world,
-            argb8888(0xff, 90, 220, 240),
-        );
-        write_ppm(&out, &fb)?;
     } else {
-        let poses = forward_kinematics(&world.trees[0]);
-        let box_com = poses[1].0;
-        let mut items = vec![showcase_support::item(
-            showcase_support::cuboid_mesh(chimy2::math::Vec3::new(6.0, 6.0, 0.04)),
-            chimy2::math::Mat4::translate(chimy2::math::Vec3::new(0.0, 0.0, -1.2)),
-            showcase_support::Material::new(chimy2::math::Vec3::new(0.04, 0.05, 0.07), 0.0, 0.9),
-        )];
-        items.push(showcase_support::item(
-            showcase_support::sphere_mesh(20, 12),
-            chimy2::math::Mat4::translate(showcase_support::to_cvec(SPHERE_CENTER))
-                * chimy2::math::Mat4::scale(chimy2::math::Vec3::new(
-                    SPHERE_RADIUS,
-                    SPHERE_RADIUS,
-                    SPHERE_RADIUS,
-                )),
-            showcase_support::Material::new(chimy2::math::Vec3::new(0.08, 0.24, 0.5), 0.55, 0.2),
-        ));
-        items.push(showcase_support::item(
-            showcase_support::cuboid_mesh(chimy2::math::Vec3::new(BOX_SIZE, BOX_SIZE, BOX_SIZE)),
-            chimy2::math::Mat4::translate(showcase_support::to_cvec(box_com)),
-            showcase_support::Material::new(chimy2::math::Vec3::new(0.78, 0.32, 0.08), 0.1, 0.34),
-        ));
-        showcase_support::add_capsule(
-            &mut items,
-            ANCHOR_WORLD,
-            SPHERE_CENTER + Vec3::new(-SPHERE_RADIUS * 0.7, 0.0, SPHERE_RADIUS * 0.7),
-            0.018,
-            showcase_support::Material::new(chimy2::math::Vec3::new(0.05, 0.75, 0.9), 0.3, 0.2),
-        );
-        showcase_support::add_capsule(
-            &mut items,
-            SPHERE_CENTER + Vec3::new(-SPHERE_RADIUS * 0.7, 0.0, SPHERE_RADIUS * 0.7),
-            box_com,
-            0.018,
-            showcase_support::Material::new(chimy2::math::Vec3::new(0.05, 0.75, 0.9), 0.3, 0.2),
-        );
-        let path = args
-            .frames_dir
-            .as_ref()
-            .map_or_else(|| out.clone(), |directory| directory.join("frame-00.ppm"));
-        showcase_support::write_frame(
-            &items,
-            showcase_support::composition("tendon"),
-            width,
-            height,
-            &format!("tendon lift  |  step {frames}  |  wrap arc highlighted"),
-            path,
-        )?;
+        let mut simulated = 0;
+        showcase_support::write_video(&out, frames, |step| {
+            for _ in simulated..step {
+                world.step();
+            }
+            simulated = step;
+            render_tendon_frame(&world, width, height, step)
+        })?;
     }
+    let poses = forward_kinematics(&world.trees[0]);
     let kin = tendon_kinematics(&world.trees[0].tendons[0], &world.trees[0], &poses);
     println!(
         "wrote {} ({}x{}) — final slide={:.3} m tendon length={:.3} m",

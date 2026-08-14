@@ -7,7 +7,8 @@
 //!
 //! Run:
 //! ```text
-//! cargo run --release --example pile -- --frames 800 --out /tmp/pile.ppm
+//! cargo run --release --example pile -- --frames 800 --out /tmp/pile.mp4
+//! cargo run --release --example pile -- --frames 800 --still /tmp/pile.ppm
 //! ```
 //!
 //! Wireframes:
@@ -35,15 +36,17 @@ struct Args {
     size: (usize, usize),
     model: Option<PathBuf>,
     frames_dir: Option<PathBuf>,
+    still: Option<PathBuf>,
     wireframe: bool,
 }
 
 fn parse_args() -> Args {
     let mut frames = 800usize;
-    let mut out = PathBuf::from("newt-pile.ppm");
+    let mut out = PathBuf::from("newt-pile.mp4");
     let mut size = (800usize, 480usize);
     let mut model: Option<PathBuf> = None;
     let mut frames_dir = None;
+    let mut still = None;
     let mut wireframe = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -57,6 +60,7 @@ fn parse_args() -> Args {
                 size = (w.parse().unwrap(), h.parse().unwrap());
             }
             "--frames-dir" => frames_dir = Some(PathBuf::from(args.next().unwrap())),
+            "--still" => still = Some(PathBuf::from(args.next().unwrap())),
             "--wireframe" => wireframe = true,
             _ => panic!("unknown arg: {a}"),
         }
@@ -67,6 +71,7 @@ fn parse_args() -> Args {
         size,
         model,
         frames_dir,
+        still,
         wireframe,
     }
 }
@@ -506,26 +511,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `World::step` runs its own engine-level unsupported-pair check on the
     // first invocation and panics with a specific error; we don't need to
     // pre-check here.
-    for _ in 0..frames {
-        world.step();
-    }
-    if args.wireframe {
-        let fb = render(&world, width, height);
-        write_ppm(&out, &fb)?;
+    let still_path = args.still.or_else(|| {
+        args.frames_dir
+            .map(|directory| directory.join("frame-00.ppm"))
+    });
+    if args.wireframe || still_path.is_some() {
+        for _ in 0..frames {
+            world.step();
+        }
+        let path = still_path.unwrap_or(out.clone());
+        if args.wireframe {
+            let fb = render(&world, width, height);
+            write_ppm(path, &fb)?;
+        } else {
+            let items = showcase_support::world_items(&world);
+            showcase_support::write_frame(
+                &items,
+                showcase_support::composition("pile"),
+                width,
+                height,
+                &format!("mixed geom pile  |  step {frames}"),
+                path,
+            )?;
+        }
     } else {
-        let path = args
-            .frames_dir
-            .as_ref()
-            .map_or_else(|| out.clone(), |directory| directory.join("frame-00.ppm"));
-        let items = showcase_support::world_items(&world);
-        showcase_support::write_frame(
-            &items,
-            showcase_support::composition("pile"),
-            width,
-            height,
-            &format!("mixed geom pile  |  step {frames}"),
-            path,
-        )?;
+        let mut simulated = 0;
+        showcase_support::write_video(&out, frames, |step| {
+            for _ in simulated..step {
+                world.step();
+            }
+            simulated = step;
+            let items = showcase_support::world_items(&world);
+            showcase_support::render_items(
+                &items,
+                showcase_support::composition("pile"),
+                width,
+                height,
+                &format!("mixed geom pile  |  step {step}"),
+            )
+        })?;
     }
     // Report final positions so the human running the demo can eyeball
     // whether everything settled (no NaN, no negative z, boxes stacked).

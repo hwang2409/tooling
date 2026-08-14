@@ -10,11 +10,7 @@ use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Quat as CQuat, Vec3};
 use chimy2::mesh::{Mesh, MeshVertex};
 use chimy2::pipeline::Pipeline;
-use chimy2::postfx::{AcesTonemapPass, BloomPass, PostChain, SsaoPass};
 use chimy2::shaders::{CookTorranceShader, CookTorranceUniforms, DirectionalLight, PointLight};
-use chimy2::shadow::{
-    ShadowDepthShader, ShadowDepthUniforms, ShadowMap, ShadowState, directional_light_view,
-};
 
 use newt::geom::{GeomShape, geom_world_pose};
 use newt::math::{Quat, Vec3 as NVec3};
@@ -22,7 +18,12 @@ use newt::tree::forward_kinematics;
 use newt::world::World;
 
 use std::f32::consts::PI;
+use std::fs;
 use std::path::Path;
+use std::process::Command;
+
+pub const VIDEO_FPS: u32 = 60;
+pub const SIM_STEPS_PER_VIDEO_FRAME: usize = 10;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Material {
@@ -79,8 +80,8 @@ impl Composition {
     }
 }
 
-/// Art-directed defaults used by the static demos. Keep this table compact so
-/// a gate review can change framing without searching each example.
+/// Fixed camera presets used by the demos. Keep this table compact so framing
+/// stays easy to adjust without changing simulation code.
 pub fn composition(name: &str) -> Composition {
     match name {
         "tendon" => Composition::new(
@@ -143,34 +144,6 @@ pub fn render_items(
     framebuffer.clear(argb8888(255, 8, 10, 16));
 
     let light_direction = Vec3::new(-0.45, -0.65, 0.9).normalize();
-    let light_view = directional_light_view(
-        light_direction,
-        composition.target,
-        30.0,
-        Vec3::new(0.0, 0.0, 1.0),
-    );
-    let light_projection = Mat4::orthographic(-12.0, 12.0, -12.0, 12.0, 0.1, 60.0);
-    let light_vp = light_projection * light_view;
-    let mut shadow_target = Framebuffer::new(512, 512);
-    shadow_target.clear(0);
-    let mut shadow_pipeline = Pipeline::new(ShadowDepthShader, ShadowDepthShader);
-    for value in items {
-        shadow_pipeline.draw_mesh_depth(
-            &mut shadow_target,
-            &value.mesh,
-            &ShadowDepthUniforms::new(value.model, light_vp),
-        );
-    }
-    let shadow_map = ShadowMap::from_framebuffer(&shadow_target).expect("valid shadow map");
-    let mut shadow = ShadowState::new(light_vp, shadow_map);
-    shadow.set_bias(0.002, 0.018);
-    shadow.set_light_size(0.16);
-    shadow.set_light_depth_origin(0.1);
-
-    let mut post = PostChain::new();
-    post.push(SsaoPass::new(camera.projection_matrix()));
-    post.push(BloomPass);
-    post.push(AcesTonemapPass::new(1.15));
     let uniforms = items
         .iter()
         .map(|value| {
@@ -192,22 +165,15 @@ pub fn render_items(
                     0.03,
                 ),
             );
-            let mut value = CookTorranceUniforms::new_with_linear_base_color(
+            CookTorranceUniforms::new_with_linear_base_color(
                 lighting,
                 value.material.albedo,
                 value.material.metallic,
                 value.material.roughness,
-            );
-            value.lighting.set_directional_shadow(
-                DirectionalLight::new(light_direction, Vec3::new(2.2, 2.0, 1.8)),
-                Some(shadow.clone()),
-            );
-            value
+            )
         })
         .collect::<Vec<_>>();
     let mut pipeline = Pipeline::new(CookTorranceShader, CookTorranceShader);
-    pipeline.set_hdr(true);
-    pipeline.set_post_chain(post);
     pipeline.render(&mut framebuffer, |frame, target| {
         for (value, uniforms) in items.iter().zip(&uniforms) {
             frame.draw_mesh(target, &value.mesh, uniforms);
@@ -228,6 +194,108 @@ pub fn write_frame(
     let framebuffer = render_items(items, composition, width, height, hud);
     chimy2::demo::write_ppm(path, &framebuffer)?;
     Ok(())
+}
+
+pub struct VideoWriter {
+    output: std::path::PathBuf,
+    frame_dir: std::path::PathBuf,
+    next_frame: usize,
+}
+
+impl VideoWriter {
+    pub fn new(output: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        let output = output.as_ref().to_path_buf();
+        let parent = output.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let frame_dir = std::env::temp_dir().join(format!(
+            "newt-showcase-{}-{}",
+            std::process::id(),
+            output
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("demo")
+        ));
+        if frame_dir.exists() {
+            fs::remove_dir_all(&frame_dir)?;
+        }
+        fs::create_dir_all(&frame_dir)?;
+        Ok(Self {
+            output,
+            frame_dir,
+            next_frame: 0,
+        })
+    }
+
+    pub fn push(&mut self, framebuffer: &Framebuffer) -> Result<(), Box<dyn std::error::Error>> {
+        let path = self
+            .frame_dir
+            .join(format!("frame-{:06}.ppm", self.next_frame));
+        chimy2::demo::write_ppm(path, framebuffer)?;
+        self.next_frame += 1;
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<(), Box<dyn std::error::Error>> {
+        let input = self.frame_dir.join("frame-%06d.ppm");
+        let result = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-framerate",
+                &VIDEO_FPS.to_string(),
+                "-i",
+                input.to_str().unwrap_or_default(),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                self.output.to_str().unwrap_or_default(),
+            ])
+            .output();
+        let cleanup = fs::remove_dir_all(&self.frame_dir);
+        match (result, cleanup) {
+            (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err("ffmpeg is required for video output; install it (for example, /opt/homebrew/bin/ffmpeg) and retry".into())
+            }
+            (Err(error), _) => Err(error.into()),
+            (Ok(output), Err(error)) if !output.status.success() => Err(format!(
+                "ffmpeg failed: {} (cleanup also failed: {error})",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into()),
+            (Ok(output), _) if !output.status.success() => {
+                Err(format!("ffmpeg failed: {}", String::from_utf8_lossy(&output.stderr)).into())
+            }
+            (Ok(_), Err(error)) => Err(error.into()),
+            (Ok(_), Ok(())) => Ok(()),
+        }
+    }
+}
+
+impl Drop for VideoWriter {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.frame_dir);
+    }
+}
+
+pub fn write_video<F>(
+    output: impl AsRef<Path>,
+    total_steps: usize,
+    mut render: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut(usize) -> Framebuffer,
+{
+    let mut writer = VideoWriter::new(output)?;
+    let mut simulated = 0;
+    while simulated < total_steps {
+        let next = simulated + SIM_STEPS_PER_VIDEO_FRAME.min(total_steps - simulated);
+        writer.push(&render(next))?;
+        simulated = next;
+    }
+    writer.finish()
 }
 
 pub fn world_items(world: &World) -> Vec<Item> {

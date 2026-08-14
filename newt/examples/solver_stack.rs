@@ -9,10 +9,11 @@
 //!
 //! Run:
 //! ```text
-//! cargo run --release --example solver_stack -- --frames 800 --out /tmp/solver_stack.ppm
+//! cargo run --release --example solver_stack -- --frames 800 --out /tmp/solver_stack.mp4
+//! cargo run --release --example solver_stack -- --frames 800 --still /tmp/solver_stack.ppm
 //! ```
 //!
-//! Wireframe PPM via chimy2, same rendering plumbing as `stack.rs`.
+//! Solid shaded meshes use the shared showcase adapter.
 
 mod showcase_support;
 
@@ -33,14 +34,16 @@ struct Args {
     out: PathBuf,
     size: (usize, usize),
     frames_dir: Option<PathBuf>,
+    still: Option<PathBuf>,
     wireframe: bool,
 }
 
 fn parse_args() -> Args {
     let mut frames = 800usize;
-    let mut out = PathBuf::from("newt-solver-stack.ppm");
+    let mut out = PathBuf::from("newt-solver-stack.mp4");
     let mut size = (640usize, 360usize);
     let mut frames_dir = None;
+    let mut still = None;
     let mut wireframe = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -53,6 +56,7 @@ fn parse_args() -> Args {
                 size = (w.parse().unwrap(), h.parse().unwrap());
             }
             "--frames-dir" => frames_dir = Some(PathBuf::from(args.next().unwrap())),
+            "--still" => still = Some(PathBuf::from(args.next().unwrap())),
             "--wireframe" => wireframe = true,
             _ => panic!("unknown arg: {a}"),
         }
@@ -62,6 +66,7 @@ fn parse_args() -> Args {
         out,
         size,
         frames_dir,
+        still,
         wireframe,
     }
 }
@@ -258,26 +263,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
     let (frames, out, (width, height)) = (args.frames, args.out, args.size);
     let mut world = build_world();
-    for _ in 0..frames {
-        world.step();
-    }
-    if args.wireframe {
-        let fb = render(&world, width, height);
-        write_ppm(&out, &fb)?;
+    let still_path = args.still.or_else(|| {
+        args.frames_dir
+            .map(|directory| directory.join("frame-00.ppm"))
+    });
+    if args.wireframe || still_path.is_some() {
+        for _ in 0..frames {
+            world.step();
+        }
+        let path = still_path.unwrap_or(out.clone());
+        if args.wireframe {
+            let fb = render(&world, width, height);
+            write_ppm(path, &fb)?;
+        } else {
+            let items = showcase_support::world_items(&world);
+            showcase_support::write_frame(
+                &items,
+                showcase_support::composition("stack"),
+                width,
+                height,
+                &format!("solver stack  |  step {frames}"),
+                path,
+            )?;
+        }
     } else {
-        let path = args
-            .frames_dir
-            .as_ref()
-            .map_or_else(|| out.clone(), |directory| directory.join("frame-00.ppm"));
-        let items = showcase_support::world_items(&world);
-        showcase_support::write_frame(
-            &items,
-            showcase_support::composition("stack"),
-            width,
-            height,
-            &format!("solver stack  |  step {frames}"),
-            path,
-        )?;
+        let mut simulated = 0;
+        showcase_support::write_video(&out, frames, |step| {
+            for _ in simulated..step {
+                world.step();
+            }
+            simulated = step;
+            let items = showcase_support::world_items(&world);
+            showcase_support::render_items(
+                &items,
+                showcase_support::composition("stack"),
+                width,
+                height,
+                &format!("solver stack  |  step {step}"),
+            )
+        })?;
     }
     println!(
         "wrote {} ({}x{}) — final positions:",

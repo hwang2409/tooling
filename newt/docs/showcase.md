@@ -1,41 +1,45 @@
-# newt rendered showcase
+# newt demo showcase
 
-the examples use chimy2's production mesh pipeline by default. each render
-uses tessellated geometry, GGX materials, a directional shadow map, SSAO,
-bloom, ACES tonemapping, and deterministic dithering. `--wireframe` keeps the
-older debug path for short-term comparison.
+the showcase demos render solid shaded meshes through chimy2. each demo uses
+simple materials, readable colors, and one fixed camera. the biped uses a
+follow camera.
+
+video is the default output. each run advances the deterministic simulation
+by 10 fixed simulation steps per video frame and writes 60 fps. this gives a
+5000-step biped walk an 8.33 second video at a documented 10x simulation
+speed. rendering does not change the simulation state.
 
 all commands run from `newt/`.
 
-## demos
+## video demos
 
 ```text
-cargo run --release --example biped_walk -- --steps 5000 --frames-dir /tmp/newt-walk
-cargo run --release --example tendon_lift -- --frames 900 --frames-dir /tmp/newt-tendon
-cargo run --release --example solver_stack -- --frames 800 --frames-dir /tmp/newt-stack
-cargo run --release --example pile -- --frames 800 --frames-dir /tmp/newt-pile
-cargo run --release --example cartpole -- --frames 900 --frames-dir /tmp/newt-cartpole
-cargo run --release --example arm -- --frames 1800 --frames-dir /tmp/newt-arm
+cargo run --release --example biped_walk -- --steps 5000 --out demo-biped.mp4
+cargo run --release --example tendon_lift -- --frames 900 --out demo-tendon.mp4
+cargo run --release --example solver_stack -- --frames 800 --out demo-stack.mp4
+cargo run --release --example pile -- --frames 800 --out demo-pile.mp4
+cargo run --release --example cartpole -- --frames 900 --out demo-cartpole.mp4
+cargo run --release --example cartpole -- --velocity --frames 900 --out demo-cartpole-velocity.mp4
+cargo run --release --example arm -- --frames 1800 --out demo-arm.mp4
 ```
 
-the default output size is kept by each example for compatibility. use
-`--size 960x640` for the art-direction review size. non-biped demos write the
-final numbered capture as `frame-00.ppm`; biped writes eight fixed-phase
-captures. chimy2 exposes PPM output, so no image dependency is added.
+`--out` defaults to a demo-specific mp4 in the current directory. the
+implementation writes numbered ppm frames to a temporary directory, invokes
+the system `ffmpeg`, and removes the temporary frames after assembly.
 
-convert a capture to PNG on macOS:
+install `ffmpeg` if a run reports that it is missing. macos homebrew users
+can install it with `brew install ffmpeg`.
 
-```text
-sips -s format png /tmp/newt-walk/frame-08.ppm --out /tmp/newt-walk/frame-08.png
-```
+use `--still PATH` for one final PPM frame. `--wireframe` keeps the old debug
+renderer. `--frames-dir` remains as a legacy sparse-PPM compatibility mode.
 
-assemble a numbered sequence into an MP4:
-
-```text
-ffmpeg -framerate 60 -i /tmp/newt-walk/frame-%02d.ppm -c:v libx264 -pix_fmt yuv420p /tmp/newt-walk.mp4
-```
+the output size is demo-specific. use `--size 960x640` when a larger video is
+needed.
 
 ## live viewer
+
+the viewer is the interactive half of the showcase. it steps the world at its
+fixed `dt` and renders every display update.
 
 ```text
 cargo run --release --example viewer -- --scenario walk
@@ -43,32 +47,25 @@ cargo run --release --example viewer -- --scenario pile --frames 600
 cargo run --release --example viewer -- --model models/arm.json
 ```
 
-the viewer steps the world at its fixed `dt` and renders independently.
-
 | key | action |
 | --- | --- |
 | space | pause or resume |
-| `.` | single fixed step |
+| `.` | single fixed step while paused |
 | `[` / `]` | halve or double speed, clamped to 0.25x–4x |
 | `1`–`3` | camera presets |
 | `a` / `d` | orbit left or right |
 | `w` / `s` | orbit up or down |
 | escape | close the window |
 
-the current chimy2 input API exposes physical key state, not pointer motion.
-the viewer therefore uses keyboard orbit controls until a public pointer-input
-surface is available.
+the chimy2 input API exposes physical key state, not pointer motion. the
+viewer uses keyboard orbit controls until a public pointer-input surface is
+available.
 
-## composition table
+## determinism check
 
-composition values live in the `showcase_support::composition` table. This
-keeps target, camera, accent, and framing changes cheap during review.
+the showcase adapter includes a test that runs the same simulation with and
+without rendering. it checks the final state bytes. run it with:
 
-| demo | target | camera | accent |
-| --- | --- | --- | --- |
-| biped walk | follow root | close three-quarter follow | blue |
-| tendon lift | sphere and box | three-quarter side view | cyan |
-| solver stack | tower center | high dramatic three-quarter | orange |
-| pile | pile center | wide three-quarter | red |
-| cartpole | cart pivot | side view | amber |
-| arm | shoulder and tip | side view | violet |
+```text
+cargo test --manifest-path newt/Cargo.toml rendering_does_not_change_deterministic_simulation_state
+```
