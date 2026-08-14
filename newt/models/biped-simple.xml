@@ -19,10 +19,21 @@
   joints get the higher damping), knee_target=0.16 rad,
   ankle_target=-0.05 rad. Feet sit flush with the ground under COM.
 
-  The standing smoke lives in tests/mjcf_load.rs
-  (`biped_simple_stands_for_2000_steps`) — asserts the root height
-  stays above 80% of its initial value for the full 2000 steps
-  (upright, not crumpled).
+  Two biped smoke tests in tests/mjcf_load.rs:
+    * `biped_simple_pure_pd_smoke` — pure joint PD, NO external
+      assist. Asserts the sim stays finite and the biped exhibits
+      its characteristic pure-PD fall between steps 300 and 600 to
+      <= 20% of initial height (matching source biped behavior —
+      no source scenario stands with pure PD either).
+    * `biped_simple_stands_with_source_balance_assist` — applies
+      the source `_apply_balance_controller` wrench (all 6
+      components, world-frame) each step, mirroring what the
+      source `stand` scenario runs at assist_scale=1.0. Asserts
+      root height > 80% of initial and torso tilt < 15° for the
+      full 2000 steps.
+
+  Full standing note + parameter-by-parameter diagnosis lives in
+  docs/mjcf.md.
 -->
 <mujoco model="biped-simple">
   <compiler angle="radian"/>

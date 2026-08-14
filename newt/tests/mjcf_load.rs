@@ -143,6 +143,34 @@ fn contact_pair_and_exclude_together_rejected() {
 }
 
 #[test]
+fn body_bogus_attribute_rejected() {
+    // Every other element already whitelists its attributes — <body> now
+    // does too. Reviewer probe: an unknown attribute on <body> must
+    // error with the attribute name, not silently load.
+    expect_err(
+        r#"<mujoco><worldbody>
+             <body name="root" bogus_attr="1">
+               <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+             </body>
+           </worldbody></mujoco>"#,
+        "bogus_attr",
+    );
+    // The same enforcement applies to nested bodies.
+    expect_err(
+        r#"<mujoco><worldbody>
+             <body name="root">
+               <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+               <body name="c" pos="0 0 -0.5" bogus_attr="1">
+                 <joint type="hinge" axis="1 0 0" pos="0 0 0.5"/>
+                 <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+               </body>
+             </body>
+           </worldbody></mujoco>"#,
+        "bogus_attr",
+    );
+}
+
+#[test]
 fn joint_ref_nonzero_rejected() {
     expect_err(
         r#"<mujoco><worldbody>
@@ -296,26 +324,58 @@ fn fromto_capsule_hand_computed() {
 // standing WITH the source biped's balance assist explicitly applied.
 // ---------------------------------------------------------------------------
 
-/// Torso balance controller mirroring
+/// Faithful mirror of the source biped's torso balance controller —
 /// `~/me/fun/biped/biped/mujoco_biped.py::_apply_balance_controller`
-/// at `assist_scale=1.0` — the wrench the source biped's `stand`
-/// scenario writes into `data.xfrc_applied[torso]` every step. Height
-/// PD (kp 240 / kd 70, clamped to `[-90, 260] N`) plus an upright
-/// torque (kp 135 / kd 24, clamped to ±95 N·m). Applied via
-/// `Tree::applied_wrenches[0]` (torso is link 0).
+/// lines 2570-2593, at `assist_scale=1.0` (the setting the source
+/// `stand` scenario ships with). All six wrench components, all
+/// source constants, all source clamps, expressed as the source
+/// intends (world-frame linear force + world-frame torque on the
+/// torso body via `Tree::applied_wrenches[0]`, which newt sums into
+/// the ABA external-wrench path exactly like `data.xfrc_applied`).
+///
+/// **Frame conversion.** The source reads `data.qvel[0..6]` — MuJoCo
+/// freejoint qvel is world-frame `(vx, vy, vz, ωx, ωy, ωz)`. newt's
+/// free-root `Tree::qdot` layout is `(ω_body, v_body)`, so the
+/// components need both a slot re-order AND a body→world rotation
+/// via `torso_ori.rotate(...)` before feeding the PDs.
 ///
 /// This is explicit external stabilization on the torso — NOT joint
 /// PD. Callers that want a pure-PD run must not invoke it.
+///
+/// Source formulas (target_x = 0, target_speed = 0 for stand):
+/// ```text
+///   force_x  = clamp(42 * -x + 82 * -vx,  -75,  75)
+///   force_y  = clamp(90 * -y  - 35 *  vy, -35,  35)
+///   force_z  = clamp(240 * (target_z - z) - 70 * vz, -90, 260)
+///   torque_x = clamp( 135 * up_y - 24 * ωx,          -95,  95)
+///   torque_y = clamp(-135 * up_x - 24 * ωy,          -95,  95)
+///   torque_z = clamp(-12 * ωz,                       -28,  28)
+/// ```
 fn apply_source_balance_wrench(world: &mut newt::world::World, target_z: f32) {
     let (torso_pos, torso_ori) = forward_kinematics(&world.trees[0])[0];
     let up_world = torso_ori.rotate(newt::math::Vec3::new(0.0, 0.0, 1.0));
-    let vz = world.trees[0].qdot[5];
-    let fz = (240.0 * (target_z - torso_pos.z) - 70.0 * vz).clamp(-90.0, 260.0);
-    let tx = (135.0 * up_world.y).clamp(-95.0, 95.0);
-    let ty = (-135.0 * up_world.x).clamp(-95.0, 95.0);
+    // newt free-root qdot: [ωx_body, ωy_body, ωz_body, vx_body, vy_body, vz_body].
+    let omega_body = newt::math::Vec3::new(
+        world.trees[0].qdot[0],
+        world.trees[0].qdot[1],
+        world.trees[0].qdot[2],
+    );
+    let v_body = newt::math::Vec3::new(
+        world.trees[0].qdot[3],
+        world.trees[0].qdot[4],
+        world.trees[0].qdot[5],
+    );
+    let omega_world = torso_ori.rotate(omega_body);
+    let v_world = torso_ori.rotate(v_body);
+    let force_x = (42.0 * -torso_pos.x + 82.0 * -v_world.x).clamp(-75.0, 75.0);
+    let force_y = (90.0 * -torso_pos.y - 35.0 * v_world.y).clamp(-35.0, 35.0);
+    let force_z = (240.0 * (target_z - torso_pos.z) - 70.0 * v_world.z).clamp(-90.0, 260.0);
+    let torque_x = (135.0 * up_world.y - 24.0 * omega_world.x).clamp(-95.0, 95.0);
+    let torque_y = (-135.0 * up_world.x - 24.0 * omega_world.y).clamp(-95.0, 95.0);
+    let torque_z = (-12.0 * omega_world.z).clamp(-28.0, 28.0);
     world.trees[0].applied_wrenches[0] = (
-        newt::math::Vec3::new(0.0, 0.0, fz),
-        newt::math::Vec3::new(tx, ty, 0.0),
+        newt::math::Vec3::new(force_x, force_y, force_z),
+        newt::math::Vec3::new(torque_x, torque_y, torque_z),
     );
 }
 

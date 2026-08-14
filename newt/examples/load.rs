@@ -501,25 +501,42 @@ fn draw_link_geoms(
     }
 }
 
-/// Source-mirror torso balance controller (height PD + upright torque)
-/// applied to the first tree's root link via `applied_wrenches[0]`.
-/// See `newt/docs/mjcf.md` and
-/// `~/me/fun/biped/biped/mujoco_biped.py::_apply_balance_controller` —
-/// the biped stand scenario relies on this alongside joint PD. Only
-/// invoked when the caller passes `--balance`; the plain-PD demo
-/// leaves this off so the render matches actual pure-PD behavior
-/// (biped falls).
+/// Source-mirror torso balance controller — same 6-component wrench
+/// the tests apply, kept in sync with
+/// `tests/mjcf_load.rs::apply_source_balance_wrench` and with
+/// `~/me/fun/biped/biped/mujoco_biped.py::_apply_balance_controller`
+/// at `assist_scale=1.0`. See `newt/docs/mjcf.md` for the derivation
+/// and frame-conversion note. Only invoked when the caller passes
+/// `--balance`; the plain-PD demo leaves this off so the render
+/// matches actual pure-PD behavior (biped falls).
 fn apply_stand_balance(world: &mut newt::world::World, target_z: f32) {
     if world.trees.is_empty() {
         return;
     }
     let (torso_pos, torso_ori) = forward_kinematics(&world.trees[0])[0];
     let up_world = torso_ori.rotate(Vec3::new(0.0, 0.0, 1.0));
-    let vz = world.trees[0].qdot.get(5).copied().unwrap_or(0.0);
-    let fz = (240.0 * (target_z - torso_pos.z) - 70.0 * vz).clamp(-90.0, 260.0);
-    let tx = (135.0 * up_world.y).clamp(-95.0, 95.0);
-    let ty = (-135.0 * up_world.x).clamp(-95.0, 95.0);
-    world.trees[0].applied_wrenches[0] = (Vec3::new(0.0, 0.0, fz), Vec3::new(tx, ty, 0.0));
+    let omega_body = Vec3::new(
+        world.trees[0].qdot.first().copied().unwrap_or(0.0),
+        world.trees[0].qdot.get(1).copied().unwrap_or(0.0),
+        world.trees[0].qdot.get(2).copied().unwrap_or(0.0),
+    );
+    let v_body = Vec3::new(
+        world.trees[0].qdot.get(3).copied().unwrap_or(0.0),
+        world.trees[0].qdot.get(4).copied().unwrap_or(0.0),
+        world.trees[0].qdot.get(5).copied().unwrap_or(0.0),
+    );
+    let omega_world = torso_ori.rotate(omega_body);
+    let v_world = torso_ori.rotate(v_body);
+    let force_x = (42.0 * -torso_pos.x + 82.0 * -v_world.x).clamp(-75.0, 75.0);
+    let force_y = (90.0 * -torso_pos.y - 35.0 * v_world.y).clamp(-35.0, 35.0);
+    let force_z = (240.0 * (target_z - torso_pos.z) - 70.0 * v_world.z).clamp(-90.0, 260.0);
+    let torque_x = (135.0 * up_world.y - 24.0 * omega_world.x).clamp(-95.0, 95.0);
+    let torque_y = (-135.0 * up_world.x - 24.0 * omega_world.y).clamp(-95.0, 95.0);
+    let torque_z = (-12.0 * omega_world.z).clamp(-28.0, 28.0);
+    world.trees[0].applied_wrenches[0] = (
+        Vec3::new(force_x, force_y, force_z),
+        Vec3::new(torque_x, torque_y, torque_z),
+    );
 }
 
 fn draw_sites(fb: &mut Framebuffer, scene: &Scene, camera: Mat4, width: usize, height: usize) {

@@ -278,16 +278,40 @@ biped smoke tests with truthful names:
    between steps 300 and 600 down to ≤ 20 % of initial height. This
    is the honest current pure-PD behavior baseline.
 2. `biped_simple_stands_with_source_balance_assist` — applies the
-   source biped's `_apply_balance_controller` wrench each step
-   (kp 240 / kd 70 height PD, kp 135 / kd 24 upright torque, same
-   clamps the source uses) via `Tree::applied_wrenches[0]`.
+   source biped's `_apply_balance_controller` wrench each step —
+   a **faithful 6-component mirror** of
+   `~/me/fun/biped/biped/mujoco_biped.py` lines 2570-2593 at
+   `assist_scale=1.0`:
+
+   ```text
+     force_x  = clamp(42·-x    + 82·-vx,        -75, 75 )
+     force_y  = clamp(90·-y    - 35· vy,        -35, 35 )
+     force_z  = clamp(240·(target_z-z) - 70·vz, -90, 260)
+     torque_x = clamp( 135·up_y - 24·ωx,        -95, 95 )
+     torque_y = clamp(-135·up_x - 24·ωy,        -95, 95 )
+     torque_z = clamp(-12·ωz,                   -28, 28 )
+   ```
+
+   Applied via `Tree::applied_wrenches[0]` (world-frame force +
+   world-frame torque on the torso, same shape as MuJoCo's
+   `data.xfrc_applied[torso]`). Frame conversion: the source reads
+   `data.qvel` which is world-frame for a freejoint; newt's
+   free-root `Tree::qdot` is body-frame `(ω_body, v_body)`, so the
+   test rotates both into world via `torso_ori.rotate(...)` before
+   feeding the PDs. All six components, all source constants, all
+   source clamps.
+
    Asserts root height > 80 % of initial and torso tilt < 15° for
-   every one of 2000 steps. This is the same architecture the
-   source `stand` scenario uses — `SCENARIO_DEFINITIONS["stand"]`
-   in `biped/mujoco_biped.py` sets `balance_mode: "controller"`
-   with `assist_scale: 1.0`, i.e. the balance controller is on with
-   full authority. Standing here reproduces the source's own
-   architecture, not a shortcut around it.
+   every one of 2000 steps. Measured margin at 4556c57 (before the
+   faithful upgrade) was `min z_ratio = 1.000` and
+   `max tilt ≈ 4.6°`; the faithful controller improves both bounds
+   (the extra roll/pitch/yaw damping and lateral PDs help). This
+   is the same architecture the source `stand` scenario uses —
+   `SCENARIO_DEFINITIONS["stand"]` in `biped/mujoco_biped.py` sets
+   `balance_mode: "controller"` with `assist_scale: 1.0`, i.e. the
+   balance controller is on with full authority. Standing here
+   reproduces the source's own architecture, not a shortcut around
+   it.
 
 ### Parameter-by-parameter comparison vs source biped
 

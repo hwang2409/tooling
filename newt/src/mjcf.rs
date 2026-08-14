@@ -765,6 +765,7 @@ impl Loader {
         // go into World.bodies (tier-1 code path); multi-link chains and
         // fixed-root chains go into World.trees. This gives us
         // byte-identical trajectories against the mirror JSON fixtures.
+        validate_body_attrs(e, path)?;
         let free_child = find_free_joint(e);
         let has_child_body = e.child_elements().any(|c| c.name == "body");
         let has_joint = e
@@ -1028,6 +1029,7 @@ impl Loader {
         parent_class: &str,
         link_names: &mut HashMap<String, usize>,
     ) -> Result<(), MjcfError> {
+        validate_body_attrs(e, path)?;
         let name = attr_required(e, "name", path)?.to_string();
         if link_names.contains_key(&name) {
             return fail(path, format!("duplicate link name \"{name}\""));
@@ -2773,6 +2775,27 @@ fn child_path(parent: &str, name: &str, hint: Option<&str>) -> String {
 fn find_free_joint(e: &Element) -> Option<&Element> {
     e.child_elements()
         .find(|c| c.name == "freejoint" || (c.name == "joint" && c.attr("type") == Some("free")))
+}
+
+/// Enforce the `<body>` attribute allowlist — mirrors every other
+/// element's whitelist and closes the no-silent-ignore hole a review
+/// caught with `<body bogus_attr="1">`.
+fn validate_body_attrs(e: &Element, path: &str) -> Result<(), MjcfError> {
+    for (k, _) in &e.attrs {
+        match k.as_str() {
+            "name" | "pos" | "quat" | "euler" | "axisangle" | "childclass" => {}
+            other => {
+                return fail(
+                    path,
+                    format!(
+                        "<body> attribute \"{other}\" is not supported in the v1 \
+                         subset (see docs/mjcf.md for the <body> attribute table)"
+                    ),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// True when the body has only free-joint children among its <joint>*
