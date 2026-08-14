@@ -665,7 +665,11 @@ fn parse_single_dof_axis_joint(
         None => JointLimit::DEFAULT,
         Some(v) => {
             let lfields = get_object(v, &format!("{path}.limit"))?;
-            reject_unknown(lfields, &["stiffness", "damping"], &format!("{path}.limit"))?;
+            reject_unknown(
+                lfields,
+                &["stiffness", "damping", "solref", "solimp"],
+                &format!("{path}.limit"),
+            )?;
             let stiffness = get_f32(
                 required(lfields, "stiffness", &format!("{path}.limit"))?,
                 &format!("{path}.limit.stiffness"),
@@ -680,7 +684,69 @@ fn parse_single_dof_axis_joint(
                     "limit stiffness and damping must be ≥ 0",
                 );
             }
-            JointLimit::new(stiffness, damping)
+            let mut jl = JointLimit::new(stiffness, damping);
+            if let Some(sv) = optional(lfields, "solref") {
+                let sf = get_object(sv, &format!("{path}.limit.solref"))?;
+                reject_unknown(
+                    sf,
+                    &["timeconst", "dampratio"],
+                    &format!("{path}.limit.solref"),
+                )?;
+                let tc = get_f32(
+                    required(sf, "timeconst", &format!("{path}.limit.solref"))?,
+                    &format!("{path}.limit.solref.timeconst"),
+                )?;
+                let zeta = get_f32(
+                    required(sf, "dampratio", &format!("{path}.limit.solref"))?,
+                    &format!("{path}.limit.solref.dampratio"),
+                )?;
+                if tc <= 0.0 || zeta < 0.0 {
+                    return fail(
+                        &format!("{path}.limit.solref"),
+                        "timeconst must be > 0 and dampratio must be ≥ 0",
+                    );
+                }
+                jl.solref = Some(SolRef::new(tc, zeta));
+            }
+            if let Some(iv) = optional(lfields, "solimp") {
+                let sf = get_object(iv, &format!("{path}.limit.solimp"))?;
+                reject_unknown(
+                    sf,
+                    &["dmin", "dmax", "width", "midpoint", "power"],
+                    &format!("{path}.limit.solimp"),
+                )?;
+                let dmin = get_f32(
+                    required(sf, "dmin", &format!("{path}.limit.solimp"))?,
+                    &format!("{path}.limit.solimp.dmin"),
+                )?;
+                let dmax = get_f32(
+                    required(sf, "dmax", &format!("{path}.limit.solimp"))?,
+                    &format!("{path}.limit.solimp.dmax"),
+                )?;
+                let width = get_f32(
+                    required(sf, "width", &format!("{path}.limit.solimp"))?,
+                    &format!("{path}.limit.solimp.width"),
+                )?;
+                let midpoint = get_f32(
+                    required(sf, "midpoint", &format!("{path}.limit.solimp"))?,
+                    &format!("{path}.limit.solimp.midpoint"),
+                )?;
+                let power_f = get_f32(
+                    required(sf, "power", &format!("{path}.limit.solimp"))?,
+                    &format!("{path}.limit.solimp.power"),
+                )?;
+                if power_f < 1.0 || power_f != power_f.floor() {
+                    return fail(
+                        &format!("{path}.limit.solimp.power"),
+                        format!("power must be a positive integer, got {power_f}"),
+                    );
+                }
+                let s = crate::solver::SolImp::new(dmin, dmax, width, midpoint, power_f as u32);
+                s.validate()
+                    .map_err(|m| ModelError::new(format!("{path}.limit.solimp"), m))?;
+                jl.solimp = Some(s);
+            }
+            jl
         }
     };
     Ok(SingleDofAxisJoint {

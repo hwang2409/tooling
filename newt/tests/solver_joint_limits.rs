@@ -33,6 +33,8 @@ use newt::world::World;
 const NEUTRALIZED_LIMIT: JointLimit = JointLimit {
     stiffness: 0.0,
     damping: 0.0,
+    solref: None,
+    solimp: None,
 };
 
 fn pendulum_with_range(range: (f32, f32)) -> World {
@@ -156,4 +158,73 @@ fn solver_hinge_limit_no_creep_over_10k_steps() {
 fn imports_are_wired() {
     let _ = Body::solid_sphere(1.0, 0.5, Vec3::ZERO, Quat::IDENTITY);
     let _ = Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5);
+}
+
+/// Per-joint SolRef override discrimination: a very soft SolRef
+/// (timeconst = 0.2s) settles the limit LOWER on the boundary than a
+/// stiff one (default 0.02s). We measure penetration under both and
+/// assert the soft-override lets more through — confirming that
+/// `JointLimit::solref` actually threads into `solve_tree_limits`.
+#[test]
+fn solver_hinge_limit_solref_override_changes_penetration() {
+    use newt::geom::SolRef;
+    let range = (-std::f32::consts::FRAC_PI_4, std::f32::consts::FRAC_PI_4);
+
+    fn build_with(solref_override: Option<SolRef>, range: (f32, f32)) -> World {
+        let mut w = World::new();
+        w.solver = SolverConfig {
+            mode: SolverMode::Pgs,
+            iterations: 30,
+            cone: ConeKind::Pyramidal,
+        };
+        let mut tree = Tree::new();
+        tree.push_link(Link::new(
+            None,
+            JointKind::Fixed,
+            (Vec3::ZERO, Quat::IDENTITY),
+            (Vec3::ZERO, Quat::IDENTITY),
+            1.0,
+            Mat3::diag(1.0, 1.0, 1.0),
+        ));
+        let mut limit = NEUTRALIZED_LIMIT;
+        limit.solref = solref_override;
+        tree.push_link(Link::new(
+            Some(0),
+            JointKind::Hinge {
+                axis: Vec3::X,
+                range: Some(range),
+                damping: 0.5,
+                armature: 0.0,
+                limit,
+            },
+            (Vec3::ZERO, Quat::IDENTITY),
+            (Vec3::new(0.0, 0.0, 1.0), Quat::IDENTITY),
+            1.0,
+            Mat3::diag(0.01, 0.01, 0.01),
+        ));
+        w.add_tree(tree);
+        w.trees[0].set_hinge_angle(1, std::f32::consts::FRAC_PI_4);
+        let slot = w.trees[0].v_offset[1];
+        w.trees[0].qfrc_applied[slot] = 12.0;
+        w
+    }
+
+    // Default SolRef (stiff, 0.02s) — small steady penetration.
+    let mut stiff = build_with(None, range);
+    let mut soft = build_with(Some(SolRef::new(0.2, 1.0)), range);
+
+    for _ in 0..3000 {
+        stiff.step();
+        soft.step();
+    }
+    let stiff_pen = stiff.trees[0].hinge_angle(1) - range.1;
+    let soft_pen = soft.trees[0].hinge_angle(1) - range.1;
+    // Both must stay bounded (limit still holds) but the soft-override
+    // must let strictly more through — proof that solref threads in.
+    assert!(stiff_pen < 0.05, "stiff limit blew out: pen={stiff_pen}");
+    assert!(soft_pen < 0.5, "soft limit runaway: pen={soft_pen}");
+    assert!(
+        soft_pen > stiff_pen + 0.001,
+        "solref override did not change penetration: stiff={stiff_pen}, soft={soft_pen}"
+    );
 }

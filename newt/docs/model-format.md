@@ -157,6 +157,12 @@ zero hinge axes — every branch has a dedicated unit test in
   **range** (optional `[lo, hi]`, lo < hi enforced), **damping**,
   **armature**, **limit.stiffness** / **limit.damping**. Units follow
   the DOF — hinge is rad / rad/s / N·m, slide is m / m/s / N.
+- **limit.solref** / **limit.solimp** (optional): per-limit override
+  for the PGS constraint solver — same shape as the geom-level
+  `solref` / `solimp` blocks (`{"timeconst", "dampratio"}` and
+  `{"dmin", "dmax", "width", "midpoint", "power"}` respectively).
+  Omitted → `SolRef::DEFAULT` / `SolImp::DEFAULT`. Only consulted
+  under `solver.mode = "pgs"`.
 - Ball: **damping** (isotropic angular, N·m per rad/s), **armature**
   (per-axis rotor inertia, kg·m²). **NO `range` field** — a physically
   correct 3-DOF orientation limit needs the v1 solver landing in a

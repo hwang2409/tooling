@@ -31,10 +31,13 @@ to a scalar row on the tree's / body pool's generalized velocity:
   (q < lo, escape = +q) and `-1` for a high-side violation.
 - Violation `r_i > 0`. Contact: `r = penetration - gap` (only active
   when > 0). Joint limit: `r = max(0, lo - q, q - hi)`.
-- `(solref, solimp)` — per-constraint parameterization, combined
-  per-pair for contacts via `combine_solref` / `combine_solimp`
+- `(solref, solimp)` — per-constraint parameterization. Contact rows
+  combine per pair via `combine_solref` / `combine_solimp`
   (per-component minimum — the "stronger setting wins" rule; see the
-  `Geom::solref` docs for rationale).
+  `Geom::solref` docs for rationale). Joint-limit rows read the
+  optional `JointLimit::solref` / `JointLimit::solimp` per limit;
+  omitted overrides fall back to `SolRef::DEFAULT` /
+  `SolImp::DEFAULT`.
 
 ### SolImp — the 5-parameter impedance sigmoid
 
@@ -130,6 +133,16 @@ where:
   RK4" below).
 - `R` sits on the diagonal because it comes from the (1 − d) · f_hard
   "soft split" (a per-constraint linear damping in impulse space).
+
+**Scaling caveat.** Newt multiplies the reference term by `d`
+(`bias = J qdot_free + d · a_ref · dt`) so the (1 − d) / d
+regularization split is consistent per row. MuJoCo's exact scaling
+(including the `impratio` normal-vs-tangent factor and the compile-
+time `dsbl_efc*` toggles) diverges from this in cases we haven't
+verified — bit-exact parity against real MuJoCo is deferred to the
+differential harness ticket (NEWT-13, biped venv). Do not read the
+`d ·` in the bias line as a claim that newt matches MuJoCo trajectory-
+for-trajectory today; it does not.
 
 For a free body with mass `m` and world-frame inertia
 `I_w = R I_body Rᵀ`, contact at arm `r_arm`:

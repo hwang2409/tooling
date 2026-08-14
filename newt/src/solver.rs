@@ -923,17 +923,24 @@ pub fn solve_tree_limits(tree: &Tree, dt: f32, iterations: u32) -> Vec<f32> {
         return qfrc;
     }
 
-    // Enumerate active hinge/slide limits.
+    // Enumerate active hinge/slide limits. Per-joint SolRef/SolImp
+    // overrides come from the JointLimit's optional solref/solimp; when
+    // absent we fall back to the crate defaults.
     let mut limits: Vec<LimitRow> = Vec::new();
     for (li, link) in tree.links.iter().enumerate() {
-        let (range, is_single_dof) = match link.joint {
-            JointKind::Hinge { range, .. } | JointKind::Slide { range, .. } => (range, true),
-            _ => (None, false),
+        let (range, limit_cfg, is_single_dof) = match link.joint {
+            JointKind::Hinge { range, limit, .. } | JointKind::Slide { range, limit, .. } => {
+                (range, Some(limit), true)
+            }
+            _ => (None, None, false),
         };
         if !is_single_dof {
             continue;
         }
         let Some((lo, hi)) = range else { continue };
+        let limit_cfg = limit_cfg.expect("single-DOF joint carries a JointLimit");
+        let per_joint_solref = limit_cfg.solref.unwrap_or(SolRef::DEFAULT);
+        let per_joint_solimp = limit_cfg.solimp.unwrap_or(SolImp::DEFAULT);
         let v_slot = tree.v_offset[li] as u32;
         let q = tree.q[tree.q_offset[li]];
         if q < lo {
@@ -941,16 +948,16 @@ pub fn solve_tree_limits(tree: &Tree, dt: f32, iterations: u32) -> Vec<f32> {
                 v_slot,
                 sign: 1.0,
                 violation: lo - q,
-                solref: SolRef::DEFAULT,
-                solimp: SolImp::DEFAULT,
+                solref: per_joint_solref,
+                solimp: per_joint_solimp,
             });
         } else if q > hi {
             limits.push(LimitRow {
                 v_slot,
                 sign: -1.0,
                 violation: q - hi,
-                solref: SolRef::DEFAULT,
-                solimp: SolImp::DEFAULT,
+                solref: per_joint_solref,
+                solimp: per_joint_solimp,
             });
         }
     }
