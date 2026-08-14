@@ -122,13 +122,13 @@ impl Link {
         // a rotated offset would get subtly wrong dynamics. The v1 lift will
         // thread these quats into `Xup` and drop this assert.
         //
-        // Exemption: for a Free root, `joint_offset_in_parent` doubles as
-        // the root's initial world pose (see `push_link` — its orientation
-        // is written into `q[3..7]`), not a joint-frame offset, so any
-        // orientation is meaningful there.
-        let is_free_root = parent.is_none() && matches!(joint, JointKind::Free);
+        // Exemption: at the root, `joint_offset_in_parent` is the world-frame
+        // anchor pose (see `push_link` — for Free it becomes q[0..7]; for
+        // Fixed it is the fixed world pose per the field docs), not a
+        // joint-frame offset, so any orientation is meaningful there.
+        let is_root = parent.is_none();
         debug_assert!(
-            is_free_root || joint_offset_in_parent.1 == Quat::IDENTITY,
+            is_root || joint_offset_in_parent.1 == Quat::IDENTITY,
             "v0: joint_offset_in_parent.orientation must be IDENTITY (v1 will lift this)"
         );
         debug_assert!(

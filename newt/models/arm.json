@@ -1,0 +1,92 @@
+{
+  "version": "1",
+  "gravity": [0.0, 0.0, -9.81],
+  "timestep": 0.005,
+
+  "trees": [
+    {
+      "name": "arm",
+      "self_collide": false,
+      "links": [
+        {
+          "name": "anchor",
+          "joint": {"kind": "fixed"},
+          "joint_offset_in_parent": {"position": [0.0, 0.0, 1.6]},
+          "mass": 1.0,
+          "inertia": {"kind": "diag", "values": [1.0, 1.0, 1.0]}
+        },
+        {
+          "name": "shoulder",
+          "parent": "anchor",
+          "joint": {"kind": "hinge", "axis": [1.0, 0.0, 0.0]},
+          "joint_offset_in_parent": {"position": [0.0, 0.0, 0.0]},
+          "joint_offset_in_child": {"position": [0.0, 0.0, 0.25]},
+          "mass": 1.0,
+          "inertia": {"kind": "diag", "values": [0.020833334, 0.020833334, 1e-6]}
+        },
+        {
+          "name": "elbow",
+          "parent": "shoulder",
+          "joint": {"kind": "hinge", "axis": [1.0, 0.0, 0.0]},
+          "joint_offset_in_parent": {"position": [0.0, 0.0, -0.25]},
+          "joint_offset_in_child": {"position": [0.0, 0.0, 0.25]},
+          "mass": 0.8,
+          "inertia": {"kind": "diag", "values": [0.016666668, 0.016666668, 1e-6]}
+        },
+        {
+          "name": "wrist",
+          "parent": "elbow",
+          "joint": {"kind": "hinge", "axis": [1.0, 0.0, 0.0]},
+          "joint_offset_in_parent": {"position": [0.0, 0.0, -0.25]},
+          "joint_offset_in_child": {"position": [0.0, 0.0, 0.25]},
+          "mass": 0.6,
+          "inertia": {"kind": "diag", "values": [0.012500001, 0.012500001, 1e-6]}
+        }
+      ]
+    }
+  ],
+
+  "actuators": [
+    {
+      "name": "shoulder_servo",
+      "type": "position",
+      "tree": "arm",
+      "link": "shoulder",
+      "kp": 200.0,
+      "dampratio": 1.0,
+      "reflected_inertia": 0.25,
+      "clamp": 60.0,
+      "target": 0.0
+    },
+    {
+      "name": "elbow_servo",
+      "type": "position",
+      "tree": "arm",
+      "link": "elbow",
+      "kp": 150.0,
+      "dampratio": 1.0,
+      "reflected_inertia": 0.2,
+      "clamp": 40.0,
+      "target": 0.0
+    },
+    {
+      "name": "wrist_servo",
+      "type": "position",
+      "tree": "arm",
+      "link": "wrist",
+      "kp": 100.0,
+      "dampratio": 1.0,
+      "reflected_inertia": 0.15,
+      "clamp": 30.0,
+      "target": 0.0
+    }
+  ],
+
+  "sites": [
+    {
+      "name": "tip",
+      "attach": {"kind": "link", "tree": "arm", "link": "wrist"},
+      "local_offset": [0.0, 0.0, -0.25]
+    }
+  ]
+}

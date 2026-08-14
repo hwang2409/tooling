@@ -1,7 +1,18 @@
-//! Tier 4 demo: a 3-link commanded arm follows a three-waypoint target
-//! sequence (reach up, reach sideways, settle) driven by PD position
-//! servos. Wireframe PPM via chimy2's Framebuffer + Mat4 helpers, same
+//! Tier 4 demo, tier-5 upgrade: a 3-link commanded arm follows a
+//! three-waypoint target sequence (reach up → reach sideways → settle)
+//! driven by PD position servos. Wireframe PPM via chimy2, same rendering
 //! plumbing as `pendulum.rs`.
+//!
+//! # What changed in tier 5
+//!
+//! The kinematic tree used to be hand-built in this file. Now the arm
+//! model — link masses, inertias, joint axes, servo gains, force clamps —
+//! all lives in [`newt/models/arm.json`](../models/arm.json) and is loaded
+//! through [`newt::model::load_from_path`]. This demo is now the reference
+//! usage of the tier-5 loader. Actuators are looked up by NAME
+//! (`shoulder_servo` / `elbow_servo` / `wrist_servo`) rather than by
+//! index, and the tip position that draws the trail comes from the
+//! `tip` [`newt::model::Site`] defined in the same JSON.
 //!
 //! Deterministic — hand-written trig in newt, fixed dt, fixed waypoint
 //! schedule. Every parameter is compile-time visible so the render
@@ -17,22 +28,23 @@ use chimy2::demo::write_ppm;
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
 
-use newt::actuator::PdServo;
-use newt::joint::JointKind;
-use newt::math::{Mat3, Quat, Vec3};
-use newt::tree::{Link, Tree, forward_kinematics, rk4_step};
+use newt::math::{Quat, Vec3};
+use newt::model::{Scene, load_from_path};
+use newt::tree::{forward_kinematics, rk4_step};
 
 use std::path::PathBuf;
 
-fn parse_args() -> (usize, PathBuf, (usize, usize)) {
+fn parse_args() -> (usize, PathBuf, (usize, usize), PathBuf) {
     let mut frames = 1800usize;
     let mut out = PathBuf::from("newt-arm.ppm");
     let mut size = (640usize, 360usize);
+    let mut model = PathBuf::from("models/arm.json");
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--frames" => frames = args.next().unwrap().parse().unwrap(),
             "--out" => out = PathBuf::from(args.next().unwrap()),
+            "--model" => model = PathBuf::from(args.next().unwrap()),
             "--size" => {
                 let s = args.next().unwrap();
                 let (w, h) = s.split_once('x').expect("--size WxH");
@@ -41,80 +53,14 @@ fn parse_args() -> (usize, PathBuf, (usize, usize)) {
             _ => panic!("unknown arg: {a}"),
         }
     }
-    (frames, out, size)
+    (frames, out, size, model)
 }
 
-const L1: f32 = 0.5;
-const L2: f32 = 0.5;
-const L3: f32 = 0.5;
-const M1: f32 = 1.0;
-const M2: f32 = 0.8;
-const M3: f32 = 0.6;
-
-/// Three waypoints for the arm's shoulder / elbow / wrist joints (rad).
-/// Chosen so each pose is legibly distinct at demo scale:
-///   • "reach up"       — arm curls upward into +y-then-+z
-///   • "reach sideways" — arm extends along +y and mildly folds
-///   • "settle"         — back to hanging straight down
-const WAYPOINTS: [[f32; 3]; 3] = [
-    [1.8, -1.0, -0.5], // reach up
-    [1.2, -0.4, 0.0],  // reach sideways
-    [0.0, 0.0, 0.0],   // settle
-];
-
-fn build_arm() -> Tree {
-    let mut tree = Tree::new();
-    // Root: fixed anchor above the "ground" so the swing volume stays in
-    // the camera frustum.
-    tree.push_link(Link::new(
-        None,
-        JointKind::Fixed,
-        (Vec3::new(0.0, 0.0, 1.6), Quat::IDENTITY),
-        (Vec3::ZERO, Quat::IDENTITY),
-        1.0,
-        Mat3::diag(1.0, 1.0, 1.0),
-    ));
-    let lens = [L1, L2, L3];
-    let masses = [M1, M2, M3];
-    for i in 0..3 {
-        let l = lens[i];
-        let m = masses[i];
-        let i_perp = (1.0 / 12.0) * m * l * l;
-        let parent_anchor = if i == 0 {
-            Vec3::ZERO
-        } else {
-            Vec3::new(0.0, 0.0, -lens[i - 1] * 0.5)
-        };
-        tree.push_link(Link::new(
-            Some(i),
-            JointKind::hinge(Vec3::X),
-            (parent_anchor, Quat::IDENTITY),
-            (Vec3::new(0.0, 0.0, l * 0.5), Quat::IDENTITY),
-            m,
-            Mat3::diag(i_perp, i_perp, 1e-6),
-        ));
-    }
-    tree
-}
-
-fn attach_servos(tree: &mut Tree) -> [usize; 3] {
-    // Reflected inertia estimates: m·L² for the point-mass-on-rod pattern.
-    // Force clamp scales with the link's mass — biped-style bounds.
-    let s1 = PdServo::from_dampratio(
-        1,
-        /*kp*/ 200.0,
-        /*ζ*/ 1.0,
-        M1 * L1 * L1,
-        /*clamp*/ 60.0,
-    );
-    let s2 = PdServo::from_dampratio(2, 150.0, 1.0, M2 * L2 * L2, 40.0);
-    let s3 = PdServo::from_dampratio(3, 100.0, 1.0, M3 * L3 * L3, 30.0);
-    [
-        tree.add_actuator(s1),
-        tree.add_actuator(s2),
-        tree.add_actuator(s3),
-    ]
-}
+/// The three-waypoint reach sequence (shoulder / elbow / wrist, radians).
+///   * reach up
+///   * reach sideways
+///   * settle
+const WAYPOINTS: [[f32; 3]; 3] = [[1.8, -1.0, -0.5], [1.2, -0.4, 0.0], [0.0, 0.0, 0.0]];
 
 fn draw_line(fb: &mut Framebuffer, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: u32) {
     let dx = (x1 - x0).abs();
@@ -159,30 +105,56 @@ fn project(camera: Mat4, world_pt: Vec3, width: usize, height: usize) -> Option<
     Some((sx as i32, sy as i32))
 }
 
-fn rod_endpoints(poses: &[(Vec3, Quat)], i: usize, l: f32) -> (Vec3, Vec3) {
-    let (com, ori) = poses[i];
+fn rod_endpoints(poses: &[(Vec3, Quat)], link_idx: usize, l: f32) -> (Vec3, Vec3) {
+    let (com, ori) = poses[link_idx];
     let top = com + ori.rotate(Vec3::new(0.0, 0.0, l * 0.5));
     let bot = com + ori.rotate(Vec3::new(0.0, 0.0, -l * 0.5));
     (top, bot)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (frames, out, (width, height)) = parse_args();
-    let mut tree = build_arm();
-    let servos = attach_servos(&mut tree);
+fn tip_world(scene: &Scene) -> Vec3 {
+    scene
+        .site_pose("tip")
+        .expect("arm.json must define a tip site")
+        .0
+}
 
-    let dt = 0.005f32;
-    let g = Vec3::new(0.0, 0.0, -9.81);
-    // Split frames evenly across the three waypoints.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (frames, out, (width, height), model_path) = parse_args();
+
+    let mut scene = load_from_path(&model_path)
+        .unwrap_or_else(|e| panic!("load {}: {e}", model_path.display()));
+    let arm_idx = *scene
+        .trees_by_name
+        .get("arm")
+        .expect("model must define a tree named \"arm\"");
+    let servo_ids: [(usize, usize); 3] =
+        ["shoulder_servo", "elbow_servo", "wrist_servo"].map(|n| {
+            *scene
+                .actuators_by_name
+                .get(n)
+                .unwrap_or_else(|| panic!("actuator {n} missing from model"))
+        });
+
+    // Rod length is model-defined: each hinge child has
+    // joint_offset_in_child.translation = (0, 0, L/2). Read L back so the
+    // rendering stays honest to the model.
+    let rod_lens: [f32; 3] = {
+        let tree = &scene.world.trees[arm_idx];
+        [1, 2, 3].map(|i| tree.links[i].joint_offset_in_child.0.z * 2.0)
+    };
+
+    let dt = scene.world.dt;
+    let g = scene.world.gravity;
     let per_phase = frames / 3;
 
-    // Trail: tip position sampled every frame.
     let mut trail: Vec<Vec3> = Vec::with_capacity(frames);
-    let lens = [L1, L2, L3];
     let mut frame = 0usize;
     for (phase, targets) in WAYPOINTS.iter().enumerate() {
         for (i, &t) in targets.iter().enumerate() {
-            tree.set_actuator_target(servos[i], t);
+            let (t_idx, a_idx) = servo_ids[i];
+            assert_eq!(t_idx, arm_idx);
+            scene.world.trees[t_idx].set_actuator_target(a_idx, t);
         }
         let stop = if phase + 1 == WAYPOINTS.len() {
             frames
@@ -190,15 +162,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (phase + 1) * per_phase
         };
         while frame < stop {
-            rk4_step(&mut tree, g, dt, |_| vec![(Vec3::ZERO, Vec3::ZERO); 4]);
-            let poses = forward_kinematics(&tree);
-            let (_top, bot) = rod_endpoints(&poses, 3, lens[2]);
-            trail.push(bot);
+            rk4_step(&mut scene.world.trees[arm_idx], g, dt, |_| {
+                vec![(Vec3::ZERO, Vec3::ZERO); 4]
+            });
+            trail.push(tip_world(&scene));
             frame += 1;
         }
     }
 
-    // Render final frame: rods + trail.
     let mut fb = Framebuffer::new(width, height);
     fb.clear(argb8888(0xff, 12, 14, 22));
     let camera = Mat4::perspective(
@@ -208,14 +179,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         100.0,
     ) * Mat4::look_at(
         // Camera on +x, looking at (0, 0, 1) — the y-z plane is the arm's
-        // swing plane, y → image-right, z → image-up.
+        // swing plane, y → image-right, z → image-up. Matches the tier-4
+        // camera exactly.
         CVec3::new(4.8, 0.0, 1.1),
         CVec3::new(0.0, 0.0, 1.0),
         CVec3::new(0.0, 0.0, 1.0),
     );
 
-    // Trail — colour ramps by frame index so the temporal path reads at a
-    // glance (cool early → warm late).
     for (i, w) in trail.windows(2).enumerate() {
         let t = i as f32 / trail.len().max(1) as f32;
         let r = (60.0 + 190.0 * t) as u8;
@@ -229,23 +199,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Base pivot marker (small cross) so the anchor position is obvious.
-    let poses = forward_kinematics(&tree);
-    let base = poses[0].0; // fixed root COM (= anchor for link 1).
+    let poses = forward_kinematics(&scene.world.trees[arm_idx]);
+    let base = poses[0].0;
     if let Some((x, y)) = project(camera, base, width, height) {
         let s = 5;
         draw_line(&mut fb, x - s, y, x + s, y, argb8888(0xff, 220, 220, 220));
         draw_line(&mut fb, x, y - s, x, y + s, argb8888(0xff, 220, 220, 220));
     }
 
-    // Rods at final frame — three distinct colours so the joint chain is
-    // easy to trace.
     let colors = [
         argb8888(0xff, 240, 200, 90),
         argb8888(0xff, 90, 220, 240),
         argb8888(0xff, 220, 120, 220),
     ];
-    for (i, &l) in [L1, L2, L3].iter().enumerate() {
+    for (i, &l) in rod_lens.iter().enumerate() {
         let (top, bot) = rod_endpoints(&poses, i + 1, l);
         if let (Some(a), Some(b)) = (
             project(camera, top, width, height),
@@ -256,6 +223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     write_ppm(&out, &fb)?;
+    let tree = &scene.world.trees[arm_idx];
     println!(
         "wrote {} ({}x{}) — final q = ({:.3}, {:.3}, {:.3})",
         out.display(),

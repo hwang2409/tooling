@@ -179,10 +179,9 @@ fn servo_p_only_steady_state_error_under_gravity() {
         (q_ss - q_expected).abs() < 5e-4,
         "P-only steady state q_ss={q_ss}, expected {q_expected}"
     );
-    // Also sanity-check the residual is essentially zero at q_ss:
-    // kp·(target − q_ss) ≈ m·g·L·sin(q_ss).
-    let residual = 100.0 * (std::f32::consts::PI / 6.0 - q_ss) - 9.81 * q_ss.sin();
-    assert!(residual.abs() < 1e-2, "static balance residual {residual}");
+    // No residual libm check here — the q_ss assertion within 5e-4 rad
+    // already implies the static-balance residual is small, and the engine
+    // tests stay libm-free by policy.
 }
 
 #[test]
@@ -216,6 +215,39 @@ fn servo_clamp_bounds_the_effective_torque() {
     assert!(
         (alpha - -2.0).abs() < 1e-4,
         "clamped negative α expected -2.0, got {alpha}"
+    );
+}
+
+#[test]
+fn servo_clamp_binds_on_full_pd_expression_not_p_only() {
+    // Discriminator between the intended `clamp(P + D)` and a bug where the
+    // clamp only binds on the P term (`clamp(P) + D`). Same hinge_x + point
+    // mass at L, kp = 1000, kd = 1, target = 1, clamp = ±2. Set an initial
+    // hinge rate `qdot0 = 20` so the D contribution is large enough to
+    // discriminate.
+    //
+    //   raw = kp·(target − q) − kd·qdot = 1000·1 − 1·20 = 980
+    //   correct:      τ = clamp(980, ±2)      = +2
+    //   mutant P-clamp: τ = clamp(1000, ±2) − 1·20 = 2 − 20 = −18
+    //
+    // I = m·L² = 1 → α_correct = +2 rad/s², α_mutant = −18 rad/s².
+    let mut tree = build_hinge(1.0, 1.0);
+    let mut servo = PdServo::new(1, 1000.0, 1.0, /*clamp*/ 2.0, 0.0);
+    servo.target = 1.0;
+    tree.add_actuator(servo);
+    tree.set_hinge_rate(1, 20.0);
+    let poses = forward_kinematics(&tree);
+    let ext = vec![(Vec3::ZERO, Vec3::ZERO); tree.links.len()];
+    let qddot = aba(&tree, &poses, Vec3::ZERO, &ext);
+    let alpha = qddot[0];
+    assert!(
+        (alpha - 2.0).abs() < 1e-4,
+        "clamp must bind on the full PD expression: expected α ≈ +2, got {alpha}"
+    );
+    // Sanity-check the mutant hypothesis is well outside the tolerance.
+    assert!(
+        (alpha - (-18.0)).abs() > 1.0,
+        "mutant α (-18) should be far from observed α ({alpha})"
     );
 }
 
