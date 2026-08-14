@@ -41,6 +41,7 @@ use crate::geom::{
     solref_to_kc,
 };
 use crate::math::{Quat, Vec3};
+use crate::solver::SolverConfig;
 use crate::tree::{Tree, forward_kinematics as tree_forward_kinematics, rk4_step as tree_rk4_step};
 
 /// Simulation world.
@@ -66,6 +67,11 @@ pub struct World {
     /// two geoms don't share a body/link and aren't both static; the
     /// resulting order is `(min, max)` lexicographic.
     pub pair_list: Option<Vec<(usize, usize)>>,
+    /// Constraint solver configuration (v1 tier 4). Default is
+    /// [`SolverConfig::DEFAULT`] — `SolverMode::Penalty`, which keeps every
+    /// pre-v1-tier-4 golden byte-identical. Set to
+    /// `SolverMode::Pgs` to switch on the MuJoCo soft-constraint solver.
+    pub solver: SolverConfig,
     /// Cached pair-support fingerprint from the last successful validation.
     /// Encoded as `(geoms.len() << 32) | pair_list_encoded` where
     /// `pair_list_encoded` is `(pair_list.len() as u32) + 1` when
@@ -93,6 +99,7 @@ impl PartialEq for World {
             && self.geoms == other.geoms
             && self.meshes == other.meshes
             && self.pair_list == other.pair_list
+            && self.solver == other.solver
     }
 }
 
@@ -121,6 +128,7 @@ impl World {
             geoms: Vec::new(),
             meshes: Vec::new(),
             pair_list: None,
+            solver: SolverConfig::DEFAULT,
             checked_pairs: std::cell::Cell::new(0),
         }
     }

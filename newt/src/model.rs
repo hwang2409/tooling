@@ -705,6 +705,7 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
             "version",
             "gravity",
             "timestep",
+            "solver",
             "bodies",
             "trees",
             "geoms",
@@ -738,6 +739,9 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
             return fail("timestep", format!("timestep must be > 0 (got {dt})"));
         }
         world.dt = dt;
+    }
+    if let Some(v) = optional(root_fields, "solver") {
+        world.solver = parse_solver_config(v, "solver")?;
     }
 
     // ---- Free bodies ----
@@ -1170,8 +1174,10 @@ fn parse_geom(
             "local_orientation",
             "friction",
             "solref",
+            "solimp",
             "margin",
             "gap",
+            "condim",
         ],
         path,
     )?;
@@ -1241,6 +1247,8 @@ fn parse_geom(
     };
 
     let (margin, gap) = parse_margin_gap(fields, path)?;
+    let solimp = parse_solimp(fields, path)?;
+    let condim = parse_condim(fields, path)?;
 
     let geom = Geom {
         shape,
@@ -1252,8 +1260,147 @@ fn parse_geom(
         solref,
         margin,
         gap,
+        condim,
+        solimp,
     };
     Ok((geom, name))
+}
+
+/// Parse the top-level `solver` object. Schema:
+///
+/// ```json
+/// {
+///   "mode": "penalty" | "pgs",
+///   "iterations": 20,
+///   "cone": "pyramidal" | "elliptic"
+/// }
+/// ```
+///
+/// All fields optional; omitted fields fall back to
+/// [`crate::solver::SolverConfig::DEFAULT`]. `iterations` must be a
+/// positive integer.
+fn parse_solver_config(v: &Value, path: &str) -> Result<crate::solver::SolverConfig, ModelError> {
+    use crate::solver::{ConeKind, SolverConfig, SolverMode};
+    let fields = get_object(v, path)?;
+    reject_unknown(fields, &["mode", "iterations", "cone"], path)?;
+    let mut cfg = SolverConfig::DEFAULT;
+    if let Some(mv) = optional(fields, "mode") {
+        let s = get_str(mv, &format!("{path}.mode"))?;
+        cfg.mode = match s {
+            "penalty" => SolverMode::Penalty,
+            "pgs" => SolverMode::Pgs,
+            other => {
+                return fail(
+                    &format!("{path}.mode"),
+                    format!("unknown solver mode \"{other}\"; expected penalty | pgs"),
+                );
+            }
+        };
+    }
+    if let Some(iv) = optional(fields, "iterations") {
+        let n = get_f32(iv, &format!("{path}.iterations"))?;
+        if n < 1.0 || n != n.floor() {
+            return fail(
+                &format!("{path}.iterations"),
+                format!("iterations must be a positive integer, got {n}"),
+            );
+        }
+        cfg.iterations = n as u32;
+    }
+    if let Some(cv) = optional(fields, "cone") {
+        let s = get_str(cv, &format!("{path}.cone"))?;
+        cfg.cone = match s {
+            "pyramidal" => ConeKind::Pyramidal,
+            "elliptic" => ConeKind::Elliptic,
+            other => {
+                return fail(
+                    &format!("{path}.cone"),
+                    format!("unknown cone kind \"{other}\"; expected pyramidal | elliptic"),
+                );
+            }
+        };
+    }
+    Ok(cfg)
+}
+
+/// Parse the optional `solimp` field on a geom object. Returns
+/// [`SolImp::DEFAULT`] when absent. Validates ranges (see
+/// [`SolImp::validate`]).
+fn parse_solimp(
+    fields: &[(String, Value)],
+    path: &str,
+) -> Result<crate::solver::SolImp, ModelError> {
+    let Some(v) = optional(fields, "solimp") else {
+        return Ok(crate::solver::SolImp::DEFAULT);
+    };
+    let sf = get_object(v, &format!("{path}.solimp"))?;
+    reject_unknown(
+        sf,
+        &["dmin", "dmax", "width", "midpoint", "power"],
+        &format!("{path}.solimp"),
+    )?;
+    let dmin = get_f32(
+        required(sf, "dmin", &format!("{path}.solimp"))?,
+        &format!("{path}.solimp.dmin"),
+    )?;
+    let dmax = get_f32(
+        required(sf, "dmax", &format!("{path}.solimp"))?,
+        &format!("{path}.solimp.dmax"),
+    )?;
+    let width = get_f32(
+        required(sf, "width", &format!("{path}.solimp"))?,
+        &format!("{path}.solimp.width"),
+    )?;
+    let midpoint = get_f32(
+        required(sf, "midpoint", &format!("{path}.solimp"))?,
+        &format!("{path}.solimp.midpoint"),
+    )?;
+    let power_f = get_f32(
+        required(sf, "power", &format!("{path}.solimp"))?,
+        &format!("{path}.solimp.power"),
+    )?;
+    if power_f < 1.0 || power_f != power_f.floor() {
+        return fail(
+            &format!("{path}.solimp.power"),
+            format!("power must be a positive integer, got {power_f}"),
+        );
+    }
+    let s = crate::solver::SolImp::new(dmin, dmax, width, midpoint, power_f as u32);
+    s.validate()
+        .map_err(|m| ModelError::new(format!("{path}.solimp"), m))?;
+    Ok(s)
+}
+
+/// Parse the optional `condim` field on a geom object. Defaults to `3`.
+/// v1-tier-4 supports `1` (frictionless) and `3` (sliding friction). Values
+/// `4` and `6` (torsional / rolling) are reserved for the equality-
+/// constraints ticket and rejected here.
+fn parse_condim(fields: &[(String, Value)], path: &str) -> Result<u8, ModelError> {
+    let Some(v) = optional(fields, "condim") else {
+        return Ok(3);
+    };
+    let n = get_f32(v, &format!("{path}.condim"))?;
+    if n != n.floor() {
+        return fail(
+            &format!("{path}.condim"),
+            format!("condim must be an integer, got {n}"),
+        );
+    }
+    let n_int = n as i32;
+    match n_int {
+        1 | 3 => Ok(n_int as u8),
+        4 | 6 => fail(
+            &format!("{path}.condim"),
+            format!(
+                "condim {n_int} (torsional/rolling friction) is deferred to \
+                 the equality-constraints ticket; use 1 or 3 for now"
+            ),
+        ),
+        _ => fail(
+            &format!("{path}.condim"),
+            format!("condim must be 1 (frictionless) or 3 (sliding); got {n_int}"),
+        ),
+    }
 }
 
 /// Parse one entry of the top-level `meshes` array. Schema:

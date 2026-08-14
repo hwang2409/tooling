@@ -49,6 +49,7 @@ pub mod joint;
 pub mod json;
 pub mod math;
 pub mod model;
+pub mod solver;
 pub mod spatial;
 pub mod tree;
 pub mod world;
