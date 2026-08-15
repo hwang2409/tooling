@@ -669,6 +669,7 @@ name = "newt"
 version = "0.1.0"
 dependencies = [
  "chimy2",
+ "winit",
 ]
 
 [[package]]

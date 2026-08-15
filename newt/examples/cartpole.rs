@@ -13,13 +13,15 @@
 //!
 //! Run:
 //! ```text
-//! cargo run --release --example cartpole -- --frames 900 --out /tmp/cartpole.ppm --size 640x360
-//! cargo run --release --example cartpole -- --velocity --frames 900 --out /tmp/cartpole_vel.ppm
-//! sips -s format png /tmp/cartpole.ppm --out /tmp/cartpole.png
+//! cargo run --release --example cartpole -- --frames 900 --out /tmp/cartpole.mp4
+//! cargo run --release --example cartpole -- --velocity --frames 900 --out /tmp/cartpole_vel.mp4
+//! cargo run --release --example cartpole -- --frames 900 --still /tmp/cartpole.ppm
 //! ```
 //!
-//! Rendering: chimy2 wireframe on a Framebuffer. The camera sits on +Y
-//! looking at the swing plane so +X → image right, +Z → image up.
+//! Rendering: solid shaded chimy2 meshes. The camera sits on +Y and looks at
+//! the swing plane.
+
+mod showcase_support;
 
 use chimy2::demo::write_ppm;
 use chimy2::fb::{Framebuffer, argb8888};
@@ -49,14 +51,20 @@ struct Args {
     out: PathBuf,
     size: (usize, usize),
     mode: Mode,
+    frames_dir: Option<PathBuf>,
+    still: Option<PathBuf>,
+    wireframe: bool,
 }
 
 fn parse_args() -> Args {
     let mut a = Args {
         frames: 900,
-        out: PathBuf::from("newt-cartpole.ppm"),
+        out: PathBuf::from("newt-cartpole.mp4"),
         size: (640, 360),
         mode: Mode::Position,
+        frames_dir: None,
+        still: None,
+        wireframe: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -70,6 +78,9 @@ fn parse_args() -> Args {
             }
             "--velocity" => a.mode = Mode::Velocity,
             "--position" => a.mode = Mode::Position,
+            "--frames-dir" => a.frames_dir = Some(PathBuf::from(it.next().unwrap())),
+            "--still" => a.still = Some(PathBuf::from(it.next().unwrap())),
+            "--wireframe" => a.wireframe = true,
             _ => panic!("unknown arg: {arg}"),
         }
     }
@@ -131,6 +142,56 @@ fn build_cartpole(mode: Mode) -> (Tree, usize) {
     (tree, actuator_idx)
 }
 
+fn mode_str(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Position => "position",
+        Mode::Velocity => "velocity",
+    }
+}
+
+fn render_cartpole_frame(
+    tree: &Tree,
+    width: usize,
+    height: usize,
+    step: usize,
+    mode: Mode,
+) -> Framebuffer {
+    let poses = forward_kinematics(tree);
+    let (cart_com, _) = poses[1];
+    let (pole_com, pole_ori) = poses[2];
+    let pole_tip = pole_com + pole_ori.rotate(Vec3::new(0.0, 0.0, -POLE_L * 0.5));
+    let mut items = vec![showcase_support::item(
+        showcase_support::cuboid_mesh(chimy2::math::Vec3::new(3.0, 2.0, 0.04)),
+        chimy2::math::Mat4::translate(chimy2::math::Vec3::new(0.0, 0.0, -0.04)),
+        showcase_support::Material::new(chimy2::math::Vec3::new(0.04, 0.05, 0.07), 0.0, 0.9),
+    )];
+    items.push(showcase_support::item(
+        showcase_support::cuboid_mesh(chimy2::math::Vec3::new(0.28, 0.22, 0.09)),
+        chimy2::math::Mat4::translate(showcase_support::to_cvec(cart_com)),
+        showcase_support::Material::new(chimy2::math::Vec3::new(0.12, 0.48, 0.78), 0.45, 0.25),
+    ));
+    showcase_support::add_capsule(
+        &mut items,
+        cart_com,
+        pole_tip,
+        0.045,
+        showcase_support::Material::new(chimy2::math::Vec3::new(0.92, 0.42, 0.08), 0.5, 0.2),
+    );
+    showcase_support::add_marker(
+        &mut items,
+        cart_com,
+        0.08,
+        showcase_support::Material::new(chimy2::math::Vec3::new(0.95, 0.75, 0.16), 0.35, 0.18),
+    );
+    showcase_support::render_items(
+        &items,
+        showcase_support::composition("cartpole"),
+        width,
+        height,
+        &format!("cartpole  |  step {step}  |  {} mode", mode_str(mode)),
+    )
+}
+
 fn draw_line(fb: &mut Framebuffer, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: u32) {
     let dx = (x1 - x0).abs();
     let dy = -(y1 - y0).abs();
@@ -185,6 +246,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut trail: Vec<Vec3> = Vec::with_capacity(frames);
     // Cart-position samples across the run (draws a translucent slide track).
     let mut cart_trail: Vec<Vec3> = Vec::with_capacity(frames);
+    let video_mode = !args.wireframe && args.still.is_none() && args.frames_dir.is_none();
+    let mut video = video_mode
+        .then(|| showcase_support::VideoWriter::new(&out))
+        .transpose()?;
     for step in 0..frames {
         if let Mode::Velocity = mode {
             // Track a sinusoidal velocity profile: 0.6·sin(2π·t/1.5s) m/s
@@ -202,6 +267,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pole_tip = pole_com + pole_ori.rotate(Vec3::new(0.0, 0.0, -POLE_L * 0.5));
         trail.push(pole_tip);
         cart_trail.push(cart_com);
+        if let Some(writer) = video.as_mut()
+            && ((step + 1) % showcase_support::SIM_STEPS_PER_VIDEO_FRAME == 0 || step + 1 == frames)
+        {
+            writer.push(&render_cartpole_frame(&tree, width, height, step + 1, mode))?;
+        }
+    }
+
+    if let Some(writer) = video {
+        writer.finish()?;
+        println!(
+            "wrote {} ({}x{}, {} fps, {:.2}x simulation speed)",
+            out.display(),
+            width,
+            height,
+            showcase_support::VIDEO_FPS,
+            showcase_support::video_speed_factor(dt)
+        );
+        return Ok(());
+    }
+
+    if !args.wireframe {
+        let path = args
+            .still
+            .or_else(|| {
+                args.frames_dir
+                    .map(|directory| directory.join("frame-00.ppm"))
+            })
+            .unwrap_or(out.clone());
+        write_ppm(
+            path,
+            &render_cartpole_frame(&tree, width, height, frames, mode),
+        )?;
+        return Ok(());
     }
 
     let mut fb = Framebuffer::new(width, height);
@@ -309,11 +407,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::Velocity => "velocity",
     };
     println!(
-        "wrote {} ({}x{}, {} mode) — final cart x = {:.3} m, cart_v = {:.3} m/s, pole θ = {:.3} rad",
+        "wrote {} ({}x{}, {} mode, {:.2}x simulation speed) — final cart x = {:.3} m, cart_v = {:.3} m/s, pole θ = {:.3} rad",
         out.display(),
         width,
         height,
         mode_str,
+        showcase_support::video_speed_factor(dt),
         tree.slide_position(1),
         tree.slide_rate(1),
         tree.hinge_angle(2)

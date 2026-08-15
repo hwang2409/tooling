@@ -1,10 +1,11 @@
 //! NEWT-18 biped walking showcase.
 //!
 //! The demo runs the source `stable_joint_walk` preset by default. It writes
-//! eight fixed-phase PPM frames and prints the same gait metrics used by the
-//! integration tests.
+//! a full-run MP4 and prints the same gait metrics used by the integration
+//! tests.
 
 mod biped_walk_support;
+mod showcase_support;
 
 use std::path::PathBuf;
 
@@ -19,21 +20,32 @@ use newt::tree::forward_kinematics;
 struct Args {
     steps: usize,
     assist_scale: f32,
-    out_dir: PathBuf,
+    out: PathBuf,
+    still: Option<PathBuf>,
+    out_dir: Option<PathBuf>,
+    wireframe: bool,
 }
 
 fn parse_args() -> Args {
     let mut args = Args {
         steps: 5000,
         assist_scale: 0.8,
-        out_dir: PathBuf::from("/tmp/newt-biped-walk-frames"),
+        out: PathBuf::from("newt-biped-walk.mp4"),
+        still: None,
+        out_dir: None,
+        wireframe: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--steps" => args.steps = it.next().expect("--steps value").parse().unwrap(),
             "--no-assist" => args.assist_scale = 0.0,
-            "--out-dir" => args.out_dir = PathBuf::from(it.next().expect("--out-dir value")),
+            "--out" => args.out = PathBuf::from(it.next().expect("output path")),
+            "--still" => args.still = Some(PathBuf::from(it.next().expect("still path"))),
+            "--out-dir" | "--frames-dir" => {
+                args.out_dir = Some(PathBuf::from(it.next().expect("output directory value")))
+            }
+            "--wireframe" => args.wireframe = true,
             _ => panic!("unknown argument: {arg}"),
         }
     }
@@ -42,7 +54,9 @@ fn parse_args() -> Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
-    std::fs::create_dir_all(&args.out_dir)?;
+    if let Some(out_dir) = &args.out_dir {
+        std::fs::create_dir_all(out_dir)?;
+    }
     let mut config = if args.assist_scale == 0.0 {
         GaitConfig::joint_walk(args.steps)
     } else {
@@ -50,6 +64,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     config.assist_scale = args.assist_scale;
     let frame_stride = (args.steps / 8).max(1);
+    let video_mode = !args.wireframe && args.still.is_none() && args.out_dir.is_none();
+    let mut video = video_mode
+        .then(|| showcase_support::VideoWriter::new(&args.out))
+        .transpose()?;
     let out_dir = args.out_dir.clone();
     let mut window_start_step = 0;
     let mut window_start_x = 0.0;
@@ -62,10 +80,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         window_max_clearance = window_max_clearance
             .max(sample.left_clearance)
             .max(sample.right_clearance);
-        if step % frame_stride == 0 || step == args.steps {
+        if video_mode {
+            if step % showcase_support::SIM_STEPS_PER_VIDEO_FRAME == 0 || step == args.steps {
+                video
+                    .as_mut()
+                    .expect("video writer")
+                    .push(&render_frame_buffer(scene))
+                    .expect("write video frame");
+            }
+        } else if let Some(path) = &args.still {
+            if step == args.steps {
+                write_ppm(path, &render_frame_buffer(scene)).expect("write still frame");
+            }
+        } else if step % frame_stride == 0 || step == args.steps {
             let frame = (step / frame_stride).min(8);
-            let path = out_dir.join(format!("frame-{frame:02}.ppm"));
-            render_frame(scene, &path).expect("write PPM frame");
+            let path = out_dir
+                .as_ref()
+                .expect("frame directory")
+                .join(format!("frame-{frame:02}.ppm"));
+            if args.wireframe {
+                render_wireframe(scene, &path).expect("write PPM frame");
+            } else {
+                render_frame(scene, &path).expect("write PPM frame");
+            }
             println!(
                 "frame {frame:02}: steps={} assist_scale={:.1} window_distance={:.4} window_clearance={:.4} root_x={:.4} root_z={:.4} speed={:.4} contacts=({},{})",
                 step - window_start_step,
@@ -83,10 +120,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             window_max_clearance = 0.0;
         }
     });
+    if let Some(writer) = video {
+        writer.finish()?;
+        println!(
+            "wrote {} (960x640, {} fps, {:.2}x simulation speed)",
+            args.out.display(),
+            showcase_support::VIDEO_FPS,
+            showcase_support::video_speed_factor(0.005),
+        );
+    }
     println!(
-        "walk: assist_scale={:.1} steps={} distance={:.4} cadence={:.2} bpm step_length={:.4} stride_length={:.4} duty=({:.4},{:.4}) clearance={:.4} self_contact_steps={} max_self_contact_force={:.6} final_root_height={:.4} final_forward_speed={:.4}",
+        "walk: assist_scale={:.1} steps={} speed={:.2}x distance={:.4} cadence={:.2} bpm step_length={:.4} stride_length={:.4} duty=({:.4},{:.4}) clearance={:.4} self_contact_steps={} max_self_contact_force={:.6} final_root_height={:.4} final_forward_speed={:.4}",
         config.assist_scale,
         config.steps,
+        showcase_support::video_speed_factor(0.005),
         result.metrics.forward_distance,
         result.metrics.cadence_bpm,
         result.metrics.mean_step_length,
@@ -102,7 +149,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn render_frame(scene: &Scene, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+fn render_wireframe(
+    scene: &Scene,
+    path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let width = 800;
     let height = 500;
     let mut fb = Framebuffer::new(width, height);
@@ -187,6 +237,28 @@ fn render_frame(scene: &Scene, path: &std::path::Path) -> Result<(), Box<dyn std
         }
     }
     write_ppm(path, &fb)?;
+    Ok(())
+}
+
+fn render_frame_buffer(scene: &Scene) -> Framebuffer {
+    let poses = forward_kinematics(&scene.world.trees[0]);
+    let root = poses[0].0;
+    let items = showcase_support::world_items(&scene.world);
+    showcase_support::render_items(
+        &items,
+        showcase_support::Composition::new(
+            showcase_support::to_cvec(root + Vec3::new(0.0, 0.0, 0.45)),
+            showcase_support::to_cvec(root + Vec3::new(2.4, -3.4, 2.0)),
+            chimy2::math::Vec3::new(0.1, 0.55, 1.0),
+        ),
+        960,
+        640,
+        "biped walk  |  follow camera  |  step sequence",
+    )
+}
+
+fn render_frame(scene: &Scene, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    write_ppm(path, &render_frame_buffer(scene))?;
     Ok(())
 }
 
