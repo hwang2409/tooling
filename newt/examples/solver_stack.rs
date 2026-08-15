@@ -304,10 +304,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     }
     println!(
-        "wrote {} ({}x{}) — final positions:",
+        "wrote {} ({}x{}, {:.2}x simulation speed) — final positions:",
         out.display(),
         width,
-        height
+        height,
+        showcase_support::video_speed_factor(world.dt)
     );
     for (i, b) in world.bodies.iter().enumerate() {
         if i < 6 {

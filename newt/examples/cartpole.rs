@@ -277,11 +277,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(writer) = video {
         writer.finish()?;
         println!(
-            "wrote {} ({}x{}, {} fps)",
+            "wrote {} ({}x{}, {} fps, {:.2}x simulation speed)",
             out.display(),
             width,
             height,
-            showcase_support::VIDEO_FPS
+            showcase_support::VIDEO_FPS,
+            showcase_support::video_speed_factor(dt)
         );
         return Ok(());
     }
@@ -406,11 +407,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::Velocity => "velocity",
     };
     println!(
-        "wrote {} ({}x{}, {} mode) — final cart x = {:.3} m, cart_v = {:.3} m/s, pole θ = {:.3} rad",
+        "wrote {} ({}x{}, {} mode, {:.2}x simulation speed) — final cart x = {:.3} m, cart_v = {:.3} m/s, pole θ = {:.3} rad",
         out.display(),
         width,
         height,
         mode_str,
+        showcase_support::video_speed_factor(dt),
         tree.slide_position(1),
         tree.slide_rate(1),
         tree.hinge_angle(2)

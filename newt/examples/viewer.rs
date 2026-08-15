@@ -61,6 +61,7 @@ struct Viewer {
     distance: f32,
     target: Vec3,
     previous: InputState,
+    step_accumulator: f32,
     steps: usize,
 }
 
@@ -75,7 +76,7 @@ impl Viewer {
         if self.edge(input, KeyCode::Space) {
             self.paused = !self.paused;
         }
-        if self.edge(input, KeyCode::Period) {
+        if self.paused && self.edge(input, KeyCode::Period) {
             self.world.step();
             self.steps += 1;
         }
@@ -111,8 +112,10 @@ impl Viewer {
             self.pitch = (self.pitch - orbit_step).max(-0.4);
         }
         if !self.paused {
-            let steps = self.speed.round() as usize;
-            for _ in 0..steps.max(1) {
+            self.step_accumulator += self.speed;
+            let steps = self.step_accumulator.floor() as usize;
+            self.step_accumulator -= steps as f32;
+            for _ in 0..steps {
                 self.world.step();
                 self.steps += 1;
             }
@@ -214,6 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         distance: 5.0,
         target: Vec3::new(0.0, 0.0, 1.0),
         previous: InputState::default(),
+        step_accumulator: 0.0,
         steps: 0,
     };
     run_with_input(

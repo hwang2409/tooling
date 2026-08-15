@@ -25,6 +25,10 @@ use std::process::Command;
 pub const VIDEO_FPS: u32 = 60;
 pub const SIM_STEPS_PER_VIDEO_FRAME: usize = 10;
 
+pub fn video_speed_factor(sim_dt: f32) -> f32 {
+    VIDEO_FPS as f32 * SIM_STEPS_PER_VIDEO_FRAME as f32 * sim_dt
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Material {
     pub albedo: Vec3,
@@ -531,21 +535,50 @@ fn cylinder_mesh(segments: usize, radius: f32, half_height: f32) -> Mesh {
 }
 
 fn capsule_mesh(segments: usize, rings: usize, radius: f32, half_height: f32) -> Mesh {
-    let sphere = sphere_mesh(segments, rings * 2);
-    let vertices = sphere
-        .vertices()
-        .iter()
-        .map(|source| {
-            let p = source.position();
-            let z = if p.z >= 0.0 {
-                p.z * radius + half_height
-            } else {
-                p.z * radius - half_height
-            };
-            vertex(Vec3::new(p.x * radius, p.y * radius, z))
-        })
-        .collect();
-    Mesh::new(vertices, sphere.indices().to_vec())
+    let mut vertices = Vec::new();
+    let mut triangles = Vec::new();
+    let mut push_ring = |ring_radius: f32, z: f32| {
+        for segment in 0..segments {
+            let theta = 2.0 * PI * segment as f32 / segments as f32;
+            vertices.push(vertex(Vec3::new(
+                ring_radius * theta.cos(),
+                ring_radius * theta.sin(),
+                z,
+            )));
+        }
+    };
+
+    // Lower hemisphere, from the south pole to the cylinder.
+    for ring in 0..=rings {
+        let t = ring as f32 / rings as f32;
+        let angle = -PI * 0.5 + t * PI * 0.5;
+        push_ring(radius * angle.cos(), -half_height + radius * angle.sin());
+    }
+    // Include interior cylinder rings so the cylindrical section is explicit.
+    for ring in 1..=rings + 1 {
+        let t = ring as f32 / (rings + 1) as f32;
+        push_ring(radius, -half_height + 2.0 * half_height * t);
+    }
+    // Upper hemisphere, from the cylinder to the north pole.
+    for ring in 1..=rings {
+        let t = ring as f32 / rings as f32;
+        let angle = t * PI * 0.5;
+        push_ring(radius * angle.cos(), half_height + radius * angle.sin());
+    }
+
+    let ring_count = vertices.len() / segments;
+    for ring in 0..ring_count - 1 {
+        for segment in 0..segments {
+            let next = (segment + 1) % segments;
+            let a = ring * segments + segment;
+            let b = ring * segments + next;
+            let c = (ring + 1) * segments + next;
+            let d = (ring + 1) * segments + segment;
+            triangles.push([a, b, c]);
+            triangles.push([a, c, d]);
+        }
+    }
+    Mesh::new(vertices, triangles)
 }
 
 fn main() {}
@@ -555,24 +588,160 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rendering_does_not_change_deterministic_simulation_state() {
-        let mut headless = newt::model::load_from_path("models/pile.json")
+    fn capsule_rings_have_monotone_z_and_a_cylinder_section() {
+        let segments = 8;
+        let rings = 4;
+        let half_height = 2.0;
+        let mesh = capsule_mesh(segments, rings, 0.5, half_height);
+        let ring_z = mesh
+            .vertices()
+            .chunks(segments)
+            .map(|ring| ring[0].position().z)
+            .collect::<Vec<_>>();
+
+        assert!(ring_z.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            ring_z
+                .iter()
+                .filter(|&&z| -half_height < z && z < half_height)
+                .count()
+                >= rings
+        );
+    }
+
+    fn push_f32(bytes: &mut Vec<u8>, value: f32) {
+        bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
+
+    fn push_vec3(bytes: &mut Vec<u8>, value: NVec3) {
+        push_f32(bytes, value.x);
+        push_f32(bytes, value.y);
+        push_f32(bytes, value.z);
+    }
+
+    fn push_quat(bytes: &mut Vec<u8>, value: Quat) {
+        push_f32(bytes, value.x);
+        push_f32(bytes, value.y);
+        push_f32(bytes, value.z);
+        push_f32(bytes, value.w);
+    }
+
+    fn push_mat3(bytes: &mut Vec<u8>, value: newt::math::Mat3) {
+        for component in value.data {
+            push_f32(bytes, component);
+        }
+    }
+
+    fn push_geom_shape(bytes: &mut Vec<u8>, shape: &GeomShape) {
+        match shape {
+            GeomShape::Plane => bytes.push(0),
+            GeomShape::Sphere { radius } => {
+                bytes.push(1);
+                push_f32(bytes, *radius);
+            }
+            GeomShape::Box { half_extents } => {
+                bytes.push(2);
+                push_vec3(bytes, *half_extents);
+            }
+            GeomShape::Capsule {
+                radius,
+                half_height,
+            } => {
+                bytes.push(3);
+                push_f32(bytes, *radius);
+                push_f32(bytes, *half_height);
+            }
+            GeomShape::Cylinder {
+                radius,
+                half_height,
+            } => {
+                bytes.push(4);
+                push_f32(bytes, *radius);
+                push_f32(bytes, *half_height);
+            }
+            GeomShape::Ellipsoid { semi_axes } => {
+                bytes.push(5);
+                push_vec3(bytes, *semi_axes);
+            }
+            GeomShape::Mesh { mesh_id } => {
+                bytes.push(6);
+                bytes.extend_from_slice(&(*mesh_id as u64).to_le_bytes());
+            }
+        }
+    }
+
+    fn world_float_bits(world: &World) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_f32(&mut bytes, world.dt);
+        push_vec3(&mut bytes, world.gravity);
+        push_vec3(&mut bytes, world.magnetic_field);
+        for body in &world.bodies {
+            push_f32(&mut bytes, body.mass);
+            push_mat3(&mut bytes, body.inertia_body);
+            push_mat3(&mut bytes, body.inertia_body_inverse);
+            push_vec3(&mut bytes, body.position);
+            push_vec3(&mut bytes, body.linear_velocity);
+            push_quat(&mut bytes, body.orientation);
+            push_vec3(&mut bytes, body.angular_velocity_body);
+        }
+        for geom in &world.geoms {
+            push_geom_shape(&mut bytes, &geom.shape);
+            push_vec3(&mut bytes, geom.local_offset);
+            push_quat(&mut bytes, geom.local_orientation);
+            push_f32(&mut bytes, geom.friction);
+            push_f32(&mut bytes, geom.solref.timeconst);
+            push_f32(&mut bytes, geom.solref.dampratio);
+            push_f32(&mut bytes, geom.margin);
+            push_f32(&mut bytes, geom.gap);
+            push_f32(&mut bytes, geom.torsional_friction);
+            push_f32(&mut bytes, geom.rolling_friction);
+            push_f32(&mut bytes, geom.solimp.dmin);
+            push_f32(&mut bytes, geom.solimp.dmax);
+            push_f32(&mut bytes, geom.solimp.width);
+            push_f32(&mut bytes, geom.solimp.midpoint);
+        }
+        for mesh in &world.meshes {
+            for vertex in &mesh.vertices {
+                push_vec3(&mut bytes, *vertex);
+            }
+        }
+        bytes
+    }
+
+    fn run_with_render_divisor(divisor: Option<usize>) -> World {
+        let mut world = newt::model::load_from_path("models/pile.json")
             .expect("pile model")
             .world;
-        let mut rendered = headless.clone();
         let composition = Composition::new(
             Vec3::new(0.0, 0.0, 0.6),
             Vec3::new(3.4, -4.1, 2.6),
             Vec3::new(1.0, 0.3, 0.2),
         );
-        for _ in 0..4 {
-            headless.step();
-            rendered.step();
-            let items = world_items(&rendered);
-            let _ = render_items(&items, composition, 32, 32, "test");
+        for step in 1..=60 {
+            world.step();
+            if divisor.is_some_and(|value| step % value == 0 || step == 60) {
+                let items = world_items(&world);
+                let _ = render_items(&items, composition, 32, 32, "test");
+            }
         }
-        assert_eq!(headless.bodies, rendered.bodies);
-        assert_eq!(headless.trees, rendered.trees);
-        assert_eq!(headless.geoms, rendered.geoms);
+        world
+    }
+
+    #[test]
+    fn rendering_does_not_change_deterministic_simulation_state() {
+        let headless = run_with_render_divisor(None);
+        let headless_bits = world_float_bits(&headless);
+        for divisor in [1, 10, 60] {
+            let rendered = run_with_render_divisor(Some(divisor));
+            assert_eq!(
+                headless, rendered,
+                "state differs at render divisor {divisor}"
+            );
+            assert_eq!(
+                headless_bits,
+                world_float_bits(&rendered),
+                "float to_bits state differs at render divisor {divisor}"
+            );
+        }
     }
 }

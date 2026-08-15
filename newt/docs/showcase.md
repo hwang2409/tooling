@@ -5,9 +5,10 @@ simple materials, readable colors, and one fixed camera. the biped uses a
 follow camera.
 
 video is the default output. each run advances the deterministic simulation
-by 10 fixed simulation steps per video frame and writes 60 fps. this gives a
-5000-step biped walk an 8.33 second video at a documented 10x simulation
-speed. rendering does not change the simulation state.
+by 10 fixed simulation steps per video frame and writes 60 fps. with the
+showcase timestep of 0.005 seconds, this is 3x simulation speed. a 5000-step
+biped walk covers 25 seconds of simulation in an 8.33 second video.
+rendering does not change the simulation state.
 
 all commands run from `newt/`.
 
@@ -67,5 +68,5 @@ the showcase adapter includes a test that runs the same simulation with and
 without rendering. it checks the final state bytes. run it with:
 
 ```text
-cargo test --manifest-path newt/Cargo.toml rendering_does_not_change_deterministic_simulation_state
+cargo test --manifest-path newt/Cargo.toml --example showcase_support rendering_does_not_change_deterministic_simulation_state
 ```

@@ -123,16 +123,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(writer) = video {
         writer.finish()?;
         println!(
-            "wrote {} (960x640, {} fps, {} sim steps per video frame)",
+            "wrote {} (960x640, {} fps, {:.2}x simulation speed)",
             args.out.display(),
             showcase_support::VIDEO_FPS,
-            showcase_support::SIM_STEPS_PER_VIDEO_FRAME,
+            showcase_support::video_speed_factor(0.005),
         );
     }
     println!(
-        "walk: assist_scale={:.1} steps={} distance={:.4} cadence={:.2} bpm step_length={:.4} stride_length={:.4} duty=({:.4},{:.4}) clearance={:.4} self_contact_steps={} max_self_contact_force={:.6} final_root_height={:.4} final_forward_speed={:.4}",
+        "walk: assist_scale={:.1} steps={} speed={:.2}x distance={:.4} cadence={:.2} bpm step_length={:.4} stride_length={:.4} duty=({:.4},{:.4}) clearance={:.4} self_contact_steps={} max_self_contact_force={:.6} final_root_height={:.4} final_forward_speed={:.4}",
         config.assist_scale,
         config.steps,
+        showcase_support::video_speed_factor(0.005),
         result.metrics.forward_distance,
         result.metrics.cadence_bpm,
         result.metrics.mean_step_length,

@@ -463,10 +463,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let poses = forward_kinematics(&world.trees[0]);
     let kin = tendon_kinematics(&world.trees[0].tendons[0], &world.trees[0], &poses);
     println!(
-        "wrote {} ({}x{}) — final slide={:.3} m tendon length={:.3} m",
+        "wrote {} ({}x{}, {:.2}x simulation speed) — final slide={:.3} m tendon length={:.3} m",
         out.display(),
         width,
         height,
+        showcase_support::video_speed_factor(world.dt),
         world.trees[0].slide_position(1),
         kin.length,
     );

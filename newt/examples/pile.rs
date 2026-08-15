@@ -554,10 +554,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Report final positions so the human running the demo can eyeball
     // whether everything settled (no NaN, no negative z, boxes stacked).
     println!(
-        "wrote {} ({}x{}) — final positions:",
+        "wrote {} ({}x{}, {:.2}x simulation speed) — final positions:",
         out.display(),
         width,
-        height
+        height,
+        showcase_support::video_speed_factor(world.dt)
     );
     let labels = [
         "cylinder",

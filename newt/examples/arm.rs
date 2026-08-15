@@ -280,11 +280,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(writer) = video {
         writer.finish()?;
         println!(
-            "wrote {} ({}x{}, {} fps)",
+            "wrote {} ({}x{}, {} fps, {:.2}x simulation speed)",
             out.display(),
             width,
             height,
-            showcase_support::VIDEO_FPS
+            showcase_support::VIDEO_FPS,
+            showcase_support::video_speed_factor(dt)
         );
         return Ok(());
     }
@@ -359,10 +360,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_ppm(&out, &fb)?;
     let tree = &scene.world.trees[arm_idx];
     println!(
-        "wrote {} ({}x{}) — final q = ({:.3}, {:.3}, {:.3})",
+        "wrote {} ({}x{}, {:.2}x simulation speed) — final q = ({:.3}, {:.3}, {:.3})",
         out.display(),
         width,
         height,
+        showcase_support::video_speed_factor(dt),
         tree.hinge_angle(1),
         tree.hinge_angle(2),
         tree.hinge_angle(3),
