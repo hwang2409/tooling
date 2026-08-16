@@ -43,8 +43,10 @@
 //! - condim 1 (frictionless) and condim 3 (normal + 2 tangents). PGS accepts
 //!   both cone options; Newton accepts pyramidal cones in this ticket.
 //! - Constraint-based joint limits for hinge and slide (ball still deferred).
-//! - condim 4 / 6 (torsional / rolling) use the same free-body rows as the
-//!   solver. Tree contacts remain on the penalty pathway in every mode.
+//! - condim 4 / 6 (torsional / rolling) use the same row assembly for free
+//!   bodies and trees.
+//! - Tree-involved contacts use one world-level joint-space system. This
+//!   includes tree-vs-static, tree-vs-body, and tree-vs-tree contacts.
 //! - RK4 integrator + solve-once-per-step (ZOH): we compute the solver
 //!   forces at the START of the step and hold them constant across the four
 //!   RK4 stages. MuJoCo does one Euler step per solve; keeping RK4 while
@@ -422,7 +424,7 @@ pub fn project_pyramidal(f: f32, cap: f32) -> f32 {
 use crate::body::Body;
 use crate::contact::Contact;
 use crate::equality::{DISTANCE_DEGENERATE_EPS, Equality};
-use crate::geom::{Geom, SolRef, combine_solref};
+use crate::geom::{Geom, GeomAttach, SolRef, combine_solref};
 use crate::math::{Quat, Vec3};
 use crate::world::tangent_basis;
 
@@ -1699,7 +1701,7 @@ fn point_direction_velocity(
 
 use crate::dynamics::{cholesky, cholesky_solve, mass_matrix};
 use crate::joint::JointKind;
-use crate::tree::Tree;
+use crate::tree::{Tree, forward_kinematics};
 
 /// One assembled tree-space row. Joint limits, joint-coupling equalities,
 /// AND tendon length limits all reduce to a sparse row on the tree's `nv`
@@ -2236,6 +2238,653 @@ pub fn solve_tree_limits_newton(
         }
     }
     qfrc
+}
+
+// ---------------------------------------------------------------------------
+// Tree-involved contact solver
+// ---------------------------------------------------------------------------
+
+/// Constraint forces for contacts with at least one tree link. The contact
+/// rows share one generalized system across all free bodies and trees, so a
+/// tree-vs-body contact transfers the impulse to both participants.
+#[derive(Clone, Debug)]
+pub struct TreeContactSolution {
+    /// World-frame free-body wrenches, indexed like the input body slice.
+    pub body_wrenches: Vec<(Vec3, Vec3)>,
+    /// Joint-space generalized forces, indexed by tree and then `nv` slot.
+    pub tree_qfrc: Vec<Vec<f32>>,
+    /// Per-link world-frame wrenches equivalent to the solved contact
+    /// impulses. This feeds post-step acceleration and force sensors.
+    pub tree_wrenches: Vec<crate::tree::ExternalWrenches>,
+    /// Normal forces, indexed by the original input contact index.
+    pub contact_normal_forces: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+struct WorldContactRow {
+    components: Vec<WorldJacobian>,
+    reg: f32,
+    diag: f32,
+    bias: f32,
+}
+
+#[derive(Clone, Debug)]
+struct WorldJacobian {
+    body: Option<WorldBodyJacobian>,
+    tree: Option<WorldTreeJacobian>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorldBodyJacobian {
+    index: usize,
+    linear: Vec3,
+    angular: Vec3,
+}
+
+#[derive(Clone, Debug)]
+struct WorldTreeJacobian {
+    index: usize,
+    link: usize,
+    coefficients: Vec<f32>,
+    wrench_linear: Vec3,
+    wrench_angular: Vec3,
+}
+
+struct WorldContactBlock {
+    contact_index: usize,
+    start_row: usize,
+    condim: u8,
+    solref: SolRef,
+    solimp: SolImp,
+    penetration: f32,
+    mu_slide: f32,
+    mu_torsion: f32,
+    mu_roll: f32,
+}
+
+/// Solve all active contacts that touch a tree in one joint-space system.
+///
+/// `tree_implicit` selects the tree free-velocity model used by the
+/// integrator: `None` is explicit RK4, `Some(false)` is Euler with implicit
+/// joint damping, and `Some(true)` is implicitfast. The returned impulses are
+/// converted to body wrenches and tree generalized forces by the caller.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_tree_contacts(
+    bodies: &[Body],
+    trees: &[Tree],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+    use_newton: bool,
+    tree_implicit: Option<bool>,
+) -> TreeContactSolution {
+    let mut solution = TreeContactSolution {
+        body_wrenches: vec![(Vec3::ZERO, Vec3::ZERO); bodies.len()],
+        tree_qfrc: trees.iter().map(|tree| vec![0.0; tree.nv()]).collect(),
+        tree_wrenches: trees
+            .iter()
+            .map(|tree| vec![(Vec3::ZERO, Vec3::ZERO); tree.links.len()])
+            .collect(),
+        contact_normal_forces: vec![0.0; contacts.len()],
+    };
+    if contacts.is_empty() || dt <= 0.0 || trees.is_empty() {
+        return solution;
+    }
+    if use_newton && cone == ConeKind::Elliptic {
+        panic!("{NEWTON_ELLIPTIC_ERROR}");
+    }
+
+    let poses: Vec<Vec<(Vec3, Quat)>> = trees.iter().map(forward_kinematics).collect();
+    let inv_i_world: Vec<crate::math::Mat3> = bodies
+        .iter()
+        .map(|body| {
+            let rotation = body.orientation.to_mat3();
+            rotation * body.inertia_body_inverse * rotation.transpose()
+        })
+        .collect();
+    let tree_factors: Vec<Vec<f32>> = trees
+        .iter()
+        .map(|tree| {
+            let n = tree.nv();
+            if n == 0 {
+                Vec::new()
+            } else {
+                cholesky(&mass_matrix(tree), n).unwrap_or_else(|| {
+                    panic!("tree contact solve failed: mass matrix is not positive definite")
+                })
+            }
+        })
+        .collect();
+    let tree_free_velocity: Vec<Vec<f32>> = trees
+        .iter()
+        .map(|tree| tree_free_velocity_delta(tree, gravity, dt, tree_implicit))
+        .collect();
+
+    let mut rows = Vec::new();
+    let mut blocks = Vec::new();
+    for (contact_index, contact) in contacts.iter().enumerate() {
+        let ga = &geoms[contact.geom_a];
+        let gb = &geoms[contact.geom_b];
+        if !matches!(ga.attachment(), GeomAttach::Link(_, _))
+            && !matches!(gb.attachment(), GeomAttach::Link(_, _))
+        {
+            continue;
+        }
+        let penetration = contact.penetration - contact.gap;
+        if penetration <= 0.0 {
+            continue;
+        }
+        let solref = combine_solref(ga.solref, gb.solref);
+        let solimp = combine_solimp(ga.solimp, gb.solimp);
+        let condim = ga.condim.min(gb.condim);
+        let start_row = rows.len();
+        let (t1, t2) = tangent_basis(contact.normal_world);
+        for (direction, angular) in contact_row_directions(contact.normal_world, t1, t2, condim) {
+            rows.push(WorldContactRow {
+                components: [
+                    world_jacobian_for_side(
+                        ga.attachment(),
+                        1.0,
+                        contact.position_world,
+                        direction,
+                        angular,
+                        bodies,
+                        trees,
+                        &poses,
+                    ),
+                    world_jacobian_for_side(
+                        gb.attachment(),
+                        -1.0,
+                        contact.position_world,
+                        direction,
+                        angular,
+                        bodies,
+                        trees,
+                        &poses,
+                    ),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+                reg: 0.0,
+                diag: 0.0,
+                bias: 0.0,
+            });
+        }
+        blocks.push(WorldContactBlock {
+            contact_index,
+            start_row,
+            condim,
+            solref,
+            solimp,
+            penetration,
+            mu_slide: crate::contact::combine_friction(ga.friction, gb.friction),
+            mu_torsion: crate::geom::combine_torsional_friction(
+                ga.torsional_friction,
+                gb.torsional_friction,
+            ),
+            mu_roll: crate::geom::combine_rolling_friction(
+                ga.rolling_friction,
+                gb.rolling_friction,
+            ),
+        });
+    }
+    if rows.is_empty() {
+        return solution;
+    }
+
+    let n_rows = rows.len();
+    let mut response = vec![0.0f32; n_rows * n_rows];
+    for column in 0..n_rows {
+        let mut body_response = vec![(Vec3::ZERO, Vec3::ZERO); bodies.len()];
+        let mut tree_response: Vec<Vec<f32>> =
+            trees.iter().map(|tree| vec![0.0; tree.nv()]).collect();
+        apply_world_impulse(
+            &rows[column],
+            1.0,
+            &mut body_response,
+            &mut tree_response,
+            bodies,
+            &inv_i_world,
+            &tree_factors,
+        );
+        for (row_index, row) in rows.iter().enumerate() {
+            response[row_index * n_rows + column] =
+                world_velocity_from_delta(row, &body_response, &tree_response, bodies);
+        }
+    }
+
+    for block in &blocks {
+        let row_count = contact_block_n_rows(block.condim);
+        let normal_row = block.start_row;
+        for row_offset in 0..row_count {
+            let row_index = block.start_row + row_offset;
+            let diagonal = response[row_index * n_rows + row_index];
+            let impedance_value = impedance(block.penetration, block.solimp);
+            rows[row_index].reg = if impedance_value > 0.0 {
+                (1.0 - impedance_value) / impedance_value * diagonal
+            } else {
+                0.0
+            };
+            rows[row_index].diag = diagonal + rows[row_index].reg;
+            let velocity = world_current_velocity(&rows[row_index], bodies, trees);
+            let free_velocity =
+                world_free_velocity(&rows[row_index], &tree_free_velocity, gravity, dt);
+            rows[row_index].bias = velocity + free_velocity;
+        }
+        let normal_velocity = world_current_velocity(&rows[normal_row], bodies, trees);
+        let free_normal_velocity =
+            world_free_velocity(&rows[normal_row], &tree_free_velocity, gravity, dt);
+        let reference = reference_accel_scaled(
+            block.penetration,
+            -normal_velocity,
+            block.solref,
+            CONTACT_AREF_ALPHA_DAMPING,
+            CONTACT_AREF_ALPHA_STIFFNESS,
+        );
+        rows[normal_row].bias = normal_velocity + free_normal_velocity + reference * dt;
+    }
+
+    let impulses = if use_newton {
+        let mut hessian = response;
+        for (index, row) in rows.iter().enumerate() {
+            hessian[index * n_rows + index] += row.reg;
+        }
+        let mut projections = Vec::new();
+        for block in &blocks {
+            let normal = block.start_row;
+            projections.push(crate::newton::Projection::NonNegative { index: normal });
+            if block.condim >= 3 {
+                projections.push(crate::newton::Projection::PyramidalCone {
+                    normal,
+                    tangent_1: normal + 1,
+                    tangent_2: normal + 2,
+                    mu: block.mu_slide,
+                });
+                if block.condim >= 4 {
+                    projections.push(crate::newton::Projection::ScalarConeBound {
+                        index: normal + 3,
+                        normal,
+                        mu: block.mu_torsion,
+                    });
+                }
+                if block.condim >= 6 {
+                    projections.push(crate::newton::Projection::PyramidalCone {
+                        normal,
+                        tangent_1: normal + 4,
+                        tangent_2: normal + 5,
+                        mu: block.mu_roll,
+                    });
+                }
+            }
+        }
+        crate::newton::NewtonSystem {
+            hessian,
+            linear: rows.iter().map(|row| row.bias).collect(),
+            projections,
+            max_iterations: iterations.max(1),
+            cost_tolerance: 1e-7,
+        }
+        .solve()
+        .unwrap_or_else(|error| panic!("Newton tree contact solve failed: {error}"))
+        .solution
+    } else {
+        let mut impulses = vec![0.0f32; n_rows];
+        for _ in 0..iterations {
+            for block in &blocks {
+                let normal = block.start_row;
+                world_pgs_non_negative(&rows, &response, normal, &mut impulses);
+                if block.condim >= 3 {
+                    world_pgs_pair(
+                        &rows,
+                        &response,
+                        normal + 1,
+                        normal + 2,
+                        block.mu_slide,
+                        impulses[normal],
+                        cone,
+                        &mut impulses,
+                    );
+                    if block.condim >= 4 {
+                        world_pgs_scalar(
+                            &rows,
+                            &response,
+                            normal + 3,
+                            block.mu_torsion * impulses[normal],
+                            &mut impulses,
+                        );
+                    }
+                    if block.condim >= 6 {
+                        world_pgs_pair(
+                            &rows,
+                            &response,
+                            normal + 4,
+                            normal + 5,
+                            block.mu_roll,
+                            impulses[normal],
+                            cone,
+                            &mut impulses,
+                        );
+                    }
+                }
+            }
+        }
+        impulses
+    };
+
+    for block in &blocks {
+        solution.contact_normal_forces[block.contact_index] = impulses[block.start_row] / dt;
+    }
+    for (row_index, row) in rows.iter().enumerate() {
+        let force = impulses[row_index] / dt;
+        for component in &row.components {
+            if let Some(body) = component.body {
+                let output = &mut solution.body_wrenches[body.index];
+                output.0 += body.linear * force;
+                output.1 += body.angular * force;
+            }
+            if let Some(tree) = &component.tree {
+                for (slot, coefficient) in tree.coefficients.iter().enumerate() {
+                    solution.tree_qfrc[tree.index][slot] += coefficient * force;
+                }
+                let wrench = &mut solution.tree_wrenches[tree.index][tree.link];
+                wrench.0 += tree.wrench_linear * force;
+                wrench.1 += tree.wrench_angular * force;
+            }
+        }
+    }
+    solution
+}
+
+fn contact_row_directions(
+    normal: Vec3,
+    tangent_1: Vec3,
+    tangent_2: Vec3,
+    condim: u8,
+) -> Vec<(Vec3, bool)> {
+    let mut directions = vec![(normal, false)];
+    if condim >= 3 {
+        directions.extend([(tangent_1, false), (tangent_2, false)]);
+    }
+    if condim >= 4 {
+        directions.push((normal, true));
+    }
+    if condim >= 6 {
+        directions.extend([(tangent_1, true), (tangent_2, true)]);
+    }
+    directions
+}
+
+#[allow(clippy::too_many_arguments)]
+fn world_jacobian_for_side(
+    attachment: GeomAttach,
+    sign: f32,
+    contact_position: Vec3,
+    direction: Vec3,
+    angular: bool,
+    bodies: &[Body],
+    trees: &[Tree],
+    poses: &[Vec<(Vec3, Quat)>],
+) -> Option<WorldJacobian> {
+    match attachment {
+        GeomAttach::Static => None,
+        GeomAttach::Body(index) => {
+            let arm = contact_position - bodies[index].position;
+            Some(WorldJacobian {
+                body: Some(WorldBodyJacobian {
+                    index,
+                    linear: if angular {
+                        Vec3::ZERO
+                    } else {
+                        direction * sign
+                    },
+                    angular: if angular {
+                        direction * sign
+                    } else {
+                        arm.cross(direction) * sign
+                    },
+                }),
+                tree: None,
+            })
+        }
+        GeomAttach::Link(tree_index, link_index) => {
+            let (com, orientation) = poses[tree_index][link_index];
+            let local_point = orientation.inverse_rotate(contact_position - com);
+            let jacobian = trees[tree_index].point_jacobian(link_index, local_point);
+            let source = if angular {
+                jacobian.rotational
+            } else {
+                jacobian.translational
+            };
+            Some(WorldJacobian {
+                body: None,
+                tree: Some(WorldTreeJacobian {
+                    index: tree_index,
+                    link: link_index,
+                    coefficients: source
+                        .into_iter()
+                        .map(|column| column.dot(direction) * sign)
+                        .collect(),
+                    wrench_linear: if angular {
+                        Vec3::ZERO
+                    } else {
+                        direction * sign
+                    },
+                    wrench_angular: if angular {
+                        direction * sign
+                    } else {
+                        (contact_position - com).cross(direction * sign)
+                    },
+                }),
+            })
+        }
+    }
+}
+
+fn tree_free_velocity_delta(
+    tree: &Tree,
+    gravity: Vec3,
+    dt: f32,
+    tree_implicit: Option<bool>,
+) -> Vec<f32> {
+    if tree.nv() == 0 {
+        return Vec::new();
+    }
+    let mut free_tree = tree.clone();
+    free_tree.disable_penalty_limits = true;
+    let poses = forward_kinematics(&free_tree);
+    let external = vec![(Vec3::ZERO, Vec3::ZERO); free_tree.links.len()];
+    let qddot = match tree_implicit {
+        None => crate::tree::aba(&free_tree, &poses, gravity, &external),
+        Some(implicit_fast) => {
+            crate::tree::aba_implicit(&free_tree, &poses, gravity, &external, dt, implicit_fast)
+        }
+    };
+    qddot.into_iter().map(|accel| accel * dt).collect()
+}
+
+fn world_current_velocity(row: &WorldContactRow, bodies: &[Body], trees: &[Tree]) -> f32 {
+    row.components
+        .iter()
+        .map(|component| {
+            let body_velocity = component.body.map_or(0.0, |body| {
+                body.linear.dot(bodies[body.index].linear_velocity)
+                    + body
+                        .angular
+                        .dot(bodies[body.index].angular_velocity_world())
+            });
+            let tree_velocity = component.tree.as_ref().map_or(0.0, |tree| {
+                tree.coefficients
+                    .iter()
+                    .zip(&trees[tree.index].qdot)
+                    .map(|(coefficient, velocity)| coefficient * velocity)
+                    .sum()
+            });
+            body_velocity + tree_velocity
+        })
+        .sum()
+}
+
+fn world_free_velocity(
+    row: &WorldContactRow,
+    tree_free_velocity: &[Vec<f32>],
+    gravity: Vec3,
+    dt: f32,
+) -> f32 {
+    row.components
+        .iter()
+        .map(|component| {
+            let body_velocity = component
+                .body
+                .map_or(0.0, |body| body.linear.dot(gravity * dt));
+            let tree_velocity = component.tree.as_ref().map_or(0.0, |tree| {
+                tree.coefficients
+                    .iter()
+                    .zip(&tree_free_velocity[tree.index])
+                    .map(|(coefficient, velocity)| coefficient * velocity)
+                    .sum()
+            });
+            body_velocity + tree_velocity
+        })
+        .sum()
+}
+
+fn world_velocity_from_delta(
+    row: &WorldContactRow,
+    body_delta: &[(Vec3, Vec3)],
+    tree_delta: &[Vec<f32>],
+    bodies: &[Body],
+) -> f32 {
+    row.components
+        .iter()
+        .map(|component| {
+            let body_velocity = component.body.map_or(0.0, |body| {
+                body.linear.dot(body_delta[body.index].0)
+                    + body.angular.dot(
+                        bodies[body.index]
+                            .orientation
+                            .rotate(body_delta[body.index].1),
+                    )
+            });
+            let tree_velocity = component.tree.as_ref().map_or(0.0, |tree| {
+                tree.coefficients
+                    .iter()
+                    .zip(&tree_delta[tree.index])
+                    .map(|(coefficient, velocity)| coefficient * velocity)
+                    .sum()
+            });
+            body_velocity + tree_velocity
+        })
+        .sum()
+}
+
+fn apply_world_impulse(
+    row: &WorldContactRow,
+    impulse: f32,
+    body_delta: &mut [(Vec3, Vec3)],
+    tree_delta: &mut [Vec<f32>],
+    bodies: &[Body],
+    inv_i_world: &[crate::math::Mat3],
+    tree_factors: &[Vec<f32>],
+) {
+    for component in &row.components {
+        if let Some(body) = component.body {
+            let body_state = &bodies[body.index];
+            let force = body.linear * impulse;
+            let torque = body.angular * impulse;
+            let angular_velocity = inv_i_world[body.index] * torque;
+            body_delta[body.index].0 += force / body_state.mass;
+            body_delta[body.index].1 += body_state.orientation.inverse_rotate(angular_velocity);
+        }
+        if let Some(tree) = &component.tree {
+            let mut generalized_impulse = vec![0.0; tree.coefficients.len()];
+            for (slot, coefficient) in tree.coefficients.iter().enumerate() {
+                generalized_impulse[slot] = coefficient * impulse;
+            }
+            let response = cholesky_solve(
+                &tree_factors[tree.index],
+                generalized_impulse.len(),
+                &generalized_impulse,
+            );
+            for (slot, velocity) in response.into_iter().enumerate() {
+                tree_delta[tree.index][slot] += velocity;
+            }
+        }
+    }
+}
+
+fn world_pgs_residual(
+    rows: &[WorldContactRow],
+    response: &[f32],
+    index: usize,
+    impulses: &[f32],
+) -> f32 {
+    let n_rows = rows.len();
+    rows[index].bias
+        + (0..n_rows)
+            .map(|column| response[index * n_rows + column] * impulses[column])
+            .sum::<f32>()
+}
+
+fn world_pgs_non_negative(
+    rows: &[WorldContactRow],
+    response: &[f32],
+    index: usize,
+    impulses: &mut [f32],
+) {
+    let residual =
+        world_pgs_residual(rows, response, index, impulses) + rows[index].reg * impulses[index];
+    let projected = (impulses[index] - residual / rows[index].diag).max(0.0);
+    impulses[index] = projected;
+}
+
+fn world_pgs_scalar(
+    rows: &[WorldContactRow],
+    response: &[f32],
+    index: usize,
+    cap: f32,
+    impulses: &mut [f32],
+) {
+    let residual =
+        world_pgs_residual(rows, response, index, impulses) + rows[index].reg * impulses[index];
+    impulses[index] = project_pyramidal(impulses[index] - residual / rows[index].diag, cap);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn world_pgs_pair(
+    rows: &[WorldContactRow],
+    response: &[f32],
+    index_1: usize,
+    index_2: usize,
+    mu: f32,
+    normal_impulse: f32,
+    cone: ConeKind,
+    impulses: &mut [f32],
+) {
+    match cone {
+        ConeKind::Pyramidal => {
+            let cap = mu * normal_impulse;
+            world_pgs_scalar(rows, response, index_1, cap, impulses);
+            world_pgs_scalar(rows, response, index_2, cap, impulses);
+        }
+        ConeKind::Elliptic => {
+            let residual_1 = world_pgs_residual(rows, response, index_1, impulses)
+                + rows[index_1].reg * impulses[index_1];
+            let residual_2 = world_pgs_residual(rows, response, index_2, impulses)
+                + rows[index_2].reg * impulses[index_2];
+            let (projected_1, projected_2) = project_elliptic(
+                impulses[index_1] - residual_1 / rows[index_1].diag,
+                impulses[index_2] - residual_2 / rows[index_2].diag,
+                mu,
+                normal_impulse,
+            );
+            impulses[index_1] = projected_1;
+            impulses[index_2] = projected_2;
+        }
+    }
 }
 
 /// Contribution of the "free evolution" (gravity + gyroscopic) step to

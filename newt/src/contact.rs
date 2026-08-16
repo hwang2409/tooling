@@ -449,7 +449,7 @@ pub fn sphere_capsule(
 /// contacts as soon as the top block tilts even microradians and its
 /// two lifted corners fail the "vertex inside the other box" test — the
 /// root cause of the v1 box_stack differential finding
-/// (docs/differential.md). Only the PGS pipeline routes through the
+/// (docs/differential.md). The PGS and Newton pipelines route through the
 /// full-manifold variant; the penalty pipeline continues to use
 /// [`box_box`] so its trajectories stay bit-identical.
 #[allow(clippy::too_many_arguments)]

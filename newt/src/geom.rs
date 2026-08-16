@@ -281,8 +281,9 @@ pub struct Geom {
     /// `3` — normal + 2 tangents (sliding friction); `4` — condim 3 plus a
     /// torsional row about the normal (drills spinning); `6` — condim 4
     /// plus two rolling rows about the tangent axes. Only consulted when
-    /// `world.solver.mode == Pgs`; penalty mode always applies the
-    /// condim-3 pyramidal path. Tree contacts remain on the penalty path.
+    /// `world.solver.mode` is `Pgs` or `Newton`; penalty mode always applies the
+    /// condim-3 pyramidal path. Tree contacts use the same selected solver
+    /// rows as free-body contacts when PGS or Newton is active.
     ///
     /// Pair rule: `min(a.condim, b.condim)` — the less-detailed cone
     /// wins, matching MuJoCo. Default `3`. condim `4` reads

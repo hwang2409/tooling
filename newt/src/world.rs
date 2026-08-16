@@ -2,7 +2,8 @@
 //!
 //! # Scope (tier 2)
 //!
-//! Free bodies under uniform gravity plus contact forces from a penalty model.
+//! Free bodies under uniform gravity plus contact forces from the selected
+//! penalty or soft-constraint model.
 //! Bodies, geoms, and contact pairs are index-stable across the simulation.
 //!
 //! # Contact model
@@ -44,7 +45,7 @@ use crate::geom::{
 use crate::joint::JointKind;
 use crate::math::{Quat, Vec3};
 use crate::sensor::{Sensor, SensorBank, SensorError, SensorInputs};
-use crate::solver::{SolverConfig, SolverMode, solve_free_bodies};
+use crate::solver::{SolverConfig, SolverMode, TreeContactSolution, solve_free_bodies};
 use crate::tree::{
     Tree, euler_step as tree_euler_step, forward_kinematics as tree_forward_kinematics,
     rk4_step as tree_rk4_step,
@@ -704,18 +705,23 @@ impl World {
             Some(p) => p.clone(),
             None => self.auto_pairs(),
         };
+        let tree_contact_solution = match self.solver.mode {
+            SolverMode::Penalty => None,
+            SolverMode::Pgs => self.compute_tree_contact_solution(&pairs, false),
+            SolverMode::Newton => self.compute_tree_contact_solution(&pairs, true),
+        };
         match self.integrator {
             Integrator::Rk4 => {
-                self.step_bodies(&pairs);
-                self.step_trees(&pairs);
+                self.step_bodies(&pairs, tree_contact_solution.as_ref());
+                self.step_trees(&pairs, tree_contact_solution.as_ref());
             }
             Integrator::Euler => {
-                self.step_trees_euler(&pairs, false);
-                self.step_bodies_euler(&pairs);
+                self.step_trees_euler(&pairs, false, tree_contact_solution.as_ref());
+                self.step_bodies_euler(&pairs, tree_contact_solution.as_ref());
             }
             Integrator::ImplicitFast => {
-                self.step_trees_euler(&pairs, true);
-                self.step_bodies_euler(&pairs);
+                self.step_trees_euler(&pairs, true, tree_contact_solution.as_ref());
+                self.step_bodies_euler(&pairs, tree_contact_solution.as_ref());
             }
         }
         // Sensor evaluation runs strictly on post-step state — no
@@ -790,7 +796,7 @@ impl World {
         );
 
         // Body wrenches + per-contact normal forces (touch sensor input).
-        let (body_wrenches, free_body_contact_forces): (Vec<(Vec3, Vec3)>, Vec<f32>) =
+        let (mut body_wrenches, free_body_contact_forces): (Vec<(Vec3, Vec3)>, Vec<f32>) =
             match self.solver.mode {
                 SolverMode::Penalty => {
                     let w = self.compute_wrenches(&self.bodies, pairs);
@@ -822,44 +828,71 @@ impl World {
                 ),
             };
 
-        // Per-tree external wrenches + contacts touching each tree. We
-        // package all tree contacts for touch (each with its penalty-formula
-        // normal force — trees always use the penalty pathway for wrenches
-        // in the current implementation).
-        let mut tree_wrenches: Vec<crate::tree::ExternalWrenches> =
-            Vec::with_capacity(self.trees.len());
-        let mut tree_contacts: Vec<Contact> = Vec::new();
-        let mut tree_contact_forces: Vec<f32> = Vec::new();
-        for (ti, tree) in self.trees.iter().enumerate() {
-            let mut tp: Vec<(usize, usize)> = Vec::new();
-            for &(a, b) in pairs {
-                let att_a = self.geoms[a].attachment();
-                let att_b = self.geoms[b].attachment();
-                let a_ours = matches!(att_a, GeomAttach::Link(t, _) if t == ti);
-                let b_ours = matches!(att_b, GeomAttach::Link(t, _) if t == ti);
-                if a_ours || b_ours {
-                    tp.push((a, b));
+        // Keep one original-indexed tree contact list. The solver solution
+        // uses this exact order, so touch sensors cannot drift when a gap
+        // contact is omitted from the compact row system.
+        let tree_contacts: Vec<Contact> =
+            collect_contacts_full(&self.bodies, &self.trees, &self.geoms, &self.meshes, pairs)
+                .into_iter()
+                .filter(|contact| {
+                    matches!(
+                        self.geoms[contact.geom_a].attachment(),
+                        GeomAttach::Link(_, _)
+                    ) || matches!(
+                        self.geoms[contact.geom_b].attachment(),
+                        GeomAttach::Link(_, _)
+                    )
+                })
+                .collect();
+        let tree_contact_solution = match self.solver.mode {
+            SolverMode::Penalty => None,
+            SolverMode::Pgs => Some(self.solve_tree_contact_sensor_solution(&tree_contacts, false)),
+            SolverMode::Newton => {
+                Some(self.solve_tree_contact_sensor_solution(&tree_contacts, true))
+            }
+        };
+        let (tree_wrenches, tree_contact_forces) =
+            if let Some(solution) = tree_contact_solution.as_ref() {
+                (
+                    solution.tree_wrenches.clone(),
+                    solution.contact_normal_forces.clone(),
+                )
+            } else {
+                let mut wrenches = Vec::with_capacity(self.trees.len());
+                for (ti, tree) in self.trees.iter().enumerate() {
+                    let tree_pairs: Vec<(usize, usize)> = pairs
+                        .iter()
+                        .copied()
+                        .filter(|&(a, b)| {
+                            matches!(self.geoms[a].attachment(), GeomAttach::Link(t, _) if t == ti)
+                                || matches!(
+                                    self.geoms[b].attachment(),
+                                    GeomAttach::Link(t, _) if t == ti
+                                )
+                        })
+                        .collect();
+                    wrenches.push(tree_wrenches_from_contacts(
+                        tree,
+                        ti,
+                        &self.bodies,
+                        &self.geoms,
+                        &self.meshes,
+                        &tree_pairs,
+                    ));
                 }
+                let forces = tree_contacts
+                    .iter()
+                    .map(|contact| {
+                        penalty_normal_force(contact, &self.bodies, &self.trees, &self.geoms)
+                    })
+                    .collect();
+                (wrenches, forces)
+            };
+        if let Some(solution) = tree_contact_solution.as_ref() {
+            for (wrench, solved) in body_wrenches.iter_mut().zip(&solution.body_wrenches) {
+                wrench.0 += solved.0;
+                wrench.1 += solved.1;
             }
-            tree_wrenches.push(tree_wrenches_from_contacts(
-                tree,
-                ti,
-                &self.bodies,
-                &self.geoms,
-                &self.meshes,
-                &tp,
-            ));
-            let cts =
-                collect_contacts_full(&self.bodies, &self.trees, &self.geoms, &self.meshes, &tp);
-            for c in &cts {
-                tree_contact_forces.push(penalty_normal_force(
-                    c,
-                    &self.bodies,
-                    &self.trees,
-                    &self.geoms,
-                ));
-            }
-            tree_contacts.extend(cts);
         }
 
         // Merge free-body + tree contacts (preserving order) so touch
@@ -886,7 +919,11 @@ impl World {
 
     /// Advance only the free bodies. Preserves the tier-1/2 behavior
     /// bit-for-bit when no tree links are in play.
-    fn step_bodies(&mut self, pairs: &[(usize, usize)]) {
+    fn step_bodies(
+        &mut self,
+        pairs: &[(usize, usize)],
+        tree_contact_solution: Option<&TreeContactSolution>,
+    ) {
         let s0 = self.bodies.clone();
 
         // Solver mode dispatch:
@@ -898,7 +935,9 @@ impl World {
         //   for the rationale + tradeoffs.
         let solver_zoh: Option<Vec<(Vec3, Vec3)>> = match self.solver.mode {
             SolverMode::Penalty => None,
-            SolverMode::Pgs | SolverMode::Newton => Some(self.compute_solver_wrenches(&s0, pairs)),
+            SolverMode::Pgs | SolverMode::Newton => {
+                Some(self.compute_solver_wrenches(&s0, pairs, tree_contact_solution))
+            }
         };
         let sample_wrenches = |state: &[Body], pairs: &[(usize, usize)]| -> Vec<(Vec3, Vec3)> {
             match &solver_zoh {
@@ -957,11 +996,15 @@ impl World {
     /// Advance free bodies with MuJoCo's semi-implicit Euler ordering.
     /// Contact and PGS forces are sampled once from the current state. The
     /// updated velocity drives both the position and quaternion updates.
-    fn step_bodies_euler(&mut self, pairs: &[(usize, usize)]) {
+    fn step_bodies_euler(
+        &mut self,
+        pairs: &[(usize, usize)],
+        tree_contact_solution: Option<&TreeContactSolution>,
+    ) {
         let ext = match self.solver.mode {
             SolverMode::Penalty => self.compute_wrenches(&self.bodies, pairs),
             SolverMode::Pgs | SolverMode::Newton => {
-                self.compute_solver_wrenches(&self.bodies, pairs)
+                self.compute_solver_wrenches(&self.bodies, pairs, tree_contact_solution)
             }
         };
         let accel = evaluate_all(&self.bodies, self.gravity, &ext);
@@ -980,14 +1023,16 @@ impl World {
 
     /// Advance the kinematic trees under gravity + contact wrenches.
     ///
-    /// v0 simplification: cross-integration between free bodies and tree
-    /// links within a single sub-stage is NOT modeled. Contacts that touch
-    /// a tree link generate a wrench for the link's tree only; the other
-    /// side (a free body or a static geom) is treated as a "wall" for the
-    /// tree. Contacts that touch only free bodies are handled by
-    /// [`Self::step_bodies`]. Trees are integrated independently of each
-    /// other in stable index order.
-    fn step_trees(&mut self, pairs: &[(usize, usize)]) {
+    /// Penalty mode keeps the legacy independent-tree contact callback.
+    /// PGS and Newton use one start-of-step world contact solve, then add the
+    /// returned joint forces here. Contacts touching only free bodies are
+    /// handled by [`Self::step_bodies`]. Trees are integrated in stable index
+    /// order after the shared solve.
+    fn step_trees(
+        &mut self,
+        pairs: &[(usize, usize)],
+        tree_contact_solution: Option<&TreeContactSolution>,
+    ) {
         if self.trees.is_empty() {
             return;
         }
@@ -1047,6 +1092,11 @@ impl World {
                     ),
                     SolverMode::Penalty => unreachable!(),
                 };
+                if let Some(solution) = tree_contact_solution {
+                    for (slot, delta) in solution.tree_qfrc[ti].iter().enumerate() {
+                        solver_qfrc_delta[slot] += delta;
+                    }
+                }
                 for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
                     tree.qfrc_applied[slot] += delta;
                 }
@@ -1059,14 +1109,18 @@ impl World {
                 let geoms_ref = &self.geoms;
                 let meshes_ref = &self.meshes;
                 tree_rk4_step(&mut tree, gravity, dt, |t| {
-                    tree_wrenches_from_contacts(
-                        t,
-                        ti,
-                        bodies_ref,
-                        geoms_ref,
-                        meshes_ref,
-                        &tree_pairs,
-                    )
+                    if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
+                        vec![(Vec3::ZERO, Vec3::ZERO); t.links.len()]
+                    } else {
+                        tree_wrenches_from_contacts(
+                            t,
+                            ti,
+                            bodies_ref,
+                            geoms_ref,
+                            meshes_ref,
+                            &tree_pairs,
+                        )
+                    }
                 });
             }
             // Roll back the ZOH limit torque + penalty-limit gate so
@@ -1084,7 +1138,12 @@ impl World {
     /// callback is called once at the current state, and the tree ABA folds
     /// joint damping into `M + dt*B`. `implicit_fast` also folds the negative
     /// velocity derivative of joint-transmitted actuator forces.
-    fn step_trees_euler(&mut self, pairs: &[(usize, usize)], implicit_fast: bool) {
+    fn step_trees_euler(
+        &mut self,
+        pairs: &[(usize, usize)],
+        implicit_fast: bool,
+        tree_contact_solution: Option<&TreeContactSolution>,
+    ) {
         if self.trees.is_empty() {
             return;
         }
@@ -1125,6 +1184,11 @@ impl World {
                     ),
                     SolverMode::Penalty => unreachable!(),
                 };
+                if let Some(solution) = tree_contact_solution {
+                    for (slot, delta) in solution.tree_qfrc[ti].iter().enumerate() {
+                        solver_qfrc_delta[slot] += delta;
+                    }
+                }
                 for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
                     tree.qfrc_applied[slot] += delta;
                 }
@@ -1135,14 +1199,18 @@ impl World {
                 let geoms_ref = &self.geoms;
                 let meshes_ref = &self.meshes;
                 tree_euler_step(&mut tree, gravity, dt, implicit_fast, |state| {
-                    tree_wrenches_from_contacts(
-                        state,
-                        ti,
-                        bodies_ref,
-                        geoms_ref,
-                        meshes_ref,
-                        &tree_pairs,
-                    )
+                    if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
+                        vec![(Vec3::ZERO, Vec3::ZERO); state.links.len()]
+                    } else {
+                        tree_wrenches_from_contacts(
+                            state,
+                            ti,
+                            bodies_ref,
+                            geoms_ref,
+                            meshes_ref,
+                            &tree_pairs,
+                        )
+                    }
                 });
             }
             for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
@@ -1165,15 +1233,15 @@ impl World {
 
     /// Compute per-body external wrench arrays for solver mode.
     ///
-    /// Runs the PGS solve at `state` (typically s0 — start of RK4 step) and
+    /// Runs the PGS or Newton solve at `state` (typically s0 — start of RK4 step) and
     /// returns per-body `(force_world, torque_world_at_com)` to hold
-    /// constant across all four RK4 sub-stages. Contacts touching tree
-    /// links are dropped (v1-tier-4 scope: cross-tree/body contacts remain
-    /// on the penalty pathway; see newt/docs/solver.md).
+    /// constant across all four RK4 sub-stages. Tree-involved contact rows
+    /// are added by the shared world solve before this result is returned.
     fn compute_solver_wrenches(
         &self,
         state: &[Body],
         pairs: &[(usize, usize)],
+        tree_contact_solution: Option<&TreeContactSolution>,
     ) -> Vec<(Vec3, Vec3)> {
         // Filter pairs to free-body-only ones (both sides Body or
         // Static). `solve_free_bodies` returns per-body zero wrenches
@@ -1218,8 +1286,65 @@ impl World {
             ),
             SolverMode::Penalty => unreachable!("penalty does not call compute_solver_wrenches"),
         };
-        self.apply_mocap_wrenches(&mut wrenches, state, pairs);
+        if tree_contact_solution.is_none() {
+            self.apply_mocap_wrenches(&mut wrenches, state, pairs);
+        }
+        if let Some(solution) = tree_contact_solution {
+            for (wrench, solved) in wrenches.iter_mut().zip(&solution.body_wrenches) {
+                wrench.0 += solved.0;
+                wrench.1 += solved.1;
+            }
+        }
         wrenches
+    }
+
+    /// Assemble the full solver contact set for rows that touch a tree.
+    /// Contacts stay in the original narrow-phase order so sensor force
+    /// readings can index the result without a compact-row offset.
+    fn compute_tree_contact_solution(
+        &self,
+        pairs: &[(usize, usize)],
+        use_newton: bool,
+    ) -> Option<TreeContactSolution> {
+        let contacts =
+            collect_contacts_full(&self.bodies, &self.trees, &self.geoms, &self.meshes, pairs);
+        let tree_contacts: Vec<Contact> = contacts
+            .into_iter()
+            .filter(|contact| {
+                matches!(
+                    self.geoms[contact.geom_a].attachment(),
+                    GeomAttach::Link(_, _)
+                ) || matches!(
+                    self.geoms[contact.geom_b].attachment(),
+                    GeomAttach::Link(_, _)
+                )
+            })
+            .collect();
+        Some(self.solve_tree_contact_sensor_solution(&tree_contacts, use_newton))
+    }
+
+    fn solve_tree_contact_sensor_solution(
+        &self,
+        tree_contacts: &[Contact],
+        use_newton: bool,
+    ) -> TreeContactSolution {
+        let tree_implicit = match self.integrator {
+            Integrator::Rk4 => None,
+            Integrator::Euler => Some(false),
+            Integrator::ImplicitFast => Some(true),
+        };
+        crate::solver::solve_tree_contacts(
+            &self.bodies,
+            &self.trees,
+            &self.geoms,
+            tree_contacts,
+            self.gravity,
+            self.dt,
+            self.solver.cone,
+            self.solver.iterations,
+            use_newton,
+            tree_implicit,
+        )
     }
 
     /// Compute per-body external wrench arrays for a given body-state vector.
@@ -1384,7 +1509,7 @@ fn collect_contacts_full(
     out
 }
 
-/// Compute per-link external wrenches for one tree at its current state.
+/// Compute per-link external wrenches for one tree in penalty mode.
 /// Iterates the pairs that touch this tree, resolves the OTHER side of each
 /// pair (a body, static, or another tree link), and applies the same
 /// penalty/friction contact model as tier 2, but records forces only on the
@@ -1438,7 +1563,7 @@ fn tree_wrenches_from_contacts(
     out
 }
 
-/// Apply one contact's wrench to a link of the given tree, following the
+/// Apply one penalty contact's wrench to a link of the given tree, following the
 /// same penalty / pyramidal-friction model as the free-body path. The
 /// "other side" of the contact contributes only its point velocity for the
 /// relative-normal-velocity term; equal-opposite reaction on the other side
