@@ -146,6 +146,7 @@ def _capture_scenario(
     scenario: dict,
     refs_dir: Path,
     integrator_override: str | None = None,
+    solver_override: str | None = None,
     suffix: str = "",
 ) -> tuple[Path, str]:
     """Run one scenario and write its fixture. Returns (path, provenance).
@@ -174,6 +175,12 @@ def _capture_scenario(
             "implicitfast": mujoco.mjtIntegrator.mjINT_IMPLICITFAST,
         }
         model.opt.integrator = integrators[integrator_override]
+    if solver_override is not None:
+        solvers = {
+            "PGS": mujoco.mjtSolver.mjSOL_PGS,
+            "Newton": mujoco.mjtSolver.mjSOL_NEWTON,
+        }
+        model.opt.solver = solvers[solver_override]
     data = mujoco.MjData(model)
 
     # Apply overrides. Both are applied in MuJoCo layout — the scenarios.json
@@ -355,6 +362,11 @@ def main(argv: list[str]) -> int:
         help="Override the XML integrator for a matched-integrator capture.",
     )
     parser.add_argument(
+        "--solver",
+        choices=["PGS", "Newton"],
+        help="Override the XML solver for a matched-solver capture.",
+    )
+    parser.add_argument(
         "--suffix",
         default="",
         help="Suffix inserted before .bin, for example _euler.",
@@ -404,6 +416,7 @@ def main(argv: list[str]) -> int:
             scenario,
             refs_dir,
             integrator_override=args.integrator,
+            solver_override=args.solver,
             suffix=args.suffix,
         )
         print(f"wrote {path.name} :: {prov}")

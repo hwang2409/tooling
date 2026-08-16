@@ -12,6 +12,7 @@ use newt::contact::Contact;
 use newt::math::{self, Quat, Vec3};
 use newt::mjcf::load_mjcf_path;
 use newt::model::Scene;
+use newt::solver::{ConeKind, SolverMode};
 use newt::tree::Tree;
 use newt::world::Integrator;
 
@@ -615,6 +616,23 @@ pub fn run_walk_with_integrator(config: GaitConfig, integrator: Integrator) -> W
     run_walk_observed_with_integrator(config, integrator, |_, _| {})
 }
 
+/// Run the walker with an explicit integrator and constraint solver. This is
+/// used by the Newton acceptance anchor; the default helpers keep their
+/// established PGS configuration. Tree contacts remain on the penalty path.
+pub fn run_walk_with_solver(
+    config: GaitConfig,
+    integrator: Integrator,
+    solver: SolverMode,
+) -> WalkResult {
+    run_walk_observed_from_path_with_options(
+        Path::new(MODEL_PATH),
+        config,
+        Some(integrator),
+        Some(solver),
+        |_, _| {},
+    )
+}
+
 pub fn run_walk_from_path(path: &Path, config: GaitConfig) -> WalkResult {
     run_walk_observed_from_path(path, config, |_, _| {})
 }
@@ -672,7 +690,7 @@ fn run_walk_observed_from_path<F>(path: &Path, config: GaitConfig, observer: F) 
 where
     F: FnMut(usize, &Scene),
 {
-    run_walk_observed_from_path_with_integrator(path, config, None, observer)
+    run_walk_observed_from_path_with_options(path, config, None, None, observer)
 }
 
 fn run_walk_observed_with_integrator<F>(
@@ -683,18 +701,20 @@ fn run_walk_observed_with_integrator<F>(
 where
     F: FnMut(usize, &Scene),
 {
-    run_walk_observed_from_path_with_integrator(
+    run_walk_observed_from_path_with_options(
         Path::new(MODEL_PATH),
         config,
         Some(integrator),
+        None,
         observer,
     )
 }
 
-fn run_walk_observed_from_path_with_integrator<F>(
+fn run_walk_observed_from_path_with_options<F>(
     path: &Path,
     config: GaitConfig,
     integrator: Option<Integrator>,
+    solver: Option<SolverMode>,
     mut observer: F,
 ) -> WalkResult
 where
@@ -703,6 +723,12 @@ where
     let mut scene = load_mjcf_path(path).expect("biped-walk MJCF must load");
     if let Some(integrator) = integrator {
         scene.world.integrator = integrator;
+    }
+    if let Some(solver) = solver {
+        scene.world.solver.mode = solver;
+        if solver == SolverMode::Newton {
+            scene.world.solver.cone = ConeKind::Pyramidal;
+        }
     }
     let root_height = config.newt_root_height();
     scene.world.trees[0].set_free_root_pose(Vec3::new(0.0, 0.0, root_height), Quat::IDENTITY);

@@ -76,6 +76,18 @@ fn incline_scene() -> World {
     w
 }
 
+fn newton_stack_scene() -> World {
+    let mut world = stack_scene();
+    world.solver.mode = SolverMode::Newton;
+    world
+}
+
+fn newton_incline_scene() -> World {
+    let mut world = incline_scene();
+    world.solver.mode = SolverMode::Newton;
+    world
+}
+
 fn snapshot(world: &World) -> Vec<u8> {
     let mut out = Vec::with_capacity(world.bodies.len() * F32_PER_BODY * 4);
     for body in &world.bodies {
@@ -126,6 +138,14 @@ const INCLINE_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/goldens/solver_incline.bin"
 );
+const NEWTON_STACK_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/goldens/solver_newton_stack.bin"
+);
+const NEWTON_INCLINE_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/goldens/solver_newton_incline.bin"
+);
 
 fn assert_golden(path: &str, actual: &[u8]) {
     let expected = std::fs::read(path).unwrap_or_else(|e| {
@@ -165,6 +185,18 @@ fn solver_incline_golden_byte_identical() {
     assert_golden(INCLINE_PATH, &bytes);
 }
 
+#[test]
+fn solver_newton_stack_golden_byte_identical() {
+    let mut world = newton_stack_scene();
+    assert_golden(NEWTON_STACK_PATH, &record(&mut world));
+}
+
+#[test]
+fn solver_newton_incline_golden_byte_identical() {
+    let mut world = newton_incline_scene();
+    assert_golden(NEWTON_INCLINE_PATH, &record(&mut world));
+}
+
 /// Regenerate BOTH solver-mode goldens. Ignored so it does not run in
 /// CI. macOS-aarch64 only — see the panic in the standing
 /// [`regenerate_golden`](tests/golden.rs) test for the rationale.
@@ -183,6 +215,8 @@ fn regenerate_solver_goldens() {
     for (path, bytes) in [
         (STACK_PATH, record(&mut stack_scene())),
         (INCLINE_PATH, record(&mut incline_scene())),
+        (NEWTON_STACK_PATH, record(&mut newton_stack_scene())),
+        (NEWTON_INCLINE_PATH, record(&mut newton_incline_scene())),
     ] {
         let dir = std::path::Path::new(path).parent().unwrap();
         std::fs::create_dir_all(dir).unwrap();

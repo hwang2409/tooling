@@ -47,6 +47,9 @@
 //!   limits for hinge/slide. Opt-in via `world.solver.mode = Pgs`;
 //!   penalty is still default and preserves every existing golden.
 //!   See `docs/solver.md`.
+//! - **v3** (`newton`) — opt-in dense Newton minimization over the same
+//!   regularized system, with exact pyramidal zone derivatives and an
+//!   analytical piecewise-quadratic line search. See `docs/newton.md`.
 //! - **v1 tier 5** (`equality`, solver/model extensions) — equality
 //!   constraints (connect, weld, joint coupling, distance) as bilateral
 //!   PGS rows with per-constraint `(solref, solimp)`; contact `condim`
@@ -81,6 +84,7 @@ pub mod json;
 pub mod math;
 pub mod mjcf;
 pub mod model;
+pub mod newton;
 pub mod sensor;
 pub mod solver;
 pub mod spatial;

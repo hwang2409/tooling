@@ -1,4 +1,4 @@
-//! MuJoCo soft-constraint contact model and PGS solver (v1 tier 4).
+//! MuJoCo soft-constraint contact model with PGS and Newton solvers.
 //!
 //! Full derivation lives in `docs/solver.md`. In brief: contacts and
 //! joint-range limits are modeled as *inequality constraints* on a
@@ -25,9 +25,9 @@
 //! h(q, qdot)) · dt`). The projection sets are per-constraint: normal /
 //! limit forces are non-negative; friction is bounded by the cone.
 //!
-//! We solve this with a fixed-iteration Projected Gauss-Seidel sweep. The
-//! iteration count is a model parameter — determinism outranks convergence
-//! sensitivity in this engine, so we do not early-exit.
+//! PGS remains the established dual sweep. Newton uses the same assembled
+//! rows and minimizes the dense regularized quadratic in `crate::newton`.
+//! Both have fixed iteration caps and deterministic cost convergence.
 //!
 //! # Determinism
 //!
@@ -40,11 +40,11 @@
 //!
 //! # Scope this ticket
 //!
-//! - condim 1 (frictionless) and condim 3 (normal + 2 tangents), with both
-//!   pyramidal and elliptic cone options.
+//! - condim 1 (frictionless) and condim 3 (normal + 2 tangents). PGS accepts
+//!   both cone options; Newton accepts pyramidal cones in this ticket.
 //! - Constraint-based joint limits for hinge and slide (ball still deferred).
-//! - condim 4 / 6 (torsional / rolling) land with the equality-constraints
-//!   ticket.
+//! - condim 4 / 6 (torsional / rolling) use the same free-body rows as the
+//!   solver. Tree contacts remain on the penalty pathway in every mode.
 //! - RK4 integrator + solve-once-per-step (ZOH): we compute the solver
 //!   forces at the START of the step and hold them constant across the four
 //!   RK4 stages. MuJoCo does one Euler step per solve; keeping RK4 while
@@ -63,6 +63,11 @@ pub enum SolverMode {
     Penalty,
     /// MuJoCo soft-constraint model solved by PGS.
     Pgs,
+    /// MuJoCo soft-constraint model solved by dense Newton iterations.
+    ///
+    /// Newton is opt-in.  The legacy penalty default and the PGS path remain
+    /// unchanged for existing scenes and byte-identical goldens.
+    Newton,
 }
 
 /// Friction cone parameterization.
@@ -79,6 +84,9 @@ pub enum ConeKind {
     Elliptic,
 }
 
+const NEWTON_ELLIPTIC_ERROR: &str =
+    "solver=newton with cone=elliptic is not supported yet; use cone=pyramidal";
+
 /// World-level solver configuration.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SolverConfig {
@@ -89,7 +97,8 @@ pub struct SolverConfig {
     /// same runtime cost per iteration. Determinism outranks early-exit
     /// convergence sensitivity here: we always run exactly this many.
     pub iterations: u32,
-    /// Cone parameterization (only consulted when `mode == Pgs`).
+    /// Cone parameterization. Newton currently accepts pyramidal cones only;
+    /// elliptic Newton models are rejected during loading.
     pub cone: ConeKind,
 }
 
@@ -104,6 +113,20 @@ impl SolverConfig {
 impl Default for SolverConfig {
     fn default() -> Self {
         Self::DEFAULT
+    }
+}
+
+impl SolverConfig {
+    /// Validate configuration combinations that loaders can reject before a
+    /// simulation starts.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mode == SolverMode::Newton && self.cone == ConeKind::Elliptic {
+            return Err(NEWTON_ELLIPTIC_ERROR.to_string());
+        }
+        if self.iterations == 0 {
+            return Err("solver iterations must be >= 1".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -510,6 +533,26 @@ pub fn solve_free_bodies(
     wrenches
 }
 
+/// Newton counterpart to [`solve_free_bodies`].  It assembles the same rows,
+/// bias, and regularized Delassus matrix as PGS, then minimizes the convex
+/// quadratic with deterministic pyramidal-cone Newton steps.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_free_bodies_newton(
+    bodies: &[Body],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    equalities: &[Equality],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+) -> Vec<(Vec3, Vec3)> {
+    let (wrenches, _) = solve_free_bodies_newton_diag(
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations,
+    );
+    wrenches
+}
+
 /// Diagnostic variant of [`solve_free_bodies`]. Returns the same per-body
 /// wrenches PLUS a `Vec<f32>` with one entry per input contact: the
 /// per-contact normal force (impulse / dt) after the PGS sweep. Used by
@@ -528,6 +571,77 @@ pub fn solve_free_bodies_diag(
     cone: ConeKind,
     iterations: u32,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
+    solve_free_bodies_diag_mode(
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, false, None,
+    )
+}
+
+/// Diagnostic Newton variant. The normal-force output has the same shape as
+/// the PGS diagnostic API so touch sensors observe the force actually used by
+/// the integrator.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_free_bodies_newton_diag(
+    bodies: &[Body],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    equalities: &[Equality],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
+    solve_free_bodies_diag_mode(
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, true, None,
+    )
+}
+
+/// Return the live Newton cost trace for one free-body constraint solve.
+///
+/// The first value is the zero-impulse cost. Later values are accepted line
+/// search costs. An empty trace means that the input has no active rows.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_free_bodies_newton_trace(
+    bodies: &[Body],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    equalities: &[Equality],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+) -> Vec<f32> {
+    let mut trace = Vec::new();
+    let _ = solve_free_bodies_diag_mode(
+        bodies,
+        geoms,
+        contacts,
+        equalities,
+        gravity,
+        dt,
+        cone,
+        iterations,
+        true,
+        Some(&mut trace),
+    );
+    trace
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_free_bodies_diag_mode(
+    bodies: &[Body],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    equalities: &[Equality],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+    use_newton: bool,
+    newton_cost_trace: Option<&mut Vec<f32>>,
+) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
+    if use_newton && cone == ConeKind::Elliptic {
+        panic!("{NEWTON_ELLIPTIC_ERROR}");
+    }
     let n_bodies = bodies.len();
     let mut wrenches = vec![(Vec3::ZERO, Vec3::ZERO); n_bodies];
     let mut contact_normal_forces = vec![0.0f32; contacts.len()];
@@ -551,7 +665,7 @@ pub fn solve_free_bodies_diag(
     let dw_body_free_per_body: Vec<Vec3> = vec![Vec3::ZERO; n_bodies];
 
     // ---- Contact blocks ---------------------------------------------------
-    for c in contacts.iter() {
+    for (contact_index, c) in contacts.iter().enumerate() {
         let ga = &geoms[c.geom_a];
         let gb = &geoms[c.geom_b];
         let body_a = ga.body.map(|i| i as u32);
@@ -655,6 +769,7 @@ pub fn solve_free_bodies_diag(
         }
 
         per_contact.push(PerContact {
+            contact_index,
             start_row,
             condim,
             solref,
@@ -775,89 +890,108 @@ pub fn solve_free_bodies_diag(
         }
     }
 
-    // ---- PGS iteration ----------------------------------------------------
-    let mut impulses = vec![0.0f32; n_rows];
-    let mut body_delta = vec![BodyDelta::default(); n_bodies];
+    // ---- Solve the shared regularized system -----------------------------
+    // Newton and PGS consume the same H = J M⁻¹ Jᵀ + R and bias. This keeps
+    // the solver switch a numerical method choice, not a second constraint
+    // model.
+    let impulses = if use_newton {
+        let result = solve_free_body_newton_impulses(
+            &rows,
+            &per_contact,
+            n_bodies,
+            bodies,
+            &inv_i_world,
+            iterations,
+        );
+        if let Some(trace) = newton_cost_trace {
+            *trace = result.costs.clone();
+        }
+        result.solution
+    } else {
+        let mut impulses = vec![0.0f32; n_rows];
+        let mut body_delta = vec![BodyDelta::default(); n_bodies];
 
-    for _iter in 0..iterations {
-        // Contact blocks first. Row sweep order within a contact:
-        //   normal → t1, t2 (sliding cone cap on impulses[n_row])
-        //   → torsion (cone cap: mu_torsion · f_n)
-        //   → roll1, roll2 (cone cap: mu_roll · f_n)
-        // The just-updated normal impulse drives all cone caps this
-        // iteration — same "normal-first" idea as the condim 3 loop.
-        for pc in &per_contact {
-            let n_row = pc.start_row as usize;
-            // NORMAL: half-line projection.
-            pgs_step_non_negative(
-                &rows,
-                n_row,
-                &mut impulses,
-                &mut body_delta,
-                bodies,
-                &inv_i_world,
-            );
-            if pc.condim >= 3 {
-                let cap_normal = impulses[n_row];
-                let t1 = pc.start_row as usize + 1;
-                let t2 = pc.start_row as usize + 2;
-                pgs_step_pair_cone(
+        for _iter in 0..iterations {
+            // Contact blocks first. Row sweep order within a contact:
+            //   normal → t1, t2 (sliding cone cap on impulses[n_row])
+            //   → torsion (cone cap: mu_torsion · f_n)
+            //   → roll1, roll2 (cone cap: mu_roll · f_n)
+            // The just-updated normal impulse drives all cone caps this
+            // iteration — same "normal-first" idea as the condim 3 loop.
+            for pc in &per_contact {
+                let n_row = pc.start_row as usize;
+                // NORMAL: half-line projection.
+                pgs_step_non_negative(
                     &rows,
-                    t1,
-                    t2,
-                    cap_normal,
-                    pc.mu_slide,
-                    cone,
+                    n_row,
                     &mut impulses,
                     &mut body_delta,
                     bodies,
                     &inv_i_world,
                 );
-                if pc.condim >= 4 {
-                    let torsion = pc.start_row as usize + 3;
-                    pgs_step_scalar_cap(
-                        &rows,
-                        torsion,
-                        pc.mu_torsion * cap_normal,
-                        &mut impulses,
-                        &mut body_delta,
-                        bodies,
-                        &inv_i_world,
-                    );
-                }
-                if pc.condim >= 6 {
-                    let r1 = pc.start_row as usize + 4;
-                    let r2 = pc.start_row as usize + 5;
+                if pc.condim >= 3 {
+                    let cap_normal = impulses[n_row];
+                    let t1 = pc.start_row as usize + 1;
+                    let t2 = pc.start_row as usize + 2;
                     pgs_step_pair_cone(
                         &rows,
-                        r1,
-                        r2,
+                        t1,
+                        t2,
                         cap_normal,
-                        pc.mu_roll,
+                        pc.mu_slide,
                         cone,
                         &mut impulses,
                         &mut body_delta,
                         bodies,
                         &inv_i_world,
                     );
+                    if pc.condim >= 4 {
+                        let torsion = pc.start_row as usize + 3;
+                        pgs_step_scalar_cap(
+                            &rows,
+                            torsion,
+                            pc.mu_torsion * cap_normal,
+                            &mut impulses,
+                            &mut body_delta,
+                            bodies,
+                            &inv_i_world,
+                        );
+                    }
+                    if pc.condim >= 6 {
+                        let r1 = pc.start_row as usize + 4;
+                        let r2 = pc.start_row as usize + 5;
+                        pgs_step_pair_cone(
+                            &rows,
+                            r1,
+                            r2,
+                            cap_normal,
+                            pc.mu_roll,
+                            cone,
+                            &mut impulses,
+                            &mut body_delta,
+                            bodies,
+                            &inv_i_world,
+                        );
+                    }
+                }
+            }
+            // Equality blocks — bilateral update, no clamp.
+            for pe in &per_equality {
+                for k in 0..pe.n_rows as usize {
+                    let ri = pe.start_row as usize + k;
+                    pgs_step_bilateral(
+                        &rows,
+                        ri,
+                        &mut impulses,
+                        &mut body_delta,
+                        bodies,
+                        &inv_i_world,
+                    );
                 }
             }
         }
-        // Equality blocks — bilateral update, no clamp.
-        for pe in &per_equality {
-            for k in 0..pe.n_rows as usize {
-                let ri = pe.start_row as usize + k;
-                pgs_step_bilateral(
-                    &rows,
-                    ri,
-                    &mut impulses,
-                    &mut body_delta,
-                    bodies,
-                    &inv_i_world,
-                );
-            }
-        }
-    }
+        impulses
+    };
 
     // ---- Extract per-body wrenches ----------------------------------------
     // Linear rows: force at anchor → force + arm × force per body. Angular
@@ -896,12 +1030,11 @@ pub fn solve_free_bodies_diag(
         }
     }
 
-    // Per-contact normal FORCE = normal-row impulse / dt. The touch sensor
-    // consumes this to report the actual constraint-computed normal force
-    // rather than the penalty-formula approximation. `per_contact` was
-    // pushed in the same order as `contacts` so the mapping is 1:1.
-    for (i, pc) in per_contact.iter().enumerate() {
-        contact_normal_forces[i] = impulses[pc.start_row as usize] / dt;
+    // Per-contact normal FORCE = normal-row impulse / dt. A contact can be
+    // omitted from `per_contact` when its force-free gap is active, so use
+    // the original contact index rather than the compact row-block index.
+    for pc in &per_contact {
+        contact_normal_forces[pc.contact_index] = impulses[pc.start_row as usize] / dt;
     }
 
     (wrenches, contact_normal_forces)
@@ -909,6 +1042,7 @@ pub fn solve_free_bodies_diag(
 
 /// Per-contact solver bookkeeping shared across all rows of one contact.
 struct PerContact {
+    contact_index: usize,
     start_row: u32,
     condim: u8,
     solref: SolRef,
@@ -918,6 +1052,73 @@ struct PerContact {
     mu_slide: f32,
     mu_torsion: f32,
     mu_roll: f32,
+}
+
+/// Assemble and solve the dense free-body Newton system. The response matrix
+/// is built by applying one unit impulse per row, which shares the exact
+/// `J M⁻¹ Jᵀ` path used by the PGS residual accumulator.
+fn solve_free_body_newton_impulses(
+    rows: &[ConstraintRow],
+    per_contact: &[PerContact],
+    n_bodies: usize,
+    bodies: &[Body],
+    inv_i_world: &[crate::math::Mat3],
+    iterations: u32,
+) -> crate::newton::NewtonResult {
+    let n_rows = rows.len();
+    let mut hessian = vec![0.0f32; n_rows * n_rows];
+    for j in 0..n_rows {
+        let mut response = vec![BodyDelta::default(); n_bodies];
+        apply_impulse_delta(&rows[j], 1.0, &mut response, bodies, inv_i_world);
+        for i in 0..n_rows {
+            hessian[i * n_rows + j] = row_residual(&rows[i], &response, bodies, inv_i_world);
+        }
+    }
+    for i in 0..n_rows {
+        hessian[i * n_rows + i] += rows[i].reg;
+    }
+
+    let mut projections = Vec::new();
+    for contact in per_contact {
+        let normal = contact.start_row as usize;
+        projections.push(crate::newton::Projection::NonNegative { index: normal });
+        if contact.condim >= 3 {
+            let tangent_1 = normal + 1;
+            let tangent_2 = normal + 2;
+            projections.push(crate::newton::Projection::PyramidalCone {
+                normal,
+                tangent_1,
+                tangent_2,
+                mu: contact.mu_slide,
+            });
+            if contact.condim >= 4 {
+                projections.push(crate::newton::Projection::ScalarConeBound {
+                    index: normal + 3,
+                    normal,
+                    mu: contact.mu_torsion,
+                });
+            }
+            if contact.condim >= 6 {
+                projections.push(crate::newton::Projection::PyramidalCone {
+                    normal,
+                    tangent_1: normal + 4,
+                    tangent_2: normal + 5,
+                    mu: contact.mu_roll,
+                });
+            }
+        }
+    }
+    // Rows belonging to equalities have no projection and are bilateral.
+    let system = crate::newton::NewtonSystem {
+        hessian,
+        linear: rows.iter().map(|row| row.bias).collect(),
+        projections,
+        max_iterations: iterations.max(1),
+        cost_tolerance: 1e-7,
+    };
+    system
+        .solve()
+        .unwrap_or_else(|error| panic!("Newton free-body solve failed: {error}"))
 }
 
 /// Row count for a contact block by condim.
@@ -1953,6 +2154,87 @@ pub fn solve_tree_limits(
         }
     }
 
+    qfrc
+}
+
+/// Newton counterpart to [`solve_tree_limits`]. It uses the same tree rows,
+/// mass response, bias, and regularization, then solves the dense convex
+/// quadratic with non-negative projections for limits and bilateral rows for
+/// couplings.
+pub fn solve_tree_limits_newton(
+    tree: &Tree,
+    tree_idx: usize,
+    equalities: &[Equality],
+    dt: f32,
+    iterations: u32,
+) -> Vec<f32> {
+    let nv = tree.nv();
+    let mut qfrc = vec![0.0f32; nv];
+    if nv == 0 || dt <= 0.0 {
+        return qfrc;
+    }
+    let rows = build_tree_solver_rows(tree, tree_idx, equalities);
+    if rows.is_empty() {
+        return qfrc;
+    }
+    let m = mass_matrix(tree);
+    let Some(l) = cholesky(&m, nv) else {
+        panic!("Newton tree solve failed: tree mass matrix is not positive definite");
+    };
+    let n_rows = rows.len();
+    let mut d_vecs = Vec::with_capacity(n_rows);
+    for row in &rows {
+        let mut e = vec![0.0f32; nv];
+        for &(slot, coeff) in &row.sparse_coeffs {
+            e[slot as usize] += coeff;
+        }
+        d_vecs.push(cholesky_solve(&l, nv, &e));
+    }
+    let mut hessian = vec![0.0f32; n_rows * n_rows];
+    for i in 0..n_rows {
+        for j in 0..n_rows {
+            hessian[i * n_rows + j] = rows[i].dot_response(&d_vecs[j]);
+        }
+    }
+    let mut linear = vec![0.0f32; n_rows];
+    for (i, row) in rows.iter().enumerate() {
+        let v_row = row.dot_qdot(&tree.qdot);
+        let r_dot = -v_row;
+        let a_ref = reference_accel(row.violation, r_dot, row.solref);
+        let d = impedance(row.violation, row.solimp);
+        linear[i] = v_row + d * a_ref * dt;
+        let reg = if d > 0.0 {
+            (1.0 - d) / d * hessian[i * n_rows + i]
+        } else {
+            0.0
+        };
+        hessian[i * n_rows + i] += reg;
+    }
+    let projections = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| match row.projection {
+            TreeRowProjection::NonNegative => {
+                Some(crate::newton::Projection::NonNegative { index })
+            }
+            TreeRowProjection::Bilateral => None,
+        })
+        .collect();
+    let result = crate::newton::NewtonSystem {
+        hessian,
+        linear,
+        projections,
+        max_iterations: iterations.max(1),
+        cost_tolerance: 1e-7,
+    }
+    .solve()
+    .unwrap_or_else(|error| panic!("Newton tree solve failed: {error}"));
+    for (i, row) in rows.iter().enumerate() {
+        let f_dt = result.solution[i] / dt;
+        for &(slot, coeff) in &row.sparse_coeffs {
+            qfrc[slot as usize] += coeff * f_dt;
+        }
+    }
     qfrc
 }
 

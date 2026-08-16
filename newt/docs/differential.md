@@ -383,7 +383,29 @@ python tools/capture_mujoco.py                       # regen ALL fixtures
 python tools/capture_mujoco.py sphere_drop           # regen one scenario
 python tools/capture_mujoco.py --force               # override mujoco-version guard
 python tools/capture_mujoco.py --list                # print scenario names
+# Matched Newton / Euler captures for the v3 solver rows:
+python tools/capture_mujoco.py box_stack sphere_drop joint_limit_swing \
+  --solver Newton --integrator Euler --suffix _newton_euler --force
 ```
+
+## NEWT-21 Newton rows
+
+The Newton rows use MuJoCo 3.11.0, `solver=Newton`, `integrator=Euler`,
+`cone=pyramidal`, and 20 iterations. Newt loads the same MJCF, selects
+`SolverMode::Newton`, and uses the matched Euler path.
+
+| scenario | observed max qpos | bound | observed max qvel | bound |
+|----------|------------------:|------:|------------------:|------:|
+| sphere_drop | 7.220840e-3 | 2.0e-2 | 4.196461e-1 | 1.2 |
+| box_stack | 9.693845e-3 | 5.0e-2 | 2.274836e-1 | 1.0 |
+| joint_limit_swing | 9.167274e-2 | 2.0e-1 | 9.246982e-1 | 1.5 |
+
+These bounds are measured from the committed `_newton_euler` fixtures.
+The Newton path is also covered by stack and incline byte goldens.
+The assisted biped walk uses Newton for TREE-LIMIT rows only; tree contacts
+remain penalty contacts. It remains stable for 2,000 Euler steps: distance
+`1.1372 m`, cadence `102.00 bpm`, mean step length
+`0.4082 m`, clearance `0.1681 m`, and zero self-contact steps.
 
 ## Debugging a failing tolerance
 

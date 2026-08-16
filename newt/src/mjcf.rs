@@ -756,15 +756,21 @@ impl Loader {
                     self.world.solver.iterations = n as u32;
                 }
                 "solver" => {
-                    // MJCF uses "PGS" / "CG" / "Newton"; we accept "PGS" only.
+                    // MJCF uses "PGS" / "CG" / "Newton". CG remains out
+                    // of scope; Newton is the opt-in dense solver.
                     match v.as_str() {
                         "PGS" | "pgs" => {
                             self.world.solver.mode = crate::solver::SolverMode::Pgs;
                         }
+                        "Newton" | "newton" => {
+                            self.world.solver.mode = crate::solver::SolverMode::Newton;
+                        }
                         other => {
                             return fail(
                                 path,
-                                format!("option solver=\"{other}\" not supported (only \"PGS\")"),
+                                format!(
+                                    "option solver=\"{other}\" not supported (expected \"PGS\" or \"Newton\")"
+                                ),
                             );
                         }
                     }
@@ -791,6 +797,9 @@ impl Loader {
                     child.name
                 ),
             );
+        }
+        if let Err(message) = self.world.solver.validate() {
+            return fail(path, message);
         }
         Ok(())
     }
