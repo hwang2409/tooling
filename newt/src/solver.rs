@@ -40,11 +40,11 @@
 //!
 //! # Scope this ticket
 //!
-//! - condim 1 (frictionless) and condim 3 (normal + 2 tangents), with both
-//!   pyramidal and elliptic cone options.
+//! - condim 1 (frictionless) and condim 3 (normal + 2 tangents). PGS accepts
+//!   both cone options; Newton accepts pyramidal cones in this ticket.
 //! - Constraint-based joint limits for hinge and slide (ball still deferred).
-//! - condim 4 / 6 (torsional / rolling) land with the equality-constraints
-//!   ticket.
+//! - condim 4 / 6 (torsional / rolling) use the same free-body rows as the
+//!   solver. Tree contacts remain on the penalty pathway in every mode.
 //! - RK4 integrator + solve-once-per-step (ZOH): we compute the solver
 //!   forces at the START of the step and hold them constant across the four
 //!   RK4 stages. MuJoCo does one Euler step per solve; keeping RK4 while
@@ -84,6 +84,9 @@ pub enum ConeKind {
     Elliptic,
 }
 
+const NEWTON_ELLIPTIC_ERROR: &str =
+    "solver=newton with cone=elliptic is not supported yet; use cone=pyramidal";
+
 /// World-level solver configuration.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SolverConfig {
@@ -118,10 +121,7 @@ impl SolverConfig {
     /// simulation starts.
     pub fn validate(&self) -> Result<(), String> {
         if self.mode == SolverMode::Newton && self.cone == ConeKind::Elliptic {
-            return Err(
-                "solver=newton with cone=elliptic is not supported yet; use cone=pyramidal"
-                    .to_string(),
-            );
+            return Err(NEWTON_ELLIPTIC_ERROR.to_string());
         }
         if self.iterations == 0 {
             return Err("solver iterations must be >= 1".to_string());
@@ -572,7 +572,7 @@ pub fn solve_free_bodies_diag(
     iterations: u32,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     solve_free_bodies_diag_mode(
-        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, false,
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, false, None,
     )
 }
 
@@ -591,8 +591,39 @@ pub fn solve_free_bodies_newton_diag(
     iterations: u32,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     solve_free_bodies_diag_mode(
-        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, true,
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, true, None,
     )
+}
+
+/// Return the live Newton cost trace for one free-body constraint solve.
+///
+/// The first value is the zero-impulse cost. Later values are accepted line
+/// search costs. An empty trace means that the input has no active rows.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_free_bodies_newton_trace(
+    bodies: &[Body],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    equalities: &[Equality],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+) -> Vec<f32> {
+    let mut trace = Vec::new();
+    let _ = solve_free_bodies_diag_mode(
+        bodies,
+        geoms,
+        contacts,
+        equalities,
+        gravity,
+        dt,
+        cone,
+        iterations,
+        true,
+        Some(&mut trace),
+    );
+    trace
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -606,7 +637,11 @@ fn solve_free_bodies_diag_mode(
     cone: ConeKind,
     iterations: u32,
     use_newton: bool,
+    newton_cost_trace: Option<&mut Vec<f32>>,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
+    if use_newton && cone == ConeKind::Elliptic {
+        panic!("{NEWTON_ELLIPTIC_ERROR}");
+    }
     let n_bodies = bodies.len();
     let mut wrenches = vec![(Vec3::ZERO, Vec3::ZERO); n_bodies];
     let mut contact_normal_forces = vec![0.0f32; contacts.len()];
@@ -630,7 +665,7 @@ fn solve_free_bodies_diag_mode(
     let dw_body_free_per_body: Vec<Vec3> = vec![Vec3::ZERO; n_bodies];
 
     // ---- Contact blocks ---------------------------------------------------
-    for c in contacts.iter() {
+    for (contact_index, c) in contacts.iter().enumerate() {
         let ga = &geoms[c.geom_a];
         let gb = &geoms[c.geom_b];
         let body_a = ga.body.map(|i| i as u32);
@@ -734,6 +769,7 @@ fn solve_free_bodies_diag_mode(
         }
 
         per_contact.push(PerContact {
+            contact_index,
             start_row,
             condim,
             solref,
@@ -859,19 +895,18 @@ fn solve_free_bodies_diag_mode(
     // the solver switch a numerical method choice, not a second constraint
     // model.
     let impulses = if use_newton {
-        assert_eq!(
-            cone,
-            ConeKind::Pyramidal,
-            "solver=newton with cone=elliptic is rejected at load time"
-        );
-        solve_free_body_newton_impulses(
+        let result = solve_free_body_newton_impulses(
             &rows,
             &per_contact,
             n_bodies,
             bodies,
             &inv_i_world,
             iterations,
-        )
+        );
+        if let Some(trace) = newton_cost_trace {
+            *trace = result.costs.clone();
+        }
+        result.solution
     } else {
         let mut impulses = vec![0.0f32; n_rows];
         let mut body_delta = vec![BodyDelta::default(); n_bodies];
@@ -995,12 +1030,11 @@ fn solve_free_bodies_diag_mode(
         }
     }
 
-    // Per-contact normal FORCE = normal-row impulse / dt. The touch sensor
-    // consumes this to report the actual constraint-computed normal force
-    // rather than the penalty-formula approximation. `per_contact` was
-    // pushed in the same order as `contacts` so the mapping is 1:1.
-    for (i, pc) in per_contact.iter().enumerate() {
-        contact_normal_forces[i] = impulses[pc.start_row as usize] / dt;
+    // Per-contact normal FORCE = normal-row impulse / dt. A contact can be
+    // omitted from `per_contact` when its force-free gap is active, so use
+    // the original contact index rather than the compact row-block index.
+    for pc in &per_contact {
+        contact_normal_forces[pc.contact_index] = impulses[pc.start_row as usize] / dt;
     }
 
     (wrenches, contact_normal_forces)
@@ -1008,6 +1042,7 @@ fn solve_free_bodies_diag_mode(
 
 /// Per-contact solver bookkeeping shared across all rows of one contact.
 struct PerContact {
+    contact_index: usize,
     start_row: u32,
     condim: u8,
     solref: SolRef,
@@ -1029,7 +1064,7 @@ fn solve_free_body_newton_impulses(
     bodies: &[Body],
     inv_i_world: &[crate::math::Mat3],
     iterations: u32,
-) -> Vec<f32> {
+) -> crate::newton::NewtonResult {
     let n_rows = rows.len();
     let mut hessian = vec![0.0f32; n_rows * n_rows];
     for j in 0..n_rows {
@@ -1084,7 +1119,6 @@ fn solve_free_body_newton_impulses(
     system
         .solve()
         .unwrap_or_else(|error| panic!("Newton free-body solve failed: {error}"))
-        .solution
 }
 
 /// Row count for a contact block by condim.

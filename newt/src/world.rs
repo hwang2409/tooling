@@ -693,6 +693,9 @@ impl World {
     /// geoms, this collapses to tier-1 gravity-only RK4 bit-for-bit, and
     /// the golden `tumbling_3_body.bin` still passes.
     pub fn step(&mut self) {
+        self.solver
+            .validate()
+            .unwrap_or_else(|message| panic!("{message}"));
         // Loud engine-level enforcement: the first step after any pair-list
         // or geom-count change panics if any ACTIVE pair falls in the
         // deferred bucket. Prevents a stack.json-style silent no-op.
