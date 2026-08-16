@@ -408,6 +408,43 @@ impl Actuator {
         }
     }
 
+    /// Return the positive velocity coefficient in the actuator force law.
+    ///
+    /// This is `-∂τ/∂vel` before the force clamp. It is the derivative that
+    /// MuJoCo's `implicitfast` path folds into the velocity solve. A force
+    /// clamp is deliberately not differentiated here; the implicitfast
+    /// scope in this crate covers the actuator velocity terms themselves.
+    #[inline]
+    pub fn velocity_damping(&self, _len: f32, _vel: f32) -> f32 {
+        match self.flavor {
+            ActuatorFlavor::Position { kv, .. } | ActuatorFlavor::Velocity { kv } => kv,
+            ActuatorFlavor::Motor { .. } => 0.0,
+            ActuatorFlavor::General {
+                gain_type,
+                gain_prm,
+                bias_type,
+                bias_prm,
+                gear,
+            } => {
+                let signal = match self.dyn_type {
+                    DynType::None => self.clamped_ctrl(),
+                    DynType::Filter => self.act,
+                };
+                let gain_velocity = match gain_type {
+                    GainType::Fixed => 0.0,
+                    GainType::Affine => gain_prm[2],
+                };
+                let bias_velocity = match bias_type {
+                    BiasType::None => 0.0,
+                    BiasType::Affine => bias_prm[2],
+                };
+                // Keep the same transmission-space derivative as torque:
+                // both the sampled velocity and output force carry `gear`.
+                -gear * gear * (gain_velocity * signal + bias_velocity)
+            }
+        }
+    }
+
     /// Advance activation state by one step using forward Euler on
     /// `act' = (u - act) / tau`. No-op for `DynType::None`.
     ///

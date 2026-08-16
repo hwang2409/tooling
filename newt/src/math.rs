@@ -641,6 +641,13 @@ impl Quat {
         let omega_q = Self::new(omega_body.x, omega_body.y, omega_body.z, 0.0);
         (self * omega_q) * 0.5
     }
+
+    /// Integrate a body-frame angular velocity over `dt` on the unit
+    /// quaternion manifold. The right-multiplied exponential map matches the
+    /// body-frame convention used by [`Self::derivative`].
+    pub fn integrate_body_angular_velocity(self, omega_body: Vec3, dt: f32) -> Self {
+        (self * Self::from_axis_angle(omega_body, dt * omega_body.length())).renormalize()
+    }
 }
 
 impl Default for Quat {

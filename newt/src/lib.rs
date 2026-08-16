@@ -7,7 +7,8 @@
 //!   transforms. Load-bearing for tier 3+ (ABA); tier 1 uses only the inertia
 //!   primitives.
 //! - [`body`] — free rigid body with mass, body-frame inertia, pose, twist.
-//! - [`world`] — N free bodies under uniform gravity, RK4 integration.
+//! - [`world`] — N free bodies under uniform gravity, RK4, Euler, and
+//!   implicit-in-velocity integration.
 //!
 //! # Determinism
 //!

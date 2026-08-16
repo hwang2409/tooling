@@ -39,6 +39,7 @@ zero hinge axes — every branch has a dedicated unit test in
   "version": "1",
   "gravity": [0.0, 0.0, -9.81],
   "timestep": 0.005,
+  "integrator": "RK4",
   "bodies":   [ ... ],
   "trees":    [ ... ],
   "meshes":   [ ... ],
@@ -52,7 +53,9 @@ zero hinge axes — every branch has a dedicated unit test in
 - **version** — must be `"1"` when present. Missing is fine; any other
   value is rejected.
 - **gravity** — `[x, y, z]`. Default `[0, 0, -9.81]`.
-- **timestep** — RK4 step size in seconds. Must be > 0. Default `0.005`.
+- **timestep** — fixed integration step size in seconds. Must be > 0.
+  Default `0.005`.
+- **integrator** — `RK4`, `Euler`, or `implicitfast`. Default `RK4`.
 - Every collection is optional. An empty scene loads cleanly.
 
 ## bodies (tier-1/2 free bodies)
@@ -153,6 +156,8 @@ zero hinge axes — every branch has a dedicated unit test in
 ```
 
 - **kind** = `free` (6-DOF root), `fixed`, `hinge`, `slide`, or `ball`.
+- Free roots accept scalar **damping** for all three angular and three
+  linear velocity DOFs. The default is `0`.
 - Hinges + slides: **axis** (required, normalized on load; zero rejected),
   **range** (optional `[lo, hi]`, lo < hi enforced), **damping**,
   **armature**, **limit.stiffness** / **limit.damping**. Units follow

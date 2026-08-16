@@ -140,7 +140,14 @@ def _load_scenarios(refs_dir: Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def _capture_scenario(mujoco, np, scenario: dict, refs_dir: Path) -> tuple[Path, str]:
+def _capture_scenario(
+    mujoco,
+    np,
+    scenario: dict,
+    refs_dir: Path,
+    integrator_override: str | None = None,
+    suffix: str = "",
+) -> tuple[Path, str]:
     """Run one scenario and write its fixture. Returns (path, provenance).
 
     If `scenario["check_kind"] == "energy"`, an additional sidecar
@@ -161,6 +168,12 @@ def _capture_scenario(mujoco, np, scenario: dict, refs_dir: Path) -> tuple[Path,
         raise ValueError(f"{name}: stride and n_steps must be > 0")
 
     model = mujoco.MjModel.from_xml_path(str(mjcf_path))
+    if integrator_override is not None:
+        integrators = {
+            "Euler": mujoco.mjtIntegrator.mjINT_EULER,
+            "implicitfast": mujoco.mjtIntegrator.mjINT_IMPLICITFAST,
+        }
+        model.opt.integrator = integrators[integrator_override]
     data = mujoco.MjData(model)
 
     # Apply overrides. Both are applied in MuJoCo layout — the scenarios.json
@@ -240,7 +253,7 @@ def _capture_scenario(mujoco, np, scenario: dict, refs_dir: Path) -> tuple[Path,
         f"|stride={stride}|n_steps={n_steps}"
         f"|date={_dt.date.today().isoformat()}"
     )
-    path = refs_dir / f"{name}.bin"
+    path = refs_dir / f"{name}{suffix}.bin"
     _write_fixture(path, provenance, stride, n_steps, qpos_samples, qvel_samples)
     if want_energy:
         energy_path = refs_dir / f"{name}_energy.bin"
@@ -336,6 +349,16 @@ def main(argv: list[str]) -> int:
         help="Path to the venv Python to re-exec under (default: biped venv). "
         "Pass --venv '' to disable re-exec.",
     )
+    parser.add_argument(
+        "--integrator",
+        choices=["Euler", "implicitfast"],
+        help="Override the XML integrator for a matched-integrator capture.",
+    )
+    parser.add_argument(
+        "--suffix",
+        default="",
+        help="Suffix inserted before .bin, for example _euler.",
+    )
     args = parser.parse_args(argv[1:])
 
     # Re-exec under the venv if we're not already in one that has mujoco.
@@ -375,7 +398,14 @@ def main(argv: list[str]) -> int:
     _check_version_guard(refs_dir, scenarios, mujoco.__version__, args.force)
 
     for scenario in scenarios:
-        path, prov = _capture_scenario(mujoco, np, scenario, refs_dir)
+        path, prov = _capture_scenario(
+            mujoco,
+            np,
+            scenario,
+            refs_dir,
+            integrator_override=args.integrator,
+            suffix=args.suffix,
+        )
         print(f"wrote {path.name} :: {prov}")
 
     return 0

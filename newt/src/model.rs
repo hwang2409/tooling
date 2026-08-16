@@ -32,7 +32,7 @@ use crate::math::{Mat3, Quat, Vec3};
 use crate::sensor::{Sensor, SensorAttach, SensorKind, SiteFrame};
 use crate::tendon::{FixedTendonJoint, SpatialTendonSite, Tendon, WrapSphere};
 use crate::tree::{Link, Tree, forward_kinematics};
-use crate::world::World;
+use crate::world::{Integrator, World};
 
 // ---------------------------------------------------------------------------
 // public error type
@@ -530,7 +530,7 @@ fn parse_joint(v: &Value, path: &str) -> Result<JointKind, ModelError> {
     let kind_s = get_str(kind, &format!("{path}.kind"))?;
     match kind_s {
         "free" => {
-            reject_unknown(fields, &["kind"], path)?;
+            reject_unknown(fields, &["kind", "damping"], path)?;
             Ok(JointKind::Free)
         }
         "fixed" => {
@@ -784,6 +784,7 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
             "gravity",
             "magnetic_field",
             "timestep",
+            "integrator",
             "solver",
             "bodies",
             "trees",
@@ -825,6 +826,9 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
             return fail("timestep", format!("timestep must be > 0 (got {dt})"));
         }
         world.dt = dt;
+    }
+    if let Some(v) = optional(root_fields, "integrator") {
+        world.integrator = parse_integrator(v, "integrator")?;
     }
     if let Some(v) = optional(root_fields, "solver") {
         world.solver = parse_solver_config(v, "solver")?;
@@ -1272,7 +1276,14 @@ fn parse_link(
         }
     };
 
-    let joint = parse_joint(required(fields, "joint", path)?, &format!("{path}.joint"))?;
+    let joint_value = required(fields, "joint", path)?;
+    let joint_path = format!("{path}.joint");
+    let joint = parse_joint(joint_value, &joint_path)?;
+    let free_damping = if matches!(joint, JointKind::Free) {
+        parse_free_damping(joint_value, &joint_path)?
+    } else {
+        0.0
+    };
     // Consistency: only Free/Fixed are allowed at the root; the non-root
     // joints (Hinge, Slide, Ball) all need a parent to reference.
     let joint_kind_name = match &joint {
@@ -1347,6 +1358,7 @@ fn parse_link(
         mass,
         inertia,
     );
+    link.free_damping = free_damping;
     if let Some(mocap) = optional(fields, "mocap") {
         link.mocap = get_bool(mocap, &format!("{path}.mocap"))?;
         if link.mocap && index != 0 {
@@ -1365,6 +1377,18 @@ fn parse_link(
 fn approx_identity(q: Quat) -> bool {
     // Post-renormalization we're within f32 epsilon of the identity.
     (q.x.abs() < 1e-5) && (q.y.abs() < 1e-5) && (q.z.abs() < 1e-5) && ((q.w - 1.0).abs() < 1e-5)
+}
+
+fn parse_free_damping(v: &Value, path: &str) -> Result<f32, ModelError> {
+    let fields = get_object(v, path)?;
+    let damping = optional(fields, "damping")
+        .map(|v| get_f32(v, &format!("{path}.damping")))
+        .transpose()?
+        .unwrap_or(0.0);
+    if damping < 0.0 {
+        return fail(&format!("{path}.damping"), "damping must be ≥ 0");
+    }
+    Ok(damping)
 }
 
 // ---------------------------------------------------------------------------
@@ -1483,6 +1507,21 @@ fn parse_nonneg_float(
         return fail(&format!("{path}.{key}"), format!("{key} must be ≥ 0"));
     }
     Ok(Some(f))
+}
+
+fn parse_integrator(v: &Value, path: &str) -> Result<Integrator, ModelError> {
+    let name = get_str(v, path)?;
+    match name {
+        "RK4" | "rk4" => Ok(Integrator::Rk4),
+        "Euler" | "euler" => Ok(Integrator::Euler),
+        "implicitfast" | "ImplicitFast" | "implicit_fast" | "implicit" | "Implicit" => {
+            Ok(Integrator::ImplicitFast)
+        }
+        other => fail(
+            path,
+            format!("unknown integrator \"{other}\"; expected RK4 | Euler | implicitfast"),
+        ),
+    }
 }
 
 /// Parse the top-level `solver` object. Schema:

@@ -88,6 +88,12 @@ pub struct Link {
     /// when `parent` is `Some`.
     pub joint: JointKind,
 
+    /// Scalar damping applied to every DOF of a free root joint. MuJoCo's
+    /// free-joint damping uses one coefficient for its three angular and
+    /// three linear velocity slots. This stays separate from `JointKind` so
+    /// existing programmatic `JointKind::Free` callers keep their API.
+    pub free_damping: f32,
+
     /// Joint anchor pose in the parent's body frame. For the root with a
     /// `Fixed` joint, this is the world-frame anchor. For the root with a
     /// `Free` joint, this is ignored (initial pose comes from `q`).
@@ -152,6 +158,7 @@ impl Link {
         Self {
             parent,
             joint,
+            free_damping: 0.0,
             joint_offset_in_parent,
             joint_offset_in_child,
             mass,
@@ -832,6 +839,13 @@ impl AbaWorkspace {
 /// `ext[i] = (force_world, torque_world_about_com)`.
 pub type ExternalWrenches = Vec<(Vec3, Vec3)>;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum VelocityImplicit {
+    Explicit,
+    JointDamping { dt: f32 },
+    JointDampingAndActuators { dt: f32 },
+}
+
 /// Compute the generalized acceleration `qddot` for the tree at its current
 /// state `(q, qdot, qfrc_applied)` under gravity + `external_wrenches`.
 ///
@@ -843,6 +857,49 @@ pub fn aba(
     poses: &[(Vec3, Quat)],
     gravity: Vec3,
     external_wrenches: &ExternalWrenches,
+) -> Vec<f32> {
+    aba_with_velocity_implicit(
+        tree,
+        poses,
+        gravity,
+        external_wrenches,
+        VelocityImplicit::Explicit,
+    )
+}
+
+fn implicit_mass_damping(
+    tree: &Tree,
+    link_idx: usize,
+    q: f32,
+    qdot: f32,
+    joint_damping: f32,
+    mode: VelocityImplicit,
+) -> f32 {
+    let (dt, actuator_damping) = match mode {
+        VelocityImplicit::Explicit => return 0.0,
+        VelocityImplicit::JointDamping { dt } => (dt, 0.0),
+        VelocityImplicit::JointDampingAndActuators { dt } => {
+            // Tendon actuator velocity derivatives are dense JᵀJ terms. Do
+            // not fold them into these scalar joint denominators; this
+            // ticket evaluates tendon velocity force explicitly.
+            let damping = tree
+                .actuators
+                .iter()
+                .filter(|act| act.tendon_target.is_none() && act.link_idx == link_idx)
+                .map(|act| act.velocity_damping(q, qdot))
+                .sum();
+            (dt, damping)
+        }
+    };
+    dt * (joint_damping + actuator_damping)
+}
+
+fn aba_with_velocity_implicit(
+    tree: &Tree,
+    poses: &[(Vec3, Quat)],
+    gravity: Vec3,
+    external_wrenches: &ExternalWrenches,
+    velocity_implicit: VelocityImplicit,
 ) -> Vec<f32> {
     let n = tree.links.len();
     assert_eq!(poses.len(), n);
@@ -1019,7 +1076,9 @@ pub fn aba(
                     - damping * qdot_i
                     + tau_lim
                     + tau_act;
-                single_dof_pass2(&mut w, tree, i, parent, armature, tau_scalar);
+                let damping_mass =
+                    implicit_mass_damping(tree, i, q_i, qdot_i, damping, velocity_implicit);
+                single_dof_pass2(&mut w, tree, i, parent, armature, damping_mass, tau_scalar);
             }
             JointKind::Slide {
                 damping,
@@ -1053,7 +1112,9 @@ pub fn aba(
                     - damping * qdot_i
                     + tau_lim
                     + tau_act;
-                single_dof_pass2(&mut w, tree, i, parent, armature, tau_scalar);
+                let damping_mass =
+                    implicit_mass_damping(tree, i, q_i, qdot_i, damping, velocity_implicit);
+                single_dof_pass2(&mut w, tree, i, parent, armature, damping_mass, tau_scalar);
             }
             JointKind::Ball { damping, armature } => {
                 let parent = link.parent.expect("ball must have parent");
@@ -1067,16 +1128,21 @@ pub fn aba(
                 // D = Sᵀ IA S + armature * I₃  (3x3 symmetric).
                 // Written out column-major (matches Mat3's layout) so clippy's
                 // needless_range_loop lint doesn't fire on nested index loops.
+                let damping_mass = match velocity_implicit {
+                    VelocityImplicit::Explicit => 0.0,
+                    VelocityImplicit::JointDamping { dt }
+                    | VelocityImplicit::JointDampingAndActuators { dt } => dt * damping,
+                };
                 let d_mat = Mat3::new([
-                    spatial_dot_ms(s3[0], ia_s3[0]) + armature,
+                    spatial_dot_ms(s3[0], ia_s3[0]) + armature + damping_mass,
                     spatial_dot_ms(s3[1], ia_s3[0]),
                     spatial_dot_ms(s3[2], ia_s3[0]),
                     spatial_dot_ms(s3[0], ia_s3[1]),
-                    spatial_dot_ms(s3[1], ia_s3[1]) + armature,
+                    spatial_dot_ms(s3[1], ia_s3[1]) + armature + damping_mass,
                     spatial_dot_ms(s3[2], ia_s3[1]),
                     spatial_dot_ms(s3[0], ia_s3[2]),
                     spatial_dot_ms(s3[1], ia_s3[2]),
-                    spatial_dot_ms(s3[2], ia_s3[2]) + armature,
+                    spatial_dot_ms(s3[2], ia_s3[2]) + armature + damping_mass,
                 ]);
                 let d_inv = d_mat
                     .inverse()
@@ -1160,9 +1226,36 @@ pub fn aba(
                 tau_free.torque - w.pa[0].torque,
                 tau_free.linear - w.pa[0].linear,
             );
-            let a0 = w.ia[0]
-                .solve(rhs)
-                .expect("root articulated inertia is singular — degenerate mass distribution?");
+            let root_damping = tree.links[0].free_damping;
+            let a0 = if root_damping == 0.0 {
+                w.ia[0]
+                    .solve(rhs)
+                    .expect("root articulated inertia is singular — degenerate mass distribution?")
+            } else {
+                let voff = tree.v_offset[0];
+                let qdot = SpatialMotion::new(
+                    Vec3::new(tree.qdot[voff], tree.qdot[voff + 1], tree.qdot[voff + 2]),
+                    Vec3::new(
+                        tree.qdot[voff + 3],
+                        tree.qdot[voff + 4],
+                        tree.qdot[voff + 5],
+                    ),
+                );
+                let damped_rhs = rhs
+                    - SpatialForce::new(qdot.angular * root_damping, qdot.linear * root_damping);
+                let damping_mass = match velocity_implicit {
+                    VelocityImplicit::Explicit => 0.0,
+                    VelocityImplicit::JointDamping { dt }
+                    | VelocityImplicit::JointDampingAndActuators { dt } => dt * root_damping,
+                };
+                let mut root_ia = w.ia[0];
+                for i in 0..6 {
+                    root_ia.rows[i][i] += damping_mass;
+                }
+                root_ia
+                    .solve(damped_rhs)
+                    .expect("root articulated inertia is singular — degenerate mass distribution?")
+            };
             w.a[0] = a0;
             // Store the 6 free-root accelerations (body-frame at COM) into
             // qddot slots 0..6.
@@ -1285,11 +1378,12 @@ fn single_dof_pass2(
     i: usize,
     parent: usize,
     armature: f32,
+    damping_mass: f32,
     tau_scalar: f32,
 ) {
     let s = w.s[i];
     let ia_s = w.ia[i].times_motion(s);
-    let d_scalar = spatial_dot_ms(s, ia_s) + armature;
+    let d_scalar = spatial_dot_ms(s, ia_s) + armature + damping_mass;
     // Featherstone's reduced-inertia form; see the derivation comment in
     // docs/joints.md ("the u_stage form").
     let ia_c = w.ia[i].times_motion(w.c[i]);
@@ -1473,6 +1567,96 @@ where
     // the ZOH convention for ctrl/qfrc_applied/applied_wrenches. Non-
     // filter actuators are no-ops here. See docs/actuators.md.
     tree.integrate_activations(dt);
+}
+
+/// One semi-implicit Euler step on a tree.
+///
+/// The forward-kinematics and external-wrench callback observe the state at
+/// the start of the step. ABA computes acceleration, then the new velocity
+/// integrates generalized positions. Joint damping is folded into the mass
+/// solve for both modes. `implicit_fast` additionally folds actuator velocity
+/// derivatives and does not differentiate Coriolis terms.
+pub fn euler_step<F>(
+    tree: &mut Tree,
+    gravity: Vec3,
+    dt: f32,
+    implicit_fast: bool,
+    mut compute_ext_wrenches: F,
+) where
+    F: FnMut(&Tree) -> ExternalWrenches,
+{
+    let poses = forward_kinematics(tree);
+    let ext = compute_ext_wrenches(tree);
+    let mode = if implicit_fast {
+        VelocityImplicit::JointDampingAndActuators { dt }
+    } else {
+        VelocityImplicit::JointDamping { dt }
+    };
+    let qddot = aba_with_velocity_implicit(tree, &poses, gravity, &ext, mode);
+    let mocap_root = tree.links.first().is_some_and(|link| link.mocap);
+    for (i, qdot) in tree.qdot.iter_mut().enumerate() {
+        let in_mocap_root = mocap_root && i < tree.links[0].joint.nv();
+        if !in_mocap_root {
+            *qdot += qddot[i] * dt;
+        }
+    }
+    integrate_tree_positions(tree, dt, mocap_root);
+    tree.integrate_activations(dt);
+}
+
+fn integrate_tree_positions(tree: &mut Tree, dt: f32, mocap_root: bool) {
+    for (i, link) in tree.links.iter().enumerate() {
+        if mocap_root && i == 0 {
+            continue;
+        }
+        match link.joint {
+            JointKind::Free => {
+                let qoff = tree.q_offset[i];
+                let voff = tree.v_offset[i];
+                let orientation = Quat::new(
+                    tree.q[qoff + 3],
+                    tree.q[qoff + 4],
+                    tree.q[qoff + 5],
+                    tree.q[qoff + 6],
+                );
+                let omega = Vec3::new(tree.qdot[voff], tree.qdot[voff + 1], tree.qdot[voff + 2]);
+                let velocity = Vec3::new(
+                    tree.qdot[voff + 3],
+                    tree.qdot[voff + 4],
+                    tree.qdot[voff + 5],
+                );
+                let position_delta = orientation.rotate(velocity) * dt;
+                tree.q[qoff] += position_delta.x;
+                tree.q[qoff + 1] += position_delta.y;
+                tree.q[qoff + 2] += position_delta.z;
+                let next = orientation.integrate_body_angular_velocity(omega, dt);
+                tree.q[qoff + 3] = next.x;
+                tree.q[qoff + 4] = next.y;
+                tree.q[qoff + 5] = next.z;
+                tree.q[qoff + 6] = next.w;
+            }
+            JointKind::Fixed => {}
+            JointKind::Hinge { .. } | JointKind::Slide { .. } => {
+                tree.q[tree.q_offset[i]] += tree.qdot[tree.v_offset[i]] * dt;
+            }
+            JointKind::Ball { .. } => {
+                let qoff = tree.q_offset[i];
+                let voff = tree.v_offset[i];
+                let orientation = Quat::new(
+                    tree.q[qoff],
+                    tree.q[qoff + 1],
+                    tree.q[qoff + 2],
+                    tree.q[qoff + 3],
+                );
+                let omega = Vec3::new(tree.qdot[voff], tree.qdot[voff + 1], tree.qdot[voff + 2]);
+                let next = orientation.integrate_body_angular_velocity(omega, dt);
+                tree.q[qoff] = next.x;
+                tree.q[qoff + 1] = next.y;
+                tree.q[qoff + 2] = next.z;
+                tree.q[qoff + 3] = next.w;
+            }
+        }
+    }
 }
 
 /// Compute the position and velocity derivatives for every DOF of the tree,

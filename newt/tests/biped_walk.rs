@@ -5,9 +5,12 @@
 #[path = "../examples/biped_walk_support.rs"]
 mod biped_walk_support;
 
-use biped_walk_support::{GaitConfig, controller_target_trace, run_walk, trace_bytes};
+use biped_walk_support::{
+    GaitConfig, controller_target_trace, run_walk, run_walk_with_integrator, trace_bytes,
+};
 use newt::actuator::ActuatorFlavor;
 use newt::mjcf::{load_mjcf_path, load_mjcf_str};
+use newt::world::Integrator;
 
 const CADENCE_MIN_BPM: f32 = 80.0;
 const STEP_LENGTH_MIN_M: f32 = 0.05;
@@ -26,6 +29,27 @@ fn assert_gait_metrics(result: &biped_walk_support::WalkResult, distance: f32) {
 fn tier_one_assisted_walk_short_ci_variant_passes() {
     let result = run_walk(GaitConfig::stable_joint_walk(2000));
     assert_gait_metrics(&result, 0.8);
+}
+
+#[test]
+fn assisted_walk_euler_stays_in_the_rk4_metric_family() {
+    let result = run_walk_with_integrator(GaitConfig::stable_joint_walk(2000), Integrator::Euler);
+    println!(
+        "Euler assisted walk: distance={:.4} cadence={:.2} step_length={:.4} clearance={:.4} self_contact_steps={}",
+        result.metrics.forward_distance,
+        result.metrics.cadence_bpm,
+        result.metrics.mean_step_length,
+        result.metrics.max_foot_clearance,
+        result.metrics.self_contact_force_steps,
+    );
+    assert!(result.metrics.forward_distance.is_finite());
+    assert!(result.metrics.cadence_bpm.is_finite());
+    assert!(result.metrics.mean_step_length.is_finite());
+    assert!(result.metrics.max_foot_clearance.is_finite());
+    assert!(result.metrics.forward_distance > 0.4);
+    assert!(result.metrics.cadence_bpm > 60.0);
+    assert!(result.metrics.max_foot_clearance > 0.03);
+    assert_eq!(result.metrics.self_contact_force_steps, 0);
 }
 
 #[test]

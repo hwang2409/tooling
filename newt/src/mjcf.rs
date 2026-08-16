@@ -56,7 +56,7 @@ use crate::sensor::{Sensor, SensorAttach, SensorKind, SiteFrame};
 use crate::solver::SolImp;
 use crate::tendon::{FixedTendonJoint, SpatialTendonSite, Tendon, WrapSphere};
 use crate::tree::{Link, Tree};
-use crate::world::World;
+use crate::world::{Integrator, World};
 use crate::xml::{self, Element};
 
 // ---------------------------------------------------------------------------
@@ -717,12 +717,21 @@ impl Loader {
                     self.world.magnetic_field = parse_vec3_attr(v, path, "magnetic")?;
                 }
                 "integrator" => {
-                    if v != "RK4" && v != "rk4" {
-                        return fail(
-                            path,
-                            format!("option integrator=\"{v}\" is not supported (only \"RK4\")"),
-                        );
-                    }
+                    self.world.integrator = match v.as_str() {
+                        "RK4" | "rk4" => Integrator::Rk4,
+                        "Euler" | "euler" => Integrator::Euler,
+                        "implicitfast" | "ImplicitFast" | "implicit_fast" | "implicit"
+                        | "Implicit" => Integrator::ImplicitFast,
+                        other => {
+                            return fail(
+                                path,
+                                format!(
+                                    "option integrator=\"{other}\" is not supported \
+                                     (expected RK4, Euler, or implicitfast)"
+                                ),
+                            );
+                        }
+                    };
                 }
                 "cone" => {
                     use crate::solver::ConeKind;
@@ -1039,6 +1048,7 @@ impl Loader {
         let (mass, inertia) = self.find_and_parse_inertial(e, path, class)?;
         // Root joint: <freejoint/> → Free, no <joint> → Fixed, other → error.
         let joint_kind = self.determine_root_joint(e, path)?;
+        let free_damping = self.parse_free_root_damping(e, path, class)?;
         // joint_offset_in_parent semantics: for a fixed root, this IS the
         // world-anchor pose. For a free root the position is currently
         // ignored by ABA (initial pose comes from q which we initialize
@@ -1056,6 +1066,7 @@ impl Loader {
             mass,
             inertia,
         );
+        link.free_damping = free_damping;
         if let Some(value) = e.attr("mocap") {
             link.mocap = parse_bool(value, path, "mocap")?;
             if link.mocap && !matches!(link.joint, JointKind::Free | JointKind::Fixed) {
@@ -1063,6 +1074,38 @@ impl Loader {
             }
         }
         Ok((link, name))
+    }
+
+    fn parse_free_root_damping(
+        &self,
+        e: &Element,
+        path: &str,
+        class: &str,
+    ) -> Result<f32, MjcfError> {
+        let Some(free_j) = find_free_joint(e) else {
+            return Ok(0.0);
+        };
+        for (k, _) in &free_j.attrs {
+            let supported = match free_j.name.as_str() {
+                "freejoint" => matches!(k.as_str(), "name" | "damping"),
+                "joint" => matches!(k.as_str(), "name" | "type" | "damping"),
+                _ => false,
+            };
+            if !supported {
+                return fail(
+                    path,
+                    format!("<{}> attribute \"{k}\" not supported", free_j.name),
+                );
+            }
+        }
+        let free_path = child_path(path, &free_j.name, free_j.attr("name"));
+        let effective_class = e.attr("class").unwrap_or(class);
+        let dc = self
+            .defaults
+            .lookup(effective_class)
+            .cloned()
+            .unwrap_or_default();
+        Ok(optional_nonneg_float(free_j, "damping", &free_path, &dc, "joint")?.unwrap_or(0.0))
     }
 
     fn determine_root_joint(&self, e: &Element, path: &str) -> Result<JointKind, MjcfError> {
@@ -3907,9 +3950,13 @@ mod tests {
     }
 
     #[test]
-    fn integrator_non_rk4_rejected() {
-        let e = err(r#"<mujoco><option integrator="Euler"/></mujoco>"#);
-        assert!(e.message.contains("integrator"), "{}", e.message);
+    fn integrator_selection_is_loaded() {
+        let euler = load_mjcf_str(r#"<mujoco><option integrator="Euler"/></mujoco>"#)
+            .expect("Euler should load");
+        assert_eq!(euler.world.integrator, Integrator::Euler);
+        let implicit = load_mjcf_str(r#"<mujoco><option integrator="implicitfast"/></mujoco>"#)
+            .expect("implicitfast should load");
+        assert_eq!(implicit.world.integrator, Integrator::ImplicitFast);
     }
 
     #[test]

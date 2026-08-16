@@ -13,6 +13,7 @@ use newt::math::{self, Quat, Vec3};
 use newt::mjcf::load_mjcf_path;
 use newt::model::Scene;
 use newt::tree::Tree;
+use newt::world::Integrator;
 
 // Cargo also discovers top-level files in `examples/` as binaries. The
 // implementation is included as a module by `biped_walk.rs` and tests.
@@ -608,6 +609,12 @@ pub fn run_walk(config: GaitConfig) -> WalkResult {
     run_walk_observed(config, |_, _| {})
 }
 
+/// Run the walker with an explicit engine integrator. The default
+/// `run_walk` path keeps the model's configured RK4 selection unchanged.
+pub fn run_walk_with_integrator(config: GaitConfig, integrator: Integrator) -> WalkResult {
+    run_walk_observed_with_integrator(config, integrator, |_, _| {})
+}
+
 pub fn run_walk_from_path(path: &Path, config: GaitConfig) -> WalkResult {
     run_walk_observed_from_path(path, config, |_, _| {})
 }
@@ -661,11 +668,42 @@ where
     run_walk_observed_from_path(Path::new(MODEL_PATH), config, observer)
 }
 
-fn run_walk_observed_from_path<F>(path: &Path, config: GaitConfig, mut observer: F) -> WalkResult
+fn run_walk_observed_from_path<F>(path: &Path, config: GaitConfig, observer: F) -> WalkResult
+where
+    F: FnMut(usize, &Scene),
+{
+    run_walk_observed_from_path_with_integrator(path, config, None, observer)
+}
+
+fn run_walk_observed_with_integrator<F>(
+    config: GaitConfig,
+    integrator: Integrator,
+    observer: F,
+) -> WalkResult
+where
+    F: FnMut(usize, &Scene),
+{
+    run_walk_observed_from_path_with_integrator(
+        Path::new(MODEL_PATH),
+        config,
+        Some(integrator),
+        observer,
+    )
+}
+
+fn run_walk_observed_from_path_with_integrator<F>(
+    path: &Path,
+    config: GaitConfig,
+    integrator: Option<Integrator>,
+    mut observer: F,
+) -> WalkResult
 where
     F: FnMut(usize, &Scene),
 {
     let mut scene = load_mjcf_path(path).expect("biped-walk MJCF must load");
+    if let Some(integrator) = integrator {
+        scene.world.integrator = integrator;
+    }
     let root_height = config.newt_root_height();
     scene.world.trees[0].set_free_root_pose(Vec3::new(0.0, 0.0, root_height), Quat::IDENTITY);
     scene.world.trees[0].qdot.fill(0.0);
