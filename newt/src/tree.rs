@@ -210,8 +210,9 @@ pub struct Tree {
 
     /// When `true`, [`aba`] skips the tier-3 penalty limit torque
     /// contribution for every hinge/slide range. Owned by
-    /// [`crate::world::World`], which sets this before each RK4 step when
-    /// `SolverMode::Pgs` is active so the PGS limit constraint (see
+    /// [`crate::world::World`], which sets this before each solver step when
+    /// `SolverMode::Pgs` or `SolverMode::Newton` is active so the selected
+    /// limit constraint (see
     /// [`crate::solver::solve_tree_limits`]) is the sole limit
     /// enforcer — mirroring how contacts already switch. Default `false`
     /// preserves every pre-v1-tier-4 golden and any direct
@@ -615,6 +616,47 @@ impl Tree {
         crate::dynamics::mass_matrix(self)
     }
 
+    /// Dense joint-space response matrix for the selected implicit velocity
+    /// solve. This is `M + dt*B`, matching the damping and actuator terms
+    /// that [`aba_implicit`] folds into its articulated-inertia pivots.
+    pub fn implicit_mass_matrix(&self, dt: f32, implicit_fast: bool) -> Vec<f32> {
+        let mut matrix = self.mass_matrix();
+        let nv = self.nv();
+        if nv == 0 || dt == 0.0 {
+            return matrix;
+        }
+        for (link_idx, link) in self.links.iter().enumerate() {
+            let (offset, damping): (usize, Vec<f32>) = match link.joint {
+                JointKind::Free => (
+                    self.v_offset[link_idx],
+                    vec![link.free_damping; link.joint.nv()],
+                ),
+                JointKind::Hinge { damping, .. } | JointKind::Slide { damping, .. } => {
+                    let actuator_damping = if implicit_fast {
+                        let q = self.q[self.q_offset[link_idx]];
+                        let qdot = self.qdot[self.v_offset[link_idx]];
+                        self.actuators
+                            .iter()
+                            .filter(|act| act.tendon_target.is_none() && act.link_idx == link_idx)
+                            .map(|act| act.velocity_damping(q, qdot))
+                            .sum()
+                    } else {
+                        0.0
+                    };
+                    (self.v_offset[link_idx], vec![damping + actuator_damping])
+                }
+                JointKind::Ball { damping, .. } => {
+                    (self.v_offset[link_idx], vec![damping; link.joint.nv()])
+                }
+                JointKind::Fixed => continue,
+            };
+            for (slot, damping) in (offset..offset + link.joint.nv()).zip(damping) {
+                matrix[slot * nv + slot] += dt * damping;
+            }
+        }
+        matrix
+    }
+
     /// Coriolis + centrifugal + gravity torques `h(q, qdot)` — RNE with
     /// `qddot = 0` and no external wrenches. See
     /// [`crate::dynamics::bias_forces`].
@@ -865,6 +907,25 @@ pub fn aba(
         external_wrenches,
         VelocityImplicit::Explicit,
     )
+}
+
+/// Compute generalized acceleration with the same velocity-implicit fold as
+/// [`euler_step`]. Constraint assembly uses this to form the free velocity
+/// before a tree contact impulse enters the selected solver.
+pub fn aba_implicit(
+    tree: &Tree,
+    poses: &[(Vec3, Quat)],
+    gravity: Vec3,
+    external_wrenches: &ExternalWrenches,
+    dt: f32,
+    implicit_fast: bool,
+) -> Vec<f32> {
+    let mode = if implicit_fast {
+        VelocityImplicit::JointDampingAndActuators { dt }
+    } else {
+        VelocityImplicit::JointDamping { dt }
+    };
+    aba_with_velocity_implicit(tree, poses, gravity, external_wrenches, mode)
 }
 
 fn implicit_mass_damping(
@@ -1213,14 +1274,29 @@ fn aba_with_velocity_implicit(
     match tree.links[0].joint {
         JointKind::Free => {
             // At root: IA[0] a[0] = tau_free_gen - pA[0]. The generalized
-            // free-root force is a spatial force in body-frame-at-COM
-            // coordinates conjugate to the 6 slot layout (ω_body, v_body)
-            // — populated by tendons via `tendon_qfrc[0..6]`. Zero when
-            // no tendon touches the free-root link (pre-v2-tier-3
-            // behavior preserved bit-for-bit).
+            // free-root solver force is a spatial force in body-frame-at-COM
+            // coordinates conjugate to the 6 slot layout (ω_body, v_body).
+            // The solver path sets `disable_penalty_limits`, which gates this
+            // channel on. Penalty callers keep the old free-root behavior.
+            let applied_free = tree.disable_penalty_limits;
+            let free_force = |slot: usize| {
+                if applied_free {
+                    tree.qfrc_applied[slot]
+                } else {
+                    0.0
+                }
+            };
             let tau_free = SpatialForce::new(
-                Vec3::new(tendon_qfrc[0], tendon_qfrc[1], tendon_qfrc[2]),
-                Vec3::new(tendon_qfrc[3], tendon_qfrc[4], tendon_qfrc[5]),
+                Vec3::new(
+                    free_force(0) + tendon_qfrc[0],
+                    free_force(1) + tendon_qfrc[1],
+                    free_force(2) + tendon_qfrc[2],
+                ),
+                Vec3::new(
+                    free_force(3) + tendon_qfrc[3],
+                    free_force(4) + tendon_qfrc[4],
+                    free_force(5) + tendon_qfrc[5],
+                ),
             );
             let rhs = SpatialForce::new(
                 tau_free.torque - w.pa[0].torque,

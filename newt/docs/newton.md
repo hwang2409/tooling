@@ -1,11 +1,12 @@
 # newt Newton constraint solver
 
-Status: opt-in Newton solver. PGS and the legacy penalty path remain
-unchanged.
+Status: Newton and PGS are the soft-constraint modes. Penalty remains the
+legacy default path.
 
 The Newton solver uses the same soft-constraint rows as PGS. It changes the
-numerical method only. It assembles a dense system per independent body or
-tree pool. Sparse factorization is future work.
+numerical method only. It assembles dense systems for free-body constraints,
+tree limits and equalities, and all tree-involved contacts. Sparse
+factorization is future work.
 
 ## Primal problem
 
@@ -187,10 +188,19 @@ Cone rows recover the projected impulse from the solved dual system.
 
 ## Tree contacts and the biped anchor
 
-Tree contacts stay on the penalty pathway in every solver mode in this ticket.
-Newton does not route tree contacts through its free-body rows. The assisted
-biped anchor therefore tests Newton tree-limit rows together with penalty
-contacts. Tree-contact routing for Newton is deferred to a later ticket.
+Tree-involved contacts use the selected soft-constraint solver in PGS and
+Newton modes. The world assembles one dense row system for all tree links and
+free bodies that touch those links. A link Jacobian row maps each contact
+direction into the tree's `qdot` layout. The same row carries the impulse to
+the opposite body or tree link, so mixed contacts conserve internal momentum.
+
+Penalty mode still calls the legacy tree wrench callback. This keeps the
+penalty trajectory and penalty goldens byte-identical.
+
+The solved normal impulse stays aligned with the original contact index. Touch
+sensors therefore report solver forces for tree contacts, including contacts
+that sit inside a force-free gap. The biped anchor now exercises solver-based
+ground and self contacts instead of a penalty fallback.
 
 The runtime checks the solver configuration at every `World::step` call.
 Programmatic `solver = Newton` plus `cone = elliptic` fails with the same
@@ -236,9 +246,12 @@ The Newton test set includes:
 - contact-index writeback when a force-free contact precedes an active one;
 - condim 4 torsional contact agreement;
 - Newton stack and incline byte goldens;
+- symmetry-broken PGS and Newton tree-contact byte goldens;
 - JSON and MJCF solver selection and loud elliptic rejection.
 
-The existing PGS goldens and full differential suite remain unchanged.
+Penalty goldens remain unchanged. The solver-mode tree goldens and matched
+tree-contact differential fixtures are new because PGS and Newton now own
+tree contact forces.
 
 The measured cross-solver bounds use 120 steps and add modest headroom:
 

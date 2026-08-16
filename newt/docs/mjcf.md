@@ -289,8 +289,10 @@ biped smoke tests with truthful names:
 1. `biped_simple_pure_pd_smoke` — pure joint PD, **NO external
    assist**. Asserts (a) the simulation stays finite and inside a
    generous world box, and (b) the biped's characteristic fall
-   between steps 300 and 600 down to ≤ 20 % of initial height. This
-   is the honest current pure-PD behavior baseline.
+   between steps 900 and 1200 down to ≤ 20 % of initial height. The
+   wider window reflects NEWT-22 routing tree contacts through PGS
+   instead of the legacy penalty callback. This is the honest current
+   pure-PD behavior baseline.
 2. `biped_simple_stands_with_source_balance_assist` — applies the
    source biped's `_apply_balance_controller` wrench each step —
    a **faithful 6-component mirror** of
@@ -339,7 +341,7 @@ of this commit.
 | `<option gravity>`       | 0 0 -9.81                           | 0 0 -9.81                                | yes    |
 | `<option integrator>`    | RK4                                 | RK4 (default)                            | yes    |
 | `<option cone>`          | elliptic                            | elliptic                                 | yes    |
-| `<option solver>`        | default (Newton)                    | PGS (newt has no Newton solver)          | **NO** |
+| `<option solver>`        | default (Newton)                    | PGS (Newton is also supported)           | **NO** |
 | joint `damping` default  | 2.0                                 | 2.0                                      | yes    |
 | joint `damping` roll     | 8.0 (hip_roll) / 5.0 (ankle_roll)   | 8.0 / 5.0                                | yes    |
 | joint `armature` default | 0.02                                | 0.02                                     | yes    |
@@ -361,11 +363,10 @@ of this commit.
 
 **Identified engine-level gaps (candidate NEWT-13 seeds):**
 
-- **No Newton solver.** MuJoCo's default constraint solver is Newton;
-  newt only ships Penalty and PGS in v1. The stand scenario's contact
-  model may behave differently under PGS iterations vs. Newton at the
-  same solref/solimp. Impact: unknown until we run the NEWT-13
-  differential harness against real MuJoCo trajectories.
+- **Tree contact routing changed in NEWT-22.** PGS and Newton now solve
+  tree-involved contacts with shared soft-constraint rows. Penalty remains
+  the legacy path. The matched differential rows in
+  [`docs/differential.md`](differential.md) record the resulting behavior.
 - **`dampratio` in `<position>` uses a unit-inertia approximation.**
   The loader converts `dampratio=ζ` into `kd = 2ζ·√(kp·1)` because
   the actuator does not know the joint's `Sᵀ IA S` at parse time
@@ -394,17 +395,17 @@ Nm/rad`. Even at the top of the source range (`kp = 80`), total is
 `160 Nm/rad` — still under 177. Net stiffness is negative in both
 cases, so the linearized dynamics have an unstable eigenvalue and
 any small perturbation grows exponentially. Observed pure-PD
-trajectory (`examples/biped_diag.rs`, not shipped as a test):
+trajectory after NEWT-22 tree-contact routing (`examples/biped_diag.rs`,
+not shipped as a test):
 
 ```
 step  100  root=(-0.022,-0.000,1.2459)  z_ratio=1.009  tilt≈0.018 rad
 step  200  root=(-0.102,+0.000,1.2403)  z_ratio=1.004  tilt≈0.102 rad
-step  300  root=(-0.329,+0.000,1.1918)  z_ratio=0.965  tilt≈0.339 rad
-step  400  root=(-0.981,+0.000,0.7768)  z_ratio=0.629  tilt≈0.972 rad
-step  500  root=(-1.318,+0.000,0.1388)  z_ratio=0.112  tilt≈1.567 rad
+step  300  root=(see test trace)  z_ratio=above 0.5
+step 1000  root=(see test trace)  z_ratio=above 0.5
+step 1045  root=(see test output) z_ratio<0.5
 ...
-min z ratio: 0.105 (10.5% of initial)
-first crossed z_ratio < 0.5 at step 413
+first crossed z_ratio < 0.5 at step 1045
 ```
 
 The source biped's `stand` scenario ships with the balance

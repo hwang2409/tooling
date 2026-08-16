@@ -1,0 +1,27 @@
+<!-- Differential scenario: a free-root, one-hinge chain falling onto a plane.
+
+  The asymmetric link masses, offsets, and initial joint angles break the
+  contact and inertia symmetries. Matched Newton/Euler is captured separately
+  because this is a tree-contact routing fixture, not a legacy PGS row.
+-->
+<mujoco model="tree_chain_contact">
+  <compiler angle="radian"/>
+  <option timestep="0.002" gravity="0 0 -9.81"
+          integrator="Euler" solver="Newton" cone="pyramidal" iterations="20"/>
+
+  <worldbody>
+    <geom name="ground" type="plane" size="5 5 0.1" friction="0.6"/>
+
+    <body name="root" pos="0 0 1.35">
+      <freejoint name="root_free"/>
+      <inertial pos="0 0 0" mass="1.1" diaginertia="0.08 0.09 0.1"/>
+      <geom name="root_geom" type="sphere" size="0.24" friction="0.6"/>
+
+      <body name="upper" pos="0 0 -0.5">
+        <joint name="upper_hinge" type="hinge" axis="0 1 0" pos="0 0 0.25"/>
+        <inertial pos="0 0 0" mass="0.8" diaginertia="0.025 0.03 0.02"/>
+        <geom name="upper_geom" type="sphere" size="0.19" friction="0.6"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

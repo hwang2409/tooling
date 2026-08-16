@@ -7,12 +7,13 @@ mod biped_walk_support;
 
 use biped_walk_support::{
     GaitConfig, controller_target_trace, run_walk, run_walk_with_integrator, run_walk_with_solver,
-    trace_bytes,
+    run_walk_with_solver_observed, trace_bytes,
 };
 use newt::actuator::ActuatorFlavor;
 use newt::mjcf::{load_mjcf_path, load_mjcf_str};
 use newt::solver::SolverMode;
 use newt::world::Integrator;
+use std::fs;
 
 const CADENCE_MIN_BPM: f32 = 80.0;
 const STEP_LENGTH_MIN_M: f32 = 0.05;
@@ -55,14 +56,14 @@ fn assisted_walk_euler_stays_in_the_rk4_metric_family() {
 }
 
 #[test]
-fn assisted_walk_newton_tree_limits_with_penalty_contacts_stays_stable() {
+fn assisted_walk_newton_tree_contacts_stays_stable() {
     let result = run_walk_with_solver(
         GaitConfig::stable_joint_walk(2000),
         Integrator::Euler,
         SolverMode::Newton,
     );
     println!(
-        "Newton tree-limit + penalty-contact walk: distance={:.4} cadence={:.2} step_length={:.4} clearance={:.4} self_contact_steps={}",
+        "Newton tree-contact walk: distance={:.4} cadence={:.2} step_length={:.4} clearance={:.4} self_contact_steps={}",
         result.metrics.forward_distance,
         result.metrics.cadence_bpm,
         result.metrics.mean_step_length,
@@ -82,8 +83,133 @@ fn assisted_walk_newton_tree_limits_with_penalty_contacts_stays_stable() {
 #[test]
 #[ignore = "the dictated 5000-step acceptance run is executed by the demo"]
 fn tier_one_assisted_walk_full_acceptance_run_passes() {
-    let result = run_walk(GaitConfig::stable_joint_walk(5000));
-    assert_gait_metrics(&result, 2.0);
+    let result = run_walk_with_solver(
+        GaitConfig::stable_joint_walk(5000),
+        Integrator::Euler,
+        SolverMode::Newton,
+    );
+    println!("Newton tree-contact walk: {:?}", result.metrics);
+    assert!(result.metrics.forward_distance.is_finite());
+    assert!(result.metrics.cadence_bpm.is_finite());
+    assert!(result.metrics.forward_distance > 2.0);
+    assert!(result.metrics.cadence_bpm > 80.0);
+    assert!(result.metrics.max_foot_clearance > 0.06);
+    assert_eq!(result.metrics.self_contact_force_steps, 0);
+}
+
+#[test]
+#[ignore = "the 5000-step matched MuJoCo capture is an acceptance run"]
+fn assisted_walk_matches_captured_mujoco_trajectory() {
+    let (fixture_steps, fixture_stride, expected) = read_biped_fixture();
+    assert_eq!(fixture_steps, 5000);
+    assert_eq!(fixture_stride, 100);
+    let config = GaitConfig::stable_joint_walk(fixture_steps as usize);
+    let mut actual = vec![initial_biped_qpos_qvel()];
+    run_walk_with_solver_observed(
+        config,
+        Integrator::Euler,
+        SolverMode::Newton,
+        |step, scene| {
+            if step % fixture_stride as usize == 0 {
+                actual.push(extract_biped_qpos_qvel(scene));
+            }
+        },
+    );
+    assert_eq!(actual.len(), expected.len());
+    let mut max_qpos = 0.0f64;
+    let mut max_qvel = 0.0f64;
+    for (actual, expected) in actual.iter().zip(expected.iter()) {
+        for (a, e) in actual.0.iter().zip(&expected.0) {
+            max_qpos = max_qpos.max((f64::from(*a) - f64::from(*e)).abs());
+        }
+        for (a, e) in actual.1.iter().zip(&expected.1) {
+            max_qvel = max_qvel.max((f64::from(*a) - f64::from(*e)).abs());
+        }
+    }
+    println!("assisted biped Newton/Euler differential qpos={max_qpos:.6e} qvel={max_qvel:.6e}");
+    assert!(max_qpos < 0.4, "qpos divergence={max_qpos}");
+    assert!(max_qvel < 3.0, "qvel divergence={max_qvel}");
+}
+
+type BipedState = (Vec<f32>, Vec<f32>);
+
+fn read_biped_fixture() -> (u32, u32, Vec<BipedState>) {
+    let bytes = fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/references/biped_assisted_walk_newton_euler.bin"
+    ))
+    .expect("matched biped MuJoCo fixture must exist");
+    let mut cursor = 0;
+    assert_eq!(&bytes[cursor..cursor + 8], b"NEWTDIF1");
+    cursor += 8;
+    let provenance_len = read_u32(&bytes, &mut cursor) as usize;
+    cursor += provenance_len;
+    let nq = read_u32(&bytes, &mut cursor) as usize;
+    let nv = read_u32(&bytes, &mut cursor) as usize;
+    let stride = read_u32(&bytes, &mut cursor);
+    let samples = read_u32(&bytes, &mut cursor) as usize;
+    let steps = read_u32(&bytes, &mut cursor);
+    let mut output = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        cursor += 4;
+        let qpos = (0..nq)
+            .map(|_| read_f64(&bytes, &mut cursor) as f32)
+            .collect();
+        let qvel = (0..nv)
+            .map(|_| read_f64(&bytes, &mut cursor) as f32)
+            .collect();
+        output.push((qpos, qvel));
+    }
+    assert_eq!(cursor, bytes.len());
+    (steps, stride, output)
+}
+
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> u32 {
+    let value = u32::from_le_bytes(bytes[*cursor..*cursor + 4].try_into().unwrap());
+    *cursor += 4;
+    value
+}
+
+fn read_f64(bytes: &[u8], cursor: &mut usize) -> f64 {
+    let value = f64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
+    *cursor += 8;
+    value
+}
+
+fn initial_biped_qpos_qvel() -> BipedState {
+    (
+        vec![
+            0.0,
+            0.0,
+            1.2431770031,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            -0.4389568694,
+            0.06,
+            0.0,
+            0.091696537,
+            0.0,
+            0.4492281700,
+            0.1390241230,
+            0.0,
+            0.1388300015,
+        ],
+        vec![0.0; 16],
+    )
+}
+
+fn extract_biped_qpos_qvel(scene: &newt::model::Scene) -> BipedState {
+    let tree = &scene.world.trees[0];
+    let mut qpos = tree.q[..3].to_vec();
+    qpos.extend([tree.q[6], tree.q[3], tree.q[4], tree.q[5]]);
+    qpos.extend_from_slice(&tree.q[7..]);
+    let mut qvel = tree.qdot[3..6].to_vec();
+    qvel.extend_from_slice(&tree.qdot[0..3]);
+    qvel.extend_from_slice(&tree.qdot[6..]);
+    (qpos, qvel)
 }
 
 #[test]

@@ -166,8 +166,8 @@ zero hinge axes — every branch has a dedicated unit test in
   for the PGS constraint solver — same shape as the geom-level
   `solref` / `solimp` blocks (`{"timeconst", "dampratio"}` and
   `{"dmin", "dmax", "width", "midpoint", "power"}` respectively).
-  Omitted → `SolRef::DEFAULT` / `SolImp::DEFAULT`. Only consulted
-  under `solver.mode = "pgs"`.
+  Omitted → `SolRef::DEFAULT` / `SolImp::DEFAULT`. Consulted when
+  `solver.mode` is `"pgs"` or `"newton"`.
 - Ball: **damping** (isotropic angular, N·m per rad/s), **armature**
   (per-axis rotor inertia, kg·m²). **NO `range` field** — a physically
   correct 3-DOF orientation limit needs the v1 solver landing in a
@@ -260,12 +260,12 @@ lookup by name resolves to a mesh id used at runtime.
   is `SolRef::DEFAULT` (`timeconst = 0.02`, critical damping). See
   [`docs/contacts.md`](contacts.md).
 - **solimp** — MuJoCo-style 5-parameter impedance sigmoid. Optional;
-  default is `SolImp::DEFAULT`. Only consulted when
-  `solver.mode = "pgs"`. See [`docs/solver.md`](solver.md).
+  default is `SolImp::DEFAULT`. Consulted when `solver.mode` is
+  `"pgs"` or `"newton"`. See [`docs/solver.md`](solver.md).
 - **condim** — Contact dimensionality. `1` (frictionless), `3`
   (normal + 2 tangents, sliding friction), `4` (adds torsion about
   the normal), or `6` (adds two rolling rows about the tangents).
-  Default `3`. Only consulted when `solver.mode = "pgs"`. See
+  Default `3`. Consulted when `solver.mode` is `"pgs"` or `"newton"`. See
   [`docs/solver.md`](solver.md) for the row structure.
 - **torsional_friction** — Coulomb coefficient about the contact
   normal, ≥ 0. Default `0`. Only read when the pair's condim ≥ 4;

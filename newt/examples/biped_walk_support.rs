@@ -618,7 +618,7 @@ pub fn run_walk_with_integrator(config: GaitConfig, integrator: Integrator) -> W
 
 /// Run the walker with an explicit integrator and constraint solver. This is
 /// used by the Newton acceptance anchor; the default helpers keep their
-/// established PGS configuration. Tree contacts remain on the penalty path.
+/// established PGS configuration. Tree contacts use the selected solver.
 pub fn run_walk_with_solver(
     config: GaitConfig,
     integrator: Integrator,
@@ -630,6 +630,27 @@ pub fn run_walk_with_solver(
         Some(integrator),
         Some(solver),
         |_, _| {},
+    )
+}
+
+/// Run the walker with an explicit solver and expose each post-step state.
+/// This supports matched differential captures without changing the public
+/// acceptance result or its metric bookkeeping.
+pub fn run_walk_with_solver_observed<F>(
+    config: GaitConfig,
+    integrator: Integrator,
+    solver: SolverMode,
+    observer: F,
+) -> WalkResult
+where
+    F: FnMut(usize, &Scene),
+{
+    run_walk_observed_from_path_with_options(
+        Path::new(MODEL_PATH),
+        config,
+        Some(integrator),
+        Some(solver),
+        observer,
     )
 }
 
