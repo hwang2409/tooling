@@ -1,0 +1,213 @@
+# newt Newton constraint solver
+
+Status: opt-in v3 solver. PGS and the legacy penalty path remain unchanged.
+
+The Newton solver uses the same soft-constraint rows as PGS. It changes the
+numerical method only. It assembles a dense system per independent body or
+tree pool. Sparse factorization is future work.
+
+## Primal problem
+
+Let `qacc` be the generalized acceleration for one solve. Let
+`qacc_smooth` be the acceleration from external forces, gravity, bias, and
+actuator forces before constraints. The smooth dynamics cost is
+
+```text
+  C_smooth(qacc) = 1/2 (qacc - qacc_smooth)^T M (qacc - qacc_smooth).
+```
+
+For row `i`, let `J_i` be its generalized Jacobian and let `a_ref_i` be the
+MuJoCo reference acceleration. Define the constraint-space residual
+
+```text
+  s_i(qacc) = J_i qacc + a_ref_i.
+```
+
+A positive `s_i` means that the row escapes the violation. A negative value
+means that the row still moves into the violation. A one-sided row contributes
+
+```text
+  C_i(s_i) = 1/2 w_i min(s_i, 0)^2.
+```
+
+The full convex primal cost is
+
+```text
+  C(qacc) = C_smooth(qacc) + Σ_i C_i(s_i).
+```
+
+The weight `w_i` is the inverse soft compliance after the `solimp` split. The
+implementation uses the equivalent regularized dual after eliminating
+`qacc`. This avoids forming a second generalized-coordinate copy of the
+mass matrix. The dual variable is the constraint impulse `f` and its cost is
+
+```text
+  D(f) = 1/2 f^T (J M^-1 J^T + R) f + b^T f.
+```
+
+Here `b` is the existing PGS bias and
+
+```text
+  R_ii = (1 - d_i) / d_i · (J M^-1 J^T)_ii.
+```
+
+The primal and dual have the same optimum. The Newton module minimizes this
+dense dual quadratic, then recovers `qacc` and the applied wrench from `f`.
+This is why PGS and Newton use identical row assembly and agree on stable
+scenes.
+
+## Scalar zones
+
+For `C_i(s) = 1/2 w min(s, 0)^2`, the zones are:
+
+| zone | condition | gradient | Hessian |
+| --- | --- | --- | --- |
+| inactive | `s > 0` | `0` | `0` |
+| boundary | `s = 0` | `0` | `0` by convention |
+| active | `s < 0` | `w s` | `w` |
+
+The gradient with respect to generalized acceleration is `J_i^T` times the
+scalar gradient. The Hessian contribution is `w J_i^T J_i` in the active
+zone. The boundary uses the inactive-side Hessian. This choice is fixed and
+f32 deterministic.
+
+Normal contact and joint-limit rows use the non-negative projection
+`f_i >= 0`. Bilateral equality rows use the identity projection.
+
+## Pyramidal friction zones
+
+For a contact with normal residual `n`, tangent residuals `t1` and `t2`, and
+friction coefficient `mu`, the pyramidal cone has two affine faces:
+
+```text
+  e1 = |t1| - mu n
+  e2 = |t2| - mu n.
+```
+
+The tangential cone cost is
+
+```text
+  C_cone = 1/2 w max(e1, 0)^2 + 1/2 w max(e2, 0)^2.
+```
+
+Each face has one of these exact active gradients:
+
+```text
+  v1 = (-mu, sign(t1), 0)
+  v2 = (-mu, 0, sign(t2)).
+```
+
+For an active face `e`, its derivatives are
+
+```text
+  gradient = w e v
+  Hessian  = w v v^T.
+```
+
+The contact normal one-sided term is assembled separately. The zones are:
+
+| zone | condition |
+| --- | --- |
+| interior | `e1 < 0` and `e2 < 0` |
+| boundary | either face equals zero and neither face is positive |
+| outside | `e1 > 0` or `e2 > 0` |
+
+Torsional friction is a scalar cone bound. Rolling friction uses a second
+pyramidal pair. All bounds use the current normal impulse, so a zero normal
+impulse collapses every tangential bound to zero.
+
+## Elliptic status
+
+`elliptic_derivatives` contains the exact curved-cone derivatives for
+
+```text
+  1/2 w max(sqrt(t1² + t2²) - mu n, 0)².
+```
+
+The live Newton loader rejects `solver = Newton` with `cone = elliptic`.
+The curved projection makes the current piecewise-quadratic line search
+invalid. JSON and MJCF reject this pair with an error that names
+`cone=pyramidal`. PGS elliptic cones remain supported.
+
+## Newton step and line search
+
+The dense Hessian is the regularized Delassus matrix. Cholesky supplies the
+Newton direction:
+
+```text
+  H p = -(H f + b).
+```
+
+The initial impulse is zero. It is feasible for every supported projection.
+The pyramidal projection path is piecewise affine in step length `alpha`.
+The line search collects every zone boundary in `0 <= alpha <= 1`. On each
+interval, the projected impulse is affine. The minimum of the quadratic on
+that interval is the closed-form root
+
+```text
+  alpha* = alpha_mid - (gradient · p) / (p^T H p).
+```
+
+The best interval candidate is selected. A step is accepted only when it
+reduces the f32 cost. This gives a monotone cost sequence without random
+backtracking. If the improvement is at most
+`1e-7 * (1 + abs(cost))`, the solve converges. The iteration cap is
+`world.solver.iterations`; the default is 20. A zero iteration request is
+invalid in loaded configurations.
+
+The solve records the initial and accepted costs in `NewtonResult::costs`.
+Tests assert monotonicity and exact hand-derived derivatives for inactive,
+boundary, active, interior, and outside zones.
+
+## Integration and force recovery
+
+Newton solves once at the start of an integration step. The resulting
+wrenches use the same zero-order hold as PGS across RK4 stages. Euler and
+implicit-fast apply the wrench in their single semi-implicit solve.
+
+For every row, the recovered impulse is converted to force by `f / dt`.
+Linear rows apply equal and opposite force at the contact arm. Angular rows
+apply equal and opposite torque. This is equivalent to recovering the
+constraint force from
+
+```text
+  f_constraint = -R^-1 (J qacc - a_ref)
+```
+
+and keeps touch sensors on the actual applied normal force.
+
+## Selection
+
+JSON:
+
+```json
+{
+  "solver": {
+    "mode": "newton",
+    "iterations": 20,
+    "cone": "pyramidal"
+  }
+}
+```
+
+MJCF:
+
+```xml
+<option solver="Newton" iterations="20" cone="pyramidal"/>
+```
+
+`solver = PGS` remains the existing soft-constraint mode. Omitting the
+solver keeps the legacy default and all pre-existing goldens byte-identical.
+
+## Verification anchors
+
+The Newton test set includes:
+
+- PGS/Newton agreement on a resting contact;
+- deterministic duplicate Newton runs;
+- monotone cost and convergence tests on dense hand-built systems;
+- hand-derived scalar and cone zone derivatives;
+- Newton stack and incline byte goldens;
+- JSON and MJCF solver selection and loud elliptic rejection.
+
+The existing PGS goldens and full differential suite remain unchanged.
