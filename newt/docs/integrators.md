@@ -8,7 +8,7 @@ trajectory.
 | --- | --- | --- | --- |
 | `Rk4` | four interpolated stages | penalty contacts at every stage; PGS constraints once at step start and held constant | weighted stage sum |
 | `Euler` | start of step | forward kinematics, collision, and constraint solve once at the current state | `qvel += dt*qacc`; integrate `qpos` from new `qvel` |
-| `ImplicitFast` | start of step | same one-solve pipeline as Euler | same velocity-first update, with actuator velocity terms folded into the solve |
+| `ImplicitFast` | start of step | same one-solve pipeline as Euler | same velocity-first update, with joint and joint-actuator velocity terms folded into the solve |
 
 ## euler pipeline
 
@@ -53,6 +53,11 @@ matrix. For a scalar hinge or slide, it adds `dt*damping` to
 diagonal of its three-by-three joint block. The right-hand side still uses
 `-damping*qvel` from the start of the step.
 
+A free root uses the same scalar damping coefficient on all six velocity
+slots. Its root `6×6` articulated inertia gets `dt*damping` on every diagonal,
+and its right-hand side gets `-damping*qvel`. JSON and MJCF root joints accept
+that scalar as `damping`.
+
 This fold prevents the explicit factor `1 - dt*damping/I` from becoming
 unstable at the biped timestep. The permanent stability anchor uses
 `dt=0.005` and `damping=1000`: the explicit probe grows by a factor of four
@@ -72,9 +77,14 @@ actuators and the velocity terms in a general actuator's affine gain/bias.
 It includes actuator gear factors in transmission space.
 
 This ticket does not include Coriolis derivatives. It also does not
-differentiate force clamps. That is the known delta from full MuJoCo
-`implicitfast`; the supported scope is joint damping plus actuator velocity
-terms only.
+differentiate force clamps. Tendon-actuator velocity derivatives are also
+excluded: their correct fold is the dense, non-diagonal `kv*Jᵀ*J` term. This
+ticket evaluates those tendon forces explicitly; the full coupled fold arrives
+with the Newton ticket's dense machinery. That is the known delta from full
+MuJoCo `implicitfast`; the supported implicit scope is joint damping plus
+joint-transmitted actuator velocity terms only. At force saturation, the
+review probe measured `qacc=-1` with the full clamp derivative and `qacc=-0.167`
+with this intentional clamp-derivative omission.
 
 ## selection
 

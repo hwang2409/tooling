@@ -1,8 +1,11 @@
 use newt::actuator::Actuator;
 use newt::body::Body;
+use newt::dynamics::{bias_forces, cholesky, cholesky_solve, mass_matrix};
 use newt::joint::{JointKind, JointLimit};
 use newt::math::{Mat3, Quat, Vec3};
+use newt::mjcf::load_mjcf_str;
 use newt::model::load_str;
+use newt::tendon::{FixedTendonJoint, Tendon, tendon_kinematics};
 use newt::tree::{Link, Tree, aba, forward_kinematics};
 use newt::world::{Integrator, World};
 
@@ -31,6 +34,21 @@ fn damped_hinge(damping: f32) -> Tree {
         Mat3::IDENTITY,
     ));
     tree.set_hinge_rate(1, 1.0);
+    tree
+}
+
+fn damped_free_root(damping: f32) -> Tree {
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Free,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        2.0,
+        Mat3::IDENTITY,
+    ));
+    tree.links[0].free_damping = damping;
+    tree.qdot[3] = 3.0;
     tree
 }
 
@@ -86,6 +104,54 @@ fn implicit_joint_damping_stays_stable_when_explicit_probe_diverges() {
 }
 
 #[test]
+fn euler_free_root_damping_uses_hand_derived_implicit_rate() {
+    let dt = 0.1;
+    let mut world = World::new();
+    world.integrator = Integrator::Euler;
+    world.dt = dt;
+    world.gravity = Vec3::ZERO;
+    world.add_tree(damped_free_root(4.0));
+
+    world.step();
+
+    // m vdot = -d v_new gives v_new = m/(m + dt*d) * v_old.
+    let tree = &world.trees[0];
+    assert!((tree.qdot[3] - 2.5).abs() < 1e-6, "qvel = {}", tree.qdot[3]);
+    assert!((tree.q[0] - 0.25).abs() < 1e-6, "qpos = {}", tree.q[0]);
+    assert!(((tree.qdot[3] - 3.0) / dt + 5.0).abs() < 1e-5);
+}
+
+#[test]
+fn free_root_damping_loads_from_json_and_mjcf() {
+    let json = r#"{
+        "trees": [{
+            "name": "t",
+            "links": [{
+                "name": "root",
+                "joint": {"kind": "free", "damping": 2.5},
+                "mass": 1,
+                "inertia": {"kind": "diag", "values": [1, 1, 1]}
+            }]
+        }]
+    }"#;
+    let scene = load_str(json).expect("json free-root damping should load");
+    assert_eq!(scene.world.trees[0].links[0].free_damping, 2.5);
+
+    let mjcf = r#"<mujoco><worldbody>
+        <body name="root">
+            <inertial mass="1" diaginertia="1 1 1"/>
+            <freejoint damping="3.5"/>
+            <body name="child" pos="0 0 -1">
+                <joint type="hinge" axis="1 0 0"/>
+                <inertial mass="1" diaginertia="1 1 1"/>
+            </body>
+        </body>
+    </worldbody></mujoco>"#;
+    let scene = load_mjcf_str(mjcf).expect("mjcf free-root damping should load");
+    assert_eq!(scene.world.trees[0].links[0].free_damping, 3.5);
+}
+
+#[test]
 fn implicitfast_folds_velocity_actuator_derivative() {
     let dt = 0.005;
     let mut euler_tree = damped_hinge(0.0);
@@ -115,6 +181,76 @@ fn implicitfast_folds_velocity_actuator_derivative() {
     let implicit_rate = implicit.trees[0].qdot[implicit.trees[0].v_offset[1]];
     assert!(implicit_rate.is_finite());
     assert!(implicit_rate.abs() < 1.0);
+}
+
+#[test]
+fn implicitfast_tendon_velocity_derivative_stays_explicit() {
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::IDENTITY,
+    ));
+    for _ in 0..2 {
+        let parent = tree.links.len() - 1;
+        tree.push_link(Link::new(
+            Some(parent),
+            JointKind::hinge(Vec3::Z),
+            (Vec3::ZERO, Quat::IDENTITY),
+            (Vec3::ZERO, Quat::IDENTITY),
+            1.0,
+            Mat3::IDENTITY,
+        ));
+    }
+    let tendon = tree.add_tendon(Tendon::fixed(vec![
+        FixedTendonJoint { link: 1, coef: 1.0 },
+        FixedTendonJoint { link: 2, coef: 2.0 },
+    ]));
+    let actuator = tree.add_actuator(Actuator::velocity(0, 100.0, 0.0).on_tendon(tendon));
+    tree.set_actuator_target(actuator, 0.0);
+    tree.qdot[tree.v_offset[1]] = 1.0;
+    tree.qdot[tree.v_offset[2]] = -0.25;
+
+    let poses = forward_kinematics(&tree);
+    let kin = tendon_kinematics(&tree.tendons[tendon], &tree, &poses);
+    let force = tree.actuators[actuator].torque(kin.length, kin.velocity);
+    let mut rhs = vec![0.0; tree.nv()];
+    for (slot, &coef) in kin.jacobian.iter().enumerate() {
+        rhs[slot] += coef * force;
+    }
+    let mass = mass_matrix(&tree);
+    let bias = bias_forces(&tree, Vec3::ZERO);
+    for (r, value) in rhs.iter_mut().enumerate() {
+        *value -= bias[r];
+    }
+    let factor = cholesky(&mass, tree.nv()).expect("dense mass matrix should be positive definite");
+    let dense_qacc = cholesky_solve(&factor, tree.nv(), &rhs);
+
+    let mut world = World::new();
+    world.integrator = Integrator::ImplicitFast;
+    world.dt = 0.005;
+    world.gravity = Vec3::ZERO;
+    world.add_tree(tree);
+    let before = world.trees[0].qdot.clone();
+    world.step();
+    let observed_qacc: Vec<f32> = world.trees[0]
+        .qdot
+        .iter()
+        .zip(before.iter())
+        .map(|(&after, &before)| (after - before) / world.dt)
+        .collect();
+
+    for slot in [world.trees[0].v_offset[1], world.trees[0].v_offset[2]] {
+        assert!(
+            (observed_qacc[slot] - dense_qacc[slot]).abs() < 1e-4,
+            "tendon actuator qacc slot {slot}: observed {}, dense {}",
+            observed_qacc[slot],
+            dense_qacc[slot]
+        );
+    }
 }
 
 #[test]

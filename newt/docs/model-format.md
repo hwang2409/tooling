@@ -156,6 +156,8 @@ zero hinge axes — every branch has a dedicated unit test in
 ```
 
 - **kind** = `free` (6-DOF root), `fixed`, `hinge`, `slide`, or `ball`.
+- Free roots accept scalar **damping** for all three angular and three
+  linear velocity DOFs. The default is `0`.
 - Hinges + slides: **axis** (required, normalized on load; zero rejected),
   **range** (optional `[lo, hi]`, lo < hi enforced), **damping**,
   **armature**, **limit.stiffness** / **limit.damping**. Units follow

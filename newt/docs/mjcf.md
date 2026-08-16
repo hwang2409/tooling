@@ -133,7 +133,8 @@ For each body:
 ### `<joint>` / `<freejoint>`
 
 `<freejoint>` is only valid as the sole joint on a top-level body
-(and becomes newt's `JointKind::Free`). `<joint>` supports:
+(and becomes newt's `JointKind::Free`). Its scalar `damping` attribute
+applies to all six free-root DOFs. `<joint>` supports:
 
 | Attribute  | Supported values                       | Notes |
 | ---------- | -------------------------------------- | ----- |

@@ -88,6 +88,12 @@ pub struct Link {
     /// when `parent` is `Some`.
     pub joint: JointKind,
 
+    /// Scalar damping applied to every DOF of a free root joint. MuJoCo's
+    /// free-joint damping uses one coefficient for its three angular and
+    /// three linear velocity slots. This stays separate from `JointKind` so
+    /// existing programmatic `JointKind::Free` callers keep their API.
+    pub free_damping: f32,
+
     /// Joint anchor pose in the parent's body frame. For the root with a
     /// `Fixed` joint, this is the world-frame anchor. For the root with a
     /// `Free` joint, this is ignored (initial pose comes from `q`).
@@ -152,6 +158,7 @@ impl Link {
         Self {
             parent,
             joint,
+            free_damping: 0.0,
             joint_offset_in_parent,
             joint_offset_in_child,
             mass,
@@ -872,6 +879,9 @@ fn implicit_mass_damping(
         VelocityImplicit::Explicit => return 0.0,
         VelocityImplicit::JointDamping { dt } => (dt, 0.0),
         VelocityImplicit::JointDampingAndActuators { dt } => {
+            // Tendon actuator velocity derivatives are dense JᵀJ terms. Do
+            // not fold them into these scalar joint denominators; this
+            // ticket evaluates tendon velocity force explicitly.
             let damping = tree
                 .actuators
                 .iter()
@@ -1216,9 +1226,36 @@ fn aba_with_velocity_implicit(
                 tau_free.torque - w.pa[0].torque,
                 tau_free.linear - w.pa[0].linear,
             );
-            let a0 = w.ia[0]
-                .solve(rhs)
-                .expect("root articulated inertia is singular — degenerate mass distribution?");
+            let root_damping = tree.links[0].free_damping;
+            let a0 = if root_damping == 0.0 {
+                w.ia[0]
+                    .solve(rhs)
+                    .expect("root articulated inertia is singular — degenerate mass distribution?")
+            } else {
+                let voff = tree.v_offset[0];
+                let qdot = SpatialMotion::new(
+                    Vec3::new(tree.qdot[voff], tree.qdot[voff + 1], tree.qdot[voff + 2]),
+                    Vec3::new(
+                        tree.qdot[voff + 3],
+                        tree.qdot[voff + 4],
+                        tree.qdot[voff + 5],
+                    ),
+                );
+                let damped_rhs = rhs
+                    - SpatialForce::new(qdot.angular * root_damping, qdot.linear * root_damping);
+                let damping_mass = match velocity_implicit {
+                    VelocityImplicit::Explicit => 0.0,
+                    VelocityImplicit::JointDamping { dt }
+                    | VelocityImplicit::JointDampingAndActuators { dt } => dt * root_damping,
+                };
+                let mut root_ia = w.ia[0];
+                for i in 0..6 {
+                    root_ia.rows[i][i] += damping_mass;
+                }
+                root_ia
+                    .solve(damped_rhs)
+                    .expect("root articulated inertia is singular — degenerate mass distribution?")
+            };
             w.a[0] = a0;
             // Store the 6 free-root accelerations (body-frame at COM) into
             // qddot slots 0..6.
