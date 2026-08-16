@@ -68,7 +68,7 @@ errors out with the attribute name.
 | `timestep`   | positive float                                | Sets `World::dt`. |
 | `gravity`    | `x y z`                                       | Sets `World::gravity`. |
 | `magnetic`   | `x y z`                                       | Sets `World::magnetic_field`. |
-| `integrator` | `RK4` / `rk4`                                 | Others error (only RK4 is implemented). |
+| `integrator` | `RK4`, `Euler`, `implicitfast`                | Maps to `World::integrator`; default is RK4. |
 | `cone`       | `pyramidal` or `elliptic`                     | Maps to `World::solver.cone`. |
 | `iterations` | positive integer                              | Maps to `World::solver.iterations`. |
 | `solver`     | `PGS` / `pgs`                                 | Switches `World::solver.mode` to `Pgs`. Newt's default stays `Penalty` when this attribute is absent. |
