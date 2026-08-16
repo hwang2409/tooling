@@ -111,12 +111,18 @@ pub fn pyramidal_derivatives(
         gradient: [0.0; 3],
         hessian: [0.0; 9],
     };
-    for (tangent, excess) in [(tangent_1, e1), (tangent_2, e2)] {
+    for (face_index, (tangent, excess)) in
+        [(tangent_1, e1), (tangent_2, e2)].into_iter().enumerate()
+    {
         if excess <= 0.0 {
             continue;
         }
         let sign = if tangent >= 0.0 { 1.0 } else { -1.0 };
-        let face = [-mu, sign, 0.0];
+        let face = if face_index == 0 {
+            [-mu, sign, 0.0]
+        } else {
+            [-mu, 0.0, sign]
+        };
         out.cost += 0.5 * weight * excess * excess;
         for i in 0..3 {
             out.gradient[i] += weight * excess * face[i];
@@ -589,6 +595,195 @@ mod tests {
         approx(d.hessian[0], 1.0);
         approx(d.hessian[1], -2.0);
         approx(d.hessian[4], 4.0);
+    }
+
+    #[test]
+    fn pyramidal_second_face_matches_hand_derivation() {
+        let d = pyramidal_derivatives(1.0, 0.1, -2.0, 0.5, 4.0);
+        assert_eq!(d.zone, ConeZone::Outside);
+        // e1 = .1 - .5 is inactive; e2 = 2 - .5 = 1.5.
+        approx(d.cost, 4.5);
+        approx(d.gradient[0], -3.0);
+        approx(d.gradient[1], 0.0);
+        approx(d.gradient[2], -6.0);
+        approx(d.hessian[0], 1.0);
+        approx(d.hessian[2], 2.0);
+        approx(d.hessian[6], 2.0);
+        approx(d.hessian[8], 4.0);
+    }
+
+    #[test]
+    fn pyramidal_both_faces_match_hand_derivation() {
+        let d = pyramidal_derivatives(1.0, 2.0, -2.0, 0.5, 4.0);
+        assert_eq!(d.zone, ConeZone::Outside);
+        approx(d.cost, 9.0);
+        approx(d.gradient[0], -6.0);
+        approx(d.gradient[1], 6.0);
+        approx(d.gradient[2], -6.0);
+        approx(d.hessian[0], 2.0);
+        approx(d.hessian[1], -2.0);
+        approx(d.hessian[2], 2.0);
+        approx(d.hessian[3], -2.0);
+        approx(d.hessian[4], 4.0);
+        approx(d.hessian[6], 2.0);
+        approx(d.hessian[8], 4.0);
+    }
+
+    struct FixedRng(u32);
+
+    impl FixedRng {
+        fn next(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            self.0 as f32 / u32::MAX as f32
+        }
+
+        fn range(&mut self, low: f32, high: f32) -> f32 {
+            low + (high - low) * self.next()
+        }
+    }
+
+    fn numerical_gradient(cost: &impl Fn(&[f32]) -> f32, point: &[f32], h: f32) -> Vec<f32> {
+        let mut gradient = vec![0.0; point.len()];
+        for i in 0..point.len() {
+            let mut plus = point.to_vec();
+            let mut minus = point.to_vec();
+            plus[i] += h;
+            minus[i] -= h;
+            gradient[i] = (cost(&plus) - cost(&minus)) / (2.0 * h);
+        }
+        gradient
+    }
+
+    fn numerical_hessian(cost: &impl Fn(&[f32]) -> f32, point: &[f32], h: f32) -> Vec<f32> {
+        let mut hessian = vec![0.0; point.len() * point.len()];
+        for j in 0..point.len() {
+            let mut plus = point.to_vec();
+            let mut minus = point.to_vec();
+            plus[j] += h;
+            minus[j] -= h;
+            let gradient_plus = numerical_gradient(cost, &plus, h);
+            let gradient_minus = numerical_gradient(cost, &minus, h);
+            for i in 0..point.len() {
+                hessian[i * point.len() + j] = (gradient_plus[i] - gradient_minus[i]) / (2.0 * h);
+            }
+        }
+        hessian
+    }
+
+    fn max_relative_error(actual: &[f32], expected: &[f32]) -> f32 {
+        actual
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| (actual - expected).abs() / (1.0 + expected.abs()))
+            .fold(0.0, f32::max)
+    }
+
+    fn assert_finite_difference(
+        cost: impl Fn(&[f32]) -> f32,
+        derivatives: impl Fn(&[f32]) -> (Vec<f32>, Vec<f32>),
+        point: &[f32],
+        gradient_tolerance: f32,
+        hessian_tolerance: f32,
+    ) {
+        let (gradient, hessian) = derivatives(point);
+        let numerical_gradient = numerical_gradient(&cost, point, 2e-3);
+        let numerical_hessian = numerical_hessian(&cost, point, 2e-2);
+        let gradient_error = max_relative_error(&gradient, &numerical_gradient);
+        let hessian_error = max_relative_error(&hessian, &numerical_hessian);
+        assert!(
+            gradient_error <= gradient_tolerance,
+            "gradient relative error {gradient_error} > {gradient_tolerance}"
+        );
+        assert!(
+            hessian_error <= hessian_tolerance,
+            "Hessian relative error {hessian_error} > {hessian_tolerance}; point={point:?} expected={hessian:?} actual={numerical_hessian:?}"
+        );
+    }
+
+    #[test]
+    fn zone_derivatives_match_finite_differences_for_fixed_random_samples() {
+        let mut rng = FixedRng(0x005e_ed21);
+        let quadratic_hessian = vec![4.0, 0.3, -0.2, 0.3, 3.0, 0.4, -0.2, 0.4, 2.0];
+
+        for _ in 0..1000 {
+            let direction = [
+                rng.range(-1.0, 1.0),
+                rng.range(-1.0, 1.0),
+                rng.range(-1.0, 1.0),
+            ];
+            let point = vec![
+                rng.range(-1.0, 1.0) + 0.1 * direction[0],
+                rng.range(-1.0, 1.0) + 0.1 * direction[1],
+                rng.range(-1.0, 1.0) + 0.1 * direction[2],
+            ];
+            let linear = vec![
+                rng.range(-1.0, 1.0),
+                rng.range(-1.0, 1.0),
+                rng.range(-1.0, 1.0),
+            ];
+            assert_finite_difference(
+                |x| quadratic_cost(&quadratic_hessian, &linear, x),
+                |x| {
+                    (
+                        quadratic_gradient(&quadratic_hessian, &linear, x),
+                        quadratic_hessian.clone(),
+                    )
+                },
+                &point,
+                5e-3,
+                5e-2,
+            );
+
+            let mut scalar_point = point.clone();
+            if scalar_point[0].abs() < 0.2 {
+                scalar_point[0] += 0.4;
+            }
+            let scalar_weight = 2.3;
+            assert_finite_difference(
+                |x| one_sided_derivatives(x[0], scalar_weight).cost,
+                |x| {
+                    let d = one_sided_derivatives(x[0], scalar_weight);
+                    (vec![d.gradient, 0.0, 0.0], {
+                        let mut hessian = vec![0.0; 9];
+                        hessian[0] = d.hessian;
+                        hessian
+                    })
+                },
+                &scalar_point,
+                5e-3,
+                5e-2,
+            );
+
+            let mut cone_point = vec![
+                rng.range(0.3, 1.5),
+                rng.range(-1.5, 1.5),
+                rng.range(-1.5, 1.5),
+            ];
+            let mu = 0.4;
+            if cone_point[1].abs() < 0.2 {
+                cone_point[1] += 0.4;
+            }
+            if cone_point[2].abs() < 0.2 {
+                cone_point[2] -= 0.4;
+            }
+            while (cone_point[1].abs() - mu * cone_point[0]).abs() < 0.2 {
+                cone_point[1] += 0.31;
+            }
+            while (cone_point[2].abs() - mu * cone_point[0]).abs() < 0.2 {
+                cone_point[2] -= 0.31;
+            }
+            let weight = 1.7;
+            assert_finite_difference(
+                |x| pyramidal_derivatives(x[0], x[1], x[2], mu, weight).cost,
+                |x| {
+                    let d = pyramidal_derivatives(x[0], x[1], x[2], mu, weight);
+                    (d.gradient.to_vec(), d.hessian.to_vec())
+                },
+                &cone_point,
+                5e-3,
+                5e-2,
+            );
+        }
     }
 
     #[test]
