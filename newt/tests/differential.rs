@@ -42,7 +42,7 @@ use newt::joint::JointKind;
 use newt::json::{self, Value};
 use newt::math::{Quat, Vec3};
 use newt::model::Scene;
-use newt::solver::SolverMode;
+use newt::solver::{ConeKind, SolverMode};
 use newt::world::{Integrator, World};
 
 // ---------------------------------------------------------------------------
@@ -1441,8 +1441,6 @@ fn permanent_constraint_factor_diagnostics_match_mujoco() {
         let dt = expect_f64(object_value(&record, "dt"));
         let positions = expect_f64_vec(object_value(&record, "efc_pos"));
         let velocities = expect_f64_vec(object_value(&record, "efc_vel"));
-        let margins = expect_f64_vec(object_value(&record, "efc_margin"));
-        let diag_a = expect_f64_vec(object_value(&record, "efc_diagA"));
         let reference = expect_f64_vec(object_value(&record, "efc_aref"));
         let regularization = expect_f64_vec(object_value(&record, "efc_R"));
         let kbip = match object_value(&record, "efc_KBIP") {
@@ -1450,32 +1448,48 @@ fn permanent_constraint_factor_diagnostics_match_mujoco() {
             other => panic!("efc_KBIP must be an array, got {}", other.type_name()),
         };
         assert_eq!(positions.len(), 4);
-        let solref = SolRef::new(tc as f32, dampratio as f32);
-        let effective_tc = tc.max(2.0 * dt);
+        let mjcf = fs::read_to_string(references_dir().join("sphere_drop.xml")).unwrap();
+        let mut scene = newt::mjcf::load_mjcf_str(&mjcf).unwrap();
+        scene.world.dt = dt as f32;
+        scene.world.solver.mode = SolverMode::Pgs;
+        scene.world.solver.cone = ConeKind::Pyramidal;
+        scene.world.solver.iterations = 20;
+        for geom in &mut scene.world.geoms {
+            geom.solref = SolRef::new(tc as f32, dampratio as f32);
+        }
+        let qpos = expect_f64_vec(object_value(&record, "qpos"));
+        scene.world.bodies[0].position = Vec3::new(qpos[0] as f32, qpos[1] as f32, qpos[2] as f32);
+        let qvel = expect_f64_vec(object_value(&record, "qvel"));
+        scene.world.bodies[0].linear_velocity =
+            Vec3::new(qvel[0] as f32, qvel[1] as f32, qvel[2] as f32);
+        scene.world.bodies[0].angular_velocity_body =
+            Vec3::new(qvel[3] as f32, qvel[4] as f32, qvel[5] as f32);
+        let contacts = scene.world.detect_contacts();
+        let actual = newt::solver::diagnose_free_body_contact_rows(
+            &scene.world.bodies,
+            &scene.world.geoms,
+            &contacts,
+            scene.world.gravity,
+            scene.world.dt,
+            ConeKind::Pyramidal,
+            20,
+        );
+        assert_eq!(actual.len(), 4);
         for row in 0..4 {
-            let position = positions[row] as f32 - margins[row] as f32;
-            let velocity = velocities[row] as f32;
-            let impedance_value = newt::solver::impedance(position, newt::solver::SolImp::DEFAULT);
-            let expected_b = 2.0 / (newt::solver::SolImp::DEFAULT.dmax * effective_tc as f32);
-            let expected_k_eff = impedance_value
-                / (newt::solver::SolImp::DEFAULT.dmax
-                    * newt::solver::SolImp::DEFAULT.dmax
-                    * effective_tc as f32
-                    * effective_tc as f32
-                    * dampratio as f32
-                    * dampratio as f32);
-            let expected_aref = newt::solver::reference_accel(
-                position,
-                velocity,
-                solref,
-                newt::solver::SolImp::DEFAULT,
-            );
-            let expected_r = (1.0 - impedance_value) / impedance_value * diag_a[row] as f32;
-            assert!((kbip[row][2] as f32 - impedance_value).abs() < 2.0e-6);
-            assert!((kbip[row][1] as f32 - expected_b).abs() < 2.0e-4);
-            assert!((kbip[row][0] as f32 * impedance_value - expected_k_eff).abs() < 2.0e-1);
-            assert!((reference[row] as f32 - expected_aref).abs() < 1.0e-3);
-            assert!((regularization[row] as f32 - expected_r).abs() < 1.0e-5);
+            let got = actual[row];
+            let target_k = kbip[row][0] as f32 * kbip[row][2] as f32;
+            let position_delta = (got.position - positions[row] as f32).abs();
+            let velocity_delta = (got.velocity - velocities[row] as f32).abs();
+            assert!(position_delta < 1.0e-8);
+            assert!(velocity_delta < 5.0e-5);
+            assert!((got.stiffness - target_k).abs() < 5.0e-2);
+            assert!((got.damping - kbip[row][1] as f32).abs() < 5.0e-5);
+            assert!((got.impedance - kbip[row][2] as f32).abs() < 1.0e-7);
+            // The remaining allowance follows f32 qpos/qvel quantization.
+            let aref_budget =
+                1.0e-3 + got.damping * velocity_delta + got.stiffness * position_delta;
+            assert!((got.reference_accel - reference[row] as f32).abs() <= aref_budget);
+            assert!((got.regularization - regularization[row] as f32).abs() < 1.0e-6);
         }
     }
 
@@ -1485,20 +1499,67 @@ fn permanent_constraint_factor_diagnostics_match_mujoco() {
     };
     assert_eq!(tree_records.len(), 1);
     let tree = expect_object(tree_records.into_iter().next().unwrap());
-    let tree_diag = expect_f64_vec(object_value(&tree, "efc_diagA"));
     let tree_r = expect_f64_vec(object_value(&tree, "efc_R"));
     let tree_kbip = match object_value(&tree, "efc_KBIP") {
         Value::Array(rows) => rows.into_iter().map(expect_f64_vec).collect::<Vec<_>>(),
         other => panic!("tree efc_KBIP must be an array, got {}", other.type_name()),
     };
-    assert_eq!(tree_diag.len(), 4);
-    let normal_diag_approx = tree_diag[0] / (2.0 * 0.6f64 * 0.6);
-    let normal_r = (1.0 - tree_kbip[0][2]) / tree_kbip[0][2] * normal_diag_approx;
-    let expected_rpy = 2.0 * 0.6f64 * 0.6 * normal_r;
+    let tree_qpos = expect_f64_vec(object_value(&tree, "qpos"));
+    let tree_qvel = expect_f64_vec(object_value(&tree, "qvel"));
+    let mjcf = fs::read_to_string(references_dir().join("tree_chain_contact.xml")).unwrap();
+    let mut scene = newt::mjcf::load_mjcf_str(&mjcf).unwrap();
+    scene.world.dt = expect_f64(object_value(&tree, "dt")) as f32;
+    scene.world.solver.mode = SolverMode::Pgs;
+    scene.world.solver.cone = ConeKind::Pyramidal;
+    scene.world.solver.iterations = 20;
+    scene.world.trees[0].q.copy_from_slice(&[
+        tree_qpos[0] as f32,
+        tree_qpos[1] as f32,
+        tree_qpos[2] as f32,
+        tree_qpos[4] as f32,
+        tree_qpos[5] as f32,
+        tree_qpos[6] as f32,
+        tree_qpos[3] as f32,
+        tree_qpos[7] as f32,
+    ]);
+    scene.world.trees[0].qdot.copy_from_slice(&[
+        tree_qvel[3] as f32,
+        tree_qvel[4] as f32,
+        tree_qvel[5] as f32,
+        tree_qvel[0] as f32,
+        tree_qvel[1] as f32,
+        tree_qvel[2] as f32,
+        tree_qvel[6] as f32,
+    ]);
+    let contacts = scene.world.detect_contacts();
+    let actual = newt::solver::diagnose_tree_contact_rows(
+        &scene.world.bodies,
+        &scene.world.trees,
+        &scene.world.geoms,
+        &contacts,
+        scene.world.gravity,
+        scene.world.dt,
+        ConeKind::Pyramidal,
+        20,
+    );
+    assert_eq!(actual.len(), 4);
+    let tree_pos = expect_f64_vec(object_value(&tree, "efc_pos"));
+    let tree_vel = expect_f64_vec(object_value(&tree, "efc_vel"));
+    let tree_ref = expect_f64_vec(object_value(&tree, "efc_aref"));
     for row in 0..4 {
-        assert!((tree_diag[row] - tree_diag[0]).abs() < 1.0e-7);
-        assert!((tree_r[row] - expected_rpy).abs() < 1.0e-7);
-        assert!((tree_kbip[row][0] - tree_kbip[0][0]).abs() < 1.0e-7);
+        let got = actual[row];
+        let target_k = tree_kbip[row][0] as f32 * tree_kbip[row][2] as f32;
+        assert!((got.position - tree_pos[row] as f32).abs() < 1.0e-7);
+        let position_delta = (got.position - tree_pos[row] as f32).abs();
+        let velocity_delta = (got.velocity - tree_vel[row] as f32).abs();
+        assert!(velocity_delta < 1.0e-5);
+        assert!((got.stiffness - target_k).abs() < 5.0e-2);
+        assert!((got.damping - tree_kbip[row][1] as f32).abs() < 5.0e-5);
+        assert!((got.impedance - tree_kbip[row][2] as f32).abs() < 1.0e-7);
+        // The remaining allowance follows f32 qpos/qvel quantization.
+        let aref_budget = 1.0e-3 + got.damping * velocity_delta + got.stiffness * position_delta;
+        assert!((got.reference_accel - tree_ref[row] as f32).abs() <= aref_budget);
+        assert!((got.regularization - tree_r[row] as f32).abs() < 1.0e-6);
     }
 }
 
@@ -1512,7 +1573,9 @@ fn permanent_matched_euler_solref_sweep() {
         Value::Array(records) => records,
         other => panic!("records must be an array, got {}", other.type_name()),
     };
-    let bounds_um = [10.0, 20.0, 50.0, 6_000.0, 35_000.0, 70_000.0, 4_000.0];
+    // The 0.200 / 2 row has no stable equilibrium. Its final z gap is not a
+    // steady-state penetration measure, so keep a wider measured bound.
+    let bounds_um = [0.01, 0.05, 0.2, 12.0, 60.0, 120.0, 4_000.0];
     assert_eq!(records.len(), bounds_um.len());
     for (value, gap_um) in records.into_iter().zip(bounds_um) {
         let record = expect_object(value);

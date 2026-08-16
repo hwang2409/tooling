@@ -357,6 +357,15 @@ pub fn reference_accel(
     solref: crate::geom::SolRef,
     solimp: SolImp,
 ) -> f32 {
+    let (b, k, _) = reference_coefficients(position, solref, solimp);
+    -b * velocity - k * position
+}
+
+fn reference_coefficients(
+    position: f32,
+    solref: crate::geom::SolRef,
+    solimp: SolImp,
+) -> (f32, f32, f32) {
     let solimp = effective_solimp(solimp);
     let d = impedance_at_position(position, 0.0, solimp);
     let (b, k) = if solref.is_direct() {
@@ -372,7 +381,7 @@ pub fn reference_accel(
             d / (dmax * dmax * tc * tc * solref.dampratio * solref.dampratio),
         )
     };
-    -b * velocity - k * position
+    (b, k, d)
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +579,7 @@ pub fn solve_free_bodies_diag(
     iterations: u32,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     solve_free_bodies_diag_mode(
-        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, false, None,
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, false, None, None,
     )
 }
 
@@ -589,7 +598,7 @@ pub fn solve_free_bodies_newton_diag(
     iterations: u32,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     solve_free_bodies_diag_mode(
-        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, true, None,
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, true, None, None,
     )
 }
 
@@ -620,8 +629,49 @@ pub fn solve_free_bodies_newton_trace(
         iterations,
         true,
         Some(&mut trace),
+        None,
     );
     trace
+}
+
+/// One assembled soft-constraint row before the impulse solve.
+#[derive(Clone, Copy, Debug)]
+pub struct ConstraintRowDiagnostic {
+    pub position: f32,
+    pub velocity: f32,
+    pub stiffness: f32,
+    pub damping: f32,
+    pub impedance: f32,
+    pub regularization: f32,
+    pub reference_accel: f32,
+}
+
+/// Assemble free-body contact rows and return their source factors.
+#[allow(clippy::too_many_arguments)]
+pub fn diagnose_free_body_contact_rows(
+    bodies: &[Body],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+) -> Vec<ConstraintRowDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let _ = solve_free_bodies_diag_mode(
+        bodies,
+        geoms,
+        contacts,
+        &[],
+        gravity,
+        dt,
+        cone,
+        iterations,
+        false,
+        None,
+        Some(&mut diagnostics),
+    );
+    diagnostics
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -636,6 +686,7 @@ fn solve_free_bodies_diag_mode(
     iterations: u32,
     use_newton: bool,
     newton_cost_trace: Option<&mut Vec<f32>>,
+    mut row_diagnostics: Option<&mut Vec<ConstraintRowDiagnostic>>,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     if use_newton && cone == ConeKind::Elliptic {
         panic!("{NEWTON_ELLIPTIC_ERROR}");
@@ -815,6 +866,19 @@ fn solve_free_bodies_diag_mode(
             // the free velocity change minus aref*dt. J*qvel itself is
             // already represented in aref's damping term.
             rows[ri].bias = dv_free - a_ref * dt;
+            if let Some(diagnostics) = row_diagnostics.as_deref_mut() {
+                let (damping, stiffness, impedance) =
+                    reference_coefficients(position, solref, pc.solimp);
+                diagnostics.push(ConstraintRowDiagnostic {
+                    position,
+                    velocity: v_cur,
+                    stiffness,
+                    damping,
+                    impedance,
+                    regularization: rows[ri].reg,
+                    reference_accel: a_ref,
+                });
+            }
         }
     }
 
@@ -2381,6 +2445,8 @@ pub struct TreeContactSolution {
     /// Dense `J M⁻¹ Jᵀ` response for the compact active contact rows.
     /// Rows follow the order assembled from `contacts`.
     pub contact_response: Vec<f32>,
+    /// Source factors for the assembled active contact rows.
+    pub row_diagnostics: Vec<ConstraintRowDiagnostic>,
 }
 
 #[derive(Clone, Debug)]
@@ -2453,6 +2519,7 @@ pub fn solve_tree_contacts(
             .collect(),
         contact_normal_forces: vec![0.0; contacts.len()],
         contact_response: Vec::new(),
+        row_diagnostics: Vec::new(),
     };
     if contacts.is_empty() || dt <= 0.0 || trees.is_empty() {
         return solution;
@@ -2655,6 +2722,17 @@ pub fn solve_tree_contacts(
                 block.solimp,
             );
             rows[row_index].bias = free_velocity - reference * dt;
+            let (damping, stiffness, impedance) =
+                reference_coefficients(position, safe_solref(block.solref, dt), block.solimp);
+            solution.row_diagnostics.push(ConstraintRowDiagnostic {
+                position,
+                velocity,
+                stiffness,
+                damping,
+                impedance,
+                regularization: rows[row_index].reg,
+                reference_accel: reference,
+            });
         }
     }
 
@@ -2807,6 +2885,24 @@ pub fn solve_tree_contacts(
         }
     }
     solution
+}
+
+/// Assemble tree contact rows and return their source factors.
+#[allow(clippy::too_many_arguments)]
+pub fn diagnose_tree_contact_rows(
+    bodies: &[Body],
+    trees: &[Tree],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+) -> Vec<ConstraintRowDiagnostic> {
+    solve_tree_contacts(
+        bodies, trees, geoms, contacts, gravity, dt, cone, iterations, false, None,
+    )
+    .row_diagnostics
 }
 
 fn component_is_dynamic(component: &WorldJacobian, trees: &[Tree]) -> bool {
