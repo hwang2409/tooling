@@ -79,6 +79,14 @@
       "horizon_note": "1.0 s zero-gravity free-root + hinge to exercise every slot of the free-root remap (quat slot order, linear-vs-angular slot order, body-vs-world linear frame)."
     },
     {
+      "name": "tree_chain_contact",
+      "mjcf": "tree_chain_contact.xml",
+      "n_steps": 500,
+      "stride": 50,
+      "init_qpos": [0.0, 0.0, 1.35, 1.0, 0.0, 0.0, 0.0, 0.35],
+      "horizon_note": "1.0 s falling two-link free-root chain with ground contact; matched Newton/Euler capture checks tree link Jacobians and the first contact transition."
+    },
+    {
       "name": "joint_limit_swing",
       "mjcf": "joint_limit_swing.xml",
       "n_steps": 1000,

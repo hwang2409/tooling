@@ -1301,6 +1301,42 @@ fn differential_floating_base() {
 }
 
 #[test]
+fn differential_tree_chain_contact_newton_euler() {
+    let d = run_scenario_with_solver(
+        &scenario("tree_chain_contact"),
+        Some(Integrator::Euler),
+        Some(SolverMode::Newton),
+        "_newton_euler",
+    );
+    assert_within_bounds(
+        "tree_chain_contact Newton Euler",
+        &d,
+        Tolerance {
+            qpos: 8.0e-2,
+            qvel: 1.3,
+        },
+    );
+}
+
+#[test]
+fn differential_tree_chain_contact_pgs_euler() {
+    let d = run_scenario_with_solver(
+        &scenario("tree_chain_contact"),
+        Some(Integrator::Euler),
+        Some(SolverMode::Pgs),
+        "_pgs_euler",
+    );
+    assert_within_bounds(
+        "tree_chain_contact PGS Euler",
+        &d,
+        Tolerance {
+            qpos: 7.0e-2,
+            qvel: 0.7,
+        },
+    );
+}
+
+#[test]
 fn differential_double_pendulum_energy() {
     let report = run_energy_scenario(&scenario("double_pendulum_energy"));
     assert_energy_bounds("double_pendulum_energy", &report);
