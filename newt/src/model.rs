@@ -1528,7 +1528,7 @@ fn parse_integrator(v: &Value, path: &str) -> Result<Integrator, ModelError> {
 ///
 /// ```json
 /// {
-///   "mode": "penalty" | "pgs",
+///   "mode": "penalty" | "pgs" | "newton",
 ///   "iterations": 20,
 ///   "cone": "pyramidal" | "elliptic"
 /// }
@@ -1536,7 +1536,7 @@ fn parse_integrator(v: &Value, path: &str) -> Result<Integrator, ModelError> {
 ///
 /// All fields optional; omitted fields fall back to
 /// [`crate::solver::SolverConfig::DEFAULT`]. `iterations` must be a
-/// positive integer.
+/// positive integer. Newton currently requires `cone = "pyramidal"`.
 fn parse_solver_config(v: &Value, path: &str) -> Result<crate::solver::SolverConfig, ModelError> {
     use crate::solver::{ConeKind, SolverConfig, SolverMode};
     let fields = get_object(v, path)?;
@@ -1547,10 +1547,11 @@ fn parse_solver_config(v: &Value, path: &str) -> Result<crate::solver::SolverCon
         cfg.mode = match s {
             "penalty" => SolverMode::Penalty,
             "pgs" => SolverMode::Pgs,
+            "newton" => SolverMode::Newton,
             other => {
                 return fail(
                     &format!("{path}.mode"),
-                    format!("unknown solver mode \"{other}\"; expected penalty | pgs"),
+                    format!("unknown solver mode \"{other}\"; expected penalty | pgs | newton"),
                 );
             }
         };
@@ -1578,6 +1579,8 @@ fn parse_solver_config(v: &Value, path: &str) -> Result<crate::solver::SolverCon
             }
         };
     }
+    cfg.validate()
+        .map_err(|message| ModelError::new(path, message))?;
     Ok(cfg)
 }
 
