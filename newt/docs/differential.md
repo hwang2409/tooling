@@ -436,6 +436,54 @@ The chain fixtures are `tree_chain_contact_pgs_euler.bin` and
 `tools/capture_biped_mujoco.py`. Its 5,000-step run uses the source-faithful
 controller, `assist_scale=0.8`, and no debug state correction.
 
+## NEWT-24 biped v3 sweep
+
+The biped acceptance oracle uses MuJoCo `3.11.0`, Euler, Newton, pyramidal
+cones, 20 iterations, and `dt=0.005`. The source controller stays unchanged.
+The four binary fixtures are `biped_walk_oracle_v3_assist_080.bin`,
+`_040.bin`, `_020.bin`, and `_000.bin`. They contain one qpos/qvel checkpoint
+per step and the measured gait metrics.
+
+The normal test runs a 120-step representative sweep at assist `0.8` and
+`0.0`. The ignored full sweep compares each source trace with newt through the
+newt fall step. These are current-gap regression bounds, not parity claims.
+Run the full sweep with:
+
+```text
+cargo test --manifest-path newt/Cargo.toml --test biped_walk_acceptance v3_full_sweep -- --ignored --nocapture
+```
+
+| assist | source outcome | newt outcome | source fall | newt fall | compared steps | max qpos gap | max qvel gap |
+|---:|---|---|---:|---:|---:|---:|---:|
+| `0.8` | complete | complete | — | — | `5,000` | `3.60056e-1` | `4.86051e0` |
+| `0.4` | fallen | fallen | `756` | `553` | `553` | `1.15385e0` | `6.73314e0` |
+| `0.2` | fallen | fallen | `492` | `469` | `469` | `9.01380e-1` | `6.85567e0` |
+| `0.0` | fallen | fallen | `578` | `442` | `442` | `1.14941e0` | `6.40730e0` |
+
+The outcome class matches at all four levels. The `0.4` row is the acceptance
+failure because MuJoCo falls at `756` while newt falls at `553`, outside the
+fall-step bound. The no-assist oracle also falls, so stable no-assist walking
+is not a valid target for this source controller.
+
+The first remaining gap is contact timing and manifold selection. The visual
+contact masks first differ at step `12`. With the controller's `0.035 m`
+support threshold, newt reports right-foot contact at step `17` while MuJoCo
+does not. At step `25`,
+MuJoCo has one right-foot contact and four pyramid rows. Newt has two contacts
+and eight rows. Their maximum generalized-force difference is `182.518`.
+At step `36`, both have four contacts and 16 rows, but their maximum
+generalized-force difference is `542.575`. The source and newt row reference
+acceleration maxima at step `25` are `124.283` and `140.555`.
+
+The source-side contact and row records are in
+`tests/references/biped_walk_v3_diagnostics.json`. Records cover step `0`
+through `40`, including the first visual mismatch window. The selected newt
+records are in `tests/references/biped_walk_v3_newt_diagnostics.json`. Each
+contact stores the geom pair, point, normal, condim, frame, and row mapping.
+The newt diagnostic runner is `examples/biped_walk_diagnostics`; it prints
+steps `0..12`, `17`, `25`, and `36` with the same geom-level fields. It calls
+`solver::solve_tree_contacts`, the NEWT-23 row assembly path.
+
 ## Debugging a failing tolerance
 
 Set `NEWT_DIFFERENTIAL_DUMP=1` when running the tests to print the
