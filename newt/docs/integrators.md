@@ -35,6 +35,12 @@ rows at each RK4 stage. This creates a real residual for soft contacts because
 their force changes within one step. Matched-Euler NEWT-23 captures isolate
 this residual from the solref reference-row form.
 
+For tree contacts, the row regularizer follows MuJoCo's model-level
+`diagApprox`, not the exact per-facet response diagonal. Pyramidal facets
+share `Rpy = 2*mu^2*Rnormal`. The tree and free-body paths use one shared
+implementation. The factor fixture records this relation for the first
+tree contact.
+
 ## tree-contact impulse entry
 
 For PGS and Newton, the world assembles tree-involved contact rows before it

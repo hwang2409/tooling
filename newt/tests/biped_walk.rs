@@ -19,6 +19,13 @@ const CADENCE_MIN_BPM: f32 = 80.0;
 const STEP_LENGTH_MIN_M: f32 = 0.05;
 const CLEARANCE_MIN_M: f32 = 0.06;
 
+// Measured on 2026-08-16 after the exact solref row and shared tree R
+// changes. These bands leave headroom, but fail a silent metric shift.
+const RECORDED_DISTANCE_M: (f32, f32) = (2.50, 2.55);
+const RECORDED_CADENCE_BPM: (f32, f32) = (116.0, 119.0);
+const RECORDED_STEP_LENGTH_M: (f32, f32) = (0.36, 0.39);
+const RECORDED_CLEARANCE_M: (f32, f32) = (0.19, 0.21);
+
 fn assert_gait_metrics(result: &biped_walk_support::WalkResult, distance: f32) {
     assert!(result.metrics.forward_distance >= distance);
     assert!(result.metrics.cadence_bpm > CADENCE_MIN_BPM);
@@ -81,7 +88,6 @@ fn assisted_walk_newton_tree_contacts_stays_stable() {
 }
 
 #[test]
-#[ignore = "the dictated 5000-step acceptance run is executed by the demo"]
 fn tier_one_assisted_walk_full_acceptance_run_passes() {
     let result = run_walk_with_solver(
         GaitConfig::stable_joint_walk(5000),
@@ -94,6 +100,20 @@ fn tier_one_assisted_walk_full_acceptance_run_passes() {
     assert!(result.metrics.forward_distance > 2.0);
     assert!(result.metrics.cadence_bpm > 80.0);
     assert!(result.metrics.max_foot_clearance > 0.06);
+    assert!(
+        (RECORDED_DISTANCE_M.0..=RECORDED_DISTANCE_M.1).contains(&result.metrics.forward_distance)
+    );
+    assert!(
+        (RECORDED_CADENCE_BPM.0..=RECORDED_CADENCE_BPM.1).contains(&result.metrics.cadence_bpm)
+    );
+    assert!(
+        (RECORDED_STEP_LENGTH_M.0..=RECORDED_STEP_LENGTH_M.1)
+            .contains(&result.metrics.mean_step_length)
+    );
+    assert!(
+        (RECORDED_CLEARANCE_M.0..=RECORDED_CLEARANCE_M.1)
+            .contains(&result.metrics.max_foot_clearance)
+    );
     assert_eq!(result.metrics.self_contact_force_steps, 0);
 }
 

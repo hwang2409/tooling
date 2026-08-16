@@ -130,13 +130,19 @@ the source reports its torso body origin. newt reports its root com.
 | `joint_walk` | source mujoco | 1000 | 0.0 | `0.050958` | `84.00` | `0.478817` | `0.196834` | `0.895/0.885` | `0.137258` | 0 | `1.090112` |
 | `joint_walk` | newt | 1000 | 0.0 | `-1.4245` | `72.00` | `0.3805` | `0.2295` | `0.735/0.851` | `0.4213` | 0 | `0.1439` |
 | `stable_joint_walk` | source mujoco | 5000 | 0.8 | `2.260855` | `117.60` | `0.499528` | `0.109163` | `0.668/0.764` | `0.212095` | 0 | `0.988434` |
-| `stable_joint_walk` | newt | 5000 | 0.8 | `2.4452` | `112.80` | `0.4339` | `0.0959` | `0.724/0.797` | `0.1737` | 0 | `0.9255` |
+| `stable_joint_walk` | newt | 5000 | 0.8 | `2.524537` | `117.60` | `0.373537` | `0.114487` | `0.666/0.686` | `0.196953` | 0 | `0.9255` |
 
 the source and newt definitions use the same metric formulas. both now define
 contact from heel/toe height at `0.035 m`. contact events use a
 false-to-true transition with a `0.16 s` debounce. duty factor is stance time
 divided by stance plus swing time. newt also reports the actual touch-force
 maximum. it is `0.0 N` for both acceptance runs.
+
+the newt values above are a disclosed re-measurement after the exact solref
+bias and shared tree regularization changes. the permanent 5000-step test
+records these bands: distance `2.50..2.55 m`, cadence `116..119 bpm`, mean
+step length `0.36..0.39 m`, and clearance `0.19..0.21 m`. self-contact force
+steps must stay at `0`.
 
 ## acceptance ladder
 
@@ -149,10 +155,10 @@ the full acceptance run uses 5000 steps and `assist_scale=0.8`:
 
 | metric | result | requirement |
 | --- | ---: | ---: |
-| distance | `2.4452 m` | `>= 2.0 m` |
-| cadence | `112.80 bpm` | `> 80 bpm` |
-| mean step length | `0.4339 m` | `> 0.05 m` |
-| max foot clearance | `0.1737 m` | `> 0.06 m` |
+| distance | `2.524537 m` | `2.50..2.55 m` |
+| cadence | `117.60 bpm` | `116..119 bpm` |
+| mean step length | `0.373537 m` | `0.36..0.39 m` |
+| max foot clearance | `0.196953 m` | `0.19..0.21 m` |
 | self-contact force steps | `0` | `0` |
 
 ### tier 2: no-assist target

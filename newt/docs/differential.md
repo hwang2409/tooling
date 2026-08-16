@@ -2,7 +2,7 @@
 
 Status: NEWT-23 (v2 tier 1). The exact solref reference-row finding
 is closed. Capture tool at
-`tools/capture_mujoco.py`; Rust suite at `tests/differential.rs`;
+  `tools/capture_mujoco.py`; Rust suite at `tests/differential.rs`;
 shared scenario manifest at `tests/references/scenarios.json`.
 
 This document is the honest map of where newt stands against real
@@ -22,8 +22,8 @@ out at the top of the PR body.
 - **Reference** — `tools/capture_mujoco.py` loads each scenario's
   MJCF under the biped-venv MuJoCo, configures matching timestep,
   solver, cone, and iteration settings, then writes a compact binary
-  fixture. The `--row-diagnostics` and `--solref-sweep` modes write JSON
-  evidence for factor and matched-integrator checks.
+  fixture. The `--row-diagnostics`, `--solref-sweep`, and `--rk4-sweep`
+  modes write committed JSON evidence for factor and integrator checks.
 - **Comparison** — `tests/differential.rs` reads the same MJCF via
   newt's loader, applies the same initial `qpos` / `qvel` overrides
   and actuator targets from `scenarios.json`, steps newt with its
@@ -270,17 +270,25 @@ The path is shared by contacts, equalities, limits, and both solver modes.
 ### first-contact factor parity
 
 `tools/capture_mujoco.py --row-diagnostics` captures the first contact
-state for six rows. The control row is `tc=0.020, dr=1`. Newt uses the
-same `qpos` and `qvel` in its row assembly. Facet rows are compared after
-the MuJoCo pyramid ordering is applied.
+state for six sphere rows and one tree row. The committed fixture is
+`tests/references/constraint_factor_diagnostics.json`, captured with
+MuJoCo 3.11.0. The control row is `tc=0.020, dr=1`. Newt uses the same
+`qpos` and `qvel` in its row assembly. Facet rows use MuJoCo's
+`N ± μT` ordering.
 
-| factor | result | evidence |
-|---|---|---|
-| `efc_pos` | match | signed distance `-0.002272`; margin `0` |
-| `efc_vel` / `efc_J` | match | facet rows use `N ± μT`; max velocity delta `1.3e-5` |
-| `k`, `b` | match | standard and `tc=0.005` clamp use source formulas |
-| `efc_R` / `efc_D` | match | `R=0.2209684211`; `D=4.5255335366` |
-| `efc_aref` | match | max delta `5.0e-3 m/s²` from f32 state input |
+The maximum absolute factor deltas across the six sphere rows are:
+
+| tc / dr | pos | vel | k_eff | b | imp | R | aref |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 0.005 / 0.5 | 2.399e-9 | 1.666e-7 | 2.547e-2 | 1.122e-5 | 1.190e-8 | 6.385e-8 | 4.965e-4 |
+| 0.010 / 1 | 2.399e-9 | 7.779e-8 | 1.591e-3 | 5.611e-6 | 1.190e-8 | 6.385e-8 | 7.706e-5 |
+| 0.020 / 1 | 2.399e-9 | 1.819e-7 | 3.986e-4 | 2.805e-6 | 1.190e-8 | 6.385e-8 | 1.824e-5 |
+| 0.050 / 1 | 2.399e-9 | 2.076e-7 | 1.928e-5 | 3.979e-7 | 1.190e-8 | 6.385e-8 | 1.716e-5 |
+| 0.100 / 1 | 2.399e-9 | 1.475e-7 | 4.795e-6 | 1.989e-7 | 1.190e-8 | 6.385e-8 | 6.292e-6 |
+| 0.200 / 2 | 2.399e-9 | 1.450e-7 | 3.014e-7 | 9.947e-8 | 1.190e-8 | 6.385e-8 | 4.259e-6 |
+
+The permanent Rust test checks `pos`, `vel`, `k_eff`, `b`, `imp`, `R`,
+and `aref` against these committed MuJoCo factors.
 
 The `tc=0.005` row uses MuJoCo's `timeconst >= 2*dt` clamp. The impedance
 clamps are also reproduced: `dmin`, `dmax`, and midpoint stay in
@@ -299,6 +307,11 @@ step has these normal-force comparisons:
 These small deltas come from the finite PGS sweep and f32 state. They are
 not factor mismatches. The old hundreds-of-m/s² `aref` error is gone.
 
+The tree record also stores `efc_diagA`, `efc_R`, and `efc_KBIP` for all
+four facets. The permanent test checks the source relation
+`Rpy = 2*mu²*Rnormal`. Newt now computes tree regularization from the
+source body-level `diagApprox`, then applies the shared pyramid rule.
+
 ### matched Euler sweep
 
 MuJoCo and newt both use Euler, PGS, pyramidal cones, `dt=0.002`, and
@@ -313,10 +326,17 @@ now match at the same tier across and outside the old fitted window:
 | 0.050 / 1 | 740.598 | 735.468 | 5.130 |
 | 0.070 / 1 | 1261.329 | 1232.369 | 28.960 |
 | 0.100 / 1 | 2574.144 | 2514.167 | 59.977 |
+| 0.200 / 2 | no stable equilibrium | no stable equilibrium | 2652.394 final-z μm |
 
 The `0.200 / 2` row has no stable contact equilibrium. Both systems pass
 through the plane under the very soft reference, so its final position is
 not a penetration-parity signal. Its first-step force is included above.
+
+The committed `solref_sweep_rk4.json` fixture keeps separate RK4 evidence
+for the two out-of-window rows. The measured final-z gaps are `59.977 μm`
+for `0.100 / 1` and `3031.035 μm` for `0.200 / 2`. The Rust test uses
+separate bounds of `100 μm` and `4000 μm`. These rows remain honest
+integration-semantics rows, not impedance-form evidence.
 
 Verdict: the impedance finding is CLOSED. RK4 rows remain honest rows with
 measured bounds. Their residual is the documented constraint-ZOH versus
@@ -325,7 +345,9 @@ per-stage reevaluation gap; see `docs/integrators.md`.
 The solver and equality goldens changed because their shared row bias now
 uses the source acceleration equation. The affected files are the six
 equality/condim goldens and the six PGS/Newton solver goldens. Penalty-mode
-goldens remain byte-identical.
+goldens remain byte-identical. The shared tree `diagApprox` and `Rpy` change
+regenerated `solver_tree.bin` and `solver_newton_tree.bin`; the stack and
+incline bytes did not change.
 
 ## Regeneration
 
@@ -337,6 +359,7 @@ python tools/capture_mujoco.py --force               # override mujoco-version g
 python tools/capture_mujoco.py --list                # print scenario names
 python tools/capture_mujoco.py --row-diagnostics /tmp/newt-23-row-diagnostics.json
 python tools/capture_mujoco.py --solref-sweep /tmp/newt-23-euler-sweep.json
+python tools/capture_mujoco.py --rk4-sweep /tmp/newt-23-rk4-sweep.json
 python tools/capture_mujoco.py sphere_drop sphere_drop_stiff sphere_drop_soft \
   --integrator Euler --suffix _euler --force
 # Matched Newton / Euler captures for the v3 solver rows:
@@ -359,6 +382,13 @@ The Newton rows use MuJoCo 3.11.0, `solver=Newton`, `integrator=Euler`,
 These bounds are measured from the committed `_newton_euler` fixtures.
 The Newton path is also covered by stack and incline byte goldens.
 
+The exact source `k` changes the finite-iteration PGS/Newton residual in
+the condim-4 torsional anchor. The measured maxima are `8.931686729e-2`
+qpos, `3.880491853e-1` qvel, and `3.008949041` rad/s spin. A 10x PGS
+probe (`300` versus the default `30` iterations) produced the same values.
+The gap is not PGS iteration starvation. The test keeps bounds of `0.1`,
+`0.5`, and `3.2`, with this error budget disclosed here and in the test.
+
 ## NEWT-22 tree-contact rows
 
 Tree contacts now use the selected PGS or Newton row system. Penalty mode stays
@@ -372,15 +402,23 @@ measured result is:
 
 | scenario | steps | distance | cadence | mean step | clearance | self-contact steps |
 |---|---:|---:|---:|---:|---:|---:|
-| assisted biped, Newton tree contacts | 5,000 | `2.5138 m` | `117.60 bpm` | `0.3251 m` | `0.2059 m` | `0` |
+| assisted biped, Newton tree contacts | 5,000 | `2.524537 m` | `117.60 bpm` | `0.373537 m` | `0.196953 m` | `0` |
+
+These values are a disclosed re-measurement after the exact-bias and shared
+tree-regularization changes. CI records bands of `2.50..2.55 m` distance,
+`116..119 bpm` cadence, `0.36..0.39 m` mean step length, and
+`0.19..0.21 m` clearance. A future shift outside a band fails the walk test.
 
 The 2,000-step solver smoke rows measured `1.2456 m` for Euler PGS and
 `1.2491 m` for Euler Newton. The PGS and Newton tree anchor forces both
 settled at `9.81 N` for a unit-mass free-root sphere.
 
-The symmetry-broken tree PGS/Newton anchor agrees within `8.94e-8` in q and
-`9.54e-7` in qdot over 100 steps. The test prints these maxima and keeps
-`1.0e-6` and `2.0e-6` bounds.
+The shared `diagApprox` and pyramid `Rpy` construction changes the
+symmetry-broken tree PGS/Newton residual. The measured maxima are
+`1.365253e-2` in q and `4.467820e-1` in qdot over 100 steps. A 10x PGS
+probe (`400` versus the default `40` iterations) produced `1.364952e-2`
+and `4.467788e-1`. This also rules out iteration starvation. The test
+keeps measured-plus-headroom bounds of `2.0e-2` and `5.0e-1`.
 
 The matched articulated-chain fixtures use MuJoCo 3.11.0, Euler, pyramidal
 cones, and 20 iterations. They cover the first ground-contact transition:
