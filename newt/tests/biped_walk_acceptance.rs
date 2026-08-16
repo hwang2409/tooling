@@ -15,6 +15,9 @@ const MAGIC: &[u8; 8] = b"NEWTBIP3";
 const QPOS_COUNT: usize = 17;
 const QVEL_COUNT: usize = 16;
 const FALL_ROOT_COM_HEIGHT: f32 = 0.45 + 0.023298969;
+const COM_OFFSET_Z: f64 = 0.023298969;
+const EARLY_QPOS_GAP_BOUND: f64 = 0.08;
+const EARLY_QVEL_GAP_BOUND: f64 = 1.5;
 
 #[derive(Debug)]
 struct OracleFixture {
@@ -61,8 +64,7 @@ fn fixture(level: &str) -> OracleFixture {
     let provenance_length = cursor.u32() as usize;
     let provenance = cursor.take(provenance_length);
     let provenance = std::str::from_utf8(provenance).expect("oracle provenance is utf8");
-    assert!(provenance.contains("mujoco=3.11.0"), "{provenance}");
-    assert!(provenance.contains("stride=1"), "{provenance}");
+    assert_provenance(level, provenance);
     let assist_scale = cursor.f64();
     let steps_requested = cursor.u32();
     let steps_simulated = cursor.u32();
@@ -111,6 +113,91 @@ fn fixture(level: &str) -> OracleFixture {
         ground_contact_steps,
         checkpoints,
     }
+}
+
+fn assert_provenance(level: &str, provenance: &str) {
+    let (assist, scenario, config_sha256) = match level {
+        "080" => (
+            "0.8",
+            "stable_joint_walk",
+            "21747154ff36c0bceaeb9e6bca6a2a64678acc4f3343f9c2762a192c77493eef",
+        ),
+        "040" => (
+            "0.4",
+            "stable_joint_walk",
+            "07700ea795cea806b9e13edda2e8efd24da785ba4d703a6c38bcbc4fb3241bc8",
+        ),
+        "020" => (
+            "0.2",
+            "stable_joint_walk",
+            "fd25fe326cc9b5b767d4c168826b2f543e18ffa140101ca69c71303c29b3b0cb",
+        ),
+        "000" => (
+            "0.0",
+            "joint_walk",
+            "e5a7c0f1d25da486b4b8c106c9cd85fb1eeabc595de2768d0d239428dbd24403",
+        ),
+        _ => unreachable!(),
+    };
+    for (key, expected) in [
+        ("name", "biped_walk_oracle_v3"),
+        ("mujoco", "3.11.0"),
+        ("source_model", "phase3_biped_3d_v1"),
+        (
+            "model_sha256",
+            "1e7eb5bea5f624b1dc139d027a031af72b8ba9cfb590d155925833eb19b9c62c",
+        ),
+        ("config_sha256", config_sha256),
+        ("controller", "joint_walk"),
+        (
+            "controller_source_sha256",
+            "e8d59b084df687b359aa4d4a71032c2717590ac275a39844c05a36cb943ee62f",
+        ),
+        (
+            "controller_constants_sha256",
+            "65baeb118d26cdea9e9c949727c5d754deb10fa4d323a3b92b5d451596026151",
+        ),
+        ("controller_constants_count", "123"),
+        ("scenario", scenario),
+        ("balance_mode", "controller"),
+        (
+            "deterministic_init",
+            "zero_qpos_qvel_controller_targets_mj_forward",
+        ),
+        ("random_seed", "none"),
+        ("dt", "0.005"),
+        ("integrator", "Euler"),
+        ("solver", "Newton"),
+        ("cone", "pyramidal"),
+        ("iters", "20"),
+        ("steps", "5000"),
+        ("stride", "1"),
+        ("assist_scale", assist),
+        ("nq", "17"),
+        ("nv", "16"),
+        ("target_speed", "0.087026797316651347"),
+        ("gait_amplitude", "0.21245733613562609"),
+        ("gait_frequency", "0.97925167990440609"),
+        ("knee_target", "0.16236533098347533"),
+        ("ankle_target", "0.09169653690943777"),
+        ("root_height", "1.2431770030617277"),
+        (
+            "initial_qpos",
+            "0,0,1.2431770030617277,1,0,0,0,0,-0.43895686944129908,0.059999999999999998,0,0.09169653690943777,0,0.44922817002131532,0.13902412302495534,0,0.1388300014922402",
+        ),
+        ("initial_qvel", "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0"),
+    ] {
+        assert_eq!(provenance_field(provenance, key), expected, "{provenance}");
+    }
+    assert_eq!(provenance_field(provenance, "date").len(), 10);
+    assert!(provenance_field(provenance, "controller_constants").starts_with("{"));
+}
+
+fn provenance_field<'a>(provenance: &'a str, key: &str) -> &'a str {
+    provenance
+        .split('|')
+        .find_map(|field| field.strip_prefix(&format!("{key}=")))
+        .unwrap_or_else(|| panic!("missing {key} in provenance: {provenance}"))
 }
 
 fn run_newt(assist_scale: f32, steps: usize) -> NewtRun {
@@ -186,11 +273,29 @@ fn assert_level(level: &str, expected_newt_fall_step: Option<u32>) {
         if first_contact_mismatch.is_none() && expected.contact_mask != actual.contact_mask {
             first_contact_mismatch = Some(step);
         }
-        for (actual, expected) in actual.qpos.iter().zip(&expected.qpos) {
-            max_qpos = max_qpos.max((actual - expected).abs());
-        }
-        for (actual, expected) in actual.qvel.iter().zip(&expected.qvel) {
-            max_qvel = max_qvel.max((actual - expected).abs());
+        let step_qpos = actual
+            .qpos
+            .iter()
+            .zip(&expected.qpos)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0, f64::max);
+        let step_qvel = actual
+            .qvel
+            .iter()
+            .zip(&expected.qvel)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0, f64::max);
+        max_qpos = max_qpos.max(step_qpos);
+        max_qvel = max_qvel.max(step_qvel);
+        if step <= 12 {
+            assert!(
+                step_qpos <= EARLY_QPOS_GAP_BOUND,
+                "{level} step {step} qpos gap {step_qpos} exceeds early bound {EARLY_QPOS_GAP_BOUND}"
+            );
+            assert!(
+                step_qvel <= EARLY_QVEL_GAP_BOUND,
+                "{level} step {step} qvel gap {step_qvel} exceeds early bound {EARLY_QVEL_GAP_BOUND}"
+            );
         }
     }
     let metrics = &newt.result.metrics;
@@ -252,6 +357,40 @@ fn assert_level(level: &str, expected_newt_fall_step: Option<u32>) {
         assert!((116.0..=119.0).contains(&metrics.cadence_bpm));
         assert!((0.36..=0.39).contains(&metrics.mean_step_length));
         assert!((0.19..=0.21).contains(&metrics.max_foot_clearance));
+    }
+}
+
+fn assert_representative_level(level: &str, assist_scale: f32) {
+    let source = fixture(level);
+    let newt = run_newt(assist_scale, 120);
+    assert_eq!(newt.first_fall_step, None);
+    assert!(newt.result.final_root_height.is_finite());
+    assert!(newt.result.final_forward_speed.is_finite());
+    for step in 0..=120 {
+        let expected = &source.checkpoints[step];
+        let actual = &newt.checkpoints[step];
+        let qpos_gap = actual
+            .qpos
+            .iter()
+            .zip(&expected.qpos)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0, f64::max);
+        let qvel_gap = actual
+            .qvel
+            .iter()
+            .zip(&expected.qvel)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0, f64::max);
+        if step <= 12 {
+            assert!(
+                qpos_gap <= EARLY_QPOS_GAP_BOUND,
+                "{level} step {step} qpos gap {qpos_gap}"
+            );
+            assert!(
+                qvel_gap <= EARLY_QVEL_GAP_BOUND,
+                "{level} step {step} qvel gap {qvel_gap}"
+            );
+        }
     }
 }
 
@@ -332,7 +471,14 @@ fn assert_metric(level: &str, side: &str, name: &str, actual: f64, expected: f64
 }
 
 #[test]
-fn v3_sweep_records_each_measured_outcome_and_divergence() {
+fn v3_representative_sweep_is_short_and_deterministic() {
+    assert_representative_level("080", 0.8);
+    assert_representative_level("000", 0.0);
+}
+
+#[test]
+#[ignore = "full four-level 5000-step acceptance sweep"]
+fn v3_full_sweep_records_each_measured_outcome_and_divergence() {
     assert_level("080", None);
     assert_level("040", Some(553));
     assert_level("020", Some(469));
@@ -369,12 +515,47 @@ fn initial_biped_qpos_qvel() -> BipedState {
 fn extract_biped_qpos_qvel(scene: &newt::model::Scene) -> BipedState {
     let tree = &scene.world.trees[0];
     let mut qpos = tree.q[..3].to_vec();
+    qpos[2] -= COM_OFFSET_Z as f32;
     qpos.extend([tree.q[6], tree.q[3], tree.q[4], tree.q[5]]);
     qpos.extend_from_slice(&tree.q[7..]);
     let mut qvel = tree.qdot[3..6].to_vec();
     qvel.extend_from_slice(&tree.qdot[0..3]);
     qvel.extend_from_slice(&tree.qdot[6..]);
     (qpos, qvel)
+}
+
+#[test]
+fn v3_diagnostic_fixture_records_geom_manifolds() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("tests/references/biped_walk_v3_diagnostics.json");
+    let diagnostics = fs::read_to_string(path).expect("biped diagnostics fixture");
+    for field in [
+        "\"qpos\"",
+        "\"qvel\"",
+        "\"position\"",
+        "\"normal\"",
+        "\"condim\"",
+        "\"frame\"",
+        "\"efc_address\"",
+        "\"row_indices\"",
+        "\"row_to_contact\"",
+    ] {
+        assert!(diagnostics.contains(field), "missing {field}");
+    }
+    assert!(diagnostics.contains("\"geom1\": \"ground\""));
+    assert!(diagnostics.contains("\"geom2\": \"right_foot_geom\""));
+    assert!(
+        diagnostics
+            .contains("\"row_indices\": [\n            0,\n            1,\n            2,\n            3\n          ]")
+    );
+    assert!(diagnostics.contains("\"step\": 12"));
+
+    let newt_path = root.join("tests/references/biped_walk_v3_newt_diagnostics.json");
+    let newt_diagnostics = fs::read_to_string(newt_path).expect("newt biped diagnostics fixture");
+    assert!(newt_diagnostics.contains("\"geom_pair\": [\"ground\", \"right_foot_geom\"]"));
+    assert!(newt_diagnostics.contains("\"normal\": [0.0, 0.0, -1.0]"));
+    assert!(newt_diagnostics.contains("\"frame\": [0.0, 0.0, -1.0"));
+    assert!(newt_diagnostics.contains("\"row_to_contact\": [0, 0, 0, 0, 1, 1, 1, 1]"));
 }
 
 fn visual_contact_mask(scene: &newt::model::Scene) -> u8 {

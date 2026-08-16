@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as date
+import hashlib
+import json
 import struct
 import sys
 from pathlib import Path
@@ -37,6 +39,21 @@ def _state_vectors(sample) -> tuple[list[float], list[float]]:
     return qpos, qvel
 
 
+def _canonical_vector(values) -> str:
+    return ",".join("0" if float(value) == 0.0 else format(float(value), ".17g") for value in values)
+
+
+def _controller_constants(controller) -> str:
+    constants = {
+        key: value
+        for key, value in vars(type(controller)).items()
+        if not key.startswith("__")
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+    }
+    return json.dumps(constants, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
 def capture(assist_scale: float, output: Path, steps: int, stride: int) -> None:
     scenario = "joint_walk" if assist_scale == 0.0 else "stable_joint_walk"
     config = biped.BipedSimConfig.for_scenario(
@@ -50,18 +67,38 @@ def capture(assist_scale: float, output: Path, steps: int, stride: int) -> None:
         current_config, original_load_model
     )
     try:
+        controller = biped.CONTROLLERS[config.controller_name]
+        mujoco_module, model, data = biped._load_model(config)
+        biped._set_initial_pose(mujoco_module, model, data, config, controller)
+        initial_qpos = _canonical_vector(data.qpos)
+        initial_qvel = _canonical_vector(data.qvel)
         result = biped.run_biped_simulation(config)
     finally:
         biped._load_model = original_load_model
     summary = result.summary
     outcome = 1 if summary["final_status"] == "fallen" else 0
     fall_step = int(summary["steps_simulated"]) if outcome else 0
+    controller_constants = _controller_constants(controller)
+    controller_source_sha256 = hashlib.sha256(Path(biped.__file__).read_bytes()).hexdigest()
+    controller_constants_sha256 = hashlib.sha256(controller_constants.encode()).hexdigest()
     provenance = (
         f"name=biped_walk_oracle_v3|mujoco={mujoco.__version__}"
-        f"|source_model={biped.MODEL_ID}|controller={config.controller_name}"
+        f"|source_model={biped.MODEL_ID}|model_sha256={biped.model_sha256()}"
+        f"|config_sha256={biped.config_hash(config)}|controller={config.controller_name}"
+        f"|controller_source_sha256={controller_source_sha256}"
+        f"|controller_constants_sha256={controller_constants_sha256}"
+        f"|controller_constants_count={len(json.loads(controller_constants))}"
+        f"|controller_constants={controller_constants}"
+        f"|scenario={config.scenario}|balance_mode={config.balance_mode}"
+        "|deterministic_init=zero_qpos_qvel_controller_targets_mj_forward"
+        "|random_seed=none"
         f"|dt={config.dt:.9g}|integrator=Euler|solver=Newton|cone=pyramidal|iters=20"
         f"|steps={steps}|stride={stride}"
         f"|assist_scale={assist_scale:.1f}|nq={QPOS_COUNT}|nv={QVEL_COUNT}"
+        f"|target_speed={config.target_speed:.17g}|gait_amplitude={config.gait_amplitude:.17g}"
+        f"|gait_frequency={config.gait_frequency:.17g}|knee_target={config.knee_target:.17g}"
+        f"|ankle_target={config.ankle_target:.17g}|root_height={config.root_height:.17g}"
+        f"|initial_qpos={initial_qpos}|initial_qvel={initial_qvel}"
         f"|date={date.date.today().isoformat()}"
     ).encode()
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -444,8 +444,14 @@ The four binary fixtures are `biped_walk_oracle_v3_assist_080.bin`,
 `_040.bin`, `_020.bin`, and `_000.bin`. They contain one qpos/qvel checkpoint
 per step and the measured gait metrics.
 
-The permanent sweep test compares each source trace with newt through the
+The normal test runs a 120-step representative sweep at assist `0.8` and
+`0.0`. The ignored full sweep compares each source trace with newt through the
 newt fall step. These are current-gap regression bounds, not parity claims.
+Run the full sweep with:
+
+```text
+cargo test --manifest-path newt/Cargo.toml --test biped_walk_acceptance v3_full_sweep -- --ignored --nocapture
+```
 
 | assist | source outcome | newt outcome | source fall | newt fall | compared steps | max qpos gap | max qvel gap |
 |---:|---|---|---:|---:|---:|---:|---:|
@@ -454,9 +460,10 @@ newt fall step. These are current-gap regression bounds, not parity claims.
 | `0.2` | fallen | fallen | `492` | `469` | `469` | `9.01380e-1` | `6.85567e0` |
 | `0.0` | fallen | fallen | `578` | `442` | `442` | `1.14941e0` | `6.40730e0` |
 
-The `0.4` row is the acceptance failure: MuJoCo falls later, so the outcome
-class does not match. The no-assist oracle also falls, so stable no-assist
-walking is not a valid target for this source controller.
+The outcome class matches at all four levels. The `0.4` row is the acceptance
+failure because MuJoCo falls at `756` while newt falls at `553`, outside the
+fall-step bound. The no-assist oracle also falls, so stable no-assist walking
+is not a valid target for this source controller.
 
 The first remaining gap is contact timing and manifold selection. The visual
 contact masks first differ at step `12`. With the controller's `0.035 m`
@@ -469,8 +476,12 @@ generalized-force difference is `542.575`. The source and newt row reference
 acceleration maxima at step `25` are `124.283` and `140.555`.
 
 The source-side contact and row records are in
-`tests/references/biped_walk_v3_diagnostics.json`. The newt diagnostic runner
-is `examples/biped_walk_diagnostics`; it calls
+`tests/references/biped_walk_v3_diagnostics.json`. Records cover step `0`
+through `40`, including the first visual mismatch window. The selected newt
+records are in `tests/references/biped_walk_v3_newt_diagnostics.json`. Each
+contact stores the geom pair, point, normal, condim, frame, and row mapping.
+The newt diagnostic runner is `examples/biped_walk_diagnostics`; it prints
+steps `0..12`, `17`, `25`, and `36` with the same geom-level fields. It calls
 `solver::solve_tree_contacts`, the NEWT-23 row assembly path.
 
 ## Debugging a failing tolerance

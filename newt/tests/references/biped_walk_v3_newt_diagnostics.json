@@ -1,0 +1,100 @@
+{
+  "engine": "newt",
+  "integrator": "Euler",
+  "solver": "Newton",
+  "cone": "pyramidal",
+  "iterations": 20,
+  "assist_scale": 0.4,
+  "records": [
+    {
+      "step": 0,
+      "contact_mask": 0,
+      "root_com": [0.0, 0.0, 1.243177],
+      "contacts": [],
+      "rows": 0,
+      "row_to_contact": []
+    },
+    {
+      "step": 12,
+      "contact_mask": 0,
+      "root_com": [0.000319, -0.000014, 1.224642],
+      "contacts": [],
+      "rows": 0,
+      "row_to_contact": []
+    },
+    {
+      "step": 17,
+      "contact_mask": 2,
+      "root_com": [0.000169, -0.000084, 1.207029],
+      "contacts": [],
+      "rows": 0,
+      "row_to_contact": []
+    },
+    {
+      "step": 25,
+      "contact_mask": 2,
+      "root_com": [0.000590, -0.000233, 1.167577],
+      "rows": 8,
+      "row_to_contact": [0, 0, 0, 0, 1, 1, 1, 1],
+      "contacts": [
+        {
+          "geom_pair": ["ground", "right_foot_geom"],
+          "position": [-0.28548723, -0.2493027, 0.0],
+          "normal": [0.0, 0.0, -1.0],
+          "condim": 3,
+          "frame": [0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0],
+          "row_indices": [0, 1, 2, 3]
+        },
+        {
+          "geom_pair": ["ground", "right_foot_geom"],
+          "position": [-0.28625453, -0.109304965, 0.0],
+          "normal": [0.0, 0.0, -1.0],
+          "condim": 3,
+          "frame": [0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0],
+          "row_indices": [4, 5, 6, 7]
+        }
+      ]
+    },
+    {
+      "step": 36,
+      "contact_mask": 3,
+      "root_com": [0.004504, 0.001704, 1.103865],
+      "rows": 16,
+      "row_to_contact": [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3],
+      "contacts": [
+        {
+          "geom_pair": ["ground", "left_foot_geom"],
+          "position": [0.26218307, 0.25012857, 0.0],
+          "normal": [0.0, 0.0, -1.0],
+          "condim": 3,
+          "frame": [0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0],
+          "row_indices": [0, 1, 2, 3]
+        },
+        {
+          "geom_pair": ["ground", "left_foot_geom"],
+          "position": [0.26265436, 0.11013509, 0.0],
+          "normal": [0.0, 0.0, -1.0],
+          "condim": 3,
+          "frame": [0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0],
+          "row_indices": [4, 5, 6, 7]
+        },
+        {
+          "geom_pair": ["ground", "right_foot_geom"],
+          "position": [-0.29172802, -0.24974197, 0.0],
+          "normal": [0.0, 0.0, -1.0],
+          "condim": 3,
+          "frame": [0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0],
+          "row_indices": [8, 9, 10, 11]
+        },
+        {
+          "geom_pair": ["ground", "right_foot_geom"],
+          "position": [-0.2925622, -0.109745145, 0.0],
+          "normal": [0.0, 0.0, -1.0],
+          "condim": 3,
+          "frame": [0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0],
+          "row_indices": [12, 13, 14, 15]
+        }
+      ]
+    }
+  ]
+}

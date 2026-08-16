@@ -171,17 +171,19 @@ changes.
 
 the oracle fixtures use one state checkpoint per step. each fixture stores its
 MuJoCo version, model, controller, solver settings, outcome, metrics, and
-state trace:
+state trace. its canonical provenance also stores the model and config hashes,
+the controller source and constants hashes, balance mode, explicit
+zero-qpos/qvel initialization, and the initial qpos/qvel vectors:
 
 - `tests/references/biped_walk_oracle_v3_assist_080.bin`
 - `tests/references/biped_walk_oracle_v3_assist_040.bin`
 - `tests/references/biped_walk_oracle_v3_assist_020.bin`
 - `tests/references/biped_walk_oracle_v3_assist_000.bin`
 
-the permanent test is `tests/biped_walk_acceptance.rs`. the test reruns every
-level, checks the measured outcome and fall step, compares the trace until the
-newt fall, and checks current regression bounds. these bounds are not parity
-claims.
+the normal test runs a 120-step representative sweep at assist `0.8` and
+`0.0`. the ignored full test reruns every level, checks the measured outcome
+and fall step, compares the trace until the newt fall, and checks current
+regression bounds. these bounds are not parity claims.
 
 | assist | MuJoCo outcome | newt outcome | MuJoCo fall step | newt fall step | MuJoCo distance m | newt distance m | MuJoCo cadence bpm | newt cadence bpm | MuJoCo step m | newt step m | MuJoCo clearance m | newt clearance m |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -191,8 +193,8 @@ claims.
 | `0.0` | falls | falls | `578` | `442` | `-0.694926` | `0.270446` | `83.04` | `7.20` | `0.813246` | `0.916760` | `0.165822` | `0.396145` |
 
 the source falls at no assist, so a stable no-assist target is not available.
-newt matches the outcome class at `0.8`, `0.2`, and `0.0`. it falls too early
-at `0.4`, so the MUST tier fails across the sweep. TARGET is not reached.
+the outcome class matches at all four levels. newt falls too early at `0.4`,
+so its measured fall-step bound fails MUST. TARGET is not reached.
 
 the current diagnosis is a contact-manifold and state-timing gap. at the
 visual contact masks first differ at step `12`.
@@ -203,6 +205,12 @@ contacts and eight rows. source and newt `qfrc_constraint` maxima are
 `110.342` and `173.762`; their maximum generalized-force delta is
 `182.518`. the NEWT-23 row diagnostic path reports source reference-accel
 maximum `124.283` and newt `140.555` at this state.
+
+the source diagnostic records no physical pair at step `12`. at step `25`,
+source has one `ground/right_foot_geom` pair and four rows; newt has two of
+the same pair and eight rows. the source normal is `+z`; newt's contact
+normal follows its `from B into A` convention and is `-z`. both records store
+the contact point, normal, condim, frame, and row-to-contact mapping.
 
 at step `36`, both sides have four contacts and 16 rows. the source and newt
 generalized-force maxima are `493.388` and `537.673`; their maximum delta is
@@ -215,12 +223,14 @@ the measured trace gaps through the newt fall are:
 | assist | compared steps | max qpos gap | max qvel gap | status |
 | ---: | ---: | ---: | ---: | --- |
 | `0.8` | `5000` | `0.360056` | `4.860505` | current gap; both complete |
-| `0.4` | `553` | `1.153848` | `6.733136` | current gap; outcome mismatch |
+| `0.4` | `553` | `1.153848` | `6.733136` | current gap; fall-step bound miss |
 | `0.2` | `469` | `0.901380` | `6.855671` | current gap; fall step mismatch |
 | `0.0` | `442` | `1.149408` | `6.407299` | current gap; fall step mismatch |
 
-the contact and row records are in
-`tests/references/biped_walk_v3_diagnostics.json`. regenerate them with:
+the source contact and row records are in
+`tests/references/biped_walk_v3_diagnostics.json`; the matched newt records
+are in `tests/references/biped_walk_v3_newt_diagnostics.json`. regenerate the
+source records with:
 
 ```text
 PYTHONPATH=~/me/fun/biped ~/me/fun/biped/.venv/bin/python \
@@ -232,8 +242,9 @@ PYTHONPATH=~/me/fun/biped ~/me/fun/biped/.venv/bin/python \
 ```
 
 `examples/biped_walk_acceptance` prints the four matched sweep rows.
-`examples/biped_walk_diagnostics` prints contact counts, generalized-force
-values, and NEWT-23 row factors at the first divergence.
+`examples/biped_walk_diagnostics` prints steps `0..12`, `17`, `25`, and `36`.
+It prints normalized root-com state, contact geometry, frames, row mappings,
+generalized forces, and NEWT-23 row factors.
 
 ## tests
 
@@ -241,6 +252,9 @@ values, and NEWT-23 row factors at the first divergence.
 
 - short tier-1 assisted acceptance;
 - the ignored full 5000-step tier-1 acceptance;
+- the short v3 representative sweep;
+- the ignored full v3 sweep and provenance checks;
+- the committed source and newt geom-manifold diagnostic artifacts;
 - hand-built contact metric formulas;
 - byte-identical deterministic rollouts;
 - active self-contact and touch-force zero checks on acceptance runs;
@@ -256,4 +270,5 @@ run the focused test with:
 ```text
 cargo test --manifest-path newt/Cargo.toml --test biped_walk -- --nocapture
 cargo test --manifest-path newt/Cargo.toml --test biped_walk_acceptance -- --nocapture
+cargo test --manifest-path newt/Cargo.toml --test biped_walk_acceptance v3_full_sweep -- --ignored --nocapture
 ```
