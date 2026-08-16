@@ -2659,7 +2659,7 @@ pub fn solve_tree_contacts(
     }
 
     let impulses = if use_newton {
-        let mut hessian = response;
+        let mut hessian = response.clone();
         for (index, row) in rows.iter().enumerate() {
             hessian[index * n_rows + index] += row.reg;
         }
@@ -2697,6 +2697,24 @@ pub fn solve_tree_contacts(
                         mu: block.mu_roll,
                     });
                 }
+            }
+        }
+        if crate::dynamics::cholesky(&hessian, n_rows).is_none()
+            && blocks.iter().any(|block| {
+                cone == ConeKind::Pyramidal && block.condim == 3 && block.mu_slide == 0.0
+            })
+        {
+            // Zero-friction pyramid facets are identical rows. MuJoCo keeps
+            // their source Rpy at zero, so the resulting Hessian is positive
+            // semidefinite. Add a solver-only pivot for Cholesky without
+            // changing the assembled constraint regularizer.
+            let scale = hessian
+                .iter()
+                .copied()
+                .fold(0.0f32, |max_value, value| max_value.max(value.abs()));
+            let pivot = (scale * 1.0e-6).max(1.0e-7);
+            for index in 0..n_rows {
+                hessian[index * n_rows + index] += pivot;
             }
         }
         crate::newton::NewtonSystem {

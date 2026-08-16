@@ -41,6 +41,10 @@ share `Rpy = 2*mu^2*Rnormal`. The tree and free-body paths use one shared
 implementation. The factor fixture records this relation for the first
 tree contact.
 
+When zero friction makes all four pyramid facets identical, the source `Rpy`
+is zero and the Newton Hessian is semidefinite. Newt adds a solver-only
+Cholesky pivot in this degenerate case. It does not change the assembled `R`.
+
 ## tree-contact impulse entry
 
 For PGS and Newton, the world assembles tree-involved contact rows before it
