@@ -161,30 +161,79 @@ the full acceptance run uses 5000 steps and `assist_scale=0.8`:
 | max foot clearance | `0.196953 m` | `0.19..0.21 m` |
 | self-contact force steps | `0` | `0` |
 
-### tier 2: no-assist target
+### v3 no-assist acceptance sweep
 
-the 1000-step no-assist run does not reach the `0.4 m` target. it records
-`-1.4245 m` and falls to root com height `0.1439 m`. it has zero self-contact
-force and zero active self contacts.
+the v3 oracle uses the real source model with MuJoCo `3.11.0`, `dt=0.005`,
+Euler integration, the Newton solver, pyramidal cones, and 20 iterations.
+newt uses `SolverMode::Newton` and `Integrator::Euler` with the same settings.
+the controller and all gait values stay source-faithful. only `assist_scale`
+changes.
 
-a bounded 27-run sweep checks target speed at `0.8x`, `1.0x`, and `1.2x`,
-gait amplitude at `0.9x`, `1.0x`, and `1.1x`, and gait frequency at `0.9x`,
-`1.0x`, and `1.1x`. each run uses 1000 steps and no assist. the best result
-is `-1.108822 m` at speed `1.2x`, amplitude `0.9x`, and frequency `0.9x`.
-no candidate reaches `0.4 m`. `biped_walk_sweep` prints every run and the
-same best-run line on each invocation.
+the oracle fixtures use one state checkpoint per step. each fixture stores its
+MuJoCo version, model, controller, solver settings, outcome, metrics, and
+state trace:
 
-the no-assist outcome is therefore an honest diagnosis fallback, not a
-passing target claim. the source no-assist oracle also records only
-`0.050958 m` over 1000 steps.
+- `tests/references/biped_walk_oracle_v3_assist_080.bin`
+- `tests/references/biped_walk_oracle_v3_assist_040.bin`
+- `tests/references/biped_walk_oracle_v3_assist_020.bin`
+- `tests/references/biped_walk_oracle_v3_assist_000.bin`
 
-the aligned target probe moves the first remaining difference to physical
-contact timing at step `17`, not controller math. source enters right-foot
-contact at toe height `0.033224 m`; newt enters at step `18` after a toe height
-of `0.033807 m`. the source and newt target traces then follow different
-closed-loop states. the no-assist rollout later loses vertical support and
-falls. the remaining hypotheses are solver and integration differences after
-the proven controller and actuator alignment. engine sources stay unchanged.
+the permanent test is `tests/biped_walk_acceptance.rs`. the test reruns every
+level, checks the measured outcome and fall step, compares the trace until the
+newt fall, and checks current regression bounds. these bounds are not parity
+claims.
+
+| assist | MuJoCo outcome | newt outcome | MuJoCo fall step | newt fall step | MuJoCo distance m | newt distance m | MuJoCo cadence bpm | newt cadence bpm | MuJoCo step m | newt step m | MuJoCo clearance m | newt clearance m |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `0.8` | walks | walks | — | — | `2.258638` | `2.524537` | `117.60` | `117.60` | `0.489715` | `0.373536` | `0.216504` | `0.196953` |
+| `0.4` | falls | falls | `756` | `553` | `0.553179` | `3.223390` | `79.37` | `122.40` | `0.532088` | `0.105318` | `0.224684` | `0.169206` |
+| `0.2` | falls | falls | `492` | `469` | `-0.123535` | `0.957340` | `73.17` | `52.80` | `0.734206` | `0.198833` | `0.137381` | `0.502567` |
+| `0.0` | falls | falls | `578` | `442` | `-0.694926` | `0.270446` | `83.04` | `7.20` | `0.813246` | `0.916760` | `0.165822` | `0.396145` |
+
+the source falls at no assist, so a stable no-assist target is not available.
+newt matches the outcome class at `0.8`, `0.2`, and `0.0`. it falls too early
+at `0.4`, so the MUST tier fails across the sweep. TARGET is not reached.
+
+the current diagnosis is a contact-manifold and state-timing gap. at the
+visual contact masks first differ at step `12`.
+using the controller's `0.035 m` support threshold, source reaches right-foot
+contact at step `18`; newt reaches it at step `17`. at step `25`, source has one active
+right-foot contact and four pyramid rows. newt has two active right-foot
+contacts and eight rows. source and newt `qfrc_constraint` maxima are
+`110.342` and `173.762`; their maximum generalized-force delta is
+`182.518`. the NEWT-23 row diagnostic path reports source reference-accel
+maximum `124.283` and newt `140.555` at this state.
+
+at step `36`, both sides have four contacts and 16 rows. the source and newt
+generalized-force maxima are `493.388` and `537.673`; their maximum delta is
+`542.575`. the contact count matches by then, but the closed-loop states do
+not. this explains why exact isolated row factors do not prove trajectory
+parity.
+
+the measured trace gaps through the newt fall are:
+
+| assist | compared steps | max qpos gap | max qvel gap | status |
+| ---: | ---: | ---: | ---: | --- |
+| `0.8` | `5000` | `0.360056` | `4.860505` | current gap; both complete |
+| `0.4` | `553` | `1.153848` | `6.733136` | current gap; outcome mismatch |
+| `0.2` | `469` | `0.901380` | `6.855671` | current gap; fall step mismatch |
+| `0.0` | `442` | `1.149408` | `6.407299` | current gap; fall step mismatch |
+
+the contact and row records are in
+`tests/references/biped_walk_v3_diagnostics.json`. regenerate them with:
+
+```text
+PYTHONPATH=~/me/fun/biped ~/me/fun/biped/.venv/bin/python \
+  tools/capture_biped_oracle.py --assist-scale 0.0 \
+  --output tests/references/biped_walk_oracle_v3_assist_000.bin
+PYTHONPATH=~/me/fun/biped ~/me/fun/biped/.venv/bin/python \
+  tools/capture_biped_diagnostics.py --assist-scale 0.4 --steps 40 \
+  --output tests/references/biped_walk_v3_diagnostics.json
+```
+
+`examples/biped_walk_acceptance` prints the four matched sweep rows.
+`examples/biped_walk_diagnostics` prints contact counts, generalized-force
+values, and NEWT-23 row factors at the first divergence.
 
 ## tests
 
@@ -192,7 +241,6 @@ the proven controller and actuator alignment. engine sources stay unchanged.
 
 - short tier-1 assisted acceptance;
 - the ignored full 5000-step tier-1 acceptance;
-- the conditional tier-2 target or diagnosis fallback;
 - hand-built contact metric formulas;
 - byte-identical deterministic rollouts;
 - active self-contact and touch-force zero checks on acceptance runs;
@@ -200,8 +248,12 @@ the proven controller and actuator alignment. engine sources stay unchanged.
 - all-ten compiled position-actuator `kv` checks;
 - the steps `0..30` ankle target probe.
 
+`newt/tests/biped_walk_acceptance.rs` covers the v3 four-level oracle sweep,
+current-gap bounds, and NEWT-23 contact and row diagnostics.
+
 run the focused test with:
 
 ```text
 cargo test --manifest-path newt/Cargo.toml --test biped_walk -- --nocapture
+cargo test --manifest-path newt/Cargo.toml --test biped_walk_acceptance -- --nocapture
 ```
