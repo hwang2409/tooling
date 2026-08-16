@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use newt::geom::SolRef;
 use newt::joint::JointKind;
 use newt::json::{self, Value};
 use newt::math::{Quat, Vec3};
@@ -456,6 +457,21 @@ fn expect_f64_vec(v: Value) -> Vec<f64> {
         other => panic!("expected array, got {}", other.type_name()),
     };
     arr.into_iter().map(expect_f64).collect()
+}
+
+fn object_value(object: &[(String, Value)], key: &str) -> Value {
+    object
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| panic!("fixture object missing {key}"))
+}
+
+fn expect_object(v: Value) -> Vec<(String, Value)> {
+    match v {
+        Value::Object(object) => object,
+        other => panic!("expected object, got {}", other.type_name()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1404,5 +1420,162 @@ fn differential_matched_newton_euler_rows() {
             _ => unreachable!(),
         };
         assert_within_bounds(&format!("{name} Newton Euler"), &d, bound);
+    }
+}
+
+#[test]
+fn permanent_constraint_factor_diagnostics_match_mujoco() {
+    let source = fs::read_to_string(references_dir().join("constraint_factor_diagnostics.json"))
+        .expect("constraint factor fixture missing");
+    let root = expect_object(json::parse(&source).expect("constraint factor fixture is invalid"));
+    assert_eq!(expect_string(object_value(&root, "mujoco")), "3.11.0");
+    let records = match object_value(&root, "records") {
+        Value::Array(records) => records,
+        other => panic!("records must be an array, got {}", other.type_name()),
+    };
+    assert_eq!(records.len(), 6);
+    for value in records {
+        let record = expect_object(value);
+        let tc = expect_f64(object_value(&record, "tc"));
+        let dampratio = expect_f64(object_value(&record, "dampratio"));
+        let dt = expect_f64(object_value(&record, "dt"));
+        let positions = expect_f64_vec(object_value(&record, "efc_pos"));
+        let velocities = expect_f64_vec(object_value(&record, "efc_vel"));
+        let margins = expect_f64_vec(object_value(&record, "efc_margin"));
+        let diag_a = expect_f64_vec(object_value(&record, "efc_diagA"));
+        let reference = expect_f64_vec(object_value(&record, "efc_aref"));
+        let regularization = expect_f64_vec(object_value(&record, "efc_R"));
+        let kbip = match object_value(&record, "efc_KBIP") {
+            Value::Array(rows) => rows.into_iter().map(expect_f64_vec).collect::<Vec<_>>(),
+            other => panic!("efc_KBIP must be an array, got {}", other.type_name()),
+        };
+        assert_eq!(positions.len(), 4);
+        let solref = SolRef::new(tc as f32, dampratio as f32);
+        let effective_tc = tc.max(2.0 * dt);
+        for row in 0..4 {
+            let position = positions[row] as f32 - margins[row] as f32;
+            let velocity = velocities[row] as f32;
+            let impedance_value = newt::solver::impedance(position, newt::solver::SolImp::DEFAULT);
+            let expected_b = 2.0 / (newt::solver::SolImp::DEFAULT.dmax * effective_tc as f32);
+            let expected_k_eff = impedance_value
+                / (newt::solver::SolImp::DEFAULT.dmax
+                    * newt::solver::SolImp::DEFAULT.dmax
+                    * effective_tc as f32
+                    * effective_tc as f32
+                    * dampratio as f32
+                    * dampratio as f32);
+            let expected_aref = newt::solver::reference_accel(
+                position,
+                velocity,
+                solref,
+                newt::solver::SolImp::DEFAULT,
+            );
+            let expected_r = (1.0 - impedance_value) / impedance_value * diag_a[row] as f32;
+            assert!((kbip[row][2] as f32 - impedance_value).abs() < 2.0e-6);
+            assert!((kbip[row][1] as f32 - expected_b).abs() < 2.0e-4);
+            assert!((kbip[row][0] as f32 * impedance_value - expected_k_eff).abs() < 2.0e-1);
+            assert!((reference[row] as f32 - expected_aref).abs() < 1.0e-3);
+            assert!((regularization[row] as f32 - expected_r).abs() < 1.0e-5);
+        }
+    }
+
+    let tree_records = match object_value(&root, "tree_records") {
+        Value::Array(records) => records,
+        other => panic!("tree_records must be an array, got {}", other.type_name()),
+    };
+    assert_eq!(tree_records.len(), 1);
+    let tree = expect_object(tree_records.into_iter().next().unwrap());
+    let tree_diag = expect_f64_vec(object_value(&tree, "efc_diagA"));
+    let tree_r = expect_f64_vec(object_value(&tree, "efc_R"));
+    let tree_kbip = match object_value(&tree, "efc_KBIP") {
+        Value::Array(rows) => rows.into_iter().map(expect_f64_vec).collect::<Vec<_>>(),
+        other => panic!("tree efc_KBIP must be an array, got {}", other.type_name()),
+    };
+    assert_eq!(tree_diag.len(), 4);
+    let normal_diag_approx = tree_diag[0] / (2.0 * 0.6f64 * 0.6);
+    let normal_r = (1.0 - tree_kbip[0][2]) / tree_kbip[0][2] * normal_diag_approx;
+    let expected_rpy = 2.0 * 0.6f64 * 0.6 * normal_r;
+    for row in 0..4 {
+        assert!((tree_diag[row] - tree_diag[0]).abs() < 1.0e-7);
+        assert!((tree_r[row] - expected_rpy).abs() < 1.0e-7);
+        assert!((tree_kbip[row][0] - tree_kbip[0][0]).abs() < 1.0e-7);
+    }
+}
+
+#[test]
+fn permanent_matched_euler_solref_sweep() {
+    let source = fs::read_to_string(references_dir().join("solref_sweep_euler.json"))
+        .expect("Euler sweep fixture missing");
+    let root = expect_object(json::parse(&source).expect("Euler sweep fixture is invalid"));
+    assert_eq!(expect_string(object_value(&root, "mujoco")), "3.11.0");
+    let records = match object_value(&root, "records") {
+        Value::Array(records) => records,
+        other => panic!("records must be an array, got {}", other.type_name()),
+    };
+    let bounds_um = [10.0, 20.0, 50.0, 6_000.0, 35_000.0, 70_000.0, 4_000.0];
+    assert_eq!(records.len(), bounds_um.len());
+    for (value, gap_um) in records.into_iter().zip(bounds_um) {
+        let record = expect_object(value);
+        let tc = expect_f64(object_value(&record, "tc"));
+        let dampratio = expect_f64(object_value(&record, "dampratio"));
+        let steps = expect_u32(object_value(&record, "steps"));
+        let expected_qpos = expect_f64_vec(object_value(&record, "qpos"));
+        let mjcf = fs::read_to_string(references_dir().join("sphere_drop.xml")).unwrap();
+        let mut scene = newt::mjcf::load_mjcf_str(&mjcf).unwrap();
+        for geom in &mut scene.world.geoms {
+            geom.solref = SolRef::new(tc as f32, dampratio as f32);
+        }
+        scene.world.integrator = Integrator::Euler;
+        scene.world.solver.mode = SolverMode::Pgs;
+        for _ in 0..steps {
+            scene.world.step();
+        }
+        let gap_um_observed =
+            (scene.world.bodies[0].position.z as f64 - expected_qpos[2]).abs() * 1.0e6;
+        println!(
+            "Euler solref tc={tc:.3} dr={dampratio:.1}: z gap={gap_um_observed:.3}μm (bound {gap_um:.0}μm)"
+        );
+        assert!(
+            gap_um_observed <= gap_um,
+            "Euler solref tc={tc} dr={dampratio}: gap {gap_um_observed:.3}μm exceeds {gap_um:.0}μm"
+        );
+    }
+}
+
+#[test]
+fn permanent_rk4_out_of_window_solref_rows_have_separate_bounds() {
+    let source = fs::read_to_string(references_dir().join("solref_sweep_rk4.json"))
+        .expect("RK4 sweep fixture missing");
+    let root = expect_object(json::parse(&source).expect("RK4 sweep fixture is invalid"));
+    assert_eq!(expect_string(object_value(&root, "mujoco")), "3.11.0");
+    let records = match object_value(&root, "records") {
+        Value::Array(records) => records,
+        other => panic!("records must be an array, got {}", other.type_name()),
+    };
+    let bounds_um = [100.0, 4_000.0];
+    assert_eq!(records.len(), bounds_um.len());
+    for (value, gap_um) in records.into_iter().zip(bounds_um) {
+        let record = expect_object(value);
+        let tc = expect_f64(object_value(&record, "tc"));
+        let dampratio = expect_f64(object_value(&record, "dampratio"));
+        let steps = expect_u32(object_value(&record, "steps"));
+        let expected_qpos = expect_f64_vec(object_value(&record, "qpos"));
+        let mjcf = fs::read_to_string(references_dir().join("sphere_drop.xml")).unwrap();
+        let mut scene = newt::mjcf::load_mjcf_str(&mjcf).unwrap();
+        for geom in &mut scene.world.geoms {
+            geom.solref = SolRef::new(tc as f32, dampratio as f32);
+        }
+        for _ in 0..steps {
+            scene.world.step();
+        }
+        let gap_um_observed =
+            (scene.world.bodies[0].position.z as f64 - expected_qpos[2]).abs() * 1.0e6;
+        println!(
+            "RK4 solref tc={tc:.3} dr={dampratio:.1}: z gap={gap_um_observed:.3}μm (bound {gap_um:.0}μm)"
+        );
+        assert!(
+            gap_um_observed <= gap_um,
+            "RK4 solref tc={tc} dr={dampratio}: gap {gap_um_observed:.3}μm exceeds {gap_um:.0}μm"
+        );
     }
 }

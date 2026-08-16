@@ -17,6 +17,7 @@ USAGE
   python capture_mujoco.py --venv PATH        # bootstrap check against a venv
   python capture_mujoco.py --row-diagnostics PATH
   python capture_mujoco.py --solref-sweep PATH
+  python capture_mujoco.py --rk4-sweep PATH
 
 The default venv is ~/me/fun/biped/.venv/bin/python; if you invoke this
 script under a different Python (e.g. the venv's own), the venv check is
@@ -282,7 +283,7 @@ def _capture_scenario(
 
 
 def _capture_row_diagnostics(mujoco, np, refs_dir: Path, path: Path) -> None:
-    """Dump MuJoCo's first-contact constraint factors for sphere_drop.
+    """Dump MuJoCo's first-contact constraint factors for sphere_drop and a tree.
 
     The snapshot is taken after the first step that creates a contact, then
     forwarded once so all efc_* arrays describe the same qpos/qvel state.
@@ -326,6 +327,7 @@ def _capture_row_diagnostics(mujoco, np, refs_dir: Path, path: Path) -> None:
                 "efc_vel": data.efc_vel[:nefc].astype("float64").tolist(),
                 "efc_aref": data.efc_aref[:nefc].astype("float64").tolist(),
                 "efc_margin": data.efc_margin[:nefc].astype("float64").tolist(),
+                "efc_diagA": data.efc_diagA[:nefc].astype("float64").tolist(),
                 "efc_R": data.efc_R[:nefc].astype("float64").tolist(),
                 "efc_D": data.efc_D[:nefc].astype("float64").tolist(),
                 "efc_KBIP": data.efc_KBIP[:nefc].reshape(nefc, 4).astype("float64").tolist(),
@@ -345,7 +347,42 @@ def _capture_row_diagnostics(mujoco, np, refs_dir: Path, path: Path) -> None:
             break
         else:
             raise RuntimeError(f"no contact found for tc={tc}, dampratio={dr}")
-    path.write_text(json.dumps({"mujoco": mujoco.__version__, "records": records}, indent=2) + "\n")
+    tree_path = refs_dir / "tree_chain_contact.xml"
+    tree_model = mujoco.MjModel.from_xml_path(str(tree_path))
+    tree_data = mujoco.MjData(tree_model)
+    mujoco.mj_forward(tree_model, tree_data)
+    for tree_step in range(1, 5000):
+        mujoco.mj_step(tree_model, tree_data)
+        if tree_data.ncon == 0:
+            continue
+        mujoco.mj_forward(tree_model, tree_data)
+        tree_nefc = int(tree_data.nefc)
+        tree_records = [{
+            "name": "tree_chain_contact",
+            "step": tree_step,
+            "dt": float(tree_model.opt.timestep),
+            "nq": int(tree_model.nq),
+            "nv": int(tree_model.nv),
+            "qpos": tree_data.qpos.astype("float64").tolist(),
+            "qvel": tree_data.qvel.astype("float64").tolist(),
+            "efc_pos": tree_data.efc_pos[:tree_nefc].astype("float64").tolist(),
+            "efc_vel": tree_data.efc_vel[:tree_nefc].astype("float64").tolist(),
+            "efc_aref": tree_data.efc_aref[:tree_nefc].astype("float64").tolist(),
+            "efc_diagA": tree_data.efc_diagA[:tree_nefc].astype("float64").tolist(),
+            "efc_R": tree_data.efc_R[:tree_nefc].astype("float64").tolist(),
+            "efc_KBIP": tree_data.efc_KBIP[:tree_nefc].reshape(tree_nefc, 4).astype("float64").tolist(),
+            "efc_J": tree_data.efc_J.reshape(tree_nefc, tree_model.nv).astype("float64").tolist(),
+        }]
+        break
+    else:
+        raise RuntimeError("no contact found for tree_chain_contact")
+    path.write_text(
+        json.dumps(
+            {"mujoco": mujoco.__version__, "records": records, "tree_records": tree_records},
+            indent=2,
+        )
+        + "\n"
+    )
     print(f"wrote {path}")
 
 
@@ -378,6 +415,33 @@ def _capture_solref_sweep(mujoco, np, refs_dir: Path, path: Path) -> None:
                 "dampratio": dr,
                 "steps": 1500,
                 "integrator": "Euler",
+                "qpos": data.qpos.astype("float64").tolist(),
+                "qvel": data.qvel.astype("float64").tolist(),
+            }
+        )
+    path.write_text(json.dumps({"mujoco": mujoco.__version__, "records": records}, indent=2) + "\n")
+    print(f"wrote {path}")
+
+
+def _capture_rk4_sweep(mujoco, np, refs_dir: Path, path: Path) -> None:
+    """Capture RK4 final states for the out-of-window solref rows."""
+    mjcf_path = refs_dir / "sphere_drop.xml"
+    records = []
+    for tc, dr in [(0.100, 1.0), (0.200, 2.0)]:
+        model = mujoco.MjModel.from_xml_path(str(mjcf_path))
+        model.geom_solref[:, 0] = tc
+        model.geom_solref[:, 1] = dr
+        data = mujoco.MjData(model)
+        mujoco.mj_forward(model, data)
+        for _ in range(1500):
+            mujoco.mj_step(model, data)
+        mujoco.mj_forward(model, data)
+        records.append(
+            {
+                "tc": tc,
+                "dampratio": dr,
+                "steps": 1500,
+                "integrator": "RK4",
                 "qpos": data.qpos.astype("float64").tolist(),
                 "qvel": data.qvel.astype("float64").tolist(),
             }
@@ -490,6 +554,12 @@ def main(argv: list[str]) -> int:
         metavar="PATH",
         help="Write the matched-Euler sphere-drop solref sweep final states as JSON.",
     )
+    parser.add_argument(
+        "--rk4-sweep",
+        type=Path,
+        metavar="PATH",
+        help="Write the out-of-window RK4 sphere-drop solref final states as JSON.",
+    )
     args = parser.parse_args(argv[1:])
 
     # Re-exec under the venv if we're not already in one that has mujoco.
@@ -517,6 +587,9 @@ def main(argv: list[str]) -> int:
         return 0
     if args.solref_sweep is not None:
         _capture_solref_sweep(mujoco, np, refs_dir, args.solref_sweep)
+        return 0
+    if args.rk4_sweep is not None:
+        _capture_rk4_sweep(mujoco, np, refs_dir, args.rk4_sweep)
         return 0
 
     if args.list:
