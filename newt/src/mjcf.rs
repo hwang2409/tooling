@@ -56,7 +56,7 @@ use crate::sensor::{Sensor, SensorAttach, SensorKind, SiteFrame};
 use crate::solver::SolImp;
 use crate::tendon::{FixedTendonJoint, SpatialTendonSite, Tendon, WrapSphere};
 use crate::tree::{Link, Tree};
-use crate::world::World;
+use crate::world::{Integrator, World};
 use crate::xml::{self, Element};
 
 // ---------------------------------------------------------------------------
@@ -717,12 +717,21 @@ impl Loader {
                     self.world.magnetic_field = parse_vec3_attr(v, path, "magnetic")?;
                 }
                 "integrator" => {
-                    if v != "RK4" && v != "rk4" {
-                        return fail(
-                            path,
-                            format!("option integrator=\"{v}\" is not supported (only \"RK4\")"),
-                        );
-                    }
+                    self.world.integrator = match v.as_str() {
+                        "RK4" | "rk4" => Integrator::Rk4,
+                        "Euler" | "euler" => Integrator::Euler,
+                        "implicitfast" | "ImplicitFast" | "implicit_fast" | "implicit"
+                        | "Implicit" => Integrator::ImplicitFast,
+                        other => {
+                            return fail(
+                                path,
+                                format!(
+                                    "option integrator=\"{other}\" is not supported \
+                                     (expected RK4, Euler, or implicitfast)"
+                                ),
+                            );
+                        }
+                    };
                 }
                 "cone" => {
                     use crate::solver::ConeKind;
@@ -3907,9 +3916,13 @@ mod tests {
     }
 
     #[test]
-    fn integrator_non_rk4_rejected() {
-        let e = err(r#"<mujoco><option integrator="Euler"/></mujoco>"#);
-        assert!(e.message.contains("integrator"), "{}", e.message);
+    fn integrator_selection_is_loaded() {
+        let euler = load_mjcf_str(r#"<mujoco><option integrator="Euler"/></mujoco>"#)
+            .expect("Euler should load");
+        assert_eq!(euler.world.integrator, Integrator::Euler);
+        let implicit = load_mjcf_str(r#"<mujoco><option integrator="implicitfast"/></mujoco>"#)
+            .expect("implicitfast should load");
+        assert_eq!(implicit.world.integrator, Integrator::ImplicitFast);
     }
 
     #[test]

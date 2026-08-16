@@ -1,4 +1,4 @@
-//! World: free rigid bodies + geoms, penalty contacts, RK4 integration.
+//! World: free rigid bodies + geoms, contacts, and fixed-step integration.
 //!
 //! # Scope (tier 2)
 //!
@@ -45,13 +45,46 @@ use crate::joint::JointKind;
 use crate::math::{Quat, Vec3};
 use crate::sensor::{Sensor, SensorBank, SensorError, SensorInputs};
 use crate::solver::{SolverConfig, SolverMode, solve_free_bodies};
-use crate::tree::{Tree, forward_kinematics as tree_forward_kinematics, rk4_step as tree_rk4_step};
+use crate::tree::{
+    Tree, euler_step as tree_euler_step, forward_kinematics as tree_forward_kinematics,
+    rk4_step as tree_rk4_step,
+};
+
+/// Fixed-step integration schemes supported by [`World::step`].
+///
+/// `Rk4` remains the default to preserve every pre-v3 trajectory. `Euler`
+/// is MuJoCo's semi-implicit Euler path with implicit joint damping.
+/// `ImplicitFast` adds the velocity derivative of actuator forces to the same
+/// mass-matrix fold. It intentionally does not include Coriolis derivatives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Integrator {
+    /// MuJoCo-style semi-implicit Euler.
+    Euler,
+    /// MuJoCo's documented implicit-in-velocity approximation.
+    ImplicitFast,
+    /// The original four-stage integrator. This is the default.
+    #[default]
+    Rk4,
+}
+
+impl Integrator {
+    /// Compatibility spelling for callers that use MuJoCo's name.
+    #[allow(non_upper_case_globals)]
+    pub const RK4: Self = Self::Rk4;
+    /// Compatibility alias for MuJoCo's full implicit spelling. Newt uses
+    /// the documented implicitfast scope for both names.
+    #[allow(non_upper_case_globals)]
+    pub const Implicit: Self = Self::ImplicitFast;
+}
 
 /// Simulation world.
 #[derive(Clone, Debug)]
 pub struct World {
     /// Fixed integration timestep. Default 5 ms (matches biped).
     pub dt: f32,
+    /// Integration scheme. Defaults to [`Integrator::Rk4`] for trajectory
+    /// compatibility with all pre-v3 scenes.
+    pub integrator: Integrator,
     /// Uniform gravity vector applied to every body's COM.
     pub gravity: Vec3,
     /// Global magnetic field in world coordinates for magnetometer sensors.
@@ -136,6 +169,7 @@ impl std::error::Error for KeyframeError {}
 impl PartialEq for World {
     fn eq(&self, other: &Self) -> bool {
         self.dt == other.dt
+            && self.integrator == other.integrator
             && self.gravity == other.gravity
             && self.magnetic_field == other.magnetic_field
             && self.bodies == other.bodies
@@ -169,6 +203,7 @@ impl World {
     pub fn new() -> Self {
         Self {
             dt: 0.005,
+            integrator: Integrator::default(),
             gravity: Vec3::new(0.0, 0.0, -9.81),
             magnetic_field: Vec3::new(0.0, -0.5, 0.0),
             bodies: Vec::new(),
@@ -644,7 +679,7 @@ impl World {
         self.trees[tree_idx].inverse_dynamics_at(q, qdot, qddot, self.gravity, external_wrenches)
     }
 
-    /// Advance the whole world by one fixed-dt RK4 step.
+    /// Advance the whole world by one fixed-dt step.
     ///
     /// Contact forces are recomputed at each RK4 sub-stage from the
     /// interpolated body states. This is the standard RK4 treatment for a
@@ -666,8 +701,20 @@ impl World {
             Some(p) => p.clone(),
             None => self.auto_pairs(),
         };
-        self.step_bodies(&pairs);
-        self.step_trees(&pairs);
+        match self.integrator {
+            Integrator::Rk4 => {
+                self.step_bodies(&pairs);
+                self.step_trees(&pairs);
+            }
+            Integrator::Euler => {
+                self.step_trees_euler(&pairs, false);
+                self.step_bodies_euler(&pairs);
+            }
+            Integrator::ImplicitFast => {
+                self.step_trees_euler(&pairs, true);
+                self.step_bodies_euler(&pairs);
+            }
+        }
         // Sensor evaluation runs strictly on post-step state — no
         // perturbation. Skipped when no sensors are declared so every
         // pre-v1-tier-6 golden path is bit-for-bit untouched.
@@ -894,6 +941,28 @@ impl World {
         }
     }
 
+    /// Advance free bodies with MuJoCo's semi-implicit Euler ordering.
+    /// Contact and PGS forces are sampled once from the current state. The
+    /// updated velocity drives both the position and quaternion updates.
+    fn step_bodies_euler(&mut self, pairs: &[(usize, usize)]) {
+        let ext = match self.solver.mode {
+            SolverMode::Penalty => self.compute_wrenches(&self.bodies, pairs),
+            SolverMode::Pgs => self.compute_solver_wrenches(&self.bodies, pairs),
+        };
+        let accel = evaluate_all(&self.bodies, self.gravity, &ext);
+        let dt = self.dt;
+        for (body, d) in self.bodies.iter_mut().zip(accel) {
+            let linear_velocity = body.linear_velocity + d.dlinear_velocity * dt;
+            let angular_velocity_body = body.angular_velocity_body + d.dangular_velocity_body * dt;
+            body.position += linear_velocity * dt;
+            body.orientation = body
+                .orientation
+                .integrate_body_angular_velocity(angular_velocity_body, dt);
+            body.linear_velocity = linear_velocity;
+            body.angular_velocity_body = angular_velocity_body;
+        }
+    }
+
     /// Advance the kinematic trees under gravity + contact wrenches.
     ///
     /// v0 simplification: cross-integration between free bodies and tree
@@ -978,6 +1047,69 @@ impl World {
             // Roll back the ZOH limit torque + penalty-limit gate so
             // neither accumulates across steps (the solver recomputes
             // both fresh at each step start).
+            for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
+                tree.qfrc_applied[slot] -= delta;
+            }
+            tree.disable_penalty_limits = prior_disable;
+            self.trees[ti] = tree;
+        }
+    }
+
+    /// Advance trees with one MuJoCo-style semi-implicit step. The contact
+    /// callback is called once at the current state, and the tree ABA folds
+    /// joint damping into `M + dt*B`. `implicit_fast` also folds the negative
+    /// velocity derivative of joint-transmitted actuator forces.
+    fn step_trees_euler(&mut self, pairs: &[(usize, usize)], implicit_fast: bool) {
+        if self.trees.is_empty() {
+            return;
+        }
+        let dt = self.dt;
+        let gravity = self.gravity;
+        let solver_mode = self.solver.mode;
+        let solver_iterations = self.solver.iterations;
+        for ti in 0..self.trees.len() {
+            let mut tree_pairs = Vec::new();
+            for &(a, b) in pairs {
+                let att_a = self.geoms[a].attachment();
+                let att_b = self.geoms[b].attachment();
+                if matches!(att_a, GeomAttach::Link(t, _) if t == ti)
+                    || matches!(att_b, GeomAttach::Link(t, _) if t == ti)
+                {
+                    tree_pairs.push((a, b));
+                }
+            }
+
+            let mut tree = std::mem::take(&mut self.trees[ti]);
+            let prior_disable = tree.disable_penalty_limits;
+            let mut solver_qfrc_delta = Vec::new();
+            if solver_mode == SolverMode::Pgs {
+                solver_qfrc_delta = crate::solver::solve_tree_limits(
+                    &tree,
+                    ti,
+                    &self.equalities,
+                    dt,
+                    solver_iterations,
+                );
+                for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
+                    tree.qfrc_applied[slot] += delta;
+                }
+                tree.disable_penalty_limits = true;
+            }
+            {
+                let bodies_ref = &self.bodies;
+                let geoms_ref = &self.geoms;
+                let meshes_ref = &self.meshes;
+                tree_euler_step(&mut tree, gravity, dt, implicit_fast, |state| {
+                    tree_wrenches_from_contacts(
+                        state,
+                        ti,
+                        bodies_ref,
+                        geoms_ref,
+                        meshes_ref,
+                        &tree_pairs,
+                    )
+                });
+            }
             for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
                 tree.qfrc_applied[slot] -= delta;
             }

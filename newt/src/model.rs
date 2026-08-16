@@ -32,7 +32,7 @@ use crate::math::{Mat3, Quat, Vec3};
 use crate::sensor::{Sensor, SensorAttach, SensorKind, SiteFrame};
 use crate::tendon::{FixedTendonJoint, SpatialTendonSite, Tendon, WrapSphere};
 use crate::tree::{Link, Tree, forward_kinematics};
-use crate::world::World;
+use crate::world::{Integrator, World};
 
 // ---------------------------------------------------------------------------
 // public error type
@@ -784,6 +784,7 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
             "gravity",
             "magnetic_field",
             "timestep",
+            "integrator",
             "solver",
             "bodies",
             "trees",
@@ -825,6 +826,9 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
             return fail("timestep", format!("timestep must be > 0 (got {dt})"));
         }
         world.dt = dt;
+    }
+    if let Some(v) = optional(root_fields, "integrator") {
+        world.integrator = parse_integrator(v, "integrator")?;
     }
     if let Some(v) = optional(root_fields, "solver") {
         world.solver = parse_solver_config(v, "solver")?;
@@ -1483,6 +1487,21 @@ fn parse_nonneg_float(
         return fail(&format!("{path}.{key}"), format!("{key} must be ≥ 0"));
     }
     Ok(Some(f))
+}
+
+fn parse_integrator(v: &Value, path: &str) -> Result<Integrator, ModelError> {
+    let name = get_str(v, path)?;
+    match name {
+        "RK4" | "rk4" => Ok(Integrator::Rk4),
+        "Euler" | "euler" => Ok(Integrator::Euler),
+        "implicitfast" | "ImplicitFast" | "implicit_fast" | "implicit" | "Implicit" => {
+            Ok(Integrator::ImplicitFast)
+        }
+        other => fail(
+            path,
+            format!("unknown integrator \"{other}\"; expected RK4 | Euler | implicitfast"),
+        ),
+    }
 }
 
 /// Parse the top-level `solver` object. Schema:
