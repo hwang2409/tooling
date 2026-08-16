@@ -111,10 +111,14 @@ fn equality_linkage(mode: SolverMode) -> World {
 }
 
 fn condim_four_contact(mode: SolverMode) -> World {
+    condim_four_contact_with_iterations(mode, 30)
+}
+
+fn condim_four_contact_with_iterations(mode: SolverMode, iterations: u32) -> World {
     let mut world = World::new();
     world.solver = SolverConfig {
         mode,
-        iterations: 30,
+        iterations,
         cone: ConeKind::Pyramidal,
     };
     let mut plane = Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.8);
@@ -135,6 +139,29 @@ fn condim_four_contact(mode: SolverMode) -> World {
     sphere.torsional_friction = 0.2;
     world.add_geom(sphere);
     world
+}
+
+#[test]
+fn condim_four_cross_solver_iteration_probe() {
+    let mut pgs = condim_four_contact_with_iterations(SolverMode::Pgs, 300);
+    let mut newton = condim_four_contact_with_iterations(SolverMode::Newton, 30);
+    let mut max_position_delta = 0.0f32;
+    let mut max_velocity_delta = 0.0f32;
+    let mut max_spin_delta = 0.0f32;
+    for _ in 0..120 {
+        pgs.step();
+        newton.step();
+        let p = pgs.bodies[0];
+        let n = newton.bodies[0];
+        max_position_delta = max_position_delta.max((p.position - n.position).length());
+        max_velocity_delta =
+            max_velocity_delta.max((p.linear_velocity - n.linear_velocity).length());
+        max_spin_delta =
+            max_spin_delta.max((p.angular_velocity_body - n.angular_velocity_body).length());
+    }
+    println!(
+        "condim4 pgs(300)/newton(30) maxima: position={max_position_delta:.9e} velocity={max_velocity_delta:.9e} spin={max_spin_delta:.9e}"
+    );
 }
 
 fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {

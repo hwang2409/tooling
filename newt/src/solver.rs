@@ -294,13 +294,17 @@ pub fn sigmoid(x: f32, power: u32, midpoint: f32) -> f32 {
 /// yield an impedance in case they are treated as pushing back toward the
 /// boundary.
 pub fn impedance(violation: f32, s: SolImp) -> f32 {
+    impedance_at_position(-violation, 0.0, s)
+}
+
+/// MuJoCo's `getimpedance`: evaluate the sigmoid from signed row position
+/// and margin before taking the absolute normalized distance.
+fn impedance_at_position(position: f32, margin: f32, s: SolImp) -> f32 {
     let s = effective_solimp(s);
-    let r = if violation >= 0.0 {
-        violation
-    } else {
-        -violation
-    };
-    let x = r / s.width;
+    let mut x = (position - margin) / s.width;
+    if x < 0.0 {
+        x = -x;
+    }
     let y = sigmoid(x, s.power, s.midpoint);
     s.dmin + (s.dmax - s.dmin) * y
 }
@@ -354,7 +358,7 @@ pub fn reference_accel(
     solimp: SolImp,
 ) -> f32 {
     let solimp = effective_solimp(solimp);
-    let d = impedance(position, solimp);
+    let d = impedance_at_position(position, 0.0, solimp);
     let (b, k) = if solref.is_direct() {
         (
             -solref.dampratio / solimp.dmax,
@@ -453,9 +457,8 @@ struct ConstraintRow {
     reg: f32,
     /// Diagonal `A_ii + R_ii`. Populated during assembly.
     diag: f32,
-    /// Bias `b_i = J_i · qdot_free + a_ref_scaled · dt`, where the two
-    /// terms of `a_ref` carry independent scalars
-    /// ([`AREF_BIAS_ALPHA_DAMPING`], [`AREF_BIAS_ALPHA_STIFFNESS`]).
+    /// Bias `b_i = delta_v_free - a_ref * dt`, using the source reference
+    /// acceleration directly.
     bias: f32,
     /// Row geometry.
     geom: RowGeom,
@@ -786,7 +789,7 @@ fn solve_free_bodies_diag_mode(
         for k in 0..contact_block_n_rows(pc.condim, cone) {
             let ri = pc.start_row as usize + k;
             let a_ii = row_body_diagonal(&rows[ri], bodies, &inv_i_world);
-            let d = impedance(pc.pen_active, pc.solimp);
+            let d = impedance_at_position(-pc.pen_active, 0.0, pc.solimp);
             let reg = contact_regularization(pc, &rows[ri], bodies, &inv_i_world, d, cone);
             rows[ri].reg = reg;
             rows[ri].diag = a_ii + reg;
@@ -1602,9 +1605,26 @@ fn contact_regularization(
     } else {
         row_body_diagonal(row, bodies, inv_i_world)
     };
+    contact_regularization_from_diag(
+        base_diag,
+        impedance_value,
+        pc.mu_slide,
+        cone == ConeKind::Pyramidal && pc.condim == 3,
+    )
+}
+
+/// Apply MuJoCo's `mj_makeImpedance` regularizer to one diagonal
+/// approximation. Pyramidal facets use the common `Rpy` value derived from
+/// the normal facet, so every solver path shares the same cone rule.
+fn contact_regularization_from_diag(
+    base_diag: f32,
+    impedance_value: f32,
+    mu_slide: f32,
+    pyramidal_condim3: bool,
+) -> f32 {
     let base_reg = (1.0 - impedance_value) / impedance_value * base_diag;
-    if cone == ConeKind::Pyramidal && pc.condim == 3 {
-        2.0 * pc.mu_slide * pc.mu_slide * base_reg
+    if pyramidal_condim3 {
+        2.0 * mu_slide * mu_slide * base_reg
     } else {
         base_reg
     }
@@ -2466,6 +2486,21 @@ pub fn solve_tree_contacts(
             }
         })
         .collect();
+    // MuJoCo's diagApprox is a model-time body inverse weight. It does not
+    // use the exact contact response or the implicit damping matrix.
+    let tree_diag_factors: Vec<Vec<f32>> = trees
+        .iter()
+        .map(|tree| {
+            let n = tree.nv();
+            if n == 0 {
+                Vec::new()
+            } else {
+                cholesky(&mass_matrix(tree), n).unwrap_or_else(|| {
+                    panic!("tree diagApprox failed: mass matrix is not positive definite")
+                })
+            }
+        })
+        .collect();
     let tree_free_velocity: Vec<Vec<f32>> = trees
         .iter()
         .map(|tree| tree_free_velocity_delta(tree, gravity, dt, tree_implicit))
@@ -2586,13 +2621,23 @@ pub fn solve_tree_contacts(
         let row_count = contact_block_n_rows(block.condim, cone);
         for row_offset in 0..row_count {
             let row_index = block.start_row + row_offset;
+            let impedance_value = impedance_at_position(-block.penetration, 0.0, block.solimp);
+            let diag_approx = tree_contact_diag_approx(
+                &rows[row_index],
+                bodies,
+                trees,
+                &inv_i_world,
+                &tree_diag_factors,
+                block.mu_slide,
+                cone == ConeKind::Pyramidal && block.condim == 3,
+            );
+            rows[row_index].reg = contact_regularization_from_diag(
+                diag_approx,
+                impedance_value,
+                block.mu_slide,
+                cone == ConeKind::Pyramidal && block.condim == 3,
+            );
             let diagonal = response[row_index * n_rows + row_index];
-            let impedance_value = impedance(block.penetration, block.solimp);
-            rows[row_index].reg = if impedance_value > 0.0 {
-                (1.0 - impedance_value) / impedance_value * diagonal
-            } else {
-                0.0
-            };
             rows[row_index].diag = diagonal + rows[row_index].reg;
             let velocity = world_current_velocity(&rows[row_index], bodies, trees);
             let free_velocity =
@@ -2964,6 +3009,88 @@ fn world_velocity_from_delta(
         .sum()
 }
 
+/// Compute MuJoCo's body-level inverse weights for one tree link. MuJoCo
+/// averages the diagonal of `J_body M^-1 J_body^T` at model setup. The tree
+/// solver uses the same definition at the assembled configuration.
+fn tree_body_invweight0(tree: &Tree, link: usize, factor: &[f32]) -> (f32, f32) {
+    let jacobian = tree.link_jacobian(link);
+    let mut translation = 0.0;
+    let mut rotation = 0.0;
+    for axis in 0..3 {
+        let mut linear = vec![0.0; tree.nv()];
+        let mut angular = vec![0.0; tree.nv()];
+        for slot in 0..tree.nv() {
+            let linear_axis = match axis {
+                0 => jacobian.translational[slot].x,
+                1 => jacobian.translational[slot].y,
+                _ => jacobian.translational[slot].z,
+            };
+            let angular_axis = match axis {
+                0 => jacobian.rotational[slot].x,
+                1 => jacobian.rotational[slot].y,
+                _ => jacobian.rotational[slot].z,
+            };
+            linear[slot] = linear_axis;
+            angular[slot] = angular_axis;
+        }
+        let linear_response = cholesky_solve(factor, tree.nv(), &linear);
+        let angular_response = cholesky_solve(factor, tree.nv(), &angular);
+        translation += linear
+            .iter()
+            .zip(&linear_response)
+            .map(|(a, b)| a * b)
+            .sum::<f32>();
+        rotation += angular
+            .iter()
+            .zip(&angular_response)
+            .map(|(a, b)| a * b)
+            .sum::<f32>();
+    }
+    (translation / 3.0, rotation / 3.0)
+}
+
+fn tree_contact_diag_approx(
+    row: &WorldContactRow,
+    bodies: &[Body],
+    trees: &[Tree],
+    inv_i_world: &[crate::math::Mat3],
+    tree_diag_factors: &[Vec<f32>],
+    mu_slide: f32,
+    pyramidal_condim3: bool,
+) -> f32 {
+    let mut translation = 0.0;
+    let mut rotation = 0.0;
+    for component in &row.components {
+        if let Some(body) = component.body {
+            if body.linear != Vec3::ZERO {
+                translation += 1.0 / bodies[body.index].mass;
+            } else {
+                rotation += body.angular.dot(inv_i_world[body.index] * body.angular);
+            }
+        }
+        if let Some(tree) = &component.tree {
+            if tree_is_mocap(tree.index, trees) {
+                continue;
+            }
+            let (body_translation, body_rotation) = tree_body_invweight0(
+                &trees[tree.index],
+                tree.link,
+                &tree_diag_factors[tree.index],
+            );
+            if tree.wrench_linear != Vec3::ZERO {
+                translation += body_translation;
+            } else {
+                rotation += body_rotation;
+            }
+        }
+    }
+    if pyramidal_condim3 {
+        translation * (1.0 + mu_slide * mu_slide)
+    } else {
+        translation + rotation
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_world_impulse(
     row: &WorldContactRow,
@@ -3167,6 +3294,75 @@ mod tests {
         // At violation = 0.00025 (x = 0.25), y = 0.125, d = 0.9 + 0.05*0.125 = 0.90625.
         let s = SolImp::DEFAULT;
         approx(impedance(0.00025, s), 0.90625, 1e-6);
+    }
+
+    #[test]
+    fn signed_position_keeps_reference_acceleration_direction() {
+        let solimp = SolImp::new(0.8, 0.9, 0.001, 0.25, 2);
+        let solref = crate::geom::SolRef::new(0.02, 1.0);
+        let position = -0.00025;
+        let d = impedance(position, solimp);
+        let k = d / (solimp.dmax * solimp.dmax * 0.02 * 0.02);
+        let expected = k * 0.00025;
+        approx(
+            reference_accel(position, 0.0, solref, solimp),
+            expected,
+            1e-5,
+        );
+        assert!(reference_accel(position, 0.0, solref, solimp) > 0.0);
+    }
+
+    #[test]
+    fn signed_position_sigmoid_applies_margin_before_absolute_distance() {
+        let solimp = SolImp::new(0.8, 0.9, 0.001, 0.5, 2);
+        // x = abs((-0.00025 - 0.00025) / 0.001) = 0.5, so y = 0.5.
+        approx(impedance_at_position(-0.00025, 0.00025, solimp), 0.85, 1e-6);
+    }
+
+    #[test]
+    fn effective_solimp_clamps_source_ranges() {
+        let unclamped = SolImp::new(0.0, 1.2, 0.001, 0.5, 2);
+        let expected = 0.0001 + (0.9999 - 0.0001) * 0.125;
+        approx(impedance(0.00025, unclamped), expected, 1e-6);
+    }
+
+    #[test]
+    fn safe_solref_clamps_timeconst_to_two_timesteps() {
+        let dt = 0.01;
+        let solref = crate::geom::SolRef::new(0.005, 1.0);
+        let effective = safe_solref(solref, dt);
+        assert_eq!(effective.timeconst, 2.0 * dt);
+        let solimp = SolImp::DEFAULT;
+        let position = 0.00025;
+        let velocity = 0.3;
+        let d = impedance(position, solimp);
+        let b = 2.0 / (solimp.dmax * effective.timeconst);
+        let k = d
+            / (solimp.dmax
+                * solimp.dmax
+                * effective.timeconst
+                * effective.timeconst
+                * effective.dampratio
+                * effective.dampratio);
+        let expected = -b * velocity - k * position;
+        approx(
+            reference_accel(position, velocity, effective, solimp),
+            expected,
+            1e-5,
+        );
+    }
+
+    #[test]
+    fn pyramidal_regularizer_uses_shared_rpy_rule() {
+        let diagonal_approx = 0.7721514;
+        let impedance_value = 0.95;
+        let mu = 0.6;
+        let expected = 2.0 * mu * mu * (1.0 - impedance_value) / impedance_value * diagonal_approx;
+        approx(
+            contact_regularization_from_diag(diagonal_approx, impedance_value, mu, true),
+            expected,
+            1e-7,
+        );
     }
 
     #[test]
