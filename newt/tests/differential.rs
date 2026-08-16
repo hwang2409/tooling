@@ -41,6 +41,7 @@ use newt::joint::JointKind;
 use newt::json::{self, Value};
 use newt::math::{Quat, Vec3};
 use newt::model::Scene;
+use newt::solver::SolverMode;
 use newt::world::{Integrator, World};
 
 // ---------------------------------------------------------------------------
@@ -898,6 +899,15 @@ fn run_scenario_with(
     integrator: Option<Integrator>,
     fixture_suffix: &str,
 ) -> Divergence {
+    run_scenario_with_solver(spec, integrator, None, fixture_suffix)
+}
+
+fn run_scenario_with_solver(
+    spec: &ScenarioSpec,
+    integrator: Option<Integrator>,
+    solver: Option<SolverMode>,
+    fixture_suffix: &str,
+) -> Divergence {
     let mjcf_path = references_dir().join(&spec.mjcf);
     let src = fs::read_to_string(&mjcf_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", mjcf_path.display()));
@@ -905,6 +915,9 @@ fn run_scenario_with(
         .unwrap_or_else(|e| panic!("{} newt-load failed: {e}", spec.name));
     if let Some(integrator) = integrator {
         scene.world.integrator = integrator;
+    }
+    if let Some(solver) = solver {
+        scene.world.solver.mode = solver;
     }
 
     if let Some(qpos) = &spec.init_qpos {
@@ -1346,4 +1359,35 @@ fn differential_matched_implicitfast_filtered_pendulum() {
             qvel: 1.0e-6,
         },
     );
+}
+
+#[test]
+fn differential_matched_newton_euler_rows() {
+    for name in ["sphere_drop", "box_stack", "joint_limit_swing"] {
+        let d = run_scenario_with_solver(
+            &scenario(name),
+            Some(Integrator::Euler),
+            Some(SolverMode::Newton),
+            "_newton_euler",
+        );
+        // These bounds are measured from the captured MuJoCo 3.11.0 Newton
+        // fixtures. Newton is a new parity row, so keep the bounds separate
+        // from the PGS scorecard rows.
+        let bound = match name {
+            "sphere_drop" => Tolerance {
+                qpos: 2.0e-2,
+                qvel: 1.2,
+            },
+            "box_stack" => Tolerance {
+                qpos: 5.0e-2,
+                qvel: 1.0,
+            },
+            "joint_limit_swing" => Tolerance {
+                qpos: 2.0e-1,
+                qvel: 1.5,
+            },
+            _ => unreachable!(),
+        };
+        assert_within_bounds(&format!("{name} Newton Euler"), &d, bound);
+    }
 }
