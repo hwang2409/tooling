@@ -5,6 +5,7 @@
 //! impulse after the original contact-index mapping.
 
 use newt::body::Body;
+use newt::contact::Contact;
 use newt::geom::Geom;
 use newt::joint::JointKind;
 use newt::math::{Mat3, Quat, Vec3};
@@ -24,6 +25,26 @@ fn free_sphere_tree(z: f32) -> Tree {
         Mat3::diag(0.1, 0.1, 0.1),
     ));
     tree
+}
+
+fn free_root_contact_row(tree: &Tree, point: Vec3, sign: f32) -> Vec<f32> {
+    let root = Vec3::new(tree.q[0], tree.q[1], tree.q[2]);
+    tree.point_jacobian(0, point - root)
+        .translational
+        .into_iter()
+        .map(|column| column.dot(Vec3::X) * sign)
+        .collect()
+}
+
+fn hand_free_root_response(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .enumerate()
+        .map(|(slot, (a, b))| {
+            let inverse_mass = if slot < 3 { 10.0 } else { 1.0 };
+            a * b * inverse_mass
+        })
+        .sum()
 }
 
 fn resting_tree_world(mode: SolverMode) -> World {
@@ -111,6 +132,100 @@ fn tree_contact_solver_supports_implicitfast_pipeline() {
         let force = world.sensor(0).expect("touch reading")[0];
         assert!((force - 9.81).abs() < 0.15, "{mode:?} force={force}");
         assert!(world.trees[0].qdot[5].abs() < 0.05, "{mode:?} vz");
+    }
+}
+
+#[test]
+fn solver_modes_route_mocap_contacts_into_shared_rows() {
+    for mode in [SolverMode::Pgs, SolverMode::Newton] {
+        let mut world = World::new();
+        world.dt = 0.005;
+        world.gravity = Vec3::ZERO;
+        world.solver = SolverConfig {
+            mode,
+            iterations: 40,
+            cone: ConeKind::Pyramidal,
+        };
+
+        let mut platform = free_sphere_tree(0.25);
+        platform.q[0] = -0.4;
+        platform.set_mocap(0, true);
+        platform.set_mocap_velocity(Vec3::new(1.0, 0.0, 0.0), Vec3::ZERO);
+        let platform_tree = world.add_tree(platform);
+        world.add_geom(Geom::sphere_on_link(platform_tree, 0, 0.3, Vec3::ZERO, 0.8));
+        let body = world.add_body(Body::solid_sphere(
+            1.0,
+            0.2,
+            Vec3::new(0.0, 0.0, 0.25),
+            Quat::IDENTITY,
+        ));
+        world.add_geom(Geom::sphere(body, 0.2, Vec3::ZERO, 0.0));
+
+        for step in 0..100 {
+            world.set_mocap_pose(
+                platform_tree,
+                Vec3::new(-0.4 + step as f32 * world.dt, 0.0, 0.25),
+                Quat::IDENTITY,
+            );
+            world.step();
+        }
+        assert!(
+            world.bodies[body].position.x > 0.05,
+            "{mode:?} mocap platform failed to push sphere: x={}",
+            world.bodies[body].position.x
+        );
+    }
+}
+
+#[test]
+fn implicit_tree_contact_response_matches_hand_matrix() {
+    for implicit_fast in [false, true] {
+        let mut no_damping_force = None;
+        for damping in [0.0, 100.0] {
+            let mut world = World::new();
+            world.dt = 0.01;
+            world.gravity = Vec3::ZERO;
+            world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.0));
+            let tree = world.add_tree(free_sphere_tree(0.4));
+            world.trees[tree].links[0].free_damping = damping;
+            world.add_geom(Geom::sphere_on_link(tree, 0, 0.5, Vec3::ZERO, 0.0));
+            let contacts = world.detect_contacts();
+            let solution = newt::solver::solve_tree_contacts(
+                &world.bodies,
+                &world.trees,
+                &world.geoms,
+                &contacts,
+                world.gravity,
+                world.dt,
+                ConeKind::Pyramidal,
+                40,
+                false,
+                Some(implicit_fast),
+            );
+            let response = world.trees[tree].implicit_mass_matrix(world.dt, implicit_fast);
+            let expected = 1.0 / (1.0 + world.dt * damping);
+            let observed = response[5 * world.trees[tree].nv() + 5];
+            assert!((1.0 / observed - expected).abs() < 1.0e-5);
+            let assembled = solution
+                .contact_response
+                .first()
+                .copied()
+                .expect("plane contact must assemble one response row");
+            assert!((assembled - expected).abs() < 1.0e-5);
+            let contact_force = solution.tree_qfrc[tree][5];
+            assert!(contact_force > 0.0);
+            if damping == 0.0 {
+                no_damping_force = Some(contact_force);
+            } else {
+                let no_damping_force = no_damping_force.expect("baseline response");
+                assert!(
+                    (no_damping_force / contact_force - expected).abs() < 1.0e-5,
+                    "implicit_fast={implicit_fast} contact response={}; expected {}",
+                    no_damping_force / contact_force,
+                    expected
+                );
+            }
+        }
     }
 }
 
@@ -240,6 +355,91 @@ fn tree_tree_contact_transfers_equal_and_opposite_impulses() {
         world.step();
         let total_px = world.trees[left].qdot[3] + world.trees[right].qdot[3];
         assert!(total_px.abs() < 1.0e-4, "{mode:?} total px={total_px}");
+    }
+}
+
+#[test]
+fn tree_tree_two_contact_response_includes_the_opposite_tree() {
+    let mut world = World::new();
+    world.gravity = Vec3::ZERO;
+    let left = world.add_tree(free_sphere_tree(0.0));
+    let right = world.add_tree(free_sphere_tree(0.0));
+    world.trees[left].q[0] = -0.4;
+    world.trees[right].q[0] = 0.4;
+    let left_a = world.add_geom(Geom::sphere_on_link(
+        left,
+        0,
+        0.2,
+        Vec3::new(0.0, 0.05, 0.0),
+        0.0,
+    ));
+    let left_b = world.add_geom(Geom::sphere_on_link(
+        left,
+        0,
+        0.2,
+        Vec3::new(0.0, -0.05, 0.0),
+        0.0,
+    ));
+    let right_a = world.add_geom(Geom::sphere_on_link(
+        right,
+        0,
+        0.2,
+        Vec3::new(0.0, 0.05, 0.0),
+        0.0,
+    ));
+    let right_b = world.add_geom(Geom::sphere_on_link(
+        right,
+        0,
+        0.2,
+        Vec3::new(0.0, -0.05, 0.0),
+        0.0,
+    ));
+    for geom in [left_a, left_b, right_a, right_b] {
+        world.geoms[geom].condim = 1;
+    }
+    let points = [Vec3::new(0.0, 0.05, 0.0), Vec3::new(0.0, -0.05, 0.0)];
+    let contacts = points
+        .iter()
+        .zip([(left_a, right_a), (left_b, right_b)])
+        .map(|(&point, (geom_a, geom_b))| Contact {
+            geom_a,
+            geom_b,
+            position_world: point,
+            normal_world: Vec3::X,
+            penetration: 0.1,
+            friction: 0.0,
+            gap: 0.0,
+        })
+        .collect::<Vec<_>>();
+    let solution = newt::solver::solve_tree_contacts(
+        &world.bodies,
+        &world.trees,
+        &world.geoms,
+        &contacts,
+        world.gravity,
+        0.005,
+        ConeKind::Pyramidal,
+        40,
+        true,
+        None,
+    );
+    assert!(
+        solution.tree_qfrc[right][3].abs() > 1.0e-3,
+        "opposite tree received no contact acceleration"
+    );
+
+    let left_rows = points.map(|point| free_root_contact_row(&world.trees[left], point, 1.0));
+    let right_rows = points.map(|point| free_root_contact_row(&world.trees[right], point, -1.0));
+    for row in 0..2 {
+        for column in 0..2 {
+            let hand = hand_free_root_response(&left_rows[row], &left_rows[column])
+                + hand_free_root_response(&right_rows[row], &right_rows[column]);
+            let measured = solution.contact_response[row * 2 + column];
+            assert!(
+                (measured - hand).abs() < 1.0e-5,
+                "response[{row},{column}] measured={measured} hand={hand}"
+            );
+        }
     }
 }
 
