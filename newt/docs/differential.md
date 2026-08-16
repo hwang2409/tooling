@@ -402,10 +402,45 @@ The Newton rows use MuJoCo 3.11.0, `solver=Newton`, `integrator=Euler`,
 
 These bounds are measured from the committed `_newton_euler` fixtures.
 The Newton path is also covered by stack and incline byte goldens.
-The assisted biped walk uses Newton for TREE-LIMIT rows only; tree contacts
-remain penalty contacts. It remains stable for 2,000 Euler steps: distance
-`1.1372 m`, cadence `102.00 bpm`, mean step length
-`0.4082 m`, clearance `0.1681 m`, and zero self-contact steps.
+
+## NEWT-22 tree-contact rows
+
+Tree contacts now use the selected PGS or Newton row system. Penalty mode stays
+on its old callback, so penalty goldens remain byte-identical. The new tree
+anchors cover a free-root foot on a plane, a force-free contact before an
+active contact, and a mixed tree/free-body pair.
+
+The assisted biped uses `SolverMode::Newton`, `Integrator::Euler`, and the
+source-faithful controller for 5,000 steps. No controller gains changed. The
+measured result is:
+
+| scenario | steps | distance | cadence | mean step | clearance | self-contact steps |
+|---|---:|---:|---:|---:|---:|---:|
+| assisted biped, Newton tree contacts | 5,000 | `2.5138 m` | `117.60 bpm` | `0.3251 m` | `0.2059 m` | `0` |
+
+The 2,000-step solver smoke rows measured `1.2456 m` for Euler PGS and
+`1.2491 m` for Euler Newton. The PGS and Newton tree anchor forces both
+settled at `9.81 N` for a unit-mass free-root sphere.
+
+The symmetry-broken tree PGS/Newton anchor agrees within `8.94e-8` in q and
+`9.54e-7` in qdot over 100 steps. The test prints these maxima and keeps
+`1.0e-6` and `2.0e-6` bounds.
+
+The matched articulated-chain fixtures use MuJoCo 3.11.0, Euler, pyramidal
+cones, and 20 iterations. They cover the first ground-contact transition:
+
+| scenario | observed max qpos | bound | observed max qvel | bound |
+|---|---:|---:|---:|---:|
+| falling chain, PGS | `6.396024e-2` | `7.0e-2` | `6.105601e-1` | `7.0e-1` |
+| falling chain, Newton | `7.089735e-2` | `8.0e-2` | `1.127755e0` | `1.3` |
+| assisted biped, Newton | `3.546789e-1` | `4.0e-1` | `2.552028e0` | `3.0` |
+
+The chain fixtures are `tree_chain_contact_pgs_euler.bin` and
+`tree_chain_contact_newton_euler.bin`. Recapture them with the matching
+`tools/capture_mujoco.py` commands. The assisted biped fixture is
+`biped_assisted_walk_newton_euler.bin`; recapture it with
+`tools/capture_biped_mujoco.py`. Its 5,000-step run uses the source-faithful
+controller, `assist_scale=0.8`, and no debug state correction.
 
 ## Debugging a failing tolerance
 

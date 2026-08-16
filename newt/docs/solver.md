@@ -1,7 +1,7 @@
 # newt/docs/solver.md — MuJoCo Soft-Constraint Contact Model + PGS
 
-Status: v1 tier 5, shipped through NEWT-10 (equality constraints,
-condim 4/6).
+Status: v3 tier 3, shipped through NEWT-22 (tree contacts, equality
+constraints, condim 4/6).
 
 ## Purpose
 
@@ -17,7 +17,8 @@ byte-identical.
 ## Model reference
 
 Every constraint (contact normal, contact tangent, joint limit) reduces
-to a scalar row on the tree's / body pool's generalized velocity:
+to a scalar row on the tree's or body's generalized velocity. Tree-involved
+contact rows share one world-level system across all participating pools.
 
 - Jacobian row `J_i` (1 × nv). For a contact normal with two bodies A
   and B and contact point `p`, world-frame arms `r_a = p - com_a`,
@@ -204,10 +205,12 @@ Free bodies: we maintain a per-body velocity accumulator
 `M⁻¹ · Jᵢᵀ · delta_f`. The `J_i · body_delta` inner product then
 becomes cheap in the residual.
 
-Tree joint limits: we build `A` densely (`n_limits × n_limits`, a
-submatrix of `M⁻¹`) by precomputing `M⁻¹ · e_j` for each limit via
-Cholesky solve. Trees are independent; each tree's limits solve
-independently.
+Tree joint limits build `A` densely (`n_limits × n_limits`, a submatrix of
+`M⁻¹`) by precomputing `M⁻¹ · e_j` for each limit via Cholesky solve. Tree
+contact rows use the same response construction, but assemble one system
+across every tree and free body in the contact set. This handles tree-vs-
+static, tree-vs-body, and tree-vs-tree contacts without treating the other
+participant as a wall.
 
 ### Friction cone projections
 
@@ -290,11 +293,14 @@ sub-stages (zero-order hold, ZOH).
 
 **Deferred (documented):**
 - Ball-joint limits (cone / swing-twist).
-- Cross-tree / body-vs-link contacts under solver mode.
 - Equality constraints attached to tree links (currently free-body /
   world only for the linear-and-angular equalities; joint coupling
   handles tree DOFs).
-- MuJoCo differential parity — the biped venv comparison is NEWT-13.
+- The remaining differential scorecard rows outside tree contacts are
+  documented in `docs/differential.md`.
+
+Penalty mode remains a separate legacy path. It does not enter the shared
+contact system, which preserves penalty-mode trajectories and goldens.
 
 ## Equality constraint rows (v1 tier 5)
 

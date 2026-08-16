@@ -6,8 +6,8 @@ trajectory.
 
 | integrator | state sample | force and constraint sample | position update |
 | --- | --- | --- | --- |
-| `Rk4` | four interpolated stages | penalty contacts at every stage; PGS constraints once at step start and held constant | weighted stage sum |
-| `Euler` | start of step | forward kinematics, collision, and constraint solve once at the current state | `qvel += dt*qacc`; integrate `qpos` from new `qvel` |
+| `Rk4` | four interpolated stages | penalty contacts at every stage; PGS/Newton rows once at step start and held constant | weighted stage sum |
+| `Euler` | start of step | forward kinematics, collision, and PGS/Newton rows once at the current state | `qvel += dt*qacc`; integrate `qpos` from new `qvel` |
 | `ImplicitFast` | start of step | same one-solve pipeline as Euler | same velocity-first update, with joint and joint-actuator velocity terms folded into the solve |
 
 ## euler pipeline
@@ -29,6 +29,26 @@ quaternion manifold.
 
 Contacts, limits, and equality rows are fresh for every Euler step. The RK4
 constraint ZOH is not used by Euler.
+
+## tree-contact impulse entry
+
+For PGS and Newton, the world assembles tree-involved contact rows before it
+advances either pool. A tree link point Jacobian maps the contact direction to
+joint-space `qfrc`. The equal-and-opposite body or tree participant receives
+the same impulse in the shared solve.
+
+RK4 adds the recovered tree `qfrc` to `qfrc_applied` for the step. The value
+stays constant through all four ABA stages, then the temporary addition is
+removed. The tree penalty contact callback is disabled for that step, so a
+solver contact cannot be applied twice.
+
+Euler and implicitfast add the same recovered `qfrc` before their one ABA
+call. Their free-velocity term uses the matching tree ABA mode: explicit ABA
+for RK4, implicit joint damping for Euler, and implicit joint plus
+joint-transmitted actuator velocity terms for implicitfast.
+
+Penalty mode does not enter this path. It keeps the old per-stage RK4 and
+single-stage Euler contact wrenches.
 
 ## implicit joint damping
 
