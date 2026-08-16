@@ -616,6 +616,47 @@ impl Tree {
         crate::dynamics::mass_matrix(self)
     }
 
+    /// Dense joint-space response matrix for the selected implicit velocity
+    /// solve. This is `M + dt*B`, matching the damping and actuator terms
+    /// that [`aba_implicit`] folds into its articulated-inertia pivots.
+    pub fn implicit_mass_matrix(&self, dt: f32, implicit_fast: bool) -> Vec<f32> {
+        let mut matrix = self.mass_matrix();
+        let nv = self.nv();
+        if nv == 0 || dt == 0.0 {
+            return matrix;
+        }
+        for (link_idx, link) in self.links.iter().enumerate() {
+            let (offset, damping): (usize, Vec<f32>) = match link.joint {
+                JointKind::Free => (
+                    self.v_offset[link_idx],
+                    vec![link.free_damping; link.joint.nv()],
+                ),
+                JointKind::Hinge { damping, .. } | JointKind::Slide { damping, .. } => {
+                    let actuator_damping = if implicit_fast {
+                        let q = self.q[self.q_offset[link_idx]];
+                        let qdot = self.qdot[self.v_offset[link_idx]];
+                        self.actuators
+                            .iter()
+                            .filter(|act| act.tendon_target.is_none() && act.link_idx == link_idx)
+                            .map(|act| act.velocity_damping(q, qdot))
+                            .sum()
+                    } else {
+                        0.0
+                    };
+                    (self.v_offset[link_idx], vec![damping + actuator_damping])
+                }
+                JointKind::Ball { damping, .. } => {
+                    (self.v_offset[link_idx], vec![damping; link.joint.nv()])
+                }
+                JointKind::Fixed => continue,
+            };
+            for (slot, damping) in (offset..offset + link.joint.nv()).zip(damping) {
+                matrix[slot * nv + slot] += dt * damping;
+            }
+        }
+        matrix
+    }
+
     /// Coriolis + centrifugal + gravity torques `h(q, qdot)` — RNE with
     /// `qddot = 0` and no external wrenches. See
     /// [`crate::dynamics::bias_forces`].

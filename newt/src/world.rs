@@ -1286,9 +1286,9 @@ impl World {
             ),
             SolverMode::Penalty => unreachable!("penalty does not call compute_solver_wrenches"),
         };
-        if tree_contact_solution.is_none() {
-            self.apply_mocap_wrenches(&mut wrenches, state, pairs);
-        }
+        // Mocap contacts are kinematic rows in the shared tree solve. Their
+        // recovered force reaches this body pool through `body_wrenches`, so
+        // the legacy penalty mocap callback must not run here.
         if let Some(solution) = tree_contact_solution {
             for (wrench, solved) in wrenches.iter_mut().zip(&solution.body_wrenches) {
                 wrench.0 += solved.0;
