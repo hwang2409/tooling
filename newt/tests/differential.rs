@@ -41,7 +41,7 @@ use newt::joint::JointKind;
 use newt::json::{self, Value};
 use newt::math::{Quat, Vec3};
 use newt::model::Scene;
-use newt::world::World;
+use newt::world::{Integrator, World};
 
 // ---------------------------------------------------------------------------
 // tolerances (MEASURED-then-stated; see docs/differential.md)
@@ -890,11 +890,22 @@ fn read_mujoco_totals(name: &str, expected_samples: usize) -> Vec<f64> {
 // ---------------------------------------------------------------------------
 
 fn run_scenario(spec: &ScenarioSpec) -> Divergence {
+    run_scenario_with(spec, None, "")
+}
+
+fn run_scenario_with(
+    spec: &ScenarioSpec,
+    integrator: Option<Integrator>,
+    fixture_suffix: &str,
+) -> Divergence {
     let mjcf_path = references_dir().join(&spec.mjcf);
     let src = fs::read_to_string(&mjcf_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", mjcf_path.display()));
     let mut scene: Scene = newt::mjcf::load_mjcf_str(&src)
         .unwrap_or_else(|e| panic!("{} newt-load failed: {e}", spec.name));
+    if let Some(integrator) = integrator {
+        scene.world.integrator = integrator;
+    }
 
     if let Some(qpos) = &spec.init_qpos {
         apply_init_qpos(&mut scene.world, qpos);
@@ -912,7 +923,7 @@ fn run_scenario(spec: &ScenarioSpec) -> Divergence {
         }
     }
 
-    let fixture_path = references_dir().join(format!("{}.bin", spec.name));
+    let fixture_path = references_dir().join(format!("{}{}.bin", spec.name, fixture_suffix));
     let fixture = read_fixture(&fixture_path);
     assert_eq!(
         fixture.n_steps, spec.n_steps,
@@ -1092,7 +1103,10 @@ fn assert_energy_bounds(scenario: &str, report: &EnergyReport) {
 }
 
 fn assert_within_tolerance(scenario: &str, d: &Divergence) {
-    let tol = tolerance(scenario);
+    assert_within_bounds(scenario, d, tolerance(scenario));
+}
+
+fn assert_within_bounds(scenario: &str, d: &Divergence, tol: Tolerance) {
     println!(
         "differential[{scenario}] observed qpos_max={:.6e} @ sample {} comp {} (bound {:.2e}) \
          qvel_max={:.6e} @ sample {} comp {} (bound {:.2e})",
@@ -1123,6 +1137,31 @@ fn assert_within_tolerance(scenario: &str, d: &Divergence) {
         d.qvel_max_idx.0,
         d.qvel_max_idx.1,
     );
+}
+
+fn matched_integrator_tolerance(name: &str) -> Tolerance {
+    match name {
+        // These bounds are measured against the 2026-08-15 MuJoCo 3.11.0
+        // Euler captures. They are intentionally separate from the older
+        // RK4-reference scorecard rows.
+        "ballistic" => Tolerance {
+            qpos: 3.0e-5,
+            qvel: 8.0e-5,
+        },
+        "double_pendulum" => Tolerance {
+            qpos: 4.0e-7,
+            qvel: 1.0e-6,
+        },
+        "sphere_drop" => Tolerance {
+            qpos: 1.5e-2,
+            qvel: 9.0e-1,
+        },
+        "box_stack" => Tolerance {
+            qpos: 2.0e-2,
+            qvel: 5.0e-1,
+        },
+        other => panic!("no matched-integrator tolerance for {other:?}"),
+    }
 }
 
 fn scenario(name: &str) -> ScenarioSpec {
@@ -1282,4 +1321,29 @@ fn differential_tendon_wrap() {
 fn differential_mocap_rangefinder() {
     let d = run_scenario(&scenario("mocap_rangefinder"));
     assert_within_tolerance("mocap_rangefinder", &d);
+}
+
+#[test]
+fn differential_matched_euler_rows() {
+    for name in ["ballistic", "double_pendulum", "sphere_drop", "box_stack"] {
+        let d = run_scenario_with(&scenario(name), Some(Integrator::Euler), "_euler");
+        assert_within_bounds(name, &d, matched_integrator_tolerance(name));
+    }
+}
+
+#[test]
+fn differential_matched_implicitfast_filtered_pendulum() {
+    let d = run_scenario_with(
+        &scenario("filtered_motor_pendulum"),
+        Some(Integrator::ImplicitFast),
+        "_implicitfast",
+    );
+    assert_within_bounds(
+        "filtered_motor_pendulum implicitfast",
+        &d,
+        Tolerance {
+            qpos: 3.0e-7,
+            qvel: 1.0e-6,
+        },
+    );
 }
