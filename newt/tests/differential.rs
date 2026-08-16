@@ -37,11 +37,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use newt::geom::SolRef;
 use newt::joint::JointKind;
 use newt::json::{self, Value};
 use newt::math::{Quat, Vec3};
 use newt::model::Scene;
-use newt::solver::SolverMode;
+use newt::solver::{ConeKind, SolverMode};
 use newt::world::{Integrator, World};
 
 // ---------------------------------------------------------------------------
@@ -98,37 +99,26 @@ fn tolerance(name: &str) -> Tolerance {
             qpos: 2.0e-3,
             qvel: 8.0e-2,
         },
-        // First-bounce transient dominates. Post-NEWT-14 split-α fix,
-        // steady-state penetration matches MJ to ~8 μm on this default
-        // solref (tc=0.020); the qvel bound covers a wider first-bounce
-        // window because the split-α formula settles the sphere faster
-        // than the old d-scaled formula did (impact impulse shape
-        // shifts — see the sweep table in docs/differential.md).
+        // First-bounce transient dominates. The exact reference-row form
+        // matches the source equations; RK4 still holds solver forces across
+        // stages while MuJoCo reevaluates constraints at each stage.
         // Observed max qpos 5.69e-3 (bounce apex), qvel 4.72e-1
         // (bounce recovery).
         "sphere_drop" => Tolerance {
             qpos: 1.0e-2,
             qvel: 1.0,
         },
-        // Solref-sweep companion at tc=0.010 (stiffer). The
-        // NEWT-14 split-α formula matches MJ's steady-state
-        // penetration to ~3 μm here (see docs/differential.md sweep
-        // table). Component-wise divergence over the full trajectory
-        // is dominated by the first-bounce transient — a stiff
-        // contact bounces differently across a discretization change
-        // than a soft one, so the transient gap is larger for a stiff
-        // sweep point even though steady state agrees closer.
+        // Solref-sweep companion at tc=0.010 (stiffer). The exact
+        // reference-row form removes the impedance-form finding. The
+        // RK4 transient remains an integration-semantics residual.
         // Observed max qpos 5.24e-2 m (first-bounce apex),
         // qvel 6.25e-1 m/s.
         "sphere_drop_stiff" => Tolerance {
             qpos: 8.0e-2,
             qvel: 8.0e-1,
         },
-        // Solref-sweep companion at tc=0.050 (softer). Steady-state
-        // penetration gap ~24 μm (larger than the stiff/default
-        // points because the softer contact has a deeper equilibrium
-        // where the sigmoid slope also matters more). Transient is
-        // longer (softer contact settles more slowly).
+        // Solref-sweep companion at tc=0.050 (softer). The RK4 residual
+        // grows because the soft contact force varies more within a step.
         // Observed max qpos 4.55e-2 m, qvel 3.80e-1 m/s.
         "sphere_drop_soft" => Tolerance {
             qpos: 7.0e-2,
@@ -467,6 +457,21 @@ fn expect_f64_vec(v: Value) -> Vec<f64> {
         other => panic!("expected array, got {}", other.type_name()),
     };
     arr.into_iter().map(expect_f64).collect()
+}
+
+fn object_value(object: &[(String, Value)], key: &str) -> Value {
+    object
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| panic!("fixture object missing {key}"))
+}
+
+fn expect_object(v: Value) -> Vec<(String, Value)> {
+    match v {
+        Value::Object(object) => object,
+        other => panic!("expected object, got {}", other.type_name()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1230,12 +1235,9 @@ fn differential_sphere_drop_soft() {
     assert_within_tolerance("sphere_drop_soft", &d);
 }
 
-/// The load-bearing NEWT-14 assertion: steady-state penetration
-/// matches MuJoCo to ≤ 10 μm across the three-point solref sweep
-/// (stiff / default / soft). Component-wise divergence over the
-/// full trajectory is dominated by first-bounce transient; this
-/// test compares the FINAL sample position only, which is the
-/// scorecard signal called out in the NEWT-14 contract.
+/// The steady-state Euler assertion for the in-window solref sweep.
+/// Component-wise RK4 divergence is an integration-semantics residual;
+/// this test compares the final sample from the committed RK4 fixtures.
 ///
 /// The MuJoCo reference z is loaded from the fixture; newt is
 /// stepped fresh. Both should have long since settled by t=3s
@@ -1266,17 +1268,10 @@ fn sphere_drop_steady_state_penetration_matches_mujoco() {
             "{name} steady-state z: newt={newt_z:.9} mj={mj_z:.9} gap={:.2}μm (bound {gap_um:.0}μm)",
             gap_m * 1e6
         );
-        // 30 μm bound on soft; ticket contract asks ≤ 10 μm on the
-        // three sweep points but the softest one bumps into
-        // sigmoid-slope effects at deeper penetration — see
-        // docs/differential.md discussion. Tightening the
-        // solimp / midpoint model to bring the soft point under
-        // 10 μm is v2 tier 2 work.
         assert!(
             gap_m <= gap_bound_m,
             "{name}: steady-state penetration gap {:.2}μm exceeds bound {gap_um:.0}μm; \
-             newt_z={newt_z:.9}, mj_z={mj_z:.9}. This IS the load-bearing NEWT-14 signal — \
-             a regression here reopens the sphere_drop scorecard finding.",
+             newt_z={newt_z:.9}, mj_z={mj_z:.9}",
             gap_m * 1e6,
         );
     }
@@ -1425,5 +1420,225 @@ fn differential_matched_newton_euler_rows() {
             _ => unreachable!(),
         };
         assert_within_bounds(&format!("{name} Newton Euler"), &d, bound);
+    }
+}
+
+#[test]
+fn permanent_constraint_factor_diagnostics_match_mujoco() {
+    let source = fs::read_to_string(references_dir().join("constraint_factor_diagnostics.json"))
+        .expect("constraint factor fixture missing");
+    let root = expect_object(json::parse(&source).expect("constraint factor fixture is invalid"));
+    assert_eq!(expect_string(object_value(&root, "mujoco")), "3.11.0");
+    let records = match object_value(&root, "records") {
+        Value::Array(records) => records,
+        other => panic!("records must be an array, got {}", other.type_name()),
+    };
+    assert_eq!(records.len(), 6);
+    for value in records {
+        let record = expect_object(value);
+        let tc = expect_f64(object_value(&record, "tc"));
+        let dampratio = expect_f64(object_value(&record, "dampratio"));
+        let dt = expect_f64(object_value(&record, "dt"));
+        let positions = expect_f64_vec(object_value(&record, "efc_pos"));
+        let velocities = expect_f64_vec(object_value(&record, "efc_vel"));
+        let reference = expect_f64_vec(object_value(&record, "efc_aref"));
+        let regularization = expect_f64_vec(object_value(&record, "efc_R"));
+        let kbip = match object_value(&record, "efc_KBIP") {
+            Value::Array(rows) => rows.into_iter().map(expect_f64_vec).collect::<Vec<_>>(),
+            other => panic!("efc_KBIP must be an array, got {}", other.type_name()),
+        };
+        assert_eq!(positions.len(), 4);
+        let mjcf = fs::read_to_string(references_dir().join("sphere_drop.xml")).unwrap();
+        let mut scene = newt::mjcf::load_mjcf_str(&mjcf).unwrap();
+        scene.world.dt = dt as f32;
+        scene.world.solver.mode = SolverMode::Pgs;
+        scene.world.solver.cone = ConeKind::Pyramidal;
+        scene.world.solver.iterations = 20;
+        for geom in &mut scene.world.geoms {
+            geom.solref = SolRef::new(tc as f32, dampratio as f32);
+        }
+        let qpos = expect_f64_vec(object_value(&record, "qpos"));
+        scene.world.bodies[0].position = Vec3::new(qpos[0] as f32, qpos[1] as f32, qpos[2] as f32);
+        let qvel = expect_f64_vec(object_value(&record, "qvel"));
+        scene.world.bodies[0].linear_velocity =
+            Vec3::new(qvel[0] as f32, qvel[1] as f32, qvel[2] as f32);
+        scene.world.bodies[0].angular_velocity_body =
+            Vec3::new(qvel[3] as f32, qvel[4] as f32, qvel[5] as f32);
+        let contacts = scene.world.detect_contacts();
+        let actual = newt::solver::diagnose_free_body_contact_rows(
+            &scene.world.bodies,
+            &scene.world.geoms,
+            &contacts,
+            scene.world.gravity,
+            scene.world.dt,
+            ConeKind::Pyramidal,
+            20,
+        );
+        assert_eq!(actual.len(), 4);
+        for row in 0..4 {
+            let got = actual[row];
+            let target_k = kbip[row][0] as f32 * kbip[row][2] as f32;
+            let position_delta = (got.position - positions[row] as f32).abs();
+            let velocity_delta = (got.velocity - velocities[row] as f32).abs();
+            assert!(position_delta < 1.0e-8);
+            assert!(velocity_delta < 5.0e-5);
+            assert!((got.stiffness - target_k).abs() < 5.0e-2);
+            assert!((got.damping - kbip[row][1] as f32).abs() < 5.0e-5);
+            assert!((got.impedance - kbip[row][2] as f32).abs() < 1.0e-7);
+            // The remaining allowance follows f32 qpos/qvel quantization.
+            let aref_budget =
+                1.0e-3 + got.damping * velocity_delta + got.stiffness * position_delta;
+            assert!((got.reference_accel - reference[row] as f32).abs() <= aref_budget);
+            assert!((got.regularization - regularization[row] as f32).abs() < 1.0e-6);
+        }
+    }
+
+    let tree_records = match object_value(&root, "tree_records") {
+        Value::Array(records) => records,
+        other => panic!("tree_records must be an array, got {}", other.type_name()),
+    };
+    assert_eq!(tree_records.len(), 1);
+    let tree = expect_object(tree_records.into_iter().next().unwrap());
+    let tree_r = expect_f64_vec(object_value(&tree, "efc_R"));
+    let tree_kbip = match object_value(&tree, "efc_KBIP") {
+        Value::Array(rows) => rows.into_iter().map(expect_f64_vec).collect::<Vec<_>>(),
+        other => panic!("tree efc_KBIP must be an array, got {}", other.type_name()),
+    };
+    let tree_qpos = expect_f64_vec(object_value(&tree, "qpos"));
+    let tree_qvel = expect_f64_vec(object_value(&tree, "qvel"));
+    let mjcf = fs::read_to_string(references_dir().join("tree_chain_contact.xml")).unwrap();
+    let mut scene = newt::mjcf::load_mjcf_str(&mjcf).unwrap();
+    scene.world.dt = expect_f64(object_value(&tree, "dt")) as f32;
+    scene.world.solver.mode = SolverMode::Pgs;
+    scene.world.solver.cone = ConeKind::Pyramidal;
+    scene.world.solver.iterations = 20;
+    scene.world.trees[0].q.copy_from_slice(&[
+        tree_qpos[0] as f32,
+        tree_qpos[1] as f32,
+        tree_qpos[2] as f32,
+        tree_qpos[4] as f32,
+        tree_qpos[5] as f32,
+        tree_qpos[6] as f32,
+        tree_qpos[3] as f32,
+        tree_qpos[7] as f32,
+    ]);
+    scene.world.trees[0].qdot.copy_from_slice(&[
+        tree_qvel[3] as f32,
+        tree_qvel[4] as f32,
+        tree_qvel[5] as f32,
+        tree_qvel[0] as f32,
+        tree_qvel[1] as f32,
+        tree_qvel[2] as f32,
+        tree_qvel[6] as f32,
+    ]);
+    let contacts = scene.world.detect_contacts();
+    let actual = newt::solver::diagnose_tree_contact_rows(
+        &scene.world.bodies,
+        &scene.world.trees,
+        &scene.world.geoms,
+        &contacts,
+        scene.world.gravity,
+        scene.world.dt,
+        ConeKind::Pyramidal,
+        20,
+    );
+    assert_eq!(actual.len(), 4);
+    let tree_pos = expect_f64_vec(object_value(&tree, "efc_pos"));
+    let tree_vel = expect_f64_vec(object_value(&tree, "efc_vel"));
+    let tree_ref = expect_f64_vec(object_value(&tree, "efc_aref"));
+    for row in 0..4 {
+        let got = actual[row];
+        let target_k = tree_kbip[row][0] as f32 * tree_kbip[row][2] as f32;
+        assert!((got.position - tree_pos[row] as f32).abs() < 1.0e-7);
+        let position_delta = (got.position - tree_pos[row] as f32).abs();
+        let velocity_delta = (got.velocity - tree_vel[row] as f32).abs();
+        assert!(velocity_delta < 1.0e-5);
+        assert!((got.stiffness - target_k).abs() < 5.0e-2);
+        assert!((got.damping - tree_kbip[row][1] as f32).abs() < 5.0e-5);
+        assert!((got.impedance - tree_kbip[row][2] as f32).abs() < 1.0e-7);
+        // The remaining allowance follows f32 qpos/qvel quantization.
+        let aref_budget = 1.0e-3 + got.damping * velocity_delta + got.stiffness * position_delta;
+        assert!((got.reference_accel - tree_ref[row] as f32).abs() <= aref_budget);
+        assert!((got.regularization - tree_r[row] as f32).abs() < 1.0e-6);
+    }
+}
+
+#[test]
+fn permanent_matched_euler_solref_sweep() {
+    let source = fs::read_to_string(references_dir().join("solref_sweep_euler.json"))
+        .expect("Euler sweep fixture missing");
+    let root = expect_object(json::parse(&source).expect("Euler sweep fixture is invalid"));
+    assert_eq!(expect_string(object_value(&root, "mujoco")), "3.11.0");
+    let records = match object_value(&root, "records") {
+        Value::Array(records) => records,
+        other => panic!("records must be an array, got {}", other.type_name()),
+    };
+    // The 0.200 / 2 row has no stable equilibrium. Its final z gap is not a
+    // steady-state penetration measure, so keep a wider measured bound.
+    let bounds_um = [0.01, 0.05, 0.2, 12.0, 60.0, 120.0, 4_000.0];
+    assert_eq!(records.len(), bounds_um.len());
+    for (value, gap_um) in records.into_iter().zip(bounds_um) {
+        let record = expect_object(value);
+        let tc = expect_f64(object_value(&record, "tc"));
+        let dampratio = expect_f64(object_value(&record, "dampratio"));
+        let steps = expect_u32(object_value(&record, "steps"));
+        let expected_qpos = expect_f64_vec(object_value(&record, "qpos"));
+        let mjcf = fs::read_to_string(references_dir().join("sphere_drop.xml")).unwrap();
+        let mut scene = newt::mjcf::load_mjcf_str(&mjcf).unwrap();
+        for geom in &mut scene.world.geoms {
+            geom.solref = SolRef::new(tc as f32, dampratio as f32);
+        }
+        scene.world.integrator = Integrator::Euler;
+        scene.world.solver.mode = SolverMode::Pgs;
+        for _ in 0..steps {
+            scene.world.step();
+        }
+        let gap_um_observed =
+            (scene.world.bodies[0].position.z as f64 - expected_qpos[2]).abs() * 1.0e6;
+        println!(
+            "Euler solref tc={tc:.3} dr={dampratio:.1}: z gap={gap_um_observed:.3}μm (bound {gap_um:.0}μm)"
+        );
+        assert!(
+            gap_um_observed <= gap_um,
+            "Euler solref tc={tc} dr={dampratio}: gap {gap_um_observed:.3}μm exceeds {gap_um:.0}μm"
+        );
+    }
+}
+
+#[test]
+fn permanent_rk4_out_of_window_solref_rows_have_separate_bounds() {
+    let source = fs::read_to_string(references_dir().join("solref_sweep_rk4.json"))
+        .expect("RK4 sweep fixture missing");
+    let root = expect_object(json::parse(&source).expect("RK4 sweep fixture is invalid"));
+    assert_eq!(expect_string(object_value(&root, "mujoco")), "3.11.0");
+    let records = match object_value(&root, "records") {
+        Value::Array(records) => records,
+        other => panic!("records must be an array, got {}", other.type_name()),
+    };
+    let bounds_um = [100.0, 4_000.0];
+    assert_eq!(records.len(), bounds_um.len());
+    for (value, gap_um) in records.into_iter().zip(bounds_um) {
+        let record = expect_object(value);
+        let tc = expect_f64(object_value(&record, "tc"));
+        let dampratio = expect_f64(object_value(&record, "dampratio"));
+        let steps = expect_u32(object_value(&record, "steps"));
+        let expected_qpos = expect_f64_vec(object_value(&record, "qpos"));
+        let mjcf = fs::read_to_string(references_dir().join("sphere_drop.xml")).unwrap();
+        let mut scene = newt::mjcf::load_mjcf_str(&mjcf).unwrap();
+        for geom in &mut scene.world.geoms {
+            geom.solref = SolRef::new(tc as f32, dampratio as f32);
+        }
+        for _ in 0..steps {
+            scene.world.step();
+        }
+        let gap_um_observed =
+            (scene.world.bodies[0].position.z as f64 - expected_qpos[2]).abs() * 1.0e6;
+        println!(
+            "RK4 solref tc={tc:.3} dr={dampratio:.1}: z gap={gap_um_observed:.3}μm (bound {gap_um:.0}μm)"
+        );
+        assert!(
+            gap_um_observed <= gap_um,
+            "RK4 solref tc={tc} dr={dampratio}: gap {gap_um_observed:.3}μm exceeds {gap_um:.0}μm"
+        );
     }
 }

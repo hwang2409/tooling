@@ -294,89 +294,95 @@ pub fn sigmoid(x: f32, power: u32, midpoint: f32) -> f32 {
 /// yield an impedance in case they are treated as pushing back toward the
 /// boundary.
 pub fn impedance(violation: f32, s: SolImp) -> f32 {
-    let r = if violation >= 0.0 {
-        violation
-    } else {
-        -violation
-    };
-    let x = r / s.width;
+    impedance_at_position(-violation, 0.0, s)
+}
+
+/// MuJoCo's `getimpedance`: evaluate the sigmoid from signed row position
+/// and margin before taking the absolute normalized distance.
+fn impedance_at_position(position: f32, margin: f32, s: SolImp) -> f32 {
+    let s = effective_solimp(s);
+    let mut x = (position - margin) / s.width;
+    if x < 0.0 {
+        x = -x;
+    }
     let y = sigmoid(x, s.power, s.midpoint);
     s.dmin + (s.dmax - s.dmin) * y
 }
 
-/// Reference acceleration `a_ref(r, r_dot)` for the SolRef `(timeconst,
-/// dampratio)` parameterization.
+const MJ_MIN_IMP: f32 = 1.0e-4;
+const MJ_MAX_IMP: f32 = 0.9999;
+
+#[inline]
+fn clamp_impedance(value: f32) -> f32 {
+    value.clamp(MJ_MIN_IMP, MJ_MAX_IMP)
+}
+
+#[inline]
+fn effective_solimp(s: SolImp) -> SolImp {
+    SolImp {
+        dmin: clamp_impedance(s.dmin),
+        dmax: clamp_impedance(s.dmax),
+        width: if s.width > 0.0 { s.width } else { 0.0 },
+        midpoint: clamp_impedance(s.midpoint),
+        power: s.power.max(1),
+    }
+}
+
+#[inline]
+fn safe_solref(solref: SolRef, dt: f32) -> SolRef {
+    if !solref.is_direct() && solref.timeconst < 2.0 * dt {
+        SolRef::new(2.0 * dt, solref.dampratio)
+    } else {
+        solref
+    }
+}
+
+/// Compute MuJoCo's reference acceleration for one soft-constraint row.
 ///
-/// Derivation: model the constraint's temporal behavior as a critically-ish
-/// damped second-order response with natural time constant `timeconst`. The
-/// desired constraint-space acceleration that would drive `r` to zero is
+/// For positive solref, MuJoCo derives the coefficients from the maximum
+/// impedance and the row's current impedance:
 ///
 /// ```text
-///     a_ref = -(2 / timeconst) · dampratio · r_dot − (1 / timeconst²) · r
+/// b = 2 / (dmax · timeconst)
+/// k = d(r) / (dmax² · timeconst² · dampratio²)
+/// a_ref = -b · r_dot - k · r
 /// ```
 ///
-/// which corresponds to MuJoCo's `solref = (timeconst, dampratio)` positive
-/// form (`solref` field 1 positive → time-constant seconds; negative would
-/// be direct stiffness — we always take the positive branch here, matching
-/// the [`crate::geom::SolRef`] contract). Convention: `r > 0` means
-/// "constraint violated by r units"; a positive `a_ref` accelerates the
-/// constraint toward violation, negative toward the acceptance set. So the
-/// signs above drive `r → 0` for a critical response.
-pub fn reference_accel(violation: f32, violation_dot: f32, solref: crate::geom::SolRef) -> f32 {
-    let tc = solref.timeconst;
-    let z = solref.dampratio;
-    // -(2 z / tc) r_dot - (1 / tc²) r
-    -(2.0 * z / tc) * violation_dot - (1.0 / (tc * tc)) * violation
-}
-
-/// Same shape as [`reference_accel`] but the two terms carry independent
-/// scalars — `α_b` on the damping (velocity) term and `α_k` on the
-/// stiffness (position) term. Used by the PGS bias assembly with
-/// (`α_b`, `α_k`) = ([`AREF_BIAS_ALPHA_DAMPING`],
-/// [`AREF_BIAS_ALPHA_STIFFNESS`]).
-pub fn reference_accel_scaled(
-    violation: f32,
-    violation_dot: f32,
+/// Negative solref uses direct `(stiffness, damping)` values. The stored
+/// values are negative, so `(-timeconst, -dampratio)` are used verbatim.
+/// This helper is shared by contact, friction, limit, and equality rows.
+pub fn reference_accel(
+    position: f32,
+    velocity: f32,
     solref: crate::geom::SolRef,
-    alpha_b: f32,
-    alpha_k: f32,
+    solimp: SolImp,
 ) -> f32 {
-    let tc = solref.timeconst;
-    let z = solref.dampratio;
-    // -α_b · (2 z / tc) r_dot  −  α_k · (1 / tc²) r
-    -alpha_b * (2.0 * z / tc) * violation_dot - alpha_k * (1.0 / (tc * tc)) * violation
+    let (b, k, _) = reference_coefficients(position, solref, solimp);
+    -b * velocity - k * position
 }
 
-/// Damping-term scalar `α_b` on the contact-normal reference term
-/// in the PGS bias assembly (see [`reference_accel_scaled`]). Kept
-/// at 1 because scaling this term past 1 makes the bias multiplier
-/// on `v_current` (namely `1 + α_b · b · dt`) large enough at
-/// MuJoCo-comparable timesteps (dt=5ms, tc=20ms → b·dt = 0.5) that
-/// the constraint over-corrects the approach velocity and the
-/// contact bounces near-elastically.
-pub const CONTACT_AREF_ALPHA_DAMPING: f32 = 1.0;
-
-/// Stiffness-term scalar `α_k` on the contact-normal reference term
-/// in the PGS bias assembly (see [`reference_accel_scaled`]).
-/// Empirical fit from the NEWT-14 solref sweep against real MuJoCo
-/// (`docs/differential.md`, sphere_drop row): 2 matches MuJoCo's
-/// steady-state penetration formula `r_ss = g(1−d) / (2·d·k)`
-/// **only within the fitted window `tc ∈ [0.010, 0.050]` at
-/// dampratio = 1**. Out-of-window probes at tc = 0.005, 0.070,
-/// 0.100 show newt over-penetrating by 0.5–1.2 mm (see the "new
-/// open finding" section in `docs/differential.md`) — the true
-/// MuJoCo `k_impedance` functional form outside the window is
-/// unknown and NOT captured by this constant. The pre-NEWT-14
-/// code used `α_k = d(r)` here (impedance-scaled reference),
-/// which put newt's in-window steady-state penetration at
-/// roughly `2/d ≈ 2.1×` MuJoCo's — that v1 signal is what this
-/// constant closes.
-///
-/// Scoping: applied only on CONTACT normal rows. We have NOT
-/// fitted equality or joint-limit rows against MuJoCo; they keep
-/// the pre-NEWT-14 impedance-scaled reference until a future
-/// ticket does the same measurement for those row types.
-pub const CONTACT_AREF_ALPHA_STIFFNESS: f32 = 2.0;
+fn reference_coefficients(
+    position: f32,
+    solref: crate::geom::SolRef,
+    solimp: SolImp,
+) -> (f32, f32, f32) {
+    let solimp = effective_solimp(solimp);
+    let d = impedance_at_position(position, 0.0, solimp);
+    let (b, k) = if solref.is_direct() {
+        (
+            -solref.dampratio / solimp.dmax,
+            -solref.timeconst / (solimp.dmax * solimp.dmax),
+        )
+    } else {
+        let tc = solref.timeconst;
+        let dmax = solimp.dmax;
+        (
+            2.0 / (dmax * tc),
+            d / (dmax * dmax * tc * tc * solref.dampratio * solref.dampratio),
+        )
+    };
+    (b, k, d)
+}
 
 // ---------------------------------------------------------------------------
 // Elliptic-cone projection (public helper — the ticket lists it as a test
@@ -424,7 +430,7 @@ pub fn project_pyramidal(f: f32, cap: f32) -> f32 {
 use crate::body::Body;
 use crate::contact::Contact;
 use crate::equality::{DISTANCE_DEGENERATE_EPS, Equality};
-use crate::geom::{Geom, GeomAttach, SolRef, combine_solref};
+use crate::geom::{Geom, GeomAttach, GeomShape, SolRef, combine_solref};
 use crate::math::{Quat, Vec3};
 use crate::world::tangent_basis;
 
@@ -460,9 +466,8 @@ struct ConstraintRow {
     reg: f32,
     /// Diagonal `A_ii + R_ii`. Populated during assembly.
     diag: f32,
-    /// Bias `b_i = J_i · qdot_free + a_ref_scaled · dt`, where the two
-    /// terms of `a_ref` carry independent scalars
-    /// ([`AREF_BIAS_ALPHA_DAMPING`], [`AREF_BIAS_ALPHA_STIFFNESS`]).
+    /// Bias `b_i = delta_v_free - a_ref * dt`, using the source reference
+    /// acceleration directly.
     bias: f32,
     /// Row geometry.
     geom: RowGeom,
@@ -574,7 +579,7 @@ pub fn solve_free_bodies_diag(
     iterations: u32,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     solve_free_bodies_diag_mode(
-        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, false, None,
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, false, None, None,
     )
 }
 
@@ -593,7 +598,7 @@ pub fn solve_free_bodies_newton_diag(
     iterations: u32,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     solve_free_bodies_diag_mode(
-        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, true, None,
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, true, None, None,
     )
 }
 
@@ -624,8 +629,49 @@ pub fn solve_free_bodies_newton_trace(
         iterations,
         true,
         Some(&mut trace),
+        None,
     );
     trace
+}
+
+/// One assembled soft-constraint row before the impulse solve.
+#[derive(Clone, Copy, Debug)]
+pub struct ConstraintRowDiagnostic {
+    pub position: f32,
+    pub velocity: f32,
+    pub stiffness: f32,
+    pub damping: f32,
+    pub impedance: f32,
+    pub regularization: f32,
+    pub reference_accel: f32,
+}
+
+/// Assemble free-body contact rows and return their source factors.
+#[allow(clippy::too_many_arguments)]
+pub fn diagnose_free_body_contact_rows(
+    bodies: &[Body],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+) -> Vec<ConstraintRowDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let _ = solve_free_bodies_diag_mode(
+        bodies,
+        geoms,
+        contacts,
+        &[],
+        gravity,
+        dt,
+        cone,
+        iterations,
+        false,
+        None,
+        Some(&mut diagnostics),
+    );
+    diagnostics
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -640,6 +686,7 @@ fn solve_free_bodies_diag_mode(
     iterations: u32,
     use_newton: bool,
     newton_cost_trace: Option<&mut Vec<f32>>,
+    mut row_diagnostics: Option<&mut Vec<ConstraintRowDiagnostic>>,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     if use_newton && cone == ConeKind::Elliptic {
         panic!("{NEWTON_ELLIPTIC_ERROR}");
@@ -694,51 +741,38 @@ fn solve_free_bodies_diag_mode(
 
         let n_world = c.normal_world;
         let (t1_world, t2_world) = tangent_basis(n_world);
+        let contact_position = solver_contact_position(c, ga, gb);
         let arm_a = match body_a {
-            Some(i) => c.position_world - bodies[i as usize].position,
+            Some(i) => contact_position - bodies[i as usize].position,
             None => Vec3::ZERO,
         };
         let arm_b = match body_b {
-            Some(i) => c.position_world - bodies[i as usize].position,
+            Some(i) => contact_position - bodies[i as usize].position,
             None => Vec3::ZERO,
         };
 
         let start_row = rows.len() as u32;
-        let v_n_start = normal_velocity_at_point(bodies, body_a, body_b, arm_a, arm_b, n_world);
-
-        // Normal row.
-        rows.push(ConstraintRow {
-            dir_world: n_world,
-            body_a,
-            body_b,
-            arm_a,
-            arm_b,
-            reg: 0.0,
-            diag: 0.0,
-            bias: 0.0,
-            geom: RowGeom::Linear,
-        });
-
-        let mut n_rows_here: u8 = 1;
-        // Sliding tangent rows (condim >= 3).
-        if condim >= 3 {
-            for &dir in &[t1_world, t2_world] {
-                rows.push(ConstraintRow {
-                    dir_world: dir,
-                    body_a,
-                    body_b,
-                    arm_a,
-                    arm_b,
-                    reg: 0.0,
-                    diag: 0.0,
-                    bias: 0.0,
-                    geom: RowGeom::Linear,
-                });
-            }
-            n_rows_here += 2;
+        let row_directions = contact_row_directions(n_world, t1_world, t2_world, condim, cone, mu);
+        for (dir, geom) in row_directions {
+            rows.push(ConstraintRow {
+                dir_world: dir,
+                body_a,
+                body_b,
+                arm_a,
+                arm_b,
+                reg: 0.0,
+                diag: 0.0,
+                bias: 0.0,
+                geom: if geom {
+                    RowGeom::Angular
+                } else {
+                    RowGeom::Linear
+                },
+            });
         }
-        // Torsional row about the contact normal (condim >= 4). Angular.
-        if condim >= 4 {
+
+        if !(cone == ConeKind::Pyramidal && condim == 3) && condim >= 4 {
+            // Torsional row about the contact normal. Angular.
             rows.push(ConstraintRow {
                 dir_world: n_world,
                 body_a,
@@ -750,10 +784,9 @@ fn solve_free_bodies_diag_mode(
                 bias: 0.0,
                 geom: RowGeom::Angular,
             });
-            n_rows_here += 1;
         }
-        // Rolling rows about the two tangents (condim == 6). Angular.
-        if condim >= 6 {
+        if !(cone == ConeKind::Pyramidal && condim == 3) && condim >= 6 {
+            // Rolling rows about the two tangents. Angular.
             for &dir in &[t1_world, t2_world] {
                 rows.push(ConstraintRow {
                     dir_world: dir,
@@ -767,7 +800,6 @@ fn solve_free_bodies_diag_mode(
                     geom: RowGeom::Angular,
                 });
             }
-            n_rows_here += 2;
         }
 
         per_contact.push(PerContact {
@@ -777,12 +809,10 @@ fn solve_free_bodies_diag_mode(
             solref,
             solimp,
             pen_active,
-            v_n_current: v_n_start,
             mu_slide: mu,
             mu_torsion,
             mu_roll,
         });
-        let _ = n_rows_here; // block boundaries derive from `condim`.
     }
 
     // ---- Equality blocks --------------------------------------------------
@@ -807,44 +837,15 @@ fn solve_free_bodies_diag_mode(
 
     // ---- Compute A_ii, R_ii, bias for every row ---------------------------
     for pc in &per_contact {
-        for k in 0..contact_block_n_rows(pc.condim) {
+        for k in 0..contact_block_n_rows(pc.condim, cone) {
             let ri = pc.start_row as usize + k;
             let a_ii = row_body_diagonal(&rows[ri], bodies, &inv_i_world);
-            let d = impedance(pc.pen_active, pc.solimp);
-            let reg = if d > 0.0 { (1.0 - d) / d * a_ii } else { 0.0 };
+            let d = impedance_at_position(-pc.pen_active, 0.0, pc.solimp);
+            let reg = contact_regularization(pc, &rows[ri], bodies, &inv_i_world, d, cone);
             rows[ri].reg = reg;
             rows[ri].diag = a_ii + reg;
         }
-        // Contact-normal row bias uses the split-alpha scaling from
-        // the NEWT-14 sphere_drop fix: damping term stays at α_b=1
-        // (avoids over-correction at large dt·b), stiffness term
-        // uses α_k=2 (matches MuJoCo's steady-state penetration
-        // formula — see docs on the CONTACT_AREF_ALPHA_* constants).
-        // Scoped to contact-normal rows only; equality / joint-limit
-        // rows below continue to use the pre-NEWT-14 impedance-scaled
-        // reference.
-        let r = pc.pen_active;
-        let r_dot = -pc.v_n_current;
-        let a_ref = reference_accel_scaled(
-            r,
-            r_dot,
-            pc.solref,
-            CONTACT_AREF_ALPHA_DAMPING,
-            CONTACT_AREF_ALPHA_STIFFNESS,
-        );
-        let n_row = pc.start_row as usize;
-        rows[n_row].bias = pc.v_n_current
-            + row_free_step_velocity(
-                &rows[n_row],
-                &dv_lin_free_per_body,
-                &dw_body_free_per_body,
-                bodies,
-            )
-            + a_ref * dt;
-        // All non-normal rows in a contact block have a "target velocity =
-        // 0" reference (stick / no spin / no roll). Bias = current
-        // constraint velocity + free-step delta.
-        for k in 1..contact_block_n_rows(pc.condim) {
+        for k in 0..contact_block_n_rows(pc.condim, cone) {
             let ri = pc.start_row as usize + k;
             let v_cur = row_current_velocity(&rows[ri], bodies);
             let dv_free = row_free_step_velocity(
@@ -853,7 +854,31 @@ fn solve_free_bodies_diag_mode(
                 &dw_body_free_per_body,
                 bodies,
             );
-            rows[ri].bias = v_cur + dv_free;
+            let position = if (cone == ConeKind::Pyramidal && pc.condim == 3) || k == 0 {
+                -pc.pen_active
+            } else {
+                0.0
+            };
+            let solref = safe_solref(pc.solref, dt);
+            let a_ref = reference_accel(position, v_cur, solref, pc.solimp);
+            // MuJoCo solves the acceleration equation J*qacc - aref = 0.
+            // The impulse changes velocity, so the velocity-form residual is
+            // the free velocity change minus aref*dt. J*qvel itself is
+            // already represented in aref's damping term.
+            rows[ri].bias = dv_free - a_ref * dt;
+            if let Some(diagnostics) = row_diagnostics.as_deref_mut() {
+                let (damping, stiffness, impedance) =
+                    reference_coefficients(position, solref, pc.solimp);
+                diagnostics.push(ConstraintRowDiagnostic {
+                    position,
+                    velocity: v_cur,
+                    stiffness,
+                    damping,
+                    impedance,
+                    regularization: rows[ri].reg,
+                    reference_accel: a_ref,
+                });
+            }
         }
     }
 
@@ -879,16 +904,9 @@ fn solve_free_bodies_diag_mode(
                 &dw_body_free_per_body,
                 bodies,
             );
-            // We have only FIT contact-normal rows against MuJoCo
-            // (the NEWT-14 sphere_drop sweep). Equality rows keep the
-            // pre-NEWT-14 impedance-scaled reference until a future
-            // ticket does the same measurement for equality
-            // constraints. This is engineering scope, not a physics
-            // claim: the old formula is what our equality tests
-            // (e.g. `equality_connect`) were calibrated against.
-            let r_dot = -v_cur;
-            let a_ref = reference_accel(r, r_dot, pe.solref);
-            rows[ri].bias = v_cur + dv_free + d * a_ref * dt;
+            let solref = safe_solref(pe.solref, dt);
+            let a_ref = reference_accel(-r, v_cur, solref, pe.solimp);
+            rows[ri].bias = dv_free - a_ref * dt;
         }
     }
 
@@ -904,6 +922,7 @@ fn solve_free_bodies_diag_mode(
             bodies,
             &inv_i_world,
             iterations,
+            cone,
         );
         if let Some(trace) = newton_cost_trace {
             *trace = result.costs.clone();
@@ -931,7 +950,24 @@ fn solve_free_bodies_diag_mode(
                     bodies,
                     &inv_i_world,
                 );
-                if pc.condim >= 3 {
+                if cone == ConeKind::Pyramidal && pc.condim == 3 {
+                    pgs_step_pyramidal_pair(
+                        &rows,
+                        pc.start_row as usize,
+                        &mut impulses,
+                        &mut body_delta,
+                        bodies,
+                        &inv_i_world,
+                    );
+                    pgs_step_pyramidal_pair(
+                        &rows,
+                        pc.start_row as usize + 2,
+                        &mut impulses,
+                        &mut body_delta,
+                        bodies,
+                        &inv_i_world,
+                    );
+                } else if pc.condim >= 3 {
                     let cap_normal = impulses[n_row];
                     let t1 = pc.start_row as usize + 1;
                     let t2 = pc.start_row as usize + 2;
@@ -1036,7 +1072,15 @@ fn solve_free_bodies_diag_mode(
     // omitted from `per_contact` when its force-free gap is active, so use
     // the original contact index rather than the compact row-block index.
     for pc in &per_contact {
-        contact_normal_forces[pc.contact_index] = impulses[pc.start_row as usize] / dt;
+        let rows = contact_block_n_rows(pc.condim, cone);
+        let normal_impulse = if cone == ConeKind::Pyramidal && pc.condim == 3 {
+            (0..rows)
+                .map(|offset| impulses[pc.start_row as usize + offset])
+                .sum()
+        } else {
+            impulses[pc.start_row as usize]
+        };
+        contact_normal_forces[pc.contact_index] = normal_impulse / dt;
     }
 
     (wrenches, contact_normal_forces)
@@ -1050,10 +1094,30 @@ struct PerContact {
     solref: SolRef,
     solimp: SolImp,
     pen_active: f32,
-    v_n_current: f32,
     mu_slide: f32,
     mu_torsion: f32,
     mu_roll: f32,
+}
+
+/// MuJoCo places a sphere-plane contact at the midpoint of the two opposing
+/// surfaces. Penalty mode keeps its legacy surface anchor; solver rows use
+/// this midpoint so angular Jacobians match `efc_J`.
+fn solver_contact_position(contact: &Contact, geom_a: &Geom, geom_b: &Geom) -> Vec3 {
+    let sphere_plane = matches!(geom_a.shape, GeomShape::Sphere { .. })
+        && matches!(geom_b.shape, GeomShape::Plane)
+        || matches!(geom_a.shape, GeomShape::Plane)
+            && matches!(geom_b.shape, GeomShape::Sphere { .. });
+    if sphere_plane {
+        let margin = if geom_a.margin > geom_b.margin {
+            geom_a.margin
+        } else {
+            geom_b.margin
+        };
+        let raw_penetration = contact.penetration - margin;
+        contact.position_world + contact.normal_world * (0.5 * raw_penetration)
+    } else {
+        contact.position_world
+    }
 }
 
 /// Assemble and solve the dense free-body Newton system. The response matrix
@@ -1066,6 +1130,7 @@ fn solve_free_body_newton_impulses(
     bodies: &[Body],
     inv_i_world: &[crate::math::Mat3],
     iterations: u32,
+    cone: ConeKind,
 ) -> crate::newton::NewtonResult {
     let n_rows = rows.len();
     let mut hessian = vec![0.0f32; n_rows * n_rows];
@@ -1083,8 +1148,14 @@ fn solve_free_body_newton_impulses(
     let mut projections = Vec::new();
     for contact in per_contact {
         let normal = contact.start_row as usize;
-        projections.push(crate::newton::Projection::NonNegative { index: normal });
-        if contact.condim >= 3 {
+        if cone == ConeKind::Pyramidal && contact.condim == 3 {
+            for k in 0..4 {
+                projections.push(crate::newton::Projection::NonNegative { index: normal + k });
+            }
+        } else {
+            projections.push(crate::newton::Projection::NonNegative { index: normal });
+        }
+        if cone != ConeKind::Pyramidal && contact.condim >= 3 {
             let tangent_1 = normal + 1;
             let tangent_2 = normal + 2;
             projections.push(crate::newton::Projection::PyramidalCone {
@@ -1133,7 +1204,10 @@ fn solve_free_body_newton_impulses(
 /// Panics on any other condim — the loader and the Geom programmatic
 /// API both restrict `condim` to `{1, 3, 4, 6}`; a stray value here
 /// is a caller bug.
-fn contact_block_n_rows(condim: u8) -> usize {
+fn contact_block_n_rows(condim: u8, cone: ConeKind) -> usize {
+    if cone == ConeKind::Pyramidal && condim == 3 {
+        return 4;
+    }
     match condim {
         1 => 1,
         3 => 3,
@@ -1176,6 +1250,66 @@ fn pgs_step_non_negative(
     delta = projected - impulses[ri];
     impulses[ri] = projected;
     apply_impulse_delta(&rows[ri], delta, body_delta, bodies, inv_i_world);
+}
+
+/// Update one pair of opposing pyramidal facets as one 2D block.
+/// MuJoCo's PGS solver keeps the pair's non-negative cone constraint while
+/// minimizing the paired quadratic, rather than clamping each facet alone.
+#[allow(clippy::too_many_arguments)]
+fn pgs_step_pyramidal_pair(
+    rows: &[ConstraintRow],
+    ri: usize,
+    impulses: &mut [f32],
+    body_delta: &mut [BodyDelta],
+    bodies: &[Body],
+    inv_i_world: &[crate::math::Mat3],
+) {
+    let rj = ri + 1;
+    let residual_i = row_residual(&rows[ri], body_delta, bodies, inv_i_world)
+        + rows[ri].reg * impulses[ri]
+        + rows[ri].bias;
+    let residual_j = row_residual(&rows[rj], body_delta, bodies, inv_i_world)
+        + rows[rj].reg * impulses[rj]
+        + rows[rj].bias;
+    let h01 = row_cross_response(&rows[ri], &rows[rj], bodies, inv_i_world);
+    let h00 = rows[ri].diag;
+    let h11 = rows[rj].diag;
+    let det = h00 * h11 - h01 * h01;
+    if det <= 0.0 {
+        pgs_step_non_negative(rows, ri, impulses, body_delta, bodies, inv_i_world);
+        pgs_step_non_negative(rows, rj, impulses, body_delta, bodies, inv_i_world);
+        return;
+    }
+    let delta_i = (-residual_i * h11 + h01 * residual_j) / det;
+    let delta_j = (h01 * residual_i - h00 * residual_j) / det;
+    let next_i = impulses[ri] + delta_i;
+    let next_j = impulses[rj] + delta_j;
+    let (new_i, new_j) = if next_i >= 0.0 && next_j >= 0.0 {
+        (next_i, next_j)
+    } else if next_i < 0.0 && next_j < 0.0 {
+        (0.0, 0.0)
+    } else if next_i < 0.0 {
+        (0.0, (impulses[rj] - residual_j / h11).max(0.0))
+    } else {
+        ((impulses[ri] - residual_i / h00).max(0.0), 0.0)
+    };
+    let applied_i = new_i - impulses[ri];
+    let applied_j = new_j - impulses[rj];
+    impulses[ri] = new_i;
+    impulses[rj] = new_j;
+    apply_impulse_delta(&rows[ri], applied_i, body_delta, bodies, inv_i_world);
+    apply_impulse_delta(&rows[rj], applied_j, body_delta, bodies, inv_i_world);
+}
+
+fn row_cross_response(
+    row: &ConstraintRow,
+    applied_row: &ConstraintRow,
+    bodies: &[Body],
+    inv_i_world: &[crate::math::Mat3],
+) -> f32 {
+    let mut response = vec![BodyDelta::default(); bodies.len()];
+    apply_impulse_delta(applied_row, 1.0, &mut response, bodies, inv_i_world);
+    row_residual(row, &response, bodies, inv_i_world)
 }
 
 /// Bilateral PGS update — no clamp. Used by equality rows.
@@ -1508,6 +1642,55 @@ fn row_body_diagonal(
             }
             a_ii
         }
+    }
+}
+
+/// MuJoCo's contact regularizer starts from its diagonal approximation, not
+/// the exact row response. Pyramidal condim-3 rows then share the translated
+/// cone regularizer `2*mu^2*R_normal`.
+fn contact_regularization(
+    pc: &PerContact,
+    row: &ConstraintRow,
+    bodies: &[Body],
+    inv_i_world: &[crate::math::Mat3],
+    impedance_value: f32,
+    cone: ConeKind,
+) -> f32 {
+    if impedance_value <= 0.0 {
+        return 0.0;
+    }
+    let mut tran = 0.0;
+    for body in [row.body_a, row.body_b].into_iter().flatten() {
+        tran += 1.0 / bodies[body as usize].mass;
+    }
+    let base_diag = if cone == ConeKind::Pyramidal && pc.condim == 3 {
+        // mj_diagApprox assigns tran + mu^2*tran to each sliding facet.
+        tran * (1.0 + pc.mu_slide * pc.mu_slide)
+    } else {
+        row_body_diagonal(row, bodies, inv_i_world)
+    };
+    contact_regularization_from_diag(
+        base_diag,
+        impedance_value,
+        pc.mu_slide,
+        cone == ConeKind::Pyramidal && pc.condim == 3,
+    )
+}
+
+/// Apply MuJoCo's `mj_makeImpedance` regularizer to one diagonal
+/// approximation. Pyramidal facets use the common `Rpy` value derived from
+/// the normal facet, so every solver path shares the same cone rule.
+fn contact_regularization_from_diag(
+    base_diag: f32,
+    impedance_value: f32,
+    mu_slide: f32,
+    pyramidal_condim3: bool,
+) -> f32 {
+    let base_reg = (1.0 - impedance_value) / impedance_value * base_diag;
+    if pyramidal_condim3 {
+        2.0 * mu_slide * mu_slide * base_reg
+    } else {
+        base_reg
     }
 }
 
@@ -2096,16 +2279,13 @@ pub fn solve_tree_limits(
         // Limit rows: sign chosen so v_row = sign · qdot[v_slot] = escape
         // velocity (positive when escaping). Coupling rows: flipped at
         // construction so `+f` reduces |signed residual|.
-        // We have only FIT contact-normal rows against MuJoCo.
-        // Joint-limit / joint-coupling rows keep the pre-NEWT-14
-        // impedance-scaled reference until a future ticket does the
-        // same measurement for these row types. Engineering scope,
-        // not a physics claim: `joint_limit_swing` and the coupling
-        // tests were calibrated to the old formula.
-        let r_dot = -v_row;
-        let a_ref = reference_accel(row.violation, r_dot, row.solref);
-        let d = impedance(row.violation, row.solimp);
-        bias[i] = v_row + d * a_ref * dt;
+        let a_ref = reference_accel(
+            -row.violation,
+            v_row,
+            safe_solref(row.solref, dt),
+            row.solimp,
+        );
+        bias[i] = -a_ref * dt;
     }
 
     // Regularization R_i = ((1 - d)/d) · A_ii per row.
@@ -2201,10 +2381,14 @@ pub fn solve_tree_limits_newton(
     let mut linear = vec![0.0f32; n_rows];
     for (i, row) in rows.iter().enumerate() {
         let v_row = row.dot_qdot(&tree.qdot);
-        let r_dot = -v_row;
-        let a_ref = reference_accel(row.violation, r_dot, row.solref);
+        let a_ref = reference_accel(
+            -row.violation,
+            v_row,
+            safe_solref(row.solref, dt),
+            row.solimp,
+        );
         let d = impedance(row.violation, row.solimp);
-        linear[i] = v_row + d * a_ref * dt;
+        linear[i] = -a_ref * dt;
         let reg = if d > 0.0 {
             (1.0 - d) / d * hessian[i * n_rows + i]
         } else {
@@ -2261,6 +2445,8 @@ pub struct TreeContactSolution {
     /// Dense `J M⁻¹ Jᵀ` response for the compact active contact rows.
     /// Rows follow the order assembled from `contacts`.
     pub contact_response: Vec<f32>,
+    /// Source factors for the assembled active contact rows.
+    pub row_diagnostics: Vec<ConstraintRowDiagnostic>,
 }
 
 #[derive(Clone, Debug)]
@@ -2333,6 +2519,7 @@ pub fn solve_tree_contacts(
             .collect(),
         contact_normal_forces: vec![0.0; contacts.len()],
         contact_response: Vec::new(),
+        row_diagnostics: Vec::new(),
     };
     if contacts.is_empty() || dt <= 0.0 || trees.is_empty() {
         return solution;
@@ -2366,6 +2553,21 @@ pub fn solve_tree_contacts(
             }
         })
         .collect();
+    // MuJoCo's diagApprox is a model-time body inverse weight. It does not
+    // use the exact contact response or the implicit damping matrix.
+    let tree_diag_factors: Vec<Vec<f32>> = trees
+        .iter()
+        .map(|tree| {
+            let n = tree.nv();
+            if n == 0 {
+                Vec::new()
+            } else {
+                cholesky(&mass_matrix(tree), n).unwrap_or_else(|| {
+                    panic!("tree diagApprox failed: mass matrix is not positive definite")
+                })
+            }
+        })
+        .collect();
     let tree_free_velocity: Vec<Vec<f32>> = trees
         .iter()
         .map(|tree| tree_free_velocity_delta(tree, gravity, dt, tree_implicit))
@@ -2389,8 +2591,9 @@ pub fn solve_tree_contacts(
         let solimp = combine_solimp(ga.solimp, gb.solimp);
         let condim = ga.condim.min(gb.condim);
         let (t1, t2) = tangent_basis(contact.normal_world);
+        let mu_slide = crate::contact::combine_friction(ga.friction, gb.friction);
         let row_components: Vec<Vec<WorldJacobian>> =
-            contact_row_directions(contact.normal_world, t1, t2, condim)
+            contact_row_directions(contact.normal_world, t1, t2, condim, cone, mu_slide)
                 .into_iter()
                 .map(|(direction, angular)| {
                     [
@@ -2443,7 +2646,7 @@ pub fn solve_tree_contacts(
             solref,
             solimp,
             penetration,
-            mu_slide: crate::contact::combine_friction(ga.friction, gb.friction),
+            mu_slide,
             mu_torsion: crate::geom::combine_torsional_friction(
                 ga.torsional_friction,
                 gb.torsional_friction,
@@ -2482,46 +2685,75 @@ pub fn solve_tree_contacts(
     solution.contact_response = response.clone();
 
     for block in &blocks {
-        let row_count = contact_block_n_rows(block.condim);
-        let normal_row = block.start_row;
+        let row_count = contact_block_n_rows(block.condim, cone);
         for row_offset in 0..row_count {
             let row_index = block.start_row + row_offset;
+            let impedance_value = impedance_at_position(-block.penetration, 0.0, block.solimp);
+            let diag_approx = tree_contact_diag_approx(
+                &rows[row_index],
+                bodies,
+                trees,
+                &inv_i_world,
+                &tree_diag_factors,
+                block.mu_slide,
+                cone == ConeKind::Pyramidal && block.condim == 3,
+            );
+            rows[row_index].reg = contact_regularization_from_diag(
+                diag_approx,
+                impedance_value,
+                block.mu_slide,
+                cone == ConeKind::Pyramidal && block.condim == 3,
+            );
             let diagonal = response[row_index * n_rows + row_index];
-            let impedance_value = impedance(block.penetration, block.solimp);
-            rows[row_index].reg = if impedance_value > 0.0 {
-                (1.0 - impedance_value) / impedance_value * diagonal
-            } else {
-                0.0
-            };
             rows[row_index].diag = diagonal + rows[row_index].reg;
             let velocity = world_current_velocity(&rows[row_index], bodies, trees);
             let free_velocity =
                 world_free_velocity(&rows[row_index], &tree_free_velocity, trees, gravity, dt);
-            rows[row_index].bias = velocity + free_velocity;
+            let position = if (cone == ConeKind::Pyramidal && block.condim == 3) || row_offset == 0
+            {
+                -block.penetration
+            } else {
+                0.0
+            };
+            let reference = reference_accel(
+                position,
+                velocity,
+                safe_solref(block.solref, dt),
+                block.solimp,
+            );
+            rows[row_index].bias = free_velocity - reference * dt;
+            let (damping, stiffness, impedance) =
+                reference_coefficients(position, safe_solref(block.solref, dt), block.solimp);
+            solution.row_diagnostics.push(ConstraintRowDiagnostic {
+                position,
+                velocity,
+                stiffness,
+                damping,
+                impedance,
+                regularization: rows[row_index].reg,
+                reference_accel: reference,
+            });
         }
-        let normal_velocity = world_current_velocity(&rows[normal_row], bodies, trees);
-        let free_normal_velocity =
-            world_free_velocity(&rows[normal_row], &tree_free_velocity, trees, gravity, dt);
-        let reference = reference_accel_scaled(
-            block.penetration,
-            -normal_velocity,
-            block.solref,
-            CONTACT_AREF_ALPHA_DAMPING,
-            CONTACT_AREF_ALPHA_STIFFNESS,
-        );
-        rows[normal_row].bias = normal_velocity + free_normal_velocity + reference * dt;
     }
 
     let impulses = if use_newton {
-        let mut hessian = response;
+        let mut hessian = response.clone();
         for (index, row) in rows.iter().enumerate() {
             hessian[index * n_rows + index] += row.reg;
         }
         let mut projections = Vec::new();
         for block in &blocks {
             let normal = block.start_row;
-            projections.push(crate::newton::Projection::NonNegative { index: normal });
-            if block.condim >= 3 {
+            if cone == ConeKind::Pyramidal && block.condim == 3 {
+                for offset in 0..4 {
+                    projections.push(crate::newton::Projection::NonNegative {
+                        index: normal + offset,
+                    });
+                }
+            } else {
+                projections.push(crate::newton::Projection::NonNegative { index: normal });
+            }
+            if cone != ConeKind::Pyramidal && block.condim >= 3 {
                 projections.push(crate::newton::Projection::PyramidalCone {
                     normal,
                     tangent_1: normal + 1,
@@ -2545,6 +2777,24 @@ pub fn solve_tree_contacts(
                 }
             }
         }
+        if crate::dynamics::cholesky(&hessian, n_rows).is_none()
+            && blocks.iter().any(|block| {
+                cone == ConeKind::Pyramidal && block.condim == 3 && block.mu_slide == 0.0
+            })
+        {
+            // Zero-friction pyramid facets are identical rows. MuJoCo keeps
+            // their source Rpy at zero, so the resulting Hessian is positive
+            // semidefinite. Add a solver-only pivot for Cholesky without
+            // changing the assembled constraint regularizer.
+            let scale = hessian
+                .iter()
+                .copied()
+                .fold(0.0f32, |max_value, value| max_value.max(value.abs()));
+            let pivot = (scale * 1.0e-6).max(1.0e-7);
+            for index in 0..n_rows {
+                hessian[index * n_rows + index] += pivot;
+            }
+        }
         crate::newton::NewtonSystem {
             hessian,
             linear: rows.iter().map(|row| row.bias).collect(),
@@ -2561,7 +2811,11 @@ pub fn solve_tree_contacts(
             for block in &blocks {
                 let normal = block.start_row;
                 world_pgs_non_negative(&rows, &response, normal, &mut impulses);
-                if block.condim >= 3 {
+                if cone == ConeKind::Pyramidal && block.condim == 3 {
+                    for offset in 1..4 {
+                        world_pgs_non_negative(&rows, &response, normal + offset, &mut impulses);
+                    }
+                } else if block.condim >= 3 {
                     world_pgs_pair(
                         &rows,
                         &response,
@@ -2600,7 +2854,15 @@ pub fn solve_tree_contacts(
     };
 
     for block in &blocks {
-        solution.contact_normal_forces[block.contact_index] = impulses[block.start_row] / dt;
+        let row_count = contact_block_n_rows(block.condim, cone);
+        let normal_impulse = if cone == ConeKind::Pyramidal && block.condim == 3 {
+            (0..row_count)
+                .map(|offset| impulses[block.start_row + offset])
+                .sum()
+        } else {
+            impulses[block.start_row]
+        };
+        solution.contact_normal_forces[block.contact_index] = normal_impulse / dt;
     }
     for (row_index, row) in rows.iter().enumerate() {
         let force = impulses[row_index] / dt;
@@ -2625,6 +2887,24 @@ pub fn solve_tree_contacts(
     solution
 }
 
+/// Assemble tree contact rows and return their source factors.
+#[allow(clippy::too_many_arguments)]
+pub fn diagnose_tree_contact_rows(
+    bodies: &[Body],
+    trees: &[Tree],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+) -> Vec<ConstraintRowDiagnostic> {
+    solve_tree_contacts(
+        bodies, trees, geoms, contacts, gravity, dt, cone, iterations, false, None,
+    )
+    .row_diagnostics
+}
+
 fn component_is_dynamic(component: &WorldJacobian, trees: &[Tree]) -> bool {
     component.body.is_some()
         || component
@@ -2645,7 +2925,17 @@ fn contact_row_directions(
     tangent_1: Vec3,
     tangent_2: Vec3,
     condim: u8,
+    cone: ConeKind,
+    slide_friction: f32,
 ) -> Vec<(Vec3, bool)> {
+    if cone == ConeKind::Pyramidal && condim == 3 {
+        return vec![
+            (normal + tangent_1 * slide_friction, false),
+            (normal - tangent_1 * slide_friction, false),
+            (normal + tangent_2 * slide_friction, false),
+            (normal - tangent_2 * slide_friction, false),
+        ];
+    }
     let mut directions = vec![(normal, false)];
     if condim >= 3 {
         directions.extend([(tangent_1, false), (tangent_2, false)]);
@@ -2831,6 +3121,88 @@ fn world_velocity_from_delta(
             body_velocity + tree_velocity
         })
         .sum()
+}
+
+/// Compute MuJoCo's body-level inverse weights for one tree link. MuJoCo
+/// averages the diagonal of `J_body M^-1 J_body^T` at model setup. The tree
+/// solver uses the same definition at the assembled configuration.
+fn tree_body_invweight0(tree: &Tree, link: usize, factor: &[f32]) -> (f32, f32) {
+    let jacobian = tree.link_jacobian(link);
+    let mut translation = 0.0;
+    let mut rotation = 0.0;
+    for axis in 0..3 {
+        let mut linear = vec![0.0; tree.nv()];
+        let mut angular = vec![0.0; tree.nv()];
+        for slot in 0..tree.nv() {
+            let linear_axis = match axis {
+                0 => jacobian.translational[slot].x,
+                1 => jacobian.translational[slot].y,
+                _ => jacobian.translational[slot].z,
+            };
+            let angular_axis = match axis {
+                0 => jacobian.rotational[slot].x,
+                1 => jacobian.rotational[slot].y,
+                _ => jacobian.rotational[slot].z,
+            };
+            linear[slot] = linear_axis;
+            angular[slot] = angular_axis;
+        }
+        let linear_response = cholesky_solve(factor, tree.nv(), &linear);
+        let angular_response = cholesky_solve(factor, tree.nv(), &angular);
+        translation += linear
+            .iter()
+            .zip(&linear_response)
+            .map(|(a, b)| a * b)
+            .sum::<f32>();
+        rotation += angular
+            .iter()
+            .zip(&angular_response)
+            .map(|(a, b)| a * b)
+            .sum::<f32>();
+    }
+    (translation / 3.0, rotation / 3.0)
+}
+
+fn tree_contact_diag_approx(
+    row: &WorldContactRow,
+    bodies: &[Body],
+    trees: &[Tree],
+    inv_i_world: &[crate::math::Mat3],
+    tree_diag_factors: &[Vec<f32>],
+    mu_slide: f32,
+    pyramidal_condim3: bool,
+) -> f32 {
+    let mut translation = 0.0;
+    let mut rotation = 0.0;
+    for component in &row.components {
+        if let Some(body) = component.body {
+            if body.linear != Vec3::ZERO {
+                translation += 1.0 / bodies[body.index].mass;
+            } else {
+                rotation += body.angular.dot(inv_i_world[body.index] * body.angular);
+            }
+        }
+        if let Some(tree) = &component.tree {
+            if tree_is_mocap(tree.index, trees) {
+                continue;
+            }
+            let (body_translation, body_rotation) = tree_body_invweight0(
+                &trees[tree.index],
+                tree.link,
+                &tree_diag_factors[tree.index],
+            );
+            if tree.wrench_linear != Vec3::ZERO {
+                translation += body_translation;
+            } else {
+                rotation += body_rotation;
+            }
+        }
+    }
+    if pyramidal_condim3 {
+        translation * (1.0 + mu_slide * mu_slide)
+    } else {
+        translation + rotation
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3039,18 +3411,115 @@ mod tests {
     }
 
     #[test]
-    fn reference_accel_signs() {
-        // Positive violation, zero rate: a_ref should be negative (push back
-        // toward acceptance set).
+    fn signed_position_keeps_reference_acceleration_direction() {
+        let solimp = SolImp::new(0.8, 0.9, 0.001, 0.25, 2);
         let solref = crate::geom::SolRef::new(0.02, 1.0);
-        let a = reference_accel(0.001, 0.0, solref);
+        let position = -0.00025;
+        let d = impedance(position, solimp);
+        let k = d / (solimp.dmax * solimp.dmax * 0.02 * 0.02);
+        let expected = k * 0.00025;
+        approx(
+            reference_accel(position, 0.0, solref, solimp),
+            expected,
+            1e-5,
+        );
+        assert!(reference_accel(position, 0.0, solref, solimp) > 0.0);
+    }
+
+    #[test]
+    fn signed_position_sigmoid_applies_margin_before_absolute_distance() {
+        let solimp = SolImp::new(0.8, 0.9, 0.001, 0.5, 2);
+        // x = abs((-0.00025 - 0.00025) / 0.001) = 0.5, so y = 0.5.
+        approx(impedance_at_position(-0.00025, 0.00025, solimp), 0.85, 1e-6);
+    }
+
+    #[test]
+    fn effective_solimp_clamps_source_ranges() {
+        let unclamped = SolImp::new(0.0, 1.2, 0.001, 0.5, 2);
+        let expected = 0.0001 + (0.9999 - 0.0001) * 0.125;
+        approx(impedance(0.00025, unclamped), expected, 1e-6);
+    }
+
+    #[test]
+    fn safe_solref_clamps_timeconst_to_two_timesteps() {
+        let dt = 0.01;
+        let solref = crate::geom::SolRef::new(0.005, 1.0);
+        let effective = safe_solref(solref, dt);
+        assert_eq!(effective.timeconst, 2.0 * dt);
+        let solimp = SolImp::DEFAULT;
+        let position = 0.00025;
+        let velocity = 0.3;
+        let d = impedance(position, solimp);
+        let b = 2.0 / (solimp.dmax * effective.timeconst);
+        let k = d
+            / (solimp.dmax
+                * solimp.dmax
+                * effective.timeconst
+                * effective.timeconst
+                * effective.dampratio
+                * effective.dampratio);
+        let expected = -b * velocity - k * position;
+        approx(
+            reference_accel(position, velocity, effective, solimp),
+            expected,
+            1e-5,
+        );
+    }
+
+    #[test]
+    fn pyramidal_regularizer_uses_shared_rpy_rule() {
+        let diagonal_approx = 0.7721514;
+        let impedance_value = 0.95;
+        let mu = 0.6;
+        let expected = 2.0 * mu * mu * (1.0 - impedance_value) / impedance_value * diagonal_approx;
+        approx(
+            contact_regularization_from_diag(diagonal_approx, impedance_value, mu, true),
+            expected,
+            1e-7,
+        );
+    }
+
+    #[test]
+    fn reference_accel_signs() {
+        let solref = crate::geom::SolRef::new(0.02, 1.0);
+        let solimp = SolImp::DEFAULT;
+        let a = reference_accel(0.001, 0.0, solref, solimp);
         assert!(a < 0.0);
-        // At -1 / tc² · 0.001, exactly.
-        approx(a, -0.001 / (0.02 * 0.02), 1e-6);
-        // With positive violation_dot (getting worse), damping term adds
-        // more negative acceleration.
-        let a2 = reference_accel(0.001, 0.1, solref);
+        let d = impedance(0.001, solimp);
+        let k = d / (solimp.dmax * solimp.dmax * 0.02 * 0.02);
+        approx(a, -k * 0.001, 1e-5);
+        let a2 = reference_accel(0.001, 0.1, solref, solimp);
         assert!(a2 < a, "damping term must push a_ref more negative");
+    }
+
+    #[test]
+    fn reference_accel_exact_hand_anchors() {
+        let solimp = SolImp::new(0.8, 0.9, 0.001, 0.5, 2);
+        let cases = [(0.005, 0.5), (0.1, 1.0), (0.2, 2.0)];
+        for (tc, zeta) in cases {
+            let solref = crate::geom::SolRef::new(tc, zeta);
+            let violation = 0.00025;
+            let d = impedance(violation, solimp);
+            let b = 2.0 / (solimp.dmax * tc);
+            let k = d / (solimp.dmax * solimp.dmax * tc * tc * zeta * zeta);
+            let expected = -b * 0.3 - k * violation;
+            approx(
+                reference_accel(violation, 0.3, solref, solimp),
+                expected,
+                1e-4,
+            );
+        }
+    }
+
+    #[test]
+    fn reference_accel_direct_hand_anchor() {
+        let solref = crate::geom::SolRef::new(-400.0, -12.0);
+        let expected = -(12.0 / 0.95) * 0.25 - (400.0 / (0.95 * 0.95)) * 0.002;
+        approx(
+            reference_accel(0.002, 0.25, solref, SolImp::DEFAULT),
+            expected,
+            1e-6,
+        );
     }
 
     #[test]

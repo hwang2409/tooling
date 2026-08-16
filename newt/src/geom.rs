@@ -59,24 +59,23 @@
 //!
 //! # Contact stiffness parameters
 //!
-//! [`Geom::solref`] mirrors MuJoCo's `solref` parameter shape: a
-//! `(timeconst, dampratio)` pair. For a contact, the effective normal spring
-//! constant is `k = m_eff / timeconst²` and damping is `c = 2 * dampratio *
-//! m_eff / timeconst`, where `m_eff` is the reduced mass of the pair
-//! (`m_eff = m_a` for a body-vs-static contact, `m_a m_b / (m_a + m_b)` for
-//! two dynamic bodies). See [`solref_to_kc`]. When two geoms disagree, the
-//! stiffer setting (smaller `timeconst`) wins — matches MuJoCo's `solmix` in
-//! the equal-weight case.
+//! [`Geom::solref`] mirrors MuJoCo's `solref` parameter shape. Positive values
+//! mean `(timeconst, dampratio)`. Two negative values mean direct
+//! `(-stiffness, -damping)`. When two geoms disagree, the stronger setting
+//! wins — matches MuJoCo's `solmix` in the equal-weight case.
 
 use crate::math::{Mat3, Quat, Vec3};
 use crate::solver::SolImp;
 
 /// Contact stiffness/damping parameterization, mirroring MuJoCo's `solref`.
 ///
-/// - `timeconst` — time constant of the contact spring, in seconds. Smaller is
-///   stiffer (less penetration under load).
-/// - `dampratio` — damping ratio of the underlying spring-damper.
-///   `1.0` = critical, `< 1.0` = underdamped (bounce), `> 1.0` = overdamped.
+/// Positive pair:
+/// - `timeconst` — time constant in seconds. Smaller is stiffer.
+/// - `dampratio` — damping ratio. `1.0` is critical.
+///
+/// Direct pair:
+/// - `timeconst` — negative stiffness.
+/// - `dampratio` — negative damping.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SolRef {
     pub timeconst: f32,
@@ -98,6 +97,25 @@ impl SolRef {
             dampratio,
         }
     }
+
+    /// Validate the positive or direct MuJoCo solref convention.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.timeconst > 0.0 && self.dampratio >= 0.0 {
+            return Ok(());
+        }
+        if self.timeconst < 0.0 && self.dampratio < 0.0 {
+            return Ok(());
+        }
+        Err(format!(
+            "solref must use positive (timeconst, dampratio) or negative (stiffness, damping) values; got ({}, {})",
+            self.timeconst, self.dampratio
+        ))
+    }
+
+    /// Whether this pair uses direct stiffness and damping values.
+    pub const fn is_direct(self) -> bool {
+        self.timeconst < 0.0
+    }
 }
 
 /// Convert `(SolRef, m_eff)` into `(k, c)` spring/damper constants.
@@ -107,6 +125,9 @@ impl SolRef {
 /// `dampratio`. Derivation: `k = m_eff ω² = m_eff / timeconst²`;
 /// `c = 2 dampratio m_eff ω = 2 dampratio m_eff / timeconst`.
 pub fn solref_to_kc(solref: SolRef, m_eff: f32) -> (f32, f32) {
+    if solref.is_direct() {
+        return (-solref.timeconst, -solref.dampratio);
+    }
     let tc = solref.timeconst;
     let k = m_eff / (tc * tc);
     let c = 2.0 * solref.dampratio * m_eff / tc;
@@ -123,6 +144,23 @@ pub fn solref_to_kc(solref: SolRef, m_eff: f32) -> (f32, f32) {
 /// not a critically-damped one. Both parameters mix independently so this
 /// stays deterministic and monotone.
 pub fn combine_solref(a: SolRef, b: SolRef) -> SolRef {
+    if a.is_direct() || b.is_direct() {
+        if a.is_direct() && b.is_direct() {
+            return SolRef::new(
+                if a.timeconst <= b.timeconst {
+                    a.timeconst
+                } else {
+                    b.timeconst
+                },
+                if a.dampratio <= b.dampratio {
+                    a.dampratio
+                } else {
+                    b.dampratio
+                },
+            );
+        }
+        return if a.is_direct() { a } else { b };
+    }
     let tc = if a.timeconst <= b.timeconst {
         a.timeconst
     } else {

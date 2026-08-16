@@ -2085,13 +2085,11 @@ impl Loader {
         };
         let nums = parse_f32_list(v, path, "solref")?;
         require_len(&nums, 2, path, "solref")?;
-        if nums[0] <= 0.0 || nums[1] < 0.0 {
-            return fail(
-                path,
-                "solref timeconst must be > 0 and dampratio must be ≥ 0",
-            );
-        }
-        Ok(Some(SolRef::new(nums[0], nums[1])))
+        let solref = SolRef::new(nums[0], nums[1]);
+        solref
+            .validate()
+            .map_err(|message| MjcfError::new(path, message))?;
+        Ok(Some(solref))
     }
 
     fn parse_solimp_attr(

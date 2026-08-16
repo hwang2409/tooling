@@ -515,9 +515,9 @@ fn biped_simple_pure_pd_smoke() {
         }
     }
     // Documented current behavior: under pure PD the biped falls
-    // between steps ~900 and ~1200 and lies flat afterwards. The
-    // wider window reflects NEWT-22 routing tree contacts through PGS
-    // instead of the legacy penalty callback. If any
+    // between steps ~700 and ~900 and lies flat afterwards. The
+    // window reflects NEWT-22 tree-contact routing plus NEWT-23's
+    // exact MuJoCo reference acceleration. If any
     // future change lifts pure-PD standing above 50% of initial
     // height, this assertion catches it so we can promote the
     // fixture / test accordingly.
@@ -527,8 +527,8 @@ fn biped_simple_pure_pd_smoke() {
          significant behavior change worth surfacing.",
     );
     assert!(
-        (900..=1200).contains(&fell_step),
-        "biped fell at step {fell_step} — outside the recorded [900, 1200] \
+        (700..=900).contains(&fell_step),
+        "biped fell at step {fell_step} — outside the recorded [700, 900] \
          window (see docs/mjcf.md#biped-simple-standing-note)",
     );
     assert!(

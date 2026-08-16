@@ -30,6 +30,21 @@ quaternion manifold.
 Contacts, limits, and equality rows are fresh for every Euler step. The RK4
 constraint ZOH is not used by Euler.
 
+The RK4 solver rows still use zero-order hold. MuJoCo reevaluates constraint
+rows at each RK4 stage. This creates a real residual for soft contacts because
+their force changes within one step. Matched-Euler NEWT-23 captures isolate
+this residual from the solref reference-row form.
+
+For tree contacts, the row regularizer follows MuJoCo's model-level
+`diagApprox`, not the exact per-facet response diagonal. Pyramidal facets
+share `Rpy = 2*mu^2*Rnormal`. The tree and free-body paths use one shared
+implementation. The factor fixture records this relation for the first
+tree contact.
+
+When zero friction makes all four pyramid facets identical, the source `Rpy`
+is zero and the Newton Hessian is semidefinite. Newt adds a solver-only
+Cholesky pivot in this degenerate case. It does not change the assembled `R`.
+
 ## tree-contact impulse entry
 
 For PGS and Newton, the world assembles tree-involved contact rows before it
@@ -142,7 +157,7 @@ maximum absolute error, followed by the stated bound:
 | --- | ---: | ---: |
 | ballistic | `1.24e-5 / 3.0e-5` | `3.61e-5 / 8.0e-5` |
 | double pendulum | `1.71e-7 / 4.0e-7` | `4.29e-7 / 1.0e-6` |
-| sphere drop | `7.22e-3 / 1.5e-2` | `4.20e-1 / 9.0e-1` |
+| sphere drop | `9.83e-5 / 1.5e-2` | `1.64e-4 / 9.0e-1` |
 | box stack | `9.76e-3 / 2.0e-2` | `2.25e-1 / 5.0e-1` |
 
 The matched rows are tighter than cross-integrator comparisons because both
