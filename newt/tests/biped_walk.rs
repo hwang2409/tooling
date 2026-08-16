@@ -21,10 +21,10 @@ const CLEARANCE_MIN_M: f32 = 0.06;
 
 // Measured on 2026-08-16 after the exact solref row and shared tree R
 // changes. These bands leave headroom, but fail a silent metric shift.
-const RECORDED_DISTANCE_M: (f32, f32) = (2.50, 2.55);
-const RECORDED_CADENCE_BPM: (f32, f32) = (116.0, 119.0);
-const RECORDED_STEP_LENGTH_M: (f32, f32) = (0.36, 0.39);
-const RECORDED_CLEARANCE_M: (f32, f32) = (0.19, 0.21);
+const RECORDED_DISTANCE_M: (f32, f32) = (2.51, 2.54);
+const RECORDED_CADENCE_BPM: (f32, f32) = (117.0, 118.2);
+const RECORDED_STEP_LENGTH_M: (f32, f32) = (0.371, 0.376);
+const RECORDED_CLEARANCE_M: (f32, f32) = (0.195, 0.199);
 
 fn assert_gait_metrics(result: &biped_walk_support::WalkResult, distance: f32) {
     assert!(result.metrics.forward_distance >= distance);
