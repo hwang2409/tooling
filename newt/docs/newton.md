@@ -1,6 +1,7 @@
 # newt Newton constraint solver
 
-Status: opt-in v3 solver. PGS and the legacy penalty path remain unchanged.
+Status: opt-in Newton solver. PGS and the legacy penalty path remain
+unchanged.
 
 The Newton solver uses the same soft-constraint rows as PGS. It changes the
 numerical method only. It assembles a dense system per independent body or
@@ -159,6 +160,11 @@ The solve records the initial and accepted costs in `NewtonResult::costs`.
 Tests assert monotonicity and exact hand-derived derivatives for inactive,
 boundary, active, interior, and outside zones.
 
+On the live penetrated stack anchor, Newton accepted 1 step before reaching
+the scaled `1e-7` cost threshold. PGS uses its fixed 30-sweep cap because its
+legacy path has no early-exit test. The comparison is therefore PGS: 30
+sweeps versus Newton: 1 accepted step.
+
 ## Integration and force recovery
 
 Newton solves once at the start of an integration step. The resulting
@@ -171,10 +177,28 @@ apply equal and opposite torque. This is equivalent to recovering the
 constraint force from
 
 ```text
-  f_constraint = -R^-1 (J qacc - a_ref)
+  f_constraint = -R^-1 (J qacc + a_ref)
 ```
 
 and keeps touch sensors on the actual applied normal force.
+
+For the primal row sign used above, inactive rows have zero KKT multiplier.
+Cone rows recover the projected impulse from the solved dual system.
+
+## Tree contacts and the biped anchor
+
+Tree contacts stay on the penalty pathway in every solver mode in this ticket.
+Newton does not route tree contacts through its free-body rows. The assisted
+biped anchor therefore tests Newton tree-limit rows together with penalty
+contacts. Tree-contact routing for Newton is deferred to a later ticket.
+
+The runtime checks the solver configuration at every `World::step` call.
+Programmatic `solver = Newton` plus `cone = elliptic` fails with the same
+message as JSON and MJCF loading:
+
+```text
+solver=newton with cone=elliptic is not supported yet; use cone=pyramidal
+```
 
 ## Selection
 
@@ -207,7 +231,23 @@ The Newton test set includes:
 - deterministic duplicate Newton runs;
 - monotone cost and convergence tests on dense hand-built systems;
 - hand-derived scalar and cone zone derivatives;
+- live Newton cost traces with monotone accepted costs and published
+  PGS-versus-Newton iteration counts;
+- contact-index writeback when a force-free contact precedes an active one;
+- condim 4 torsional contact agreement;
 - Newton stack and incline byte goldens;
 - JSON and MJCF solver selection and loud elliptic rejection.
 
 The existing PGS goldens and full differential suite remain unchanged.
+
+The measured cross-solver bounds use 120 steps and add modest headroom:
+
+| scene | max position delta | max velocity delta | test bounds |
+| --- | ---: | ---: | --- |
+| stack | `1.130524441e-3` | `3.262443095e-2` | `1.5e-3`, `4.0e-2` |
+| incline | `9.781371802e-3` | `2.716029808e-2` | `1.2e-2`, `3.5e-2` |
+| equality linkage | `5.820766091e-9` | `7.836956684e-8` | `1.0e-6`, `1.0e-5` |
+| joint-limit swing | `0` | `0` | `1.0e-5`, `1.0e-4` |
+
+The condim 4 anchor adds torsional friction to a spinning sphere on a plane.
+It checks finite state and PGS/Newton position, velocity, and spin agreement.

@@ -55,14 +55,14 @@ fn assisted_walk_euler_stays_in_the_rk4_metric_family() {
 }
 
 #[test]
-fn assisted_walk_newton_euler_stays_stable() {
+fn assisted_walk_newton_tree_limits_with_penalty_contacts_stays_stable() {
     let result = run_walk_with_solver(
         GaitConfig::stable_joint_walk(2000),
         Integrator::Euler,
         SolverMode::Newton,
     );
     println!(
-        "Newton assisted walk: distance={:.4} cadence={:.2} step_length={:.4} clearance={:.4} self_contact_steps={}",
+        "Newton tree-limit + penalty-contact walk: distance={:.4} cadence={:.2} step_length={:.4} clearance={:.4} self_contact_steps={}",
         result.metrics.forward_distance,
         result.metrics.cadence_bpm,
         result.metrics.mean_step_length,

@@ -12,7 +12,7 @@ use newt::contact::Contact;
 use newt::math::{self, Quat, Vec3};
 use newt::mjcf::load_mjcf_path;
 use newt::model::Scene;
-use newt::solver::SolverMode;
+use newt::solver::{ConeKind, SolverMode};
 use newt::tree::Tree;
 use newt::world::Integrator;
 
@@ -618,7 +618,7 @@ pub fn run_walk_with_integrator(config: GaitConfig, integrator: Integrator) -> W
 
 /// Run the walker with an explicit integrator and constraint solver. This is
 /// used by the Newton acceptance anchor; the default helpers keep their
-/// established PGS configuration.
+/// established PGS configuration. Tree contacts remain on the penalty path.
 pub fn run_walk_with_solver(
     config: GaitConfig,
     integrator: Integrator,
@@ -726,6 +726,9 @@ where
     }
     if let Some(solver) = solver {
         scene.world.solver.mode = solver;
+        if solver == SolverMode::Newton {
+            scene.world.solver.cone = ConeKind::Pyramidal;
+        }
     }
     let root_height = config.newt_root_height();
     scene.world.trees[0].set_free_root_pose(Vec3::new(0.0, 0.0, root_height), Quat::IDENTITY);

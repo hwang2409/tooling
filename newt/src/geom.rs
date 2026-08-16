@@ -282,7 +282,7 @@ pub struct Geom {
     /// torsional row about the normal (drills spinning); `6` — condim 4
     /// plus two rolling rows about the tangent axes. Only consulted when
     /// `world.solver.mode == Pgs`; penalty mode always applies the
-    /// condim-3 pyramidal path.
+    /// condim-3 pyramidal path. Tree contacts remain on the penalty path.
     ///
     /// Pair rule: `min(a.condim, b.condim)` — the less-detailed cone
     /// wins, matching MuJoCo. Default `3`. condim `4` reads
@@ -301,8 +301,8 @@ pub struct Geom {
     /// this. Following MuJoCo, both rolling rows share this coefficient
     /// (single scalar), not a per-axis pair.
     pub rolling_friction: f32,
-    /// Impedance profile for the constraint solver. See [`SolImp`]. Only
-    /// consulted when `world.solver.mode == Pgs`. Default `SolImp::DEFAULT`.
+    /// Impedance profile for the constraint solver. See [`SolImp`]. Consulted
+    /// by PGS and Newton free-body rows. Default `SolImp::DEFAULT`.
     pub solimp: SolImp,
 }
 
