@@ -712,13 +712,11 @@ fn parse_single_dof_axis_joint(
                     required(sf, "dampratio", &format!("{path}.limit.solref"))?,
                     &format!("{path}.limit.solref.dampratio"),
                 )?;
-                if tc <= 0.0 || zeta < 0.0 {
-                    return fail(
-                        &format!("{path}.limit.solref"),
-                        "timeconst must be > 0 and dampratio must be ≥ 0",
-                    );
-                }
-                jl.solref = Some(SolRef::new(tc, zeta));
+                let solref = SolRef::new(tc, zeta);
+                solref
+                    .validate()
+                    .map_err(|message| ModelError::new(format!("{path}.limit.solref"), message))?;
+                jl.solref = Some(solref);
             }
             if let Some(iv) = optional(lfields, "solimp") {
                 let sf = get_object(iv, &format!("{path}.limit.solimp"))?;
@@ -2729,13 +2727,11 @@ fn parse_optional_solref(fields: &[(String, Value)], path: &str) -> Result<SolRe
         required(sf, "dampratio", &format!("{path}.solref"))?,
         &format!("{path}.solref.dampratio"),
     )?;
-    if tc <= 0.0 || zeta < 0.0 {
-        return fail(
-            &format!("{path}.solref"),
-            "timeconst must be > 0 and dampratio must be ≥ 0",
-        );
-    }
-    Ok(SolRef::new(tc, zeta))
+    let solref = SolRef::new(tc, zeta);
+    solref
+        .validate()
+        .map_err(|message| ModelError::new(format!("{path}.solref"), message))?;
+    Ok(solref)
 }
 
 /// Optional `solimp` on a geom or equality object. Returns

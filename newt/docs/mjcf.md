@@ -289,9 +289,9 @@ biped smoke tests with truthful names:
 1. `biped_simple_pure_pd_smoke` — pure joint PD, **NO external
    assist**. Asserts (a) the simulation stays finite and inside a
    generous world box, and (b) the biped's characteristic fall
-   between steps 900 and 1200 down to ≤ 20 % of initial height. The
-   wider window reflects NEWT-22 routing tree contacts through PGS
-   instead of the legacy penalty callback. This is the honest current
+   between steps 850 and 1200 down to ≤ 20 % of initial height. The
+   window reflects NEWT-22 tree-contact routing plus NEWT-23's exact
+   MuJoCo reference acceleration. This is the honest current
    pure-PD behavior baseline.
 2. `biped_simple_stands_with_source_balance_assist` — applies the
    source biped's `_apply_balance_controller` wrench each step —
@@ -403,9 +403,9 @@ step  100  root=(-0.022,-0.000,1.2459)  z_ratio=1.009  tilt≈0.018 rad
 step  200  root=(-0.102,+0.000,1.2403)  z_ratio=1.004  tilt≈0.102 rad
 step  300  root=(see test trace)  z_ratio=above 0.5
 step 1000  root=(see test trace)  z_ratio=above 0.5
-step 1045  root=(see test output) z_ratio<0.5
+step  876  root=(see test output) z_ratio<0.5
 ...
-first crossed z_ratio < 0.5 at step 1045
+first crossed z_ratio < 0.5 at step 876
 ```
 
 The source biped's `stand` scenario ships with the balance

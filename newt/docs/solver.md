@@ -79,38 +79,40 @@ saturation hits).
 
 ### Reference acceleration
 
-For each constraint at violation `r > 0` and constraint velocity
-`x_dot` (constraint escape velocity; positive = separating), define
-`r_dot = -x_dot` (positive = worsening) and take:
+For each row, use MuJoCo's signed position `s = efc_pos - efc_margin`.
+Penetration has `s < 0`. Let `v = J · qvel`.
+
+For positive `solref`, clamp `timeconst` to at least `2 · dt`, then use:
 
 ```
-a_ref(r, r_dot) = -(2 · dampratio / timeconst) · r_dot − (1 / timeconst²) · r
+b = 2 / (dmax · timeconst)
+k = 1 / (dmax² · timeconst² · dampratio²)
+a_ref(s, v) = -b · v - k · d(s) · s
 ```
 
-This is a critically-damped second-order response with natural
-frequency `1/timeconst` and damping `dampratio` (MuJoCo's positive
-`solref = (timeconst, dampratio)` convention). For `dampratio = 1` and
-`r_dot > 0` the response drives `r → 0` critically.
+For negative `solref = (-stiffness, -damping)`, use the direct values:
 
-Convention wart to be aware of: `a_ref` is the target acceleration for
-r (constraint violation), NOT for the constraint escape velocity.
-Since `r_dot = -x_dot`, sign flips propagate:
-`r_ddot = a_ref → x_ddot = -a_ref`.
+```
+k = stiffness / dmax²
+b = damping / dmax
+```
 
-We evaluate `r_dot` from the constraint velocity AT THE START of the
-step, BEFORE the free-step (gravity/qfrc_applied) kick is applied.
-Using the post-free-step velocity would inflate `r_dot` by the free
-step's contribution and produce over-corrective impulses (empirically:
-3-box stacks diverge). This matches MuJoCo's "reference is defined at
-the solve instant" behavior.
+The stored values are negative, so the implementation negates them. The
+same helper serves contacts, equalities, limits, and both solver modes.
+MuJoCo clamps `dmin`, `dmax`, and midpoint to `[1e-4, 0.9999]`, clamps
+width to non-negative, and clamps power to at least one. Newt applies the
+same clamps.
+
+The reference uses the row velocity at the solve instant. It does not add
+the current `J · qvel` again to the impulse residual.
 
 ### Regularized dual
 
 Stack the constraint rows into `J`. The primal problem is:
 
 ```
-find qdot_new such that
-    J · qdot_new + a_ref · dt = 0                (equality target)
+find qacc such that
+    J · qacc - a_ref = 0                         (equality target)
     subject to per-constraint projections:
         normal / limit rows:  f ≥ 0
         tangent rows:         cone(f_t, f_n, μ) satisfied
@@ -121,53 +123,21 @@ The convex dual: solve for impulses `f`, one per row, such that
 ```
 A · f + b = 0            (with acceptance-set projections)
 A = J M⁻¹ Jᵀ + R          — regularized system matrix
-R = diag((1 − d) / d) · diag(A)   — MuJoCo regularization
-b = J · qdot_free + α_b · (−b·r_dot) · dt + α_k · (−k·r) · dt
-                                  — bias (residual + split-α reference)
+b = Δ(J · qvel)_free - a_ref · dt
+                                  — velocity-form acceleration residual
 ```
 
 where:
 - `M` is the joint-space mass matrix (for tree-DOF constraints) or the
   block-diagonal rigid-body inertia (for free-body constraints).
-- `qdot_free = qdot + M⁻¹ · (τ_external − h) · dt` is the velocity that
-  would arise from all non-constraint forces over one dt. For free
-  bodies this ticket approximates by gravity only; higher-order terms
-  are folded into the RK4 stages that follow (see "Once-per-step under
-  RK4" below).
-- `R` sits on the diagonal because it comes from the (1 − d) · f_hard
-  "soft split" (a per-constraint linear damping in impulse space).
-- `b = 2·dampratio / timeconst` and `k = 1 / timeconst²` are the
-  reference-response coefficients from [`SolRef`] (see the earlier
-  "reference acceleration" section).
-- `(α_b, α_k)` are the split scalars on the reference term. For
-  **contact-normal rows** they are `(1, 2)` — the NEWT-14 empirical
-  fit derived from a solref sweep against real MuJoCo
-  (`docs/differential.md`, sphere_drop row). For **equality and
-  joint-limit rows** they are the historical `(d(r), d(r))` — the
-  pre-NEWT-14 impedance-scaled reference — because those rows were
-  never surveyed empirically and their tests are calibrated to the
-  old scaling.
-
-**NEWT-14 derivation (scope: fitted window).** For a contact-normal
-row on a sphere at rest, the (A + R) f = -b at equilibrium yields a
-steady-state penetration `r_ss = g(1 − d) / (α_k · d · k)`. With
-the pre-NEWT-14 `α_k = d(r)` this is `g(1 − d) / (d² · k)` —
-approximately `2/d ≈ 2.1×` MuJoCo's observed penetration across
-the sweep. With `α_k = 2` this is `g(1 − d) / (2 · d · k)`, which
-matches MuJoCo's steady state to within ~10 μm at the stiff and
-default sweep points and ~24 μm at the soft point, **but only
-within `tc ∈ [0.010, 0.050]` at dampratio = 1**. Out-of-window
-probes at tc = 0.005 / 0.070 / 0.100 show newt over-penetrates
-MuJoCo by 0.5–1.2 mm — the true MuJoCo `k_impedance` functional
-form outside the fitted window is unknown and NOT captured by
-`α_k = 2`. See `docs/differential.md`, "MuJoCo k_impedance
-functional form outside fitted window" (NEW OPEN FINDING).
-
-The damping-side `α_b` stays at 1 (rather than 2) because scaling
-it up makes the bias multiplier on `v_current` (`1 + α_b · b · dt`)
-large enough at MuJoCo-comparable timesteps (dt=5 ms, tc=20 ms →
-`b·dt = 0.5`) to over-correct the approach velocity and turn the
-contact near-elastic.
+- `Δ(J · qvel)_free` is the non-constraint velocity change for one step.
+  Free-body rows include the gravity kick. RK4 reuses these rows with the
+  solver's zero-order-hold force semantics.
+- `R` is derived from MuJoCo's `diagApprox`, impedance, and pyramid rule.
+  For a pyramidal condim-3 contact, each facet gets
+  `Rpy = 2 · μ² · Rnormal`.
+- `b` and `k` are the exact `mj_makeImpedance` coefficients. `a_ref` is
+  the exact `mj_referenceConstraint` expression.
 
 For a free body with mass `m` and world-frame inertia
 `I_w = R I_body Rᵀ`, contact at arm `r_arm`:
@@ -327,15 +297,9 @@ signed raw residual `r_raw` and a natural direction `dir_raw`. We
 store `r = |r_raw|` and flip `dir` so a positive impulse drives `r`
 down: `dir = −sign(r_raw) · dir_raw`. Then `J · qdot = −r_dot` in the
 row's convention, matching the contact-normal escape convention.
-Equality rows use the pre-NEWT-14 impedance-scaled reference
-(`b = J·qdot_free + d · a_ref(r, −J·qdot) · dt`) rather than the
-split-α form used by contact-normal rows. This is engineering
-scope, not a physics claim: we have only FIT contact-normal rows
-against MuJoCo (the NEWT-14 sphere_drop sweep). Equality rows keep
-the old formula until a future ticket does the same measurement
-for equality constraints —
-`equality_connect_two_bodies_hold_together_under_gravity` and the
-other equality tests were calibrated against the old scaling.
+Equality rows use the same signed-position reference and acceleration-form
+bias as contacts. This keeps one source-derived path for all row types and
+both solver modes.
 
 **Distance-at-zero-separation guard.** When `|p_A − p_B| <
 DISTANCE_DEGENERATE_EPS` (currently 1 µm) the row is elided that step:
