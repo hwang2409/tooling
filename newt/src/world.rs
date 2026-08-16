@@ -105,10 +105,10 @@ pub struct World {
     /// two geoms don't share a body/link and aren't both static; the
     /// resulting order is `(min, max)` lexicographic.
     pub pair_list: Option<Vec<(usize, usize)>>,
-    /// Constraint solver configuration (v1 tier 4). Default is
+    /// Constraint solver configuration. Default is
     /// [`SolverConfig::DEFAULT`] — `SolverMode::Penalty`, which keeps every
-    /// pre-v1-tier-4 golden byte-identical. Set to
-    /// `SolverMode::Pgs` to switch on the MuJoCo soft-constraint solver.
+    /// pre-v1-tier-4 golden byte-identical. Set to `SolverMode::Pgs` or
+    /// `SolverMode::Newton` to switch on a MuJoCo soft-constraint solver.
     pub solver: SolverConfig,
     /// Equality constraints (v1 tier 5). Only active when
     /// `solver.mode == Pgs`. Free-body equalities (connect / weld /
@@ -775,7 +775,7 @@ impl World {
         // readings (touch, contact forces) see the same contact set the
         // wrench pathway used this step.
         let manifold = match self.solver.mode {
-            SolverMode::Pgs => ContactManifold::Full,
+            SolverMode::Pgs | SolverMode::Newton => ContactManifold::Full,
             SolverMode::Penalty => ContactManifold::Legacy,
         };
         let free_body_contacts = collect_contacts(
@@ -798,6 +798,16 @@ impl World {
                     (w, f)
                 }
                 SolverMode::Pgs => crate::solver::solve_free_bodies_diag(
+                    &self.bodies,
+                    &self.geoms,
+                    &free_body_contacts,
+                    &self.equalities,
+                    self.gravity,
+                    self.dt,
+                    self.solver.cone,
+                    self.solver.iterations,
+                ),
+                SolverMode::Newton => crate::solver::solve_free_bodies_newton_diag(
                     &self.bodies,
                     &self.geoms,
                     &free_body_contacts,
@@ -885,7 +895,7 @@ impl World {
         //   for the rationale + tradeoffs.
         let solver_zoh: Option<Vec<(Vec3, Vec3)>> = match self.solver.mode {
             SolverMode::Penalty => None,
-            SolverMode::Pgs => Some(self.compute_solver_wrenches(&s0, pairs)),
+            SolverMode::Pgs | SolverMode::Newton => Some(self.compute_solver_wrenches(&s0, pairs)),
         };
         let sample_wrenches = |state: &[Body], pairs: &[(usize, usize)]| -> Vec<(Vec3, Vec3)> {
             match &solver_zoh {
@@ -947,7 +957,9 @@ impl World {
     fn step_bodies_euler(&mut self, pairs: &[(usize, usize)]) {
         let ext = match self.solver.mode {
             SolverMode::Penalty => self.compute_wrenches(&self.bodies, pairs),
-            SolverMode::Pgs => self.compute_solver_wrenches(&self.bodies, pairs),
+            SolverMode::Pgs | SolverMode::Newton => {
+                self.compute_solver_wrenches(&self.bodies, pairs)
+            }
         };
         let accel = evaluate_all(&self.bodies, self.gravity, &ext);
         let dt = self.dt;
@@ -1014,14 +1026,24 @@ impl World {
             // switch on solver mode.
             let mut solver_qfrc_delta: Vec<f32> = Vec::new();
             let prior_disable = tree.disable_penalty_limits;
-            if solver_mode == SolverMode::Pgs {
-                solver_qfrc_delta = crate::solver::solve_tree_limits(
-                    &tree,
-                    ti,
-                    &self.equalities,
-                    dt,
-                    solver_iterations,
-                );
+            if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
+                solver_qfrc_delta = match solver_mode {
+                    SolverMode::Pgs => crate::solver::solve_tree_limits(
+                        &tree,
+                        ti,
+                        &self.equalities,
+                        dt,
+                        solver_iterations,
+                    ),
+                    SolverMode::Newton => crate::solver::solve_tree_limits_newton(
+                        &tree,
+                        ti,
+                        &self.equalities,
+                        dt,
+                        solver_iterations,
+                    ),
+                    SolverMode::Penalty => unreachable!(),
+                };
                 for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
                     tree.qfrc_applied[slot] += delta;
                 }
@@ -1082,14 +1104,24 @@ impl World {
             let mut tree = std::mem::take(&mut self.trees[ti]);
             let prior_disable = tree.disable_penalty_limits;
             let mut solver_qfrc_delta = Vec::new();
-            if solver_mode == SolverMode::Pgs {
-                solver_qfrc_delta = crate::solver::solve_tree_limits(
-                    &tree,
-                    ti,
-                    &self.equalities,
-                    dt,
-                    solver_iterations,
-                );
+            if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
+                solver_qfrc_delta = match solver_mode {
+                    SolverMode::Pgs => crate::solver::solve_tree_limits(
+                        &tree,
+                        ti,
+                        &self.equalities,
+                        dt,
+                        solver_iterations,
+                    ),
+                    SolverMode::Newton => crate::solver::solve_tree_limits_newton(
+                        &tree,
+                        ti,
+                        &self.equalities,
+                        dt,
+                        solver_iterations,
+                    ),
+                    SolverMode::Penalty => unreachable!(),
+                };
                 for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
                     tree.qfrc_applied[slot] += delta;
                 }
@@ -1160,16 +1192,29 @@ impl World {
             &free_pairs,
             ContactManifold::Full,
         );
-        let mut wrenches = solve_free_bodies(
-            state,
-            &self.geoms,
-            &contacts,
-            &self.equalities,
-            self.gravity,
-            self.dt,
-            self.solver.cone,
-            self.solver.iterations,
-        );
+        let mut wrenches = match self.solver.mode {
+            SolverMode::Pgs => solve_free_bodies(
+                state,
+                &self.geoms,
+                &contacts,
+                &self.equalities,
+                self.gravity,
+                self.dt,
+                self.solver.cone,
+                self.solver.iterations,
+            ),
+            SolverMode::Newton => crate::solver::solve_free_bodies_newton(
+                state,
+                &self.geoms,
+                &contacts,
+                &self.equalities,
+                self.gravity,
+                self.dt,
+                self.solver.cone,
+                self.solver.iterations,
+            ),
+            SolverMode::Penalty => unreachable!("penalty does not call compute_solver_wrenches"),
+        };
         self.apply_mocap_wrenches(&mut wrenches, state, pairs);
         wrenches
     }
