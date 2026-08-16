@@ -402,8 +402,9 @@ The Newton rows use MuJoCo 3.11.0, `solver=Newton`, `integrator=Euler`,
 
 These bounds are measured from the committed `_newton_euler` fixtures.
 The Newton path is also covered by stack and incline byte goldens. The
-assisted biped walk uses the same Newton mode and remains stable for 2,000
-Euler steps: distance `1.1372 m`, cadence `102.00 bpm`, mean step length
+The assisted biped walk uses Newton for TREE-LIMIT rows only; tree contacts
+remain penalty contacts. It remains stable for 2,000 Euler steps: distance
+`1.1372 m`, cadence `102.00 bpm`, mean step length
 `0.4082 m`, clearance `0.1681 m`, and zero self-contact steps.
 
 ## Debugging a failing tolerance

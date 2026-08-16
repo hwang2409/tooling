@@ -124,11 +124,13 @@ fn condim_four_contact(mode: SolverMode) -> World {
     let body = world.add_body(Body::solid_sphere(
         1.0,
         0.3,
-        Vec3::new(0.0, 0.0, 0.295),
+        Vec3::new(0.01, -0.008, 0.295),
         Quat::IDENTITY,
     ));
-    world.bodies[body].angular_velocity_body = Vec3::new(0.0, 0.0, 3.0);
-    let mut sphere = Geom::sphere(body, 0.3, Vec3::ZERO, 0.8);
+    // The geom offset creates a contact lever arm from the body COM. The
+    // tilted spin axis exercises angular and linear coupling in condim 4.
+    world.bodies[body].angular_velocity_body = Vec3::new(0.15, -0.1, 3.0);
+    let mut sphere = Geom::sphere(body, 0.3, Vec3::new(0.03, -0.02, 0.0), 0.8);
     sphere.condim = 4;
     sphere.torsional_friction = 0.2;
     world.add_geom(sphere);
@@ -380,9 +382,19 @@ fn live_stack_newton_cost_trace_is_monotone() {
 fn newton_and_pgs_agree_on_condim_four_torsional_contact() {
     let mut pgs = condim_four_contact(SolverMode::Pgs);
     let mut newton = condim_four_contact(SolverMode::Newton);
+    let mut max_position_delta: f32 = 0.0;
+    let mut max_velocity_delta: f32 = 0.0;
+    let mut max_spin_delta: f32 = 0.0;
     for _ in 0..120 {
         pgs.step();
         newton.step();
+        let p = pgs.bodies[0];
+        let n = newton.bodies[0];
+        max_position_delta = max_position_delta.max((p.position - n.position).length());
+        max_velocity_delta =
+            max_velocity_delta.max((p.linear_velocity - n.linear_velocity).length());
+        max_spin_delta =
+            max_spin_delta.max((p.angular_velocity_body - n.angular_velocity_body).length());
     }
     let p = pgs.bodies[0];
     let n = newton.bodies[0];
@@ -402,7 +414,15 @@ fn newton_and_pgs_agree_on_condim_four_torsional_contact() {
             && n.angular_velocity_body.y.is_finite()
             && n.angular_velocity_body.z.is_finite()
     );
-    assert!((p.position - n.position).length() < 3e-2);
-    assert!((p.linear_velocity - n.linear_velocity).length() < 2e-1);
-    assert!((p.angular_velocity_body - n.angular_velocity_body).length() < 2e-1);
+    // Measured maxima are 5.744356895e-4 m, 1.912438497e-2 m/s, and
+    // 1.578792334e-1 rad/s. These bounds add modest headroom.
+    const MAX_POSITION_DELTA: f32 = 1.0e-3;
+    const MAX_VELOCITY_DELTA: f32 = 3.0e-2;
+    const MAX_SPIN_DELTA: f32 = 2.0e-1;
+    println!(
+        "condim4 cross-solver maxima: position={max_position_delta:.9e} velocity={max_velocity_delta:.9e} spin={max_spin_delta:.9e}"
+    );
+    assert!(max_position_delta < MAX_POSITION_DELTA);
+    assert!(max_velocity_delta < MAX_VELOCITY_DELTA);
+    assert!(max_spin_delta < MAX_SPIN_DELTA);
 }
