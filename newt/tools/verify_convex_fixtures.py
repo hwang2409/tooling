@@ -115,10 +115,10 @@ def sorted_body_frame_contacts(body_pose: dict, contacts: list[dict]) -> list[di
     return sorted(
         transformed,
         key=lambda contact: (
+            contact["geom"],
+            -contact["penetration"],
             tuple(contact["position"]),
             tuple(contact["frame_normal"]),
-            contact["penetration"],
-            contact["geom"],
         ),
     )
 
