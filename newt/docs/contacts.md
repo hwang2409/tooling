@@ -287,10 +287,16 @@ orientation bound is the measured per-step replay maximum plus the reviewed
 MuJoCo captures, checks byte identity, replays Newt over every captured step,
 computes both window maxima, and rejects bounds that do not equal those
 generated values. CI runs the same tool with `--ci`: it skips cross-platform
-fixture byte identity, uses fresh Linux MuJoCo states, and requires every
-fresh per-step error to fit the committed bounds. The Rust fixture test also
-recomputes both maxima and requires exact float32 equality between each
-stored position/orientation bound and its stored maximum plus `1e-4`.
+fixture byte identity, compares every committed route and dynamic sample with
+fresh MuJoCo values, and uses those fresh Linux states for the Newt replay
+check. The reviewed cross-platform capture tolerance is `1e-6` for each
+position, orientation, normal, and penetration component; the current
+macOS/Linux capture observed zero drift. Contact counts and sample identifiers
+remain exact. This tolerance is separate from the committed Newt parity bounds.
+The verifier also runs a non-max sample mutation self-test in CI. The Rust
+fixture test also recomputes both maxima and requires exact float32 equality
+between each stored position/orientation bound and its stored maximum plus
+`1e-4`.
 
 The plane-mesh route intentionally stays at two rows. MuJoCo can add a third
 row through its mesh graph neighbor walk. Newt's graph walk is not implemented

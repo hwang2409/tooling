@@ -14,6 +14,16 @@ import tempfile
 from pathlib import Path
 
 
+# This is separate from the Newt parity tolerances stored in the bounds fixture.
+# It covers only cross-platform MuJoCo capture drift in the reviewed sample data.
+CI_ORACLE_TOLERANCE = {
+    "position": 1.0e-6,
+    "orientation_wxyz": 1.0e-6,
+    "frame_normal": 1.0e-6,
+    "penetration": 1.0e-6,
+}
+
+
 def without_date(document: dict) -> dict:
     result = json.loads(json.dumps(document))
     result["capture_provenance"].pop("date", None)
@@ -33,6 +43,175 @@ def orientation_error(newt: list[float], mujoco: list[float]) -> float:
 
 def float32(value: float) -> float:
     return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def compare_vector(
+    committed: list[float],
+    fresh: list[float],
+    field: str,
+    path: str,
+    maxima: dict[str, float],
+) -> None:
+    assert len(committed) == len(fresh), path
+    tolerance = CI_ORACLE_TOLERANCE[field]
+    for index, (committed_value, fresh_value) in enumerate(zip(committed, fresh)):
+        difference = abs(float(committed_value) - float(fresh_value))
+        maxima[field] = max(maxima[field], difference)
+        assert difference <= tolerance, (
+            f"{path}[{index}] differs from fresh MuJoCo capture",
+            committed_value,
+            fresh_value,
+            difference,
+            tolerance,
+        )
+
+
+def compare_dynamic_oracle(
+    committed: dict,
+    fresh: dict,
+    maxima: dict[str, float],
+) -> None:
+    assert committed["mujoco"] == fresh["mujoco"]
+    assert without_date(committed)["capture_provenance"] == without_date(fresh)[
+        "capture_provenance"
+    ]
+    assert committed["windows"] == fresh["windows"]
+    assert len(committed["cases"]) == len(fresh["cases"])
+    for committed_case, fresh_case in zip(committed["cases"], fresh["cases"]):
+        for field in ("id", "source_xml", "route"):
+            assert committed_case[field] == fresh_case[field], field
+        assert len(committed_case["samples"]) == len(fresh_case["samples"])
+        for committed_sample, fresh_sample in zip(
+            committed_case["samples"], fresh_case["samples"]
+        ):
+            path = f"dynamic.{committed_case['id']}.step{committed_sample['step']}"
+            assert committed_sample["step"] == fresh_sample["step"], path
+            compare_vector(
+                committed_sample["position"],
+                fresh_sample["position"],
+                "position",
+                f"{path}.position",
+                maxima,
+            )
+            compare_vector(
+                committed_sample["orientation_wxyz"],
+                fresh_sample["orientation_wxyz"],
+                "orientation_wxyz",
+                f"{path}.orientation_wxyz",
+                maxima,
+            )
+            assert committed_sample["contacts"] == fresh_sample["contacts"], path
+
+
+def compare_route_oracle(
+    committed: dict,
+    fresh: dict,
+    maxima: dict[str, float],
+) -> None:
+    assert committed["mujoco"] == fresh["mujoco"]
+    assert without_date(committed)["capture_provenance"] == without_date(fresh)[
+        "capture_provenance"
+    ]
+    assert len(committed["probes"]) == len(fresh["probes"])
+    for committed_probe, fresh_probe in zip(committed["probes"], fresh["probes"]):
+        for field in ("id", "pair", "mujoco_route", "source_xml"):
+            assert committed_probe[field] == fresh_probe[field], field
+        assert len(committed_probe["poses"]) == len(fresh_probe["poses"])
+        for committed_pose, fresh_pose in zip(
+            committed_probe["poses"], fresh_probe["poses"]
+        ):
+            path = f"route.{committed_probe['id']}.{committed_pose['id']}"
+            for field in ("id", "geom_a", "geom_b"):
+                assert committed_pose[field] == fresh_pose[field], f"{path}.{field}"
+            for geom in ("pose_a", "pose_b"):
+                compare_vector(
+                    committed_pose[geom]["position"],
+                    fresh_pose[geom]["position"],
+                    "position",
+                    f"{path}.{geom}.position",
+                    maxima,
+                )
+                compare_vector(
+                    committed_pose[geom]["orientation_wxyz"],
+                    fresh_pose[geom]["orientation_wxyz"],
+                    "orientation_wxyz",
+                    f"{path}.{geom}.orientation_wxyz",
+                    maxima,
+                )
+            assert len(committed_pose["contacts"]) == len(fresh_pose["contacts"])
+            for index, (committed_contact, fresh_contact) in enumerate(
+                zip(committed_pose["contacts"], fresh_pose["contacts"])
+            ):
+                contact_path = f"{path}.contacts[{index}]"
+                assert committed_contact["geom"] == fresh_contact["geom"], contact_path
+                compare_vector(
+                    committed_contact["position"],
+                    fresh_contact["position"],
+                    "position",
+                    f"{contact_path}.position",
+                    maxima,
+                )
+                compare_vector(
+                    committed_contact["frame_normal"],
+                    fresh_contact["frame_normal"],
+                    "frame_normal",
+                    f"{contact_path}.frame_normal",
+                    maxima,
+                )
+                difference = abs(
+                    float(committed_contact["penetration"])
+                    - float(fresh_contact["penetration"])
+                )
+                maxima["penetration"] = max(maxima["penetration"], difference)
+                assert difference <= CI_ORACLE_TOLERANCE["penetration"], (
+                    f"{contact_path}.penetration differs from fresh MuJoCo capture",
+                    committed_contact["penetration"],
+                    fresh_contact["penetration"],
+                    difference,
+                    CI_ORACLE_TOLERANCE["penetration"],
+                )
+
+
+def run_ci_regression_self_test() -> None:
+    fresh = {
+        "mujoco": "3.11.0",
+        "capture_provenance": {"script": "test", "method": "test"},
+        "windows": {"early": 2, "full": 2},
+        "cases": [
+            {
+                "id": "non-max-sample",
+                "source_xml": "test.xml",
+                "route": "mjc_Convex",
+                "samples": [
+                    {
+                        "step": 0,
+                        "position": [0.0, 0.0, 0.0],
+                        "orientation_wxyz": [1.0, 0.0, 0.0, 0.0],
+                        "contacts": 1,
+                    },
+                    {
+                        "step": 1,
+                        "position": [0.1, 0.0, 0.0],
+                        "orientation_wxyz": [1.0, 0.0, 0.0, 0.0],
+                        "contacts": 1,
+                    },
+                    {
+                        "step": 2,
+                        "position": [1.0, 0.0, 0.0],
+                        "orientation_wxyz": [1.0, 0.0, 0.0, 0.0],
+                        "contacts": 1,
+                    },
+                ],
+            }
+        ],
+    }
+    committed = json.loads(json.dumps(fresh))
+    committed["cases"][0]["samples"][1]["position"][0] = 0.2
+    try:
+        compare_dynamic_oracle(committed, fresh, {field: 0.0 for field in CI_ORACLE_TOLERANCE})
+    except AssertionError:
+        return
+    raise AssertionError("CI oracle comparison accepted a non-max sample mutation")
 
 
 def dynamic_bounds(
@@ -168,6 +347,9 @@ def main() -> int:
         help="use fresh MuJoCo states and tolerance bounds without byte identity",
     )
     args = parser.parse_args()
+    if args.ci:
+        run_ci_regression_self_test()
+        print("CI oracle mutation self-test passed")
     import mujoco  # type: ignore[import-not-found]
 
     from capture_contact_route_probes import capture as capture_routes
@@ -205,9 +387,10 @@ def main() -> int:
             assert without_date(generated_routes) == without_date(expected_routes)
             assert without_date(generated_dynamic) == without_date(expected_dynamic)
         else:
-            assert [case["id"] for case in generated_dynamic["cases"]] == [
-                case["id"] for case in expected_dynamic["cases"]
-            ]
+            maxima = {field: 0.0 for field in CI_ORACLE_TOLERANCE}
+            compare_route_oracle(expected_routes, generated_routes, maxima)
+            compare_dynamic_oracle(expected_dynamic, generated_dynamic, maxima)
+            print(f"CI MuJoCo capture drift maxima: {maxima}")
     bounds_path = args.references / "contact_dynamic_anchor_bounds.json"
     bounds = json.loads(
         bounds_path.read_text(encoding="utf-8")
