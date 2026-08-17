@@ -5,7 +5,7 @@
   "cone": "pyramidal",
   "iterations": 20,
   "assist_scale": 0.4,
-  "contact_capture": "post-step detect_contacts",
+  "contact_capture": "post-step detect_contacts; not solver phase",
   "records": [
     {
       "step": 0,

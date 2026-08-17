@@ -49,7 +49,7 @@ def capture(assist_scale: float, steps: int, output: Path) -> None:
             )
         return mapping
 
-    def record(step: int):
+    def record(step: int, phase: str):
         points = biped._foot_contact_points_3d(mujoco_module, model, data)
         contact_mask = (1 if biped._foot_in_contact(points, "left") else 0) | (
             2 if biped._foot_in_contact(points, "right") else 0
@@ -86,6 +86,7 @@ def capture(assist_scale: float, steps: int, output: Path) -> None:
             )
         return {
             "step": step,
+            "phase": phase,
             "contact_mask": contact_mask,
             "qpos": data.qpos.tolist(),
             "qvel": data.qvel.tolist(),
@@ -99,19 +100,33 @@ def capture(assist_scale: float, steps: int, output: Path) -> None:
             "efc_force": data.efc_force[: data.nefc].tolist(),
         }
 
-    records.append(record(0))
+    mujoco_module.mj_forward(model, data)
+    records.append(
+        {
+            "step": 0,
+            "solver_phase": record(0, "solver_phase_pre_step"),
+            "post_step_geometry": record(0, "post_step_geometry"),
+        }
+    )
     for step in range(1, steps + 1):
         biped._apply_balance_controller(mujoco_module, model, data, config, data.time)
         controller.before_step(mujoco_module, model, data, step, config)
         targets = controller.targets(config, data.time, data=data)
         biped._apply_controls(mujoco_module, model, data, targets)
-        mujoco_module.mj_step(model, data)
-        # mj_step leaves data.contact at the solver state used for the step,
-        # while qpos and qvel already contain the post-step state. Refresh the
-        # contact manifold so this diagnostic compares the same post-step
-        # configuration that newt.world.detect_contacts reports.
+        # Capture the state and rows that the upcoming mj_step solves. The
+        # post-step refresh below is a separate visual-geometry diagnostic.
         mujoco_module.mj_forward(model, data)
-        records.append(record(step))
+        solver_phase = record(step, "solver_phase_pre_step")
+        mujoco_module.mj_step(model, data)
+        # Keep post-step geometry separate from the solver-phase record.
+        mujoco_module.mj_forward(model, data)
+        records.append(
+            {
+                "step": step,
+                "solver_phase": solver_phase,
+                "post_step_geometry": record(step, "post_step_geometry"),
+            }
+        )
     payload = {
         "mujoco": mujoco.__version__,
         "captured": date.date.today().isoformat(),
@@ -124,6 +139,7 @@ def capture(assist_scale: float, steps: int, output: Path) -> None:
         "iterations": 20,
         "steps": steps,
         "model": biped.MODEL_ID,
+        "contact_capture": "solver phase before mj_step; post-step mj_forward separately",
         "records": records,
     }
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -2411,6 +2411,12 @@ pub fn solve_tree_limits_newton(
 /// tree-vs-body contact transfers the impulse to both participants.
 #[derive(Clone, Debug)]
 pub struct TreeContactSolution {
+    /// Original tree contact list consumed by this solve, in deterministic
+    /// narrow-phase order.
+    pub contacts: Vec<Contact>,
+    /// Solver-row to original-contact mapping. Contacts in a force-free gap
+    /// have no entries here.
+    pub row_to_contact: Vec<usize>,
     /// World-frame free-body wrenches, indexed like the input body slice.
     pub body_wrenches: Vec<(Vec3, Vec3)>,
     /// Joint-space generalized forces, indexed by tree and then `nv` slot.
@@ -2489,6 +2495,8 @@ pub fn solve_tree_contacts(
     tree_implicit: Option<bool>,
 ) -> TreeContactSolution {
     let mut solution = TreeContactSolution {
+        contacts: contacts.to_vec(),
+        row_to_contact: Vec::new(),
         body_wrenches: vec![(Vec3::ZERO, Vec3::ZERO); bodies.len()],
         tree_qfrc: trees.iter().map(|tree| vec![0.0; tree.nv()]).collect(),
         tree_wrenches: trees
@@ -2640,6 +2648,12 @@ pub fn solve_tree_contacts(
     }
 
     let n_rows = rows.len();
+    for block in &blocks {
+        let row_count = contact_block_n_rows(block.condim, cone);
+        solution
+            .row_to_contact
+            .extend(std::iter::repeat_n(block.contact_index, row_count));
+    }
     let mut response = vec![0.0f32; n_rows * n_rows];
     for column in 0..n_rows {
         let mut body_response = vec![(Vec3::ZERO, Vec3::ZERO); bodies.len()];

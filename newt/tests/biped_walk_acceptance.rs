@@ -5,9 +5,11 @@
 #[path = "../examples/biped_walk_support.rs"]
 mod biped_walk_support;
 
-use biped_walk_support::{GaitConfig, run_walk_with_solver_observed};
+use biped_walk_support::{GaitConfig, run_walk_with_solver_phase_observed};
+use newt::contact::Contact;
+use newt::json::{self, Value};
 use newt::solver::SolverMode;
-use newt::world::Integrator;
+use newt::world::{Integrator, SolverPhaseDiagnostics};
 use std::fs;
 use std::path::Path;
 
@@ -52,6 +54,190 @@ struct NewtRun {
     result: biped_walk_support::WalkResult,
     first_fall_step: Option<u32>,
     checkpoints: Vec<Checkpoint>,
+    phase_checkpoints: Vec<PhaseCheckpoint>,
+}
+
+#[derive(Debug)]
+struct PhaseCheckpoint {
+    step: u32,
+    contact_mask: u8,
+    qpos: Vec<f64>,
+    qvel: Vec<f64>,
+    contacts: Vec<PhaseContact>,
+    row_to_contact: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct PhaseContact {
+    geom_pair: [String; 2],
+    position: [f64; 3],
+    dist: f64,
+    row_indices: Vec<usize>,
+}
+
+fn solver_phase_fixture() -> Vec<PhaseCheckpoint> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("tests/references/biped_walk_v3_diagnostics.json"))
+        .expect("biped solver-phase diagnostics fixture");
+    let object = expect_object(json::parse(&source).expect("biped diagnostics JSON is valid"));
+    assert_eq!(expect_string(object_value(&object, "mujoco")), "3.11.0");
+    assert_eq!(
+        expect_string(object_value(&object, "contact_capture")),
+        "solver phase before mj_step; post-step mj_forward separately"
+    );
+    match object_value(&object, "records") {
+        Value::Array(records) => records
+            .into_iter()
+            .map(|record| {
+                let record = expect_object(record);
+                let phase = expect_object(object_value(&record, "solver_phase"));
+                assert_eq!(
+                    expect_string(object_value(&phase, "phase")),
+                    "solver_phase_pre_step"
+                );
+                parse_phase_checkpoint(&phase)
+            })
+            .collect(),
+        other => panic!(
+            "diagnostic records must be an array, got {}",
+            other.type_name()
+        ),
+    }
+}
+
+fn parse_phase_checkpoint(object: &[(String, Value)]) -> PhaseCheckpoint {
+    let contacts = match object_value(object, "contacts") {
+        Value::Array(contacts) => contacts
+            .into_iter()
+            .map(|contact| {
+                let contact = expect_object(contact);
+                let pair = [
+                    expect_string(object_value(&contact, "geom1")),
+                    expect_string(object_value(&contact, "geom2")),
+                ];
+                let position = expect_f64_vec(object_value(&contact, "position"));
+                assert_eq!(position.len(), 3);
+                let row_indices = expect_usize_vec(object_value(&contact, "row_indices"));
+                PhaseContact {
+                    geom_pair: pair,
+                    position: [position[0], position[1], position[2]],
+                    dist: expect_f64(object_value(&contact, "dist")),
+                    row_indices,
+                }
+            })
+            .collect(),
+        other => panic!("contacts must be an array, got {}", other.type_name()),
+    };
+    let row_to_contact = match object_value(object, "row_to_contact") {
+        Value::Array(rows) => rows
+            .into_iter()
+            .map(|row| {
+                let row = expect_object(row);
+                expect_usize(object_value(&row, "contact_index"))
+            })
+            .collect(),
+        other => panic!(
+            "source row_to_contact must be an array, got {}",
+            other.type_name()
+        ),
+    };
+    let qpos = expect_f64_vec(object_value(object, "qpos"));
+    let qvel = expect_f64_vec(object_value(object, "qvel"));
+    PhaseCheckpoint {
+        step: expect_u32(object_value(object, "step")),
+        contact_mask: expect_u8(object_value(object, "contact_mask")),
+        qpos,
+        qvel,
+        contacts,
+        row_to_contact,
+    }
+}
+
+fn phase_checkpoint_from_newt(step: usize, scene: &newt::model::Scene) -> PhaseCheckpoint {
+    let phase = scene
+        .world
+        .solver_phase_diagnostics()
+        .expect("solver phase capture enabled");
+    let (qpos, qvel) = extract_solver_phase_qpos_qvel(phase);
+    let contacts = phase
+        .contacts
+        .iter()
+        .enumerate()
+        .map(|(contact_index, contact)| {
+            phase_contact_from_newt(scene, contact_index, contact, &phase.row_to_contact)
+        })
+        .collect();
+    PhaseCheckpoint {
+        step: step as u32,
+        contact_mask: solver_contact_mask(scene, &phase.contacts),
+        qpos: qpos.into_iter().map(f64::from).collect(),
+        qvel: qvel.into_iter().map(f64::from).collect(),
+        contacts,
+        row_to_contact: phase.row_to_contact.clone(),
+    }
+}
+
+fn extract_solver_phase_qpos_qvel(phase: &SolverPhaseDiagnostics) -> BipedState {
+    let mut qpos = phase.qpos[..3].to_vec();
+    qpos[2] -= COM_OFFSET_Z as f32;
+    qpos.extend([phase.qpos[6], phase.qpos[3], phase.qpos[4], phase.qpos[5]]);
+    qpos.extend_from_slice(&phase.qpos[7..]);
+    let mut qvel = phase.qvel[3..6].to_vec();
+    qvel.extend_from_slice(&phase.qvel[0..3]);
+    qvel.extend_from_slice(&phase.qvel[6..]);
+    (qpos, qvel)
+}
+
+fn phase_contact_from_newt(
+    scene: &newt::model::Scene,
+    contact_index: usize,
+    contact: &Contact,
+    row_to_contact: &[usize],
+) -> PhaseContact {
+    let pair = [
+        geom_name(scene, contact.geom_a),
+        geom_name(scene, contact.geom_b),
+    ];
+    let row_indices = row_to_contact
+        .iter()
+        .enumerate()
+        .filter_map(|(row, &mapped_contact)| (mapped_contact == contact_index).then_some(row))
+        .collect();
+    PhaseContact {
+        geom_pair: pair,
+        position: [
+            f64::from(contact.position_world.x),
+            f64::from(contact.position_world.y),
+            f64::from(contact.position_world.z),
+        ],
+        dist: -f64::from(contact.penetration),
+        row_indices,
+    }
+}
+
+fn geom_name(scene: &newt::model::Scene, index: usize) -> String {
+    scene
+        .geoms_by_name
+        .iter()
+        .find_map(|(name, &candidate)| (candidate == index).then_some(name.clone()))
+        .unwrap_or_else(|| format!("<unnamed:{index}>"))
+}
+
+fn solver_contact_mask(scene: &newt::model::Scene, contacts: &[Contact]) -> u8 {
+    let mut mask = 0;
+    for contact in contacts {
+        let names = [
+            geom_name(scene, contact.geom_a),
+            geom_name(scene, contact.geom_b),
+        ];
+        if names.iter().any(|name| name == "left_foot_geom") {
+            mask |= 1;
+        }
+        if names.iter().any(|name| name == "right_foot_geom") {
+            mask |= 2;
+        }
+    }
+    mask
 }
 
 fn fixture(level: &str) -> OracleFixture {
@@ -209,6 +395,7 @@ fn run_newt(assist_scale: f32, steps: usize) -> NewtRun {
     config.assist_scale = assist_scale;
     let mut first_fall_step = None;
     let mut checkpoints = Vec::with_capacity(steps + 1);
+    let mut phase_checkpoints = Vec::with_capacity(steps + 1);
     let (initial_qpos, initial_qvel) = initial_biped_qpos_qvel();
     checkpoints.push(Checkpoint {
         step: 0,
@@ -216,20 +403,26 @@ fn run_newt(assist_scale: f32, steps: usize) -> NewtRun {
         qpos: initial_qpos.into_iter().map(f64::from).collect(),
         qvel: initial_qvel.into_iter().map(f64::from).collect(),
     });
-    let result = run_walk_with_solver_observed(
+    let result = run_walk_with_solver_phase_observed(
         config,
         Integrator::Euler,
         SolverMode::Newton,
         |step, scene| {
-            let contact_mask = visual_contact_mask(scene);
-            let (qpos, qvel) = extract_biped_qpos_qvel(scene);
-            checkpoints.push(Checkpoint {
-                step: step as u32,
-                contact_mask,
-                qpos: qpos.into_iter().map(f64::from).collect(),
-                qvel: qvel.into_iter().map(f64::from).collect(),
-            });
-            if first_fall_step.is_none() && scene.world.trees[0].q[2] < FALL_ROOT_COM_HEIGHT {
+            phase_checkpoints.push(phase_checkpoint_from_newt(step, scene));
+            if step > 0 {
+                let contact_mask = visual_contact_mask(scene);
+                let (qpos, qvel) = extract_biped_qpos_qvel(scene);
+                checkpoints.push(Checkpoint {
+                    step: step as u32,
+                    contact_mask,
+                    qpos: qpos.into_iter().map(f64::from).collect(),
+                    qvel: qvel.into_iter().map(f64::from).collect(),
+                });
+            }
+            if step > 0
+                && first_fall_step.is_none()
+                && scene.world.trees[0].q[2] < FALL_ROOT_COM_HEIGHT
+            {
                 first_fall_step = Some(step as u32);
             }
         },
@@ -238,6 +431,7 @@ fn run_newt(assist_scale: f32, steps: usize) -> NewtRun {
         result,
         first_fall_step,
         checkpoints,
+        phase_checkpoints,
     }
 }
 
@@ -533,38 +727,200 @@ fn extract_biped_qpos_qvel(scene: &newt::model::Scene) -> BipedState {
 #[test]
 fn v3_diagnostic_fixture_records_geom_manifolds() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let path = root.join("tests/references/biped_walk_v3_diagnostics.json");
-    let diagnostics = fs::read_to_string(path).expect("biped diagnostics fixture");
-    for field in [
-        "\"qpos\"",
-        "\"qvel\"",
-        "\"position\"",
-        "\"normal\"",
-        "\"condim\"",
-        "\"frame\"",
-        "\"efc_address\"",
-        "\"row_indices\"",
-        "\"row_to_contact\"",
-    ] {
-        assert!(diagnostics.contains(field), "missing {field}");
+    let source = solver_phase_fixture();
+    assert_eq!(source.len(), 41);
+    for (step, checkpoint) in source.iter().enumerate() {
+        assert_eq!(checkpoint.step, step as u32);
+        assert_eq!(checkpoint.qpos.len(), QPOS_COUNT);
+        assert_eq!(checkpoint.qvel.len(), QVEL_COUNT);
+        assert_eq!(
+            checkpoint.row_to_contact.len(),
+            checkpoint.contacts.len() * 4
+        );
+        assert_contact_rows(checkpoint);
     }
-    assert!(diagnostics.contains("\"geom1\": \"ground\""));
-    assert!(diagnostics.contains("\"geom2\": \"right_foot_geom\""));
-    assert!(diagnostics.contains("\"contact_capture\": \"post-step mj_forward\""));
-    assert!(
-        diagnostics
-            .contains("\"row_indices\": [\n            0,\n            1,\n            2,\n            3\n          ]")
+    let step25 = &source[25];
+    assert_eq!(step25.contact_mask, 2);
+    assert_eq!(step25.contacts.len(), 1);
+    assert_eq!(
+        step25.contacts[0].geom_pair,
+        ["ground".to_string(), "right_foot_geom".to_string()]
     );
-    assert!(diagnostics.contains("\"step\": 12"));
+    assert!((step25.contacts[0].dist + 0.00030427783267333863).abs() < 1e-12);
+    assert_eq!(step25.contacts[0].row_indices, vec![0, 1, 2, 3]);
+
+    let newt = run_newt(0.4, 36);
+    assert_eq!(newt.phase_checkpoints.len(), 37);
+    let mut first_structural_mismatch = None;
+    let mut first_qpos_bound_exceed = None;
+    let mut first_qvel_bound_exceed = None;
+    for step in 0..=36 {
+        let expected = &source[step];
+        let actual = &newt.phase_checkpoints[step];
+        assert_eq!(actual.step, step as u32);
+        assert_eq!(actual.qpos.len(), QPOS_COUNT);
+        assert_eq!(actual.qvel.len(), QVEL_COUNT);
+        assert_contact_rows(actual);
+        let qpos_gap = max_gap(&actual.qpos, &expected.qpos);
+        let qvel_gap = max_gap(&actual.qvel, &expected.qvel);
+        if qpos_gap > EARLY_QPOS_GAP_BOUND && first_qpos_bound_exceed.is_none() {
+            first_qpos_bound_exceed = Some(step);
+        }
+        if qvel_gap > EARLY_QVEL_GAP_BOUND && first_qvel_bound_exceed.is_none() {
+            first_qvel_bound_exceed = Some(step);
+        }
+        let structural_match = phase_structure_matches(expected, actual);
+        if !structural_match && first_structural_mismatch.is_none() {
+            first_structural_mismatch = Some(step);
+        }
+        if structural_match {
+            for (expected_contact, actual_contact) in expected.contacts.iter().zip(&actual.contacts)
+            {
+                assert!(
+                    max_gap(&actual_contact.position, &expected_contact.position) <= 0.02,
+                    "step {step} contact position gap exceeds 0.02"
+                );
+                assert!(
+                    (actual_contact.dist - expected_contact.dist).abs() <= 0.02,
+                    "step {step} contact depth gap exceeds 0.02"
+                );
+            }
+        }
+        println!(
+            "solver_phase_gap step={step} qpos={qpos_gap:.6e} qvel={qvel_gap:.6e} oracle_mask={} newt_mask={} oracle_contacts={} newt_contacts={} structural_match={structural_match}",
+            expected.contact_mask,
+            actual.contact_mask,
+            expected.contacts.len(),
+            actual.contacts.len(),
+        );
+    }
+    assert_eq!(
+        first_structural_mismatch,
+        Some(18),
+        "solver-phase manifold divergence moved; update the fixture and diagnosis"
+    );
+    println!(
+        "solver_phase_first_bound_exceed qpos={first_qpos_bound_exceed:?} qvel={first_qvel_bound_exceed:?} structural={first_structural_mismatch:?}"
+    );
 
     let newt_path = root.join("tests/references/biped_walk_v3_newt_diagnostics.json");
     let newt_diagnostics = fs::read_to_string(newt_path).expect("newt biped diagnostics fixture");
-    assert!(newt_diagnostics.contains("\"contact_capture\": \"post-step detect_contacts\""));
-    assert!(newt_diagnostics.contains("\"geom_pair\": [\"ground\", \"right_foot_geom\"]"));
-    assert!(newt_diagnostics.contains("\"normal\": [0.0, 0.0, 1.0]"));
-    assert!(newt_diagnostics.contains("\"frame\": [0.0, 0.0, 1.0"));
-    assert!(newt_diagnostics.contains("\"dist\": -0.004183933"));
-    assert!(newt_diagnostics.contains("\"row_to_contact\": [0, 0, 0, 0, 1, 1, 1, 1]"));
+    let newt_object = expect_object(json::parse(&newt_diagnostics).expect("newt diagnostics JSON"));
+    assert_eq!(expect_string(object_value(&newt_object, "engine")), "newt");
+    assert_eq!(
+        expect_string(object_value(&newt_object, "contact_capture")),
+        "post-step detect_contacts; not solver phase"
+    );
+    let newt_records = match object_value(&newt_object, "records") {
+        Value::Array(records) => records,
+        other => panic!(
+            "newt diagnostic records must be an array, got {}",
+            other.type_name()
+        ),
+    };
+    let step25 = expect_object(newt_records[3].clone());
+    assert_eq!(expect_u32(object_value(&step25, "step")), 25);
+    assert_eq!(expect_u32(object_value(&step25, "rows")), 8);
+    assert_eq!(
+        expect_usize_vec(object_value(&step25, "row_to_contact")),
+        vec![0, 0, 0, 0, 1, 1, 1, 1]
+    );
+}
+
+fn phase_structure_matches(expected: &PhaseCheckpoint, actual: &PhaseCheckpoint) -> bool {
+    expected.contact_mask == actual.contact_mask
+        && expected.row_to_contact == actual.row_to_contact
+        && expected.contacts.len() == actual.contacts.len()
+        && expected
+            .contacts
+            .iter()
+            .zip(&actual.contacts)
+            .all(|(expected, actual)| {
+                expected.geom_pair == actual.geom_pair && expected.row_indices == actual.row_indices
+            })
+}
+
+fn assert_contact_rows(checkpoint: &PhaseCheckpoint) {
+    assert_eq!(
+        checkpoint.row_to_contact.len(),
+        checkpoint.contacts.len() * 4
+    );
+    for (contact_index, contact) in checkpoint.contacts.iter().enumerate() {
+        assert_eq!(
+            contact.row_indices,
+            (contact_index * 4..contact_index * 4 + 4).collect::<Vec<_>>()
+        );
+    }
+    for (row, &contact_index) in checkpoint.row_to_contact.iter().enumerate() {
+        assert_eq!(contact_index, row / 4);
+    }
+}
+
+fn max_gap(actual: &[f64], expected: &[f64]) -> f64 {
+    assert_eq!(actual.len(), expected.len());
+    actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0, f64::max)
+}
+
+fn expect_string(v: Value) -> String {
+    match v {
+        Value::String(value) => value,
+        other => panic!("expected string, got {}", other.type_name()),
+    }
+}
+
+fn expect_u8(v: Value) -> u8 {
+    expect_usize(v) as u8
+}
+
+fn expect_u32(v: Value) -> u32 {
+    expect_usize(v) as u32
+}
+
+fn expect_usize(v: Value) -> usize {
+    match v {
+        Value::Number(value) => value as usize,
+        other => panic!("expected number, got {}", other.type_name()),
+    }
+}
+
+fn expect_f64(v: Value) -> f64 {
+    match v {
+        Value::Number(value) => value,
+        other => panic!("expected number, got {}", other.type_name()),
+    }
+}
+
+fn expect_f64_vec(v: Value) -> Vec<f64> {
+    match v {
+        Value::Array(values) => values.into_iter().map(expect_f64).collect(),
+        other => panic!("expected array, got {}", other.type_name()),
+    }
+}
+
+fn expect_usize_vec(v: Value) -> Vec<usize> {
+    match v {
+        Value::Array(values) => values.into_iter().map(expect_usize).collect(),
+        other => panic!("expected array, got {}", other.type_name()),
+    }
+}
+
+fn object_value(object: &[(String, Value)], key: &str) -> Value {
+    object
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| panic!("fixture object missing {key}"))
+}
+
+fn expect_object(v: Value) -> Vec<(String, Value)> {
+    match v {
+        Value::Object(object) => object,
+        other => panic!("expected object, got {}", other.type_name()),
+    }
 }
 
 fn visual_contact_mask(scene: &newt::model::Scene) -> u8 {
