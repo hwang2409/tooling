@@ -1,13 +1,51 @@
 <mujoco model="contact_route_sphere_ellipsoid">
   <option gravity="0 0 0"/>
+  <contact>
+    <pair geom1="sphere_no_contact" geom2="ellipsoid_no_contact"/>
+    <pair geom1="sphere_shallow" geom2="ellipsoid_shallow"/>
+    <pair geom1="sphere_deep" geom2="ellipsoid_deep"/>
+    <pair geom1="sphere_off_axis" geom2="ellipsoid_off_axis"/>
+  </contact>
   <worldbody>
-    <body pos="0.6 0 0">
+    <body name="sphere_no_contact" pos="1 0 0">
       <freejoint/>
-      <geom name="sphere" type="sphere" size="0.2"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="sphere_no_contact" type="sphere" size="0.2"/>
     </body>
-    <body>
+    <body name="ellipsoid_no_contact">
       <freejoint/>
-      <geom name="ellipsoid" type="ellipsoid" size="0.5 0.3 0.2"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="ellipsoid_no_contact" type="ellipsoid" size="0.5 0.3 0.2"/>
+    </body>
+    <body name="sphere_shallow" pos="0.695 0 0">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="sphere_shallow" type="sphere" size="0.2"/>
+    </body>
+    <body name="ellipsoid_shallow">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="ellipsoid_shallow" type="ellipsoid" size="0.5 0.3 0.2"/>
+    </body>
+    <body name="sphere_deep" pos="0.52 0 0">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="sphere_deep" type="sphere" size="0.2"/>
+    </body>
+    <body name="ellipsoid_deep">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="ellipsoid_deep" type="ellipsoid" size="0.5 0.3 0.2"/>
+    </body>
+    <body name="sphere_off_axis" pos="0.45 0.2 0.1">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="sphere_off_axis" type="sphere" size="0.2"/>
+    </body>
+    <body name="ellipsoid_off_axis" euler="0.2 0.3 0.4">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="ellipsoid_off_axis" type="ellipsoid" size="0.5 0.3 0.2"/>
     </body>
   </worldbody>
 </mujoco>

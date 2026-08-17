@@ -1,10 +1,32 @@
 <mujoco model="contact_route_plane_ellipsoid">
   <option gravity="0 0 0"/>
+  <contact>
+    <pair geom1="plane" geom2="ellipsoid_no_contact"/>
+    <pair geom1="plane" geom2="ellipsoid_shallow"/>
+    <pair geom1="plane" geom2="ellipsoid_deep"/>
+    <pair geom1="plane" geom2="ellipsoid_off_axis"/>
+  </contact>
   <worldbody>
     <geom name="plane" type="plane" size="2 2 0.1"/>
-    <body pos="0 0 0.1">
+    <body name="ellipsoid_no_contact" pos="0 0 0.5">
       <freejoint/>
-      <geom name="ellipsoid" type="ellipsoid" size="0.5 0.3 0.2"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="ellipsoid_no_contact" type="ellipsoid" size="0.5 0.3 0.2"/>
+    </body>
+    <body name="ellipsoid_shallow" pos="0 0 0.19">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="ellipsoid_shallow" type="ellipsoid" size="0.5 0.3 0.2"/>
+    </body>
+    <body name="ellipsoid_deep" pos="0 0 0">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="ellipsoid_deep" type="ellipsoid" size="0.5 0.3 0.2"/>
+    </body>
+    <body name="ellipsoid_off_axis" pos="0.2 -0.1 0.18" euler="0.2 0.3 0.4">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="ellipsoid_off_axis" type="ellipsoid" size="0.5 0.3 0.2"/>
     </body>
   </worldbody>
 </mujoco>
