@@ -66,7 +66,7 @@ fn tendon_actuator_link_index_does_not_double_count_torque() {
 }
 
 #[test]
-fn json_rejects_wrap_sphere_on_dof_ancestor_chain() {
+fn json_accepts_moving_wrap_for_envelope_jacobian() {
     let src = r#"{
         "trees": [{
             "name": "t",
@@ -86,13 +86,8 @@ fn json_rejects_wrap_sphere_on_dof_ancestor_chain() {
             "wraps":[{"segment":0,"link":"hinge","center":[0,0,0],"radius":0.1}]
         }]
     }"#;
-    let err = newt::model::load_str(src).expect_err("moving wrap must be rejected");
-    let message = format!("{err}");
-    assert!(
-        message.contains("sphere wrap attached to a link"),
-        "{message}"
-    );
-    assert!(message.contains("deferred in v2 tier 3"), "{message}");
+    let scene = newt::model::load_str(src).expect("moving wrap is supported");
+    assert_eq!(scene.world.trees[0].tendons.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -544,7 +539,7 @@ fn json_loads_fixed_tendon_with_sensors_and_motor() {
 }
 
 #[test]
-fn json_rejects_cylinder_wrap_loudly() {
+fn json_loads_cylinder_wrap() {
     let src = r#"{
         "trees": [{
             "name": "t",
@@ -563,12 +558,8 @@ fn json_rejects_cylinder_wrap_loudly() {
             }]
         }]
     }"#;
-    let err = newt::model::load_str(src).expect_err("cylinder wrap must be rejected");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("cylinder wrap is deferred"),
-        "message should name cylinder deferral: {msg}"
-    );
+    let scene = newt::model::load_str(src).expect("cylinder wrap is supported");
+    assert_eq!(scene.world.trees[0].tendons.len(), 1);
 }
 
 #[test]

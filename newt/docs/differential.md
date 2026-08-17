@@ -66,6 +66,14 @@ those units.
 | filtered_motor_pendulum | 2.56e-4      | 6.0e-4     | 1.34e-3           | 3.0e-3     | bounded divergence |
 | mocap_rangefinder | 0                  | 1.0e-6     | 0                  | 1.0e-6     | parity; sensors 2.4e-8 |
 
+### NEWT-27 spatial tendon probes
+
+The cylinder and pulley extension has committed hand and finite-difference
+probes in `tests/tendon_wrap_cylinder.rs`. The probes cover tangent length,
+shortest-side selection, divisor scaling, and the analytic Jacobian. A
+trajectory capture row needs a MuJoCo scene capture before it can state a
+measured bound; no fitted bound is recorded here.
+
 `mocap_rangefinder` also compares all seven `sensordata` values at each
 sample. The maximum direct sensor error is `2.4e-8`, below the `2.0e-6`
 sensor bound. It covers rangefinder ray casting, mocap site attachment,

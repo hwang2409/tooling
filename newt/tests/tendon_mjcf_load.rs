@@ -17,7 +17,7 @@ fn tendon_wrap_mjcf_loads() {
 }
 
 #[test]
-fn mjcf_rejects_wrap_sphere_on_dof_ancestor_chain() {
+fn mjcf_accepts_moving_wrap_for_envelope_jacobian() {
     let src = r#"
         <mujoco model="moving_wrap">
           <worldbody>
@@ -41,11 +41,6 @@ fn mjcf_rejects_wrap_sphere_on_dof_ancestor_chain() {
           </tendon>
         </mujoco>
     "#;
-    let err = newt::mjcf::load_mjcf_str(src).expect_err("moving wrap must be rejected");
-    let message = format!("{err}");
-    assert!(
-        message.contains("sphere wrap attached to a link"),
-        "{message}"
-    );
-    assert!(message.contains("deferred in v2 tier 3"), "{message}");
+    let scene = newt::mjcf::load_mjcf_str(src).expect("moving wrap is supported");
+    assert_eq!(scene.world.trees[0].tendons.len(), 1);
 }
