@@ -52,7 +52,8 @@ use crate::solver::{
 };
 use crate::tree::{
     AbaWorkspace, Tree, euler_step_with_workspace as tree_euler_step_with_workspace,
-    forward_kinematics as tree_forward_kinematics, rk4_step as tree_rk4_step,
+    forward_kinematics as tree_forward_kinematics,
+    rk4_step_with_workspace as tree_rk4_step_with_workspace,
 };
 
 #[cfg(feature = "instrumentation")]
@@ -1177,6 +1178,14 @@ impl World {
         if self.trees.is_empty() {
             return;
         }
+        while self.tree_aba_workspaces.len() < self.trees.len() {
+            let index = self.tree_aba_workspaces.len();
+            self.tree_aba_workspaces
+                .push(AbaWorkspace::new(self.trees[index].links.len()));
+        }
+        for (workspace, tree) in self.tree_aba_workspaces.iter_mut().zip(&self.trees) {
+            workspace.ensure_len(tree.links.len());
+        }
         let n_trees = self.trees.len();
         // Snapshot scalars before we start borrowing the vector fields.
         let dt = self.dt;
@@ -1248,21 +1257,27 @@ impl World {
                 // ends before we mutate self.trees[ti] on the next line.
                 let bodies_ref = &self.bodies;
                 let geoms_ref = &self.geoms;
-                tree_rk4_step(&mut tree, gravity, dt, |t| {
-                    if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
-                        vec![(Vec3::ZERO, Vec3::ZERO); t.links.len()]
-                    } else {
-                        tree_wrenches_from_pairs(
-                            t,
-                            ti,
-                            bodies_ref,
-                            geoms_ref,
-                            &self.meshes,
-                            &self.hfields,
-                            &tree_pairs,
-                        )
-                    }
-                });
+                tree_rk4_step_with_workspace(
+                    &mut tree,
+                    gravity,
+                    dt,
+                    |t| {
+                        if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
+                            vec![(Vec3::ZERO, Vec3::ZERO); t.links.len()]
+                        } else {
+                            tree_wrenches_from_pairs(
+                                t,
+                                ti,
+                                bodies_ref,
+                                geoms_ref,
+                                &self.meshes,
+                                &self.hfields,
+                                &tree_pairs,
+                            )
+                        }
+                    },
+                    &mut self.tree_aba_workspaces[ti],
+                );
             }
             // Roll back the ZOH limit torque + penalty-limit gate so
             // neither accumulates across steps (the solver recomputes

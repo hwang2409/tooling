@@ -1001,7 +1001,7 @@ fn aba_with_velocity_implicit_workspace(
     assert_eq!(poses.len(), n);
     assert_eq!(external_wrenches.len(), n);
     workspace.ensure_len(n);
-    let mut w = workspace;
+    let w = workspace;
 
     // --- Pass 1: compute Xup, S, v, c bottom-down. ---
     for i in 0..n {
@@ -1175,7 +1175,7 @@ fn aba_with_velocity_implicit_workspace(
                     + tau_act;
                 let damping_mass =
                     implicit_mass_damping(tree, i, q_i, qdot_i, damping, velocity_implicit);
-                single_dof_pass2(&mut w, tree, i, parent, armature, damping_mass, tau_scalar);
+                single_dof_pass2(w, tree, i, parent, armature, damping_mass, tau_scalar);
             }
             JointKind::Slide {
                 damping,
@@ -1211,7 +1211,7 @@ fn aba_with_velocity_implicit_workspace(
                     + tau_act;
                 let damping_mass =
                     implicit_mass_damping(tree, i, q_i, qdot_i, damping, velocity_implicit);
-                single_dof_pass2(&mut w, tree, i, parent, armature, damping_mass, tau_scalar);
+                single_dof_pass2(w, tree, i, parent, armature, damping_mass, tau_scalar);
             }
             JointKind::Ball { damping, armature } => {
                 let parent = link.parent.expect("ball must have parent");
@@ -1599,8 +1599,21 @@ fn scale_mat6(mut m: Mat6, s: f32) -> Mat6 {
 /// it receives a temporary snapshot of the tree (with intermediate `q` and
 /// `qdot`) and returns per-link external wrenches (contacts, etc.). Gravity
 /// is added by [`aba`] directly; do NOT include it here.
-pub fn rk4_step<F>(tree: &mut Tree, gravity: Vec3, dt: f32, mut compute_ext_wrenches: F)
+pub fn rk4_step<F>(tree: &mut Tree, gravity: Vec3, dt: f32, compute_ext_wrenches: F)
 where
+    F: FnMut(&Tree) -> ExternalWrenches,
+{
+    let mut workspace = AbaWorkspace::new(tree.links.len());
+    rk4_step_with_workspace(tree, gravity, dt, compute_ext_wrenches, &mut workspace);
+}
+
+pub(crate) fn rk4_step_with_workspace<F>(
+    tree: &mut Tree,
+    gravity: Vec3,
+    dt: f32,
+    mut compute_ext_wrenches: F,
+    workspace: &mut AbaWorkspace,
+) where
     F: FnMut(&Tree) -> ExternalWrenches,
 {
     let s0 = tree.clone();
@@ -1608,7 +1621,14 @@ where
     // k1
     let poses1 = forward_kinematics(&s0);
     let ext1 = compute_ext_wrenches(&s0);
-    let k1 = aba(&s0, &poses1, gravity, &ext1);
+    let k1 = aba_with_velocity_implicit_workspace(
+        &s0,
+        &poses1,
+        gravity,
+        &ext1,
+        VelocityImplicit::Explicit,
+        workspace,
+    );
     let (dq1, dv1) = tree_deriv(&s0, &k1);
     let da1 = muscle_activation_deriv(&s0);
 
@@ -1617,7 +1637,14 @@ where
     advance_muscle_activation(&mut s1, &s0, &da1, dt * 0.5);
     let poses2 = forward_kinematics(&s1);
     let ext2 = compute_ext_wrenches(&s1);
-    let k2 = aba(&s1, &poses2, gravity, &ext2);
+    let k2 = aba_with_velocity_implicit_workspace(
+        &s1,
+        &poses2,
+        gravity,
+        &ext2,
+        VelocityImplicit::Explicit,
+        workspace,
+    );
     let (dq2, dv2) = tree_deriv(&s1, &k2);
     let da2 = muscle_activation_deriv(&s1);
 
@@ -1626,7 +1653,14 @@ where
     advance_muscle_activation(&mut s2, &s0, &da2, dt * 0.5);
     let poses3 = forward_kinematics(&s2);
     let ext3 = compute_ext_wrenches(&s2);
-    let k3 = aba(&s2, &poses3, gravity, &ext3);
+    let k3 = aba_with_velocity_implicit_workspace(
+        &s2,
+        &poses3,
+        gravity,
+        &ext3,
+        VelocityImplicit::Explicit,
+        workspace,
+    );
     let (dq3, dv3) = tree_deriv(&s2, &k3);
     let da3 = muscle_activation_deriv(&s2);
 
@@ -1635,7 +1669,14 @@ where
     advance_muscle_activation(&mut s3, &s0, &da3, dt);
     let poses4 = forward_kinematics(&s3);
     let ext4 = compute_ext_wrenches(&s3);
-    let k4 = aba(&s3, &poses4, gravity, &ext4);
+    let k4 = aba_with_velocity_implicit_workspace(
+        &s3,
+        &poses4,
+        gravity,
+        &ext4,
+        VelocityImplicit::Explicit,
+        workspace,
+    );
     let (dq4, dv4) = tree_deriv(&s3, &k4);
     let da4 = muscle_activation_deriv(&s3);
 
