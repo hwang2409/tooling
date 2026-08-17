@@ -51,8 +51,8 @@ use crate::solver::{
     ConstraintRowDiagnostic, SolverConfig, SolverMode, TreeContactSolution, solve_free_bodies,
 };
 use crate::tree::{
-    Tree, euler_step as tree_euler_step, forward_kinematics as tree_forward_kinematics,
-    rk4_step as tree_rk4_step,
+    AbaWorkspace, Tree, euler_step_with_workspace as tree_euler_step_with_workspace,
+    forward_kinematics as tree_forward_kinematics, rk4_step as tree_rk4_step,
 };
 
 #[cfg(feature = "instrumentation")]
@@ -154,6 +154,8 @@ pub struct World {
     solver_phase_capture: bool,
     #[doc(hidden)]
     last_solver_phase: Option<SolverPhaseDiagnostics>,
+    #[doc(hidden)]
+    tree_aba_workspaces: Vec<AbaWorkspace>,
     #[cfg(feature = "instrumentation")]
     step_timings: StepTimings,
 }
@@ -276,6 +278,7 @@ impl World {
             contact_detection_count: std::cell::Cell::new(0),
             solver_phase_capture: false,
             last_solver_phase: None,
+            tree_aba_workspaces: Vec::new(),
             #[cfg(feature = "instrumentation")]
             step_timings: StepTimings::default(),
         }
@@ -677,6 +680,8 @@ impl World {
     /// Adds a tree and returns its stable index.
     pub fn add_tree(&mut self, tree: Tree) -> usize {
         let idx = self.trees.len();
+        self.tree_aba_workspaces
+            .push(AbaWorkspace::new(tree.links.len()));
         self.trees.push(tree);
         idx
     }
@@ -1283,6 +1288,14 @@ impl World {
         if self.trees.is_empty() {
             return;
         }
+        while self.tree_aba_workspaces.len() < self.trees.len() {
+            let index = self.tree_aba_workspaces.len();
+            self.tree_aba_workspaces
+                .push(AbaWorkspace::new(self.trees[index].links.len()));
+        }
+        for (workspace, tree) in self.tree_aba_workspaces.iter_mut().zip(&self.trees) {
+            workspace.ensure_len(tree.links.len());
+        }
         let dt = self.dt;
         let gravity = self.gravity;
         let solver_mode = self.solver.mode;
@@ -1334,21 +1347,28 @@ impl World {
             {
                 let bodies_ref = &self.bodies;
                 let geoms_ref = &self.geoms;
-                tree_euler_step(&mut tree, gravity, dt, implicit_fast, |state| {
-                    if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
-                        vec![(Vec3::ZERO, Vec3::ZERO); state.links.len()]
-                    } else {
-                        tree_wrenches_from_pairs(
-                            state,
-                            ti,
-                            bodies_ref,
-                            geoms_ref,
-                            &self.meshes,
-                            &self.hfields,
-                            &tree_pairs,
-                        )
-                    }
-                });
+                tree_euler_step_with_workspace(
+                    &mut tree,
+                    gravity,
+                    dt,
+                    implicit_fast,
+                    |state| {
+                        if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
+                            vec![(Vec3::ZERO, Vec3::ZERO); state.links.len()]
+                        } else {
+                            tree_wrenches_from_pairs(
+                                state,
+                                ti,
+                                bodies_ref,
+                                geoms_ref,
+                                &self.meshes,
+                                &self.hfields,
+                                &tree_pairs,
+                            )
+                        }
+                    },
+                    &mut self.tree_aba_workspaces[ti],
+                );
             }
             for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
                 tree.qfrc_applied[slot] -= delta;

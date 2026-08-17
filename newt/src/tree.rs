@@ -819,7 +819,8 @@ pub fn forward_kinematics(tree: &Tree) -> Vec<(Vec3, Quat)> {
 /// for the 3-DOF ball joint. Only one set is meaningful per link, decided
 /// by the link's `JointKind`; the other is left at its default and never
 /// read on that link's ABA arms.
-struct AbaWorkspace {
+#[derive(Clone, Debug)]
+pub(crate) struct AbaWorkspace {
     /// Motion transform from parent body frame to this link's body frame.
     xup: Vec<Xform>,
     /// Joint subspace basis (child-body-frame spatial motion per unit qdot)
@@ -862,7 +863,7 @@ struct AbaWorkspace {
 }
 
 impl AbaWorkspace {
-    fn new(n: usize) -> Self {
+    pub(crate) fn new(n: usize) -> Self {
         let zero_s3 = [SpatialMotion::ZERO; 3];
         let zero_f3 = [SpatialForce::ZERO; 3];
         Self {
@@ -882,6 +883,12 @@ impl AbaWorkspace {
             qddot_joint: vec![0.0; n],
             qddot_ball: vec![Vec3::ZERO; n],
             a: vec![SpatialMotion::ZERO; n],
+        }
+    }
+
+    pub(crate) fn ensure_len(&mut self, n: usize) {
+        if self.xup.len() != n {
+            *self = Self::new(n);
         }
     }
 }
@@ -971,10 +978,30 @@ fn aba_with_velocity_implicit(
     external_wrenches: &ExternalWrenches,
     velocity_implicit: VelocityImplicit,
 ) -> Vec<f32> {
+    let mut workspace = AbaWorkspace::new(tree.links.len());
+    aba_with_velocity_implicit_workspace(
+        tree,
+        poses,
+        gravity,
+        external_wrenches,
+        velocity_implicit,
+        &mut workspace,
+    )
+}
+
+fn aba_with_velocity_implicit_workspace(
+    tree: &Tree,
+    poses: &[(Vec3, Quat)],
+    gravity: Vec3,
+    external_wrenches: &ExternalWrenches,
+    velocity_implicit: VelocityImplicit,
+    workspace: &mut AbaWorkspace,
+) -> Vec<f32> {
     let n = tree.links.len();
     assert_eq!(poses.len(), n);
     assert_eq!(external_wrenches.len(), n);
-    let mut w = AbaWorkspace::new(n);
+    workspace.ensure_len(n);
+    let mut w = workspace;
 
     // --- Pass 1: compute Xup, S, v, c bottom-down. ---
     for i in 0..n {
@@ -1675,7 +1702,28 @@ pub fn euler_step<F>(
     gravity: Vec3,
     dt: f32,
     implicit_fast: bool,
+    compute_ext_wrenches: F,
+) where
+    F: FnMut(&Tree) -> ExternalWrenches,
+{
+    let mut workspace = AbaWorkspace::new(tree.links.len());
+    euler_step_with_workspace(
+        tree,
+        gravity,
+        dt,
+        implicit_fast,
+        compute_ext_wrenches,
+        &mut workspace,
+    );
+}
+
+pub(crate) fn euler_step_with_workspace<F>(
+    tree: &mut Tree,
+    gravity: Vec3,
+    dt: f32,
+    implicit_fast: bool,
     mut compute_ext_wrenches: F,
+    workspace: &mut AbaWorkspace,
 ) where
     F: FnMut(&Tree) -> ExternalWrenches,
 {
@@ -1686,7 +1734,7 @@ pub fn euler_step<F>(
     } else {
         VelocityImplicit::JointDamping { dt }
     };
-    let qddot = aba_with_velocity_implicit(tree, &poses, gravity, &ext, mode);
+    let qddot = aba_with_velocity_implicit_workspace(tree, &poses, gravity, &ext, mode, workspace);
     let mocap_root = tree.links.first().is_some_and(|link| link.mocap);
     for (i, qdot) in tree.qdot.iter_mut().enumerate() {
         let in_mocap_root = mocap_root && i < tree.links[0].joint.nv();
