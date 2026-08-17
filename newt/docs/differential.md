@@ -342,12 +342,10 @@ Verdict: the impedance finding is CLOSED. RK4 rows remain honest rows with
 measured bounds. Their residual is the documented constraint-ZOH versus
 per-stage reevaluation gap; see `docs/integrators.md`.
 
-The solver and equality goldens changed because their shared row bias now
-uses the source acceleration equation. The affected files are the six
-equality/condim goldens and the six PGS/Newton solver goldens. Penalty-mode
-goldens remain byte-identical. The shared tree `diagApprox` and `Rpy` change
-regenerated `solver_tree.bin` and `solver_newton_tree.bin`; the stack and
-incline bytes did not change.
+Earlier row-bias work changed the solver and equality goldens. NEWT-25 also
+changes the six PGS/Newton solver goldens, the penalty stack goldens, and the
+packaged `model_stack.bin`: all use plane contacts. This is an expected
+behavior change from the exact MuJoCo manifold, not a hidden solver tweak.
 
 ## Regeneration
 
@@ -402,7 +400,7 @@ measured result is:
 
 | scenario | steps | distance | cadence | mean step | clearance | self-contact steps |
 |---|---:|---:|---:|---:|---:|---:|
-| assisted biped, Newton tree contacts | 5,000 | `2.524537 m` | `117.60 bpm` | `0.373537 m` | `0.196953 m` | `0` |
+| assisted biped, Newton tree contacts | 5,000 | `2.523389 m` | `117.60 bpm` | `0.372897 m` | `0.200563 m` | `0` |
 
 These values are a disclosed re-measurement after the exact-bias and shared
 tree-regularization changes. CI records bands of `2.50..2.55 m` distance,
@@ -436,7 +434,7 @@ The chain fixtures are `tree_chain_contact_pgs_euler.bin` and
 `tools/capture_biped_mujoco.py`. Its 5,000-step run uses the source-faithful
 controller, `assist_scale=0.8`, and no debug state correction.
 
-## NEWT-24 biped v3 sweep
+## NEWT-25 biped v3 sweep and manifold closure
 
 The biped acceptance oracle uses MuJoCo `3.11.0`, Euler, Newton, pyramidal
 cones, 20 iterations, and `dt=0.005`. The source controller stays unchanged.
@@ -455,31 +453,32 @@ cargo test --manifest-path newt/Cargo.toml --test biped_walk_acceptance v3_full_
 
 | assist | source outcome | newt outcome | source fall | newt fall | compared steps | max qpos gap | max qvel gap |
 |---:|---|---|---:|---:|---:|---:|---:|
-| `0.8` | complete | complete | — | — | `5,000` | `3.60056e-1` | `4.86051e0` |
-| `0.4` | fallen | fallen | `756` | `553` | `553` | `1.15385e0` | `6.73314e0` |
-| `0.2` | fallen | fallen | `492` | `469` | `469` | `9.01380e-1` | `6.85567e0` |
-| `0.0` | fallen | fallen | `578` | `442` | `442` | `1.14941e0` | `6.40730e0` |
+| `0.8` | complete | complete | — | — | `5,000` | `3.54990e-1` | `4.83753e0` |
+| `0.4` | fallen | fallen | `756` | `551` | `551` | `1.15327e0` | `6.69538e0` |
+| `0.2` | fallen | fallen | `492` | `472` | `472` | `9.03753e-1` | `6.88275e0` |
+| `0.0` | fallen | fallen | `578` | `439` | `439` | `1.15190e0` | `6.40614e0` |
 
-The outcome class matches at all four levels. The `0.4` row is the acceptance
-failure because MuJoCo falls at `756` while newt falls at `553`, outside the
-fall-step bound. The no-assist oracle also falls, so stable no-assist walking
-is not a valid target for this source controller.
+The outcome class matches at all four levels. The `0.4` row remains the
+acceptance failure: the fall-step gap is `756 - 551 = 205`, versus `203`
+before the manifold update. The no-assist oracle also falls, so stable
+no-assist walking is not a valid target for this source controller.
 
-The first remaining gap is contact timing and manifold selection. The visual
-contact masks first differ at step `12`. With the controller's `0.035 m`
-support threshold, newt reports right-foot contact at step `17` while MuJoCo
-does not. At step `25`,
-MuJoCo has one right-foot contact and four pyramid rows. Newt has two contacts
-and eight rows. Their maximum generalized-force difference is `182.518`.
-At step `36`, both have four contacts and 16 rows, but their maximum
-generalized-force difference is `542.575`. The source and newt row reference
-acceleration maxima at step `25` are `124.283` and `140.555`.
+status: the NEWT-24 manifold finding is closed for the early diagnostic
+window. The step-12 visual divergence is closed. Both sides use the source `0.035 m`
+support threshold, and masks match through step `12`; the first later mask
+difference is step `13`. At step `25`, both have two right-foot contacts and
+eight pyramid rows. At step `36`, both have four contacts and 16 rows. The
+post-step source and newt qfrc maxima are `138.844` and `174.299` at step 25,
+then `515.329` and `537.563` at step 36. The row reference-acceleration
+maxima at step 25 are `95.700` and `140.604`.
 
 The source-side contact and row records are in
 `tests/references/biped_walk_v3_diagnostics.json`. Records cover step `0`
-through `40`, including the first visual mismatch window. The selected newt
-records are in `tests/references/biped_walk_v3_newt_diagnostics.json`. Each
-contact stores the geom pair, point, normal, condim, frame, and row mapping.
+through `40`, including the first visual mismatch window. The source capture
+calls `mj_forward` after each step so contact geometry uses the post-step
+state. The selected newt records are in
+`tests/references/biped_walk_v3_newt_diagnostics.json`. Each contact stores
+the geom pair, point, depth, normal, condim, frame, and row mapping.
 The newt diagnostic runner is `examples/biped_walk_diagnostics`; it prints
 steps `0..12`, `17`, `25`, and `36` with the same geom-level fields. It calls
 `solver::solve_tree_contacts`, the NEWT-23 row assembly path.

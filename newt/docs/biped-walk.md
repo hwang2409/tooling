@@ -130,7 +130,7 @@ the source reports its torso body origin. newt reports its root com.
 | `joint_walk` | source mujoco | 1000 | 0.0 | `0.050958` | `84.00` | `0.478817` | `0.196834` | `0.895/0.885` | `0.137258` | 0 | `1.090112` |
 | `joint_walk` | newt | 1000 | 0.0 | `-1.4245` | `72.00` | `0.3805` | `0.2295` | `0.735/0.851` | `0.4213` | 0 | `0.1439` |
 | `stable_joint_walk` | source mujoco | 5000 | 0.8 | `2.260855` | `117.60` | `0.499528` | `0.109163` | `0.668/0.764` | `0.212095` | 0 | `0.988434` |
-| `stable_joint_walk` | newt | 5000 | 0.8 | `2.524537` | `117.60` | `0.373537` | `0.114487` | `0.666/0.686` | `0.196953` | 0 | `0.9255` |
+| `stable_joint_walk` | newt | 5000 | 0.8 | `2.523389` | `117.60` | `0.372897` | `0.114431` | `0.666/0.686` | `0.200563` | 0 | `0.9255` |
 
 the source and newt definitions use the same metric formulas. both now define
 contact from heel/toe height at `0.035 m`. contact events use a
@@ -155,10 +155,10 @@ the full acceptance run uses 5000 steps and `assist_scale=0.8`:
 
 | metric | result | requirement |
 | --- | ---: | ---: |
-| distance | `2.524537 m` | `2.50..2.55 m` |
+| distance | `2.523389 m` | `2.50..2.55 m` |
 | cadence | `117.60 bpm` | `116..119 bpm` |
 | mean step length | `0.373537 m` | `0.36..0.39 m` |
-| max foot clearance | `0.196953 m` | `0.19..0.21 m` |
+| max foot clearance | `0.200563 m` | `0.19..0.21 m` |
 | self-contact force steps | `0` | `0` |
 
 ### v3 no-assist acceptance sweep
@@ -187,45 +187,50 @@ regression bounds. these bounds are not parity claims.
 
 | assist | MuJoCo outcome | newt outcome | MuJoCo fall step | newt fall step | MuJoCo distance m | newt distance m | MuJoCo cadence bpm | newt cadence bpm | MuJoCo step m | newt step m | MuJoCo clearance m | newt clearance m |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `0.8` | walks | walks | — | — | `2.258638` | `2.524537` | `117.60` | `117.60` | `0.489715` | `0.373536` | `0.216504` | `0.196953` |
-| `0.4` | falls | falls | `756` | `553` | `0.553179` | `3.223390` | `79.37` | `122.40` | `0.532088` | `0.105318` | `0.224684` | `0.169206` |
-| `0.2` | falls | falls | `492` | `469` | `-0.123535` | `0.957340` | `73.17` | `52.80` | `0.734206` | `0.198833` | `0.137381` | `0.502567` |
-| `0.0` | falls | falls | `578` | `442` | `-0.694926` | `0.270446` | `83.04` | `7.20` | `0.813246` | `0.916760` | `0.165822` | `0.396145` |
+| `0.8` | walks | walks | — | — | `2.258638` | `2.523389` | `117.60` | `117.60` | `0.489715` | `0.372897` | `0.216504` | `0.200563` |
+| `0.4` | falls | falls | `756` | `551` | `0.553179` | `3.199486` | `79.37` | `129.60` | `0.532088` | `0.099338` | `0.224684` | `0.182692` |
+| `0.2` | falls | falls | `492` | `472` | `-0.123535` | `0.901319` | `73.17` | `45.60` | `0.734206` | `0.132662` | `0.137381` | `0.493977` |
+| `0.0` | falls | falls | `578` | `439` | `-0.694926` | `0.238266` | `83.04` | `4.80` | `0.813246` | `0.831020` | `0.165822` | `0.425592` |
 
 the source falls at no assist, so a stable no-assist target is not available.
-the outcome class matches at all four levels. newt falls too early at `0.4`,
-so its measured fall-step bound fails MUST. TARGET is not reached.
+the outcome class matches at all four levels. newt falls at `551` for assist
+`0.4`, so the `203`-step gap changed to `205` steps and still fails MUST.
+the manifold update did not improve the fall-step result. TARGET is not
+reached.
 
-the current diagnosis is a contact-manifold and state-timing gap. at the
-visual contact masks first differ at step `12`.
-using the controller's `0.035 m` support threshold, source reaches right-foot
-contact at step `18`; newt reaches it at step `17`. at step `25`, source has one active
-right-foot contact and four pyramid rows. newt has two active right-foot
-contacts and eight rows. source and newt `qfrc_constraint` maxima are
-`110.342` and `173.762`; their maximum generalized-force delta is
-`182.518`. the NEWT-23 row diagnostic path reports source reference-accel
-maximum `124.283` and newt `140.555` at this state.
+status: the NEWT-24 manifold finding is closed for the early diagnostic
+window. the step-12 visual divergence is closed. both fixtures use the source
+`0.035 m` support threshold, and masks match through step `12`. the first
+later mask difference is step `13`. at step `17`, both report right-foot
+support. the residual is a closed-loop state gap, not a contact-threshold
+tuning change.
 
-the source diagnostic records no physical pair at step `12`. at step `25`,
-source has one `ground/right_foot_geom` pair and four rows; newt has two of
-the same pair and eight rows. the source normal is `+z`; newt's contact
-normal follows its `from B into A` convention and is `-z`. both records store
-the contact point, normal, condim, frame, and row-to-contact mapping.
+the diagnostics now refresh MuJoCo contacts with `mj_forward` after each
+step. This matches newt's post-step `detect_contacts` timing. At step `25`,
+both sides have two right-foot contacts and eight pyramid rows. Source and
+newt `qfrc_constraint` maxima are `138.844` and `174.299`; row reference-
+acceleration maxima are `95.700` and `140.604`.
+
+the source and newt diagnostic records have no physical pair at step `12`.
+At step `25`, both have two `ground/right_foot_geom` contacts and eight rows.
+The source-facing records use a `+z` normal. Newt keeps its internal
+`from B into A` convention and flips only the diagnostic view. Both records
+store the contact point, depth, normal, condim, frame, and row mapping.
 
 at step `36`, both sides have four contacts and 16 rows. the source and newt
-generalized-force maxima are `493.388` and `537.673`; their maximum delta is
-`542.575`. the contact count matches by then, but the closed-loop states do
-not. this explains why exact isolated row factors do not prove trajectory
-parity.
+generalized-force maxima are `515.329` and `537.563`; row reference-
+acceleration maxima are `98.033` and `86.734`. The contact counts and order
+match, but the closed-loop states do not. Exact isolated row factors still do
+not prove trajectory parity.
 
 the measured trace gaps through the newt fall are:
 
 | assist | compared steps | max qpos gap | max qvel gap | status |
 | ---: | ---: | ---: | ---: | --- |
-| `0.8` | `5000` | `0.360056` | `4.860505` | current gap; both complete |
-| `0.4` | `553` | `1.153848` | `6.733136` | current gap; fall-step bound miss |
-| `0.2` | `469` | `0.901380` | `6.855671` | current gap; fall step mismatch |
-| `0.0` | `442` | `1.149408` | `6.407299` | current gap; fall step mismatch |
+| `0.8` | `5000` | `0.354990` | `4.837531` | current gap; both complete |
+| `0.4` | `551` | `1.153268` | `6.695380` | current gap; fall-step bound miss |
+| `0.2` | `472` | `0.903753` | `6.882749` | current gap; fall step mismatch |
+| `0.0` | `439` | `1.151902` | `6.406135` | current gap; fall step mismatch |
 
 the source contact and row records are in
 `tests/references/biped_walk_v3_diagnostics.json`; the matched newt records
