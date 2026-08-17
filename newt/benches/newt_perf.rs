@@ -3,6 +3,7 @@ use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use newt::benchmark::nearest_rank_percentile;
 use newt::mjcf::load_mjcf_path;
 use newt::model::load_from_path;
 use newt::solver::{ConeKind, SolverMode};
@@ -130,8 +131,7 @@ impl Stats {
     }
 
     fn percentile_ns(&self, fraction: f64) -> u128 {
-        let index = (fraction * (self.samples_ns.len() - 1) as f64).floor() as usize;
-        self.samples_ns[index]
+        nearest_rank_percentile(&self.samples_ns, fraction)
     }
 
     fn median_ns(&self) -> u128 {

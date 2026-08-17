@@ -101,7 +101,7 @@ the optimization commits are independent and reversible:
 | commit | change | measured result |
 | --- | --- | --- |
 | `5969385` | reuse the ABA workspace for Euler steps | muscle PGS: 829.2 → 573.9 ns/step, 30.8% faster; muscle Newton: 828.9 → 562.1 ns/step, 32.2% faster |
-| `e2f6ee6` | reuse the ABA workspace across RK4 stages | tendon penalty: 6,455.2 → 4,797.5 ns/step, 25.7% faster; muscle penalty: 3,401.2 → 2,542.1 ns/step, 25.3% faster |
+| `7e8db92` | reuse the ABA workspace across RK4 stages | this result is hardware- and load-sensitive. on this machine, matched repetitions measured 5,887.2–6,725.0 → 4,715.4–4,866.2 ns/step, or 19.9%–28.7% faster. the reviewer machine measured 5,403.5 → 5,385.5 ns/step back-to-back, or 0.3% faster; its separate full-suite run measured 4,572.2 ns/step, or 15.4% faster. |
 
 both changes reuse scratch storage only. they do not change arithmetic order.
 the full differential suite and all byte-identity golden suites passed after
@@ -150,7 +150,12 @@ with `cfg(feature = "instrumentation")`. A repeated feature-off
 ns/step because it records five `Instant` values per step. This is expected
 instrumentation cost and is absent from the default binary.
 
-the optimized workspace does not make a zero-allocation claim for the full
-public `World::step` path. contact buffers, poses, and acceleration results
-still allocate in existing paths. The guard is byte identity, not an
-allocation count.
+the optimized Euler muscle path has a test-feature allocation guard. after
+three warmup steps, sixteen steady-state steps each make twelve allocation
+events. the guard checks both the stable count and the current count of twelve.
+the remaining events are existing tendon, external-force, and acceleration
+result buffers. run it with:
+
+```text
+cargo test --manifest-path newt/Cargo.toml --test alloc_guard --features alloc-guard
+```
