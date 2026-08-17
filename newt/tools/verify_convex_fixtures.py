@@ -93,21 +93,6 @@ def inverse_rotate(quaternion: list[float], vector: list[float]) -> list[float]:
     ]
 
 
-def quaternion_multiply(left: list[float], right: list[float]) -> list[float]:
-    lw, lx, ly, lz = left
-    rw, rx, ry, rz = right
-    return [
-        lw * rw - lx * rx - ly * ry - lz * rz,
-        lw * rx + lx * rw + ly * rz - lz * ry,
-        lw * ry - lx * rz + ly * rw + lz * rx,
-        lw * rz + lx * ry - ly * rx + lz * rw,
-    ]
-
-
-def quaternion_conjugate(quaternion: list[float]) -> list[float]:
-    return [quaternion[0], -quaternion[1], -quaternion[2], -quaternion[3]]
-
-
 def dot(left: list[float], right: list[float]) -> float:
     return sum(left[index] * right[index] for index in range(3))
 
@@ -148,30 +133,18 @@ def basis_coordinates(basis: tuple[list[float], list[float], list[float]], vecto
     return [dot(axis, vector) for axis in basis]
 
 
-def body_frame_contact(body_pose: dict, geom_pose: dict, mesh: dict, contact: dict) -> dict:
+def body_frame_contact(body_pose: dict, mesh: dict, contact: dict) -> dict:
     body_position = body_pose["position"]
     body_orientation = body_pose["orientation_wxyz"]
     relative_position = inverse_rotate(
         body_orientation,
         subtract(contact["position"], body_position),
     )
-    geom_position = inverse_rotate(
-        body_orientation,
-        subtract(geom_pose["position"], body_position),
-    )
-    relative_position = subtract(relative_position, geom_position)
-    relative_orientation = quaternion_multiply(
-        quaternion_conjugate(body_orientation), geom_pose["orientation_wxyz"]
-    )
-    mesh_position = inverse_rotate(relative_orientation, relative_position)
-    mesh_normal = inverse_rotate(
-        relative_orientation,
-        inverse_rotate(body_orientation, contact["frame_normal"]),
-    )
+    mesh_normal = inverse_rotate(body_orientation, contact["frame_normal"])
     basis = mesh_basis(mesh)
     return {
         "geom": tuple(contact["geom"]),
-        "position": basis_coordinates(basis, mesh_position),
+        "position": basis_coordinates(basis, relative_position),
         "frame_normal": basis_coordinates(basis, mesh_normal),
         "penetration": float(contact["penetration"]),
     }
@@ -179,12 +152,11 @@ def body_frame_contact(body_pose: dict, geom_pose: dict, mesh: dict, contact: di
 
 def sorted_body_frame_contacts(
     body_pose: dict,
-    geom_pose: dict,
     mesh: dict,
     contacts: list[dict],
 ) -> list[dict]:
     transformed = [
-        body_frame_contact(body_pose, geom_pose, mesh, contact)
+        body_frame_contact(body_pose, mesh, contact)
         for contact in contacts
     ]
     return sorted(
@@ -296,13 +268,11 @@ def compare_route_oracle(
             if mesh_pair:
                 committed_contacts = sorted_body_frame_contacts(
                     committed_pose["body_pose_b"],
-                    committed_pose["pose_b"],
                     committed_probe["mesh"],
                     committed_pose["contacts"],
                 )
                 fresh_contacts = sorted_body_frame_contacts(
                     fresh_pose["body_pose_b"],
-                    fresh_pose["pose_b"],
                     fresh_probe["mesh"],
                     fresh_pose["contacts"],
                 )
