@@ -298,12 +298,12 @@ This tolerance is separate from the committed Newt
 parity bounds. Mesh-local route pose orientations are excluded from the CI
 value comparison because MuJoCo's mesh compiler can choose different
 principal-axis frames across platforms. Mesh contact positions and normals are
-transformed into the owning body frame by subtracting the body position and
-applying the inverse body rotation. CI compares all three components of each
-transformed vector. It uses geometry and penetration rank for stable contact
-correspondence, then full transformed vectors as tie-breakers. It compares the
-complete body-frame vectors after correspondence. The Rust fixture keeps
-world-frame values for route replay.
+transformed by subtracting the owning body position and applying the inverse
+owning compiled-geom rotation. This canonicalizes the mesh compiler frame
+while retaining all three vector components. CI uses geometry and penetration
+rank for stable contact correspondence, then full transformed vectors as
+tie-breakers. It compares the complete canonical vectors after correspondence.
+The Rust fixture keeps world-frame values for route replay.
 The verifier also runs a non-max sample mutation self-test in CI. The Rust
 fixture test also recomputes both maxima and requires exact float32 equality
 between each stored position/orientation bound and its stored maximum plus

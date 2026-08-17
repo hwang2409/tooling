@@ -93,7 +93,7 @@ def inverse_rotate(quaternion: list[float], vector: list[float]) -> list[float]:
     ]
 
 
-def body_frame_contact(body_pose: dict, contact: dict) -> dict:
+def body_frame_contact(body_pose: dict, geom_pose: dict, contact: dict) -> dict:
     relative_position = [
         contact["position"][index] - body_pose["position"][index]
         for index in range(3)
@@ -101,17 +101,21 @@ def body_frame_contact(body_pose: dict, contact: dict) -> dict:
     return {
         "geom": tuple(contact["geom"]),
         "position": inverse_rotate(
-            body_pose["orientation_wxyz"], relative_position
+            geom_pose["orientation_wxyz"], relative_position
         ),
         "frame_normal": inverse_rotate(
-            body_pose["orientation_wxyz"], contact["frame_normal"]
+            geom_pose["orientation_wxyz"], contact["frame_normal"]
         ),
         "penetration": float(contact["penetration"]),
     }
 
 
-def sorted_body_frame_contacts(body_pose: dict, contacts: list[dict]) -> list[dict]:
-    transformed = [body_frame_contact(body_pose, contact) for contact in contacts]
+def sorted_body_frame_contacts(
+    body_pose: dict, geom_pose: dict, contacts: list[dict]
+) -> list[dict]:
+    transformed = [
+        body_frame_contact(body_pose, geom_pose, contact) for contact in contacts
+    ]
     return sorted(
         transformed,
         key=lambda contact: (
@@ -220,10 +224,14 @@ def compare_route_oracle(
             mesh_pair = "mesh" in committed_probe["pair"]
             if mesh_pair:
                 committed_contacts = sorted_body_frame_contacts(
-                    committed_pose["body_pose_b"], committed_pose["contacts"]
+                    committed_pose["body_pose_b"],
+                    committed_pose["pose_b"],
+                    committed_pose["contacts"],
                 )
                 fresh_contacts = sorted_body_frame_contacts(
-                    fresh_pose["body_pose_b"], fresh_pose["contacts"]
+                    fresh_pose["body_pose_b"],
+                    fresh_pose["pose_b"],
+                    fresh_pose["contacts"],
                 )
             else:
                 committed_contacts = committed_pose["contacts"]
