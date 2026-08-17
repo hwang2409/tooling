@@ -17,7 +17,6 @@ PROBES = (
         "pair": "sphere-ellipsoid",
         "route": "mjc_Convex",
         "source_xml": "contact_route_sphere_ellipsoid.xml",
-        "bounds": {"count_delta": 0, "position": 0.11, "normal": 0.0001, "penetration": 0.0001},
         "cases": (
             ("no_contact", "sphere_no_contact", "ellipsoid_no_contact"),
             ("shallow", "sphere_shallow", "ellipsoid_shallow"),
@@ -30,7 +29,6 @@ PROBES = (
         "pair": "sphere-mesh",
         "route": "mjc_Convex",
         "source_xml": "contact_route_sphere_mesh.xml",
-        "bounds": {"count_delta": 0, "position": 0.11, "normal": 0.0001, "penetration": 0.0001},
         "cases": (
             ("no_contact", "sphere_no_contact", "mesh_no_contact"),
             ("shallow", "sphere_shallow", "mesh_shallow"),
@@ -43,7 +41,6 @@ PROBES = (
         "pair": "plane-ellipsoid",
         "route": "mjc_PlaneConvex",
         "source_xml": "contact_route_plane_ellipsoid.xml",
-        "bounds": {"count_delta": 0, "position": 0.12, "normal": 0.0001, "penetration": 0.0001},
         "cases": (
             ("no_contact", "plane", "ellipsoid_no_contact"),
             ("shallow", "plane", "ellipsoid_shallow"),
@@ -56,7 +53,6 @@ PROBES = (
         "pair": "plane-mesh",
         "route": "mjc_PlaneConvex",
         "source_xml": "contact_route_plane_mesh.xml",
-        "bounds": {"count_delta": 0, "position": 0.18, "normal": 0.0001, "penetration": 0.0001},
         "cases": (
             ("no_contact", "plane", "mesh_no_contact"),
             ("shallow", "plane", "mesh_shallow"),
@@ -69,7 +65,6 @@ PROBES = (
         "pair": "box-mesh",
         "route": "mjc_Convex",
         "source_xml": "contact_route_box_mesh.xml",
-        "bounds": {"count_delta": 0, "position": 1.0e-6, "normal": 1.01, "penetration": 1.0e-6},
         "cases": (
             ("no_contact", "box_no_contact", "mesh_no_contact"),
             ("shallow", "box_shallow", "mesh_shallow"),
@@ -82,12 +77,12 @@ PROBES = (
         "pair": "mesh-mesh",
         "route": "mjc_Convex",
         "source_xml": "contact_route_mesh_mesh.xml",
-        "bounds": {"count_delta": 0, "position": 1.0e-6, "normal": 1.0e-5, "penetration": 1.0e-6},
         "cases": (
             ("no_contact", "mesh_a_no_contact", "mesh_b_no_contact"),
             ("shallow", "mesh_a_shallow", "mesh_b_shallow"),
             ("deep", "mesh_a_deep", "mesh_b_deep"),
             ("off_axis_rotated", "mesh_a_off_axis", "mesh_b_off_axis"),
+            ("near_touch", "mesh_a_near_touch", "mesh_b_near_touch"),
         ),
     },
 )
@@ -159,7 +154,6 @@ def capture(mujoco, references: Path) -> dict:
                 "pair": probe["pair"],
                 "mujoco_route": probe["route"],
                 "source_xml": source_xml,
-                "bounds": probe["bounds"],
                 "poses": poses,
                 "mesh": (
                     {

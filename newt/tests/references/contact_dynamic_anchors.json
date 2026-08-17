@@ -11,69 +11,9 @@
   },
   "cases": [
     {
-      "id": "box-mesh-drop",
-      "source_xml": "contact_dynamic_box_mesh.xml",
-      "route": "mjc_Convex",
-      "bounds": {
-        "early": {"position": 0.9, "orientation": 1.1, "contact_count": 3},
-        "full": {"position": 0.4, "orientation": 1.1, "contact_count": 3}
-      },
-      "samples": [
-        {
-          "step": 0,
-          "position": [
-            0.0,
-            0.0,
-            0.1
-          ],
-          "orientation_wxyz": [
-            1.0,
-            0.0,
-            0.0,
-            0.0
-          ],
-          "contacts": 4
-        },
-        {
-          "step": 20,
-          "position": [
-            -0.4539252101074332,
-            -0.006370136677953394,
-            0.06823497910044439
-          ],
-          "orientation_wxyz": [
-            0.9997537568239062,
-            -0.0005395107011647574,
-            0.010533421058115782,
-            0.019523874756372454
-          ],
-          "contacts": 0
-        },
-        {
-          "step": 100,
-          "position": [
-            -2.407815520359535,
-            -0.03368441682654908,
-            -1.0315560065287974
-          ],
-          "orientation_wxyz": [
-            0.9928008852480639,
-            -0.0031237050576677187,
-            0.0642932966988448,
-            0.10100998325397165
-          ],
-          "contacts": 0
-        }
-      ]
-    },
-    {
       "id": "mesh-mesh-tumble",
       "source_xml": "contact_dynamic_mesh_mesh.xml",
       "route": "mjc_Convex",
-      "bounds": {
-        "early": {"position": 0.1, "orientation": 0.1, "contact_count": 1},
-        "full": {"position": 0.3, "orientation": 0.3, "contact_count": 1}
-      },
       "samples": [
         {
           "step": 0,

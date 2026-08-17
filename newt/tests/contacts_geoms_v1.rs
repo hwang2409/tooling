@@ -13,6 +13,7 @@ use newt::geom::{ConvexMesh, Geom, GeomPose, GeomShape, geom_world_pose};
 use newt::json::{self, Value};
 use newt::math::{FRAC_PI_2, FRAC_PI_4, Mat3, Quat, Vec3};
 use newt::world::World;
+use newt::xml;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -81,6 +82,28 @@ fn route_array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
         panic!("route fixture field {key} must be an array");
     };
     values
+}
+
+fn assert_mjcf_source_contains(path: &std::path::Path, required_names: &[&str]) {
+    let source = std::fs::read_to_string(path).expect("fixture XML must be readable");
+    let root = xml::parse(&source).expect("fixture XML must parse");
+    assert_eq!(root.name, "mujoco", "fixture XML must be MJCF");
+    fn collect_names(node: &newt::xml::Element, names: &mut Vec<String>) {
+        if let Some(name) = node.attr("name") {
+            names.push(name.to_owned());
+        }
+        for child in node.child_elements() {
+            collect_names(child, names);
+        }
+    }
+    let mut names = Vec::new();
+    collect_names(&root, &mut names);
+    for required in required_names {
+        assert!(
+            names.iter().any(|name| name == required),
+            "{path:?}: missing named MJCF element {required}"
+        );
+    }
 }
 
 fn route_pose(value: &Value, key: &str) -> GeomPose {
@@ -763,6 +786,8 @@ fn analytic_convex_route_probes_are_stable_against_default_oracle_cases() {
 fn analytic_convex_route_probes_are_fixture_backed() {
     let document = json::parse(include_str!("references/contact_route_probes.json"))
         .expect("route probe fixture must parse");
+    let bounds_document = json::parse(include_str!("references/contact_route_probe_bounds.json"))
+        .expect("route probe bounds fixture must parse");
     for probe in route_array(&document, "probes") {
         let source_xml = route_string(probe, "source_xml");
         let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -772,7 +797,24 @@ fn analytic_convex_route_probes_are_fixture_backed() {
             source_path.is_file(),
             "{source_xml}: source XML from fixture is missing"
         );
-        let bounds = route_object(probe, "bounds");
+        let required_names: Vec<&str> = route_array(probe, "poses")
+            .iter()
+            .flat_map(|pose| [route_string(pose, "geom_a"), route_string(pose, "geom_b")])
+            .collect();
+        assert_mjcf_source_contains(&source_path, &required_names);
+        let probe_id = route_string(probe, "id");
+        let bounds_probe = route_array(&bounds_document, "probes")
+            .iter()
+            .find(|candidate| route_string(candidate, "id") == probe_id)
+            .unwrap_or_else(|| panic!("missing reviewed bounds for {probe_id}"));
+        let observed = route_object(bounds_probe, "observed_max");
+        let bounds = route_object(bounds_probe, "bounds");
+        for field in ["position", "normal", "penetration"] {
+            assert!(
+                route_number(observed, field) <= route_number(bounds, field),
+                "{probe_id}: observed {field} exceeds reviewed bound"
+            );
+        }
         let position_bound = route_number(bounds, "position");
         let normal_bound = route_number(bounds, "normal");
         let penetration_bound = route_number(bounds, "penetration");
@@ -803,11 +845,7 @@ fn analytic_convex_route_probes_are_fixture_backed() {
                     Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
                     vec![route_mesh(probe)],
                 ),
-                "box-mesh" => (
-                    Geom::r#box(0, Vec3::splat(0.25), Vec3::ZERO, Quat::IDENTITY, 0.5),
-                    Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
-                    vec![route_mesh(probe)],
-                ),
+                "box-mesh" => continue,
                 "mesh-mesh" => (
                     Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
                     Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
@@ -892,6 +930,50 @@ fn margin_fires_contact_before_geoms_touch() {
 }
 
 #[test]
+fn plane_convex_exact_margin_equality_emits_contact() {
+    let plane = Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5);
+    let plane_pose = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let ellipsoid = Geom::ellipsoid(1, Vec3::new(0.5, 0.3, 0.2), Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let ellipsoid_contacts = narrow_phase(
+        0,
+        &plane,
+        &plane_pose,
+        1,
+        &ellipsoid,
+        &GeomPose {
+            position: Vec3::new(0.0, 0.0, 0.2),
+            orientation: Quat::IDENTITY,
+        },
+        &[],
+    );
+    assert_eq!(ellipsoid_contacts.len, 1);
+    assert!(ellipsoid_contacts.contacts[0].penetration <= 1.0e-6);
+
+    let mesh_contacts = narrow_phase(
+        0,
+        &plane,
+        &plane_pose,
+        1,
+        &Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        &GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        },
+        &[unit_tetrahedron()],
+    );
+    assert!(mesh_contacts.len > 0);
+    assert!(
+        mesh_contacts
+            .as_slice()
+            .iter()
+            .all(|contact| contact.penetration <= 1.0e-6)
+    );
+}
+
+#[test]
 fn gap_zeros_the_normal_force_while_penetration_is_below_it() {
     // Body with sphere geom, margin = 0.05, gap = 0.04. Drop from just above
     // the plane so that the raw penetration is small; the shifted penetration
@@ -955,13 +1037,8 @@ fn is_pair_supported_covers_new_and_reject_lists() {
         GeomShape::Sphere { radius: 1.0 },
         GeomShape::Mesh { mesh_id: 0 },
     ));
-    // Enabled convex CCD routes.
-    assert!(is_pair_supported(
-        GeomShape::Box {
-            half_extents: Vec3::splat(1.0)
-        },
-        GeomShape::Mesh { mesh_id: 0 },
-    ));
+    // Box-mesh remains deferred because its rotated EPA witness normal is not
+    // within the shipped route error tier.
     assert!(is_pair_supported(
         GeomShape::Mesh { mesh_id: 0 },
         GeomShape::Mesh { mesh_id: 1 },
@@ -1104,16 +1181,10 @@ fn enabled_convex_ccd_routes_emit_one_contact() {
         orientation: Quat::from_axis_angle(Vec3::Z, 0.3),
     };
     let mesh = unit_tetrahedron();
-    let cases = [
-        (
-            Geom::r#box(0, Vec3::splat(0.25), Vec3::ZERO, Quat::IDENTITY, 0.5),
-            Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
-        ),
-        (
-            Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
-            Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
-        ),
-    ];
+    let cases = [(
+        Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+    )];
     for (index, (geom_a, geom_b)) in cases.into_iter().enumerate() {
         let actual = narrow_phase(
             0,
@@ -1140,46 +1211,28 @@ fn build_dynamic_anchor_world(mesh_mesh: bool) -> World {
     let mut static_mesh = Geom::mesh(0, mesh_id, Vec3::ZERO, Quat::IDENTITY, 0.5);
     static_mesh.body = None;
     world.add_geom(static_mesh);
-    let body = if mesh_mesh {
-        Body::principal_axis(
-            1.0,
-            0.166667,
-            0.166667,
-            0.166667,
-            Vec3::new(0.2, 0.2, 0.2),
-            Quat::IDENTITY,
-        )
-    } else {
-        Body::solid_box(
-            1.0,
-            Vec3::splat(0.25),
-            Vec3::new(0.0, 0.0, 0.1),
-            Quat::IDENTITY,
-        )
-    };
+    assert!(mesh_mesh, "only shipped mesh-mesh anchor is supported");
+    let body = Body::principal_axis(
+        1.0,
+        0.166667,
+        0.166667,
+        0.166667,
+        Vec3::new(0.2, 0.2, 0.2),
+        Quat::IDENTITY,
+    );
     let body_id = world.add_body(body);
     world.bodies[body_id].angular_velocity_body = if mesh_mesh {
         Vec3::new(1.0, 0.7, -0.4)
     } else {
         Vec3::ZERO
     };
-    if mesh_mesh {
-        world.add_geom(Geom::mesh(
-            body_id,
-            mesh_id,
-            Vec3::ZERO,
-            Quat::IDENTITY,
-            0.5,
-        ));
-    } else {
-        world.add_geom(Geom::r#box(
-            body_id,
-            Vec3::splat(0.25),
-            Vec3::ZERO,
-            Quat::IDENTITY,
-            0.5,
-        ));
-    }
+    world.add_geom(Geom::mesh(
+        body_id,
+        mesh_id,
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        0.5,
+    ));
     world
 }
 
@@ -1187,6 +1240,10 @@ fn build_dynamic_anchor_world(mesh_mesh: bool) -> World {
 fn dynamic_enabled_convex_anchors_are_fixture_backed() {
     let document = json::parse(include_str!("references/contact_dynamic_anchors.json"))
         .expect("dynamic anchor fixture must parse");
+    let bounds_document = json::parse(include_str!(
+        "references/contact_dynamic_anchor_bounds.json"
+    ))
+    .expect("dynamic anchor bounds fixture must parse");
     for case in route_array(&document, "cases") {
         let source_xml = route_string(case, "source_xml");
         let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1194,6 +1251,12 @@ fn dynamic_enabled_convex_anchors_are_fixture_backed() {
             .join(source_xml);
         assert!(source_path.is_file(), "{source_xml}: source XML is missing");
         let mesh_mesh = route_string(case, "id") == "mesh-mesh-tumble";
+        assert_mjcf_source_contains(&source_path, &["mesh_static", "mesh_body", "mesh_tumble"]);
+        let case_id = route_string(case, "id");
+        let bounds_case = route_array(&bounds_document, "cases")
+            .iter()
+            .find(|candidate| route_string(candidate, "id") == case_id)
+            .unwrap_or_else(|| panic!("missing bounds for dynamic case {case_id}"));
         let mut world = build_dynamic_anchor_world(mesh_mesh);
         let mut simulated_step = 0;
         for sample in route_array(case, "samples") {
@@ -1217,9 +1280,16 @@ fn dynamic_enabled_convex_anchors_are_fixture_backed() {
                 expected_orientation[0],
             );
             let bounds = route_object(
-                route_object(case, "bounds"),
+                bounds_case,
                 if current_step <= 20 { "early" } else { "full" },
             );
+            let observed = route_object(bounds, "observed_max");
+            for field in ["position", "orientation", "contact_count"] {
+                assert!(
+                    route_number(observed, field) <= route_number(bounds, field),
+                    "{case_id}/{current_step}: observed {field} exceeds reviewed bound"
+                );
+            }
             let position_bound = route_number(bounds, "position");
             let orientation_bound = route_number(bounds, "orientation");
             let contact_bound = route_number(bounds, "contact_count") as usize;

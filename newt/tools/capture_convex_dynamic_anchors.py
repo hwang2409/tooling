@@ -12,7 +12,6 @@ import numpy as np
 
 
 CASES = (
-    ("box-mesh-drop", "contact_dynamic_box_mesh.xml", "box_body", "box_drop", 0.0),
     ("mesh-mesh-tumble", "contact_dynamic_mesh_mesh.xml", "mesh_body", "mesh_tumble", 1.0),
 )
 WINDOWS = (("early", 20), ("full", 100))

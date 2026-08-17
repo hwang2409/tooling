@@ -11,12 +11,6 @@
       "pair": "sphere-ellipsoid",
       "mujoco_route": "mjc_Convex",
       "source_xml": "contact_route_sphere_ellipsoid.xml",
-      "bounds": {
-        "count_delta": 0,
-        "position": 0.11,
-        "normal": 0.0001,
-        "penetration": 0.0001
-      },
       "poses": [
         {
           "id": "no_contact",
@@ -208,12 +202,6 @@
       "pair": "sphere-mesh",
       "mujoco_route": "mjc_Convex",
       "source_xml": "contact_route_sphere_mesh.xml",
-      "bounds": {
-        "count_delta": 0,
-        "position": 0.11,
-        "normal": 0.0001,
-        "penetration": 0.0001
-      },
       "poses": [
         {
           "id": "no_contact",
@@ -450,12 +438,6 @@
       "pair": "plane-ellipsoid",
       "mujoco_route": "mjc_PlaneConvex",
       "source_xml": "contact_route_plane_ellipsoid.xml",
-      "bounds": {
-        "count_delta": 0,
-        "position": 0.12,
-        "normal": 0.0001,
-        "penetration": 0.0001
-      },
       "poses": [
         {
           "id": "no_contact",
@@ -647,12 +629,6 @@
       "pair": "plane-mesh",
       "mujoco_route": "mjc_PlaneConvex",
       "source_xml": "contact_route_plane_mesh.xml",
-      "bounds": {
-        "count_delta": 0,
-        "position": 0.18,
-        "normal": 0.0001,
-        "penetration": 0.0001
-      },
       "poses": [
         {
           "id": "no_contact",
@@ -940,12 +916,6 @@
       "pair": "box-mesh",
       "mujoco_route": "mjc_Convex",
       "source_xml": "contact_route_box_mesh.xml",
-      "bounds": {
-        "count_delta": 0,
-        "position": 1e-06,
-        "normal": 1.01,
-        "penetration": 1e-06
-      },
       "poses": [
         {
           "id": "no_contact",
@@ -1182,12 +1152,6 @@
       "pair": "mesh-mesh",
       "mujoco_route": "mjc_Convex",
       "source_xml": "contact_route_mesh_mesh.xml",
-      "bounds": {
-        "count_delta": 0,
-        "position": 1e-06,
-        "normal": 1e-05,
-        "penetration": 1e-06
-      },
       "poses": [
         {
           "id": "no_contact",
@@ -1368,6 +1332,56 @@
                 0.7071062575328709
               ],
               "penetration": 0.07083232695087376
+            }
+          ]
+        },
+        {
+          "id": "near_touch",
+          "geom_a": "mesh_a_near_touch",
+          "geom_b": "mesh_b_near_touch",
+          "pose_a": {
+            "position": [
+              0.25,
+              0.24999999999999994,
+              0.24999999999999994
+            ],
+            "orientation_wxyz": [
+              0.7045563426109878,
+              0.5406250962371626,
+              -0.06000300064686609,
+              0.45576803893928275
+            ]
+          },
+          "pose_b": {
+            "position": [
+              1.249,
+              0.24999999999999994,
+              0.24999999999999994
+            ],
+            "orientation_wxyz": [
+              0.7045563426109878,
+              0.5406250962371626,
+              -0.06000300064686609,
+              0.45576803893928275
+            ]
+          },
+          "contacts": [
+            {
+              "geom": [
+                8,
+                9
+              ],
+              "position": [
+                0.9991666681623522,
+                0.00016666816235228523,
+                0.00016666816235228526
+              ],
+              "frame_normal": [
+                0.5773502691894836,
+                0.5773502691896968,
+                0.5773502691896969
+              ],
+              "penetration": 0.0005773399067746023
             }
           ]
         }

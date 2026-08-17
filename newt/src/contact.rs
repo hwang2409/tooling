@@ -6,7 +6,8 @@
 //! points **from geom B into geom A**: an infinitesimal displacement of A
 //! along `+normal` separates the pair. `penetration` is positive when the
 //! geoms interpenetrate (or the pair sits inside a nonzero margin — see
-//! below); a `penetration ≤ 0` contact is never emitted.
+//! below); a negative penetration is never emitted. Plane-convex routes also
+//! emit the exact-margin equality row, matching MuJoCo.
 //!
 //! # Narrow-phase coverage
 //!
@@ -25,13 +26,15 @@
 //! - Deferred pairs (silently emit no contact + [`is_pair_supported`]
 //!   returns `false` so the world validator can reject them):
 //!   - box vs {sphere, capsule}  (unchanged from tier 2)
+//!   - box vs mesh
 //!   - capsule vs {ellipsoid, cylinder, mesh}
 //!   - ellipsoid vs {ellipsoid, cylinder, box, mesh}
 //!   - cylinder vs {cylinder, box, mesh}
 //!   - hfield vs {cylinder, ellipsoid, mesh}
 //!
-//! Deferred pairs have no oracle evidence in this change. They are called out
-//! in the docs instead of silently producing empty contact buffers.
+//! Deferred pairs are called out in the docs instead of silently producing
+//! empty contact buffers. Box-mesh keeps an oracle probe but fails its normal
+//! tier.
 //!
 //! # Margin / gap semantics
 //!
@@ -226,7 +229,6 @@ fn supported_shape_pair(a: &GeomShape, b: &GeomShape) -> bool {
             | (GeomShape::Sphere { .. }, GeomShape::Hfield { .. })
             | (GeomShape::Capsule { .. }, GeomShape::Capsule { .. })
             | (GeomShape::Box { .. }, GeomShape::Box { .. })
-            | (GeomShape::Box { .. }, GeomShape::Mesh { .. })
             | (GeomShape::Box { .. }, GeomShape::Hfield { .. })
             | (GeomShape::Capsule { .. }, GeomShape::Hfield { .. })
             | (GeomShape::Mesh { .. }, GeomShape::Mesh { .. })
@@ -1432,7 +1434,7 @@ pub fn ellipsoid_plane(
     let signed = (support_world - p0).dot(n_world);
     let pen = margin - signed;
     let mut out = ContactBuf::new();
-    if pen > 0.0 {
+    if pen >= 0.0 {
         let contact_pt = support_world - n_world * (signed * 0.5);
         out.push(Contact {
             geom_a: idx_ell,
@@ -1447,8 +1449,9 @@ pub fn ellipsoid_plane(
     out
 }
 
-/// Convex mesh vs static plane. The native plane-convex route keeps up to two
-/// deepest support vertices with midpoint positions.
+/// Convex mesh vs static plane. The current route keeps the support vertex
+/// and one distinct vertex. MuJoCo can walk mesh graph neighbors to add a
+/// third row; that graph walk remains deferred for a later parity change.
 #[allow(clippy::too_many_arguments)]
 pub fn mesh_plane(
     idx_mesh: usize,
@@ -1469,7 +1472,7 @@ pub fn mesh_plane(
         let world = mesh_pose.point_to_world(v_local);
         let signed = (world - p0).dot(n_world);
         let pen = margin - signed;
-        if pen <= 0.0 {
+        if pen < 0.0 {
             continue;
         }
         let tangent_value = world.dot(tangent);
@@ -1491,12 +1494,9 @@ pub fn mesh_plane(
     }
     let mut out = ContactBuf::new();
     for (_, _, world) in [primary, secondary].into_iter().flatten() {
-        let pen = margin - (world - p0).dot(n_world);
-        if pen <= 0.0 {
-            continue;
-        }
-        let signed_raw = margin - pen;
-        let contact_pt = world - n_world * (signed_raw * 0.5);
+        let signed = (world - p0).dot(n_world);
+        let pen = margin - signed;
+        let contact_pt = world - n_world * (signed * 0.5);
         out.push(Contact {
             geom_a: idx_mesh,
             geom_b: idx_plane,

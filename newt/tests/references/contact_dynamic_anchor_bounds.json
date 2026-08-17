@@ -1,0 +1,24 @@
+{
+  "method": "newt replay error maxima plus reviewed tolerance",
+  "review_tolerance": {
+    "position": 0.0001,
+    "orientation": 0.0001
+  },
+  "cases": [
+    {
+      "id": "mesh-mesh-tumble",
+      "early": {
+        "observed_max": {"position": 0.01864111982, "orientation": 0.003240427701, "contact_count": 0},
+        "position": 0.01874111982,
+        "orientation": 0.003340427701,
+        "contact_count": 0
+      },
+      "full": {
+        "observed_max": {"position": 0.1280665249, "orientation": 0.003570100293, "contact_count": 0},
+        "position": 0.1281665249,
+        "orientation": 0.003670100293,
+        "contact_count": 0
+      }
+    }
+  ]
+}

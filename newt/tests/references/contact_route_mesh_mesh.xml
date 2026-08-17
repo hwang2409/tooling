@@ -9,6 +9,7 @@
     <pair geom1="mesh_a_shallow" geom2="mesh_b_shallow"/>
     <pair geom1="mesh_a_deep" geom2="mesh_b_deep"/>
     <pair geom1="mesh_a_off_axis" geom2="mesh_b_off_axis"/>
+    <pair geom1="mesh_a_near_touch" geom2="mesh_b_near_touch"/>
   </contact>
   <worldbody>
     <body name="mesh_a_no_contact">
@@ -50,6 +51,16 @@
       <freejoint/>
       <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
       <geom name="mesh_b_off_axis" type="mesh" mesh="tetra"/>
+    </body>
+    <body name="mesh_a_near_touch">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="mesh_a_near_touch" type="mesh" mesh="tetra"/>
+    </body>
+    <body name="mesh_b_near_touch" pos="0.999 0 0">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="mesh_b_near_touch" type="mesh" mesh="tetra"/>
     </body>
   </worldbody>
 </mujoco>

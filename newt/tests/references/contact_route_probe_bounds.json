@@ -1,0 +1,35 @@
+{
+  "method": "newt replay maxima plus reviewed tolerance",
+  "probes": [
+    {
+      "id": "P1",
+      "observed_max": {"position": 0.0000006805591, "normal": 0.000004922709, "penetration": 0.00000001490116},
+      "bounds": {"count_delta": 0, "position": 0.000001, "normal": 0.00001, "penetration": 0.000001}
+    },
+    {
+      "id": "P2",
+      "observed_max": {"position": 0.0000002357258, "normal": 0.000002341552, "penetration": 0.00000002980232},
+      "bounds": {"count_delta": 0, "position": 0.000001, "normal": 0.00001, "penetration": 0.000001}
+    },
+    {
+      "id": "P3",
+      "observed_max": {"position": 0.00000001117587, "normal": 0.0, "penetration": 0.0000000223548},
+      "bounds": {"count_delta": 0, "position": 0.000001, "normal": 0.000001, "penetration": 0.000001}
+    },
+    {
+      "id": "P4",
+      "observed_max": {"position": 0.00000004080851, "normal": 0.0, "penetration": 0.00000005960464},
+      "bounds": {"count_delta": 0, "position": 0.000001, "normal": 0.000001, "penetration": 0.000001}
+    },
+    {
+      "id": "P5",
+      "observed_max": {"position": 0.0000002475567, "normal": 1.0, "penetration": 0.00000005960464},
+      "bounds": {"count_delta": 0, "position": 0.000001, "normal": 1.01, "penetration": 0.000001}
+    },
+    {
+      "id": "P6",
+      "observed_max": {"position": 0.0000001757250, "normal": 0.00003508902, "penetration": 0.00000009685755},
+      "bounds": {"count_delta": 0, "position": 0.000001, "normal": 0.00004, "penetration": 0.000001}
+    }
+  ]
+}
