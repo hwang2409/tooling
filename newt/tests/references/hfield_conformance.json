@@ -1,0 +1,43 @@
+{
+  "mujoco": "3.11.0",
+  "model": "finite triangular prism per cell",
+  "poses": {
+    "cell_boundary": {"continuity": "<1e-5 across x=0"},
+    "saddle_sphere": {
+      "count": 2,
+      "normal_abs_z": "<1e-5",
+      "penetration": 0.3000002
+    },
+    "steep_sphere": {
+      "count": 2,
+      "contacts": [
+        {"position": [0.107082, 0.0, 0.485836], "normal": [-0.447214, 0.0, 0.894427], "penetration": 0.1211146},
+        {"position": [0.057578, 0.057578, 0.469690], "normal": [-0.235702, -0.235702, 0.942809], "penetration": 0.1114382}
+      ]
+    },
+    "ridge_capsule": {
+      "count": 2,
+      "normal_abs_z": "<1e-5",
+      "penetration": 0.1
+    },
+    "base_side_sphere": {
+      "count": 1,
+      "position": [0.975, 0.0, -0.1],
+      "normal": [1.0, 0.0, 0.0],
+      "penetration": 0.05
+    },
+    "outside_footprint_sphere": {
+      "count": 1,
+      "position": [0.995, 0.0, 0.0],
+      "normal": [1.0, 0.0, 0.0],
+      "penetration": 0.01
+    },
+    "steep_box": {
+      "count": 2,
+      "contacts": [
+        {"position": [0.169729, 0.220587, 0.342499], "normal": [0.578309, -0.793155, 0.190957], "penetration": 0.0741669},
+        {"position": [0.165988, -0.177464, 0.397154], "normal": [-0.603366, 0.0, 0.797464], "penetration": 0.1766979}
+      ]
+    }
+  }
+}

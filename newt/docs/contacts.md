@@ -26,7 +26,7 @@ stiffness parameter.
 | `Cylinder { radius, half_height }` (v1) | solid cylinder, axis along local Z (MuJoCo convention). |
 | `Ellipsoid { semi_axes }` (v1) | 3 semi-axes along body-frame X/Y/Z. |
 | `Mesh { mesh_id }` (v1) | reference into [`World::meshes`]. See "convex mesh trust model" below. |
-| `Hfield { hfield_id }` (v3) | reference into `World::hfields`; normalized elevation grid with a finite base box. |
+| `Hfield { hfield_id }` (v3) | reference into `World::hfields`; normalized elevation grid with a finite triangular-prism base box. |
 
 inertia helpers for uniform-density variants live in `newt::geom`: solid
 sphere, box, capsule, cylinder, ellipsoid. `Body::solid_*` constructors call
@@ -249,6 +249,13 @@ the Coulomb cap. designers who need a bright-line stiction can override
 `c_tangent` via a stiffer solref on the "sticky" geom.
 
 ### force application
+
+heightfields use the MuJoCo finite-prism model. Each grid cell is split along
+the fixed diagonal into two closed triangular prisms. Sphere and capsule
+colliders test top, base, and side faces. Capsule tests use the full center
+segment, including ridge contacts. Box colliders test the prism faces and keep
+the four deepest unique contacts in deterministic order. This preserves side
+contacts outside the footprint and base contacts below the terrain.
 
 each contact contributes an equal-and-opposite wrench to its two owning
 bodies (Newton's third law is baked in — the momentum anchor verifies it).

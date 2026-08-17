@@ -178,6 +178,29 @@
       "n_steps": 500,
       "stride": 25,
       "horizon_note": "1.0 s tilted capsule crossing a wavy hfield; matched Euler PGS."
+    },
+    {
+      "name": "hfield_bowl_settle",
+      "mjcf": "hfield_bowl_settle.xml",
+      "n_steps": 1000,
+      "stride": 100,
+      "horizon_note": "2.0 s sphere settling at the center of a symmetric bowl; quasi-static final state."
+    },
+    {
+      "name": "hfield_friction_slope_stop",
+      "mjcf": "hfield_friction_slope_stop.xml",
+      "n_steps": 2000,
+      "stride": 100,
+      "init_qvel": [0.05, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "horizon_note": "4.0 s box slide on a high-friction slope; quasi-static stopped state."
+    },
+    {
+      "name": "hfield_capsule_roll_equilibrium",
+      "mjcf": "hfield_capsule_roll_equilibrium.xml",
+      "n_steps": 2000,
+      "stride": 100,
+      "init_qvel": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "horizon_note": "4.0 s low-gravity capsule roll-down and rest on a flat hfield; quasi-static final state."
     }
   ]
 }
