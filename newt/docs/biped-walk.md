@@ -195,13 +195,15 @@ regression bounds. these bounds are not parity claims.
 the source falls at no assist, so a stable no-assist target is not available.
 the outcome class matches at all four levels. newt falls at `551` for assist
 `0.4`, so the `203`-step gap changed to `205` steps and still fails MUST.
-the manifold update did not improve the fall-step result. TARGET is not
+the contact-phase fix did not improve the fall-step result. TARGET is not
 reached.
 
 status: the isolated manifold finding is closed. the solver phase now uses the
-current Euler-step contact set. the fresh parity comparison still has a
-residual window, so solver-phase parity is not closed. both fixtures store
-visual support masks and solver contact masks separately.
+current Euler-step contact set for free-body and tree rows. the fresh parity
+comparison still measures `[25, 35]`, but state injection closes the phase
+finding: the contact predicates emit the same sets on MuJoCo's exact qpos.
+the remaining difference is trajectory drift at contact-onset boundaries.
+both fixtures store visual support masks and solver contact masks separately.
 
 the diagnostic capture now records two phases. MuJoCo records contacts and
 rows before `mj_step`. newt records the contacts consumed inside `world.step`.
@@ -211,18 +213,34 @@ geometry evidence.
 at solver step `18`, the visual mask is `2` on both sides, while both solver
 contact masks remain `0`. at step `25`, MuJoCo has one
 `ground/right_foot_geom` contact with four rows. newt has two contacts and
-eight rows from its current state. at step `35`, MuJoCo has two right-foot
+eight rows from its drifted state. at step `35`, MuJoCo has two right-foot
 contacts, while newt has two left-foot and two right-foot contacts. at step
 `36`, both sides solve four contacts and 16 rows.
+
+the state-injection probe loads MuJoCo's exact solver-phase qpos at steps `25`
+and `35` into newt before step-start collision. both probes produce the same
+contact count, geom pairs, and four-row mappings. Position gaps are at most
+`2.716e-4 m`; depth gaps are at most `1.933e-6 m`. This closes the phase and
+predicate hypothesis. The remaining live-trajectory differences are onset
+boundary sensitivity.
+
+the measured signed minimum distances for the right foot show the boundary:
+
+| step | MuJoCo right-foot distance m | newt right-foot distance m |
+|---:|---:|---:|
+| `23` | `7.689714e-3` | `4.150242e-3` |
+| `24` | `3.801346e-3` | `8.890033e-5` |
+| `25` | `-3.035516e-4` | `-4.183933e-3` |
+| `26` | `-2.890468e-3` | `-6.020486e-3` |
 
 the phase fixture records contact geometry and row mappings. Newt keeps its
 internal `from B into A` normal convention and flips only the diagnostic view.
 
 the complete measured solver structural mismatch set through step `36` is
-`[25, 35]`. the acceptance test asserts this complete fresh set. step `18` is
-only a visual-mask checkpoint; its solver masks and contacts are both zero.
-the phase-labeling error that hid step `35` is closed. the remaining steps are
-contact-manifold and trajectory differences, not a prior-step contact set.
+`[25, 35]`. the acceptance test asserts this complete measured set. step `18`
+is only a visual-mask checkpoint; its solver masks and contacts are both zero.
+the phase-labeling error that hid step `35` is closed. state injection proves
+the live mismatches are onset-boundary drift, not prior-step contact latency.
 the `0.4` fall-step gap remains an honest Euler/Newton finding.
 
 the per-step solver-phase residual trail remains the comparison specification:
@@ -230,19 +248,19 @@ the per-step solver-phase residual trail remains the comparison specification:
 | steps | source contact set | newt contact set | structure |
 |---|---|---|:---:|
 | `0..24` | no contacts | no contacts | match |
-| `25` | one right-foot contact | two right-foot contacts | mismatch |
+| `25` | one right-foot contact | two right-foot contacts after onset drift | onset boundary |
 | `26..34` | two right-foot contacts | two right-foot contacts | match |
-| `35` | two right-foot contacts | two left-foot and two right-foot contacts | mismatch |
+| `35` | two right-foot contacts | two left-foot and two right-foot contacts after onset drift | onset boundary |
 | `36` | two left-foot and two right-foot contacts | two left-foot and two right-foot contacts | match |
 
 the measured trace gaps through the newt fall are:
 
 | assist | compared steps | max qpos gap | max qvel gap | status |
 | ---: | ---: | ---: | ---: | --- |
-| `0.8` | `5000` | `0.354990` | `4.837531` | current gap; both complete |
-| `0.4` | `551` | `1.153268` | `6.695380` | current gap; fall-step bound miss |
-| `0.2` | `472` | `0.903753` | `6.882749` | current gap; fall step mismatch |
-| `0.0` | `439` | `1.151902` | `6.406135` | current gap; fall step mismatch |
+| `0.8` | `5000` | `0.354552` | `4.668125` | current gap; both complete |
+| `0.4` | `551` | `1.154574` | `6.604133` | current gap; fall-step bound miss |
+| `0.2` | `472` | `0.907494` | `6.892765` | current gap; fall step mismatch |
+| `0.0` | `439` | `1.161380` | `6.448639` | current gap; fall step mismatch |
 
 the source contact and row records are in
 `tests/references/biped_walk_v3_diagnostics.json`; the parsed newt solver-phase
@@ -274,6 +292,8 @@ generalized forces, and NEWT-23 row factors.
 - the short v3 representative sweep;
 - the ignored full v3 sweep and provenance checks;
 - the committed source and newt geom-manifold diagnostic artifacts;
+- state-injected MuJoCo-qpos contact parity at steps `25` and `35`;
+- signed foot-distance measurements around the contact-onset boundary;
 - hand-built contact metric formulas;
 - byte-identical deterministic rollouts;
 - active self-contact and touch-force zero checks on acceptance runs;

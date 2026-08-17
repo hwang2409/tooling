@@ -473,23 +473,21 @@ cargo test --manifest-path newt/Cargo.toml --test biped_walk_acceptance v3_full_
 
 | assist | source outcome | newt outcome | source fall | newt fall | compared steps | max qpos gap | max qvel gap |
 |---:|---|---|---:|---:|---:|---:|---:|
-| `0.8` | complete | complete | — | — | `5,000` | `3.54990e-1` | `4.83753e0` |
-| `0.4` | fallen | fallen | `756` | `551` | `551` | `1.15327e0` | `6.69538e0` |
-| `0.2` | fallen | fallen | `492` | `472` | `472` | `9.03753e-1` | `6.88275e0` |
-| `0.0` | fallen | fallen | `578` | `439` | `439` | `1.15190e0` | `6.40614e0` |
+| `0.8` | complete | complete | — | — | `5,000` | `3.54552e-1` | `4.66813e0` |
+| `0.4` | fallen | fallen | `756` | `551` | `551` | `1.15457e0` | `6.60413e0` |
+| `0.2` | fallen | fallen | `492` | `472` | `472` | `9.07494e-1` | `6.89277e0` |
+| `0.0` | fallen | fallen | `578` | `439` | `439` | `1.16138e0` | `6.44864e0` |
 
 The outcome class matches at all four levels. The `0.4` row remains the
 acceptance failure: the fall-step gap is `756 - 551 = 205`, versus `203`
 before the manifold update. The no-assist oracle also falls, so stable
 no-assist walking is not a valid target for this source controller.
 
-status: the isolated manifold finding is closed. solver-phase parity remains
-open. visual support masks and solver contact masks are stored separately. The
-first parsed solver structural mismatch is step `25`: source solver mask `2`
-versus newt solver mask `0`, with one contact and four rows versus zero
-contacts and rows. At visual step `18`, both solver masks and contacts are zero;
-only the source visual foot-height mask is `2`. Post-step geometry then shows
-two contacts and eight rows on both sides.
+status: the isolated manifold finding is closed. Euler PGS/Newton now use one
+current-position contact pass for free-body and tree rows. Visual support masks
+and solver contact masks are stored separately. The fresh parsed structural
+window is `[25,35]`: onset-boundary drift changes the live contact set by the
+time the engines cross the foot threshold.
 
 At solver step `25`, source and newt constraint-force maxima are `112.489` and
 `0.000`; row reference-acceleration maxima are `124.015` and `0.000`. At step
@@ -499,8 +497,12 @@ bound exceeds at step `26` (`1.636116`). The per-step trail in
 `docs/biped-walk.md` is the next ticket's comparison specification.
 
 The complete measured solver structural mismatch set through step `36` is
-`[25]`, a one-step contact-latency window. The acceptance test asserts this
-set verbatim, so a new mismatch through step `36` fails CI. The source-side
+`[25,35]`. The acceptance test asserts this set verbatim. A state-injection
+probe places MuJoCo's exact step-25 and step-35 qpos into newt before
+step-start collision. It matches contact count, geom pair, row mapping, and
+contact depth within `1.933e-6`; position gap is at most `2.716e-4 m`.
+This closes the phase finding. The remaining live mismatch is trajectory drift
+at a contact-onset boundary, not prior-step contact latency. The source-side
 contact and row records are in
 `tests/references/biped_walk_v3_diagnostics.json`. Records cover step `0`
 through `40`, including solver-phase and post-step records. The source
