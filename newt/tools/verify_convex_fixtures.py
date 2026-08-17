@@ -86,6 +86,30 @@ def contact_position_signature(pose: dict, contacts: list[dict]) -> list[float]:
     return norms + distances
 
 
+def contact_normal_signature(pose: dict, contacts: list[dict]) -> list[float]:
+    vectors = [
+        [
+            contact["position"][index] - pose["position"][index]
+            for index in range(3)
+        ]
+        for contact in contacts
+    ]
+    normals = [contact["frame_normal"] for contact in contacts]
+    position_normal_dots = sorted(
+        sum(vector[index] * normal[index] for index in range(3))
+        for vector, normal in zip(vectors, normals)
+    )
+    normal_norms = sorted(
+        sum(component * component for component in normal) for normal in normals
+    )
+    normal_dots = sorted(
+        sum(left[index] * right[index] for index in range(3))
+        for left_index, left in enumerate(normals)
+        for right in normals[left_index + 1 :]
+    )
+    return position_normal_dots + normal_norms + normal_dots
+
+
 def compare_dynamic_oracle(
     committed: dict,
     fresh: dict,
@@ -178,6 +202,17 @@ def compare_route_oracle(
                     f"{path}.contacts.position_signature",
                     maxima,
                 )
+                compare_vector(
+                    contact_normal_signature(
+                        committed_pose["body_pose_b"], committed_pose["contacts"]
+                    ),
+                    contact_normal_signature(
+                        fresh_pose["body_pose_b"], fresh_pose["contacts"]
+                    ),
+                    "frame_normal",
+                    f"{path}.contacts.normal_signature",
+                    maxima,
+                )
             for index, (committed_contact, fresh_contact) in enumerate(
                 zip(committed_pose["contacts"], fresh_pose["contacts"])
             ):
@@ -191,13 +226,14 @@ def compare_route_oracle(
                         f"{contact_path}.position",
                         maxima,
                     )
-                compare_vector(
-                    committed_contact["frame_normal"],
-                    fresh_contact["frame_normal"],
-                    "frame_normal",
-                    f"{contact_path}.frame_normal",
-                    maxima,
-                )
+                if not mesh_pair:
+                    compare_vector(
+                        committed_contact["frame_normal"],
+                        fresh_contact["frame_normal"],
+                        "frame_normal",
+                        f"{contact_path}.frame_normal",
+                        maxima,
+                    )
                 difference = abs(
                     float(committed_contact["penetration"])
                     - float(fresh_contact["penetration"])
