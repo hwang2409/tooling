@@ -93,81 +93,65 @@ def inverse_rotate(quaternion: list[float], vector: list[float]) -> list[float]:
     ]
 
 
-def dot(left: list[float], right: list[float]) -> float:
-    return sum(left[index] * right[index] for index in range(3))
-
-
 def subtract(left: list[float], right: list[float]) -> list[float]:
     return [left[index] - right[index] for index in range(3)]
 
 
-def scale(vector: list[float], factor: float) -> list[float]:
-    return [component * factor for component in vector]
-
-
-def cross(left: list[float], right: list[float]) -> list[float]:
-    return [
-        left[1] * right[2] - left[2] * right[1],
-        left[2] * right[0] - left[0] * right[2],
-        left[0] * right[1] - left[1] * right[0],
-    ]
-
-
-def normalize(vector: list[float]) -> list[float]:
-    length = math.sqrt(dot(vector, vector))
-    assert length > 0.0
-    return scale(vector, 1.0 / length)
-
-
-def mesh_basis(mesh: dict) -> tuple[list[float], list[float], list[float]]:
-    vertices = mesh["vertices"]
-    origin = vertices[0]
-    first = normalize(subtract(vertices[1], origin))
-    second_unscaled = subtract(vertices[2], origin)
-    second = normalize(subtract(second_unscaled, scale(first, dot(second_unscaled, first))))
-    third = normalize(cross(first, second))
-    return first, second, third
-
-
-def basis_coordinates(basis: tuple[list[float], list[float], list[float]], vector: list[float]) -> list[float]:
-    return [dot(axis, vector) for axis in basis]
-
-
-def body_frame_contact(body_pose: dict, mesh: dict, contact: dict) -> dict:
+def body_frame_contact(body_pose: dict, contact: dict) -> dict:
     body_position = body_pose["position"]
     body_orientation = body_pose["orientation_wxyz"]
-    relative_position = inverse_rotate(
-        body_orientation,
-        subtract(contact["position"], body_position),
-    )
-    mesh_normal = inverse_rotate(body_orientation, contact["frame_normal"])
-    basis = mesh_basis(mesh)
     return {
         "geom": tuple(contact["geom"]),
-        "position": basis_coordinates(basis, relative_position),
-        "frame_normal": basis_coordinates(basis, mesh_normal),
+        "position": inverse_rotate(
+            body_orientation,
+            subtract(contact["position"], body_position),
+        ),
+        "frame_normal": inverse_rotate(body_orientation, contact["frame_normal"]),
         "penetration": float(contact["penetration"]),
     }
 
 
-def sorted_body_frame_contacts(
-    body_pose: dict,
-    mesh: dict,
-    contacts: list[dict],
-) -> list[dict]:
-    transformed = [
-        body_frame_contact(body_pose, mesh, contact)
-        for contact in contacts
-    ]
-    return sorted(
-        transformed,
-        key=lambda contact: (
-            contact["geom"],
-            -contact["penetration"],
-            tuple(contact["position"]),
-            tuple(contact["frame_normal"]),
-        ),
+def body_frame_contacts(body_pose: dict, contacts: list[dict]) -> list[dict]:
+    return [body_frame_contact(body_pose, contact) for contact in contacts]
+
+
+def contact_distance(left: dict, right: dict) -> float:
+    position = subtract(left["position"], right["position"])
+    normal = subtract(left["frame_normal"], right["frame_normal"])
+    penetration = left["penetration"] - right["penetration"]
+    return (
+        sum(component * component for component in position)
+        + sum(component * component for component in normal)
+        + penetration * penetration
     )
+
+
+def match_body_frame_contacts(
+    committed: list[dict],
+    fresh: list[dict],
+) -> list[tuple[dict, dict]]:
+    """Match contacts by geometry and nearest complete body-frame tuple."""
+
+    remaining = list(enumerate(fresh))
+    matches = []
+    for committed_contact in committed:
+        candidates = [
+            (index, fresh_contact)
+            for index, fresh_contact in remaining
+            if fresh_contact["geom"] == committed_contact["geom"]
+        ]
+        assert candidates, committed_contact["geom"]
+        fresh_index, fresh_contact = min(
+            candidates,
+            key=lambda candidate: (
+                contact_distance(committed_contact, candidate[1]),
+                candidate[0],
+            ),
+        )
+        remaining.remove((fresh_index, fresh_contact))
+        matches.append((committed_contact, fresh_contact))
+    assert not remaining
+    return matches
 
 
 def compare_dynamic_oracle(
@@ -266,41 +250,24 @@ def compare_route_oracle(
             assert len(committed_pose["contacts"]) == len(fresh_pose["contacts"])
             mesh_pair = "mesh" in committed_probe["pair"]
             if mesh_pair:
-                committed_contacts = sorted_body_frame_contacts(
+                committed_contacts = body_frame_contacts(
                     committed_pose["body_pose_b"],
-                    committed_probe["mesh"],
                     committed_pose["contacts"],
                 )
-                fresh_contacts = sorted_body_frame_contacts(
+                fresh_contacts = body_frame_contacts(
                     fresh_pose["body_pose_b"],
-                    fresh_probe["mesh"],
                     fresh_pose["contacts"],
+                )
+                contact_pairs = match_body_frame_contacts(
+                    committed_contacts,
+                    fresh_contacts,
                 )
             else:
                 committed_contacts = committed_pose["contacts"]
                 fresh_contacts = fresh_pose["contacts"]
-            for index, (committed_contact, fresh_contact) in enumerate(
-                zip(committed_contacts, fresh_contacts)
-            ):
+                contact_pairs = zip(committed_contacts, fresh_contacts)
+            for index, (committed_contact, fresh_contact) in enumerate(contact_pairs):
                 contact_path = f"{path}.contacts[{index}]"
-                if mesh_pair and committed_probe["id"] in ("P2", "P4") and committed_pose["id"] == "shallow":
-                    print(
-                        "mesh-debug",
-                        committed_probe["id"],
-                        json.dumps(
-                            {
-                                "committed_raw": committed_pose["contacts"],
-                                "fresh_raw": fresh_pose["contacts"],
-                                "committed_transformed": committed_contacts,
-                                "fresh_transformed": fresh_contacts,
-                                "committed_mesh": committed_probe["mesh"],
-                                "fresh_mesh": fresh_probe["mesh"],
-                                "committed_body": committed_pose["body_pose_b"],
-                                "fresh_body": fresh_pose["body_pose_b"],
-                            },
-                            sort_keys=True,
-                        ),
-                    )
                 assert committed_contact["geom"] == fresh_contact["geom"], contact_path
                 compare_vector(
                     committed_contact["position"],
