@@ -96,6 +96,27 @@ struct Options {
     warmup: usize,
     steps: usize,
     scene: Option<String>,
+    profile: bool,
+}
+
+#[derive(Default)]
+struct ProfileTotals {
+    total_ns: u128,
+    collision_ns: u128,
+    solver_ns: u128,
+    integration_ns: u128,
+    sensors_ns: u128,
+}
+
+impl ProfileTotals {
+    #[cfg(feature = "instrumentation")]
+    fn add(&mut self, timings: newt::world::StepTimings) {
+        self.total_ns += timings.total_ns;
+        self.collision_ns += timings.collision_ns;
+        self.solver_ns += timings.solver_ns;
+        self.integration_ns += timings.integration_ns;
+        self.sensors_ns += timings.sensors_ns;
+    }
 }
 
 struct Stats {
@@ -177,12 +198,16 @@ fn main() {
             stats.percentile_ns(0.9) as f64 / options.steps as f64,
             stats.steps_per_second(options.steps),
         );
+        if options.profile {
+            print_profile(scene, config, &result.profile);
+        }
     }
 }
 
 struct ResultRow {
     stats: Stats,
     checksum: f32,
+    profile: ProfileTotals,
 }
 
 fn benchmark(
@@ -217,26 +242,30 @@ fn benchmark(
         return ResultRow {
             stats: Stats::new(samples_ns),
             checksum,
+            profile: ProfileTotals::default(),
         };
     }
 
     let initial = load_scene(scene.format, &path);
     let mut warmup_state = configure(initial.clone(), config);
+    let mut warmup_profile = ProfileTotals::default();
     for _ in 0..warmup {
-        run_world(&mut warmup_state, steps);
+        run_world(&mut warmup_state, steps, &mut warmup_profile);
     }
 
     let mut samples_ns = Vec::with_capacity(iterations);
     let mut checksum = 0.0;
+    let mut profile = ProfileTotals::default();
     for _ in 0..iterations {
         let mut state = configure(initial.clone(), config);
         let start = Instant::now();
-        checksum += run_world(&mut state, steps);
+        checksum += run_world(&mut state, steps, &mut profile);
         samples_ns.push(start.elapsed().as_nanos());
     }
     ResultRow {
         stats: Stats::new(samples_ns),
         checksum,
+        profile,
     }
 }
 
@@ -260,9 +289,13 @@ fn configure(mut scene: newt::model::Scene, config: Config) -> newt::world::Worl
     scene.world
 }
 
-fn run_world(world: &mut newt::world::World, steps: usize) -> f32 {
+fn run_world(world: &mut newt::world::World, steps: usize, profile: &mut ProfileTotals) -> f32 {
+    #[cfg(not(feature = "instrumentation"))]
+    let _ = profile;
     for _ in 0..steps {
         world.step();
+        #[cfg(feature = "instrumentation")]
+        profile.add(world.step_timings());
     }
     let body_sum: f32 = world
         .bodies
@@ -284,6 +317,7 @@ fn parse_options() -> Options {
         warmup: DEFAULT_WARMUP,
         steps: DEFAULT_STEPS,
         scene: None,
+        profile: false,
     };
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -295,9 +329,10 @@ fn parse_options() -> Options {
             "--warmup" => options.warmup = next_usize(&mut args, "--warmup"),
             "--steps" => options.steps = next_usize(&mut args, "--steps"),
             "--scene" => options.scene = Some(args.next().expect("--scene needs a name")),
+            "--profile" => options.profile = true,
             "--help" => {
                 println!(
-                    "usage: newt_perf [--scene NAME] [--steps N] [--warmup N] [--iterations N]"
+                    "usage: newt_perf [--scene NAME] [--steps N] [--warmup N] [--iterations N] [--profile]"
                 );
                 std::process::exit(0);
             }
@@ -305,6 +340,21 @@ fn parse_options() -> Options {
         }
     }
     options
+}
+
+fn print_profile(scene: &str, config: &str, profile: &ProfileTotals) {
+    if profile.total_ns == 0 {
+        eprintln!("profile unavailable: rebuild with --features instrumentation");
+        return;
+    }
+    let pct = |value: u128| value as f64 * 100.0 / profile.total_ns as f64;
+    eprintln!(
+        "profile {scene} {config}: collision={:.1}% solver={:.1}% integration={:.1}% sensors={:.1}%",
+        pct(profile.collision_ns),
+        pct(profile.solver_ns),
+        pct(profile.integration_ns),
+        pct(profile.sensors_ns),
+    );
 }
 
 fn next_usize(args: &mut impl Iterator<Item = String>, flag: &str) -> usize {

@@ -55,6 +55,9 @@ use crate::tree::{
     rk4_step as tree_rk4_step,
 };
 
+#[cfg(feature = "instrumentation")]
+use std::time::Instant;
+
 /// Fixed-step integration schemes supported by [`World::step`].
 ///
 /// `Rk4` remains the default to preserve every pre-v3 trajectory. `Euler`
@@ -151,6 +154,8 @@ pub struct World {
     solver_phase_capture: bool,
     #[doc(hidden)]
     last_solver_phase: Option<SolverPhaseDiagnostics>,
+    #[cfg(feature = "instrumentation")]
+    step_timings: StepTimings,
 }
 
 /// State and contacts consumed by the most recent solver phase.
@@ -174,6 +179,20 @@ pub struct SolverPhaseDiagnostics {
     pub row_diagnostics: Vec<ConstraintRowDiagnostic>,
     /// Tree generalized contact forces from the solver phase.
     pub tree_qfrc: Vec<Vec<f32>>,
+}
+
+/// Timing counters for one [`World::step`] when instrumentation is enabled.
+///
+/// This type and its collection have no code or storage cost without the
+/// `instrumentation` feature.
+#[cfg(feature = "instrumentation")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StepTimings {
+    pub total_ns: u128,
+    pub collision_ns: u128,
+    pub solver_ns: u128,
+    pub integration_ns: u128,
+    pub sensors_ns: u128,
 }
 
 /// A named generalized-state snapshot. Vectors flatten trees in world tree
@@ -257,7 +276,15 @@ impl World {
             contact_detection_count: std::cell::Cell::new(0),
             solver_phase_capture: false,
             last_solver_phase: None,
+            #[cfg(feature = "instrumentation")]
+            step_timings: StepTimings::default(),
         }
+    }
+
+    /// Return the timings recorded by the most recent [`Self::step`].
+    #[cfg(feature = "instrumentation")]
+    pub fn step_timings(&self) -> StepTimings {
+        self.step_timings
     }
 
     /// Enable or disable capture of the state and contacts used by
@@ -782,9 +809,13 @@ impl World {
     /// integration. Penalty mode keeps its live per-stage RK4 collision
     /// callback. `detect_contacts` remains an explicit current-state query.
     pub fn step(&mut self) {
+        #[cfg(feature = "instrumentation")]
+        let total_start = Instant::now();
         self.solver
             .validate()
             .unwrap_or_else(|message| panic!("{message}"));
+        #[cfg(feature = "instrumentation")]
+        let collision_start = Instant::now();
         // Loud engine-level enforcement: the first step after any pair-list
         // or geom-count change panics if any ACTIVE pair falls in the
         // deferred bucket. Prevents a stack.json-style silent no-op.
@@ -795,6 +826,10 @@ impl World {
         };
         let contacts = matches!(self.solver.mode, SolverMode::Pgs | SolverMode::Newton)
             .then(|| self.detect_contacts_for_step(&pairs));
+        #[cfg(feature = "instrumentation")]
+        let collision_ns = collision_start.elapsed().as_nanos();
+        #[cfg(feature = "instrumentation")]
+        let solver_start = Instant::now();
         let solver_phase_state = self.solver_phase_capture.then(|| self.solver_phase_state());
         let tree_contact_solution = contacts
             .as_deref()
@@ -806,6 +841,10 @@ impl World {
             );
             self.record_solver_phase(state, tree_contact_solution.as_ref(), &phase_contacts);
         }
+        #[cfg(feature = "instrumentation")]
+        let solver_ns = solver_start.elapsed().as_nanos();
+        #[cfg(feature = "instrumentation")]
+        let integration_start = Instant::now();
         match self.integrator {
             Integrator::Rk4 => {
                 self.step_bodies(&pairs, contacts.as_deref(), tree_contact_solution.as_ref());
@@ -820,6 +859,10 @@ impl World {
                 self.step_bodies_euler(&pairs, contacts.as_deref(), tree_contact_solution.as_ref());
             }
         }
+        #[cfg(feature = "instrumentation")]
+        let integration_ns = integration_start.elapsed().as_nanos();
+        #[cfg(feature = "instrumentation")]
+        let sensors_start = Instant::now();
         // Sensor evaluation runs strictly on post-step state — no
         // perturbation. Skipped when no sensors are declared so every
         // pre-v1-tier-6 golden path is bit-for-bit untouched.
@@ -829,6 +872,16 @@ impl World {
             } else {
                 self.evaluate_sensors(&pairs);
             }
+        }
+        #[cfg(feature = "instrumentation")]
+        {
+            self.step_timings = StepTimings {
+                total_ns: total_start.elapsed().as_nanos(),
+                collision_ns,
+                solver_ns,
+                integration_ns,
+                sensors_ns: sensors_start.elapsed().as_nanos(),
+            };
         }
     }
 
