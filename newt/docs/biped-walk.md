@@ -225,9 +225,14 @@ predicate hypothesis. The remaining live-trajectory differences are onset
 boundary sensitivity.
 
 the measured signed minimum distances for the right foot show the boundary:
+the acceptance test asserts the source and newt left/right values for steps
+`20..26` within `5e-6 m` of the captured values.
 
 | step | MuJoCo right-foot distance m | newt right-foot distance m |
 |---:|---:|---:|
+| `20` | `1.800464e-2` | `1.503205e-2` |
+| `21` | `1.479785e-2` | `1.162474e-2` |
+| `22` | `1.135448e-2` | `7.997453e-3` |
 | `23` | `7.689714e-3` | `4.150242e-3` |
 | `24` | `3.801346e-3` | `8.890033e-5` |
 | `25` | `-3.035516e-4` | `-4.183933e-3` |

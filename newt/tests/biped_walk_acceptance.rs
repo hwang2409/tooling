@@ -27,6 +27,51 @@ const EARLY_QPOS_GAP_BOUND: f64 = 0.08;
 const EARLY_QVEL_GAP_BOUND: f64 = 1.5;
 const STATE_INJECTION_POSITION_BOUND: f64 = 5e-4;
 const STATE_INJECTION_DEPTH_BOUND: f64 = 5e-6;
+const ONSET_DISTANCE_BOUND: f64 = 5e-6;
+const ONSET_DISTANCE_EXPECTED: [[f64; 4]; 7] = [
+    [
+        8.841191232e-2,
+        1.800464094e-2,
+        8.410302550e-2,
+        1.503205299e-2,
+    ],
+    [
+        8.388717473e-2,
+        1.479785144e-2,
+        7.941696793e-2,
+        1.162473857e-2,
+    ],
+    [
+        7.917407900e-2,
+        1.135447621e-2,
+        7.451750338e-2,
+        7.997453213e-3,
+    ],
+    [
+        7.424698025e-2,
+        7.689714432e-3,
+        6.942452490e-2,
+        4.150241613e-3,
+    ],
+    [
+        6.912415475e-2,
+        3.801345825e-3,
+        6.412933767e-2,
+        8.890032768e-5,
+    ],
+    [
+        6.379736960e-2,
+        -3.035515547e-4,
+        5.864073336e-2,
+        -4.183933139e-3,
+    ],
+    [
+        5.829266459e-2,
+        -2.890467644e-3,
+        5.298534036e-2,
+        -6.020486355e-3,
+    ],
+];
 
 #[derive(Debug)]
 struct OracleFixture {
@@ -246,7 +291,7 @@ fn newt_contacts_at_injected_qpos(qpos: &[f64]) -> Vec<PhaseContact> {
     scene.world.solver.cone = newt::solver::ConeKind::Pyramidal;
     scene.world.set_solver_phase_capture(true);
     inject_biped_qpos(&mut scene, qpos);
-    scene.world.capture_solver_phase();
+    scene.world.step();
     let phase = scene
         .world
         .solver_phase_diagnostics()
@@ -995,10 +1040,23 @@ fn biped_contact_onset_distances_are_measured() {
         println!(
             "onset_distance step={step} source_left={source_left:.9e} source_right={source_right:.9e} newt_left={newt_left:.9e} newt_right={newt_right:.9e}"
         );
-        assert!(source_left.is_finite());
-        assert!(source_right.is_finite());
-        assert!(newt_left.is_finite());
-        assert!(newt_right.is_finite());
+        let [
+            expected_source_left,
+            expected_source_right,
+            expected_newt_left,
+            expected_newt_right,
+        ] = ONSET_DISTANCE_EXPECTED[step - 20];
+        for (name, actual, expected) in [
+            ("source_left", source_left, expected_source_left),
+            ("source_right", source_right, expected_source_right),
+            ("newt_left", newt_left, expected_newt_left),
+            ("newt_right", newt_right, expected_newt_right),
+        ] {
+            assert!(
+                (actual - expected).abs() <= ONSET_DISTANCE_BOUND,
+                "step {step} {name} distance {actual:.9e} outside expected {expected:.9e} +/- {ONSET_DISTANCE_BOUND:.1e}"
+            );
+        }
     }
 }
 
