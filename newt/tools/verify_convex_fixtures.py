@@ -223,14 +223,24 @@ def compare_route_oracle(
             assert len(committed_pose["contacts"]) == len(fresh_pose["contacts"])
             mesh_pair = "mesh" in committed_probe["pair"]
             if mesh_pair:
+                committed_contact_frame = (
+                    committed_pose["pose_b"]
+                    if committed_probe["pair"] == "plane-mesh"
+                    else committed_pose["body_pose_b"]
+                )
+                fresh_contact_frame = (
+                    fresh_pose["pose_b"]
+                    if fresh_probe["pair"] == "plane-mesh"
+                    else fresh_pose["body_pose_b"]
+                )
                 committed_contacts = sorted_body_frame_contacts(
                     committed_pose["body_pose_b"],
-                    committed_pose["pose_b"],
+                    committed_contact_frame,
                     committed_pose["contacts"],
                 )
                 fresh_contacts = sorted_body_frame_contacts(
                     fresh_pose["body_pose_b"],
-                    fresh_pose["pose_b"],
+                    fresh_contact_frame,
                     fresh_pose["contacts"],
                 )
             else:
