@@ -283,6 +283,24 @@ def compare_route_oracle(
                 zip(committed_contacts, fresh_contacts)
             ):
                 contact_path = f"{path}.contacts[{index}]"
+                if mesh_pair and committed_probe["id"] in ("P2", "P4") and committed_pose["id"] == "shallow":
+                    print(
+                        "mesh-debug",
+                        committed_probe["id"],
+                        json.dumps(
+                            {
+                                "committed_raw": committed_pose["contacts"],
+                                "fresh_raw": fresh_pose["contacts"],
+                                "committed_transformed": committed_contacts,
+                                "fresh_transformed": fresh_contacts,
+                                "committed_mesh": committed_probe["mesh"],
+                                "fresh_mesh": fresh_probe["mesh"],
+                                "committed_body": committed_pose["body_pose_b"],
+                                "fresh_body": fresh_pose["body_pose_b"],
+                            },
+                            sort_keys=True,
+                        ),
+                    )
                 assert committed_contact["geom"] == fresh_contact["geom"], contact_path
                 compare_vector(
                     committed_contact["position"],
