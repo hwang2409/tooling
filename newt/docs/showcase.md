@@ -23,6 +23,7 @@ cargo run --release --example hfield_demo -- --frames 1800 --out demo-hfield.mp4
 cargo run --release --example cartpole -- --frames 900 --out demo-cartpole.mp4
 cargo run --release --example cartpole -- --velocity --frames 900 --out demo-cartpole-velocity.mp4
 cargo run --release --example arm -- --frames 1800 --out demo-arm.mp4
+cargo run --release --example muscle_pendulum -- --frames 900 --out demo-muscle-pendulum.mp4
 ```
 
 `--out` defaults to a demo-specific mp4 in the current directory. the

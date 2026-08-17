@@ -99,6 +99,78 @@ byte-identical to the v0 `PdServo`. The mapping:
 
 `<general>` accepts every field explicitly. See MJCF/JSON details below.
 
+## muscle actuators
+
+`<muscle>` and muscle-typed `<general>` actuators use MuJoCo's shared
+force-length-velocity functions. The same formulas serve joint and tendon
+transmissions.
+
+For normalized length `L` and normalized velocity `V`, active force is:
+
+```text
+FL(L) = 0                         L < lmin or L > lmax
+       = 0.5*x²                   lmin ≤ L ≤ a, x=(L-lmin)/(a-lmin)
+       = 1 - 0.5*x²               a < L ≤ 1, x=(1-L)/(1-a)
+       = 1 - 0.5*x²               1 < L ≤ b, x=(L-1)/(b-1)
+       = 0.5*x²                   b < L ≤ lmax, x=(lmax-L)/(lmax-b)
+
+FV(V) = 0                         V ≤ -1
+       = (V+1)²                    -1 < V ≤ 0
+       = fvmax - (fvmax-1-V)²/(fvmax-1)  0 < V ≤ fvmax-1
+       = fvmax                     V > fvmax-1
+
+gain = -F0 · FL(L) · FV(V)
+```
+
+Here `a=(lmin+1)/2`, `b=(1+lmax)/2`,
+`L=range0 + (length-lengthrange0)/L0`,
+`V=velocity/(L0·vmax)`, and
+`L0=(lengthrange1-lengthrange0)/(range1-range0)`. Passive bias is zero
+through `L=1`, then follows the quadratic-to-linear curve controlled by
+`fpmax`. `F0=force` when force is nonnegative; force `-1` uses
+`scale/max(MINVAL, acc0)`.
+
+Muscle activation uses `dynprm=[tau_act,tau_deact,tausmooth]`:
+
+```text
+tau_act   = tau_act0 · (0.5 + 1.5·clamp(act,0,1))
+tau_deact = tau_deact0 / (0.5 + 1.5·clamp(act,0,1))
+dctrl     = clamp(ctrl,0,1) - act
+act'      = dctrl / tau
+```
+
+With `tausmooth=0`, `tau` is `tau_act` when `dctrl>0`, else
+`tau_deact`. Smoothing blends them with MuJoCo's clamped quintic sigmoid.
+Euler updates muscle state at the step boundary. RK4 updates it at each
+mechanical stage.
+
+The supported auto-default subset uses MuJoCo's default curve and time
+parameters. `lengthrange` is required because this loader does not run
+MuJoCo's simulation-based compiler search. Omitted `acc0` uses the explicit
+subset default `1`; provide `acc0` with `force=-1` for a compiled-model
+match. Missing values never disappear silently.
+
+Muscles may target a joint or tendon. Wrapped tendon length and Jacobian
+calculation stays in the existing tendon path. Muscle velocity terms enter
+`implicitfast` only for joint transmissions. Tendon velocity terms remain
+explicit because their `JᵀJ` contribution is dense.
+
+### muscle MJCF and JSON
+
+```xml
+<muscle name="m" joint="hinge" lengthrange="0 1"
+        timeconst="0.01 0.04" tausmooth="0"/>
+<general name="g" joint="hinge" gaintype="muscle"
+         biastype="muscle" dyntype="muscle" lengthrange="0 1"
+         gainprm="0.75 1.05 -1 200 0.5 1.6 1.5 1.3 1.2"
+         dynprm="0.01 0.04 0"/>
+```
+
+JSON uses `type:"muscle"` with `lengthrange`, curve fields, `timeconst`,
+and optional `gear`, `ctrlrange`, `forcerange`, and `acc0`. A general JSON
+actuator uses nine-value `gainprm` and `biasprm`, plus three-value
+`dynprm`. Both loaders reject unknown fields.
+
 ### byte-identity: Position ↔ v0 PdServo
 
 The `Position` flavor is stored with `(kp, kv)` and evaluated as

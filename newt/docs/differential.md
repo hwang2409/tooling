@@ -352,6 +352,22 @@ The gap scales with `dt/tau` and the ctrl-step amplitude; it is much
 smaller than the bounded divergences on `sphere_drop_*` and
 `joint_limit_swing`, and it does not accumulate over the horizon.
 
+### muscle differential rows
+
+These rows use the same XML sources for MuJoCo and newt. MuJoCo 3.11.0
+captures live in `tests/references/muscle_*.json` and include post-step
+`qpos`, `qvel`, and `act` samples. Regenerate them with
+`tools/capture_muscle_differentials.py`.
+
+| scene | steps | measured max error | stated bound | purpose |
+|-------|------:|-------------------:|-------------:|---------|
+| muscle_pendulum | 500 | 8.35e-7 | 5.0e-2 | joint transmission and target pulse |
+| muscle_wrapped_tendon | 400 | 1.43e-6 | 5.0e-2 | wrapped tendon lift |
+| muscle_isometric_twitch | 300 | 1.19e-7 | 5.0e-2 | activation-only twitch |
+
+The measured values are maximum absolute error across every state and
+activation sample. The test prints the measured value on every run.
+
 ### joint_limit_swing (bounded divergence)
 
 Single-hinge pendulum with a `±0.6 rad` range limit, initial
