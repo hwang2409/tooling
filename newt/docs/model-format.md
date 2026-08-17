@@ -511,7 +511,9 @@ runaway nesting, `1e9999` overflow).
   before; the tier-5 round-trip test caught it here. Fixing the
   box-box narrow phase is a tier-2 follow-up (needs a proper SAT or
   MPR implementation); until then, rotated free-body-vs-free-body
-  contact is not supported. Golden is
+  contact is not supported. The stack golden records the exact plane-box
+  manifold path; upper boxes may redistribute onto the plane after a
+  manifold update. Golden is
   [`tests/goldens/model_stack.bin`](../tests/goldens/model_stack.bin);
   regen with `cargo test regenerate_stack_golden -- --ignored
   --nocapture` on macOS-aarch64.
