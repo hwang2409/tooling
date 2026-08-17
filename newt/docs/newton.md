@@ -194,8 +194,9 @@ free bodies that touch those links. A link Jacobian row maps each contact
 direction into the tree's `qdot` layout. The same row carries the impulse to
 the opposite body or tree link, so mixed contacts conserve internal momentum.
 
-Penalty mode still calls the legacy tree wrench callback. This keeps the
-penalty trajectory and penalty goldens byte-identical.
+Penalty mode still calls the legacy tree wrench callback. Its plane contacts
+use the shared source-parity manifold, so affected penalty trajectories and
+goldens can change.
 
 The solved normal impulse stays aligned with the original contact index. Touch
 sensors therefore report solver forces for tree contacts, including contacts
@@ -231,7 +232,8 @@ MJCF:
 ```
 
 `solver = PGS` remains the existing soft-constraint mode. Omitting the
-solver keeps the legacy default and all pre-existing goldens byte-identical.
+solver keeps the legacy default; source-manifold changes can affect contact
+scenes under that mode.
 
 ## Verification anchors
 

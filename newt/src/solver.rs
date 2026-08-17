@@ -60,15 +60,15 @@
 /// Which contact/constraint model the world uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SolverMode {
-    /// v0 penalty spring-damper. Existing default; all pre-v1-tier-4 goldens
-    /// stay byte-identical under this mode.
+    /// v0 penalty spring-damper. Existing default; scenes without a changed
+    /// contact manifold retain their previous trajectories.
     Penalty,
     /// MuJoCo soft-constraint model solved by PGS.
     Pgs,
     /// MuJoCo soft-constraint model solved by dense Newton iterations.
     ///
-    /// Newton is opt-in.  The legacy penalty default and the PGS path remain
-    /// unchanged for existing scenes and byte-identical goldens.
+    /// Newton is opt-in. The legacy penalty default and the PGS path remain
+    /// unchanged for scenes outside a changed contact manifold.
     Newton,
 }
 
@@ -92,8 +92,7 @@ const NEWTON_ELLIPTIC_ERROR: &str =
 /// World-level solver configuration.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SolverConfig {
-    /// Which model to use. Default `Penalty` keeps every existing golden
-    /// byte-identical under CI.
+    /// Which model to use. Default `Penalty` keeps the legacy force path.
     pub mode: SolverMode,
     /// Fixed number of PGS sweeps per step. Higher = tighter convergence,
     /// same runtime cost per iteration. Determinism outranks early-exit

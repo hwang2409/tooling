@@ -107,9 +107,9 @@ pub struct World {
     /// resulting order is `(min, max)` lexicographic.
     pub pair_list: Option<Vec<(usize, usize)>>,
     /// Constraint solver configuration. Default is
-    /// [`SolverConfig::DEFAULT`] — `SolverMode::Penalty`, which keeps every
-    /// pre-v1-tier-4 golden byte-identical. Set to `SolverMode::Pgs` or
-    /// `SolverMode::Newton` to switch on a MuJoCo soft-constraint solver.
+    /// [`SolverConfig::DEFAULT`] — `SolverMode::Penalty`, the legacy force
+    /// path. Set to `SolverMode::Pgs` or `SolverMode::Newton` to switch on a
+    /// MuJoCo soft-constraint solver.
     pub solver: SolverConfig,
     /// Equality constraints (v1 tier 5). Only active when
     /// `solver.mode == Pgs`. Free-body equalities (connect / weld /
@@ -1418,11 +1418,12 @@ impl World {
 // ---------------------------------------------------------------------------
 
 /// Which narrow-phase dispatch to use when enumerating contacts. Penalty
-/// keeps the legacy vertex-vs-face primary for byte-identical goldens;
+/// keeps the legacy vertex-vs-face primary for box-box pairs;
 /// [`ContactManifold::Full`] routes box-box through SAT face-clipping so
 /// tilted face-face stacks see the 4-corner manifold instead of the
 /// 2-diagonal degenerate one (see NEWT-14 evidence in
-/// `docs/differential.md`).
+/// `docs/differential.md`). Plane colliders use the shared source-parity
+/// primitive rules in both paths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContactManifold {
     Legacy,

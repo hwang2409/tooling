@@ -280,8 +280,8 @@ lookup by name resolves to a mesh id used at runtime.
 ## solver (root object, optional)
 
 Optional top-level constraint-solver configuration. Omitted → defaults
-(`SolverMode::Penalty`, 20 iterations, pyramidal cone) — every
-pre-v1-tier-4 scene stays byte-identical.
+(`SolverMode::Penalty`, 20 iterations, pyramidal cone). Scenes using a
+changed contact manifold can have a different trajectory under this default.
 
 ```json
 {
