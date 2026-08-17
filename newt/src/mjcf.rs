@@ -58,7 +58,7 @@ use crate::tendon::{
     FixedTendonJoint, SpatialSegment, SpatialTendonBranch, SpatialTendonSite, SpatialWrap, Tendon,
     WrapCylinder, WrapSphere,
 };
-use crate::tree::{Link, Tree};
+use crate::tree::{Link, Tree, forward_kinematics};
 use crate::world::{Integrator, World};
 use crate::xml::{self, Element};
 
@@ -2396,6 +2396,9 @@ impl Loader {
                 }
                 "geom" => {
                     // Between two sites: a wrap.
+                    if sites.is_empty() {
+                        return fail(&cp, "wrap geom must follow a site");
+                    }
                     if pending_wrap.is_some() {
                         return fail(
                             &cp,
@@ -2470,8 +2473,27 @@ impl Loader {
                                     position_local: self.sites[sidx].local_offset,
                                 })
                             }
-                            SiteAttach::Link { .. } => {
-                                return fail(&cp, "sidesite must belong to the tendon tree");
+                            SiteAttach::Link { tree, link } => {
+                                let mut cur = Some(link);
+                                while let Some(link_idx) = cur {
+                                    if !matches!(
+                                        self.world.trees[tree].links[link_idx].joint,
+                                        JointKind::Fixed
+                                    ) {
+                                        return fail(
+                                            &cp,
+                                            "cross-tree sidesite must belong to a fixed body",
+                                        );
+                                    }
+                                    cur = self.world.trees[tree].links[link_idx].parent;
+                                }
+                                let poses = forward_kinematics(&self.world.trees[tree]);
+                                let (position, orientation) = poses[link];
+                                Some(SpatialTendonSite {
+                                    link: None,
+                                    position_local: position
+                                        + orientation.rotate(self.sites[sidx].local_offset),
+                                })
                             }
                             SiteAttach::Body(_) => {
                                 return fail(&cp, "sidesite on a free body is not supported");

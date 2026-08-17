@@ -1006,11 +1006,23 @@ fn add_wrap_body_jacobian(
     }
     let point_a_jac = wrap_point_jacobian(tree, poses, Some(link), data.point_a);
     for &(slot, col) in &point_a_jac.columns {
-        jacobian[slot as usize] += data.force_a.dot(col);
+        let center_col = center_jac
+            .columns
+            .iter()
+            .find(|(center_slot, _)| *center_slot == slot)
+            .map(|(_, center_col)| *center_col)
+            .unwrap_or(Vec3::ZERO);
+        jacobian[slot as usize] += data.force_a.dot(col - center_col);
     }
     let point_b_jac = wrap_point_jacobian(tree, poses, Some(link), data.point_b);
     for &(slot, col) in &point_b_jac.columns {
-        jacobian[slot as usize] += data.force_b.dot(col);
+        let center_col = center_jac
+            .columns
+            .iter()
+            .find(|(center_slot, _)| *center_slot == slot)
+            .map(|(_, center_col)| *center_col)
+            .unwrap_or(Vec3::ZERO);
+        jacobian[slot as usize] += data.force_b.dot(col - center_col);
     }
 }
 

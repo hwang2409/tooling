@@ -111,6 +111,10 @@ projects both endpoints into the plane normal to that axis and applies the
 2D circle construction. The shortest tangent pair wins. A sidesite selects
 the pair whose circular arc points toward the projected sidesite.
 
+MJCF sidesites on another fixed tree are accepted and stored as world-static
+sites. Cross-tree sidesites with a moving joint remain rejected because their
+world dependency cannot fit one tree's tendon Jacobian.
+
 The 2D tangent points are lifted back to 3D. Their axial coordinates divide
 the endpoint axial change in proportion to the 2D path lengths. The central
 arc length uses `sqrt(arc² + axial_change²)`. This matches MuJoCo's
@@ -246,7 +250,7 @@ The NEWT-27 matched-Euler/PGS captures add three spatial-wrap rows:
 | Scenario | qpos observed / bound | qvel observed / bound |
 |---|---:|---:|
 | `tendon_cylinder_lift` | `8.83e-8 / 2.0e-7` | `4.58e-7 / 1.0e-6` |
-| `tendon_pulley_2to1` | `1.58e-7 / 4.0e-7` | `1.32e-6 / 3.0e-6` |
+| `tendon_pulley_2to1` | `1.95e-7 / 4.0e-7` | `1.18e-6 / 3.0e-6` |
 | `tendon_mixed_wrap` | `1.06e-7 / 3.0e-7` | `5.04e-7 / 1.0e-6` |
 
 The symmetry-broken cylinder actuator golden is

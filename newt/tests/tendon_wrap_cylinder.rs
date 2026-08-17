@@ -43,7 +43,7 @@ fn cylinder_tendon(a: Vec3, b: Vec3, sidesite: Option<Vec3>) -> Tendon {
 }
 
 #[test]
-fn cylinder_wrap_matches_hand_tangent_geometry() {
+fn mutant_wrong_tangent_side_is_killed_by_hand_anchor_test() {
     let tree = fixed_tree();
     let tendon = cylinder_tendon(Vec3::new(-2.0, 0.2, 0.0), Vec3::new(2.0, 0.2, 0.0), None);
     let poses = forward_kinematics(&tree);
@@ -64,7 +64,7 @@ fn cylinder_wrap_matches_hand_tangent_geometry() {
 }
 
 #[test]
-fn cylinder_sidesite_selects_the_other_tangent_pair() {
+fn mutant_inverted_sidesite_is_killed_by_pair_test() {
     let tree = fixed_tree();
     let poses = forward_kinematics(&tree);
     let short = cylinder_tendon(
@@ -83,7 +83,7 @@ fn cylinder_sidesite_selects_the_other_tangent_pair() {
 }
 
 #[test]
-fn cylinder_jacobian_matches_finite_difference() {
+fn cylinder_endpoint_jacobian_matches_finite_difference() {
     let mut tree = fixed_tree();
     tree.push_link(Link::new(
         Some(0),
@@ -136,7 +136,7 @@ fn cylinder_jacobian_matches_finite_difference() {
 }
 
 #[test]
-fn pulley_jacobian_matches_finite_difference() {
+fn mutant_length_only_divisor_is_killed_by_jacobian_test() {
     let mut tree = fixed_tree();
     tree.push_link(Link::new(
         Some(0),
@@ -212,6 +212,162 @@ fn pulley_divisor_scales_branch_length_and_jacobian() {
     ]);
     let kin = newt::tendon::tendon_kinematics(&tendon, &tree, &forward_kinematics(&tree));
     assert!((kin.length - 4.0).abs() < 1.0e-6);
+}
+
+fn moving_wrap_tree(axis: Vec3) -> Tree {
+    let mut tree = fixed_tree();
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::Slide {
+            axis,
+            range: None,
+            damping: 0.0,
+            armature: 0.0,
+            limit: JointLimit::DEFAULT,
+        },
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    tree
+}
+
+#[test]
+fn mutant_missing_wrap_body_contribution_is_killed_by_fd_test() {
+    for (label, wrap) in [
+        (
+            "cylinder",
+            SpatialWrap::Cylinder(WrapCylinder {
+                link: Some(1),
+                center_local: Vec3::ZERO,
+                axis_local: Vec3::Z,
+                radius: 0.5,
+                sidesite: None,
+            }),
+        ),
+        (
+            "sphere",
+            SpatialWrap::Sphere(newt::tendon::WrapSphere {
+                link: Some(1),
+                center_local: Vec3::ZERO,
+                radius: 0.5,
+                side_hint_world: None,
+            }),
+        ),
+    ] {
+        let mut tree = moving_wrap_tree(Vec3::X);
+        tree.set_slide_position(1, 0.1);
+        let tendon = Tendon::spatial_branches(vec![SpatialTendonBranch {
+            sites: vec![
+                site(None, Vec3::new(-2.0, 0.2, 0.0)),
+                site(None, Vec3::new(2.0, 0.2, 0.0)),
+            ],
+            segments: vec![SpatialSegment { wrap: Some(wrap) }],
+            divisor: 1.0,
+        }]);
+        // A 1e-4 step is below the f32 length quantum for this small body
+        // derivative. The larger probe still stays on the same wrap branch.
+        let h = 1.0e-2;
+        let base = newt::tendon::tendon_kinematics(&tendon, &tree, &forward_kinematics(&tree));
+        let mut plus = tree.clone();
+        plus.set_slide_position(1, 0.1 + h);
+        let mut minus = tree.clone();
+        minus.set_slide_position(1, 0.1 - h);
+        let lp = newt::tendon::tendon_kinematics(&tendon, &plus, &forward_kinematics(&plus)).length;
+        let lm =
+            newt::tendon::tendon_kinematics(&tendon, &minus, &forward_kinematics(&minus)).length;
+        let fd = (lp - lm) / (2.0 * h);
+        let analytic = base.jacobian[tree.v_offset[1]];
+        println!("{label} moving-wrap body fd={fd:.6e} analytic={analytic:.6e}");
+        assert!(
+            (fd - analytic).abs() < 2.0e-3,
+            "{label}: fd={fd} analytic={analytic}"
+        );
+    }
+}
+
+#[test]
+fn mutant_dropped_axial_lift_is_killed_by_fd_test() {
+    let mut tree = moving_wrap_tree(Vec3::Z);
+    tree.set_slide_position(1, 0.3);
+    let tendon = Tendon::spatial_branches(vec![SpatialTendonBranch {
+        sites: vec![
+            site(None, Vec3::new(-2.0, 0.2, 0.0)),
+            site(Some(1), Vec3::new(2.0, 0.2, 0.0)),
+        ],
+        segments: vec![SpatialSegment {
+            wrap: Some(SpatialWrap::Cylinder(WrapCylinder {
+                link: None,
+                center_local: Vec3::ZERO,
+                axis_local: Vec3::Z,
+                radius: 0.5,
+                sidesite: None,
+            })),
+        }],
+        divisor: 1.0,
+    }]);
+    let h = 1.0e-4;
+    let base = newt::tendon::tendon_kinematics(&tendon, &tree, &forward_kinematics(&tree));
+    let mut plus = tree.clone();
+    plus.set_slide_position(1, 0.3 + h);
+    let mut minus = tree.clone();
+    minus.set_slide_position(1, 0.3 - h);
+    let lp = newt::tendon::tendon_kinematics(&tendon, &plus, &forward_kinematics(&plus)).length;
+    let lm = newt::tendon::tendon_kinematics(&tendon, &minus, &forward_kinematics(&minus)).length;
+    let fd = (lp - lm) / (2.0 * h);
+    let analytic = base.jacobian[tree.v_offset[1]];
+    println!("axial-lift fd={fd:.6e} analytic={analytic:.6e}");
+    assert!(
+        (fd - analytic).abs() < 2.0e-3,
+        "fd={fd} analytic={analytic}"
+    );
+}
+
+#[test]
+fn loaded_and_programmatic_cylinder_and_pulley_anchors_match() {
+    let mjcf = r#"<mujoco><worldbody><body name="root"><inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/><site name="a" pos="-2 0 0"/><site name="b" pos="2 0 0"/><site name="c" pos="0 1 0"/><site name="d" pos="0 3 0"/><geom name="cyl" type="cylinder" size="0.5 1"/></body></worldbody><tendon><spatial name="c"><site site="a"/><geom geom="cyl"/><site site="b"/><pulley divisor="2"/><site site="c"/><site site="d"/></spatial></tendon></mujoco>"#;
+    let loaded = newt::mjcf::load_mjcf_str(mjcf).expect("loaded tendon");
+    let loaded_tree = &loaded.world.trees[0];
+    let loaded_kin = newt::tendon::tendon_kinematics(
+        &loaded_tree.tendons[0],
+        loaded_tree,
+        &forward_kinematics(loaded_tree),
+    );
+    let programmatic = Tendon::spatial_branches(vec![
+        SpatialTendonBranch {
+            sites: vec![
+                site(None, Vec3::new(-2.0, 0.0, 0.0)),
+                site(None, Vec3::new(2.0, 0.0, 0.0)),
+            ],
+            segments: vec![SpatialSegment {
+                wrap: Some(SpatialWrap::Cylinder(WrapCylinder {
+                    link: None,
+                    center_local: Vec3::ZERO,
+                    axis_local: Vec3::Z,
+                    radius: 0.5,
+                    sidesite: None,
+                })),
+            }],
+            divisor: 1.0,
+        },
+        SpatialTendonBranch {
+            sites: vec![
+                site(None, Vec3::new(0.0, 1.0, 0.0)),
+                site(None, Vec3::new(0.0, 3.0, 0.0)),
+            ],
+            segments: vec![SpatialSegment { wrap: None }],
+            divisor: 2.0,
+        },
+    ]);
+    let program_tree = fixed_tree();
+    let program_kin = newt::tendon::tendon_kinematics(
+        &programmatic,
+        &program_tree,
+        &forward_kinematics(&program_tree),
+    );
+    assert!((loaded_kin.length - program_kin.length).abs() < 2.0e-5);
+    assert_eq!(loaded_kin.jacobian, program_kin.jacobian);
 }
 
 #[test]

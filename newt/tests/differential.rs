@@ -200,8 +200,8 @@ fn tolerance(name: &str) -> Tolerance {
             qpos: 2.0e-7,
             qvel: 1.0e-6,
         },
-        // Matched-Euler 2:1 pulley capture. Observed max qpos 1.58e-7,
-        // qvel 1.32e-6; bounds leave measured headroom.
+        // Matched-Euler asymmetric 2:1 pulley capture. Observed max qpos
+        // 1.95e-7, qvel 1.18e-6; bounds leave measured headroom.
         "tendon_pulley_2to1" => Tolerance {
             qpos: 4.0e-7,
             qvel: 3.0e-6,

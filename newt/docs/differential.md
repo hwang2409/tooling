@@ -65,7 +65,7 @@ those units.
 | velocity_cartpole  | 2.70e-7           | 1.0e-6     | 5.77e-7           | 2.0e-6     | parity             |
 | filtered_motor_pendulum | 2.56e-4      | 6.0e-4     | 1.34e-3           | 3.0e-3     | bounded divergence |
 | tendon_cylinder_lift | 8.83e-8 | 2.0e-7 | 4.58e-7 | 1.0e-6 | parity; matched Euler PGS |
-| tendon_pulley_2to1 | 1.58e-7 | 4.0e-7 | 1.32e-6 | 3.0e-6 | parity; matched Euler PGS |
+| tendon_pulley_2to1 | 1.95e-7 | 4.0e-7 | 1.18e-6 | 3.0e-6 | parity; matched Euler PGS |
 | tendon_mixed_wrap | 1.06e-7 | 3.0e-7 | 5.04e-7 | 1.0e-6 | parity; matched Euler PGS |
 | mocap_rangefinder | 0                  | 1.0e-6     | 0                  | 1.0e-6     | parity; sensors 2.4e-8 |
 
