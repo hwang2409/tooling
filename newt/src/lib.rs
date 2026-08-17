@@ -73,6 +73,8 @@
 //!   space convention as joint transmissions. See `docs/tendons.md`.
 
 pub mod actuator;
+#[doc(hidden)]
+pub mod benchmark;
 pub mod body;
 pub mod contact;
 pub mod dynamics;

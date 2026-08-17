@@ -989,6 +989,7 @@ fn positive_mod(value: f32, modulus: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     #[test]

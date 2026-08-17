@@ -11,6 +11,15 @@ crate-type = ["rlib"]
 
 # Zero runtime dependencies. See docs/superpowers/specs/2026-08-13-newt-physics-design.md.
 
+[features]
+default = []
+instrumentation = []
+alloc-guard = []
+
 [dev-dependencies]
 chimy2 = { path = "../chimy2" }
 winit = "0.30"
+
+[[bench]]
+name = "newt_perf"
+harness = false

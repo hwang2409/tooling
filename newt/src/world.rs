@@ -51,9 +51,13 @@ use crate::solver::{
     ConstraintRowDiagnostic, SolverConfig, SolverMode, TreeContactSolution, solve_free_bodies,
 };
 use crate::tree::{
-    Tree, euler_step as tree_euler_step, forward_kinematics as tree_forward_kinematics,
-    rk4_step as tree_rk4_step,
+    AbaWorkspace, Tree, euler_step_with_workspace as tree_euler_step_with_workspace,
+    forward_kinematics as tree_forward_kinematics,
+    rk4_step_with_workspace as tree_rk4_step_with_workspace,
 };
+
+#[cfg(feature = "instrumentation")]
+use std::time::Instant;
 
 /// Fixed-step integration schemes supported by [`World::step`].
 ///
@@ -151,6 +155,10 @@ pub struct World {
     solver_phase_capture: bool,
     #[doc(hidden)]
     last_solver_phase: Option<SolverPhaseDiagnostics>,
+    #[doc(hidden)]
+    tree_aba_workspaces: Vec<AbaWorkspace>,
+    #[cfg(feature = "instrumentation")]
+    step_timings: StepTimings,
 }
 
 /// State and contacts consumed by the most recent solver phase.
@@ -174,6 +182,20 @@ pub struct SolverPhaseDiagnostics {
     pub row_diagnostics: Vec<ConstraintRowDiagnostic>,
     /// Tree generalized contact forces from the solver phase.
     pub tree_qfrc: Vec<Vec<f32>>,
+}
+
+/// Timing counters for one [`World::step`] when instrumentation is enabled.
+///
+/// This type and its collection have no code or storage cost without the
+/// `instrumentation` feature.
+#[cfg(feature = "instrumentation")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StepTimings {
+    pub total_ns: u128,
+    pub collision_ns: u128,
+    pub solver_ns: u128,
+    pub integration_ns: u128,
+    pub sensors_ns: u128,
 }
 
 /// A named generalized-state snapshot. Vectors flatten trees in world tree
@@ -257,7 +279,16 @@ impl World {
             contact_detection_count: std::cell::Cell::new(0),
             solver_phase_capture: false,
             last_solver_phase: None,
+            tree_aba_workspaces: Vec::new(),
+            #[cfg(feature = "instrumentation")]
+            step_timings: StepTimings::default(),
         }
+    }
+
+    /// Return the timings recorded by the most recent [`Self::step`].
+    #[cfg(feature = "instrumentation")]
+    pub fn step_timings(&self) -> StepTimings {
+        self.step_timings
     }
 
     /// Enable or disable capture of the state and contacts used by
@@ -650,6 +681,8 @@ impl World {
     /// Adds a tree and returns its stable index.
     pub fn add_tree(&mut self, tree: Tree) -> usize {
         let idx = self.trees.len();
+        self.tree_aba_workspaces
+            .push(AbaWorkspace::new(tree.links.len()));
         self.trees.push(tree);
         idx
     }
@@ -782,9 +815,13 @@ impl World {
     /// integration. Penalty mode keeps its live per-stage RK4 collision
     /// callback. `detect_contacts` remains an explicit current-state query.
     pub fn step(&mut self) {
+        #[cfg(feature = "instrumentation")]
+        let total_start = Instant::now();
         self.solver
             .validate()
             .unwrap_or_else(|message| panic!("{message}"));
+        #[cfg(feature = "instrumentation")]
+        let collision_start = Instant::now();
         // Loud engine-level enforcement: the first step after any pair-list
         // or geom-count change panics if any ACTIVE pair falls in the
         // deferred bucket. Prevents a stack.json-style silent no-op.
@@ -795,6 +832,10 @@ impl World {
         };
         let contacts = matches!(self.solver.mode, SolverMode::Pgs | SolverMode::Newton)
             .then(|| self.detect_contacts_for_step(&pairs));
+        #[cfg(feature = "instrumentation")]
+        let collision_ns = collision_start.elapsed().as_nanos();
+        #[cfg(feature = "instrumentation")]
+        let solver_start = Instant::now();
         let solver_phase_state = self.solver_phase_capture.then(|| self.solver_phase_state());
         let tree_contact_solution = contacts
             .as_deref()
@@ -806,6 +847,10 @@ impl World {
             );
             self.record_solver_phase(state, tree_contact_solution.as_ref(), &phase_contacts);
         }
+        #[cfg(feature = "instrumentation")]
+        let solver_ns = solver_start.elapsed().as_nanos();
+        #[cfg(feature = "instrumentation")]
+        let integration_start = Instant::now();
         match self.integrator {
             Integrator::Rk4 => {
                 self.step_bodies(&pairs, contacts.as_deref(), tree_contact_solution.as_ref());
@@ -820,6 +865,10 @@ impl World {
                 self.step_bodies_euler(&pairs, contacts.as_deref(), tree_contact_solution.as_ref());
             }
         }
+        #[cfg(feature = "instrumentation")]
+        let integration_ns = integration_start.elapsed().as_nanos();
+        #[cfg(feature = "instrumentation")]
+        let sensors_start = Instant::now();
         // Sensor evaluation runs strictly on post-step state — no
         // perturbation. Skipped when no sensors are declared so every
         // pre-v1-tier-6 golden path is bit-for-bit untouched.
@@ -829,6 +878,16 @@ impl World {
             } else {
                 self.evaluate_sensors(&pairs);
             }
+        }
+        #[cfg(feature = "instrumentation")]
+        {
+            self.step_timings = StepTimings {
+                total_ns: total_start.elapsed().as_nanos(),
+                collision_ns,
+                solver_ns,
+                integration_ns,
+                sensors_ns: sensors_start.elapsed().as_nanos(),
+            };
         }
     }
 
@@ -1119,6 +1178,14 @@ impl World {
         if self.trees.is_empty() {
             return;
         }
+        while self.tree_aba_workspaces.len() < self.trees.len() {
+            let index = self.tree_aba_workspaces.len();
+            self.tree_aba_workspaces
+                .push(AbaWorkspace::new(self.trees[index].links.len()));
+        }
+        for (workspace, tree) in self.tree_aba_workspaces.iter_mut().zip(&self.trees) {
+            workspace.ensure_len(tree.links.len());
+        }
         let n_trees = self.trees.len();
         // Snapshot scalars before we start borrowing the vector fields.
         let dt = self.dt;
@@ -1190,21 +1257,27 @@ impl World {
                 // ends before we mutate self.trees[ti] on the next line.
                 let bodies_ref = &self.bodies;
                 let geoms_ref = &self.geoms;
-                tree_rk4_step(&mut tree, gravity, dt, |t| {
-                    if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
-                        vec![(Vec3::ZERO, Vec3::ZERO); t.links.len()]
-                    } else {
-                        tree_wrenches_from_pairs(
-                            t,
-                            ti,
-                            bodies_ref,
-                            geoms_ref,
-                            &self.meshes,
-                            &self.hfields,
-                            &tree_pairs,
-                        )
-                    }
-                });
+                tree_rk4_step_with_workspace(
+                    &mut tree,
+                    gravity,
+                    dt,
+                    |t| {
+                        if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
+                            vec![(Vec3::ZERO, Vec3::ZERO); t.links.len()]
+                        } else {
+                            tree_wrenches_from_pairs(
+                                t,
+                                ti,
+                                bodies_ref,
+                                geoms_ref,
+                                &self.meshes,
+                                &self.hfields,
+                                &tree_pairs,
+                            )
+                        }
+                    },
+                    &mut self.tree_aba_workspaces[ti],
+                );
             }
             // Roll back the ZOH limit torque + penalty-limit gate so
             // neither accumulates across steps (the solver recomputes
@@ -1229,6 +1302,14 @@ impl World {
     ) {
         if self.trees.is_empty() {
             return;
+        }
+        while self.tree_aba_workspaces.len() < self.trees.len() {
+            let index = self.tree_aba_workspaces.len();
+            self.tree_aba_workspaces
+                .push(AbaWorkspace::new(self.trees[index].links.len()));
+        }
+        for (workspace, tree) in self.tree_aba_workspaces.iter_mut().zip(&self.trees) {
+            workspace.ensure_len(tree.links.len());
         }
         let dt = self.dt;
         let gravity = self.gravity;
@@ -1281,21 +1362,28 @@ impl World {
             {
                 let bodies_ref = &self.bodies;
                 let geoms_ref = &self.geoms;
-                tree_euler_step(&mut tree, gravity, dt, implicit_fast, |state| {
-                    if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
-                        vec![(Vec3::ZERO, Vec3::ZERO); state.links.len()]
-                    } else {
-                        tree_wrenches_from_pairs(
-                            state,
-                            ti,
-                            bodies_ref,
-                            geoms_ref,
-                            &self.meshes,
-                            &self.hfields,
-                            &tree_pairs,
-                        )
-                    }
-                });
+                tree_euler_step_with_workspace(
+                    &mut tree,
+                    gravity,
+                    dt,
+                    implicit_fast,
+                    |state| {
+                        if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
+                            vec![(Vec3::ZERO, Vec3::ZERO); state.links.len()]
+                        } else {
+                            tree_wrenches_from_pairs(
+                                state,
+                                ti,
+                                bodies_ref,
+                                geoms_ref,
+                                &self.meshes,
+                                &self.hfields,
+                                &tree_pairs,
+                            )
+                        }
+                    },
+                    &mut self.tree_aba_workspaces[ti],
+                );
             }
             for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
                 tree.qfrc_applied[slot] -= delta;
