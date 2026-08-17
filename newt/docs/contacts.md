@@ -101,7 +101,7 @@ Contacts-per-pair for the implemented primitives:
 | sphere-mesh | `contact::sphere_mesh` | ≤ 1 (closest-point-on-triangle over faces) |
 | sphere-hfield | `contact::sphere_hfield` | ≤ 4 deepest prism candidates |
 | capsule-hfield | `contact::capsule_hfield` | ≤ 4 deepest endpoint candidates |
-| box-hfield | `contact::box_hfield` | ≤ 4 deepest convex-prism candidates |
+| box-hfield | `contact::box_hfield` | ≤ 4 deepest convex-prism GJK/EPA candidates |
 | capsule-capsule | `contact::capsule_capsule` | ≤ 1 |
 | box-box | `contact::box_box` (full OBB SAT) | ≤ 4 |
 
@@ -181,28 +181,45 @@ finite base extends to `-base_depth`.
 Each cell uses the fixed `00 → 11` diagonal. Its two top triangles and the
 base define open-sided triangular prisms. The shared diagonal is a crease.
 Only outer field sides and the base are walls. Sphere and capsule collision use
-the closest point on the full prism surface. Box collision uses convex-prism
-separating axes, including box-edge features. Candidates use row, column,
+the closest point on the full prism surface. Box collision uses native-style
+convex-prism GJK plus EPA. Candidates use row, column,
 diagonal, and feature order. The existing per-pair cap retains the deepest
 four candidates.
 
-#### box hfield declared mode
+#### native CCD routing and box hfields
 
-Box-hfield conformance uses MuJoCo's legacy convex hfield path, selected by
-the exact XML declaration
-`<option><flag nativeccd="disable"/></option>`. Newt matches MuJoCo's
-contact count and minimum-penetration depths in this mode. Probe 6 uses SAT
-support-feature positions and normals, while MuJoCo uses per-prism MPR
-positions and normals. The fixture records the measured position bound of
-`0.8` and normal bound of `1.45e-2` per contact.
-The probe-6 diagnostic maps MuJoCo and newt contacts to the same cell `(0, 0)`
-and prisms `1` then `0`, so the position difference is a construction
-difference, not a cell-selection difference. The steep-field 100-step
-flag-disabled anchor bounds its dynamic effect at `7.0e-3` qpos and `1.5e-1`
-qvel.
+MuJoCo 3.11.0 routes these default narrow phases. `CCD` means native GJK plus
+EPA. `HFieldCCD` applies the convex path to heightfield prism candidates.
 
-This declaration does not claim parity with MuJoCo's default native-CCD
-pipeline. That alignment remains an open finding.
+| pair family | default MuJoCo route |
+|---|---|
+| plane with sphere, capsule, ellipsoid, cylinder, box, mesh | analytic primitive |
+| hfield with sphere, capsule, ellipsoid, cylinder, box, mesh | HFieldCCD |
+| sphere with sphere, capsule, cylinder, box | analytic primitive |
+| sphere with ellipsoid, mesh | CCD |
+| capsule with capsule, box | analytic primitive |
+| capsule with ellipsoid, cylinder, mesh | CCD |
+| ellipsoid with ellipsoid, cylinder, box, mesh | CCD |
+| cylinder with cylinder, box, mesh | CCD |
+| box with box | analytic primitive |
+| box with mesh, mesh with mesh | CCD |
+
+This table follows MuJoCo's `mjCOLLISIONFUNC` table in
+`src/engine/engine_collision_driver.c`. The runtime provenance is executable:
+`tests/references/hfield_conformance_default_box.xml` has no nativeccd
+override. The disabled comparison remains in
+`hfield_conformance_nativeccd_disabled.xml`.
+
+NEWT-31 routes box-hfield prism candidates through deterministic in-crate GJK
+plus EPA. The source-exact analytic colliders remain untouched. Other
+deferred convex pairs remain open and are rejected by the support matrix.
+
+The default box rows match MuJoCo's contact count. Contact construction is
+still bounded, not exact. The steep-box row measures position `0.27`, normal
+`0.8`, and depth `0.32` bounds. The base-crossing row measures `0.11`, `0.5`,
+and `0.04`. The bounds are stored in
+`tests/references/hfield_conformance.json` and asserted by
+`tests/hfield_conformance.rs`.
 
 Hfield collision supports sphere, capsule, and box only. Mesh, cylinder, and
 ellipsoid pairs are deferred and rejected by active-pair validation. Hfield
@@ -273,10 +290,10 @@ the Coulomb cap. designers who need a bright-line stiction can override
 heightfields use the MuJoCo finite-prism model. Each grid cell is split along
 the fixed diagonal into two open-sided triangular prisms. The diagonal is a
 top crease, not a vertical wall. Sphere and capsule colliders test top, base,
-and outer side faces. Box colliders run the SAT convex-prism query and keep the
-four deepest unique contacts in deterministic order. SAT includes the base
-face and outer side-face axes, so it preserves side contacts outside the
-footprint and base contacts below the terrain.
+and outer side faces. Box colliders run the native-style convex-prism GJK/EPA
+query and keep the four deepest unique contacts in deterministic order. The
+closed prism includes the base and outer side walls, so it preserves side
+contacts outside the footprint and base contacts below the terrain.
 
 each contact contributes an equal-and-opposite wrench to its two owning
 bodies (Newton's third law is baked in — the momentum anchor verifies it).

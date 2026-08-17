@@ -13,7 +13,7 @@
 //! - Fully implemented pairs (tier 2 + v1 tier 2):
 //!   - plane vs {sphere, box, capsule, cylinder, ellipsoid, mesh}
 //!   - sphere vs {sphere, capsule, cylinder, ellipsoid, mesh}
-//!   - hfield vs {sphere, capsule, box}
+//!   - hfield vs {sphere, capsule, box}; box-hfield uses native-style GJK/EPA
 //!   - capsule vs capsule
 //!   - box vs box (full OBB SAT with edge-edge cross axes — closes the
 //!     NEWT-5 rotated-stack incident)
@@ -25,9 +25,8 @@
 //!   - box vs {sphere, capsule}  (unchanged from tier 2)
 //!   - hfield vs {cylinder, ellipsoid, mesh}
 //!
-//! Deferred pairs would each need a GJK or bespoke narrow-phase primitive
-//! and are called out in the docs. The v1 constraint solver ticket
-//! ultimately unifies these behind a shared support-function interface.
+//! Deferred pairs still need a shared support-function interface or a bespoke
+//! narrow phase and are called out in the docs.
 //!
 //! # Margin / gap semantics
 //!
@@ -2189,7 +2188,7 @@ pub fn box_hfield(
     for row in 0..hfield.nrow - 1 {
         for col in 0..hfield.ncol - 1 {
             for prism in hfield_prisms(hfield, row, col) {
-                if let Some(mut contact) = box_prism_sat_feature_contact(
+                if let Some(mut contact) = box_prism_gjk_epa_contact(
                     &box_pose_local,
                     half_extents,
                     &prism,
@@ -2209,59 +2208,165 @@ pub fn box_hfield(
     out
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
-struct MprVertex {
+struct CcdVertex {
     minkowski: Vec3,
-    prism: Vec3,
-    box_point: Vec3,
+    shape_a: Vec3,
+    shape_b: Vec3,
 }
 
-#[allow(dead_code)]
-fn mpr_support(prism: &[Vec3; 6], box_vertices: &[Vec3; 8], direction: Vec3) -> MprVertex {
-    let mut prism_point = prism[0];
-    let mut prism_dot = prism_point.dot(direction);
-    for &point in prism.iter().skip(1) {
-        let dot = point.dot(direction);
-        if dot > prism_dot {
-            prism_point = point;
-            prism_dot = dot;
-        }
-    }
-    let opposite = -direction;
+fn ccd_support(box_vertices: &[Vec3; 8], prism_vertices: &[Vec3; 6], direction: Vec3) -> CcdVertex {
+    let direction = if direction.length_squared() > 1.0e-20 {
+        direction
+    } else {
+        Vec3::X
+    };
     let mut box_point = box_vertices[0];
-    let mut box_dot = box_point.dot(opposite);
+    let mut box_dot = box_point.dot(direction);
     for &point in box_vertices.iter().skip(1) {
-        let dot = point.dot(opposite);
+        let dot = point.dot(direction);
         if dot > box_dot {
             box_point = point;
             box_dot = dot;
         }
     }
-    MprVertex {
-        minkowski: prism_point - box_point,
-        prism: prism_point,
-        box_point,
+    let opposite = -direction;
+    let mut prism_point = prism_vertices[0];
+    let mut prism_dot = prism_point.dot(opposite);
+    for &point in prism_vertices.iter().skip(1) {
+        let dot = point.dot(opposite);
+        if dot > prism_dot {
+            prism_point = point;
+            prism_dot = dot;
+        }
+    }
+    CcdVertex {
+        minkowski: box_point - prism_point,
+        shape_a: box_point,
+        shape_b: prism_point,
     }
 }
 
-#[allow(dead_code)]
-fn mpr_direction(a: Vec3, b: Vec3, c: Vec3) -> Option<Vec3> {
-    let direction = (b - a).cross(c - a);
-    if direction.length_squared() <= 1.0e-14 {
-        None
-    } else {
-        Some(direction.normalize())
+fn triple_product(a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+    b * a.dot(c) - a * b.dot(c)
+}
+
+#[derive(Clone, Copy)]
+struct CcdSimplex {
+    points: [CcdVertex; 4],
+    len: usize,
+}
+
+impl CcdSimplex {
+    fn new(point: CcdVertex) -> Self {
+        Self {
+            points: [point; 4],
+            len: 1,
+        }
+    }
+
+    fn push(&mut self, point: CcdVertex) {
+        self.points[self.len] = point;
+        self.len += 1;
+    }
+
+    fn set(&mut self, points: &[CcdVertex]) {
+        self.len = points.len();
+        self.points[..self.len].copy_from_slice(points);
     }
 }
 
-/// Box versus one triangular prism using the same support-feature query as
-/// MuJoCo's convex hfield path. The portal keeps witness points on both
-/// shapes, so edge and face contacts do not depend on box vertex sampling.
+/// Update a GJK simplex. The newest point is at the last occupied index.
+/// Returns true when the simplex encloses the origin.
+fn ccd_simplex_step(simplex: &mut CcdSimplex, direction: &mut Vec3) -> bool {
+    let a = simplex.points[simplex.len - 1];
+    let ao = -a.minkowski;
+    match simplex.len {
+        2 => {
+            let b = simplex.points[0];
+            let ab = b.minkowski - a.minkowski;
+            if ab.dot(ao) > 0.0 {
+                *direction = triple_product(ab, ao, ab);
+                if direction.length_squared() <= 1.0e-20 {
+                    *direction = Vec3::Z;
+                }
+            } else {
+                simplex.set(&[a]);
+                *direction = ao;
+            }
+        }
+        3 => {
+            let b = simplex.points[1];
+            let c = simplex.points[0];
+            let ab = b.minkowski - a.minkowski;
+            let ac = c.minkowski - a.minkowski;
+            let abc = ab.cross(ac);
+            if abc.length_squared() <= 1.0e-20 {
+                simplex.set(&[a, b]);
+                *direction = triple_product(ab, ao, ab);
+                return false;
+            }
+            if abc.cross(ac).dot(ao) > 0.0 {
+                if ac.dot(ao) > 0.0 {
+                    simplex.set(&[a, c]);
+                    *direction = triple_product(ac, ao, ac);
+                } else if ab.dot(ao) > 0.0 {
+                    simplex.set(&[a, b]);
+                    *direction = triple_product(ab, ao, ab);
+                } else {
+                    simplex.set(&[a]);
+                    *direction = ao;
+                }
+            } else if ab.cross(abc).dot(ao) > 0.0 {
+                if ab.dot(ao) > 0.0 {
+                    simplex.set(&[a, b]);
+                    *direction = triple_product(ab, ao, ab);
+                } else {
+                    simplex.set(&[a]);
+                    *direction = ao;
+                }
+            } else if abc.dot(ao) > 0.0 {
+                *direction = abc;
+            } else {
+                simplex.set(&[a, c, b]);
+                *direction = -abc;
+            }
+        }
+        4 => {
+            let b = simplex.points[2];
+            let c = simplex.points[1];
+            let d = simplex.points[0];
+            let ab = b.minkowski - a.minkowski;
+            let ac = c.minkowski - a.minkowski;
+            let ad = d.minkowski - a.minkowski;
+            let abc = ab.cross(ac);
+            let acd = ac.cross(ad);
+            let adb = ad.cross(ab);
+            if abc.dot(ao) > 0.0 {
+                simplex.set(&[a, c, b]);
+                *direction = abc;
+            } else if acd.dot(ao) > 0.0 {
+                simplex.set(&[a, d, c]);
+                *direction = acd;
+            } else if adb.dot(ao) > 0.0 {
+                simplex.set(&[a, b, d]);
+                *direction = adb;
+            } else {
+                return true;
+            }
+        }
+        _ => unreachable!(),
+    }
+    if direction.length_squared() <= 1.0e-20 {
+        *direction = Vec3::X;
+    }
+    false
+}
+
+/// Box versus one triangular prism using MuJoCo's native convex path shape:
+/// GJK finds an enclosing simplex and EPA expands it to the closest face.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-#[allow(clippy::question_mark)]
-fn box_prism_mpr_contact(
+fn box_prism_gjk_epa_contact(
     box_pose: &GeomPose,
     half_extents: Vec3,
     prism: &HfieldPrism,
@@ -2301,152 +2406,153 @@ fn box_prism_mpr_contact(
         );
         *vertex = box_pose.point_to_world(local);
     }
-    let center = prism_vertices
+    let mut direction = prism_vertices
         .iter()
         .copied()
         .fold(Vec3::ZERO, |sum, point| sum + point)
         / 6.0
         - box_pose.position;
-    let mut portal = [
-        MprVertex {
-            minkowski: center,
-            prism: prism_vertices[0],
-            box_point: box_pose.position,
-        },
-        MprVertex {
-            minkowski: Vec3::ZERO,
-            prism: Vec3::ZERO,
-            box_point: Vec3::ZERO,
-        },
-        MprVertex {
-            minkowski: Vec3::ZERO,
-            prism: Vec3::ZERO,
-            box_point: Vec3::ZERO,
-        },
-        MprVertex {
-            minkowski: Vec3::ZERO,
-            prism: Vec3::ZERO,
-            box_point: Vec3::ZERO,
-        },
-    ];
-    if center.length_squared() <= 1.0e-14 {
-        portal[0].minkowski = Vec3::new(1.0e-5, 0.0, 0.0);
+    if direction.length_squared() <= 1.0e-20 {
+        direction = Vec3::X;
     }
-    let mut direction = (-portal[0].minkowski).normalize();
-    portal[1] = mpr_support(&prism_vertices, &box_vertices, direction);
-    if portal[1].minkowski.dot(direction) <= 1.0e-7 {
-        return None;
-    }
-    direction = match mpr_direction(Vec3::ZERO, portal[0].minkowski, portal[1].minkowski) {
-        Some(direction) => direction,
-        None => return None,
-    };
-    portal[2] = mpr_support(&prism_vertices, &box_vertices, direction);
-    if portal[2].minkowski.dot(direction) <= 1.0e-7 {
-        return None;
-    }
-    direction = match mpr_direction(
-        portal[0].minkowski,
-        portal[1].minkowski,
-        portal[2].minkowski,
-    ) {
-        Some(direction) => direction,
-        None => return None,
-    };
-    if direction.dot(portal[0].minkowski) > 1.0e-7 {
-        portal.swap(1, 2);
-        direction = -direction;
-    }
-    loop {
-        portal[3] = mpr_support(&prism_vertices, &box_vertices, direction);
-        if portal[3].minkowski.dot(direction) <= 1.0e-7 {
+    let mut simplex = CcdSimplex::new(ccd_support(&box_vertices, &prism_vertices, direction));
+    direction = -simplex.points[0].minkowski;
+    let mut enclosed = false;
+    for _ in 0..32 {
+        let point = ccd_support(&box_vertices, &prism_vertices, direction);
+        if point.minkowski.dot(direction) <= 1.0e-7 {
             return None;
         }
-        let first_cross = portal[1].minkowski.cross(portal[3].minkowski);
-        let second_cross = portal[3].minkowski.cross(portal[2].minkowski);
-        let mut replaced = false;
-        if first_cross.dot(portal[0].minkowski) < -1.0e-7 {
-            portal[2] = portal[3];
-            replaced = true;
-        } else if second_cross.dot(portal[0].minkowski) < -1.0e-7 {
-            portal[1] = portal[3];
-            replaced = true;
-        }
-        if !replaced {
+        simplex.push(point);
+        if ccd_simplex_step(&mut simplex, &mut direction) {
+            enclosed = true;
             break;
-        }
-        direction = match mpr_direction(
-            portal[0].minkowski,
-            portal[1].minkowski,
-            portal[2].minkowski,
-        ) {
-            Some(direction) => direction,
-            None => return None,
-        };
-    }
-    for _ in 0..32 {
-        direction = match mpr_direction(
-            portal[1].minkowski,
-            portal[2].minkowski,
-            portal[3].minkowski,
-        ) {
-            Some(direction) => direction,
-            None => return None,
-        };
-        if direction.dot(portal[1].minkowski) >= -1.0e-7 {
-            break;
-        }
-        let next = mpr_support(&prism_vertices, &box_vertices, direction);
-        let progress = next.minkowski.dot(direction)
-            - portal[1]
-                .minkowski
-                .dot(direction)
-                .min(portal[2].minkowski.dot(direction))
-                .min(portal[3].minkowski.dot(direction));
-        if progress <= 1.0e-5 {
-            break;
-        }
-        if next.minkowski.dot(direction) <= 1.0e-7 {
-            break;
-        }
-        let cross = next.minkowski.cross(portal[0].minkowski);
-        if portal[1].minkowski.dot(cross) > 1.0e-7 {
-            if portal[2].minkowski.dot(cross) > 1.0e-7 {
-                portal[1] = next;
-            } else {
-                portal[3] = next;
-            }
-        } else if portal[3].minkowski.dot(cross) > 1.0e-7 {
-            portal[2] = next;
-        } else {
-            portal[1] = next;
         }
     }
-    let face_normal = match mpr_direction(
-        portal[1].minkowski,
-        portal[2].minkowski,
-        portal[3].minkowski,
-    ) {
-        Some(direction) => direction,
-        None => return None,
-    };
-    let nearest = closest_point_on_triangle(
-        Vec3::ZERO,
-        portal[1].minkowski,
-        portal[2].minkowski,
-        portal[3].minkowski,
-    );
-    let depth = nearest.length();
-    let penetration = margin + depth;
-    if penetration <= 0.0 {
+    if !enclosed || simplex.len != 4 {
         return None;
     }
-    let mut bary = barycentric_triangle_origin(
-        portal[1].minkowski,
-        portal[2].minkowski,
-        portal[3].minkowski,
-        nearest,
-    );
+
+    #[derive(Clone, Copy)]
+    struct CcdFace {
+        indices: [usize; 3],
+        normal: Vec3,
+        distance: f32,
+    }
+
+    fn ccd_face(vertices: &[CcdVertex; 32], indices: [usize; 3]) -> Option<CcdFace> {
+        let a = vertices[indices[0]].minkowski;
+        let b = vertices[indices[1]].minkowski;
+        let c = vertices[indices[2]].minkowski;
+        let raw = (b - a).cross(c - a);
+        if raw.length_squared() <= 1.0e-20 {
+            return None;
+        }
+        let mut normal = raw.normalize();
+        let mut distance = normal.dot(a);
+        let mut oriented = indices;
+        if distance < 0.0 {
+            oriented = [indices[0], indices[2], indices[1]];
+            normal = -normal;
+            distance = -distance;
+        }
+        Some(CcdFace {
+            indices: oriented,
+            normal,
+            distance,
+        })
+    }
+
+    let mut vertices = [CcdVertex {
+        minkowski: Vec3::ZERO,
+        shape_a: Vec3::ZERO,
+        shape_b: Vec3::ZERO,
+    }; 32];
+    vertices[..4].copy_from_slice(&simplex.points);
+    let mut vertex_len = 4;
+    let initial_faces = [[0, 1, 2], [0, 3, 1], [0, 2, 3], [1, 3, 2]];
+    let mut faces = [CcdFace {
+        indices: [0; 3],
+        normal: Vec3::Z,
+        distance: f32::INFINITY,
+    }; 64];
+    let mut face_len = 0;
+    for indices in initial_faces {
+        if let Some(face) = ccd_face(&vertices, indices) {
+            faces[face_len] = face;
+            face_len += 1;
+        }
+    }
+    let mut best_face = faces[0];
+    for _ in 0..64 {
+        let mut best_index = 0;
+        for index in 1..face_len {
+            if faces[index].distance < faces[best_index].distance {
+                best_index = index;
+            }
+        }
+        best_face = faces[best_index];
+        let support = ccd_support(&box_vertices, &prism_vertices, best_face.normal);
+        let support_distance = support.minkowski.dot(best_face.normal);
+        if support_distance - best_face.distance <= 1.0e-5 {
+            break;
+        }
+        if vertex_len == vertices.len() {
+            break;
+        }
+        vertices[vertex_len] = support;
+        let new_vertex = vertex_len;
+        vertex_len += 1;
+        let mut next_faces = [CcdFace {
+            indices: [0; 3],
+            normal: Vec3::Z,
+            distance: f32::INFINITY,
+        }; 64];
+        let mut next_len = 0;
+        let mut edges = [[0usize; 2]; 128];
+        let mut edge_len = 0;
+        for face in faces[..face_len].iter().copied() {
+            if face.normal.dot(support.minkowski) > face.distance + 1.0e-6 {
+                for edge in [
+                    [face.indices[0], face.indices[1]],
+                    [face.indices[1], face.indices[2]],
+                    [face.indices[2], face.indices[0]],
+                ] {
+                    let reverse = [edge[1], edge[0]];
+                    if let Some(index) = edges[..edge_len]
+                        .iter()
+                        .position(|candidate| *candidate == reverse)
+                    {
+                        edges[index] = edges[edge_len - 1];
+                        edge_len -= 1;
+                    } else {
+                        edges[edge_len] = edge;
+                        edge_len += 1;
+                    }
+                }
+            } else {
+                next_faces[next_len] = face;
+                next_len += 1;
+            }
+        }
+        for edge in edges[..edge_len].iter().copied() {
+            if let Some(face) = ccd_face(&vertices, [edge[0], edge[1], new_vertex]) {
+                next_faces[next_len] = face;
+                next_len += 1;
+            }
+        }
+        faces = next_faces;
+        face_len = next_len;
+        if face_len == 0 {
+            return None;
+        }
+    }
+
+    let nearest = best_face.normal * best_face.distance;
+    let a = vertices[best_face.indices[0]].minkowski;
+    let b = vertices[best_face.indices[1]].minkowski;
+    let c = vertices[best_face.indices[2]].minkowski;
+    let mut bary = barycentric_triangle_origin(a, b, c, nearest);
     let sum = bary.0 + bary.1 + bary.2;
     if sum <= 1.0e-8 {
         return None;
@@ -2454,27 +2560,28 @@ fn box_prism_mpr_contact(
     bary.0 /= sum;
     bary.1 /= sum;
     bary.2 /= sum;
-    let prism_point =
-        portal[1].prism * bary.0 + portal[2].prism * bary.1 + portal[3].prism * bary.2;
-    let box_point =
-        portal[1].box_point * bary.0 + portal[2].box_point * bary.1 + portal[3].box_point * bary.2;
-    let normal = if face_normal.dot(box_pose.position - center) >= 0.0 {
-        face_normal
-    } else {
-        -face_normal
-    };
+    let point_a = vertices[best_face.indices[0]].shape_a * bary.0
+        + vertices[best_face.indices[1]].shape_a * bary.1
+        + vertices[best_face.indices[2]].shape_a * bary.2;
+    let point_b = vertices[best_face.indices[0]].shape_b * bary.0
+        + vertices[best_face.indices[1]].shape_b * bary.1
+        + vertices[best_face.indices[2]].shape_b * bary.2;
+    let depth = best_face.distance;
+    let penetration = depth + margin;
+    if penetration <= 0.0 {
+        return None;
+    }
     Some(Contact {
         geom_a: idx_box,
         geom_b: idx_hfield,
-        position_world: (box_point + prism_point) * 0.5,
-        normal_world: normal,
-        penetration: penetration.max(depth + margin),
+        position_world: (point_a + point_b) * 0.5,
+        normal_world: -best_face.normal,
+        penetration,
         friction,
         gap,
     })
 }
 
-#[allow(dead_code)]
 fn barycentric_triangle_origin(a: Vec3, b: Vec3, c: Vec3, point: Vec3) -> (f32, f32, f32) {
     let v0 = b - a;
     let v1 = c - a;
@@ -2491,170 +2598,6 @@ fn barycentric_triangle_origin(a: Vec3, b: Vec3, c: Vec3, point: Vec3) -> (f32, 
     let v = (d11 * d20 - d01 * d21) / denom;
     let w = (d00 * d21 - d01 * d20) / denom;
     (1.0 - v - w, v, w)
-}
-
-/// Select the minimum-overlap convex feature axis for a box and prism.
-/// Unlike vertex sampling, this includes box-edge and prism-edge axes.
-#[allow(clippy::too_many_arguments)]
-fn box_prism_sat_feature_contact(
-    box_pose: &GeomPose,
-    half_extents: Vec3,
-    prism: &HfieldPrism,
-    idx_box: usize,
-    idx_hfield: usize,
-    friction: f32,
-    margin: f32,
-    gap: f32,
-) -> Option<Contact> {
-    let box_axes = [
-        box_pose.rotate(Vec3::X),
-        box_pose.rotate(Vec3::Y),
-        box_pose.rotate(Vec3::Z),
-    ];
-    let top = prism.top;
-    let vertices = [
-        top.0,
-        top.1,
-        top.2,
-        Vec3::new(top.0.x, top.0.y, prism.base_z),
-        Vec3::new(top.1.x, top.1.y, prism.base_z),
-        Vec3::new(top.2.x, top.2.y, prism.base_z),
-    ];
-    let edges = [
-        top.1 - top.0,
-        top.2 - top.1,
-        top.0 - top.2,
-        vertices[4] - vertices[3],
-        vertices[5] - vertices[4],
-        vertices[3] - vertices[5],
-        vertices[3] - top.0,
-        vertices[4] - top.1,
-        vertices[5] - top.2,
-    ];
-    let mut axes = [Vec3::ZERO; 38];
-    let mut axis_count = 0;
-    for axis in box_axes {
-        axes[axis_count] = axis;
-        axis_count += 1;
-    }
-    for (index, &(a, b, c)) in prism.faces.iter().enumerate() {
-        if prism.valid[index] {
-            let normal = (b - a).cross(c - a).normalize();
-            if normal.length_squared() > 0.0 {
-                axes[axis_count] = normal;
-                axis_count += 1;
-            }
-        }
-    }
-    for box_axis in box_axes {
-        for edge in edges {
-            let cross = box_axis.cross(edge);
-            if cross.length_squared() > 1.0e-10 {
-                axes[axis_count] = cross.normalize();
-                axis_count += 1;
-            }
-        }
-    }
-    let prism_center = vertices
-        .iter()
-        .copied()
-        .fold(Vec3::ZERO, |sum, point| sum + point)
-        / 6.0;
-    let delta = box_pose.position - prism_center;
-    let mut best_overlap = f32::INFINITY;
-    let mut best_normal = Vec3::Z;
-    for &axis in &axes[..axis_count] {
-        let radius = half_extents.x * crate::math::abs(axis.dot(box_axes[0]))
-            + half_extents.y * crate::math::abs(axis.dot(box_axes[1]))
-            + half_extents.z * crate::math::abs(axis.dot(box_axes[2]));
-        let projection = box_pose.position.dot(axis);
-        let box_min = projection - radius;
-        let box_max = projection + radius;
-        let mut prism_min = f32::INFINITY;
-        let mut prism_max = f32::NEG_INFINITY;
-        for vertex in vertices {
-            let value = vertex.dot(axis);
-            prism_min = prism_min.min(value);
-            prism_max = prism_max.max(value);
-        }
-        let overlap = (box_max - prism_min).min(prism_max - box_min);
-        if overlap < -margin {
-            return None;
-        }
-        if overlap < best_overlap {
-            best_overlap = overlap;
-            best_normal = if delta.dot(axis) >= 0.0 { axis } else { -axis };
-        }
-    }
-    let penetration = margin + best_overlap;
-    if penetration <= 0.0 {
-        return None;
-    }
-    let box_radius = half_extents.x * crate::math::abs(best_normal.dot(box_axes[0]))
-        + half_extents.y * crate::math::abs(best_normal.dot(box_axes[1]))
-        + half_extents.z * crate::math::abs(best_normal.dot(box_axes[2]));
-    let box_surface = box_pose.position - best_normal * box_radius;
-    let prism_surface = prism_support_feature_point(prism, &vertices, best_normal, box_surface);
-    Some(Contact {
-        geom_a: idx_box,
-        geom_b: idx_hfield,
-        position_world: (box_surface + prism_surface) * 0.5,
-        normal_world: best_normal,
-        penetration,
-        friction,
-        gap,
-    })
-}
-
-/// Return the point on the prism support feature nearest to the opposing box
-/// support point. A single extreme vertex is wrong when the winning axis is a
-/// face or an edge, because it can place the reported contact outside the
-/// feature that generated the SAT result.
-fn prism_support_feature_point(
-    prism: &HfieldPrism,
-    vertices: &[Vec3; 6],
-    normal: Vec3,
-    target: Vec3,
-) -> Vec3 {
-    const EPS: f32 = 1.0e-4;
-    let max_projection = vertices
-        .iter()
-        .map(|vertex| vertex.dot(normal))
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mut best = vertices[0];
-    let mut best_distance = f32::INFINITY;
-
-    let mut consider = |point: Vec3| {
-        let distance = (point - target).length_squared();
-        if distance < best_distance {
-            best_distance = distance;
-            best = point;
-        }
-    };
-
-    for (index, &(a, b, c)) in prism.faces.iter().enumerate() {
-        if !prism.valid[index]
-            || (a.dot(normal) - max_projection).abs() > EPS
-            || (b.dot(normal) - max_projection).abs() > EPS
-            || (c.dot(normal) - max_projection).abs() > EPS
-        {
-            continue;
-        }
-        consider(closest_point_on_triangle(target, a, b, c));
-    }
-
-    for i in 0..vertices.len() {
-        if (vertices[i].dot(normal) - max_projection).abs() > EPS {
-            continue;
-        }
-        consider(vertices[i]);
-        for j in (i + 1)..vertices.len() {
-            if (vertices[j].dot(normal) - max_projection).abs() <= EPS {
-                consider(closest_point_on_segment(target, vertices[i], vertices[j]));
-            }
-        }
-    }
-    best
 }
 
 /// Closest point on triangle `(a, b, c)` to point `p`. Standard barycentric
@@ -3648,6 +3591,73 @@ mod tests {
         )
         .contacts[0];
         assert!(contact.normal_world.dot(Vec3::Z) > 0.99);
+    }
+
+    #[test]
+    fn native_ccd_box_prism_fixture_kills_epa_face_and_sign_mutants() {
+        let field = HeightField {
+            nrow: 2,
+            ncol: 2,
+            size: [1.0, 1.0, 1.0, 0.2],
+            data: vec![0.0, 1.0, 0.0, 1.0],
+        };
+        let pose = GeomPose {
+            position: Vec3::new(0.0, 0.0, 0.45),
+            orientation: Quat::from_axis_angle(Vec3::Y, 0.4),
+        };
+        let contacts = box_hfield(
+            0,
+            &pose,
+            Vec3::splat(0.25),
+            1,
+            &identity_pose(Vec3::ZERO),
+            &field,
+            0.5,
+            0.0,
+            0.0,
+        );
+        assert_eq!(contacts.len, 2);
+        assert!(contacts.contacts[0].penetration > contacts.contacts[1].penetration);
+        assert!(approx(contacts.contacts[0].penetration, 0.3874867, 2.0e-5));
+        assert!(approx(contacts.contacts[1].penetration, 0.3649474, 2.0e-5));
+        assert!(contacts.as_slice().iter().all(|contact| {
+            contact.normal_world.length() > 0.99999 && contact.penetration > 0.0
+        }));
+        assert_eq!(
+            contacts.contacts,
+            box_hfield(
+                0,
+                &pose,
+                Vec3::splat(0.25),
+                1,
+                &identity_pose(Vec3::ZERO),
+                &field,
+                0.5,
+                0.0,
+                0.0,
+            )
+            .contacts
+        );
+    }
+
+    #[test]
+    fn gjk_tetrahedron_enclosure_kills_simplex_termination_mutant() {
+        let point = |x, y, z| CcdVertex {
+            minkowski: Vec3::new(x, y, z),
+            shape_a: Vec3::ZERO,
+            shape_b: Vec3::ZERO,
+        };
+        let mut simplex = CcdSimplex {
+            points: [
+                point(1.0, 1.0, 1.0),
+                point(-1.0, -1.0, 1.0),
+                point(1.0, -1.0, -1.0),
+                point(-1.0, 1.0, -1.0),
+            ],
+            len: 4,
+        };
+        let mut direction = Vec3::X;
+        assert!(ccd_simplex_step(&mut simplex, &mut direction));
     }
 
     #[test]
