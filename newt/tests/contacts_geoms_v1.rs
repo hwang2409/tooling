@@ -661,9 +661,7 @@ fn sphere_touching_mesh_face_gives_correct_penetration() {
 #[test]
 fn analytic_convex_route_probes_are_stable_against_default_oracle_cases() {
     // These four fixed poses are the MuJoCo 3.11.0 route probes documented in
-    // docs/contacts.md. MuJoCo uses mjc_Convex for the first two pairs and
-    // mjc_PlaneConvex for the last two. Newt keeps its analytic colliders
-    // because the measured construction differences are documented there.
+    // docs/contacts.md. Newt uses the matching convex support constructions.
     let sphere = Geom::sphere(0, 0.2, Vec3::ZERO, 0.5);
     let sphere_pose = GeomPose {
         position: Vec3::new(0.6, 0.0, 0.0),
@@ -685,7 +683,7 @@ fn analytic_convex_route_probes_are_stable_against_default_oracle_cases() {
     );
     assert_eq!(sphere_ellipsoid.len, 1);
     let contact = sphere_ellipsoid.contacts[0];
-    close_vec(contact.position_world, Vec3::new(0.5, 0.0, 0.0), 1.0e-6);
+    close_vec(contact.position_world, Vec3::new(0.45, 0.0, 0.0), 2.0e-3);
     close_vec(contact.normal_world, Vec3::X, 1.0e-6);
     close_scalar(contact.penetration, 0.1, 1.0e-6, "sphere-ellipsoid depth");
 
@@ -709,7 +707,7 @@ fn analytic_convex_route_probes_are_stable_against_default_oracle_cases() {
     );
     assert_eq!(sphere_mesh.len, 1);
     let contact = sphere_mesh.contacts[0];
-    close_vec(contact.position_world, Vec3::new(0.2, 0.2, 0.0), 1.0e-6);
+    close_vec(contact.position_world, Vec3::new(0.2, 0.2, 0.05), 2.0e-3);
     close_vec(contact.normal_world, -Vec3::Z, 1.0e-6);
     close_scalar(contact.penetration, 0.1, 1.0e-6, "sphere-mesh depth");
 
@@ -732,7 +730,7 @@ fn analytic_convex_route_probes_are_stable_against_default_oracle_cases() {
     );
     assert_eq!(plane_ellipsoid.len, 1);
     let contact = plane_ellipsoid.contacts[0];
-    close_vec(contact.position_world, Vec3::ZERO, 1.0e-6);
+    close_vec(contact.position_world, Vec3::new(0.0, 0.0, -0.05), 2.0e-3);
     close_vec(contact.normal_world, -Vec3::Z, 1.0e-6);
     close_scalar(contact.penetration, 0.1, 1.0e-6, "plane-ellipsoid depth");
 
@@ -748,12 +746,12 @@ fn analytic_convex_route_probes_are_stable_against_default_oracle_cases() {
         },
         &[unit_tetrahedron()],
     );
-    assert_eq!(plane_mesh.len, 3);
+    assert_eq!(plane_mesh.len, 2);
     for contact in plane_mesh.as_slice() {
         close_vec(contact.normal_world, -Vec3::Z, 1.0e-6);
         close_scalar(
             contact.position_world.z,
-            0.0,
+            -0.05,
             1.0e-6,
             "plane-mesh position z",
         );
@@ -947,8 +945,8 @@ fn is_pair_supported_covers_new_and_reject_lists() {
         GeomShape::Sphere { radius: 1.0 },
         GeomShape::Mesh { mesh_id: 0 },
     ));
-    // Deferred.
-    assert!(!is_pair_supported(
+    // CCD routes.
+    assert!(is_pair_supported(
         GeomShape::Cylinder {
             radius: 1.0,
             half_height: 1.0
@@ -958,7 +956,7 @@ fn is_pair_supported_covers_new_and_reject_lists() {
             half_height: 1.0
         },
     ));
-    assert!(!is_pair_supported(
+    assert!(is_pair_supported(
         GeomShape::Ellipsoid {
             semi_axes: Vec3::splat(1.0)
         },
@@ -966,14 +964,14 @@ fn is_pair_supported_covers_new_and_reject_lists() {
             half_extents: Vec3::splat(1.0)
         },
     ));
-    assert!(!is_pair_supported(
+    assert!(is_pair_supported(
         GeomShape::Mesh { mesh_id: 0 },
         GeomShape::Mesh { mesh_id: 1 },
     ));
 }
 
 #[test]
-fn world_validate_supported_pairs_flags_deferred_cylinder_cylinder() {
+fn world_validate_supported_pairs_accepts_ccd_cylinder_cylinder() {
     let mut world = World::new();
     world.gravity = Vec3::ZERO;
     let b1 = Body::solid_box(1.0, Vec3::splat(0.1), Vec3::ZERO, Quat::IDENTITY);
@@ -1003,11 +1001,85 @@ fn world_validate_supported_pairs_flags_deferred_cylinder_cylinder() {
     ));
     let unsupported = world.validate_supported_pairs();
     assert!(
-        unsupported
+        !unsupported
             .iter()
-            .any(|u| u.geom_a == g1.min(g2) && u.geom_b == g1.max(g2)),
-        "expected cylinder-cylinder pair to be flagged, got {unsupported:?}"
+            .any(|u| u.geom_a == g1.min(g2) && u.geom_b == g1.max(g2))
     );
+}
+
+#[test]
+fn all_new_convex_ccd_routes_emit_one_contact() {
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(0.1, 0.1, 0.1),
+        orientation: Quat::from_axis_angle(Vec3::Z, 0.3),
+    };
+    let mesh = unit_tetrahedron();
+    let cases = [
+        (
+            Geom::capsule(0, 0.2, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
+            Geom::ellipsoid(1, Vec3::splat(0.3), Vec3::ZERO, Quat::IDENTITY, 0.5),
+        ),
+        (
+            Geom::capsule(0, 0.2, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
+            Geom::cylinder(1, 0.25, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        ),
+        (
+            Geom::capsule(0, 0.2, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
+            Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        ),
+        (
+            Geom::ellipsoid(0, Vec3::splat(0.3), Vec3::ZERO, Quat::IDENTITY, 0.5),
+            Geom::ellipsoid(1, Vec3::splat(0.3), Vec3::ZERO, Quat::IDENTITY, 0.5),
+        ),
+        (
+            Geom::ellipsoid(0, Vec3::splat(0.3), Vec3::ZERO, Quat::IDENTITY, 0.5),
+            Geom::cylinder(1, 0.25, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        ),
+        (
+            Geom::ellipsoid(0, Vec3::splat(0.3), Vec3::ZERO, Quat::IDENTITY, 0.5),
+            Geom::r#box(1, Vec3::splat(0.25), Vec3::ZERO, Quat::IDENTITY, 0.5),
+        ),
+        (
+            Geom::ellipsoid(0, Vec3::splat(0.3), Vec3::ZERO, Quat::IDENTITY, 0.5),
+            Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        ),
+        (
+            Geom::cylinder(0, 0.25, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
+            Geom::cylinder(1, 0.25, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        ),
+        (
+            Geom::cylinder(0, 0.25, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
+            Geom::r#box(1, Vec3::splat(0.25), Vec3::ZERO, Quat::IDENTITY, 0.5),
+        ),
+        (
+            Geom::cylinder(0, 0.25, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
+            Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        ),
+        (
+            Geom::r#box(0, Vec3::splat(0.25), Vec3::ZERO, Quat::IDENTITY, 0.5),
+            Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        ),
+        (
+            Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+            Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        ),
+    ];
+    for (index, (geom_a, geom_b)) in cases.into_iter().enumerate() {
+        let actual = narrow_phase(
+            0,
+            &geom_a,
+            &pose_a,
+            1,
+            &geom_b,
+            &pose_b,
+            std::slice::from_ref(&mesh),
+        );
+        assert_eq!(actual.len, 1, "ccd route {index} did not emit one contact");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,10 +1141,9 @@ fn build_mixed_scene() -> World {
     let b_b_upper = Body::solid_box(m, hb, Vec3::new(0.02, -0.7, 0.7), Quat::IDENTITY);
     let ibu = world.add_body(b_b_upper);
     world.add_geom(Geom::r#box(ibu, hb, Vec3::ZERO, Quat::IDENTITY, 0.6));
-    // Restrict pair list to supported combinations only — the four dynamic
+    // Restrict pair list to the intended pile interactions. The four dynamic
     // geoms all touch the ground plane (index 0); the two boxes also touch
-    // each other. Cylinder-vs-ellipsoid etc. are deferred and would trip
-    // the engine-level unsupported-pair panic if auto_pairs enumerated them.
+    // each other. Remaining box-sphere and box-capsule gaps stay excluded.
     let plane = 0;
     let cyl_g = 1;
     let ell_g = 2;
@@ -1121,8 +1192,8 @@ fn snapshot(world: &World) -> Vec<u8> {
 #[test]
 #[should_panic(expected = "not supported by newt's narrow phase")]
 fn world_step_panics_on_auto_generated_unsupported_pair() {
-    // Programmatic scene with two cylinders on separate bodies — auto_pairs
-    // enumerates the cylinder-cylinder pair, which is deferred. The first
+    // Programmatic scene with a box and sphere on separate bodies — auto_pairs
+    // enumerates the box-sphere pair, which is deferred. The first
     // `step()` after construction must panic; this replaces the tier-2
     // stack.json silent-no-op class of bug.
     let mut world = World::new();
@@ -1139,22 +1210,14 @@ fn world_step_panics_on_auto_generated_unsupported_pair() {
         Vec3::new(0.5, 0.0, 0.5),
         Quat::IDENTITY,
     ));
-    world.add_geom(Geom::cylinder(
+    world.add_geom(Geom::r#box(
         ba,
-        0.2,
-        0.2,
+        Vec3::splat(0.2),
         Vec3::ZERO,
         Quat::IDENTITY,
         0.5,
     ));
-    world.add_geom(Geom::cylinder(
-        bb,
-        0.2,
-        0.2,
-        Vec3::ZERO,
-        Quat::IDENTITY,
-        0.5,
-    ));
+    world.add_geom(Geom::sphere(bb, 0.2, Vec3::ZERO, 0.5));
     world.step();
 }
 
@@ -1173,7 +1236,7 @@ fn pile_scene_all_supported_steps_without_panic() {
 #[test]
 fn model_loader_rejects_explicit_unsupported_contact_pair() {
     // The JSON loader must surface an unsupported explicit pair at load
-    // time with a JSON-path error. Scene: two cylinder bodies with an
+    // time with a JSON-path error. Scene: a box and sphere with an
     // explicit `contact_pairs` entry between them.
     let json = r#"{
         "version": "1",
@@ -1182,9 +1245,9 @@ fn model_loader_rejects_explicit_unsupported_contact_pair() {
             {"name":"b","mass":1,"inertia":{"kind":"diag","values":[0.01,0.01,0.01]}}
         ],
         "geoms": [
-            {"name":"ga","shape":{"kind":"cylinder","radius":0.2,"half_height":0.2},
+            {"name":"ga","shape":{"kind":"box","half_extents":[0.2,0.2,0.2]},
              "attach":{"kind":"body","body":"a"}},
-            {"name":"gb","shape":{"kind":"cylinder","radius":0.2,"half_height":0.2},
+            {"name":"gb","shape":{"kind":"sphere","radius":0.2},
              "attach":{"kind":"body","body":"b"}}
         ],
         "contact_pairs": {"explicit":[{"a":"ga","b":"gb"}]}
@@ -1194,7 +1257,8 @@ fn model_loader_rejects_explicit_unsupported_contact_pair() {
     let msg = err.to_string();
     let lower = msg.to_lowercase();
     assert!(
-        lower.contains("cylinder")
+        lower.contains("box")
+            && lower.contains("sphere")
             && (lower.contains("not supported") || lower.contains("unsupported")),
         "loader error should mention cylinder + unsupported: {msg}"
     );

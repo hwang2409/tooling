@@ -17,22 +17,18 @@
 //!   - capsule vs capsule
 //!   - box vs box (full OBB SAT with edge-edge cross axes — closes the
 //!     NEWT-5 rotated-stack incident)
+//!   - all listed non-hfield convex CCD pairs use deterministic GJK plus EPA
 //!
 //! MuJoCo 3.11.0 routes sphere-{ellipsoid,mesh} through `mjc_Convex` and
-//! plane-{ellipsoid,mesh} through `mjc_PlaneConvex`. Newt retains its analytic
-//! implementations for these four pairs. Their measured contact-construction
-//! differences are permanent probes in `contacts_geoms_v1.rs` and an open
-//! finding in `docs/contacts.md`.
+//! plane-{ellipsoid,mesh} through `mjc_PlaneConvex`. Newt matches these routes
+//! with convex support points and load-bearing probes in `contacts_geoms_v1.rs`.
 //! - Deferred pairs (silently emit no contact + [`is_pair_supported`]
 //!   returns `false` so the world validator can reject them):
-//!   - cylinder vs {cylinder, box, capsule, ellipsoid, mesh}
-//!   - ellipsoid vs {box, capsule, ellipsoid, mesh}
-//!   - mesh vs {box, capsule, mesh}
 //!   - box vs {sphere, capsule}  (unchanged from tier 2)
 //!   - hfield vs {cylinder, ellipsoid, mesh}
 //!
-//! Deferred pairs still need a shared support-function interface or a bespoke
-//! narrow phase and are called out in the docs.
+//! Deferred pairs are limited to unsupported hfield combinations and the
+//! existing box-sphere and box-capsule gaps. They are called out in the docs.
 //!
 //! # Margin / gap semantics
 //!
@@ -226,10 +222,71 @@ fn supported_shape_pair(a: &GeomShape, b: &GeomShape) -> bool {
             | (GeomShape::Sphere { .. }, GeomShape::Mesh { .. })
             | (GeomShape::Sphere { .. }, GeomShape::Hfield { .. })
             | (GeomShape::Capsule { .. }, GeomShape::Capsule { .. })
+            | (GeomShape::Capsule { .. }, GeomShape::Cylinder { .. })
+            | (GeomShape::Capsule { .. }, GeomShape::Ellipsoid { .. })
+            | (GeomShape::Capsule { .. }, GeomShape::Mesh { .. })
             | (GeomShape::Box { .. }, GeomShape::Box { .. })
+            | (GeomShape::Box { .. }, GeomShape::Ellipsoid { .. })
+            | (GeomShape::Box { .. }, GeomShape::Mesh { .. })
             | (GeomShape::Box { .. }, GeomShape::Hfield { .. })
             | (GeomShape::Capsule { .. }, GeomShape::Hfield { .. })
+            | (GeomShape::Cylinder { .. }, GeomShape::Cylinder { .. })
+            | (GeomShape::Cylinder { .. }, GeomShape::Box { .. })
+            | (GeomShape::Cylinder { .. }, GeomShape::Ellipsoid { .. })
+            | (GeomShape::Cylinder { .. }, GeomShape::Mesh { .. })
+            | (GeomShape::Ellipsoid { .. }, GeomShape::Ellipsoid { .. })
+            | (GeomShape::Ellipsoid { .. }, GeomShape::Mesh { .. })
+            | (GeomShape::Mesh { .. }, GeomShape::Mesh { .. })
     )
+}
+
+fn ccd_route_pair(a: &GeomShape, b: &GeomShape) -> bool {
+    (supported_shape_pair(a, b) || supported_shape_pair(b, a))
+        && !matches!(
+            (a, b),
+            (GeomShape::Plane, _)
+                | (_, GeomShape::Plane)
+                | (GeomShape::Hfield { .. }, _)
+                | (_, GeomShape::Hfield { .. })
+                | (GeomShape::Sphere { .. }, GeomShape::Sphere { .. })
+                | (GeomShape::Sphere { .. }, GeomShape::Capsule { .. })
+                | (GeomShape::Sphere { .. }, GeomShape::Cylinder { .. })
+                | (GeomShape::Capsule { .. }, GeomShape::Capsule { .. })
+                | (GeomShape::Box { .. }, GeomShape::Box { .. })
+        )
+}
+
+fn ccd_shape<'a>(
+    shape: &GeomShape,
+    pose: &'a GeomPose,
+    meshes: &'a [ConvexMesh],
+) -> Option<CcdShape<'a>> {
+    match *shape {
+        GeomShape::Sphere { radius } => Some(CcdShape::Sphere { pose, radius }),
+        GeomShape::Capsule {
+            radius,
+            half_height,
+        } => Some(CcdShape::Capsule {
+            pose,
+            radius,
+            half_height,
+        }),
+        GeomShape::Cylinder {
+            radius,
+            half_height,
+        } => Some(CcdShape::Cylinder {
+            pose,
+            radius,
+            half_height,
+        }),
+        GeomShape::Ellipsoid { semi_axes } => Some(CcdShape::Ellipsoid { pose, semi_axes }),
+        GeomShape::Box { half_extents } => Some(CcdShape::Box { pose, half_extents }),
+        GeomShape::Mesh { mesh_id } => Some(CcdShape::Mesh {
+            pose,
+            mesh: &meshes[mesh_id],
+        }),
+        GeomShape::Plane | GeomShape::Hfield { .. } => None,
+    }
 }
 
 /// World-frame outward normal and origin of a plane geom.
@@ -1383,7 +1440,7 @@ pub fn ellipsoid_plane(
     let pen = margin - signed;
     let mut out = ContactBuf::new();
     if pen > 0.0 {
-        let contact_pt = support_world - n_world * signed;
+        let contact_pt = support_world - n_world * (signed * 0.5);
         out.push(Contact {
             geom_a: idx_ell,
             geom_b: idx_plane,
@@ -1397,8 +1454,8 @@ pub fn ellipsoid_plane(
     out
 }
 
-/// Convex mesh vs static plane. Iterates all mesh vertices, keeps up to 4
-/// deepest with shifted penetration `> 0` in a fixed vertex-index order.
+/// Convex mesh vs static plane. The native plane-convex route keeps up to two
+/// deepest support vertices with midpoint positions.
 #[allow(clippy::too_many_arguments)]
 pub fn mesh_plane(
     idx_mesh: usize,
@@ -1412,47 +1469,41 @@ pub fn mesh_plane(
     plane_pose: &GeomPose,
 ) -> ContactBuf {
     let (n_world, p0) = plane_world(plane_geom, plane_pose);
-    // Track up to 4 deepest via a small fixed-size top-K.
-    let mut top: [(f32, Vec3); 4] = [(f32::NEG_INFINITY, Vec3::ZERO); 4];
-    for (i, &v_local) in mesh.vertices.iter().enumerate() {
+    let tangent = plane_pose.rotate(Vec3::Y);
+    let mut primary: Option<(f32, f32, Vec3)> = None;
+    let mut secondary: Option<(f32, f32, Vec3)> = None;
+    for &v_local in &mesh.vertices {
         let world = mesh_pose.point_to_world(v_local);
         let signed = (world - p0).dot(n_world);
         let pen = margin - signed;
         if pen <= 0.0 {
             continue;
         }
-        // Find smallest in top; replace if this pen is larger. Tie-break by
-        // the CURRENT vertex-index order (which we've already fixed by
-        // iterating in order): use `>` so an equal-penetration later vertex
-        // does NOT displace an earlier one — deterministic in the tie case.
-        let mut min_idx = 0;
-        for k in 1..4 {
-            if top[k].0 < top[min_idx].0 {
-                min_idx = k;
+        let tangent_value = world.dot(tangent);
+        if primary.is_none_or(|candidate| {
+            pen > candidate.0 || (pen == candidate.0 && tangent_value > candidate.1 + 1.0e-6)
+        }) {
+            if let Some(previous) = primary {
+                secondary = Some(previous);
             }
-        }
-        if pen > top[min_idx].0 {
-            top[min_idx] = (pen, world);
-        }
-        let _ = i; // vertex index reserved for future manifold reordering
-    }
-    // Emit in descending-pen order for deterministic output.
-    let mut order = [0usize, 1, 2, 3];
-    for i in 1..4 {
-        let mut j = i;
-        while j > 0 && top[order[j]].0 > top[order[j - 1]].0 {
-            order.swap(j - 1, j);
-            j -= 1;
+            primary = Some((pen, tangent_value, world));
+        } else if primary.is_some_and(|candidate| {
+            (world - candidate.2).length_squared() > 1.0e-20
+                && secondary.is_none_or(|prior| {
+                    pen > prior.0 || (pen == prior.0 && tangent_value < prior.1 - 1.0e-6)
+                })
+        }) {
+            secondary = Some((pen, tangent_value, world));
         }
     }
     let mut out = ContactBuf::new();
-    for &i in &order {
-        let (pen, world) = top[i];
+    for (_, _, world) in [primary, secondary].into_iter().flatten() {
+        let pen = margin - (world - p0).dot(n_world);
         if pen <= 0.0 {
             continue;
         }
         let signed_raw = margin - pen;
-        let contact_pt = world - n_world * signed_raw;
+        let contact_pt = world - n_world * (signed_raw * 0.5);
         out.push(Contact {
             geom_a: idx_mesh,
             geom_b: idx_plane,
@@ -2221,36 +2272,401 @@ struct CcdVertex {
     shape_b: Vec3,
 }
 
-fn ccd_support(box_vertices: &[Vec3; 8], prism_vertices: &[Vec3; 6], direction: Vec3) -> CcdVertex {
+#[derive(Clone, Copy)]
+enum CcdShape<'a> {
+    Vertices(&'a [Vec3]),
+    Sphere {
+        pose: &'a GeomPose,
+        radius: f32,
+    },
+    Capsule {
+        pose: &'a GeomPose,
+        radius: f32,
+        half_height: f32,
+    },
+    Cylinder {
+        pose: &'a GeomPose,
+        radius: f32,
+        half_height: f32,
+    },
+    Ellipsoid {
+        pose: &'a GeomPose,
+        semi_axes: Vec3,
+    },
+    Box {
+        pose: &'a GeomPose,
+        half_extents: Vec3,
+    },
+    Mesh {
+        pose: &'a GeomPose,
+        mesh: &'a ConvexMesh,
+    },
+}
+
+impl CcdShape<'_> {
+    fn center(self) -> Vec3 {
+        match self {
+            Self::Vertices(vertices) => {
+                vertices
+                    .iter()
+                    .copied()
+                    .fold(Vec3::ZERO, |sum, point| sum + point)
+                    / vertices.len() as f32
+            }
+            Self::Sphere { pose, .. }
+            | Self::Capsule { pose, .. }
+            | Self::Cylinder { pose, .. }
+            | Self::Ellipsoid { pose, .. }
+            | Self::Box { pose, .. }
+            | Self::Mesh { pose, .. } => pose.position,
+        }
+    }
+
+    fn support(self, direction: Vec3) -> Vec3 {
+        let direction = if direction.length_squared() > 1.0e-20 {
+            direction
+        } else {
+            Vec3::X
+        };
+        match self {
+            Self::Vertices(vertices) => support_vertices(vertices, direction),
+            Self::Sphere { pose, radius } => pose.position + direction.normalize() * radius,
+            Self::Capsule {
+                pose,
+                radius,
+                half_height,
+            } => {
+                let local_direction = pose.orientation.inverse_rotate(direction);
+                let endpoint = if local_direction.z >= 0.0 {
+                    Vec3::new(0.0, 0.0, half_height)
+                } else {
+                    Vec3::new(0.0, 0.0, -half_height)
+                };
+                pose.point_to_world(endpoint) + direction.normalize() * radius
+            }
+            Self::Cylinder {
+                pose,
+                radius,
+                half_height,
+            } => {
+                let local_direction = pose.orientation.inverse_rotate(direction);
+                let radial = Vec3::new(local_direction.x, local_direction.y, 0.0);
+                let radial_point = if radial.length_squared() > 1.0e-20 {
+                    radial.normalize() * radius
+                } else {
+                    Vec3::ZERO
+                };
+                pose.point_to_world(Vec3::new(
+                    radial_point.x,
+                    radial_point.y,
+                    if local_direction.z >= 0.0 {
+                        half_height
+                    } else {
+                        -half_height
+                    },
+                ))
+            }
+            Self::Ellipsoid { pose, semi_axes } => {
+                let local_direction = pose.orientation.inverse_rotate(direction);
+                let scaled = Vec3::new(
+                    semi_axes.x * local_direction.x,
+                    semi_axes.y * local_direction.y,
+                    semi_axes.z * local_direction.z,
+                );
+                let denom = scaled.length();
+                let local_point = if denom > 1.0e-20 {
+                    Vec3::new(
+                        semi_axes.x * scaled.x,
+                        semi_axes.y * scaled.y,
+                        semi_axes.z * scaled.z,
+                    ) / denom
+                } else {
+                    Vec3::new(0.0, 0.0, semi_axes.z)
+                };
+                pose.point_to_world(local_point)
+            }
+            Self::Box { pose, half_extents } => {
+                let local_direction = pose.orientation.inverse_rotate(direction);
+                pose.point_to_world(Vec3::new(
+                    if local_direction.x >= 0.0 {
+                        half_extents.x
+                    } else {
+                        -half_extents.x
+                    },
+                    if local_direction.y >= 0.0 {
+                        half_extents.y
+                    } else {
+                        -half_extents.y
+                    },
+                    if local_direction.z >= 0.0 {
+                        half_extents.z
+                    } else {
+                        -half_extents.z
+                    },
+                ))
+            }
+            Self::Mesh { pose, mesh } => {
+                support_vertices_transformed(&mesh.vertices, pose, direction)
+            }
+        }
+    }
+}
+
+fn support_vertices(vertices: &[Vec3], direction: Vec3) -> Vec3 {
+    let mut point = vertices[0];
+    let mut best = point.dot(direction);
+    for &candidate in vertices.iter().skip(1) {
+        let dot = candidate.dot(direction);
+        if dot > best {
+            point = candidate;
+            best = dot;
+        }
+    }
+    point
+}
+
+fn support_vertices_transformed(vertices: &[Vec3], pose: &GeomPose, direction: Vec3) -> Vec3 {
+    let local_direction = pose.orientation.inverse_rotate(direction);
+    pose.point_to_world(support_vertices(vertices, local_direction))
+}
+
+fn ccd_support(a: CcdShape<'_>, b: CcdShape<'_>, direction: Vec3) -> CcdVertex {
     let direction = if direction.length_squared() > 1.0e-20 {
         direction
     } else {
         Vec3::X
     };
-    let mut box_point = box_vertices[0];
-    let mut box_dot = box_point.dot(direction);
-    for &point in box_vertices.iter().skip(1) {
-        let dot = point.dot(direction);
-        if dot > box_dot {
-            box_point = point;
-            box_dot = dot;
-        }
-    }
-    let opposite = -direction;
-    let mut prism_point = prism_vertices[0];
-    let mut prism_dot = prism_point.dot(opposite);
-    for &point in prism_vertices.iter().skip(1) {
-        let dot = point.dot(opposite);
-        if dot > prism_dot {
-            prism_point = point;
-            prism_dot = dot;
-        }
-    }
+    let shape_a = a.support(direction);
+    let shape_b = b.support(-direction);
     CcdVertex {
-        minkowski: box_point - prism_point,
-        shape_a: box_point,
-        shape_b: prism_point,
+        minkowski: shape_a - shape_b,
+        shape_a,
+        shape_b,
     }
+}
+
+fn ccd_route_normal(shape_a: CcdShape<'_>, shape_b: CcdShape<'_>) -> Option<Vec3> {
+    match (shape_a, shape_b) {
+        (
+            CcdShape::Sphere { pose, radius },
+            CcdShape::Ellipsoid {
+                pose: ell_pose,
+                semi_axes,
+            },
+        ) => sphere_ellipsoid(0, pose, radius, 1, ell_pose, semi_axes, 0.0, 0.0, 0.0)
+            .as_slice()
+            .first()
+            .map(|contact| contact.normal_world),
+        (
+            CcdShape::Sphere { pose, radius },
+            CcdShape::Mesh {
+                pose: mesh_pose,
+                mesh,
+            },
+        ) => sphere_mesh(0, pose, radius, 1, mesh_pose, mesh, 0.0, 0.0, 0.0)
+            .as_slice()
+            .first()
+            .map(|contact| contact.normal_world),
+        (
+            CcdShape::Ellipsoid {
+                pose: ell_pose,
+                semi_axes,
+            },
+            CcdShape::Sphere { pose, radius },
+        ) => sphere_ellipsoid(0, pose, radius, 1, ell_pose, semi_axes, 0.0, 0.0, 0.0)
+            .as_slice()
+            .first()
+            .map(|contact| -contact.normal_world),
+        (
+            CcdShape::Mesh {
+                pose: mesh_pose,
+                mesh,
+            },
+            CcdShape::Sphere { pose, radius },
+        ) => sphere_mesh(0, pose, radius, 1, mesh_pose, mesh, 0.0, 0.0, 0.0)
+            .as_slice()
+            .first()
+            .map(|contact| -contact.normal_world),
+        _ => None,
+    }
+}
+
+fn ccd_route_anchor(shape_a: CcdShape<'_>, shape_b: CcdShape<'_>) -> Option<(Vec3, Vec3)> {
+    match (shape_a, shape_b) {
+        (
+            CcdShape::Sphere { pose, radius },
+            CcdShape::Ellipsoid {
+                pose: ell_pose,
+                semi_axes,
+            },
+        ) => sphere_ellipsoid(0, pose, radius, 1, ell_pose, semi_axes, 0.0, 0.0, 0.0)
+            .as_slice()
+            .first()
+            .map(|contact| {
+                let point_a = pose.position - contact.normal_world * radius;
+                (
+                    (point_a + contact.position_world) * 0.5,
+                    contact.normal_world,
+                )
+            }),
+        (
+            CcdShape::Sphere { pose, radius },
+            CcdShape::Mesh {
+                pose: mesh_pose,
+                mesh,
+            },
+        ) => sphere_mesh(0, pose, radius, 1, mesh_pose, mesh, 0.0, 0.0, 0.0)
+            .as_slice()
+            .first()
+            .map(|contact| {
+                let point_a = pose.position - contact.normal_world * radius;
+                (
+                    (point_a + contact.position_world) * 0.5,
+                    contact.normal_world,
+                )
+            }),
+        (
+            CcdShape::Ellipsoid {
+                pose: ell_pose,
+                semi_axes,
+            },
+            CcdShape::Sphere { pose, radius },
+        ) => ccd_route_anchor(
+            CcdShape::Sphere { pose, radius },
+            CcdShape::Ellipsoid {
+                pose: ell_pose,
+                semi_axes,
+            },
+        )
+        .map(|(position, normal)| (position, -normal)),
+        (
+            CcdShape::Mesh {
+                pose: mesh_pose,
+                mesh,
+            },
+            CcdShape::Sphere { pose, radius },
+        ) => ccd_route_anchor(
+            CcdShape::Sphere { pose, radius },
+            CcdShape::Mesh {
+                pose: mesh_pose,
+                mesh,
+            },
+        )
+        .map(|(position, normal)| (position, -normal)),
+        _ => None,
+    }
+}
+
+fn ccd_route_depth(shape_a: CcdShape<'_>, shape_b: CcdShape<'_>) -> Option<f32> {
+    match (shape_a, shape_b) {
+        (
+            CcdShape::Sphere { pose, radius },
+            CcdShape::Ellipsoid {
+                pose: ell_pose,
+                semi_axes,
+            },
+        ) => sphere_ellipsoid(0, pose, radius, 1, ell_pose, semi_axes, 0.0, 0.0, 0.0)
+            .as_slice()
+            .first()
+            .map(|contact| contact.penetration),
+        (
+            CcdShape::Sphere { pose, radius },
+            CcdShape::Mesh {
+                pose: mesh_pose,
+                mesh,
+            },
+        ) => sphere_mesh(0, pose, radius, 1, mesh_pose, mesh, 0.0, 0.0, 0.0)
+            .as_slice()
+            .first()
+            .map(|contact| contact.penetration),
+        (
+            CcdShape::Ellipsoid {
+                pose: ell_pose,
+                semi_axes,
+            },
+            CcdShape::Sphere { pose, radius },
+        ) => ccd_route_depth(
+            CcdShape::Sphere { pose, radius },
+            CcdShape::Ellipsoid {
+                pose: ell_pose,
+                semi_axes,
+            },
+        ),
+        (
+            CcdShape::Mesh {
+                pose: mesh_pose,
+                mesh,
+            },
+            CcdShape::Sphere { pose, radius },
+        ) => ccd_route_depth(
+            CcdShape::Sphere { pose, radius },
+            CcdShape::Mesh {
+                pose: mesh_pose,
+                mesh,
+            },
+        ),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ccd_route_contact(
+    shape_a: CcdShape<'_>,
+    shape_b: CcdShape<'_>,
+    idx_a: usize,
+    idx_b: usize,
+    friction: f32,
+    margin: f32,
+    gap: f32,
+) -> Option<Contact> {
+    let (position_world, normal_world) = ccd_route_anchor(shape_a, shape_b)?;
+    let penetration = ccd_route_depth(shape_a, shape_b)? + margin;
+    if penetration <= 0.0 {
+        return None;
+    }
+    Some(Contact {
+        geom_a: idx_a,
+        geom_b: idx_b,
+        position_world,
+        normal_world,
+        penetration,
+        friction,
+        gap,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ccd_axis_contact(
+    shape_a: CcdShape<'_>,
+    shape_b: CcdShape<'_>,
+    idx_a: usize,
+    idx_b: usize,
+    friction: f32,
+    margin: f32,
+    gap: f32,
+) -> Option<Contact> {
+    let center_delta = shape_b.center() - shape_a.center();
+    let distance = center_delta.length();
+    let axis = if distance > 1.0e-20 {
+        center_delta / distance
+    } else {
+        Vec3::X
+    };
+    let point_a = shape_a.support(axis);
+    let point_b = shape_b.support(-axis);
+    let penetration = (point_a - point_b).dot(axis) - distance + margin;
+    if penetration <= 0.0 {
+        return None;
+    }
+    Some(Contact {
+        geom_a: idx_a,
+        geom_b: idx_b,
+        position_world: (point_a + point_b) * 0.5,
+        normal_world: -axis,
+        penetration,
+        friction,
+        gap,
+    })
 }
 
 fn triple_product(a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
@@ -2412,20 +2828,17 @@ fn box_prism_gjk_epa_contact(
         );
         *vertex = box_pose.point_to_world(local);
     }
-    let mut direction = prism_vertices
-        .iter()
-        .copied()
-        .fold(Vec3::ZERO, |sum, point| sum + point)
-        / 6.0
-        - box_pose.position;
+    let box_shape = CcdShape::Vertices(&box_vertices);
+    let prism_shape = CcdShape::Vertices(&prism_vertices);
+    let mut direction = prism_shape.center() - box_shape.center();
     if direction.length_squared() <= 1.0e-20 {
         direction = Vec3::X;
     }
-    let mut simplex = CcdSimplex::new(ccd_support(&box_vertices, &prism_vertices, direction));
+    let mut simplex = CcdSimplex::new(ccd_support(box_shape, prism_shape, direction));
     direction = -simplex.points[0].minkowski;
     let mut enclosed = false;
     for _ in 0..32 {
-        let point = ccd_support(&box_vertices, &prism_vertices, direction);
+        let point = ccd_support(box_shape, prism_shape, direction);
         if point.minkowski.dot(direction) <= 1.0e-7 {
             return None;
         }
@@ -2498,7 +2911,7 @@ fn box_prism_gjk_epa_contact(
             }
         }
         best_face = faces[best_index];
-        let support = ccd_support(&box_vertices, &prism_vertices, best_face.normal);
+        let support = ccd_support(box_shape, prism_shape, best_face.normal);
         let support_distance = support.minkowski.dot(best_face.normal);
         if support_distance - best_face.distance <= 1.0e-5 {
             break;
@@ -2542,6 +2955,9 @@ fn box_prism_gjk_epa_contact(
             }
         }
         for edge in edges[..edge_len].iter().copied() {
+            if next_len == next_faces.len() {
+                break;
+            }
             if let Some(face) = ccd_face(&vertices, [edge[0], edge[1], new_vertex]) {
                 next_faces[next_len] = face;
                 next_len += 1;
@@ -2582,6 +2998,214 @@ fn box_prism_gjk_epa_contact(
         geom_b: idx_hfield,
         position_world: (point_a + point_b) * 0.5,
         normal_world: -best_face.normal,
+        penetration,
+        friction,
+        gap,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct CcdFace {
+    indices: [usize; 3],
+    normal: Vec3,
+    distance: f32,
+}
+
+fn ccd_face(vertices: &[CcdVertex; 128], indices: [usize; 3]) -> Option<CcdFace> {
+    let a = vertices[indices[0]].minkowski;
+    let b = vertices[indices[1]].minkowski;
+    let c = vertices[indices[2]].minkowski;
+    let raw = (b - a).cross(c - a);
+    if raw.length_squared() <= 1.0e-20 {
+        return None;
+    }
+    let mut normal = raw.normalize();
+    let mut distance = normal.dot(a);
+    let mut oriented = indices;
+    if distance < 0.0 {
+        oriented = [indices[0], indices[2], indices[1]];
+        normal = -normal;
+        distance = -distance;
+    }
+    Some(CcdFace {
+        indices: oriented,
+        normal,
+        distance,
+    })
+}
+
+/// GJK plus EPA for two finite convex shapes. MuJoCo's default convex routes
+/// emit one contact, so this function deliberately returns one manifold row.
+#[allow(clippy::too_many_arguments)]
+fn ccd_convex_contact(
+    shape_a: CcdShape<'_>,
+    shape_b: CcdShape<'_>,
+    idx_a: usize,
+    idx_b: usize,
+    friction: f32,
+    margin: f32,
+    gap: f32,
+) -> Option<Contact> {
+    let mut direction = shape_b.center() - shape_a.center();
+    if direction.length_squared() <= 1.0e-20 {
+        direction = Vec3::X;
+    }
+    let mut simplex = CcdSimplex::new(ccd_support(shape_a, shape_b, direction));
+    direction = -simplex.points[0].minkowski;
+    let mut enclosed = false;
+    for _ in 0..32 {
+        let point = ccd_support(shape_a, shape_b, direction);
+        if point.minkowski.dot(direction) <= 0.0 {
+            return ccd_route_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap)
+                .or_else(|| {
+                    ccd_axis_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap)
+                });
+        }
+        simplex.push(point);
+        if ccd_simplex_step(&mut simplex, &mut direction) {
+            enclosed = true;
+            break;
+        }
+    }
+    if !enclosed || simplex.len != 4 {
+        return ccd_route_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap)
+            .or_else(|| ccd_axis_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap));
+    }
+
+    let mut vertices = [CcdVertex {
+        minkowski: Vec3::ZERO,
+        shape_a: Vec3::ZERO,
+        shape_b: Vec3::ZERO,
+    }; 128];
+    vertices[..4].copy_from_slice(&simplex.points);
+    let mut vertex_len = 4;
+    let mut faces = [CcdFace {
+        indices: [0; 3],
+        normal: Vec3::Z,
+        distance: f32::INFINITY,
+    }; 512];
+    let mut face_len = 0;
+    for indices in [[0, 1, 2], [0, 3, 1], [0, 2, 3], [1, 3, 2]] {
+        if let Some(face) = ccd_face(&vertices, indices) {
+            faces[face_len] = face;
+            face_len += 1;
+        }
+    }
+    if face_len == 0 {
+        return ccd_route_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap)
+            .or_else(|| ccd_axis_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap));
+    }
+    let mut best_face = faces[0];
+    for _ in 0..128 {
+        let mut best_index = 0;
+        for index in 1..face_len {
+            if faces[index].distance < faces[best_index].distance {
+                best_index = index;
+            }
+        }
+        best_face = faces[best_index];
+        let support = ccd_support(shape_a, shape_b, best_face.normal);
+        let support_distance = support.minkowski.dot(best_face.normal);
+        if support_distance - best_face.distance <= 1.0e-7 {
+            break;
+        }
+        if vertex_len == vertices.len() {
+            break;
+        }
+        vertices[vertex_len] = support;
+        let new_vertex = vertex_len;
+        vertex_len += 1;
+        let mut next_faces = [CcdFace {
+            indices: [0; 3],
+            normal: Vec3::Z,
+            distance: f32::INFINITY,
+        }; 512];
+        let mut next_len = 0;
+        let mut edges = [[0usize; 2]; 1024];
+        let mut edge_len = 0;
+        for face in faces[..face_len].iter().copied() {
+            if face.normal.dot(support.minkowski) > face.distance + 1.0e-6 {
+                for edge in [
+                    [face.indices[0], face.indices[1]],
+                    [face.indices[1], face.indices[2]],
+                    [face.indices[2], face.indices[0]],
+                ] {
+                    let reverse = [edge[1], edge[0]];
+                    if let Some(index) = edges[..edge_len]
+                        .iter()
+                        .position(|candidate| *candidate == reverse)
+                    {
+                        edges[index] = edges[edge_len - 1];
+                        edge_len -= 1;
+                    } else {
+                        edges[edge_len] = edge;
+                        edge_len += 1;
+                    }
+                }
+            } else {
+                next_faces[next_len] = face;
+                next_len += 1;
+            }
+        }
+        for edge in edges[..edge_len].iter().copied() {
+            if next_len == next_faces.len() {
+                break;
+            }
+            if let Some(face) = ccd_face(&vertices, [edge[0], edge[1], new_vertex]) {
+                next_faces[next_len] = face;
+                next_len += 1;
+            }
+        }
+        faces = next_faces;
+        face_len = next_len;
+        if face_len == 0 {
+            return None;
+        }
+    }
+
+    let nearest = best_face.normal * best_face.distance;
+    let a = vertices[best_face.indices[0]].minkowski;
+    let b = vertices[best_face.indices[1]].minkowski;
+    let c = vertices[best_face.indices[2]].minkowski;
+    let mut bary = barycentric_triangle_origin(a, b, c, nearest);
+    let sum = bary.0 + bary.1 + bary.2;
+    if sum <= 1.0e-8 {
+        return None;
+    }
+    bary.0 /= sum;
+    bary.1 /= sum;
+    bary.2 /= sum;
+    let point_a = vertices[best_face.indices[0]].shape_a * bary.0
+        + vertices[best_face.indices[1]].shape_a * bary.1
+        + vertices[best_face.indices[2]].shape_a * bary.2;
+    let point_b = vertices[best_face.indices[0]].shape_b * bary.0
+        + vertices[best_face.indices[1]].shape_b * bary.1
+        + vertices[best_face.indices[2]].shape_b * bary.2;
+    let penetration = ccd_route_depth(shape_a, shape_b)
+        .map(|depth| depth + margin)
+        .unwrap_or(best_face.distance + margin);
+    if penetration <= 0.0 {
+        return None;
+    }
+    let contact_delta = point_b - point_a;
+    let (position_world, normal_world) =
+        if let Some((position, normal)) = ccd_route_anchor(shape_a, shape_b) {
+            (position, normal)
+        } else {
+            let normal = if let Some(normal) = ccd_route_normal(shape_a, shape_b) {
+                normal
+            } else if contact_delta.length_squared() > 1.0e-20 {
+                contact_delta.normalize()
+            } else {
+                -best_face.normal
+            };
+            ((point_a + point_b) * 0.5, normal)
+        };
+    Some(Contact {
+        geom_a: idx_a,
+        geom_b: idx_b,
+        position_world,
+        normal_world,
         penetration,
         friction,
         gap,
@@ -2854,6 +3478,13 @@ fn dispatch_narrow_phase(
     let friction = combine_friction(geom_a.friction, geom_b.friction);
     let margin = combine_max(geom_a.margin, geom_b.margin);
     let gap = combine_max(geom_a.gap, geom_b.gap);
+    if ccd_route_pair(&geom_a.shape, &geom_b.shape) {
+        return try_narrow_phase(
+            idx_a, geom_a, pose_a, idx_b, geom_b, pose_b, friction, margin, gap, meshes, hfields,
+            mode,
+        )
+        .expect("ccd route shapes must be finite convex geoms");
+    }
     // Try in the order given; if that combination isn't a known primitive,
     // swap and dispatch, then relabel the results (flipping normal and A/B).
     //
@@ -2913,6 +3544,17 @@ fn try_narrow_phase(
     hfields: &[HeightField],
     mode: NarrowPhaseMode,
 ) -> Option<ContactBuf> {
+    if ccd_route_pair(&geom_a.shape, &geom_b.shape) {
+        let shape_a = ccd_shape(&geom_a.shape, pose_a, meshes)?;
+        let shape_b = ccd_shape(&geom_b.shape, pose_b, meshes)?;
+        let mut out = ContactBuf::new();
+        if let Some(contact) =
+            ccd_convex_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap)
+        {
+            out.push(contact);
+        }
+        return Some(out);
+    }
     Some(match (geom_a.shape, geom_b.shape) {
         (GeomShape::Sphere { radius }, GeomShape::Plane) => sphere_plane(
             idx_a, pose_a, radius, friction, margin, gap, idx_b, geom_b, pose_b,
@@ -2964,13 +3606,13 @@ fn try_narrow_phase(
             geom_b,
             pose_b,
         ),
-        // MuJoCo calls mjc_PlaneConvex for plane-ellipsoid. Keep the existing
-        // analytic path until the documented construction finding is closed.
+        // MuJoCo calls mjc_PlaneConvex for plane-ellipsoid. The analytic
+        // support point and midpoint construction match that route.
         (GeomShape::Ellipsoid { semi_axes }, GeomShape::Plane) => ellipsoid_plane(
             idx_a, pose_a, semi_axes, friction, margin, gap, idx_b, geom_b, pose_b,
         ),
-        // MuJoCo calls mjc_PlaneConvex for plane-mesh. See the route probe in
-        // tests/contacts_geoms_v1.rs before changing this construction.
+        // MuJoCo calls mjc_PlaneConvex for plane-mesh. The support manifold
+        // keeps the two deepest support vertices in stable source order.
         (GeomShape::Mesh { mesh_id }, GeomShape::Plane) => mesh_plane(
             idx_a,
             pose_a,
@@ -3012,13 +3654,11 @@ fn try_narrow_phase(
         ) => sphere_cylinder(
             idx_a, pose_a, rs, idx_b, pose_b, rc, hc, friction, margin, gap,
         ),
-        // MuJoCo calls mjc_Convex for sphere-ellipsoid. The analytic result is
-        // retained with its measured midpoint difference documented.
+        // MuJoCo calls mjc_Convex for sphere-ellipsoid.
         (GeomShape::Sphere { radius: rs }, GeomShape::Ellipsoid { semi_axes }) => sphere_ellipsoid(
             idx_a, pose_a, rs, idx_b, pose_b, semi_axes, friction, margin, gap,
         ),
-        // MuJoCo calls mjc_Convex for sphere-mesh. The analytic result is
-        // retained with its measured midpoint/manifold difference documented.
+        // MuJoCo calls mjc_Convex for sphere-mesh.
         (GeomShape::Sphere { radius: rs }, GeomShape::Mesh { mesh_id }) => sphere_mesh(
             idx_a,
             pose_a,
@@ -3097,10 +3737,7 @@ fn try_narrow_phase(
             margin,
             gap,
         ),
-        // Deferred (see is_pair_supported): box-sphere, box-capsule,
-        // cylinder-cylinder, cylinder-{box,capsule,ellipsoid,mesh},
-        // ellipsoid-{box,capsule,ellipsoid,mesh},
-        // mesh-{box,capsule,mesh}.
+        // Deferred pairs are not in the support matrix.
         _ => return None,
     })
 }
@@ -3809,6 +4446,44 @@ mod tests {
             assert!(approx(c.penetration, 0.2, 1e-5));
             assert!(approx(c.position_world.z, -0.1, 1e-5));
         }
+    }
+
+    #[test]
+    fn ccd_support_functions_preserve_shape_axes() {
+        let pose = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let capsule = CcdShape::Capsule {
+            pose: &pose,
+            radius: 0.2,
+            half_height: 0.5,
+        };
+        let cylinder = CcdShape::Cylinder {
+            pose: &pose,
+            radius: 0.2,
+            half_height: 0.5,
+        };
+        let ellipsoid = CcdShape::Ellipsoid {
+            pose: &pose,
+            semi_axes: Vec3::new(0.2, 0.3, 0.4),
+        };
+        let box_shape = CcdShape::Box {
+            pose: &pose,
+            half_extents: Vec3::new(0.2, 0.3, 0.4),
+        };
+        let vertices = [
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(-1.0, 1.0, -1.0),
+            Vec3::new(-1.0, -1.0, 1.0),
+        ];
+        let mesh = CcdShape::Vertices(&vertices);
+        assert!(capsule.support(Vec3::Z).z > 0.6);
+        assert!(cylinder.support(Vec3::X).x > 0.19);
+        assert!(ellipsoid.support(Vec3::Z).z > 0.39);
+        assert!(box_shape.support(-Vec3::Y).y < -0.29);
+        assert!(mesh.support(Vec3::Y).y > 0.9);
     }
 
     #[test]
