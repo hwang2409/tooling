@@ -291,12 +291,13 @@ fixture byte identity, compares every committed route contact sample and
 dynamic sample with fresh MuJoCo values, and uses those fresh Linux states for
 the Newt replay check. The reviewed cross-platform capture tolerance is `1e-6`
 for each compared position, orientation, normal, and penetration component;
-the current macOS/Linux capture observed zero drift. Contact counts and sample
+the current normalized macOS/Linux capture observed zero drift. Contact counts and sample
 identifiers remain exact. This tolerance is separate from the committed Newt
 parity bounds. Mesh-local route pose orientations are excluded from the CI
 value comparison because MuJoCo's mesh compiler can choose different
-principal-axis frames across platforms; the Rust fixture keeps those values
-for route replay.
+principal-axis frames across platforms. Mesh contact positions are compared in
+that mesh-local frame. The Rust fixture keeps the world-frame values for route
+replay, and an edited world-frame contact still changes the local comparison.
 The verifier also runs a non-max sample mutation self-test in CI. The Rust
 fixture test also recomputes both maxima and requires exact float32 equality
 between each stored position/orientation bound and its stored maximum plus

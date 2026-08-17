@@ -66,6 +66,30 @@ def compare_vector(
         )
 
 
+def inverse_rotate(quaternion: list[float], vector: list[float]) -> list[float]:
+    w, x, y, z = quaternion
+    vx, vy, vz = vector
+    return [
+        (1 - 2 * (y * y + z * z)) * vx
+        + (2 * x * y + 2 * w * z) * vy
+        + (2 * x * z - 2 * w * y) * vz,
+        (2 * x * y - 2 * w * z) * vx
+        + (1 - 2 * (x * x + z * z)) * vy
+        + (2 * y * z + 2 * w * x) * vz,
+        (2 * x * z + 2 * w * y) * vx
+        + (2 * y * z - 2 * w * x) * vy
+        + (1 - 2 * (x * x + y * y)) * vz,
+    ]
+
+
+def mesh_local_contact_position(pose: dict, contact: dict) -> list[float]:
+    relative = [
+        contact["position"][index] - pose["position"][index]
+        for index in range(3)
+    ]
+    return inverse_rotate(pose["orientation_wxyz"], relative)
+
+
 def compare_dynamic_oracle(
     committed: dict,
     fresh: dict,
@@ -150,9 +174,18 @@ def compare_route_oracle(
             ):
                 contact_path = f"{path}.contacts[{index}]"
                 assert committed_contact["geom"] == fresh_contact["geom"], contact_path
+                committed_position = committed_contact["position"]
+                fresh_position = fresh_contact["position"]
+                if "mesh" in committed_probe["pair"]:
+                    committed_position = mesh_local_contact_position(
+                        committed_pose["pose_b"], committed_contact
+                    )
+                    fresh_position = mesh_local_contact_position(
+                        fresh_pose["pose_b"], fresh_contact
+                    )
                 compare_vector(
-                    committed_contact["position"],
-                    fresh_contact["position"],
+                    committed_position,
+                    fresh_position,
                     "position",
                     f"{contact_path}.position",
                     maxima,
