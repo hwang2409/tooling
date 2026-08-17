@@ -821,6 +821,7 @@ fn ray_shape_hit(
         } => ray_cylinder(origin, direction, radius, half_height),
         GeomShape::Ellipsoid { semi_axes } => ray_ellipsoid(origin, direction, semi_axes),
         GeomShape::Mesh { mesh_id } => ray_mesh(origin, direction, &meshes[mesh_id]),
+        GeomShape::Hfield { .. } => None,
     }
 }
 

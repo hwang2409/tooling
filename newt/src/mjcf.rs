@@ -9,9 +9,10 @@
 //! # Scope
 //!
 //! Supported top-level elements (children of `<mujoco>`):
-//! `<compiler>`, `<option>`, `<default>`, `<worldbody>`, `<actuator>`,
-//! `<sensor>`, `<tendon>`, `<equality>`, `<contact>`, and `<keyframe>`. Anything else
-//! (e.g. `<asset>`, `<visual>`) is rejected with a clear
+//! `<compiler>`, `<option>`, `<default>`, `<asset>`, `<worldbody>`, `<actuator>`,
+//! `<sensor>`, `<tendon>`, `<equality>`, `<contact>`, and `<keyframe>`. Asset
+//! blocks accept inline hfields only. Anything else
+//! (e.g. `<visual>`) is rejected with a clear
 //! `unsupported in v2 tier 4` error naming the element.
 //!
 //! Body attributes: `name`, `pos`, `quat`, `euler`, `childclass`, `mocap`.
@@ -48,7 +49,7 @@ use std::path::Path;
 use crate::actuator::{Actuator, BiasType, DynType, GainType};
 use crate::body::Body;
 use crate::equality::Equality;
-use crate::geom::{Geom, GeomShape, SolRef};
+use crate::geom::{Geom, GeomShape, HeightField, SolRef};
 use crate::joint::{JointKind, JointLimit};
 use crate::math::{self, Mat3, Quat, Vec3};
 use crate::model::{Scene, Site, SiteAttach};
@@ -467,6 +468,7 @@ struct Loader {
     trees_by_name: HashMap<String, usize>,
     links_by_name: Vec<HashMap<String, usize>>,
     geoms_by_name: HashMap<String, usize>,
+    hfields_by_name: HashMap<String, usize>,
     sites: Vec<Site>,
     sites_by_name: HashMap<String, usize>,
     actuators_by_name: HashMap<String, (usize, usize)>,
@@ -507,6 +509,7 @@ impl Loader {
             trees_by_name: HashMap::new(),
             links_by_name: Vec::new(),
             geoms_by_name: HashMap::new(),
+            hfields_by_name: HashMap::new(),
             sites: Vec::new(),
             sites_by_name: HashMap::new(),
             actuators_by_name: HashMap::new(),
@@ -561,6 +564,13 @@ impl Loader {
         }
         self.defaults = build_defaults(root, &path)?;
 
+        // Assets must be available before worldbody geoms are parsed.
+        for child in root.child_elements() {
+            if child.name == "asset" {
+                self.walk_asset(child, &child_path(&path, "asset", None))?;
+            }
+        }
+
         // Two-phase walk for order-independent tendon references:
         //   phase A: worldbody + tendon (define joints, sites, tendons)
         //   phase B: actuator + sensor + equality + contact (may reference
@@ -572,7 +582,8 @@ impl Loader {
                 "worldbody" => self.walk_worldbody(child, &subpath)?,
                 "tendon" => self.walk_tendon(child, &subpath)?,
                 "actuator" | "sensor" | "equality" | "contact" | "keyframe" => {}
-                "asset" | "custom" | "visual" | "size" | "statistic" | "extension" | "include" => {
+                "asset" => {}
+                "custom" | "visual" | "size" | "statistic" | "extension" | "include" => {
                     return fail(
                         &subpath,
                         format!(
@@ -792,14 +803,41 @@ impl Loader {
                 }
             }
         }
-        if let Some(child) = e.child_elements().next() {
-            return fail(
-                path,
-                format!(
-                    "<option> child <{}> (option flags) not supported in the v1 subset",
-                    child.name
-                ),
-            );
+        for child in e.child_elements() {
+            if child.name != "flag" {
+                return fail(
+                    path,
+                    format!(
+                        "<option> child <{}> is not supported in the v1 subset",
+                        child.name
+                    ),
+                );
+            }
+            for (k, v) in &child.attrs {
+                match k.as_str() {
+                    // MuJoCo's legacy convex hfield path is selected by this
+                    // flag. Newt always uses that path, so the declaration is
+                    // accepted as an explicit parity-mode marker.
+                    "nativeccd" if v == "disable" => {}
+                    "nativeccd" => {
+                        return fail(
+                            path,
+                            format!(
+                                "<flag nativeccd=\"{v}\"> is unsupported; use nativeccd=\"disable\""
+                            ),
+                        );
+                    }
+                    other => {
+                        return fail(
+                            path,
+                            format!("<flag> attribute \"{other}\" is not supported"),
+                        );
+                    }
+                }
+            }
+            if child.child_elements().next().is_some() {
+                return fail(path, "<flag> cannot contain child elements");
+            }
         }
         if let Err(message) = self.world.solver.validate() {
             return fail(path, message);
@@ -1730,6 +1768,132 @@ impl Loader {
         Ok(())
     }
 
+    fn walk_asset(&mut self, e: &Element, path: &str) -> Result<(), MjcfError> {
+        if !e.attrs.is_empty() {
+            return fail(path, "<asset> takes no attributes");
+        }
+        for child in e.child_elements() {
+            let child_path = child_path(path, &child.name, child.attr("name"));
+            if child.name != "hfield" {
+                return fail(
+                    &child_path,
+                    format!("unknown <asset> child <{}>; supported: hfield", child.name),
+                );
+            }
+            for (key, _) in &child.attrs {
+                match key.as_str() {
+                    "name" | "nrow" | "ncol" | "size" | "data" | "elevation" => {}
+                    "file" => {
+                        return fail(
+                            &child_path,
+                            "PNG hfield files are not supported in the zero-dependency subset; use inline elevation/data",
+                        );
+                    }
+                    other => {
+                        return fail(
+                            &child_path,
+                            format!("unknown <hfield> attribute \"{other}\""),
+                        );
+                    }
+                }
+            }
+            let name = attr_required(child, "name", &child_path)?.to_string();
+            if self.hfields_by_name.contains_key(&name) {
+                return fail(&child_path, format!("duplicate hfield name \"{name}\""));
+            }
+            let nrow = parse_int(
+                attr_required(child, "nrow", &child_path)?,
+                &child_path,
+                "nrow",
+            )?;
+            let ncol = parse_int(
+                attr_required(child, "ncol", &child_path)?,
+                &child_path,
+                "ncol",
+            )?;
+            if nrow < 2 || ncol < 2 {
+                return fail(&child_path, "hfield nrow and ncol must be ≥ 2");
+            }
+            let size_values = parse_f32_list(
+                attr_required(child, "size", &child_path)?,
+                &child_path,
+                "size",
+            )?;
+            require_len(&size_values, 4, &child_path, "size")?;
+            let data_attr = child
+                .attr("data")
+                .or_else(|| child.attr("elevation"))
+                .ok_or_else(|| {
+                    MjcfError::new(&child_path, "hfield requires inline data or elevation")
+                })?;
+            let source_data = parse_f32_list(data_attr, &child_path, "data")?;
+            let nrow = usize::try_from(nrow)
+                .map_err(|_| MjcfError::new(&child_path, "hfield nrow must be positive"))?;
+            let ncol = usize::try_from(ncol)
+                .map_err(|_| MjcfError::new(&child_path, "hfield ncol must be positive"))?;
+            let expected_data_len = nrow.checked_mul(ncol).ok_or_else(|| {
+                MjcfError::new(&child_path, "hfield dimensions overflow elevation count")
+            })?;
+            if source_data.len() != expected_data_len {
+                return fail(
+                    &child_path,
+                    format!(
+                        "hfield data length must be {expected_data_len}, got {}",
+                        source_data.len()
+                    ),
+                );
+            }
+            // MuJoCo maps inline elevations to their input range before it
+            // applies size[2]. Keep this normalization after the length check
+            // so malformed rows never reach the reversal below.
+            let mut source_min = f32::INFINITY;
+            let mut source_max = f32::NEG_INFINITY;
+            for &value in &source_data {
+                source_min = source_min.min(value);
+                source_max = source_max.max(value);
+            }
+            let source_range = source_max - source_min;
+            let normalized_data: Vec<f32> = source_data
+                .iter()
+                .map(|&value| {
+                    if source_range > 0.0 {
+                        (value - source_min) / source_range
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            // MuJoCo stores inline hfield rows from the opposite local-Y
+            // edge. Reverse rows at the loader boundary so row zero maps to
+            // local y = -size_y in the engine grid.
+            let mut data = Vec::with_capacity(normalized_data.len());
+            for row in (0..nrow).rev() {
+                let begin = row * ncol;
+                data.extend_from_slice(&normalized_data[begin..begin + ncol]);
+            }
+            let hfield = HeightField {
+                nrow,
+                ncol,
+                size: [
+                    size_values[0],
+                    size_values[1],
+                    size_values[2],
+                    size_values[3],
+                ],
+                data,
+            };
+            hfield
+                .validate()
+                .map_err(|message| MjcfError::new(&child_path, message))?;
+            if child.child_elements().next().is_some() {
+                return fail(&child_path, "<hfield> has no child elements");
+            }
+            let idx = self.world.add_hfield(hfield);
+            self.hfields_by_name.insert(name, idx);
+        }
+        Ok(())
+    }
+
     fn build_geom(
         &self,
         e: &Element,
@@ -1746,9 +1910,9 @@ impl Loader {
         // Attribute whitelist.
         for (k, _) in &e.attrs {
             match k.as_str() {
-                "name" | "type" | "pos" | "quat" | "euler" | "axisangle" | "size" | "fromto"
-                | "friction" | "solref" | "solimp" | "condim" | "margin" | "gap" | "class"
-                | "mass" => {}
+                "name" | "type" | "hfield" | "pos" | "quat" | "euler" | "axisangle" | "size"
+                | "fromto" | "friction" | "solref" | "solimp" | "condim" | "margin" | "gap"
+                | "class" | "mass" => {}
                 other => {
                     return fail(
                         path,
@@ -1960,7 +2124,14 @@ impl Loader {
                 "<geom type=\"mesh\"> is not supported in the v1 subset \
                  (mesh assets need <asset><mesh>, which is not in scope)",
             ),
-            "hfield" | "sdf" => fail(
+            "hfield" => {
+                let name = attr_required(e, "hfield", path)?;
+                let hfield_id = self.hfields_by_name.get(name).copied().ok_or_else(|| {
+                    MjcfError::new(path, format!("unknown hfield asset \"{name}\""))
+                })?;
+                Ok((GeomShape::Hfield { hfield_id }, Vec3::ZERO, Quat::IDENTITY))
+            }
+            "sdf" => fail(
                 path,
                 format!("<geom type=\"{ty}\"> is not supported in the v1 subset"),
             ),
@@ -1968,7 +2139,7 @@ impl Loader {
                 path,
                 format!(
                     "unknown geom type \"{other}\" (expected plane|sphere|box|\
-                     capsule|cylinder|ellipsoid)"
+                     capsule|cylinder|ellipsoid|hfield)"
                 ),
             ),
         }
@@ -4043,10 +4214,180 @@ mod tests {
     }
 
     #[test]
-    fn asset_element_unsupported_error() {
-        let e = err("<mujoco><asset/></mujoco>");
-        assert!(e.message.contains("<asset>"), "{}", e.message);
-        assert!(e.message.contains("not supported"), "{}", e.message);
+    fn empty_asset_element_is_accepted() {
+        load_mjcf_str("<mujoco><asset/></mujoco>").expect("empty asset block is valid");
+    }
+
+    #[test]
+    fn inline_hfield_asset_and_geom_load() {
+        let scene = load_mjcf_str(
+            r#"<mujoco><asset>
+              <hfield name="terrain" nrow="2" ncol="2" size="1 1 1 0.2"
+                      elevation="0 0 0.5 1"/>
+            </asset><worldbody>
+              <geom name="ground" type="hfield" hfield="terrain"/>
+            </worldbody></mujoco>"#,
+        )
+        .expect("inline hfield should load");
+        assert_eq!(scene.world.hfields.len(), 1);
+        assert_eq!(scene.world.hfields[0].data, vec![0.5, 1.0, 0.0, 0.0]);
+        assert_eq!(
+            scene.world.geoms[0].shape,
+            GeomShape::Hfield { hfield_id: 0 }
+        );
+    }
+
+    #[test]
+    fn hfield_inline_data_length_is_validated_before_row_reversal() {
+        let short = err(r#"<mujoco><asset><hfield name="terrain" nrow="2" ncol="2"
+                 size="1 1 1 0.2" elevation="0"/></asset></mujoco>"#);
+        assert!(
+            short.message.contains("length must be 4"),
+            "{}",
+            short.message
+        );
+
+        let long = err(r#"<mujoco><asset><hfield name="terrain" nrow="2" ncol="2"
+                 size="1 1 1 0.2" elevation="0 0 0 0 0"/></asset></mujoco>"#);
+        assert!(
+            long.message.contains("length must be 4"),
+            "{}",
+            long.message
+        );
+    }
+
+    #[test]
+    fn hfield_all_equal_elevation_normalizes_to_zero() {
+        let scene = load_mjcf_str(
+            r#"<mujoco><asset><hfield name="terrain" nrow="2" ncol="2"
+                 size="2 3 4 0.5" elevation="7 7 7 7"/></asset></mujoco>"#,
+        )
+        .expect("equal elevations should load");
+        let hfield = &scene.world.hfields[0];
+        assert_eq!(hfield.data, vec![0.0; 4]);
+        assert_eq!(hfield.height(0, 0), 0.0);
+        assert_eq!(hfield.height(1, 1), 0.0);
+    }
+
+    #[test]
+    fn hfield_inline_dimensions_and_sizes_are_rejected() {
+        let bad_dims = err(r#"<mujoco><asset><hfield name="terrain" nrow="1" ncol="2"
+                 size="1 1 1 0.2" elevation="0 0"/></asset></mujoco>"#);
+        assert!(
+            bad_dims.message.contains("must be ≥ 2"),
+            "{}",
+            bad_dims.message
+        );
+
+        let short_size = err(r#"<mujoco><asset><hfield name="terrain" nrow="2" ncol="2"
+                 size="1 1 1" elevation="0 0 0 0"/></asset></mujoco>"#);
+        assert!(
+            short_size.message.contains("expected 4 numbers"),
+            "{}",
+            short_size.message
+        );
+
+        let bad_size = err(r#"<mujoco><asset><hfield name="terrain" nrow="2" ncol="2"
+                 size="1 1 -1 0.2" elevation="0 0 0 0"/></asset></mujoco>"#);
+        assert!(bad_size.message.contains("size[2]"), "{}", bad_size.message);
+    }
+
+    #[test]
+    fn hfield_row_order_flip_mutant_is_killed_at_matching_world_coordinates() {
+        let loaded = load_mjcf_str(
+            r#"<mujoco><asset>
+              <hfield name="terrain" nrow="2" ncol="2" size="2 3 4 0.5"
+                      elevation="0 0.25 0.5 0.75"/>
+            </asset></mujoco>"#,
+        )
+        .expect("asymmetric hfield should load")
+        .world
+        .hfields[0]
+            .clone();
+        let programmatic = HeightField {
+            nrow: 2,
+            ncol: 2,
+            size: [2.0, 3.0, 4.0, 0.5],
+            data: vec![2.0 / 3.0, 1.0, 0.0, 1.0 / 3.0],
+        };
+        for row in 0..2 {
+            for col in 0..2 {
+                assert_eq!(
+                    loaded.height(row, col),
+                    programmatic.height(row, col),
+                    "world row {row}, col {col}"
+                );
+            }
+        }
+        assert_eq!(loaded.height(0, 0), 8.0 / 3.0);
+        assert_eq!(loaded.height(1, 1), 4.0 / 3.0);
+    }
+
+    #[test]
+    fn hfield_world_coordinates_match_mujoco_loader_oracle() {
+        let oracle = crate::json::parse(include_str!(
+            "../tests/references/hfield_loader_oracle.json"
+        ))
+        .expect("loader oracle must parse");
+        let crate::json::Value::Object(fields) = oracle else {
+            panic!("loader oracle must be an object");
+        };
+        let crate::json::Value::Array(rays) = fields
+            .iter()
+            .find(|(name, _)| name == "rays")
+            .map(|(_, value)| value)
+            .expect("oracle rays")
+        else {
+            panic!("oracle rays must be an array");
+        };
+        let loaded = load_mjcf_str(
+            r#"<mujoco><asset>
+              <hfield name="terrain" nrow="2" ncol="2" size="2 3 4 0.5"
+                      elevation="0 0.25 0.5 0.75"/>
+            </asset></mujoco>"#,
+        )
+        .expect("asymmetric hfield should load")
+        .world
+        .hfields[0]
+            .clone();
+        for ray in rays {
+            let crate::json::Value::Object(ray_fields) = ray else {
+                panic!("oracle ray must be an object");
+            };
+            let number = |name: &str| {
+                let crate::json::Value::Number(value) = ray_fields
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value)
+                    .expect("oracle ray field")
+                else {
+                    panic!("oracle ray field must be a number");
+                };
+                *value as f32
+            };
+            let x = number("x");
+            let y = number("y");
+            let expected = number("height");
+            let fx = (x + loaded.size[0]) / (2.0 * loaded.size[0]);
+            let fy = (y + loaded.size[1]) / (2.0 * loaded.size[1]);
+            let h00 = loaded.height(0, 0);
+            let h10 = loaded.height(0, 1);
+            let h01 = loaded.height(1, 0);
+            let h11 = loaded.height(1, 1);
+            let actual = if fx + fy <= 1.0 {
+                h00 + fx * (h10 - h00) + fy * (h01 - h00)
+            } else {
+                h11 + (1.0 - fx) * (h01 - h11) + (1.0 - fy) * (h10 - h11)
+            };
+            assert!((actual - expected).abs() < 2.0e-4, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn hfield_png_file_is_rejected_without_decoder() {
+        let e = err(r#"<mujoco><asset><hfield name="terrain" file="terrain.png"
+                 nrow="2" ncol="2" size="1 1 1 0.2"/></asset></mujoco>"#);
+        assert!(e.message.contains("PNG"), "{}", e.message);
     }
 
     #[test]

@@ -36,11 +36,13 @@
 //!   [`crate::math`] appear in the compute path.
 
 use crate::body::Body;
-use crate::contact::{Contact, is_pair_supported, narrow_phase, narrow_phase_solver};
+use crate::contact::{
+    Contact, is_pair_supported, narrow_phase_solver_with_hfields, narrow_phase_with_hfields,
+};
 use crate::equality::Equality;
 use crate::geom::{
-    ConvexMesh, Geom, GeomAttach, GeomPose, GeomShape, combine_solref, geom_world_pose,
-    solref_to_kc,
+    ConvexMesh, Geom, GeomAttach, GeomPose, GeomShape, HeightField, combine_solref,
+    geom_world_pose, solref_to_kc,
 };
 use crate::joint::JointKind;
 use crate::math::{Quat, Vec3};
@@ -103,6 +105,8 @@ pub struct World {
     /// Convex-mesh assets, indexed by [`GeomShape::Mesh::mesh_id`]. Empty
     /// when no mesh geoms are in play.
     pub meshes: Vec<ConvexMesh>,
+    /// Heightfield assets, indexed by [`GeomShape::Hfield::hfield_id`].
+    pub hfields: Vec<HeightField>,
     /// Optional explicit pair list `(geom_a, geom_b)` with `a < b`. When
     /// `None`, contact detection enumerates every unordered geom pair whose
     /// two geoms don't share a body/link and aren't both static; the
@@ -162,6 +166,8 @@ pub struct SolverPhaseDiagnostics {
     pub qvel: Vec<f32>,
     /// Tree contacts consumed by the solver in deterministic order.
     pub contacts: Vec<Contact>,
+    /// Free-body contacts consumed by the solver in deterministic order.
+    pub free_body_contacts: Vec<Contact>,
     /// Solver row to original contact mapping.
     pub row_to_contact: Vec<usize>,
     /// Per-row reference diagnostics from the solver phase.
@@ -206,6 +212,7 @@ impl PartialEq for World {
             && self.trees == other.trees
             && self.geoms == other.geoms
             && self.meshes == other.meshes
+            && self.hfields == other.hfields
             && self.pair_list == other.pair_list
             && self.solver == other.solver
             && self.equalities == other.equalities
@@ -240,6 +247,7 @@ impl World {
             trees: Vec::new(),
             geoms: Vec::new(),
             meshes: Vec::new(),
+            hfields: Vec::new(),
             pair_list: None,
             solver: SolverConfig::DEFAULT,
             equalities: Vec::new(),
@@ -588,6 +596,16 @@ impl World {
             .expect("convex mesh failed structural validation");
         let idx = self.meshes.len();
         self.meshes.push(mesh);
+        idx
+    }
+
+    /// Register a heightfield asset and return its stable id.
+    pub fn add_hfield(&mut self, hfield: HeightField) -> usize {
+        hfield
+            .validate()
+            .expect("heightfield failed structural validation");
+        let idx = self.hfields.len();
+        self.hfields.push(hfield);
         idx
     }
 
@@ -1182,6 +1200,7 @@ impl World {
                             bodies_ref,
                             geoms_ref,
                             &self.meshes,
+                            &self.hfields,
                             &tree_pairs,
                         )
                     }
@@ -1272,6 +1291,7 @@ impl World {
                             bodies_ref,
                             geoms_ref,
                             &self.meshes,
+                            &self.hfields,
                             &tree_pairs,
                         )
                     }
@@ -1315,6 +1335,7 @@ impl World {
             &self.trees,
             &self.geoms,
             &self.meshes,
+            &self.hfields,
             pairs,
             manifold,
         )
@@ -1432,6 +1453,15 @@ impl World {
         solution: Option<&TreeContactSolution>,
         contacts: &[Contact],
     ) {
+        let free_body_contacts: Vec<Contact> = contacts
+            .iter()
+            .copied()
+            .filter(|contact| {
+                let att_a = self.geoms[contact.geom_a].attachment();
+                let att_b = self.geoms[contact.geom_b].attachment();
+                !matches!(att_a, GeomAttach::Link(_, _)) && !matches!(att_b, GeomAttach::Link(_, _))
+            })
+            .collect();
         let (contacts, row_to_contact, row_diagnostics, tree_qfrc) = match solution {
             Some(solution) => (
                 solution.contacts.clone(),
@@ -1465,6 +1495,7 @@ impl World {
             qpos: state.0,
             qvel: state.1,
             contacts,
+            free_body_contacts,
             row_to_contact,
             row_diagnostics,
             tree_qfrc,
@@ -1509,6 +1540,7 @@ impl World {
             state,
             &self.geoms,
             &self.meshes,
+            &self.hfields,
             pairs,
             ContactManifold::Legacy,
         );
@@ -1595,6 +1627,7 @@ impl World {
             &self.trees,
             &self.geoms,
             &self.meshes,
+            &self.hfields,
             pairs,
             ContactManifold::Legacy,
         );
@@ -1644,6 +1677,7 @@ fn collect_contacts(
     state: &[Body],
     geoms: &[Geom],
     meshes: &[ConvexMesh],
+    hfields: &[HeightField],
     pairs: &[(usize, usize)],
     manifold: ContactManifold,
 ) -> Vec<Contact> {
@@ -1665,12 +1699,12 @@ fn collect_contacts(
             continue;
         }
         let buf = match manifold {
-            ContactManifold::Legacy => {
-                narrow_phase(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes)
-            }
-            ContactManifold::Solver => {
-                narrow_phase_solver(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes)
-            }
+            ContactManifold::Legacy => narrow_phase_with_hfields(
+                a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes, hfields,
+            ),
+            ContactManifold::Solver => narrow_phase_solver_with_hfields(
+                a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes, hfields,
+            ),
         };
         out.extend_from_slice(buf.as_slice());
     }
@@ -1684,6 +1718,7 @@ fn collect_contacts_full(
     trees: &[Tree],
     geoms: &[Geom],
     meshes: &[ConvexMesh],
+    hfields: &[HeightField],
     pairs: &[(usize, usize)],
     manifold: ContactManifold,
 ) -> Vec<Contact> {
@@ -1706,12 +1741,12 @@ fn collect_contacts_full(
 
     for &(a, b) in pairs {
         let buf = match manifold {
-            ContactManifold::Legacy => {
-                narrow_phase(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes)
-            }
-            ContactManifold::Solver => {
-                narrow_phase_solver(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes)
-            }
+            ContactManifold::Legacy => narrow_phase_with_hfields(
+                a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes, hfields,
+            ),
+            ContactManifold::Solver => narrow_phase_solver_with_hfields(
+                a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes, hfields,
+            ),
         };
         for c in buf.as_slice() {
             out.push(*c);
@@ -1765,6 +1800,7 @@ fn tree_wrenches_from_pairs(
     bodies: &[Body],
     geoms: &[Geom],
     meshes: &[ConvexMesh],
+    hfields: &[HeightField],
     pairs: &[(usize, usize)],
 ) -> Vec<(Vec3, Vec3)> {
     let n_links = tree.links.len();
@@ -1795,7 +1831,7 @@ fn tree_wrenches_from_pairs(
         let gb = &geoms[b];
         let pose_a = pose_of(ga);
         let pose_b = pose_of(gb);
-        let buf = narrow_phase(a, ga, &pose_a, b, gb, &pose_b, meshes);
+        let buf = narrow_phase_with_hfields(a, ga, &pose_a, b, gb, &pose_b, meshes, hfields);
         for contact in buf.as_slice() {
             apply_tree_contact_wrench(
                 &mut out,
@@ -2210,6 +2246,7 @@ fn shape_name(s: GeomShape) -> &'static str {
         GeomShape::Cylinder { .. } => "cylinder",
         GeomShape::Ellipsoid { .. } => "ellipsoid",
         GeomShape::Mesh { .. } => "mesh",
+        GeomShape::Hfield { .. } => "hfield",
     }
 }
 

@@ -25,7 +25,7 @@ use std::path::Path;
 use crate::actuator::{Actuator, BiasType, DynType, GainType};
 use crate::body::Body;
 use crate::equality::Equality;
-use crate::geom::{Geom, GeomShape, SolRef};
+use crate::geom::{Geom, GeomShape, HeightField, SolRef};
 use crate::joint::{JointKind, JointLimit};
 use crate::json::{self, Value};
 use crate::math::{Mat3, Quat, Vec3};
@@ -791,6 +791,7 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
             "trees",
             "geoms",
             "meshes",
+            "hfields",
             "sites",
             "actuators",
             "contact_pairs",
@@ -896,6 +897,24 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
         }
     }
 
+    // ---- Heightfields (asset table, referenced by geoms) ----
+    let mut hfields_by_name: HashMap<String, usize> = HashMap::new();
+    if let Some(v) = optional(root_fields, "hfields") {
+        let arr = get_array(v, "hfields")?;
+        for (i, hfield_v) in arr.iter().enumerate() {
+            let p = format!("hfields[{i}]");
+            let (hfield, name) = parse_hfield_asset(hfield_v, &p)?;
+            if hfields_by_name.contains_key(&name) {
+                return fail(
+                    &format!("{p}.name"),
+                    format!("duplicate hfield name \"{name}\""),
+                );
+            }
+            let idx = world.add_hfield(hfield);
+            hfields_by_name.insert(name, idx);
+        }
+    }
+
     // ---- Geoms ----
     let mut geoms_by_name: HashMap<String, usize> = HashMap::new();
     if let Some(v) = optional(root_fields, "geoms") {
@@ -909,6 +928,7 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
                 &trees_by_name,
                 &links_by_name,
                 &meshes_by_name,
+                &hfields_by_name,
             )?;
             if geoms_by_name.contains_key(&name) {
                 return fail(
@@ -1404,6 +1424,7 @@ fn parse_geom(
     trees_by_name: &HashMap<String, usize>,
     links_by_name: &[HashMap<String, usize>],
     meshes_by_name: &HashMap<String, usize>,
+    hfields_by_name: &HashMap<String, usize>,
 ) -> Result<(Geom, String), ModelError> {
     let fields = get_object(v, path)?;
     reject_unknown(
@@ -1433,6 +1454,7 @@ fn parse_geom(
         required(fields, "shape", path)?,
         &format!("{path}.shape"),
         meshes_by_name,
+        hfields_by_name,
     )?;
     let (attach_body, attach_link) = parse_attach(
         required(fields, "attach", path)?,
@@ -1675,6 +1697,66 @@ fn parse_mesh_asset(
     Ok((mesh, name))
 }
 
+/// Parse one normalized MuJoCo heightfield asset.
+fn parse_hfield_asset(v: &Value, path: &str) -> Result<(HeightField, String), ModelError> {
+    let fields = get_object(v, path)?;
+    reject_unknown(
+        fields,
+        &["name", "nrow", "ncol", "size", "data", "elevation"],
+        path,
+    )?;
+    let name = get_str(required(fields, "name", path)?, &format!("{path}.name"))?.to_string();
+    if name.is_empty() {
+        return fail(&format!("{path}.name"), "hfield name must not be empty");
+    }
+    let integer = |key: &str| -> Result<usize, ModelError> {
+        let n = get_f32(required(fields, key, path)?, &format!("{path}.{key}"))?;
+        if n < 2.0 || n != n.floor() {
+            return fail(
+                &format!("{path}.{key}"),
+                format!("{key} must be an integer ≥ 2"),
+            );
+        }
+        Ok(n as usize)
+    };
+    let nrow = integer("nrow")?;
+    let ncol = integer("ncol")?;
+    let size_v = get_array(required(fields, "size", path)?, &format!("{path}.size"))?;
+    if size_v.len() != 4 {
+        return fail(
+            &format!("{path}.size"),
+            "heightfield size must have 4 numbers",
+        );
+    }
+    let mut size = [0.0; 4];
+    for (i, value) in size_v.iter().enumerate() {
+        size[i] = get_f32(value, &format!("{path}.size[{i}]"))?;
+    }
+    let data_key = if optional(fields, "data").is_some() {
+        "data"
+    } else {
+        "elevation"
+    };
+    let values = get_array(
+        required(fields, data_key, path)?,
+        &format!("{path}.{data_key}"),
+    )?;
+    let mut data = Vec::with_capacity(values.len());
+    for (i, value) in values.iter().enumerate() {
+        data.push(get_f32(value, &format!("{path}.{data_key}[{i}]"))?);
+    }
+    let hfield = HeightField {
+        nrow,
+        ncol,
+        size,
+        data,
+    };
+    hfield
+        .validate()
+        .map_err(|message| ModelError::new(path, message))?;
+    Ok((hfield, name))
+}
+
 /// Parse the optional `margin` and `gap` fields on a geom object. Zero
 /// defaults. Rejects negative values.
 fn parse_margin_gap(fields: &[(String, Value)], path: &str) -> Result<(f32, f32), ModelError> {
@@ -1705,6 +1787,7 @@ fn parse_geom_shape(
     v: &Value,
     path: &str,
     meshes_by_name: &HashMap<String, usize>,
+    hfields_by_name: &HashMap<String, usize>,
 ) -> Result<GeomShape, ModelError> {
     let fields = get_object(v, path)?;
     let kind = required(fields, "kind", path)?;
@@ -1794,11 +1877,22 @@ fn parse_geom_shape(
             })?;
             Ok(GeomShape::Mesh { mesh_id })
         }
+        "hfield" => {
+            reject_unknown(fields, &["kind", "hfield"], path)?;
+            let name = get_str(required(fields, "hfield", path)?, &format!("{path}.hfield"))?;
+            let hfield_id = hfields_by_name.get(name).copied().ok_or_else(|| {
+                ModelError::new(
+                    format!("{path}.hfield"),
+                    format!("unknown hfield name \"{name}\" — declare it in top-level \"hfields\""),
+                )
+            })?;
+            Ok(GeomShape::Hfield { hfield_id })
+        }
         other => fail(
             &format!("{path}.kind"),
             format!(
                 "unknown geom shape \"{other}\"; expected \
-                 plane | sphere | box | capsule | cylinder | ellipsoid | mesh"
+                 plane | sphere | box | capsule | cylinder | ellipsoid | mesh | hfield"
             ),
         ),
     }
@@ -3637,5 +3731,31 @@ mod tests {
         // Orientation matches the parent link's world orientation.
         assert!((ori.z - (std::f32::consts::SQRT_2 * 0.5)).abs() < 1e-3);
         assert!((ori.w - (std::f32::consts::SQRT_2 * 0.5)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn hfield_json_asset_and_geom_round_trip() {
+        let src = r#"{
+          "hfields":[{"name":"terrain","nrow":2,"ncol":2,
+            "size":[1,1,1,0.2],"data":[0,0,0.5,1]}],
+          "geoms":[{"name":"ground","shape":{"kind":"hfield","hfield":"terrain"},
+            "attach":{"kind":"static"}}]
+        }"#;
+        let loaded = scene(src);
+        assert_eq!(loaded.world.hfields.len(), 1);
+        assert_eq!(
+            loaded.world.geoms[0].shape,
+            GeomShape::Hfield { hfield_id: 0 }
+        );
+    }
+
+    #[test]
+    fn hfield_json_rejects_data_length_and_negative_size() {
+        let short = r#"{"hfields":[{"name":"t","nrow":2,"ncol":2,
+            "size":[1,1,1,0.2],"data":[0,0,0]}]}"#;
+        assert!(err(short).message.contains("data length"));
+        let negative = r#"{"hfields":[{"name":"t","nrow":2,"ncol":2,
+            "size":[-1,1,1,0.2],"data":[0,0,0,0]}]}"#;
+        assert!(err(negative).message.contains("size[0]"));
     }
 }

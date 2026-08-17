@@ -216,6 +216,18 @@ fn tolerance(name: &str) -> Tolerance {
             qpos: 1.0e-6,
             qvel: 1.0e-6,
         },
+        "hfield_bowl_settle" => Tolerance {
+            qpos: 0.01,
+            qvel: 0.03,
+        },
+        "hfield_friction_slope_stop" => Tolerance {
+            qpos: 0.01,
+            qvel: 0.01,
+        },
+        "hfield_capsule_roll_equilibrium" => Tolerance {
+            qpos: 0.01,
+            qvel: 0.01,
+        },
         other => panic!("no tolerance for scenario {other:?}"),
     }
 }
@@ -635,6 +647,8 @@ struct Divergence {
     qvel_max: f64,
     qpos_max_idx: (usize, usize), // (sample, component)
     qvel_max_idx: (usize, usize),
+    qpos_dynamic_sample_max: Vec<f64>,
+    qvel_sample_max: Vec<f64>,
 }
 
 fn compare_and_measure(
@@ -654,6 +668,8 @@ fn compare_and_measure(
         qvel_max: 0.0,
         qpos_max_idx: (0, 0),
         qvel_max_idx: (0, 0),
+        qpos_dynamic_sample_max: Vec::new(),
+        qvel_sample_max: Vec::new(),
     };
     let dump = std::env::var("NEWT_DIFFERENTIAL_DUMP").is_ok();
     for (i, (fix, (newt_qpos, newt_qvel))) in
@@ -693,8 +709,14 @@ fn compare_and_measure(
             }
             idx += 7;
         }
+        let mut sample_qpos_dynamic_max = 0.0_f64;
+        let mut sample_qvel_max = 0.0_f64;
         for (k, (a, b)) in newt_qpos.iter().zip(fix.qpos.iter()).enumerate() {
             let e = (a - b).abs();
+            let is_free_quaternion = k < scenario_free_body_slots(scenario_name) * 7 && k % 7 >= 3;
+            if !is_free_quaternion {
+                sample_qpos_dynamic_max = sample_qpos_dynamic_max.max(e);
+            }
             if e > d.qpos_max {
                 d.qpos_max = e;
                 d.qpos_max_idx = (i, k);
@@ -702,11 +724,14 @@ fn compare_and_measure(
         }
         for (k, (a, b)) in newt_qvel.iter().zip(fix.qvel.iter()).enumerate() {
             let e = (a - b).abs();
+            sample_qvel_max = sample_qvel_max.max(e);
             if e > d.qvel_max {
                 d.qvel_max = e;
                 d.qvel_max_idx = (i, k);
             }
         }
+        d.qpos_dynamic_sample_max.push(sample_qpos_dynamic_max);
+        d.qvel_sample_max.push(sample_qvel_max);
         if dump {
             let per_qpos: Vec<String> = newt_qpos
                 .iter()
@@ -769,7 +794,17 @@ fn compare_sensor_samples(name: &str, fixture: &SensorFixture, samples: &[Vec<f6
 /// to canonicalize quaternion sign for those slots.
 fn scenario_free_body_slots(name: &str) -> usize {
     match name {
-        "ballistic" | "tumble" | "sphere_drop" | "sphere_drop_stiff" | "sphere_drop_soft" => 1,
+        "ballistic"
+        | "tumble"
+        | "sphere_drop"
+        | "sphere_drop_stiff"
+        | "sphere_drop_soft"
+        | "hfield_sphere_ramp"
+        | "hfield_box_terrain"
+        | "hfield_capsule_waves"
+        | "hfield_bowl_settle"
+        | "hfield_friction_slope_stop"
+        | "hfield_capsule_roll_equilibrium" => 1,
         "box_stack" => 3,
         _ => 0,
     }
@@ -1174,6 +1209,66 @@ fn assert_within_bounds(scenario: &str, d: &Divergence, tol: Tolerance) {
     );
 }
 
+fn assert_quasi_static_final(scenario: &str, d: &Divergence, tol: Tolerance) {
+    println!(
+        "differential[{scenario}] quasi-static final qpos_err={:.6e} qvel_err={:.6e}",
+        d.qpos_dynamic_sample_max.last().copied().unwrap_or(0.0),
+        d.qvel_sample_max.last().copied().unwrap_or(0.0),
+    );
+    let final_qvel = *d
+        .qvel_sample_max
+        .last()
+        .expect("quasi-static fixture must have samples");
+    assert!(
+        final_qvel <= tol.qvel,
+        "{scenario}: final qvel divergence {final_qvel:.3e} exceeds bound {:.2e}",
+        tol.qvel
+    );
+    let final_qpos = *d
+        .qpos_dynamic_sample_max
+        .last()
+        .expect("quasi-static fixture must have qpos samples");
+    assert!(
+        final_qpos <= tol.qpos,
+        "{scenario}: final qpos divergence {final_qpos:.3e} exceeds bound {:.2e}",
+        tol.qpos
+    );
+}
+
+fn assert_hfield_early_window(
+    name: &str,
+    d: &Divergence,
+    stride: u32,
+    last_step: u32,
+    qpos_bound: f64,
+    qvel_bound: f64,
+) {
+    let end = (last_step / stride) as usize;
+    assert!(
+        end < d.qvel_sample_max.len(),
+        "{name}: early window is outside fixture"
+    );
+    let qpos = d.qpos_dynamic_sample_max[..=end]
+        .iter()
+        .copied()
+        .fold(0.0, f64::max);
+    let qvel = d.qvel_sample_max[..=end]
+        .iter()
+        .copied()
+        .fold(0.0, f64::max);
+    println!(
+        "differential[{name}] early window through step {last_step}: qpos={qpos:.6e} qvel={qvel:.6e}; chaotic onset follows"
+    );
+    assert!(
+        qpos <= qpos_bound,
+        "{name}: early qpos gap {qpos:.3e} > {qpos_bound:.1e}"
+    );
+    assert!(
+        qvel <= qvel_bound,
+        "{name}: early qvel gap {qvel:.3e} > {qvel_bound:.1e}"
+    );
+}
+
 fn matched_integrator_tolerance(name: &str) -> Tolerance {
     match name {
         // These bounds are measured against the 2026-08-15 MuJoCo 3.11.0
@@ -1400,6 +1495,73 @@ fn differential_tendon_mixed_wrap() {
 fn differential_mocap_rangefinder() {
     let d = run_scenario(&scenario("mocap_rangefinder"));
     assert_within_tolerance("mocap_rangefinder", &d);
+}
+
+#[test]
+fn differential_hfield_euler_pgs_rows() {
+    for (name, last_step) in [
+        ("hfield_sphere_ramp", 200),
+        ("hfield_box_terrain", 125),
+        ("hfield_capsule_waves", 100),
+    ] {
+        let spec = scenario(name);
+        let d = run_scenario(&spec);
+        assert_hfield_early_window(name, &d, spec.stride, last_step, 1.0e-5, 1.0e-5);
+    }
+}
+
+#[test]
+fn differential_hfield_newton_euler_rows() {
+    for (name, last_step) in [
+        ("hfield_sphere_ramp", 200),
+        ("hfield_box_terrain", 125),
+        ("hfield_capsule_waves", 100),
+    ] {
+        let spec = scenario(name);
+        let d = run_scenario_with_solver(
+            &spec,
+            Some(Integrator::Euler),
+            Some(SolverMode::Newton),
+            "_newton_euler",
+        );
+        assert_hfield_early_window(
+            &format!("{name} Newton Euler"),
+            &d,
+            spec.stride,
+            last_step,
+            1.0e-5,
+            1.0e-5,
+        );
+    }
+}
+
+#[test]
+fn differential_hfield_quasi_static_rows() {
+    for name in [
+        "hfield_bowl_settle",
+        "hfield_friction_slope_stop",
+        "hfield_capsule_roll_equilibrium",
+    ] {
+        let d = run_scenario(&scenario(name));
+        assert_quasi_static_final(name, &d, tolerance(name));
+    }
+}
+
+#[test]
+fn differential_hfield_steep_box_ccd_disabled_anchor() {
+    let d = run_scenario(&scenario("hfield_box_steep_ccd_disabled"));
+    println!(
+        "differential[hfield_box_steep_ccd_disabled] measured qpos={:.6e} qvel={:.6e}",
+        d.qpos_max, d.qvel_max
+    );
+    assert_within_bounds(
+        "hfield_box_steep_ccd_disabled",
+        &d,
+        Tolerance {
+            qpos: 7.0e-3,
+            qvel: 1.5e-1,
+        },
+    );
 }
 
 #[test]

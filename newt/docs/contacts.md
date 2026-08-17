@@ -26,6 +26,7 @@ stiffness parameter.
 | `Cylinder { radius, half_height }` (v1) | solid cylinder, axis along local Z (MuJoCo convention). |
 | `Ellipsoid { semi_axes }` (v1) | 3 semi-axes along body-frame X/Y/Z. |
 | `Mesh { mesh_id }` (v1) | reference into [`World::meshes`]. See "convex mesh trust model" below. |
+| `Hfield { hfield_id }` (v3) | reference into `World::hfields`; normalized elevation grid with a finite triangular-prism base box. |
 
 inertia helpers for uniform-density variants live in `newt::geom`: solid
 sphere, box, capsule, cylinder, ellipsoid. `Body::solid_*` constructors call
@@ -72,15 +73,16 @@ before giving up. "Impl" = shipping in `contact::narrow_phase`, "Deferred" =
 returns an empty buffer AND is flagged by
 `World::validate_supported_pairs()`.
 
-|              | Plane   | Sphere  | Box     | Capsule | Cylinder | Ellipsoid | Mesh    |
-|--------------|---------|---------|---------|---------|----------|-----------|---------|
-| **Plane**    | —       | Impl    | Impl    | Impl    | Impl     | Impl      | Impl    |
-| **Sphere**   | Impl    | Impl    | Deferred| Impl    | Impl     | Impl      | Impl    |
-| **Box**      | Impl    | Deferred| Impl    | Deferred| Deferred | Deferred  | Deferred|
-| **Capsule**  | Impl    | Impl    | Deferred| Impl    | Deferred | Deferred  | Deferred|
-| **Cylinder** | Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred|
-| **Ellipsoid**| Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred|
-| **Mesh**     | Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred|
+|              | Plane   | Sphere  | Box     | Capsule | Cylinder | Ellipsoid | Mesh    | Hfield |
+|--------------|---------|---------|---------|---------|----------|-----------|---------|--------|
+| **Plane**    | —       | Impl    | Impl    | Impl    | Impl     | Impl      | Impl    | —      |
+| **Sphere**   | Impl    | Impl    | Deferred| Impl    | Impl     | Impl      | Impl    | Impl   |
+| **Box**      | Impl    | Deferred| Impl    | Deferred| Deferred | Deferred  | Deferred| Impl   |
+| **Capsule**  | Impl    | Impl    | Deferred| Impl    | Deferred | Deferred  | Deferred| Impl   |
+| **Cylinder** | Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred| —      |
+| **Ellipsoid**| Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred| —      |
+| **Mesh**     | Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred| —      |
+| **Hfield**   | —       | Impl    | Impl    | Impl    | —        | —         | —       | —      |
 
 Contacts-per-pair for the implemented primitives:
 
@@ -97,6 +99,9 @@ Contacts-per-pair for the implemented primitives:
 | sphere-cylinder | `contact::sphere_cylinder` | ≤ 1 (closest point) |
 | sphere-ellipsoid | `contact::sphere_ellipsoid` | ≤ 1 (12-iter Newton) |
 | sphere-mesh | `contact::sphere_mesh` | ≤ 1 (closest-point-on-triangle over faces) |
+| sphere-hfield | `contact::sphere_hfield` | ≤ 4 deepest prism candidates |
+| capsule-hfield | `contact::capsule_hfield` | ≤ 4 deepest endpoint candidates |
+| box-hfield | `contact::box_hfield` | ≤ 4 deepest convex-prism candidates |
 | capsule-capsule | `contact::capsule_capsule` | ≤ 1 |
 | box-box | `contact::box_box` (full OBB SAT) | ≤ 4 |
 
@@ -166,6 +171,44 @@ now stack (previously the upper collapsed straight through).
 the deepest point on the mesh in any direction is always a vertex — so a
 tetrahedron resting on a face emits contacts at its three "down" vertices.
 
+### heightfields
+
+`HeightField` stores an `nrow × ncol` row-major grid and
+`size = (half_width_x, half_width_y, top_height, base_depth)`. Data values
+are normalized to `[0, 1]`. The surface height is `data * top_height`; the
+finite base extends to `-base_depth`.
+
+Each cell uses the fixed `00 → 11` diagonal. Its two top triangles and the
+base define open-sided triangular prisms. The shared diagonal is a crease.
+Only outer field sides and the base are walls. Sphere and capsule collision use
+the closest point on the full prism surface. Box collision uses convex-prism
+separating axes, including box-edge features. Candidates use row, column,
+diagonal, and feature order. The existing per-pair cap retains the deepest
+four candidates.
+
+#### box hfield declared mode
+
+Box-hfield conformance uses MuJoCo's legacy convex hfield path, selected by
+the exact XML declaration
+`<option><flag nativeccd="disable"/></option>`. Newt matches MuJoCo's
+contact count and minimum-penetration depths in this mode. Probe 6 uses SAT
+support-feature positions and normals, while MuJoCo uses per-prism MPR
+positions and normals. The fixture records the measured position bound of
+`0.8` and normal bound of `1.45e-2` per contact.
+The probe-6 diagnostic maps MuJoCo and newt contacts to the same cell `(0, 0)`
+and prisms `1` then `0`, so the position difference is a construction
+difference, not a cell-selection difference. The steep-field 100-step
+flag-disabled anchor bounds its dynamic effect at `7.0e-3` qpos and `1.5e-1`
+qvel.
+
+This declaration does not claim parity with MuJoCo's default native-CCD
+pipeline. That alignment remains an open finding.
+
+Hfield collision supports sphere, capsule, and box only. Mesh, cylinder, and
+ellipsoid pairs are deferred and rejected by active-pair validation. Hfield
+contacts enter the same in-step solver pass and penalty-stage callback as
+other contacts.
+
 pair filtering: when `World::pair_list` is `None`, pairs are enumerated as
 `(i, j)` with `i < j` over the geom vector, skipping same-body pairs and
 static-vs-static pairs. the order is deterministic and index-stable. a caller
@@ -226,6 +269,14 @@ the Coulomb cap. designers who need a bright-line stiction can override
 `c_tangent` via a stiffer solref on the "sticky" geom.
 
 ### force application
+
+heightfields use the MuJoCo finite-prism model. Each grid cell is split along
+the fixed diagonal into two open-sided triangular prisms. The diagonal is a
+top crease, not a vertical wall. Sphere and capsule colliders test top, base,
+and outer side faces. Box colliders run the SAT convex-prism query and keep the
+four deepest unique contacts in deterministic order. SAT includes the base
+face and outer side-face axes, so it preserves side contacts outside the
+footprint and base contacts below the terrain.
 
 each contact contributes an equal-and-opposite wrench to its two owning
 bodies (Newton's third law is baked in — the momentum anchor verifies it).

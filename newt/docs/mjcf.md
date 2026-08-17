@@ -44,9 +44,10 @@ steps. If you touch either loader, keep the anchors green.
 | `<equality>` | `<connect>`, `<weld>`, `<joint>` children.                |
 | `<contact>`  | `<pair>` XOR `<exclude>` children (exclusive).            |
 | `<keyframe>` | `<key>` snapshots with `qpos`, `qvel`, `act`, and `ctrl`. |
+| `<asset>`    | Inline `<hfield>` assets only. PNG files are rejected without a decoder. |
 
 Rejected top-level elements (clean `unsupported in v2 tier 4` error):
-`<asset>`, `<tendon>`, `<custom>`, `<visual>`, `<size>`,
+`<tendon>`, `<custom>`, `<visual>`, `<size>`,
 `<statistic>`, `<extension>`, `<include>`.
 
 ### `<compiler>`
@@ -153,7 +154,7 @@ applies to all six free-root DOFs. `<joint>` supports:
 | Attribute    | Notes |
 | ------------ | ----- |
 | `name`       | Required. Unique across the scene. |
-| `type`       | `plane` (static only), `sphere`, `box`, `capsule`, `cylinder`, `ellipsoid`. `mesh`, `hfield`, `sdf` error out. |
+| `type`       | `plane` (static only), `sphere`, `box`, `capsule`, `cylinder`, `ellipsoid`, `hfield`. `mesh` and `sdf` error out. |
 | `pos`        | Local offset (or `fromto` for capsule / cylinder — see below). |
 | `quat` / `euler` / `axisangle` | Local orientation (same forms as `<body>`). |
 | `size`       | Shape-dependent: `radius` (sphere), `hx hy hz` (box), `radius half-length` (capsule / cylinder), `ax ay az` (ellipsoid). Plane sizes are accepted but ignored (newt planes are infinite). |
@@ -169,6 +170,26 @@ applies to all six free-root DOFs. `<joint>` supports:
 Rendering / filtering attributes (`material`, `rgba`, `group`,
 `density`, `contype`, `conaffinity`) error out with the attribute
 name. Use `<contact>` for explicit pair / exclude filtering.
+
+### `<asset><hfield>`
+
+Only inline normalized elevation data is supported:
+
+```xml
+<asset>
+  <hfield name="terrain" nrow="3" ncol="3"
+          size="2 2 0.8 0.2"
+          elevation="0 0.2 0.3 0.1 0.4 0.5 0.2 0.5 0.7"/>
+</asset>
+```
+
+`nrow` and `ncol` must be at least 2. `size` is
+`half_width_x half_width_y top_height base_depth`, with positive values.
+`elevation` and `data` are aliases. Their length must equal `nrow*ncol`,
+and each value must be in `[0,1]`. A `file` attribute is rejected with a
+PNG-subset message. Reference the asset with
+`<geom type="hfield" hfield="terrain"/>`. Collision supports sphere,
+capsule, and box pairs only.
 
 ### `<site>`
 

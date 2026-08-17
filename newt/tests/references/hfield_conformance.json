@@ -1,0 +1,488 @@
+{
+  "mujoco": "3.11.0",
+  "capture": "static mj_forward contacts; elevation rows are MuJoCo storage order",
+  "cases": [
+    {
+      "name": "saddle_sphere",
+      "shape": "sphere",
+      "provenance": {
+        "mode": "default",
+        "nativeccd": "default",
+        "source_xml": "hfield_conformance_default.xml"
+      },
+      "field": {
+        "nrow": 2,
+        "ncol": 2,
+        "size": [
+          1,
+          1,
+          1,
+          0.2
+        ],
+        "data": [
+          0,
+          1,
+          1,
+          0
+        ]
+      },
+      "pose": {
+        "position": [
+          0,
+          0,
+          0.35
+        ]
+      },
+      "radius": 0.3,
+      "contacts": [
+        {
+          "position": [
+            -0.11957057690291278,
+            0.11957057690291278,
+            0.11085884619417442
+          ],
+          "normal": [
+            0.4082482904638631,
+            -0.4082482904638631,
+            0.8164965809277261
+          ],
+          "penetration": 0.014226196675295899
+        },
+        {
+          "position": [
+            0.11957057690291283,
+            -0.11957057690291283,
+            0.11085884619417445
+          ],
+          "normal": [
+            -0.4082482904638637,
+            0.4082482904638637,
+            0.8164965809277255
+          ],
+          "penetration": 0.014226196675295899
+        }
+      ]
+    },
+    {
+      "name": "steep_sphere",
+      "shape": "sphere",
+      "provenance": {
+        "mode": "default",
+        "nativeccd": "default",
+        "source_xml": "hfield_conformance_default.xml"
+      },
+      "field": {
+        "nrow": 2,
+        "ncol": 2,
+        "size": [
+          1,
+          1,
+          1,
+          0.2
+        ],
+        "data": [
+          0,
+          1,
+          0,
+          1
+        ]
+      },
+      "pose": {
+        "position": [
+          0,
+          0,
+          0.7
+        ]
+      },
+      "radius": 0.3,
+      "contacts": [
+        {
+          "position": [
+            0.057577561281549686,
+            0.057577561281549686,
+            0.4696897548738016
+          ],
+          "normal": [
+            -0.2357022603955162,
+            -0.2357022603955162,
+            0.9428090415820634
+          ],
+          "penetration": 0.1114381916835874
+        },
+        {
+          "position": [
+            0.10708203932499373,
+            -7.43030909890153e-17,
+            0.48583592135001263
+          ],
+          "normal": [
+            -0.44721359549995815,
+            3.1031676915590924e-16,
+            0.8944271909999159
+          ],
+          "penetration": 0.12111456180001684
+        }
+      ]
+    },
+    {
+      "name": "ridge_capsule",
+      "shape": "capsule",
+      "provenance": {
+        "mode": "default",
+        "nativeccd": "default",
+        "source_xml": "hfield_conformance_default.xml"
+      },
+      "field": {
+        "nrow": 2,
+        "ncol": 2,
+        "size": [
+          1,
+          1,
+          1,
+          0.2
+        ],
+        "data": [
+          0,
+          1,
+          1,
+          0
+        ]
+      },
+      "pose": {
+        "position": [
+          0,
+          0,
+          0.45
+        ]
+      },
+      "radius": 0.1,
+      "half_height": 0.35,
+      "contacts": [
+        {
+          "position": [
+            -0.0370790811898598,
+            0.0370790811898598,
+            0.025841837620280368
+          ],
+          "normal": [
+            0.40824829046386285,
+            -0.40824829046386285,
+            0.8164965809277263
+          ],
+          "penetration": 0.01835034190722737
+        },
+        {
+          "position": [
+            0.037079081189859864,
+            -0.037079081189859864,
+            0.025841837620280427
+          ],
+          "normal": [
+            -0.40824829046386346,
+            0.40824829046386346,
+            0.8164965809277258
+          ],
+          "penetration": 0.01835034190722737
+        }
+      ]
+    },
+    {
+      "name": "steep_box",
+      "shape": "box",
+      "position_tolerance": 0.8,
+      "normal_bound": 0.0145,
+      "provenance": {
+        "mode": "legacy",
+        "nativeccd": "disable",
+        "source_xml": "hfield_conformance_nativeccd_disabled.xml"
+      },
+      "field": {
+        "nrow": 2,
+        "ncol": 2,
+        "size": [
+          1,
+          1,
+          1,
+          0.2
+        ],
+        "data": [
+          0,
+          1,
+          0,
+          1
+        ]
+      },
+      "pose": {
+        "position": [
+          0,
+          0,
+          0.45
+        ],
+        "axis": [
+          0,
+          1,
+          0
+        ],
+        "angle": 0.4
+      },
+      "half_extents": [
+        0.25,
+        0.25,
+        0.25
+      ],
+      "contacts": [
+        {
+          "position": [
+            -0.11569289011558942,
+            0.1502655754230211,
+            0.3357701687267611
+          ],
+          "normal": [
+            0.29672063700052786,
+            -0.6476257885614951,
+            0.7018103031219353
+          ],
+          "penetration": 0.38748660079258757
+        },
+        {
+          "position": [
+            0.13122985226976885,
+            -0.14602822210824484,
+            0.3853971777891754
+          ],
+          "normal": [
+            -0.7461301645468772,
+            0.5799443811165231,
+            0.32703867105378104
+          ],
+          "penetration": 0.36498459087323737
+        }
+      ]
+    },
+    {
+      "name": "box_base_crossing",
+      "shape": "box",
+      "position_tolerance": 1.0,
+      "provenance": {
+        "mode": "legacy",
+        "nativeccd": "disable",
+        "source_xml": "hfield_conformance_nativeccd_disabled.xml"
+      },
+      "field": {
+        "nrow": 2,
+        "ncol": 2,
+        "size": [
+          1,
+          1,
+          1,
+          0.2
+        ],
+        "data": [
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "pose": {
+        "position": [
+          0,
+          0,
+          -0.1
+        ]
+      },
+      "half_extents": [
+        0.2,
+        0.2,
+        0.2
+      ],
+      "contacts": [
+        {
+          "position": [
+            -0.12500000000000003,
+            0.12500000000000003,
+            -0.07916666666666668
+          ],
+          "normal": [
+            0.7071067811865476,
+            -0.7071067811865476,
+            0.0
+          ],
+          "penetration": 0.28284271247461895
+        },
+        {
+          "position": [
+            0.12500000000000003,
+            -0.12500000000000003,
+            -0.07916666666666669
+          ],
+          "normal": [
+            -0.7071067811865476,
+            0.7071067811865476,
+            -4.906538933386799e-17
+          ],
+          "penetration": 0.28284271247461895
+        }
+      ]
+    },
+    {
+      "name": "outer_top_side_sphere",
+      "shape": "sphere",
+      "provenance": {
+        "mode": "default",
+        "nativeccd": "default",
+        "source_xml": "hfield_conformance_default.xml"
+      },
+      "field": {
+        "nrow": 2,
+        "ncol": 2,
+        "size": [
+          1,
+          1,
+          1,
+          0.2
+        ],
+        "data": [
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "pose": {
+        "position": [
+          1.02,
+          0,
+          0.02
+        ]
+      },
+      "radius": 0.05,
+      "contacts": [
+        {
+          "position": [
+            0.9923223304703364,
+            0.0,
+            -0.007677669529663682
+          ],
+          "normal": [
+            0.7071067811865485,
+            0.0,
+            0.7071067811865467
+          ],
+          "penetration": 0.02171572875253809
+        }
+      ]
+    },
+    {
+      "name": "cell_boundary_sphere",
+      "shape": "sphere",
+      "provenance": {
+        "mode": "default",
+        "nativeccd": "default",
+        "source_xml": "hfield_conformance_default.xml"
+      },
+      "field": {
+        "nrow": 2,
+        "ncol": 3,
+        "size": [
+          1.5,
+          1,
+          1,
+          0.2
+        ],
+        "data": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "pose": {
+        "position": [
+          0,
+          0,
+          0.15
+        ]
+      },
+      "radius": 0.2,
+      "contacts": [
+        {
+          "position": [
+            0.0,
+            0.0,
+            -0.02500000000000001
+          ],
+          "normal": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "penetration": 0.05000000000000002
+        },
+        {
+          "position": [
+            0.0,
+            0.0,
+            -0.02500000000000001
+          ],
+          "normal": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "penetration": 0.05000000000000002
+        }
+      ]
+    },
+    {
+      "name": "base_side_sphere",
+      "shape": "sphere",
+      "provenance": {
+        "mode": "default",
+        "nativeccd": "default",
+        "source_xml": "hfield_conformance_default.xml"
+      },
+      "field": {
+        "nrow": 2,
+        "ncol": 2,
+        "size": [
+          1,
+          1,
+          1,
+          0.2
+        ],
+        "data": [
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "pose": {
+        "position": [
+          1,
+          0,
+          -0.1
+        ]
+      },
+      "radius": 0.05,
+      "contacts": [
+        {
+          "position": [
+            0.975000010729364,
+            4.0917113262314026e-06,
+            -0.10001621786999726
+          ],
+          "normal": [
+            0.9999999999999899,
+            -3.405831197770806e-11,
+            1.4266925740923888e-07
+          ],
+          "penetration": 0.04999997854127213
+        }
+      ]
+    }
+  ]
+}

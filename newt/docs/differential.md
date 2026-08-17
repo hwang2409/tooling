@@ -83,10 +83,88 @@ scorecard above. Each scenario has a permanent differential test.
 The finite-difference probes report maximum relative Jacobian errors of
 `2.883e-3` for the cylinder wrap and `1.195e-3` for the pulley branches.
 
+### NEWT-28 heightfield captures
+
+MuJoCo 3.11.0 Euler/PGS captures are committed in
+`tests/references/hfield_*.bin`, with matching XML provenance. The three
+tumbling scenes assert only their measured pre-divergence windows. Dynamic
+qpos excludes free-body quaternion slots.
+
+| scene | early window | measured qpos | measured qvel | chaotic onset |
+|---|---:|---:|---:|---:|
+| hfield_sphere_ramp | through step 200 | 6.86e-7 | 8.56e-6 | step 225 |
+| hfield_box_terrain | through step 125 | 2.03e-7 | 4.19e-6 | step 150 |
+| hfield_capsule_waves | through step 100 | 1.77e-7 | 2.73e-6 | step 125 |
+
+The early assertion tier is `1e-5` for qpos and qvel. Later samples are
+chaotic and have no fitted whole-trajectory bound.
+
+Three quasi-static captures provide stable final-state evidence:
+`hfield_bowl_settle`, `hfield_friction_slope_stop`, and
+`hfield_capsule_roll_equilibrium`. Their final qpos and qvel error bounds are
+`1e-2` for qpos and `3e-2` for the bowl qvel row. The measured final errors are `(2.44e-3, 2.56e-2)`,
+`(2.64e-5, 7.45e-10)`, and `(2.58e-3, 2.53e-6)` respectively.
+
 `mocap_rangefinder` also compares all seven `sensordata` values at each
 sample. The maximum direct sensor error is `2.4e-8`, below the `2.0e-6`
 sensor bound. It covers rangefinder ray casting, mocap site attachment,
 velocimeter output, and magnetic-field frame conversion.
+
+### hfield box declared-mode finding
+
+The box conformance rows use MuJoCo's legacy convex hfield pipeline. The
+precise declaration is:
+
+```xml
+<option><flag nativeccd="disable"/></option>
+```
+
+The per-mode provenance XMLs are complete models. Each contains the declared
+hfield asset, its hfield geom, and every sourced shape body with its captured
+pose. `tools/capture_hfield_conformance.py` loads those XMLs in MuJoCo,
+filters one declared pair at a time, runs `mj_forward`, and rewrites the
+contact rows in `tests/references/hfield_conformance.json`. The Rust harness
+also loads each declared XML through the newt MJCF loader and checks the
+hfield grid, size, shape parameters, and world pose against that case.
+
+Newt's box-hfield narrow phase matches that mode's contact count and minimum
+penetration depths on the committed probe 6 and probe 8 fixtures. Probe 8
+also matches the contact normals exactly. MuJoCo exposes one hfield geom, so
+it does not expose its internal prism id. A diagnostic matched each contact to
+the same cell and prism by its normal and depth:
+
+| engine | contact | cell | prism | top triangle |
+|--------|---------:|------|-------:|--------------|
+| MuJoCo MPR | 0 | (0, 0) | 1 | (p00, p11, p01) |
+| MuJoCo MPR | 1 | (0, 0) | 0 | (p00, p10, p11) |
+| newt SAT | 0 | (0, 0) | 1 | (p00, p11, p01) |
+| newt SAT | 1 | (0, 0) | 0 | (p00, p10, p11) |
+
+Probe 6 uses different contact constructions. MuJoCo's per-prism MPR and
+newt's SAT support-feature construction produced measured position residuals
+of `0.07246` and `0.04990`. The fixture uses the dictated conservative
+per-contact position bound of `0.8`. The second contact's normal residual is
+`1.43e-2`. SAT selects a unique minimum-penetration axis, the box-local Z
+axis crossed with the internal `p11-p00` prism edge, at overlap `0.3649474`.
+The next candidate is `0.5107937`, so this is not a tie or axis-quantization
+bug. It is a construction difference between MuJoCo's per-prism MPR and
+newt's SAT. The fixture records the measured normal bound `1.45e-2`; probe 6
+does not claim exact normal parity. Counts and depths remain exact criteria.
+
+The direct dynamics anchor is `hfield_box_steep_ccd_disabled`: a tilted box
+released above the steep cell for 100 Euler steps under the same
+`nativeccd=disable` declaration. Its measured maximum divergence is
+`5.53e-3` qpos and `1.18e-1` qvel. The asserted bounds are `7.0e-3` and
+`1.5e-1`. This bounds the dynamic effect of the position construction.
+
+The stable differential rows also remain within the existing evidence tiers:
+the friction-slope final qpos residual is `2.64e-5`, and the hfield box early
+window is `4.19e-6` qvel. These rows support the bound; they do not replace
+the steep-field anchor.
+
+Sphere and capsule hfield probes remain on default MuJoCo captures. Alignment
+with MuJoCo's default native-CCD contact set remains an open finding. The
+flag-disabled result does not claim native-CCD parity.
 
 ### sphere_drop solref sweep
 

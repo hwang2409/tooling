@@ -1,0 +1,17 @@
+<mujoco model="hfield_capsule_roll_equilibrium">
+  <compiler angle="radian"/>
+  <option timestep="0.002" gravity="0 0 -0.5" integrator="Euler"
+          solver="PGS" cone="pyramidal" iterations="20"/>
+  <asset>
+    <hfield name="flat" nrow="3" ncol="3" size="1.5 1.5 0.2 0.3"
+            elevation="0 0 0 0 0 0 0 0 0"/>
+  </asset>
+  <worldbody>
+    <geom name="flat_geom" type="hfield" hfield="flat" friction="5.0"/>
+    <body name="capsule" pos="0 0 0.44">
+      <freejoint name="capsule_root"/>
+      <inertial pos="0 0 0" mass="0.8" diaginertia="0.06 0.05 0.03"/>
+      <geom name="capsule_geom" type="capsule" size="0.12 0.32" friction="5.0"/>
+    </body>
+  </worldbody>
+</mujoco>

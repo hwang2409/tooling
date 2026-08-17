@@ -19,6 +19,7 @@ cargo run --release --example biped_walk -- --steps 5000 --out demo-biped.mp4
 cargo run --release --example tendon_lift -- --frames 900 --out demo-tendon.mp4
 cargo run --release --example solver_stack -- --frames 800 --out demo-stack.mp4
 cargo run --release --example pile -- --frames 800 --out demo-pile.mp4
+cargo run --release --example hfield_demo -- --frames 1800 --out demo-hfield.mp4
 cargo run --release --example cartpole -- --frames 900 --out demo-cartpole.mp4
 cargo run --release --example cartpole -- --velocity --frames 900 --out demo-cartpole-velocity.mp4
 cargo run --release --example arm -- --frames 1800 --out demo-arm.mp4
