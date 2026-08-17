@@ -1,43 +1,93 @@
 {
   "mujoco": "3.11.0",
-  "model": "finite triangular prism per cell",
-  "poses": {
-    "cell_boundary": {"continuity": "<1e-5 across x=0"},
-    "saddle_sphere": {
-      "count": 2,
-      "normal_abs_z": "<1e-5",
-      "penetration": 0.3000002
-    },
-    "steep_sphere": {
-      "count": 2,
+  "capture": "static mj_forward contacts; elevation rows are MuJoCo storage order",
+  "cases": [
+    {
+      "name": "saddle_sphere",
+      "shape": "sphere",
+      "field": {"nrow": 2, "ncol": 2, "size": [1, 1, 1, 0.2], "data": [0, 1, 1, 0]},
+      "pose": {"position": [0, 0, 0.35]},
+      "radius": 0.3,
       "contacts": [
-        {"position": [0.107082, 0.0, 0.485836], "normal": [-0.447214, 0.0, 0.894427], "penetration": 0.1211146},
-        {"position": [0.057578, 0.057578, 0.469690], "normal": [-0.235702, -0.235702, 0.942809], "penetration": 0.1114382}
+        {"position": [-0.1195706, 0.1195706, 0.1108588], "normal": [0.4082483, -0.4082483, 0.8164966], "penetration": 0.0142262},
+        {"position": [0.1195706, -0.1195706, 0.1108588], "normal": [-0.4082483, 0.4082483, 0.8164966], "penetration": 0.0142262}
       ]
     },
-    "ridge_capsule": {
-      "count": 2,
-      "normal_abs_z": "<1e-5",
-      "penetration": 0.1
-    },
-    "base_side_sphere": {
-      "count": 1,
-      "position": [0.975, 0.0, -0.1],
-      "normal": [1.0, 0.0, 0.0],
-      "penetration": 0.05
-    },
-    "outside_footprint_sphere": {
-      "count": 1,
-      "position": [0.995, 0.0, 0.0],
-      "normal": [1.0, 0.0, 0.0],
-      "penetration": 0.01
-    },
-    "steep_box": {
-      "count": 2,
+    {
+      "name": "steep_sphere",
+      "shape": "sphere",
+      "field": {"nrow": 2, "ncol": 2, "size": [1, 1, 1, 0.2], "data": [0, 1, 0, 1]},
+      "pose": {"position": [0, 0, 0.7]},
+      "radius": 0.3,
       "contacts": [
-        {"position": [0.169729, 0.220587, 0.342499], "normal": [0.578309, -0.793155, 0.190957], "penetration": 0.0741669},
-        {"position": [0.165988, -0.177464, 0.397154], "normal": [-0.603366, 0.0, 0.797464], "penetration": 0.1766979}
+        {"position": [0.0575776, 0.0575776, 0.4696898], "normal": [-0.2357023, -0.2357023, 0.942809], "penetration": 0.1114382},
+        {"position": [0.107082, 0, 0.4858359], "normal": [-0.4472136, 0, 0.8944272], "penetration": 0.1211146}
+      ]
+    },
+    {
+      "name": "ridge_capsule",
+      "shape": "capsule",
+      "field": {"nrow": 2, "ncol": 2, "size": [1, 1, 1, 0.2], "data": [0, 1, 1, 0]},
+      "pose": {"position": [0, 0, 0.45]},
+      "radius": 0.1,
+      "half_height": 0.35,
+      "contacts": [
+        {"position": [-0.0370791, 0.0370791, 0.0258418], "normal": [0.4082483, -0.4082483, 0.8164966], "penetration": 0.0183503},
+        {"position": [0.0370791, -0.0370791, 0.0258418], "normal": [-0.4082483, 0.4082483, 0.8164966], "penetration": 0.0183503}
+      ]
+    },
+    {
+      "name": "steep_box",
+      "shape": "box",
+      "field": {"nrow": 2, "ncol": 2, "size": [1, 1, 1, 0.2], "data": [0, 1, 0, 1]},
+      "pose": {"position": [0, 0, 0.45], "axis": [0, 1, 0], "angle": 0.4},
+      "half_extents": [0.25, 0.25, 0.25],
+      "contacts": [
+        {"position": [0.4477184, 0.6141104, 0.6013424], "normal": [0.2967206, -0.6476257, 0.7018103], "penetration": 0.3874866},
+        {"position": [-0.3698867, -0.6026078, 0.1699890], "normal": [-0.7452216, 0.5876843, 0.3150746], "penetration": 0.3649474}
+      ]
+    },
+    {
+      "name": "box_base_crossing",
+      "shape": "box",
+      "field": {"nrow": 2, "ncol": 2, "size": [1, 1, 1, 0.2], "data": [1, 1, 1, 1]},
+      "pose": {"position": [0, 0, -0.1]},
+      "half_extents": [0.2, 0.2, 0.2],
+      "contacts": [
+        {"position": [0, 0.2, -0.05], "normal": [0, 0, -1], "penetration": 0.3},
+        {"position": [0, -0.2, -0.15], "normal": [0, 0, -1], "penetration": 0.3}
+      ]
+    },
+    {
+      "name": "outer_top_side_sphere",
+      "shape": "sphere",
+      "field": {"nrow": 2, "ncol": 2, "size": [1, 1, 1, 0.2], "data": [0, 0, 0, 0]},
+      "pose": {"position": [1.02, 0, 0.02]},
+      "radius": 0.05,
+      "contacts": [
+        {"position": [0.9923223, 0, -0.0076777], "normal": [0.7071068, 0, 0.7071068], "penetration": 0.0217157}
+      ]
+    },
+    {
+      "name": "cell_boundary_sphere",
+      "shape": "sphere",
+      "field": {"nrow": 2, "ncol": 3, "size": [1.5, 1, 1, 0.2], "data": [0, 0, 0, 0, 0, 0]},
+      "pose": {"position": [0, 0, 0.15]},
+      "radius": 0.2,
+      "contacts": [
+        {"position": [0, 0, -0.025], "normal": [0, 0, 1], "penetration": 0.05},
+        {"position": [0, 0, -0.025], "normal": [0, 0, 1], "penetration": 0.05}
+      ]
+    },
+    {
+      "name": "base_side_sphere",
+      "shape": "sphere",
+      "field": {"nrow": 2, "ncol": 2, "size": [1, 1, 1, 0.2], "data": [0, 0, 0, 0]},
+      "pose": {"position": [1, 0, -0.1]},
+      "radius": 0.05,
+      "contacts": [
+        {"position": [0.975, 0, -0.1], "normal": [1, 0, 0], "penetration": 0.05}
       ]
     }
-  }
+  ]
 }

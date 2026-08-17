@@ -1816,13 +1816,33 @@ impl Loader {
                     ),
                 );
             }
+            // MuJoCo maps inline elevations to their input range before it
+            // applies size[2]. Keep this normalization after the length check
+            // so malformed rows never reach the reversal below.
+            let mut source_min = f32::INFINITY;
+            let mut source_max = f32::NEG_INFINITY;
+            for &value in &source_data {
+                source_min = source_min.min(value);
+                source_max = source_max.max(value);
+            }
+            let source_range = source_max - source_min;
+            let normalized_data: Vec<f32> = source_data
+                .iter()
+                .map(|&value| {
+                    if source_range > 0.0 {
+                        (value - source_min) / source_range
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
             // MuJoCo stores inline hfield rows from the opposite local-Y
             // edge. Reverse rows at the loader boundary so row zero maps to
             // local y = -size_y in the engine grid.
-            let mut data = Vec::with_capacity(source_data.len());
+            let mut data = Vec::with_capacity(normalized_data.len());
             for row in (0..nrow).rev() {
                 let begin = row * ncol;
-                data.extend_from_slice(&source_data[begin..begin + ncol]);
+                data.extend_from_slice(&normalized_data[begin..begin + ncol]);
             }
             let hfield = HeightField {
                 nrow,
@@ -4248,7 +4268,7 @@ mod tests {
             nrow: 2,
             ncol: 2,
             size: [2.0, 3.0, 4.0, 0.5],
-            data: vec![0.5, 0.75, 0.0, 0.25],
+            data: vec![2.0 / 3.0, 1.0, 0.0, 1.0 / 3.0],
         };
         for row in 0..2 {
             for col in 0..2 {
@@ -4259,8 +4279,68 @@ mod tests {
                 );
             }
         }
-        assert_eq!(loaded.height(0, 0), 2.0);
-        assert_eq!(loaded.height(1, 1), 1.0);
+        assert_eq!(loaded.height(0, 0), 8.0 / 3.0);
+        assert_eq!(loaded.height(1, 1), 4.0 / 3.0);
+    }
+
+    #[test]
+    fn hfield_world_coordinates_match_mujoco_loader_oracle() {
+        let oracle = crate::json::parse(include_str!(
+            "../tests/references/hfield_loader_oracle.json"
+        ))
+        .expect("loader oracle must parse");
+        let crate::json::Value::Object(fields) = oracle else {
+            panic!("loader oracle must be an object");
+        };
+        let crate::json::Value::Array(rays) = fields
+            .iter()
+            .find(|(name, _)| name == "rays")
+            .map(|(_, value)| value)
+            .expect("oracle rays")
+        else {
+            panic!("oracle rays must be an array");
+        };
+        let loaded = load_mjcf_str(
+            r#"<mujoco><asset>
+              <hfield name="terrain" nrow="2" ncol="2" size="2 3 4 0.5"
+                      elevation="0 0.25 0.5 0.75"/>
+            </asset></mujoco>"#,
+        )
+        .expect("asymmetric hfield should load")
+        .world
+        .hfields[0]
+            .clone();
+        for ray in rays {
+            let crate::json::Value::Object(ray_fields) = ray else {
+                panic!("oracle ray must be an object");
+            };
+            let number = |name: &str| {
+                let crate::json::Value::Number(value) = ray_fields
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value)
+                    .expect("oracle ray field")
+                else {
+                    panic!("oracle ray field must be a number");
+                };
+                *value as f32
+            };
+            let x = number("x");
+            let y = number("y");
+            let expected = number("height");
+            let fx = (x + loaded.size[0]) / (2.0 * loaded.size[0]);
+            let fy = (y + loaded.size[1]) / (2.0 * loaded.size[1]);
+            let h00 = loaded.height(0, 0);
+            let h10 = loaded.height(0, 1);
+            let h01 = loaded.height(1, 0);
+            let h11 = loaded.height(1, 1);
+            let actual = if fx + fy <= 1.0 {
+                h00 + fx * (h10 - h00) + fy * (h01 - h00)
+            } else {
+                h11 + (1.0 - fx) * (h01 - h11) + (1.0 - fy) * (h10 - h11)
+            };
+            assert!((actual - expected).abs() < 2.0e-4, "{actual} != {expected}");
+        }
     }
 
     #[test]

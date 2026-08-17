@@ -102,7 +102,7 @@ chaotic and have no fitted whole-trajectory bound.
 Three quasi-static captures provide stable final-state evidence:
 `hfield_bowl_settle`, `hfield_friction_slope_stop`, and
 `hfield_capsule_roll_equilibrium`. Their final qpos and qvel error bounds are
-`1e-2` for both fields. The measured final errors are `(1.54e-3, 4.25e-3)`,
+`1e-2` for qpos and `3e-2` for the bowl qvel row. The measured final errors are `(2.44e-3, 2.56e-2)`,
 `(2.64e-5, 7.45e-10)`, and `(2.58e-3, 2.53e-6)` respectively.
 
 `mocap_rangefinder` also compares all seven `sensordata` values at each

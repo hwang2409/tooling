@@ -166,6 +166,8 @@ pub struct SolverPhaseDiagnostics {
     pub qvel: Vec<f32>,
     /// Tree contacts consumed by the solver in deterministic order.
     pub contacts: Vec<Contact>,
+    /// Free-body contacts consumed by the solver in deterministic order.
+    pub free_body_contacts: Vec<Contact>,
     /// Solver row to original contact mapping.
     pub row_to_contact: Vec<usize>,
     /// Per-row reference diagnostics from the solver phase.
@@ -1451,6 +1453,15 @@ impl World {
         solution: Option<&TreeContactSolution>,
         contacts: &[Contact],
     ) {
+        let free_body_contacts: Vec<Contact> = contacts
+            .iter()
+            .copied()
+            .filter(|contact| {
+                let att_a = self.geoms[contact.geom_a].attachment();
+                let att_b = self.geoms[contact.geom_b].attachment();
+                !matches!(att_a, GeomAttach::Link(_, _)) && !matches!(att_b, GeomAttach::Link(_, _))
+            })
+            .collect();
         let (contacts, row_to_contact, row_diagnostics, tree_qfrc) = match solution {
             Some(solution) => (
                 solution.contacts.clone(),
@@ -1484,6 +1495,7 @@ impl World {
             qpos: state.0,
             qvel: state.1,
             contacts,
+            free_body_contacts,
             row_to_contact,
             row_diagnostics,
             tree_qfrc,

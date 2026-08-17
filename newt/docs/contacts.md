@@ -101,7 +101,7 @@ Contacts-per-pair for the implemented primitives:
 | sphere-mesh | `contact::sphere_mesh` | ≤ 1 (closest-point-on-triangle over faces) |
 | sphere-hfield | `contact::sphere_hfield` | ≤ 4 deepest prism candidates |
 | capsule-hfield | `contact::capsule_hfield` | ≤ 4 deepest endpoint candidates |
-| box-hfield | `contact::box_hfield` | ≤ 4 deepest vertex candidates |
+| box-hfield | `contact::box_hfield` | ≤ 4 deepest convex-prism candidates |
 | capsule-capsule | `contact::capsule_capsule` | ≤ 1 |
 | box-box | `contact::box_box` (full OBB SAT) | ≤ 4 |
 
@@ -178,11 +178,13 @@ tetrahedron resting on a face emits contacts at its three "down" vertices.
 are normalized to `[0, 1]`. The surface height is `data * top_height`; the
 finite base extends to `-base_depth`.
 
-Each cell uses the fixed `00 → 11` diagonal. Its two top triangles, copied at
-the base depth, define the triangular-prism decomposition. Sphere and capsule
-collision use the closest point on each top triangle. Box collision tests each
-box vertex against those triangles. Candidates use row, column, diagonal, and
-vertex order. The existing per-pair cap retains the deepest four candidates.
+Each cell uses the fixed `00 → 11` diagonal. Its two top triangles and the
+base define open-sided triangular prisms. The shared diagonal is a crease.
+Only outer field sides and the base are walls. Sphere and capsule collision use
+the closest point on the full prism surface. Box collision uses convex-prism
+separating axes, including box-edge features. Candidates use row, column,
+diagonal, and feature order. The existing per-pair cap retains the deepest
+four candidates.
 
 Hfield collision supports sphere, capsule, and box only. Mesh, cylinder, and
 ellipsoid pairs are deferred and rejected by active-pair validation. Hfield
@@ -251,11 +253,12 @@ the Coulomb cap. designers who need a bright-line stiction can override
 ### force application
 
 heightfields use the MuJoCo finite-prism model. Each grid cell is split along
-the fixed diagonal into two closed triangular prisms. Sphere and capsule
-colliders test top, base, and side faces. Capsule tests use the full center
-segment, including ridge contacts. Box colliders test the prism faces and keep
-the four deepest unique contacts in deterministic order. This preserves side
-contacts outside the footprint and base contacts below the terrain.
+the fixed diagonal into two open-sided triangular prisms. The diagonal is a
+top crease, not a vertical wall. Sphere and capsule colliders test top, base,
+and outer side faces. Box colliders run a convex-prism query and keep the four
+deepest unique contacts in deterministic order. A box crossing the base uses
+the two base support features. This preserves side contacts outside the
+footprint and base contacts below the terrain.
 
 each contact contributes an equal-and-opposite wrench to its two owning
 bodies (Newton's third law is baked in — the momentum anchor verifies it).

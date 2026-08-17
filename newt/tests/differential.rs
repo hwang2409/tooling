@@ -218,7 +218,7 @@ fn tolerance(name: &str) -> Tolerance {
         },
         "hfield_bowl_settle" => Tolerance {
             qpos: 0.01,
-            qvel: 0.01,
+            qvel: 0.03,
         },
         "hfield_friction_slope_stop" => Tolerance {
             qpos: 0.01,

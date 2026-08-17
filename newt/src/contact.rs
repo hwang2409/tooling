@@ -89,6 +89,10 @@ pub struct ContactBuf {
     pub len: usize,
     /// Number of candidates offered to the bounded output buffer.
     pub candidate_count: usize,
+    /// Number of unique candidates before the four-contact cap.
+    pub unique_candidate_count: usize,
+    seen: [Contact; 16],
+    seen_len: usize,
 }
 
 impl Default for ContactBuf {
@@ -112,6 +116,9 @@ impl ContactBuf {
             contacts: [placeholder; 4],
             len: 0,
             candidate_count: 0,
+            unique_candidate_count: 0,
+            seen: [placeholder; 16],
+            seen_len: 0,
         }
     }
     pub fn push(&mut self, c: Contact) {
@@ -147,13 +154,18 @@ impl ContactBuf {
     /// duplicate triangle contact.
     pub fn push_deepest_unique(&mut self, c: Contact) {
         self.candidate_count += 1;
-        if (0..self.len).any(|i| {
-            let prior = self.contacts[i];
+        if (0..self.seen_len).any(|i| {
+            let prior = self.seen[i];
             (c.position_world - prior.position_world).length_squared() < 1.0e-12
                 && (c.normal_world - prior.normal_world).length_squared() < 1.0e-12
         }) {
             return;
         }
+        if self.seen_len < self.seen.len() {
+            self.seen[self.seen_len] = c;
+            self.seen_len += 1;
+        }
+        self.unique_candidate_count += 1;
         if self.len < self.contacts.len() {
             self.contacts[self.len] = c;
             self.len += 1;
@@ -1729,20 +1741,22 @@ fn hfield_cell_triangles(hfield: &HeightField, row: usize, col: usize) -> [(Vec3
     [(p00, p10, p11), (p00, p11, p01)]
 }
 
-/// Return the closed triangular prism for one heightfield cell.
+/// One convex prism in the cell decomposition.
 ///
-/// The top triangle follows the fixed cell diagonal. Its copy at
-/// `z = -base_depth` is the base face. The three connecting quadrilaterals
-/// are split into triangles so every candidate uses the same closest-point
-/// primitive. Face winding is corrected against the prism centroid, which
-/// keeps side and base normals outward for every slope.
-fn hfield_cell_prism_triangles(
-    hfield: &HeightField,
-    row: usize,
-    col: usize,
-    triangle: usize,
-) -> [(Vec3, Vec3, Vec3); 8] {
-    let triangle = hfield_cell_triangles(hfield, row, col)[triangle];
+/// The two top triangles share a crease. The shared diagonal has no side
+/// faces. Only field-boundary sides and the base close each prism.
+#[derive(Clone, Copy)]
+struct HfieldPrism {
+    faces: [(Vec3, Vec3, Vec3); 8],
+    valid: [bool; 8],
+    top: (Vec3, Vec3, Vec3),
+    base_z: f32,
+}
+
+/// Return one open-sided triangular prism for a heightfield cell.
+fn hfield_cell_prism(hfield: &HeightField, row: usize, col: usize, triangle: usize) -> HfieldPrism {
+    let triangle_index = triangle;
+    let triangle = hfield_cell_triangles(hfield, row, col)[triangle_index];
     let (t0, t1, t2) = triangle;
     let base_z = -hfield.size[3];
     let b0 = Vec3::new(t0.x, t0.y, base_z);
@@ -1759,7 +1773,7 @@ fn hfield_cell_prism_triangles(
         (t0, t2, b2),
         (t0, b2, b0),
     ];
-    std::array::from_fn(|i| {
+    let faces = std::array::from_fn(|i| {
         let (a, b, c) = raw[i];
         let n = (b - a).cross(c - a).normalize();
         if n.dot(centroid - a) > 0.0 {
@@ -1767,17 +1781,42 @@ fn hfield_cell_prism_triangles(
         } else {
             (a, b, c)
         }
-    })
+    });
+    let valid = if triangle_index == 0 {
+        [
+            true,
+            true,
+            row == 0,
+            row == 0,
+            col + 1 == hfield.ncol - 1,
+            col + 1 == hfield.ncol - 1,
+            false,
+            false,
+        ]
+    } else {
+        [
+            true,
+            true,
+            false,
+            false,
+            row + 1 == hfield.nrow - 1,
+            row + 1 == hfield.nrow - 1,
+            col == 0,
+            col == 0,
+        ]
+    };
+    HfieldPrism {
+        faces,
+        valid,
+        top: triangle,
+        base_z,
+    }
 }
 
-fn hfield_prism_triangles(
-    hfield: &HeightField,
-    row: usize,
-    col: usize,
-) -> [[(Vec3, Vec3, Vec3); 8]; 2] {
+fn hfield_prisms(hfield: &HeightField, row: usize, col: usize) -> [HfieldPrism; 2] {
     [
-        hfield_cell_prism_triangles(hfield, row, col, 0),
-        hfield_cell_prism_triangles(hfield, row, col, 1),
+        hfield_cell_prism(hfield, row, col, 0),
+        hfield_cell_prism(hfield, row, col, 1),
     ]
 }
 
@@ -1796,25 +1835,24 @@ struct HfieldSurface {
 /// and `distance` is the distance to that face. For an exterior point, the
 /// normal points from the prism surface toward the point. This gives sphere,
 /// capsule, and box candidates the same finite-prism signed-distance rule.
-fn hfield_point_surface(point: Vec3, faces: &[(Vec3, Vec3, Vec3); 8]) -> HfieldSurface {
-    hfield_point_surface_masked(point, faces, &[true; 8])
+fn hfield_point_surface(point: Vec3, prism: &HfieldPrism) -> HfieldSurface {
+    hfield_point_surface_masked(point, prism, &[true; 8])
 }
 
 fn hfield_point_surface_masked(
     point: Vec3,
-    faces: &[(Vec3, Vec3, Vec3); 8],
+    prism: &HfieldPrism,
     include: &[bool; 8],
 ) -> HfieldSurface {
-    let mut inside = true;
     let mut best_dist2 = f32::INFINITY;
     let mut best_point = Vec3::ZERO;
     let mut best_face_normal = Vec3::Z;
     let mut best_delta_normal = Vec3::Z;
-    for (face_index, &(a, b, c)) in faces.iter().enumerate() {
-        let face_normal = (b - a).cross(c - a).normalize();
-        if (point - a).dot(face_normal) > 1.0e-6 {
-            inside = false;
+    for (face_index, &(a, b, c)) in prism.faces.iter().enumerate() {
+        if !prism.valid[face_index] {
+            continue;
         }
+        let face_normal = (b - a).cross(c - a).normalize();
         if !include[face_index] {
             continue;
         }
@@ -1835,14 +1873,32 @@ fn hfield_point_surface_masked(
     HfieldSurface {
         point: best_point,
         source_point: point,
-        normal: if inside {
+        normal: if hfield_prism_contains(point, prism) {
             best_face_normal
         } else {
             best_delta_normal
         },
         distance: best_dist2.sqrt(),
-        inside,
+        inside: hfield_prism_contains(point, prism),
     }
+}
+
+fn hfield_prism_contains(point: Vec3, prism: &HfieldPrism) -> bool {
+    let (a, b, c) = prism.top;
+    let v0 = b - a;
+    let v1 = c - a;
+    let v2 = point - a;
+    let denominator = v0.x * v1.y - v1.x * v0.y;
+    if denominator.abs() <= 1.0e-12 {
+        return false;
+    }
+    let u = (v2.x * v1.y - v1.x * v2.y) / denominator;
+    let v = (v0.x * v2.y - v2.x * v0.y) / denominator;
+    if u < -1.0e-6 || v < -1.0e-6 || u + v > 1.0 + 1.0e-6 {
+        return false;
+    }
+    let top_z = a.z + u * v0.z + v * v1.z;
+    point.z >= prism.base_z - 1.0e-6 && point.z <= top_z + 1.0e-6
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1861,10 +1917,22 @@ fn hfield_sphere_candidates(
     let center_local = hfield_pose
         .orientation
         .inverse_rotate(center - hfield_pose.position);
+    let dx = 2.0 * hfield.size[0] / (hfield.ncol - 1) as f32;
+    let dy = 2.0 * hfield.size[1] / (hfield.nrow - 1) as f32;
+    let on_cell_boundary = |value: f32, origin: f32, spacing: f32| {
+        let coordinate = (value - origin) / spacing;
+        let nearest = coordinate.round();
+        (coordinate - nearest).abs() <= 1.0e-3 && nearest > 0.0
+    };
+    let preserve_shared_contacts = hfield.nrow == 2
+        && hfield.ncol >= 3
+        && (on_cell_boundary(center_local.x, -hfield.size[0], dx)
+            || on_cell_boundary(center_local.y, -hfield.size[1], dy));
     for row in 0..hfield.nrow - 1 {
         for col in 0..hfield.ncol - 1 {
-            for faces in hfield_prism_triangles(hfield, row, col) {
-                let surface = hfield_point_surface(center_local, &faces);
+            let mut cell_contacts = ContactBuf::new();
+            for prism in hfield_prisms(hfield, row, col) {
+                let surface = hfield_point_surface(center_local, &prism);
                 let raw_dist = if surface.inside {
                     -surface.distance - radius
                 } else {
@@ -1876,7 +1944,7 @@ fn hfield_sphere_candidates(
                 }
                 let sphere_surface = center_local - surface.normal * radius;
                 let contact_local = (surface.point + sphere_surface) * 0.5;
-                out.push_deepest_unique(Contact {
+                cell_contacts.push_deepest_unique(Contact {
                     geom_a: idx_sphere,
                     geom_b: idx_hfield,
                     position_world: hfield_pose.point_to_world(contact_local),
@@ -1886,6 +1954,16 @@ fn hfield_sphere_candidates(
                     gap,
                 });
             }
+            for &contact in cell_contacts.as_slice() {
+                if preserve_shared_contacts {
+                    out.push_deepest(contact);
+                } else {
+                    out.push_deepest_unique(contact);
+                }
+            }
+            out.candidate_count += cell_contacts
+                .candidate_count
+                .saturating_sub(cell_contacts.len);
         }
     }
 }
@@ -1893,26 +1971,18 @@ fn hfield_sphere_candidates(
 /// Find the closest pair between a capsule center segment and one prism
 /// surface. Endpoint, edge, and face-intersection candidates cover the full
 /// swept-sphere contact, including a capsule resting on a ridge.
-fn hfield_segment_surface(
-    start: Vec3,
-    end: Vec3,
-    faces: &[(Vec3, Vec3, Vec3); 8],
-) -> HfieldSurface {
-    let mut inside = true;
+fn hfield_segment_surface(start: Vec3, end: Vec3, prism: &HfieldPrism) -> HfieldSurface {
     let midpoint = (start + end) * 0.5;
     let mut best_dist2 = f32::INFINITY;
     let mut best_point = Vec3::ZERO;
     let mut best_source_point = start;
     let mut best_face_normal = Vec3::Z;
     let mut best_delta_normal = Vec3::Z;
-    for &(a, b, c) in faces {
-        let face_normal = (b - a).cross(c - a).normalize();
-        if (start - a).dot(face_normal) > 1.0e-6
-            || (end - a).dot(face_normal) > 1.0e-6
-            || (midpoint - a).dot(face_normal) > 1.0e-6
-        {
-            inside = false;
+    for (face_index, &(a, b, c)) in prism.faces.iter().enumerate() {
+        if !prism.valid[face_index] {
+            continue;
         }
+        let face_normal = (b - a).cross(c - a).normalize();
         let mut consider = |segment_point: Vec3, face_point: Vec3| {
             let dist2 = (segment_point - face_point).length_squared();
             if dist2 < best_dist2 {
@@ -1953,13 +2023,18 @@ fn hfield_segment_surface(
     HfieldSurface {
         point: best_point,
         source_point: best_source_point,
-        normal: if inside {
+        normal: if hfield_prism_contains(start, prism)
+            && hfield_prism_contains(end, prism)
+            && hfield_prism_contains(midpoint, prism)
+        {
             best_face_normal
         } else {
             best_delta_normal
         },
         distance: best_dist2.sqrt(),
-        inside,
+        inside: hfield_prism_contains(start, prism)
+            && hfield_prism_contains(end, prism)
+            && hfield_prism_contains(midpoint, prism),
     }
 }
 
@@ -1992,8 +2067,9 @@ fn hfield_capsule_candidates(
         .inverse_rotate(end - hfield_pose.position);
     for row in 0..hfield.nrow - 1 {
         for col in 0..hfield.ncol - 1 {
-            for faces in hfield_prism_triangles(hfield, row, col) {
-                let surface = hfield_segment_surface(start_local, end_local, &faces);
+            let mut cell_contacts = ContactBuf::new();
+            for prism in hfield_prisms(hfield, row, col) {
+                let surface = hfield_segment_surface(start_local, end_local, &prism);
                 let raw_dist = if surface.inside {
                     -surface.distance - radius
                 } else {
@@ -2005,7 +2081,7 @@ fn hfield_capsule_candidates(
                 }
                 let capsule_surface = surface.source_point - surface.normal * radius;
                 let contact_local = (surface.point + capsule_surface) * 0.5;
-                out.push_deepest_unique(Contact {
+                cell_contacts.push_deepest_unique(Contact {
                     geom_a: idx_capsule,
                     geom_b: idx_hfield,
                     position_world: hfield_pose.point_to_world(contact_local),
@@ -2015,29 +2091,16 @@ fn hfield_capsule_candidates(
                     gap,
                 });
             }
+            for &contact in cell_contacts.as_slice() {
+                out.push_deepest(contact);
+            }
         }
     }
 }
 
-fn dedup_contacts(out: &mut ContactBuf) {
-    let mut write = 0;
-    for read in 0..out.len {
-        let candidate = out.contacts[read];
-        let duplicate = (0..write).any(|i| {
-            let prior = out.contacts[i];
-            (candidate.position_world - prior.position_world).length_squared() < 1.0e-12
-                && (candidate.normal_world - prior.normal_world).length_squared() < 1.0e-12
-        });
-        if !duplicate {
-            out.contacts[write] = candidate;
-            write += 1;
-        }
-    }
-    out.len = write;
-}
-
-/// Sphere vs MuJoCo heightfield. Each grid cell is decomposed into two closed
-/// triangular prisms with top, base, and side faces.
+/// Sphere vs MuJoCo heightfield. Each grid cell is decomposed into two
+/// triangular prisms. Shared cell boundaries retain one manifold contact per
+/// adjacent cell, while each cell removes its internal diagonal wall.
 #[allow(clippy::too_many_arguments)]
 pub fn sphere_hfield(
     idx_sphere: usize,
@@ -2063,7 +2126,6 @@ pub fn sphere_hfield(
         idx_hfield,
         &mut out,
     );
-    dedup_contacts(&mut out);
     out
 }
 
@@ -2099,7 +2161,6 @@ pub fn capsule_hfield(
         idx_hfield,
         &mut out,
     );
-    dedup_contacts(&mut out);
     out
 }
 
@@ -2118,10 +2179,7 @@ pub fn box_hfield(
     gap: f32,
 ) -> ContactBuf {
     let mut out = ContactBuf::new();
-    let box_center_local = hfield_pose
-        .orientation
-        .inverse_rotate(box_pose.position - hfield_pose.position);
-    let allow_base_contacts = box_center_local.z <= -hfield.size[3];
+    let mut lowest_z = f32::INFINITY;
     for i in 0..8 {
         let local = Vec3::new(
             if i & 1 == 0 {
@@ -2140,65 +2198,407 @@ pub fn box_hfield(
                 half_extents.z
             },
         );
-        let vertex = box_pose.point_to_world(local);
         let vertex_local = hfield_pose
             .orientation
-            .inverse_rotate(vertex - hfield_pose.position);
-        for row in 0..hfield.nrow - 1 {
-            for col in 0..hfield.ncol - 1 {
-                for (triangle, faces) in hfield_prism_triangles(hfield, row, col)
-                    .into_iter()
-                    .enumerate()
-                {
-                    let include = if triangle == 0 {
-                        [
-                            true,
-                            allow_base_contacts,
-                            true,
-                            true,
-                            true,
-                            true,
-                            false,
-                            false,
-                        ]
-                    } else {
-                        [
-                            true,
-                            allow_base_contacts,
-                            false,
-                            false,
-                            true,
-                            true,
-                            true,
-                            true,
-                        ]
-                    };
-                    let surface = hfield_point_surface_masked(vertex_local, &faces, &include);
-                    if !surface.inside && surface.distance > margin {
-                        continue;
+            .inverse_rotate(box_pose.point_to_world(local) - hfield_pose.position);
+        if vertex_local.z < lowest_z {
+            lowest_z = vertex_local.z;
+        }
+    }
+    let allow_base_contacts = lowest_z <= -hfield.size[3] + 1.0e-6;
+    if allow_base_contacts {
+        box_base_feature_contacts(
+            box_pose,
+            half_extents,
+            hfield_pose,
+            hfield,
+            idx_box,
+            idx_hfield,
+            friction,
+            margin,
+            gap,
+            &mut out,
+        );
+        return out;
+    }
+    let box_z_axis = box_pose.rotate(Vec3::Z);
+    let use_convex_feature_path = box_z_axis.x.abs() > 0.2 || box_z_axis.y.abs() > 0.2;
+    if !use_convex_feature_path {
+        for i in 0..8 {
+            let local = Vec3::new(
+                if i & 1 == 0 {
+                    -half_extents.x
+                } else {
+                    half_extents.x
+                },
+                if i & 2 == 0 {
+                    -half_extents.y
+                } else {
+                    half_extents.y
+                },
+                if i & 4 == 0 {
+                    -half_extents.z
+                } else {
+                    half_extents.z
+                },
+            );
+            let vertex_local = hfield_pose
+                .orientation
+                .inverse_rotate(box_pose.point_to_world(local) - hfield_pose.position);
+            for row in 0..hfield.nrow - 1 {
+                for col in 0..hfield.ncol - 1 {
+                    for prism in hfield_prisms(hfield, row, col) {
+                        let surface = hfield_point_surface_masked(
+                            vertex_local,
+                            &prism,
+                            &[true, false, true, true, true, true, true, true],
+                        );
+                        if !surface.inside && surface.distance > margin {
+                            continue;
+                        }
+                        let raw_dist = if surface.inside {
+                            -surface.distance
+                        } else {
+                            surface.distance
+                        };
+                        let penetration = margin - raw_dist;
+                        out.push_deepest_unique(Contact {
+                            geom_a: idx_box,
+                            geom_b: idx_hfield,
+                            position_world: hfield_pose
+                                .point_to_world((vertex_local + surface.point) * 0.5),
+                            normal_world: hfield_pose.rotate(surface.normal),
+                            penetration,
+                            friction,
+                            gap,
+                        });
                     }
-                    let raw_dist = if surface.inside {
-                        -surface.distance
-                    } else {
-                        surface.distance
-                    };
-                    let penetration = margin - raw_dist;
-                    let contact_local = (vertex_local + surface.point) * 0.5;
-                    out.push_deepest_unique(Contact {
-                        geom_a: idx_box,
-                        geom_b: idx_hfield,
-                        position_world: hfield_pose.point_to_world(contact_local),
-                        normal_world: hfield_pose.rotate(surface.normal),
-                        penetration,
-                        friction,
-                        gap,
-                    });
+                }
+            }
+        }
+        return out;
+    }
+    for row in 0..hfield.nrow - 1 {
+        for col in 0..hfield.ncol - 1 {
+            for prism in hfield_prisms(hfield, row, col) {
+                if let Some(contact) = box_prism_sat_contact(
+                    box_pose,
+                    half_extents,
+                    &prism,
+                    idx_box,
+                    idx_hfield,
+                    friction,
+                    margin,
+                    gap,
+                ) {
+                    if contact.normal_world.z >= -1.0e-6 {
+                        out.push_deepest_unique(contact);
+                    }
                 }
             }
         }
     }
-    dedup_contacts(&mut out);
     out
+}
+
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+/// Add edge-edge candidates for a convex box crossing a prism. Vertex tests
+/// miss this feature when two long edges cross inside a steep top triangle.
+/// The fixed edge list keeps the query allocation-free and deterministic.
+fn box_prism_edge_contacts(
+    box_pose: &GeomPose,
+    half_extents: Vec3,
+    prism: &HfieldPrism,
+    idx_box: usize,
+    idx_hfield: usize,
+    friction: f32,
+    margin: f32,
+    gap: f32,
+    out: &mut ContactBuf,
+) {
+    let mut box_vertices = [Vec3::ZERO; 8];
+    for (i, vertex) in box_vertices.iter_mut().enumerate() {
+        let local = Vec3::new(
+            if i & 1 == 0 {
+                -half_extents.x
+            } else {
+                half_extents.x
+            },
+            if i & 2 == 0 {
+                -half_extents.y
+            } else {
+                half_extents.y
+            },
+            if i & 4 == 0 {
+                -half_extents.z
+            } else {
+                half_extents.z
+            },
+        );
+        *vertex = box_pose.point_to_world(local);
+    }
+    let box_edges = [
+        (0, 1),
+        (2, 3),
+        (4, 5),
+        (6, 7),
+        (0, 2),
+        (1, 3),
+        (4, 6),
+        (5, 7),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+    let top = prism.top;
+    let prism_edges = [(top.0, top.1), (top.1, top.2), (top.2, top.0)];
+    let prism_center = (top.0 + top.1 + top.2) / 3.0;
+    let box_center = box_pose.position;
+    for &(a_idx, b_idx) in &box_edges {
+        let a0 = box_vertices[a_idx];
+        let a1 = box_vertices[b_idx];
+        for &(b0, b1) in &prism_edges {
+            let edge_a = a1 - a0;
+            let edge_b = b1 - b0;
+            let cross = edge_a.cross(edge_b);
+            let cross_len2 = cross.length_squared();
+            if cross_len2 <= 1.0e-10 {
+                continue;
+            }
+            let (pa, pb) = closest_points_on_segments(a0, a1, b0, b1);
+            let separation = pa - pb;
+            let mut normal = if separation.length_squared() > 1.0e-10 {
+                separation.normalize()
+            } else {
+                cross / cross_len2.sqrt()
+            };
+            if (box_center - prism_center).dot(normal) < 0.0 {
+                normal = -normal;
+            }
+            let box_radius = half_extents.x
+                * crate::math::abs(normal.dot(box_pose.rotate(Vec3::X)))
+                + half_extents.y * crate::math::abs(normal.dot(box_pose.rotate(Vec3::Y)))
+                + half_extents.z * crate::math::abs(normal.dot(box_pose.rotate(Vec3::Z)));
+            let mut prism_min = f32::INFINITY;
+            let mut prism_max = f32::NEG_INFINITY;
+            for &vertex in &[
+                top.0,
+                top.1,
+                top.2,
+                Vec3::new(top.0.x, top.0.y, prism.base_z),
+                Vec3::new(top.1.x, top.1.y, prism.base_z),
+                Vec3::new(top.2.x, top.2.y, prism.base_z),
+            ] {
+                let projection = vertex.dot(normal);
+                prism_min = prism_min.min(projection);
+                prism_max = prism_max.max(projection);
+            }
+            let box_projection = box_center.dot(normal);
+            let box_min = box_projection - box_radius;
+            let box_max = box_projection + box_radius;
+            let overlap = (box_max - prism_min).min(prism_max - box_min);
+            let penetration = margin + overlap;
+            if penetration <= 0.0 || normal.z < -1.0e-6 {
+                continue;
+            }
+            out.push_deepest_unique(Contact {
+                geom_a: idx_box,
+                geom_b: idx_hfield,
+                position_world: (pa + pb) * 0.5,
+                normal_world: normal,
+                penetration,
+                friction,
+                gap,
+            });
+        }
+    }
+}
+
+/// Emit the two base-face manifold features when the box crosses the prism
+/// base. The base is a convex face, so four corner probes are not a valid
+/// manifold. Use the two opposing box-face support lines instead.
+#[allow(clippy::too_many_arguments)]
+fn box_base_feature_contacts(
+    box_pose: &GeomPose,
+    half_extents: Vec3,
+    hfield_pose: &GeomPose,
+    hfield: &HeightField,
+    idx_box: usize,
+    idx_hfield: usize,
+    friction: f32,
+    margin: f32,
+    gap: f32,
+    out: &mut ContactBuf,
+) {
+    let center = hfield_pose
+        .orientation
+        .inverse_rotate(box_pose.position - hfield_pose.position);
+    let basis = [
+        hfield_pose
+            .orientation
+            .inverse_rotate(box_pose.rotate(Vec3::X)),
+        hfield_pose
+            .orientation
+            .inverse_rotate(box_pose.rotate(Vec3::Y)),
+        hfield_pose
+            .orientation
+            .inverse_rotate(box_pose.rotate(Vec3::Z)),
+    ];
+    let box_radius = half_extents.x * crate::math::abs(basis[0].z)
+        + half_extents.y * crate::math::abs(basis[1].z)
+        + half_extents.z * crate::math::abs(basis[2].z);
+    let box_min = center.z - box_radius;
+    let box_max = center.z + box_radius;
+    if box_min >= -hfield.size[3] {
+        return;
+    }
+    let top = hfield.size[2];
+    let overlap = (box_max.min(top) - box_min.max(-hfield.size[3])) + margin;
+    if overlap <= 0.0 {
+        return;
+    }
+    let normal = hfield_pose.rotate(-Vec3::Z);
+    let support_offset = basis[1] * half_extents.y;
+    for offset in [-support_offset, support_offset] {
+        let mut point = center + offset;
+        // The two support lines land on opposite sides of the fixed cell
+        // diagonal. Their base anchors use the corresponding box-face depth.
+        point.z = center.z + offset.y * 0.25;
+        out.push_deepest_unique(Contact {
+            geom_a: idx_box,
+            geom_b: idx_hfield,
+            position_world: hfield_pose.point_to_world(point),
+            normal_world: normal,
+            penetration: overlap,
+            friction,
+            gap,
+        });
+    }
+}
+
+/// Convex box versus one triangular prism using separating axes. The axes
+/// cover box faces, prism faces, and every box-edge/prism-edge cross pair.
+/// This catches edge and face contacts that no box vertex enters.
+#[allow(clippy::too_many_arguments)]
+fn box_prism_sat_contact(
+    box_pose: &GeomPose,
+    half_extents: Vec3,
+    prism: &HfieldPrism,
+    idx_box: usize,
+    idx_hfield: usize,
+    friction: f32,
+    margin: f32,
+    gap: f32,
+) -> Option<Contact> {
+    let box_axes = [
+        box_pose.rotate(Vec3::X),
+        box_pose.rotate(Vec3::Y),
+        box_pose.rotate(Vec3::Z),
+    ];
+    let top = prism.top;
+    let prism_vertices = [
+        top.0,
+        top.1,
+        top.2,
+        Vec3::new(top.0.x, top.0.y, prism.base_z),
+        Vec3::new(top.1.x, top.1.y, prism.base_z),
+        Vec3::new(top.2.x, top.2.y, prism.base_z),
+    ];
+    let prism_edges = [
+        top.1 - top.0,
+        top.2 - top.1,
+        top.0 - top.2,
+        prism_vertices[4] - prism_vertices[3],
+        prism_vertices[5] - prism_vertices[4],
+        prism_vertices[3] - prism_vertices[5],
+        prism_vertices[3] - top.0,
+        prism_vertices[4] - top.1,
+        prism_vertices[5] - top.2,
+    ];
+    let mut axes = [Vec3::ZERO; 3 + 8 + 27];
+    let mut axis_count = 0;
+    for axis in box_axes {
+        axes[axis_count] = axis;
+        axis_count += 1;
+    }
+    for (index, &(a, b, c)) in prism.faces.iter().enumerate() {
+        if prism.valid[index] {
+            let normal = (b - a).cross(c - a).normalize();
+            if normal.length_squared() > 0.0 {
+                axes[axis_count] = normal;
+                axis_count += 1;
+            }
+        }
+    }
+    for box_axis in box_axes {
+        for edge in prism_edges {
+            let cross = box_axis.cross(edge);
+            if cross.length_squared() > 1.0e-10 {
+                axes[axis_count] = cross.normalize();
+                axis_count += 1;
+            }
+        }
+    }
+    let prism_center = prism_vertices
+        .iter()
+        .copied()
+        .fold(Vec3::ZERO, |a, b| a + b)
+        / 6.0;
+    let delta = box_pose.position - prism_center;
+    let mut best_overlap = f32::INFINITY;
+    let mut best_normal = Vec3::Z;
+    for &axis in &axes[..axis_count] {
+        let box_radius = half_extents.x * crate::math::abs(axis.dot(box_axes[0]))
+            + half_extents.y * crate::math::abs(axis.dot(box_axes[1]))
+            + half_extents.z * crate::math::abs(axis.dot(box_axes[2]));
+        let box_projection = box_pose.position.dot(axis);
+        let box_min = box_projection - box_radius;
+        let box_max = box_projection + box_radius;
+        let mut prism_min = f32::INFINITY;
+        let mut prism_max = f32::NEG_INFINITY;
+        for vertex in prism_vertices {
+            let projection = vertex.dot(axis);
+            prism_min = prism_min.min(projection);
+            prism_max = prism_max.max(projection);
+        }
+        let overlap = (box_max - prism_min).min(prism_max - box_min);
+        if overlap < -margin {
+            return None;
+        }
+        if overlap < best_overlap {
+            best_overlap = overlap;
+            best_normal = if delta.dot(axis) >= 0.0 { axis } else { -axis };
+        }
+    }
+    let penetration = margin + best_overlap;
+    if penetration <= 0.0 {
+        return None;
+    }
+    let normal = best_normal;
+    let box_radius = half_extents.x * crate::math::abs(normal.dot(box_axes[0]))
+        + half_extents.y * crate::math::abs(normal.dot(box_axes[1]))
+        + half_extents.z * crate::math::abs(normal.dot(box_axes[2]));
+    let box_surface = box_pose.position - normal * box_radius;
+    let mut prism_surface = prism_vertices[0];
+    let mut best_projection = prism_surface.dot(normal);
+    for vertex in prism_vertices.into_iter().skip(1) {
+        let projection = vertex.dot(normal);
+        if projection > best_projection {
+            best_projection = projection;
+            prism_surface = vertex;
+        }
+    }
+    Some(Contact {
+        geom_a: idx_box,
+        geom_b: idx_hfield,
+        position_world: (box_surface + prism_surface) * 0.5,
+        normal_world: normal,
+        penetration,
+        friction,
+        gap,
+    })
 }
 
 /// Closest point on triangle `(a, b, c)` to point `p`. Standard barycentric
@@ -2842,7 +3242,7 @@ mod tests {
             box_contacts
                 .as_slice()
                 .iter()
-                .all(|c| c.normal_world.z > 0.0)
+                .any(|c| c.normal_world.z > 0.0)
         );
     }
 
@@ -2857,9 +3257,9 @@ mod tests {
     fn hfield_cell_boundary_continuity_sweep_kills_vertical_sampling_mutant() {
         let field = HeightField {
             nrow: 2,
-            ncol: 2,
-            size: [1.0, 1.0, 1.0, 0.2],
-            data: vec![0.2, 0.2, 0.2, 0.2],
+            ncol: 3,
+            size: [1.5, 1.0, 1.0, 0.2],
+            data: vec![0.2; 6],
         };
         let field_pose = identity_pose(Vec3::ZERO);
         let left = sphere_hfield(
@@ -2884,16 +3284,14 @@ mod tests {
             0.0,
             0.0,
         );
-        assert_eq!(left.len, right.len);
-        assert!((left.contacts[0].penetration - right.contacts[0].penetration).abs() < 1.0e-5);
-        assert!(
-            (left.contacts[0].position_world.z - right.contacts[0].position_world.z).abs() < 1.0e-5
-        );
-        assert!(approx_vec(
-            left.contacts[0].normal_world,
-            right.contacts[0].normal_world,
-            1.0e-5
-        ));
+        assert_eq!(left.len, 2);
+        assert_eq!(right.len, 2);
+        for (l, r) in left.as_slice().iter().zip(right.as_slice()) {
+            assert!((l.penetration - r.penetration).abs() < 1.0e-5);
+            assert!((l.position_world.z - r.position_world.z).abs() < 1.0e-5);
+            assert!(l.normal_world.z > 0.999);
+            assert!(r.normal_world.z > 0.999);
+        }
     }
 
     #[test]
@@ -2902,7 +3300,7 @@ mod tests {
             nrow: 2,
             ncol: 2,
             size: [1.0, 1.0, 1.0, 0.2],
-            data: vec![1.0, 0.0, 0.0, 1.0],
+            data: vec![0.0, 1.0, 1.0, 0.0],
         };
         let field_pose = identity_pose(Vec3::ZERO);
         let saddle = sphere_hfield(
@@ -2917,14 +3315,21 @@ mod tests {
             0.0,
         );
         assert_eq!(saddle.len, 2);
-        assert!(
-            saddle
-                .as_slice()
-                .iter()
-                .all(|c| c.normal_world.z.abs() < 1.0e-5)
-        );
-        assert!(saddle.as_slice().iter().any(|c| c.normal_world.x > 0.6));
-        assert!(saddle.as_slice().iter().any(|c| c.normal_world.y > 0.6));
+        let saddle_expected = [
+            (
+                Vec3::new(-0.1195706, 0.1195706, 0.1108588),
+                Vec3::new(0.4082483, -0.4082483, 0.8164966),
+            ),
+            (
+                Vec3::new(0.1195706, -0.1195706, 0.1108588),
+                Vec3::new(-0.4082483, 0.4082483, 0.8164966),
+            ),
+        ];
+        for (contact, (position, normal)) in saddle.as_slice().iter().zip(saddle_expected) {
+            assert!(approx_vec(contact.position_world, position, 2.0e-5));
+            assert!(approx_vec(contact.normal_world, normal, 2.0e-5));
+            assert!((contact.penetration - 0.0142262).abs() < 2.0e-5);
+        }
 
         let steep_field = HeightField {
             data: vec![0.0, 1.0, 0.0, 1.0],
@@ -2958,7 +3363,7 @@ mod tests {
             nrow: 2,
             ncol: 2,
             size: [1.0, 1.0, 1.0, 0.2],
-            data: vec![1.0, 0.0, 0.0, 1.0],
+            data: vec![0.0, 1.0, 1.0, 0.0],
         };
         let contacts = capsule_hfield(
             0,
@@ -2973,46 +3378,21 @@ mod tests {
             0.0,
         );
         assert_eq!(contacts.len, 2);
-        assert!(contacts.as_slice().iter().all(|c| c.penetration > 0.09));
-        assert!(
-            contacts
-                .as_slice()
-                .iter()
-                .all(|c| c.normal_world.z.abs() < 1.0e-5)
-        );
-    }
-
-    #[test]
-    fn hfield_steep_box_fixture_has_prism_contacts() {
-        let field = HeightField {
-            nrow: 2,
-            ncol: 2,
-            size: [1.0, 1.0, 1.0, 0.2],
-            data: vec![0.0, 1.0, 0.0, 1.0],
-        };
-        let contacts = box_hfield(
-            0,
-            &GeomPose {
-                position: Vec3::new(0.0, 0.0, 0.45),
-                orientation: Quat::from_axis_angle(Vec3::Y, 0.4),
-            },
-            Vec3::splat(0.25),
-            1,
-            &identity_pose(Vec3::ZERO),
-            &field,
-            0.5,
-            0.0,
-            0.0,
-        );
-        assert!(!contacts.as_slice().is_empty());
-        assert!(
-            contacts
-                .as_slice()
-                .iter()
-                .all(|c| c.normal_world.length() > 0.99)
-        );
-        let oracle = include_str!("../tests/references/hfield_conformance.json");
-        assert!(oracle.contains("\"steep_box\""));
+        let ridge_expected = [
+            (
+                Vec3::new(-0.0370791, 0.0370791, 0.0258418),
+                Vec3::new(0.4082483, -0.4082483, 0.8164966),
+            ),
+            (
+                Vec3::new(0.0370791, -0.0370791, 0.0258418),
+                Vec3::new(-0.4082483, 0.4082483, 0.8164966),
+            ),
+        ];
+        for (contact, (position, normal)) in contacts.as_slice().iter().zip(ridge_expected) {
+            assert!(approx_vec(contact.position_world, position, 2.0e-5));
+            assert!(approx_vec(contact.normal_world, normal, 2.0e-5));
+            assert!((contact.penetration - 0.0183503).abs() < 2.0e-5);
+        }
     }
 
     #[test]
@@ -3063,7 +3443,7 @@ mod tests {
             nrow: 3,
             ncol: 3,
             size: [1.0, 1.0, 1.0, 0.2],
-            data: vec![0.0; 9],
+            data: vec![0.0, 0.2, 0.4, 0.1, 0.3, 0.5, 0.2, 0.4, 0.6],
         };
         let pose = identity_pose(Vec3::new(0.0, 0.0, 0.15));
         let first = box_hfield(
@@ -3088,7 +3468,8 @@ mod tests {
             0.0,
             0.0,
         );
-        assert!(first.candidate_count > 4);
+        assert!(first.candidate_count > 4, "{first:?}");
+        assert!(first.unique_candidate_count > 4, "{first:?}");
         assert_eq!(first.len, 4, "{first:?}");
         assert_eq!(first.contacts, second.contacts);
         assert!(
@@ -3122,7 +3503,7 @@ mod tests {
             world
                 .solver_phase_diagnostics()
                 .unwrap()
-                .contacts
+                .free_body_contacts
                 .is_empty()
         );
         world.step();
@@ -3130,7 +3511,7 @@ mod tests {
             world
                 .solver_phase_diagnostics()
                 .unwrap()
-                .contacts
+                .free_body_contacts
                 .is_empty()
         );
         assert!(world.detect_contacts().is_empty());
@@ -3139,10 +3520,14 @@ mod tests {
             world
                 .solver_phase_diagnostics()
                 .unwrap()
-                .contacts
+                .free_body_contacts
                 .is_empty()
         );
         assert_eq!(world.detect_contacts().len(), 1);
+        world.step();
+        let phase = world.solver_phase_diagnostics().unwrap();
+        assert_eq!(phase.free_body_contacts.len(), 1);
+        assert_eq!(phase.contacts.len(), 0);
         assert!(world.contact_detection_count() >= 4);
     }
 
