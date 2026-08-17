@@ -770,12 +770,13 @@ fn v3_diagnostic_fixture_records_geom_manifolds() {
     assert!((step25.contacts[0].dist + 0.00030427783267333863).abs() < 1e-12);
     assert_eq!(step25.contacts[0].row_indices, vec![0, 1, 2, 3]);
 
-    let first_structural_mismatch =
-        compare_phase_fixtures("mujoco/newt", &source, &recorded_newt, 36);
+    let structural_mismatches = compare_phase_fixtures("mujoco/newt", &source, &recorded_newt, 36);
+    // The source contact arrives one solver step before newt. This one-step
+    // latency window is the full measured mismatch set through step 36.
     assert_eq!(
-        first_structural_mismatch,
-        Some(25),
-        "solver-phase contact or row divergence moved; update the fixture and diagnosis"
+        structural_mismatches,
+        vec![25],
+        "solver-phase mismatch window changed; update the fixture and diagnosis"
     );
 
     let newt = run_newt(0.4, 36);
@@ -787,7 +788,7 @@ fn v3_diagnostic_fixture_records_geom_manifolds() {
             &newt.phase_checkpoints,
             36
         ),
-        None,
+        Vec::<usize>::new(),
         "the parsed newt solver-phase fixture must match the live capture"
     );
     let mut first_qpos_bound_exceed = None;
@@ -808,7 +809,7 @@ fn v3_diagnostic_fixture_records_geom_manifolds() {
         }
     }
     println!(
-        "solver_phase_first_bound_exceed qpos={first_qpos_bound_exceed:?} qvel={first_qvel_bound_exceed:?} structural={first_structural_mismatch:?}"
+        "solver_phase_first_bound_exceed qpos={first_qpos_bound_exceed:?} qvel={first_qvel_bound_exceed:?} structural={structural_mismatches:?}"
     );
 }
 
@@ -831,16 +832,16 @@ fn compare_phase_fixtures(
     expected: &[PhaseCheckpoint],
     actual: &[PhaseCheckpoint],
     last_step: usize,
-) -> Option<usize> {
-    let mut first_structural_mismatch = None;
+) -> Vec<usize> {
+    let mut structural_mismatches = Vec::new();
     for step in 0..=last_step {
         let expected_checkpoint = &expected[step];
         let actual_checkpoint = &actual[step];
         assert_eq!(actual_checkpoint.step, step as u32, "{label} step number");
         assert_contact_rows(actual_checkpoint);
         let structural_match = phase_structure_matches(expected_checkpoint, actual_checkpoint);
-        if !structural_match && first_structural_mismatch.is_none() {
-            first_structural_mismatch = Some(step);
+        if !structural_match {
+            structural_mismatches.push(step);
         }
         if structural_match {
             for (expected_contact, actual_contact) in expected_checkpoint
@@ -870,7 +871,7 @@ fn compare_phase_fixtures(
             actual_checkpoint.row_to_contact.len(),
         );
     }
-    first_structural_mismatch
+    structural_mismatches
 }
 
 fn phase_structure_matches(expected: &PhaseCheckpoint, actual: &PhaseCheckpoint) -> bool {

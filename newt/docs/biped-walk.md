@@ -222,13 +222,15 @@ at solver step `25`, source and newt constraint-force maxima are `112.489` and
 maxima are `155.270` and `152.956`. Newt keeps its internal `from B into A`
 normal convention and flips only the diagnostic view.
 
-the first parsed solver structural mismatch is step `25`: source solver mask
-`2` versus newt solver mask `0`, with `1/4` versus `0/0` contacts/rows. step
-`18` is only a visual-mask checkpoint; its solver masks and contacts are both
-zero. the first solver-phase qvel residual bound exceeds at step `26`
-(`1.636116`), after the missed source contact has been consumed. The candidate
-cause is phase timing, not manifold geometry. The `0.4` fall-step gap remains
-an honest closed-loop finding.
+the complete measured solver structural mismatch set through step `36` is
+`[25]`. this is a one-step contact-latency window: source solves the first
+contact at step `25`, while newt consumes it at step `26`. the acceptance test
+asserts the complete set, not only its first element. step `18` is only a
+visual-mask checkpoint; its solver masks and contacts are both zero. the first
+solver-phase qvel residual bound exceeds at step `26` (`1.636116`), after the
+missed source contact has been consumed. the candidate cause is phase timing,
+not manifold geometry. the `0.4` fall-step gap remains an honest closed-loop
+finding.
 
 the per-step solver-phase residual trail is the next ticket's comparison
 specification:

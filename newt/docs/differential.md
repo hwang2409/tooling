@@ -488,7 +488,10 @@ maxima are `155.270` and `152.956`. The first solver-phase qvel residual
 bound exceeds at step `26` (`1.636116`). The per-step trail in
 `docs/biped-walk.md` is the next ticket's comparison specification.
 
-The source-side contact and row records are in
+The complete measured solver structural mismatch set through step `36` is
+`[25]`, a one-step contact-latency window. The acceptance test asserts this
+set verbatim, so a new mismatch through step `36` fails CI. The source-side
+contact and row records are in
 `tests/references/biped_walk_v3_diagnostics.json`. Records cover step `0`
 through `40`, including solver-phase and post-step records. The source
 capture records solver-phase state before `mj_step` and keeps post-step
