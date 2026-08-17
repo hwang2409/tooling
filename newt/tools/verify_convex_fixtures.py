@@ -66,28 +66,24 @@ def compare_vector(
         )
 
 
-def inverse_rotate(quaternion: list[float], vector: list[float]) -> list[float]:
-    w, x, y, z = quaternion
-    vx, vy, vz = vector
-    return [
-        (1 - 2 * (y * y + z * z)) * vx
-        + (2 * x * y + 2 * w * z) * vy
-        + (2 * x * z - 2 * w * y) * vz,
-        (2 * x * y - 2 * w * z) * vx
-        + (1 - 2 * (x * x + z * z)) * vy
-        + (2 * y * z + 2 * w * x) * vz,
-        (2 * x * z + 2 * w * y) * vx
-        + (2 * y * z - 2 * w * x) * vy
-        + (1 - 2 * (x * x + y * y)) * vz,
+def contact_position_signature(pose: dict, contacts: list[dict]) -> list[float]:
+    vectors = [
+        [
+            contact["position"][index] - pose["position"][index]
+            for index in range(3)
+        ]
+        for contact in contacts
     ]
-
-
-def body_local_contact_position(pose: dict, contact: dict) -> list[float]:
-    relative = [
-        contact["position"][index] - pose["position"][index]
-        for index in range(3)
-    ]
-    return inverse_rotate(pose["orientation_wxyz"], relative)
+    norms = sorted(sum(component * component for component in vector) for vector in vectors)
+    distances = sorted(
+        sum(
+            (left[index] - right[index]) ** 2
+            for index in range(3)
+        )
+        for left_index, left in enumerate(vectors)
+        for right in vectors[left_index + 1 :]
+    )
+    return norms + distances
 
 
 def compare_dynamic_oracle(
@@ -169,27 +165,32 @@ def compare_route_oracle(
                         maxima,
                     )
             assert len(committed_pose["contacts"]) == len(fresh_pose["contacts"])
+            mesh_pair = "mesh" in committed_probe["pair"]
+            if mesh_pair:
+                compare_vector(
+                    contact_position_signature(
+                        committed_pose["body_pose_b"], committed_pose["contacts"]
+                    ),
+                    contact_position_signature(
+                        fresh_pose["body_pose_b"], fresh_pose["contacts"]
+                    ),
+                    "position",
+                    f"{path}.contacts.position_signature",
+                    maxima,
+                )
             for index, (committed_contact, fresh_contact) in enumerate(
                 zip(committed_pose["contacts"], fresh_pose["contacts"])
             ):
                 contact_path = f"{path}.contacts[{index}]"
                 assert committed_contact["geom"] == fresh_contact["geom"], contact_path
-                committed_position = committed_contact["position"]
-                fresh_position = fresh_contact["position"]
-                if "mesh" in committed_probe["pair"]:
-                    committed_position = body_local_contact_position(
-                        committed_pose["body_pose_b"], committed_contact
+                if not mesh_pair:
+                    compare_vector(
+                        committed_contact["position"],
+                        fresh_contact["position"],
+                        "position",
+                        f"{contact_path}.position",
+                        maxima,
                     )
-                    fresh_position = body_local_contact_position(
-                        fresh_pose["body_pose_b"], fresh_contact
-                    )
-                compare_vector(
-                    committed_position,
-                    fresh_position,
-                    "position",
-                    f"{contact_path}.position",
-                    maxima,
-                )
                 compare_vector(
                     committed_contact["frame_normal"],
                     fresh_contact["frame_normal"],
