@@ -283,11 +283,14 @@ and `0.1281665 / 0.00367010 / 0` for the full window. The rotated-drop anchor
 bounds are `0.01874084 / 0.00311405 / 0` for the early window and
 `0.1281642 / 0.00350464 / 0` for the full window. Each position and
 orientation bound is the measured per-step replay maximum plus the reviewed
-`1e-4` tolerance. `tools/verify_convex_fixtures.py` reruns both pinned MuJoCo
-captures, replays Newt over every captured step, computes both window maxima,
-and rejects bounds that do not equal those generated values. The Rust fixture
-test also recomputes both maxima and requires exact float32 equality between
-each stored position/orientation bound and its stored maximum plus `1e-4`.
+`1e-4` tolerance. Local `tools/verify_convex_fixtures.py` reruns both pinned
+MuJoCo captures, checks byte identity, replays Newt over every captured step,
+computes both window maxima, and rejects bounds that do not equal those
+generated values. CI runs the same tool with `--ci`: it skips cross-platform
+fixture byte identity, uses fresh Linux MuJoCo states, and requires every
+fresh per-step error to fit the committed bounds. The Rust fixture test also
+recomputes both maxima and requires exact float32 equality between each
+stored position/orientation bound and its stored maximum plus `1e-4`.
 
 The plane-mesh route intentionally stays at two rows. MuJoCo can add a third
 row through its mesh graph neighbor walk. Newt's graph walk is not implemented

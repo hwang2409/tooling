@@ -132,6 +132,24 @@ def run_newt_replay(references: Path, output: Path, update_bounds: bool) -> dict
     return json.loads(output.read_text(encoding="utf-8"))
 
 
+def assert_bounds_cover(measured: dict, reviewed: dict) -> None:
+    reviewed_cases = {case["id"]: case for case in reviewed["cases"]}
+    for measured_case in measured["cases"]:
+        reviewed_case = reviewed_cases.get(measured_case["id"])
+        assert reviewed_case is not None, measured_case["id"]
+        for window in ("early", "full"):
+            observed = measured_case[window]["observed_max"]
+            bound = reviewed_case[window]
+            for field in ("position", "orientation", "contact_count"):
+                assert observed[field] <= bound[field], (
+                    measured_case["id"],
+                    window,
+                    field,
+                    observed[field],
+                    bound[field],
+                )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -143,6 +161,11 @@ def main() -> int:
         "--update-bounds",
         action="store_true",
         help="write bounds generated from the full Newt replay",
+    )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="use fresh MuJoCo states and tolerance bounds without byte identity",
     )
     args = parser.parse_args()
     import mujoco  # type: ignore[import-not-found]
@@ -178,8 +201,13 @@ def main() -> int:
         (temp_references / "contact_dynamic_anchors.json").write_text(
             json.dumps(generated_dynamic, indent=2) + "\n", encoding="utf-8"
         )
-        assert without_date(generated_routes) == without_date(expected_routes)
-        assert without_date(generated_dynamic) == without_date(expected_dynamic)
+        if not args.ci:
+            assert without_date(generated_routes) == without_date(expected_routes)
+            assert without_date(generated_dynamic) == without_date(expected_dynamic)
+        else:
+            assert [case["id"] for case in generated_dynamic["cases"]] == [
+                case["id"] for case in expected_dynamic["cases"]
+            ]
     bounds_path = args.references / "contact_dynamic_anchor_bounds.json"
     bounds = json.loads(
         bounds_path.read_text(encoding="utf-8")
@@ -191,13 +219,18 @@ def main() -> int:
             Path(temp) / "contact_dynamic_replay.json",
             args.update_bounds,
         )
-    generated_bounds = dynamic_bounds(
-        expected_dynamic, replay, bounds["review_tolerance"], WINDOWS
+    measured_dynamic = dynamic_bounds(
+        generated_dynamic if args.ci else expected_dynamic,
+        replay,
+        bounds["review_tolerance"],
+        WINDOWS,
     )
     if args.update_bounds:
-        bounds_path.write_text(json.dumps(generated_bounds, indent=2) + "\n", encoding="utf-8")
+        bounds_path.write_text(json.dumps(measured_dynamic, indent=2) + "\n", encoding="utf-8")
+    elif args.ci:
+        assert_bounds_cover(measured_dynamic, bounds)
     else:
-        assert bounds == generated_bounds, "dynamic bounds are not generated from full replay"
+        assert bounds == measured_dynamic, "dynamic bounds are not generated from full replay"
     print("verified MuJoCo route samples, dynamic samples, and reviewed bounds")
     return 0
 
