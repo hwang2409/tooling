@@ -246,6 +246,10 @@ fn ccd_route_pair(a: &GeomShape, b: &GeomShape) -> bool {
                 | (GeomShape::Sphere { .. }, GeomShape::Sphere { .. })
                 | (GeomShape::Sphere { .. }, GeomShape::Capsule { .. })
                 | (GeomShape::Sphere { .. }, GeomShape::Cylinder { .. })
+                | (GeomShape::Sphere { .. }, GeomShape::Ellipsoid { .. })
+                | (GeomShape::Sphere { .. }, GeomShape::Mesh { .. })
+                | (GeomShape::Ellipsoid { .. }, GeomShape::Sphere { .. })
+                | (GeomShape::Mesh { .. }, GeomShape::Sphere { .. })
                 | (GeomShape::Capsule { .. }, GeomShape::Capsule { .. })
                 | (GeomShape::Box { .. }, GeomShape::Box { .. })
         )
@@ -1703,7 +1707,9 @@ pub fn sphere_ellipsoid(
     // p is outside (up to sign). Use delta/dist for numerical robustness.
     let normal_local = if dist > 1.0e-9 { delta / dist } else { Vec3::Z };
     let normal_world = ell_pose.rotate(normal_local);
-    let contact_world = ell_pose.point_to_world(q_local);
+    let surface_world = ell_pose.point_to_world(q_local);
+    let sphere_surface_world = sphere_pose.position - normal_world * sphere_r;
+    let contact_world = (surface_world + sphere_surface_world) * 0.5;
     let mut out = ContactBuf::new();
     out.push(Contact {
         geom_a: idx_sphere,
@@ -1761,7 +1767,9 @@ pub fn sphere_mesh(
         Vec3::Z
     };
     let normal_world = mesh_pose.rotate(normal_local);
-    let contact_world = mesh_pose.point_to_world(best_point_local);
+    let mesh_surface_world = mesh_pose.point_to_world(best_point_local);
+    let sphere_surface_world = sphere_pose.position - normal_world * sphere_r;
+    let contact_world = (mesh_surface_world + sphere_surface_world) * 0.5;
     let mut out = ContactBuf::new();
     out.push(Contact {
         geom_a: idx_sphere,
@@ -2438,196 +2446,6 @@ fn ccd_support(a: CcdShape<'_>, b: CcdShape<'_>, direction: Vec3) -> CcdVertex {
     }
 }
 
-fn ccd_route_normal(shape_a: CcdShape<'_>, shape_b: CcdShape<'_>) -> Option<Vec3> {
-    match (shape_a, shape_b) {
-        (
-            CcdShape::Sphere { pose, radius },
-            CcdShape::Ellipsoid {
-                pose: ell_pose,
-                semi_axes,
-            },
-        ) => sphere_ellipsoid(0, pose, radius, 1, ell_pose, semi_axes, 0.0, 0.0, 0.0)
-            .as_slice()
-            .first()
-            .map(|contact| contact.normal_world),
-        (
-            CcdShape::Sphere { pose, radius },
-            CcdShape::Mesh {
-                pose: mesh_pose,
-                mesh,
-            },
-        ) => sphere_mesh(0, pose, radius, 1, mesh_pose, mesh, 0.0, 0.0, 0.0)
-            .as_slice()
-            .first()
-            .map(|contact| contact.normal_world),
-        (
-            CcdShape::Ellipsoid {
-                pose: ell_pose,
-                semi_axes,
-            },
-            CcdShape::Sphere { pose, radius },
-        ) => sphere_ellipsoid(0, pose, radius, 1, ell_pose, semi_axes, 0.0, 0.0, 0.0)
-            .as_slice()
-            .first()
-            .map(|contact| -contact.normal_world),
-        (
-            CcdShape::Mesh {
-                pose: mesh_pose,
-                mesh,
-            },
-            CcdShape::Sphere { pose, radius },
-        ) => sphere_mesh(0, pose, radius, 1, mesh_pose, mesh, 0.0, 0.0, 0.0)
-            .as_slice()
-            .first()
-            .map(|contact| -contact.normal_world),
-        _ => None,
-    }
-}
-
-fn ccd_route_anchor(shape_a: CcdShape<'_>, shape_b: CcdShape<'_>) -> Option<(Vec3, Vec3)> {
-    match (shape_a, shape_b) {
-        (
-            CcdShape::Sphere { pose, radius },
-            CcdShape::Ellipsoid {
-                pose: ell_pose,
-                semi_axes,
-            },
-        ) => sphere_ellipsoid(0, pose, radius, 1, ell_pose, semi_axes, 0.0, 0.0, 0.0)
-            .as_slice()
-            .first()
-            .map(|contact| {
-                let point_a = pose.position - contact.normal_world * radius;
-                (
-                    (point_a + contact.position_world) * 0.5,
-                    contact.normal_world,
-                )
-            }),
-        (
-            CcdShape::Sphere { pose, radius },
-            CcdShape::Mesh {
-                pose: mesh_pose,
-                mesh,
-            },
-        ) => sphere_mesh(0, pose, radius, 1, mesh_pose, mesh, 0.0, 0.0, 0.0)
-            .as_slice()
-            .first()
-            .map(|contact| {
-                let point_a = pose.position - contact.normal_world * radius;
-                (
-                    (point_a + contact.position_world) * 0.5,
-                    contact.normal_world,
-                )
-            }),
-        (
-            CcdShape::Ellipsoid {
-                pose: ell_pose,
-                semi_axes,
-            },
-            CcdShape::Sphere { pose, radius },
-        ) => ccd_route_anchor(
-            CcdShape::Sphere { pose, radius },
-            CcdShape::Ellipsoid {
-                pose: ell_pose,
-                semi_axes,
-            },
-        )
-        .map(|(position, normal)| (position, -normal)),
-        (
-            CcdShape::Mesh {
-                pose: mesh_pose,
-                mesh,
-            },
-            CcdShape::Sphere { pose, radius },
-        ) => ccd_route_anchor(
-            CcdShape::Sphere { pose, radius },
-            CcdShape::Mesh {
-                pose: mesh_pose,
-                mesh,
-            },
-        )
-        .map(|(position, normal)| (position, -normal)),
-        _ => None,
-    }
-}
-
-fn ccd_route_depth(shape_a: CcdShape<'_>, shape_b: CcdShape<'_>) -> Option<f32> {
-    match (shape_a, shape_b) {
-        (
-            CcdShape::Sphere { pose, radius },
-            CcdShape::Ellipsoid {
-                pose: ell_pose,
-                semi_axes,
-            },
-        ) => sphere_ellipsoid(0, pose, radius, 1, ell_pose, semi_axes, 0.0, 0.0, 0.0)
-            .as_slice()
-            .first()
-            .map(|contact| contact.penetration),
-        (
-            CcdShape::Sphere { pose, radius },
-            CcdShape::Mesh {
-                pose: mesh_pose,
-                mesh,
-            },
-        ) => sphere_mesh(0, pose, radius, 1, mesh_pose, mesh, 0.0, 0.0, 0.0)
-            .as_slice()
-            .first()
-            .map(|contact| contact.penetration),
-        (
-            CcdShape::Ellipsoid {
-                pose: ell_pose,
-                semi_axes,
-            },
-            CcdShape::Sphere { pose, radius },
-        ) => ccd_route_depth(
-            CcdShape::Sphere { pose, radius },
-            CcdShape::Ellipsoid {
-                pose: ell_pose,
-                semi_axes,
-            },
-        ),
-        (
-            CcdShape::Mesh {
-                pose: mesh_pose,
-                mesh,
-            },
-            CcdShape::Sphere { pose, radius },
-        ) => ccd_route_depth(
-            CcdShape::Sphere { pose, radius },
-            CcdShape::Mesh {
-                pose: mesh_pose,
-                mesh,
-            },
-        ),
-        _ => None,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ccd_route_contact(
-    shape_a: CcdShape<'_>,
-    shape_b: CcdShape<'_>,
-    idx_a: usize,
-    idx_b: usize,
-    friction: f32,
-    margin: f32,
-    gap: f32,
-) -> Option<Contact> {
-    let (position_world, normal_world) = ccd_route_anchor(shape_a, shape_b)?;
-    let penetration = ccd_route_depth(shape_a, shape_b)? + margin;
-    if penetration <= 0.0 {
-        return None;
-    }
-    Some(Contact {
-        geom_a: idx_a,
-        geom_b: idx_b,
-        position_world,
-        normal_world,
-        penetration,
-        friction,
-        gap,
-    })
-}
-
 #[allow(clippy::too_many_arguments)]
 fn ccd_axis_contact(
     shape_a: CcdShape<'_>,
@@ -3049,10 +2867,7 @@ fn ccd_convex_contact(
     for _ in 0..32 {
         let point = ccd_support(shape_a, shape_b, direction);
         if point.minkowski.dot(direction) <= 0.0 {
-            return ccd_route_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap)
-                .or_else(|| {
-                    ccd_axis_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap)
-                });
+            return ccd_axis_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap);
         }
         simplex.push(point);
         if ccd_simplex_step(&mut simplex, &mut direction) {
@@ -3061,8 +2876,7 @@ fn ccd_convex_contact(
         }
     }
     if !enclosed || simplex.len != 4 {
-        return ccd_route_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap)
-            .or_else(|| ccd_axis_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap));
+        return ccd_axis_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap);
     }
 
     let mut vertices = [CcdVertex {
@@ -3085,8 +2899,7 @@ fn ccd_convex_contact(
         }
     }
     if face_len == 0 {
-        return ccd_route_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap)
-            .or_else(|| ccd_axis_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap));
+        return ccd_axis_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap);
     }
     let mut best_face = faces[0];
     for _ in 0..128 {
@@ -3174,26 +2987,17 @@ fn ccd_convex_contact(
     let point_b = vertices[best_face.indices[0]].shape_b * bary.0
         + vertices[best_face.indices[1]].shape_b * bary.1
         + vertices[best_face.indices[2]].shape_b * bary.2;
-    let penetration = ccd_route_depth(shape_a, shape_b)
-        .map(|depth| depth + margin)
-        .unwrap_or(best_face.distance + margin);
+    let penetration = best_face.distance + margin;
     if penetration <= 0.0 {
         return None;
     }
     let contact_delta = point_b - point_a;
-    let (position_world, normal_world) =
-        if let Some((position, normal)) = ccd_route_anchor(shape_a, shape_b) {
-            (position, normal)
-        } else {
-            let normal = if let Some(normal) = ccd_route_normal(shape_a, shape_b) {
-                normal
-            } else if contact_delta.length_squared() > 1.0e-20 {
-                contact_delta.normalize()
-            } else {
-                -best_face.normal
-            };
-            ((point_a + point_b) * 0.5, normal)
-        };
+    let normal_world = if contact_delta.length_squared() > 1.0e-20 {
+        contact_delta.normalize()
+    } else {
+        -best_face.normal
+    };
+    let position_world = (point_a + point_b) * 0.5;
     Some(Contact {
         geom_a: idx_a,
         geom_b: idx_b,

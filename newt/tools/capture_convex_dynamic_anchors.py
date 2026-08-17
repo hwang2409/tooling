@@ -12,13 +12,26 @@ import numpy as np
 
 
 CASES = (
-    ("mesh-mesh-tumble", "contact_dynamic_mesh_mesh.xml", "mesh_body", "mesh_tumble", 1.0),
+    (
+        "mesh-mesh-tumble",
+        "contact_dynamic_mesh_mesh.xml",
+        "mesh_body",
+        "mesh_tumble",
+        (1.0, 0.7, -0.4),
+    ),
+    (
+        "mesh-mesh-rotated-drop",
+        "contact_dynamic_mesh_mesh_rotated.xml",
+        "mesh_rotated_body",
+        "mesh_rotated",
+        (-0.6, 0.9, 0.5),
+    ),
 )
 WINDOWS = (("early", 20), ("full", 100))
 
 
 def capture_case(mujoco, references: Path, case: tuple) -> dict:
-    case_id, source_xml, body_name, geom_name, angular_speed = case
+    case_id, source_xml, body_name, geom_name, angular_velocity = case
     model = mujoco.MjModel.from_xml_path(str(references / source_xml))
     body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
     geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
@@ -29,8 +42,8 @@ def capture_case(mujoco, references: Path, case: tuple) -> dict:
     model.geom_contype[:] = 1
     model.geom_conaffinity[:] = 1
     data = mujoco.MjData(model)
-    if angular_speed:
-        data.qvel[3:6] = np.array([angular_speed, 0.7, -0.4])
+    if angular_velocity:
+        data.qvel[3:6] = np.array(angular_velocity)
     mujoco.mj_forward(model, data)
     samples = []
     for step in range(max(window for _, window in WINDOWS) + 1):

@@ -101,14 +101,14 @@ Contacts-per-pair for the implemented primitives:
 | sphere-sphere | `contact::sphere_sphere` | ≤ 1 |
 | sphere-capsule | `contact::sphere_capsule` | ≤ 1 |
 | sphere-cylinder | `contact::sphere_cylinder` | ≤ 1 (closest point) |
-| sphere-ellipsoid | `contact::ccd_convex_contact` | 1 (GJK + EPA) |
-| sphere-mesh | `contact::ccd_convex_contact` | 1 (GJK + EPA) |
+| sphere-ellipsoid | `contact::sphere_ellipsoid` | ≤ 1 (analytic `mjc_Convex` semantics) |
+| sphere-mesh | `contact::sphere_mesh` | ≤ 1 (analytic `mjc_Convex` semantics) |
 | sphere-hfield | `contact::sphere_hfield` | ≤ 4 deepest prism candidates |
 | capsule-hfield | `contact::capsule_hfield` | ≤ 4 deepest endpoint candidates |
 | box-hfield | `contact::box_hfield` | ≤ 4 deepest convex-prism GJK/EPA candidates |
 | capsule-capsule | `contact::capsule_capsule` | ≤ 1 |
 | box-box | `contact::box_box` (full OBB SAT) | ≤ 4 |
-| all `CCD` convex pairs | `contact::ccd_convex_contact` (GJK + EPA) | 1 |
+| mesh-mesh `CCD` pair | `contact::ccd_convex_contact` (GJK + EPA) | 1 |
 
 ### plane-primitive manifold parity
 
@@ -217,10 +217,11 @@ override. The disabled comparison remains in
 `hfield_conformance_nativeccd_disabled.xml`.
 
 NEWT-31 routed box-hfield prism candidates through deterministic in-crate GJK
-plus EPA. NEWT-32 extends that path to the evidenced non-hfield subset:
-sphere-ellipsoid, sphere-mesh, and mesh-mesh. Ellipsoid-plane and mesh-plane
-use the support midpoint and two-point manifold rules from `mjc_PlaneConvex`.
-Box-mesh remains deferred because its EPA witness normal is not aligned.
+plus EPA. NEWT-32 keeps sphere-ellipsoid and sphere-mesh on direct analytic
+helpers matching MuJoCo's `mjc_Convex` route. Mesh-mesh uses the deterministic
+GJK plus EPA path. Ellipsoid-plane and mesh-plane use the support midpoint and
+two-point manifold rules from `mjc_PlaneConvex`. Box-mesh remains deferred
+because its EPA witness normal is not aligned.
 
 The six probes use isolated MuJoCo 3.11.0 models with one selected dynamic
 pair at a time and `mj_forward`. Their executable provenance is
@@ -233,8 +234,8 @@ fixture-backed `analytic_convex_route_probes_are_fixture_backed` test.
 
 | probe | pair | MuJoCo default row | newt row | status |
 |---|---|---|---|---|
-| P1 | sphere-ellipsoid | position `(0.45, 0, 0)`, normal `(+1, 0, 0)`, depth `0.1` | convex midpoint, matching within `4.93e-6` normal error | aligned |
-| P2 | sphere-mesh | position `(0.2, 0.2, 0.05)`, normal `(0, 0, -1)`, depth `0.1` | convex midpoint, matching within `2.35e-6` normal error | aligned |
+| P1 | sphere-ellipsoid | position `(0.45, 0, 0)`, normal `(+1, 0, 0)`, depth `0.1` | analytic helper, matching within `4.93e-6` normal error | aligned |
+| P2 | sphere-mesh | position `(0.2, 0.2, 0.05)`, normal `(0, 0, -1)`, depth `0.1` | analytic helper, matching within `2.35e-6` normal error | aligned |
 | P3 | plane-ellipsoid | position `(0, 0, -0.05)`, normal `(0, 0, -1)`, depth `0.1` | support midpoint, matching within `1.12e-8 m` | aligned |
 | P4 | plane-mesh | 2 support contacts, midpoint near `z=-0.05` | 2 support contacts, matching within `4.1e-8 m` | aligned |
 | P5 | box-mesh | 1 contact; maximum position / normal / depth error `2.5e-7 / 1.0 / 6.0e-8` | reviewed bounds `1e-6 / 1.01 / 1e-6` | deferred: EPA normal mismatch |
@@ -275,12 +276,15 @@ and mutation coverage before enabling any of them.
 
 The box-mesh and mesh-mesh probes remain in `contact_route_probes.json` as
 open and shipped findings. Route bounds are reviewed in
-`contact_route_probe_bounds.json`. The shipped mesh-mesh dynamic anchor uses
-the executable XML source and compares steps 20 and 100. Its measured
-position / orientation / contact-count bounds are `0.0187411 / 0.00334043 / 0`
-for the early window and `0.128167 / 0.0036701 / 0` for the full window.
+`contact_route_probe_bounds.json`. The shipped mesh-mesh dynamic anchors use
+the executable XML sources and compare steps 0, 20, and 100. The tumble
+anchor bounds are `0.0187411 / 0.00334043 / 0` for the early window and
+`0.128167 / 0.0036701 / 0` for the full window. The rotated-drop anchor
+bounds are `0.0187408 / 0.00311406 / 0` for the early window and
+`0.128164 / 0.00350465 / 0` for the full window. Each position and orientation
+bound is the measured replay maximum plus the reviewed `1e-4` tolerance.
 `tools/verify_convex_fixtures.py` reruns both pinned MuJoCo captures, compares
-all generated samples, and checks the reviewed dynamic bounds.
+all generated samples, and checks both reviewed dynamic bounds.
 
 The plane-mesh route intentionally stays at two rows. MuJoCo can add a third
 row through its mesh graph neighbor walk. Newt's graph walk is not implemented
@@ -406,7 +410,7 @@ is bit-identical to tier 1 — the tier-1 tumbling golden still passes.
 | `tests/contacts_geoms_v1.rs::sphere_touching_ellipsoid_gives_penetration_matching_axial_case` | sphere on the +X support-axis of an anisotropic ellipsoid; catches the Newton-solver convergence and normal orientation. |
 | `tests/contacts_geoms_v1.rs::sphere_touching_mesh_face_gives_correct_penetration` | sphere below a mesh face; catches closest-point-on-triangle bugs. |
 | `tests/contacts_geoms_v1.rs::analytic_convex_route_probes_are_fixture_backed` | six MuJoCo route probes with parsed XML provenance and reviewed bounds; corrupted fixture data or XML fails the test. |
-| `tests/contacts_geoms_v1.rs::dynamic_enabled_convex_anchors_are_fixture_backed` | mesh-mesh tumble compares fixture-backed early step 20 and full step 100 position, orientation, and contact-count bounds. |
+| `tests/contacts_geoms_v1.rs::dynamic_enabled_convex_anchors_are_fixture_backed` | two independent mesh-mesh anchors compare fixture-backed steps 0, 20, and 100 position, orientation, and contact-count bounds. |
 | `tests/contacts_geoms_v1.rs::enabled_convex_ccd_routes_emit_one_contact` | one-contact smoke coverage for the enabled mesh-mesh CCD route. |
 | `tests/contacts_geoms_v1.rs::margin_fires_contact_before_geoms_touch` | plane margin 0.05, sphere just above touch: contact fires with shifted penetration `= margin − dist`. |
 | `tests/contacts_geoms_v1.rs::gap_zeros_the_normal_force_while_penetration_is_below_it` | pen ≤ gap gives free-fall acceleration on the sphere despite an active contact record. |
@@ -440,7 +444,7 @@ cannot silently swap the reference.
 | cylinder-plane rim sampling too coarse (skip one direction) | `cylinder_rests_on_plane_at_predicted_penetration` — expected 4-contact resting depth becomes 3-contact (33% deeper) |
 | sphere-mesh iterates vertices only instead of triangle closest points | `sphere_touching_mesh_face_gives_correct_penetration` — sphere below face center reports 0 penetration |
 | sphere-ellipsoid Newton solver iteration count varies (non-fixed termination) | `mixed_geom_scene_is_deterministic_across_two_runs` — final state byte-diff between two runs of the same scene |
-| CCD support sign or local-axis mutation | `contact::tests::ccd_support_functions_preserve_shape_axes` and `enabled_convex_ccd_routes_emit_one_contact` |
+| mesh-mesh CCD support sign or local-axis mutation | `contact::tests::ccd_support_functions_preserve_shape_axes` and `enabled_convex_ccd_routes_emit_one_contact` |
 | GJK outer termination loosening (`dot <= 1e-2`) | the fixture-backed mesh-mesh near-touch row fails on contact count; mutation command: edit `contact.rs` at the outer GJK guard, then run `cargo test --test contacts_geoms_v1 analytic_convex_route_probes_are_fixture_backed` |
 | margin shift dropped (raw penetration used instead) | `margin_fires_contact_before_geoms_touch` — no contact fires despite margin > 0 |
 | gap ignored in the force computation | `gap_zeros_the_normal_force_while_penetration_is_below_it` — sphere doesn't free-fall inside the gap zone |

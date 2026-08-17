@@ -19,6 +19,21 @@
         "orientation": 0.003670100293,
         "contact_count": 0
       }
+    },
+    {
+      "id": "mesh-mesh-rotated-drop",
+      "early": {
+        "observed_max": {"position": 0.018640846, "orientation": 0.0030140555, "contact_count": 0},
+        "position": 0.018740846,
+        "orientation": 0.0031140555,
+        "contact_count": 0
+      },
+      "full": {
+        "observed_max": {"position": 0.12806424, "orientation": 0.0034046443, "contact_count": 0},
+        "position": 0.12816424,
+        "orientation": 0.0035046443,
+        "contact_count": 0
+      }
     }
   ]
 }

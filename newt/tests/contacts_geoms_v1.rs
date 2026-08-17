@@ -1199,33 +1199,30 @@ fn enabled_convex_ccd_routes_emit_one_contact() {
     }
 }
 
-fn build_dynamic_anchor_world(mesh_mesh: bool) -> World {
+fn build_dynamic_anchor_world(rotated: bool) -> World {
     let mut world = World::new();
     world.dt = 0.005;
-    world.gravity = if mesh_mesh {
-        Vec3::ZERO
-    } else {
-        Vec3::new(0.0, 0.0, -9.81)
-    };
+    world.gravity = Vec3::ZERO;
     let mesh_id = world.add_mesh(unit_tetrahedron());
     let mut static_mesh = Geom::mesh(0, mesh_id, Vec3::ZERO, Quat::IDENTITY, 0.5);
     static_mesh.body = None;
     world.add_geom(static_mesh);
-    assert!(mesh_mesh, "only shipped mesh-mesh anchor is supported");
-    let body = Body::principal_axis(
-        1.0,
-        0.166667,
-        0.166667,
-        0.166667,
-        Vec3::new(0.2, 0.2, 0.2),
-        Quat::IDENTITY,
-    );
-    let body_id = world.add_body(body);
-    world.bodies[body_id].angular_velocity_body = if mesh_mesh {
-        Vec3::new(1.0, 0.7, -0.4)
+    let (position, orientation, angular_velocity_body) = if rotated {
+        (
+            Vec3::new(0.25, 0.1, 0.25),
+            Quat::from_axis_angle(Vec3::Z, 0.4_f32.to_radians()),
+            Vec3::new(-0.6, 0.9, 0.5),
+        )
     } else {
-        Vec3::ZERO
+        (
+            Vec3::new(0.2, 0.2, 0.2),
+            Quat::IDENTITY,
+            Vec3::new(1.0, 0.7, -0.4),
+        )
     };
+    let body = Body::principal_axis(1.0, 0.166667, 0.166667, 0.166667, position, orientation);
+    let body_id = world.add_body(body);
+    world.bodies[body_id].angular_velocity_body = angular_velocity_body;
     world.add_geom(Geom::mesh(
         body_id,
         mesh_id,
@@ -1244,20 +1241,30 @@ fn dynamic_enabled_convex_anchors_are_fixture_backed() {
         "references/contact_dynamic_anchor_bounds.json"
     ))
     .expect("dynamic anchor bounds fixture must parse");
-    for case in route_array(&document, "cases") {
+    let cases = route_array(&document, "cases");
+    assert!(
+        cases.len() >= 2,
+        "dynamic evidence needs two independent anchors"
+    );
+    for case in cases {
         let source_xml = route_string(case, "source_xml");
         let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/references")
             .join(source_xml);
         assert!(source_path.is_file(), "{source_xml}: source XML is missing");
-        let mesh_mesh = route_string(case, "id") == "mesh-mesh-tumble";
-        assert_mjcf_source_contains(&source_path, &["mesh_static", "mesh_body", "mesh_tumble"]);
         let case_id = route_string(case, "id");
+        let rotated = case_id == "mesh-mesh-rotated-drop";
+        let required_names = if rotated {
+            ["mesh_static", "mesh_rotated_body", "mesh_rotated"]
+        } else {
+            ["mesh_static", "mesh_body", "mesh_tumble"]
+        };
+        assert_mjcf_source_contains(&source_path, &required_names);
         let bounds_case = route_array(&bounds_document, "cases")
             .iter()
             .find(|candidate| route_string(candidate, "id") == case_id)
             .unwrap_or_else(|| panic!("missing bounds for dynamic case {case_id}"));
-        let mut world = build_dynamic_anchor_world(mesh_mesh);
+        let mut world = build_dynamic_anchor_world(rotated);
         let mut simulated_step = 0;
         for sample in route_array(case, "samples") {
             let target_step = route_number(sample, "step") as usize;

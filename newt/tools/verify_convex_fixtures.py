@@ -35,6 +35,7 @@ def main() -> int:
     expected_dynamic = json.loads(
         (args.references / "contact_dynamic_anchors.json").read_text(encoding="utf-8")
     )
+    assert len(expected_dynamic["cases"]) >= 2, "dynamic evidence needs two independent anchors"
     with tempfile.TemporaryDirectory(prefix="newt-convex-fixtures-") as temp:
         temp_references = Path(temp)
         # MuJoCo loads the checked-in XML paths. The temporary directory only
@@ -63,6 +64,7 @@ def main() -> int:
             encoding="utf-8"
         )
     )
+    assert len(bounds["cases"]) >= 2, "dynamic bounds need two independent anchors"
     for case in bounds["cases"]:
         for window in ("early", "full"):
             observed = case[window]["observed_max"]
