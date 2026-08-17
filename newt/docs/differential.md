@@ -55,7 +55,7 @@ those units.
 | sphere_drop_stiff  | 2.97e-4           | 8.0e-2     | 2.00e-2           | 8.0e-1     | bounded RK4 residual |
 | sphere_drop        | 5.67e-4           | 1.0e-2     | 2.05e-2           | 1.0e+0     | bounded RK4 residual |
 | sphere_drop_soft   | 1.38e-3           | 7.0e-2     | 9.68e-3           | 8.0e-1     | bounded RK4 residual |
-| box_stack          | 5.14e-3           | 5.0e-2     | 1.23e-1           | 5.0e-1     | parity (recovered) |
+| box_stack          | 1.459283e-2       | 5.0e-2     | 1.882446e-1       | 5.0e-1     | bounded divergence; plane-manifold residual |
 | joint_limit_swing  | 6.56e-2           | 1.5e-1     | 3.09e-1           | 1.2e+0     | bounded divergence |
 | velocity_cartpole  | 2.70e-7           | 1.0e-6     | 5.77e-7           | 2.0e-6     | parity             |
 | filtered_motor_pendulum | 2.56e-4      | 6.0e-4     | 1.34e-3           | 3.0e-3     | bounded divergence |
@@ -167,32 +167,41 @@ show the largest gap because their force changes more within one step.
 Verdict is "bounded integration residual". It is not an impedance-form
 finding. Matched Euler evidence is in the NEWT-23 section below.
 
-### box_stack (parity — recovered)
+### box_stack (bounded divergence; finding reopened)
 
 Three cubes (bottom, middle, top) settling on a plane over 4 s.
 Middle is offset by 2 cm in x to break perfect axial symmetry.
 `friction=0.6` on all surfaces; `iterations=20` on the PGS solver
 matching newt's default.
 
-Post-NEWT-14 (Finding 1): the stack holds. Real MuJoCo parks the
-top box at ≈ `(-6.7e-5, 2.4e-4, 1.7497)`; newt now settles at ≈
-`(+1.1e-3, +8.6e-4, +1.7469)` — a 3 mm drop below MJ's final
-position and a millimetre-scale horizontal drift. Component-wise
-divergence peaks at 1.11 cm (transient) and 7.7 cm/s (transient);
-the stack is stable through the full 4 s capture.
+The stack remains bounded, but the exact MuJoCo box-plane manifold reopens
+the differential residual. The current PGS capture measures `1.459283e-2 m`
+qpos and `1.882446e-1 m/s` qvel. The matched Euler capture measures
+`8.167121e-3 m` and `2.795157e-1 m/s`. The Newton/Euler capture measures
+`1.729087e-2 m` and `1.179916e-1 m/s`.
+
+The first large PGS qvel residual appears at sample `2`, component `15`; the
+maximum qpos residual appears at sample `20`, component `14`. These are top-box
+state slots. The exact plane rule changes the contact scan order, midpoint
+point, and penetration anchor for box-plane contacts. That changes the
+finite-step normal and friction moment during settling. The box-box clipping
+fix remains in place; this is a separate plane-contact effect.
+
+The stack does not collapse. The scorecard now reports this as bounded
+divergence, not recovered parity.
 
 The v1 investigation hypothesized three possible causes (PGS
 under-convergence, contact ordering, box-box narrow-phase
 manifold). NEWT-14 instrumented both engines with per-step
-contact dumps and found the root cause: **newt's box-box narrow
+contact dumps and found the box-box root cause: **newt's box-box narrow
 phase emits only 2 diagonal contact points for a tilted face-face
 stack while MuJoCo emits 4 face-clipped points**. With only 2
 contact points on the top-middle interface, the friction moment is
 under-determined and the top box tips off. The fix routes the PGS
 pipeline through a `narrow_phase_solver` that always runs SAT
 face-clipping for box-box (`src/contact.rs::box_box_full_manifold`);
-the penalty pipeline continues to use the vertex-vs-face primary
-so its goldens stay byte-identical.
+the penalty pipeline continues to use the vertex-vs-face primary for box-box.
+NEWT-25 still changes penalty stack goldens through the shared plane manifold.
 
 An iteration sweep (20 / 50 / 100 / 200 / 400) confirmed the
 old collapse was NOT solver-convergence-limited — even 400 PGS
@@ -342,12 +351,10 @@ Verdict: the impedance finding is CLOSED. RK4 rows remain honest rows with
 measured bounds. Their residual is the documented constraint-ZOH versus
 per-stage reevaluation gap; see `docs/integrators.md`.
 
-The solver and equality goldens changed because their shared row bias now
-uses the source acceleration equation. The affected files are the six
-equality/condim goldens and the six PGS/Newton solver goldens. Penalty-mode
-goldens remain byte-identical. The shared tree `diagApprox` and `Rpy` change
-regenerated `solver_tree.bin` and `solver_newton_tree.bin`; the stack and
-incline bytes did not change.
+Earlier row-bias work changed the solver and equality goldens. NEWT-25 also
+changes the six PGS/Newton solver goldens, the penalty stack goldens, and the
+packaged `model_stack.bin`: all use plane contacts. This is an expected
+behavior change from the exact MuJoCo manifold, not a hidden solver tweak.
 
 ## Regeneration
 
@@ -376,7 +383,7 @@ The Newton rows use MuJoCo 3.11.0, `solver=Newton`, `integrator=Euler`,
 | scenario | observed max qpos | bound | observed max qvel | bound |
 |----------|------------------:|------:|------------------:|------:|
 | sphere_drop | 7.220840e-3 | 2.0e-2 | 4.196461e-1 | 1.2 |
-| box_stack | 9.693845e-3 | 5.0e-2 | 2.274836e-1 | 1.0 |
+| box_stack | 1.729087e-2 | 5.0e-2 | 1.179916e-1 | 1.0 |
 | joint_limit_swing | 9.167274e-2 | 2.0e-1 | 9.246982e-1 | 1.5 |
 
 These bounds are measured from the committed `_newton_euler` fixtures.
@@ -392,7 +399,8 @@ The gap is not PGS iteration starvation. The test keeps bounds of `0.1`,
 ## NEWT-22 tree-contact rows
 
 Tree contacts now use the selected PGS or Newton row system. Penalty mode stays
-on its old callback, so penalty goldens remain byte-identical. The new tree
+on its old callback, but shared plane-manifold changes can move penalty
+goldens. The new tree
 anchors cover a free-root foot on a plane, a force-free contact before an
 active contact, and a mixed tree/free-body pair.
 
@@ -402,7 +410,7 @@ measured result is:
 
 | scenario | steps | distance | cadence | mean step | clearance | self-contact steps |
 |---|---:|---:|---:|---:|---:|---:|
-| assisted biped, Newton tree contacts | 5,000 | `2.524537 m` | `117.60 bpm` | `0.373537 m` | `0.196953 m` | `0` |
+| assisted biped, Newton tree contacts | 5,000 | `2.523389 m` | `117.60 bpm` | `0.372897 m` | `0.200563 m` | `0` |
 
 These values are a disclosed re-measurement after the exact-bias and shared
 tree-regularization changes. CI records bands of `2.50..2.55 m` distance,
@@ -436,7 +444,7 @@ The chain fixtures are `tree_chain_contact_pgs_euler.bin` and
 `tools/capture_biped_mujoco.py`. Its 5,000-step run uses the source-faithful
 controller, `assist_scale=0.8`, and no debug state correction.
 
-## NEWT-24 biped v3 sweep
+## NEWT-25 biped v3 sweep and solver-phase finding
 
 The biped acceptance oracle uses MuJoCo `3.11.0`, Euler, Newton, pyramidal
 cones, 20 iterations, and `dt=0.005`. The source controller stays unchanged.
@@ -455,32 +463,45 @@ cargo test --manifest-path newt/Cargo.toml --test biped_walk_acceptance v3_full_
 
 | assist | source outcome | newt outcome | source fall | newt fall | compared steps | max qpos gap | max qvel gap |
 |---:|---|---|---:|---:|---:|---:|---:|
-| `0.8` | complete | complete | — | — | `5,000` | `3.60056e-1` | `4.86051e0` |
-| `0.4` | fallen | fallen | `756` | `553` | `553` | `1.15385e0` | `6.73314e0` |
-| `0.2` | fallen | fallen | `492` | `469` | `469` | `9.01380e-1` | `6.85567e0` |
-| `0.0` | fallen | fallen | `578` | `442` | `442` | `1.14941e0` | `6.40730e0` |
+| `0.8` | complete | complete | — | — | `5,000` | `3.54990e-1` | `4.83753e0` |
+| `0.4` | fallen | fallen | `756` | `551` | `551` | `1.15327e0` | `6.69538e0` |
+| `0.2` | fallen | fallen | `492` | `472` | `472` | `9.03753e-1` | `6.88275e0` |
+| `0.0` | fallen | fallen | `578` | `439` | `439` | `1.15190e0` | `6.40614e0` |
 
-The outcome class matches at all four levels. The `0.4` row is the acceptance
-failure because MuJoCo falls at `756` while newt falls at `553`, outside the
-fall-step bound. The no-assist oracle also falls, so stable no-assist walking
-is not a valid target for this source controller.
+The outcome class matches at all four levels. The `0.4` row remains the
+acceptance failure: the fall-step gap is `756 - 551 = 205`, versus `203`
+before the manifold update. The no-assist oracle also falls, so stable
+no-assist walking is not a valid target for this source controller.
 
-The first remaining gap is contact timing and manifold selection. The visual
-contact masks first differ at step `12`. With the controller's `0.035 m`
-support threshold, newt reports right-foot contact at step `17` while MuJoCo
-does not. At step `25`,
-MuJoCo has one right-foot contact and four pyramid rows. Newt has two contacts
-and eight rows. Their maximum generalized-force difference is `182.518`.
-At step `36`, both have four contacts and 16 rows, but their maximum
-generalized-force difference is `542.575`. The source and newt row reference
-acceleration maxima at step `25` are `124.283` and `140.555`.
+status: the isolated manifold finding is closed. solver-phase parity remains
+open. visual support masks and solver contact masks are stored separately. The
+first parsed solver structural mismatch is step `25`: source solver mask `2`
+versus newt solver mask `0`, with one contact and four rows versus zero
+contacts and rows. At visual step `18`, both solver masks and contacts are zero;
+only the source visual foot-height mask is `2`. Post-step geometry then shows
+two contacts and eight rows on both sides.
 
-The source-side contact and row records are in
+At solver step `25`, source and newt constraint-force maxima are `112.489` and
+`0.000`; row reference-acceleration maxima are `124.015` and `0.000`. At step
+`36`, the maxima are `503.445` and `574.786`; row reference-acceleration
+maxima are `155.270` and `152.956`. The first solver-phase qvel residual
+bound exceeds at step `26` (`1.636116`). The per-step trail in
+`docs/biped-walk.md` is the next ticket's comparison specification.
+
+The complete measured solver structural mismatch set through step `36` is
+`[25]`, a one-step contact-latency window. The acceptance test asserts this
+set verbatim, so a new mismatch through step `36` fails CI. The source-side
+contact and row records are in
 `tests/references/biped_walk_v3_diagnostics.json`. Records cover step `0`
-through `40`, including the first visual mismatch window. The selected newt
-records are in `tests/references/biped_walk_v3_newt_diagnostics.json`. Each
-contact stores the geom pair, point, normal, condim, frame, and row mapping.
-The newt diagnostic runner is `examples/biped_walk_diagnostics`; it prints
+through `40`, including solver-phase and post-step records. The source
+capture records solver-phase state before `mj_step` and keeps post-step
+`mj_forward` geometry separate. The selected newt records are in
+`tests/references/biped_walk_v3_newt_diagnostics.json`; they are solver-phase
+records for steps `0` through `40`. Each parsed contact stores the geom pair,
+point, depth, and row mapping needed by the parity comparison.
+The newt diagnostic runner is `examples/capture_biped_diagnostics`; it writes
+the parsed fixture. The human diagnostic runner is
+`examples/biped_walk_diagnostics`; it prints
 steps `0..12`, `17`, `25`, and `36` with the same geom-level fields. It calls
 `solver::solve_tree_contacts`, the NEWT-23 row assembly path.
 

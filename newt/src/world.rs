@@ -45,7 +45,9 @@ use crate::geom::{
 use crate::joint::JointKind;
 use crate::math::{Quat, Vec3};
 use crate::sensor::{Sensor, SensorBank, SensorError, SensorInputs};
-use crate::solver::{SolverConfig, SolverMode, TreeContactSolution, solve_free_bodies};
+use crate::solver::{
+    ConstraintRowDiagnostic, SolverConfig, SolverMode, TreeContactSolution, solve_free_bodies,
+};
 use crate::tree::{
     Tree, euler_step as tree_euler_step, forward_kinematics as tree_forward_kinematics,
     rk4_step as tree_rk4_step,
@@ -107,9 +109,9 @@ pub struct World {
     /// resulting order is `(min, max)` lexicographic.
     pub pair_list: Option<Vec<(usize, usize)>>,
     /// Constraint solver configuration. Default is
-    /// [`SolverConfig::DEFAULT`] — `SolverMode::Penalty`, which keeps every
-    /// pre-v1-tier-4 golden byte-identical. Set to `SolverMode::Pgs` or
-    /// `SolverMode::Newton` to switch on a MuJoCo soft-constraint solver.
+    /// [`SolverConfig::DEFAULT`] — `SolverMode::Penalty`, the legacy force
+    /// path. Set to `SolverMode::Pgs` or `SolverMode::Newton` to switch on a
+    /// MuJoCo soft-constraint solver.
     pub solver: SolverConfig,
     /// Equality constraints (v1 tier 5). Only active when
     /// `solver.mode == Pgs`. Free-body equalities (connect / weld /
@@ -139,6 +141,31 @@ pub struct World {
     /// call [`Self::invalidate_pair_check`].
     #[doc(hidden)]
     checked_pairs: std::cell::Cell<u64>,
+    #[doc(hidden)]
+    solver_phase_capture: bool,
+    #[doc(hidden)]
+    last_solver_phase: Option<SolverPhaseDiagnostics>,
+}
+
+/// State and contacts consumed by the most recent solver phase.
+///
+/// This is a diagnostic surface. It records the state before integration, not
+/// the post-step geometry returned by [`World::detect_contacts`]. Enable it
+/// with [`World::set_solver_phase_capture`].
+#[derive(Clone, Debug)]
+pub struct SolverPhaseDiagnostics {
+    /// Flattened native tree generalized positions at the solver phase.
+    pub qpos: Vec<f32>,
+    /// Flattened native tree generalized velocities at the solver phase.
+    pub qvel: Vec<f32>,
+    /// Tree contacts consumed by the solver in deterministic order.
+    pub contacts: Vec<Contact>,
+    /// Solver row to original contact mapping.
+    pub row_to_contact: Vec<usize>,
+    /// Per-row reference diagnostics from the solver phase.
+    pub row_diagnostics: Vec<ConstraintRowDiagnostic>,
+    /// Tree generalized contact forces from the solver phase.
+    pub tree_qfrc: Vec<Vec<f32>>,
 }
 
 /// A named generalized-state snapshot. Vectors flatten trees in world tree
@@ -217,7 +244,40 @@ impl World {
             sensors: SensorBank::new(),
             keyframes: Vec::new(),
             checked_pairs: std::cell::Cell::new(0),
+            solver_phase_capture: false,
+            last_solver_phase: None,
         }
+    }
+
+    /// Enable or disable capture of the state and contacts used by
+    /// [`World::step`]. Disabled by default to avoid diagnostic allocations.
+    pub fn set_solver_phase_capture(&mut self, enabled: bool) {
+        self.solver_phase_capture = enabled;
+        if !enabled {
+            self.last_solver_phase = None;
+        }
+    }
+
+    /// Return the most recent pre-integration solver-phase capture.
+    pub fn solver_phase_diagnostics(&self) -> Option<&SolverPhaseDiagnostics> {
+        self.last_solver_phase.as_ref()
+    }
+
+    /// Capture the current state through the same solver assembly used at the
+    /// start of [`World::step`], without integrating. This supports an initial
+    /// step-zero diagnostic record.
+    pub fn capture_solver_phase(&mut self) {
+        self.solver
+            .validate()
+            .unwrap_or_else(|message| panic!("{message}"));
+        self.assert_pairs_supported();
+        let pairs = match &self.pair_list {
+            Some(p) => p.clone(),
+            None => self.auto_pairs(),
+        };
+        let state = self.solver_phase_state();
+        let solution = self.solver_phase_solution(&pairs);
+        self.record_solver_phase(state, solution.as_ref(), &pairs);
     }
 
     /// Add a sensor to the world's sensor bank. Validates the sensor's
@@ -705,11 +765,11 @@ impl World {
             Some(p) => p.clone(),
             None => self.auto_pairs(),
         };
-        let tree_contact_solution = match self.solver.mode {
-            SolverMode::Penalty => None,
-            SolverMode::Pgs => self.compute_tree_contact_solution(&pairs, false),
-            SolverMode::Newton => self.compute_tree_contact_solution(&pairs, true),
-        };
+        let solver_phase_state = self.solver_phase_capture.then(|| self.solver_phase_state());
+        let tree_contact_solution = self.solver_phase_solution(&pairs);
+        if let Some(state) = solver_phase_state {
+            self.record_solver_phase(state, tree_contact_solution.as_ref(), &pairs);
+        }
         match self.integrator {
             Integrator::Rk4 => {
                 self.step_bodies(&pairs, tree_contact_solution.as_ref());
@@ -1323,6 +1383,78 @@ impl World {
         Some(self.solve_tree_contact_sensor_solution(&tree_contacts, use_newton))
     }
 
+    fn solver_phase_solution(&self, pairs: &[(usize, usize)]) -> Option<TreeContactSolution> {
+        match self.solver.mode {
+            SolverMode::Penalty => None,
+            SolverMode::Pgs => self.compute_tree_contact_solution(pairs, false),
+            SolverMode::Newton => self.compute_tree_contact_solution(pairs, true),
+        }
+    }
+
+    fn solver_phase_state(&self) -> (Vec<f32>, Vec<f32>) {
+        let qpos = self
+            .trees
+            .iter()
+            .flat_map(|tree| tree.q.iter().copied())
+            .collect();
+        let qvel = self
+            .trees
+            .iter()
+            .flat_map(|tree| tree.qdot.iter().copied())
+            .collect();
+        (qpos, qvel)
+    }
+
+    fn record_solver_phase(
+        &mut self,
+        state: (Vec<f32>, Vec<f32>),
+        solution: Option<&TreeContactSolution>,
+        pairs: &[(usize, usize)],
+    ) {
+        let (contacts, row_to_contact, row_diagnostics, tree_qfrc) = match solution {
+            Some(solution) => (
+                solution.contacts.clone(),
+                solution.row_to_contact.clone(),
+                solution.row_diagnostics.clone(),
+                solution.tree_qfrc.clone(),
+            ),
+            None => {
+                let contacts: Vec<Contact> = collect_contacts_full(
+                    &self.bodies,
+                    &self.trees,
+                    &self.geoms,
+                    &self.meshes,
+                    pairs,
+                )
+                .into_iter()
+                .filter(|contact| {
+                    matches!(
+                        self.geoms[contact.geom_a].attachment(),
+                        GeomAttach::Link(_, _)
+                    ) || matches!(
+                        self.geoms[contact.geom_b].attachment(),
+                        GeomAttach::Link(_, _)
+                    )
+                })
+                .collect();
+                (
+                    contacts,
+                    Vec::new(),
+                    Vec::new(),
+                    self.trees.iter().map(|tree| vec![0.0; tree.nv()]).collect(),
+                )
+            }
+        };
+        self.last_solver_phase = Some(SolverPhaseDiagnostics {
+            qpos: state.0,
+            qvel: state.1,
+            contacts,
+            row_to_contact,
+            row_diagnostics,
+            tree_qfrc,
+        });
+    }
+
     fn solve_tree_contact_sensor_solution(
         &self,
         tree_contacts: &[Contact],
@@ -1418,11 +1550,12 @@ impl World {
 // ---------------------------------------------------------------------------
 
 /// Which narrow-phase dispatch to use when enumerating contacts. Penalty
-/// keeps the legacy vertex-vs-face primary for byte-identical goldens;
+/// keeps the legacy vertex-vs-face primary for box-box pairs;
 /// [`ContactManifold::Full`] routes box-box through SAT face-clipping so
 /// tilted face-face stacks see the 4-corner manifold instead of the
 /// 2-diagonal degenerate one (see NEWT-14 evidence in
-/// `docs/differential.md`).
+/// `docs/differential.md`). Plane colliders use the shared source-parity
+/// primitive rules in both paths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContactManifold {
     Legacy,
@@ -1610,7 +1743,6 @@ fn apply_tree_contact_wrench(
     let solref = combine_solref(ga.solref, gb.solref);
     let (k, c) = solref_to_kc(solref, m_eff);
     let c_tangent = c;
-
     // Point velocities.
     let (v_a, _wa, r_a) = point_velocity_generic(
         ga,
@@ -1813,7 +1945,6 @@ fn apply_contact_wrench(
     let solref = combine_solref(ga.solref, gb.solref);
     let (k, c) = solref_to_kc(solref, m_eff);
     let c_tangent = c;
-
     // Point velocities at the contact.
     let (v_a, w_a_world, r_a) = point_velocity(state, ga, contact.position_world);
     let (v_b, w_b_world, r_b) = point_velocity(state, gb, contact.position_world);

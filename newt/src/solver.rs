@@ -60,15 +60,15 @@
 /// Which contact/constraint model the world uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SolverMode {
-    /// v0 penalty spring-damper. Existing default; all pre-v1-tier-4 goldens
-    /// stay byte-identical under this mode.
+    /// v0 penalty spring-damper. Existing default; scenes without a changed
+    /// contact manifold retain their previous trajectories.
     Penalty,
     /// MuJoCo soft-constraint model solved by PGS.
     Pgs,
     /// MuJoCo soft-constraint model solved by dense Newton iterations.
     ///
-    /// Newton is opt-in.  The legacy penalty default and the PGS path remain
-    /// unchanged for existing scenes and byte-identical goldens.
+    /// Newton is opt-in. The legacy penalty default and the PGS path remain
+    /// unchanged for scenes outside a changed contact manifold.
     Newton,
 }
 
@@ -92,8 +92,7 @@ const NEWTON_ELLIPTIC_ERROR: &str =
 /// World-level solver configuration.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SolverConfig {
-    /// Which model to use. Default `Penalty` keeps every existing golden
-    /// byte-identical under CI.
+    /// Which model to use. Default `Penalty` keeps the legacy force path.
     pub mode: SolverMode,
     /// Fixed number of PGS sweeps per step. Higher = tighter convergence,
     /// same runtime cost per iteration. Determinism outranks early-exit
@@ -430,7 +429,7 @@ pub fn project_pyramidal(f: f32, cap: f32) -> f32 {
 use crate::body::Body;
 use crate::contact::Contact;
 use crate::equality::{DISTANCE_DEGENERATE_EPS, Equality};
-use crate::geom::{Geom, GeomAttach, GeomShape, SolRef, combine_solref};
+use crate::geom::{Geom, GeomAttach, SolRef, combine_solref};
 use crate::math::{Quat, Vec3};
 use crate::world::tangent_basis;
 
@@ -741,7 +740,7 @@ fn solve_free_bodies_diag_mode(
 
         let n_world = c.normal_world;
         let (t1_world, t2_world) = tangent_basis(n_world);
-        let contact_position = solver_contact_position(c, ga, gb);
+        let contact_position = c.position_world;
         let arm_a = match body_a {
             Some(i) => contact_position - bodies[i as usize].position,
             None => Vec3::ZERO,
@@ -1097,27 +1096,6 @@ struct PerContact {
     mu_slide: f32,
     mu_torsion: f32,
     mu_roll: f32,
-}
-
-/// MuJoCo places a sphere-plane contact at the midpoint of the two opposing
-/// surfaces. Penalty mode keeps its legacy surface anchor; solver rows use
-/// this midpoint so angular Jacobians match `efc_J`.
-fn solver_contact_position(contact: &Contact, geom_a: &Geom, geom_b: &Geom) -> Vec3 {
-    let sphere_plane = matches!(geom_a.shape, GeomShape::Sphere { .. })
-        && matches!(geom_b.shape, GeomShape::Plane)
-        || matches!(geom_a.shape, GeomShape::Plane)
-            && matches!(geom_b.shape, GeomShape::Sphere { .. });
-    if sphere_plane {
-        let margin = if geom_a.margin > geom_b.margin {
-            geom_a.margin
-        } else {
-            geom_b.margin
-        };
-        let raw_penetration = contact.penetration - margin;
-        contact.position_world + contact.normal_world * (0.5 * raw_penetration)
-    } else {
-        contact.position_world
-    }
 }
 
 /// Assemble and solve the dense free-body Newton system. The response matrix
@@ -2433,6 +2411,12 @@ pub fn solve_tree_limits_newton(
 /// tree-vs-body contact transfers the impulse to both participants.
 #[derive(Clone, Debug)]
 pub struct TreeContactSolution {
+    /// Original tree contact list consumed by this solve, in deterministic
+    /// narrow-phase order.
+    pub contacts: Vec<Contact>,
+    /// Solver-row to original-contact mapping. Contacts in a force-free gap
+    /// have no entries here.
+    pub row_to_contact: Vec<usize>,
     /// World-frame free-body wrenches, indexed like the input body slice.
     pub body_wrenches: Vec<(Vec3, Vec3)>,
     /// Joint-space generalized forces, indexed by tree and then `nv` slot.
@@ -2511,6 +2495,8 @@ pub fn solve_tree_contacts(
     tree_implicit: Option<bool>,
 ) -> TreeContactSolution {
     let mut solution = TreeContactSolution {
+        contacts: contacts.to_vec(),
+        row_to_contact: Vec::new(),
         body_wrenches: vec![(Vec3::ZERO, Vec3::ZERO); bodies.len()],
         tree_qfrc: trees.iter().map(|tree| vec![0.0; tree.nv()]).collect(),
         tree_wrenches: trees
@@ -2662,6 +2648,12 @@ pub fn solve_tree_contacts(
     }
 
     let n_rows = rows.len();
+    for block in &blocks {
+        let row_count = contact_block_n_rows(block.condim, cone);
+        solution
+            .row_to_contact
+            .extend(std::iter::repeat_n(block.contact_index, row_count));
+    }
     let mut response = vec![0.0f32; n_rows * n_rows];
     for column in 0..n_rows {
         let mut body_response = vec![(Vec3::ZERO, Vec3::ZERO); bodies.len()];

@@ -11,8 +11,9 @@ the convex dual problem. Ship both condim 1 (frictionless) and condim 3
 (sliding, normal + 2 tangents), both pyramidal and elliptic friction
 cones, and constraint-based joint limits for hinge/slide range.
 
-Penalty remains the default; every pre-v1-tier-4 golden stays
-byte-identical.
+Penalty remains the default legacy path. The MuJoCo plane manifold is shared
+by both modes, so affected penalty contact scenes can change trajectory; those
+golden changes are documented with the manifold update.
 
 ## Model reference
 
@@ -269,8 +270,10 @@ sub-stages (zero-order hold, ZOH).
 - The remaining differential scorecard rows outside tree contacts are
   documented in `docs/differential.md`.
 
-Penalty mode remains a separate legacy path. It does not enter the shared
-contact system, which preserves penalty-mode trajectories and goldens.
+Penalty mode remains a separate legacy force path. It does not enter the
+shared solver rows, but it uses the same source-parity plane contact set and
+positions. Affected penalty trajectories and goldens are therefore expected to
+change when that manifold changes.
 
 ## Equality constraint rows (v1 tier 5)
 

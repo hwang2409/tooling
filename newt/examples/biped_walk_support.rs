@@ -629,6 +629,7 @@ pub fn run_walk_with_solver(
         config,
         Some(integrator),
         Some(solver),
+        false,
         |_, _| {},
     )
 }
@@ -650,6 +651,29 @@ where
         config,
         Some(integrator),
         Some(solver),
+        false,
+        observer,
+    )
+}
+
+/// Run the walker and expose step-zero plus each post-step state. The
+/// world's solver-phase capture is available from every callback, including
+/// step zero before the first integration.
+pub fn run_walk_with_solver_phase_observed<F>(
+    config: GaitConfig,
+    integrator: Integrator,
+    solver: SolverMode,
+    observer: F,
+) -> WalkResult
+where
+    F: FnMut(usize, &Scene),
+{
+    run_walk_observed_from_path_with_options(
+        Path::new(MODEL_PATH),
+        config,
+        Some(integrator),
+        Some(solver),
+        true,
         observer,
     )
 }
@@ -711,7 +735,7 @@ fn run_walk_observed_from_path<F>(path: &Path, config: GaitConfig, observer: F) 
 where
     F: FnMut(usize, &Scene),
 {
-    run_walk_observed_from_path_with_options(path, config, None, None, observer)
+    run_walk_observed_from_path_with_options(path, config, None, None, false, observer)
 }
 
 fn run_walk_observed_with_integrator<F>(
@@ -727,6 +751,7 @@ where
         config,
         Some(integrator),
         None,
+        false,
         observer,
     )
 }
@@ -736,6 +761,7 @@ fn run_walk_observed_from_path_with_options<F>(
     config: GaitConfig,
     integrator: Option<Integrator>,
     solver: Option<SolverMode>,
+    capture_initial_observer: bool,
     mut observer: F,
 ) -> WalkResult
 where
@@ -747,6 +773,7 @@ where
     }
     if let Some(solver) = solver {
         scene.world.solver.mode = solver;
+        scene.world.set_solver_phase_capture(true);
         if solver == SolverMode::Newton {
             scene.world.solver.cone = ConeKind::Pyramidal;
         }
@@ -768,8 +795,14 @@ where
     ];
     set_hinge_pose(&mut scene, initial_targets);
     scene.world.evaluate_sensors(&[]);
+    if solver.is_some() {
+        scene.world.capture_solver_phase();
+    }
     let mut controller = JointWalkController::new(&scene, config);
     controller.observe_contacts(&scene);
+    if capture_initial_observer {
+        observer(0, &scene);
+    }
     controller.initial_root_x = scene.world.trees[0].q[0];
     let initial_contacts = controller.contacts;
     let mut metrics = MetricsAccumulator::new(controller.initial_root_x, initial_contacts);

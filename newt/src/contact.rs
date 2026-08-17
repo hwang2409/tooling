@@ -54,16 +54,17 @@ pub struct Contact {
     pub geom_a: usize,
     /// Index of geom B.
     pub geom_b: usize,
-    /// Contact point in world coordinates. By convention this is on B's
-    /// surface (a point that A has penetrated); moving A by `+normal *
-    /// penetration` removes the overlap.
+    /// Contact point in world coordinates. Plane contacts use MuJoCo's
+    /// midpoint between the two opposing surfaces. Other contacts use the
+    /// primitive's surface anchor.
     pub position_world: Vec3,
     /// Unit normal in world coordinates, pointing FROM B into A.
     pub normal_world: Vec3,
     /// Shifted penetration depth `pair_margin - raw_dist` (positive; a
     /// value equal to `pair_margin` means the raw distance is exactly zero,
-    /// i.e. the geoms just touch). Zero-penetration contacts are never
-    /// emitted (strictly `> 0`).
+    /// i.e. the geoms just touch). MuJoCo plane colliders also emit the
+    /// equality case; the solver skips a contact when its force-free gap
+    /// includes it.
     pub penetration: f32,
     /// Pair Coulomb friction coefficient (see [`crate::geom`]).
     pub friction: f32,
@@ -84,6 +85,8 @@ pub struct Contact {
 pub struct ContactBuf {
     pub contacts: [Contact; 4],
     pub len: usize,
+    /// Number of candidates offered to the bounded output buffer.
+    pub candidate_count: usize,
 }
 
 impl Default for ContactBuf {
@@ -106,9 +109,11 @@ impl ContactBuf {
         Self {
             contacts: [placeholder; 4],
             len: 0,
+            candidate_count: 0,
         }
     }
     pub fn push(&mut self, c: Contact) {
+        self.candidate_count += 1;
         if self.len < self.contacts.len() {
             self.contacts[self.len] = c;
             self.len += 1;
@@ -182,19 +187,19 @@ pub fn sphere_plane(
     let mut out = ContactBuf::new();
     let (n, p0) = plane_world(plane_geom, plane_pose);
     let signed = (sphere_pose.position - p0).dot(n);
-    // Raw penetration = radius - signed; contact activates when raw > -margin,
-    // and we shift the reported penetration up by `margin`.
-    let pen_raw = radius - signed;
-    let pen = pen_raw + margin;
-    if pen > 0.0 {
-        // Contact point on the plane surface directly under the sphere center.
-        let contact_pt = sphere_pose.position - n * signed;
+    // MuJoCo stores the raw signed surface distance and activates when it is
+    // no greater than the pair margin.
+    let raw_dist = signed - radius;
+    if raw_dist <= margin {
+        // MuJoCo places the contact at the midpoint of the sphere surface and
+        // the plane, not on either surface.
+        let contact_pt = sphere_pose.position - n * (radius + raw_dist * 0.5);
         out.push(Contact {
             geom_a: idx_sphere,
             geom_b: idx_plane,
             position_world: contact_pt,
             normal_world: n,
-            penetration: pen,
+            penetration: margin - raw_dist,
             friction,
             gap,
         });
@@ -202,8 +207,13 @@ pub fn sphere_plane(
     out
 }
 
-/// Box vs static plane. Emits up to 4 corner contacts (the 4 deepest of any
-/// penetrating corners) in a fixed deterministic order.
+/// Box vs static plane, matching MuJoCo's `mjc_PlaneBox` collider.
+///
+/// The collider scans all eight corners in bit order, keeps corners whose
+/// local plane-relative height is non-positive, skips corners outside the
+/// margin, and retains the first four outputs in the bounded contact buffer.
+/// It does not sort by depth. Contact positions are the midpoint between the
+/// corner and the plane along the plane normal.
 #[allow(clippy::too_many_arguments)]
 pub fn box_plane(
     idx_box: usize,
@@ -217,65 +227,40 @@ pub fn box_plane(
     plane_pose: &GeomPose,
 ) -> ContactBuf {
     let (n, p0) = plane_world(plane_geom, plane_pose);
-    // Corner sign pattern: fixed lexicographic order. The tie-break for "which
-    // 4 deepest" walks corners in this order, so a bit-identical input always
-    // yields the same 4.
-    const SIGNS: [(f32, f32, f32); 8] = [
-        (-1.0, -1.0, -1.0),
-        (-1.0, -1.0, 1.0),
-        (-1.0, 1.0, -1.0),
-        (-1.0, 1.0, 1.0),
-        (1.0, -1.0, -1.0),
-        (1.0, -1.0, 1.0),
-        (1.0, 1.0, -1.0),
-        (1.0, 1.0, 1.0),
-    ];
-    // Collect penetrations in fixed order.
-    let mut pens = [(0.0f32, Vec3::ZERO); 8];
-    for (slot, &(sx, sy, sz)) in pens.iter_mut().zip(SIGNS.iter()) {
-        let local = Vec3::new(
-            sx * half_extents.x,
-            sy * half_extents.y,
-            sz * half_extents.z,
-        );
-        let world = box_pose.point_to_world(local);
-        let signed = (world - p0).dot(n);
-        // Shifted penetration = margin - signed = -signed + margin.
-        *slot = (-signed + margin, world);
-    }
-    // Keep only positive shifted penetrations; then pick up to 4 deepest.
-    let mut order = [0usize; 8];
-    let mut count = 0usize;
-    for (i, &pen) in pens.iter().enumerate() {
-        if pen.0 > 0.0 {
-            order[count] = i;
-            count += 1;
-        }
-    }
-    // Stable sort descending by penetration; ties break by insertion order
-    // (which is corner-index order).
-    for i in 1..count {
-        let mut j = i;
-        while j > 0 && pens[order[j]].0 > pens[order[j - 1]].0 {
-            order.swap(j - 1, j);
-            j -= 1;
-        }
-    }
     let mut out = ContactBuf::new();
-    let take = if count > 4 { 4 } else { count };
-    for &i in &order[..take] {
-        let (pen, corner) = pens[i];
-        // Contact position on B's surface: the point on the plane directly
-        // above the corner. `pen` is the shifted penetration so we subtract
-        // the margin back to get the raw offset from corner to plane along
-        // `+n`.
-        let contact_pt = corner + n * (pen - margin);
+    let dist = (box_pose.position - p0).dot(n);
+    for i in 0..8 {
+        let local = Vec3::new(
+            if i & 1 == 0 {
+                -half_extents.x
+            } else {
+                half_extents.x
+            },
+            if i & 2 == 0 {
+                -half_extents.y
+            } else {
+                half_extents.y
+            },
+            if i & 4 == 0 {
+                -half_extents.z
+            } else {
+                half_extents.z
+            },
+        );
+        let corner_offset = box_pose.rotate(local);
+        let ldist = n.dot(corner_offset);
+        let raw_dist = dist + ldist;
+        if raw_dist > margin || ldist > 0.0 {
+            continue;
+        }
+        let corner = box_pose.position + corner_offset;
+        let contact_pt = corner - n * (raw_dist * 0.5);
         out.push(Contact {
             geom_a: idx_box,
             geom_b: idx_plane,
             position_world: contact_pt,
             normal_world: n,
-            penetration: pen,
+            penetration: margin - raw_dist,
             friction,
             gap,
         });
@@ -283,7 +268,8 @@ pub fn box_plane(
     out
 }
 
-/// Capsule vs static plane. Emits up to 2 endpoint contacts (axis endpoints).
+/// Capsule vs static plane, matching MuJoCo's endpoint order and midpoint
+/// contact positions.
 #[allow(clippy::too_many_arguments)]
 pub fn capsule_plane(
     idx_capsule: usize,
@@ -300,22 +286,21 @@ pub fn capsule_plane(
     let (n, p0) = plane_world(plane_geom, plane_pose);
     let axis_world = capsule_pose.rotate(Vec3::Z);
     let ends = [
-        capsule_pose.position - axis_world * half_height,
         capsule_pose.position + axis_world * half_height,
+        capsule_pose.position - axis_world * half_height,
     ];
     let mut out = ContactBuf::new();
     for &e in ends.iter() {
         let signed = (e - p0).dot(n);
-        let pen = radius - signed + margin;
-        if pen > 0.0 {
-            // Contact point is at the sphere-cap center's foot on the plane.
-            let contact_pt = e - n * signed;
+        let raw_dist = signed - radius;
+        if raw_dist <= margin {
+            let contact_pt = e - n * (radius + raw_dist * 0.5);
             out.push(Contact {
                 geom_a: idx_capsule,
                 geom_b: idx_plane,
                 position_world: contact_pt,
                 normal_world: n,
-                penetration: pen,
+                penetration: margin - raw_dist,
                 friction,
                 gap,
             });
@@ -2135,7 +2120,11 @@ mod tests {
         let c = buf.as_slice()[0];
         assert!(approx(c.penetration, 0.4, 1e-5));
         assert!(approx_vec(c.normal_world, Vec3::Z, 1e-6));
-        assert!(approx_vec(c.position_world, Vec3::new(0.0, 0.0, 0.0), 1e-5));
+        assert!(approx_vec(
+            c.position_world,
+            Vec3::new(0.0, 0.0, -0.2),
+            1e-5
+        ));
     }
 
     #[test]
@@ -2263,7 +2252,8 @@ mod tests {
             orientation: Quat::from_axis_angle(Vec3::Y, crate::math::FRAC_PI_2),
         };
         // Radius 0.5, half_height 1.0. Both endpoints at z=0.3, penetration
-        // 0.5-0.3 = 0.2 each.
+        // 0.5-0.3 = 0.2 each. MuJoCo orders the positive endpoint first and
+        // places each contact at the cap-plane midpoint z=-0.1.
         let buf = capsule_plane(
             0,
             &capsule_pose,
@@ -2277,8 +2267,12 @@ mod tests {
             &plane_pose,
         );
         assert_eq!(buf.len, 2);
-        for c in buf.as_slice() {
+        let contacts = buf.as_slice();
+        assert!(approx(contacts[0].position_world.x, 1.0, 1e-5));
+        assert!(approx(contacts[1].position_world.x, -1.0, 1e-5));
+        for c in contacts {
             assert!(approx(c.penetration, 0.2, 1e-5));
+            assert!(approx(c.position_world.z, -0.1, 1e-5));
         }
     }
 

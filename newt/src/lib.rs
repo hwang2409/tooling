@@ -45,7 +45,8 @@
 //!   dual) solved with fixed-iteration PGS. Ships condim 1 / 3, both
 //!   pyramidal and elliptic friction cones, and constraint-based joint
 //!   limits for hinge/slide. Opt-in via `world.solver.mode = Pgs`;
-//!   penalty is still default and preserves every existing golden.
+//!   penalty is still default; source-manifold changes can alter affected
+//!   contact trajectories and their documented goldens.
 //!   See `docs/solver.md`.
 //! - **v3** (`newton`) — opt-in dense Newton minimization over the same
 //!   regularized system, with exact pyramidal zone derivatives and an
