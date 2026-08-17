@@ -474,10 +474,12 @@ before the manifold update. The no-assist oracle also falls, so stable
 no-assist walking is not a valid target for this source controller.
 
 status: the isolated manifold finding is closed. solver-phase parity remains
-open. the first parsed structural mismatch is step `18`: source mask `2`
-versus newt mask `0`. At solver step `25`, source has one contact and four
-rows; newt has zero contacts and rows because it consumes the step-24 state.
-Post-step geometry then shows two contacts and eight rows on both sides.
+open. visual support masks and solver contact masks are stored separately. The
+first parsed solver structural mismatch is step `25`: source solver mask `2`
+versus newt solver mask `0`, with one contact and four rows versus zero
+contacts and rows. At visual step `18`, both solver masks and contacts are zero;
+only the source visual foot-height mask is `2`. Post-step geometry then shows
+two contacts and eight rows on both sides.
 
 At solver step `25`, source and newt constraint-force maxima are `112.489` and
 `0.000`; row reference-acceleration maxima are `124.015` and `0.000`. At step
@@ -491,9 +493,12 @@ The source-side contact and row records are in
 through `40`, including solver-phase and post-step records. The source
 capture records solver-phase state before `mj_step` and keeps post-step
 `mj_forward` geometry separate. The selected newt records are in
-`tests/references/biped_walk_v3_newt_diagnostics.json`. Each contact stores
-the geom pair, point, depth, normal, condim, frame, and row mapping.
-The newt diagnostic runner is `examples/biped_walk_diagnostics`; it prints
+`tests/references/biped_walk_v3_newt_diagnostics.json`; they are solver-phase
+records for steps `0` through `40`. Each parsed contact stores the geom pair,
+point, depth, and row mapping needed by the parity comparison.
+The newt diagnostic runner is `examples/capture_biped_diagnostics`; it writes
+the parsed fixture. The human diagnostic runner is
+`examples/biped_walk_diagnostics`; it prints
 steps `0..12`, `17`, `25`, and `36` with the same geom-level fields. It calls
 `solver::solve_tree_contacts`, the NEWT-23 row assembly path.
 

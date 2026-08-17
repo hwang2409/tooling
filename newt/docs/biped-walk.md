@@ -199,21 +199,22 @@ the manifold update did not improve the fall-step result. TARGET is not
 reached.
 
 status: the isolated manifold finding is closed. solver-phase parity remains
-open. both fixtures use the source `0.035 m` support threshold. post-step
-visual geometry matches through step `12`, but that is not the state consumed
-by either solver.
+open. both fixtures store visual support masks and solver contact masks
+separately. post-step visual geometry is not the state consumed by either
+solver.
 
 the diagnostic capture now records two phases. MuJoCo records contacts and
 rows before `mj_step`. newt records the contacts consumed inside `world.step`.
 post-step `mj_forward` and `detect_contacts` records stay separate visual
 geometry evidence.
 
-at solver step `18`, MuJoCo exposes right-foot support while newt exposes no
-contact. at solver step `25`, MuJoCo solves one `ground/right_foot_geom`
-contact with four rows while newt solves its step-24 zero-contact state. The
-post-step refresh then shows two contacts and eight rows on both sides. At
-solver step `36`, both sides solve four contacts and 16 rows, but the left-foot
-mask still differs. This timing mismatch is the current parity blocker.
+at solver step `18`, the visual mask is `2` on both sides, while both solver
+contact masks remain `0`. the first solver-phase manifold mismatch is step
+`25`: MuJoCo solves one `ground/right_foot_geom` contact with four rows while
+newt solves its step-24 zero-contact state. the post-step refresh then shows
+two contacts and eight rows on both sides. at solver step `36`, both sides
+solve four contacts and 16 rows. this timing mismatch is the current parity
+blocker.
 
 at solver step `25`, source and newt constraint-force maxima are `112.489` and
 `0.000`; row reference-acceleration maxima are `124.015` and `0.000`. At step
@@ -221,8 +222,10 @@ at solver step `25`, source and newt constraint-force maxima are `112.489` and
 maxima are `155.270` and `152.956`. Newt keeps its internal `from B into A`
 normal convention and flips only the diagnostic view.
 
-the first parsed structural mismatch is step `18`: source mask `2` versus newt
-mask `0`. The first solver-phase qvel residual bound exceeds at step `26`
+the first parsed solver structural mismatch is step `25`: source solver mask
+`2` versus newt solver mask `0`, with `1/4` versus `0/0` contacts/rows. step
+`18` is only a visual-mask checkpoint; its solver masks and contacts are both
+zero. the first solver-phase qvel residual bound exceeds at step `26`
 (`1.636116`), after the missed source contact has been consumed. The candidate
 cause is phase timing, not manifold geometry. The `0.4` fall-step gap remains
 an honest closed-loop finding.
@@ -230,7 +233,7 @@ an honest closed-loop finding.
 the per-step solver-phase residual trail is the next ticket's comparison
 specification:
 
-| step | qpos max | qvel max | source mask | newt mask | source contacts | newt contacts | structure |
+| step | qpos max | qvel max | source solver mask | newt solver mask | source contacts | newt contacts | structure |
 |---:|---:|---:|---:|---:|---:|---:|:---:|
 | 0 | 5.325e-8 | 0.000e0 | 0 | 0 | 0 | 0 | match |
 | 1 | 5.325e-8 | 0.000e0 | 0 | 0 | 0 | 0 | match |
@@ -250,24 +253,24 @@ specification:
 | 15 | 1.792e-4 | 2.050e-2 | 0 | 0 | 0 | 0 | match |
 | 16 | 2.737e-4 | 1.891e-2 | 0 | 0 | 0 | 0 | match |
 | 17 | 3.939e-4 | 2.403e-2 | 0 | 0 | 0 | 0 | match |
-| 18 | 5.009e-4 | 2.141e-2 | 2 | 0 | 0 | 0 | mismatch |
-| 19 | 6.142e-4 | 2.264e-2 | 2 | 0 | 0 | 0 | mismatch |
-| 20 | 7.578e-4 | 2.873e-2 | 2 | 0 | 0 | 0 | mismatch |
-| 21 | 8.295e-4 | 2.390e-2 | 2 | 0 | 0 | 0 | mismatch |
-| 22 | 9.045e-4 | 2.474e-2 | 2 | 0 | 0 | 0 | mismatch |
-| 23 | 9.526e-4 | 2.454e-2 | 2 | 0 | 0 | 0 | mismatch |
-| 24 | 1.004e-3 | 2.443e-2 | 2 | 0 | 0 | 0 | mismatch |
+| 18 | 5.009e-4 | 2.141e-2 | 0 | 0 | 0 | 0 | match |
+| 19 | 6.142e-4 | 2.264e-2 | 0 | 0 | 0 | 0 | match |
+| 20 | 7.578e-4 | 2.873e-2 | 0 | 0 | 0 | 0 | match |
+| 21 | 8.295e-4 | 2.390e-2 | 0 | 0 | 0 | 0 | match |
+| 22 | 9.045e-4 | 2.474e-2 | 0 | 0 | 0 | 0 | match |
+| 23 | 9.526e-4 | 2.454e-2 | 0 | 0 | 0 | 0 | match |
+| 24 | 1.004e-3 | 2.443e-2 | 0 | 0 | 0 | 0 | match |
 | 25 | 1.046e-3 | 2.401e-2 | 2 | 0 | 1 | 0 | mismatch |
 | 26 | 8.197e-3 | 1.636e0 | 2 | 2 | 2 | 2 | match |
 | 27 | 9.501e-3 | 2.609e-1 | 2 | 2 | 2 | 2 | match |
 | 28 | 8.315e-3 | 2.373e-1 | 2 | 2 | 2 | 2 | match |
 | 29 | 6.569e-3 | 3.492e-1 | 2 | 2 | 2 | 2 | match |
 | 30 | 4.997e-3 | 3.143e-1 | 2 | 2 | 2 | 2 | match |
-| 31 | 3.851e-3 | 2.384e-1 | 3 | 2 | 2 | 2 | mismatch |
-| 32 | 4.389e-3 | 2.778e-1 | 3 | 2 | 2 | 2 | mismatch |
-| 33 | 5.117e-3 | 3.016e-1 | 3 | 2 | 2 | 2 | mismatch |
-| 34 | 5.933e-3 | 2.529e-1 | 3 | 2 | 2 | 2 | mismatch |
-| 35 | 7.191e-3 | 2.516e-1 | 3 | 2 | 2 | 2 | mismatch |
+| 31 | 3.851e-3 | 2.384e-1 | 2 | 2 | 2 | 2 | match |
+| 32 | 4.389e-3 | 2.778e-1 | 2 | 2 | 2 | 2 | match |
+| 33 | 5.117e-3 | 3.016e-1 | 2 | 2 | 2 | 2 | match |
+| 34 | 5.933e-3 | 2.529e-1 | 2 | 2 | 2 | 2 | match |
+| 35 | 7.191e-3 | 2.516e-1 | 2 | 2 | 2 | 2 | match |
 | 36 | 8.357e-3 | 2.332e-1 | 3 | 3 | 4 | 4 | match |
 
 the measured trace gaps through the newt fall are:
@@ -280,9 +283,9 @@ the measured trace gaps through the newt fall are:
 | `0.0` | `439` | `1.151902` | `6.406135` | current gap; fall step mismatch |
 
 the source contact and row records are in
-`tests/references/biped_walk_v3_diagnostics.json`; the matched newt records
-are in `tests/references/biped_walk_v3_newt_diagnostics.json`. regenerate the
-source records with:
+`tests/references/biped_walk_v3_diagnostics.json`; the parsed newt solver-phase
+records are in `tests/references/biped_walk_v3_newt_diagnostics.json`. regenerate
+the source records with:
 
 ```text
 PYTHONPATH=~/me/fun/biped ~/me/fun/biped/.venv/bin/python \
@@ -291,6 +294,8 @@ PYTHONPATH=~/me/fun/biped ~/me/fun/biped/.venv/bin/python \
 PYTHONPATH=~/me/fun/biped ~/me/fun/biped/.venv/bin/python \
   tools/capture_biped_diagnostics.py --assist-scale 0.4 --steps 40 \
   --output tests/references/biped_walk_v3_diagnostics.json
+cargo run --quiet --manifest-path Cargo.toml --example capture_biped_diagnostics \
+  > tests/references/biped_walk_v3_newt_diagnostics.json
 ```
 
 `examples/biped_walk_acceptance` prints the four matched sweep rows.

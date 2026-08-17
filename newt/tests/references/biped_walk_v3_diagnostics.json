@@ -1,4 +1,5 @@
 {
+  "engine": "mujoco",
   "mujoco": "3.11.0",
   "captured": "2026-08-17",
   "assist_scale": 0.4,
@@ -17,7 +18,8 @@
       "solver_phase": {
         "step": 0,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0,
           0.0,
@@ -84,7 +86,8 @@
       "post_step_geometry": {
         "step": 0,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0,
           0.0,
@@ -154,7 +157,8 @@
       "solver_phase": {
         "step": 1,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0,
           0.0,
@@ -221,7 +225,8 @@
       "post_step_geometry": {
         "step": 1,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           5.827084587065111e-06,
           -1.0381454707294403e-07,
@@ -291,7 +296,8 @@
       "solver_phase": {
         "step": 2,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           5.827084587065111e-06,
           -1.0381454707294403e-07,
@@ -358,7 +364,8 @@
       "post_step_geometry": {
         "step": 2,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           1.6975524708775618e-05,
           -3.68935223922727e-07,
@@ -428,7 +435,8 @@
       "solver_phase": {
         "step": 3,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           1.6975524708775618e-05,
           -3.68935223922727e-07,
@@ -495,7 +503,8 @@
       "post_step_geometry": {
         "step": 3,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           3.316397420395256e-05,
           -8.229494193262632e-07,
@@ -565,7 +574,8 @@
       "solver_phase": {
         "step": 4,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           3.316397420395256e-05,
           -8.229494193262632e-07,
@@ -632,7 +642,8 @@
       "post_step_geometry": {
         "step": 4,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           5.42148634464446e-05,
           -1.4787700278400123e-06,
@@ -702,7 +713,8 @@
       "solver_phase": {
         "step": 5,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           5.42148634464446e-05,
           -1.4787700278400123e-06,
@@ -769,7 +781,8 @@
       "post_step_geometry": {
         "step": 5,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           8.002429813235473e-05,
           -2.340717199951862e-06,
@@ -839,7 +852,8 @@
       "solver_phase": {
         "step": 6,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           8.002429813235473e-05,
           -2.340717199951862e-06,
@@ -906,7 +920,8 @@
       "post_step_geometry": {
         "step": 6,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0001105234269113267,
           -3.406633976830326e-06,
@@ -976,7 +991,8 @@
       "solver_phase": {
         "step": 7,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0001105234269113267,
           -3.406633976830326e-06,
@@ -1043,7 +1059,8 @@
       "post_step_geometry": {
         "step": 7,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00014566770914263823,
           -4.6709110144049215e-06,
@@ -1113,7 +1130,8 @@
       "solver_phase": {
         "step": 8,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00014566770914263823,
           -4.6709110144049215e-06,
@@ -1180,7 +1198,8 @@
       "post_step_geometry": {
         "step": 8,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00018542305463252278,
           -6.125346783275175e-06,
@@ -1250,7 +1269,8 @@
       "solver_phase": {
         "step": 9,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00018542305463252278,
           -6.125346783275175e-06,
@@ -1317,7 +1337,8 @@
       "post_step_geometry": {
         "step": 9,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00022976204352860674,
           -7.760340746168544e-06,
@@ -1387,7 +1408,8 @@
       "solver_phase": {
         "step": 10,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00022976204352860674,
           -7.760340746168544e-06,
@@ -1454,7 +1476,8 @@
       "post_step_geometry": {
         "step": 10,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0002786589004816873,
           -9.565243489140406e-06,
@@ -1524,7 +1547,8 @@
       "solver_phase": {
         "step": 11,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0002786589004816873,
           -9.565243489140406e-06,
@@ -1591,7 +1615,8 @@
       "post_step_geometry": {
         "step": 11,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0003320881692406917,
           -1.1528815245474183e-05,
@@ -1661,7 +1686,8 @@
       "solver_phase": {
         "step": 12,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0003320881692406917,
           -1.1528815245474183e-05,
@@ -1728,7 +1754,8 @@
       "post_step_geometry": {
         "step": 12,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00032137051793218474,
           -1.3287460221313006e-05,
@@ -1798,7 +1825,8 @@
       "solver_phase": {
         "step": 13,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00032137051793218474,
           -1.3287460221313006e-05,
@@ -1865,7 +1893,8 @@
       "post_step_geometry": {
         "step": 13,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00032227228505554093,
           -2.1874976744715573e-05,
@@ -1935,7 +1964,8 @@
       "solver_phase": {
         "step": 14,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00032227228505554093,
           -2.1874976744715573e-05,
@@ -2002,7 +2032,8 @@
       "post_step_geometry": {
         "step": 14,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00030044600572749146,
           -3.121632007750478e-05,
@@ -2072,7 +2103,8 @@
       "solver_phase": {
         "step": 15,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00030044600572749146,
           -3.121632007750478e-05,
@@ -2139,7 +2171,8 @@
       "post_step_geometry": {
         "step": 15,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0002835314798145838,
           -4.4126799680881115e-05,
@@ -2209,7 +2242,8 @@
       "solver_phase": {
         "step": 16,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0002835314798145838,
           -4.4126799680881115e-05,
@@ -2276,7 +2310,8 @@
       "post_step_geometry": {
         "step": 16,
         "phase": "post_step_geometry",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0002580016204971818,
           -5.81527042961637e-05,
@@ -2346,7 +2381,8 @@
       "solver_phase": {
         "step": 17,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 0,
+        "visual_contact_mask": 0,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0002580016204971818,
           -5.81527042961637e-05,
@@ -2413,7 +2449,8 @@
       "post_step_geometry": {
         "step": 17,
         "phase": "post_step_geometry",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0002345240579533437,
           -7.442097780556461e-05,
@@ -2483,7 +2520,8 @@
       "solver_phase": {
         "step": 18,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0002345240579533437,
           -7.442097780556461e-05,
@@ -2550,7 +2588,8 @@
       "post_step_geometry": {
         "step": 18,
         "phase": "post_step_geometry",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00026591808628719784,
           -9.408538565503723e-05,
@@ -2620,7 +2659,8 @@
       "solver_phase": {
         "step": 19,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00026591808628719784,
           -9.408538565503723e-05,
@@ -2687,7 +2727,8 @@
       "post_step_geometry": {
         "step": 19,
         "phase": "post_step_geometry",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0002932016673002132,
           -0.00011098674897865798,
@@ -2757,7 +2798,8 @@
       "solver_phase": {
         "step": 20,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0002932016673002132,
           -0.00011098674897865798,
@@ -2824,7 +2866,8 @@
       "post_step_geometry": {
         "step": 20,
         "phase": "post_step_geometry",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0003447658500883969,
           -0.00012902995313260367,
@@ -2894,7 +2937,8 @@
       "solver_phase": {
         "step": 21,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0003447658500883969,
           -0.00012902995313260367,
@@ -2961,7 +3005,8 @@
       "post_step_geometry": {
         "step": 21,
         "phase": "post_step_geometry",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00039848836281096666,
           -0.00014586718719352754,
@@ -3031,7 +3076,8 @@
       "solver_phase": {
         "step": 22,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 0,
         "qpos": [
           0.00039848836281096666,
           -0.00014586718719352754,
@@ -3098,7 +3144,8 @@
       "post_step_geometry": {
         "step": 22,
         "phase": "post_step_geometry",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0004655820668906011,
           -0.00016315441349405802,
@@ -3168,7 +3215,8 @@
       "solver_phase": {
         "step": 23,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 0,
         "qpos": [
           0.0004655820668906011,
           -0.00016315441349405802,
@@ -3235,7 +3283,8 @@
       "post_step_geometry": {
         "step": 23,
         "phase": "post_step_geometry",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 0,
         "qpos": [
           0.000537407259472008,
           -0.0001800554721889814,
@@ -3305,7 +3354,8 @@
       "solver_phase": {
         "step": 24,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 0,
         "qpos": [
           0.000537407259472008,
           -0.0001800554721889814,
@@ -3372,7 +3422,8 @@
       "post_step_geometry": {
         "step": 24,
         "phase": "post_step_geometry",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0006183974511967849,
           -0.0001972275335882517,
@@ -3523,7 +3574,8 @@
       "solver_phase": {
         "step": 25,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0006183974511967849,
           -0.0001972275335882517,
@@ -3671,7 +3723,8 @@
       "post_step_geometry": {
         "step": 25,
         "phase": "post_step_geometry",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0007522805462518462,
           -0.00019389367127013892,
@@ -3896,7 +3949,8 @@
       "solver_phase": {
         "step": 26,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0007522805462518462,
           -0.00019389367127013892,
@@ -4118,7 +4172,8 @@
       "post_step_geometry": {
         "step": 26,
         "phase": "post_step_geometry",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0009586639353222269,
           -0.00016078696897058351,
@@ -4343,7 +4398,8 @@
       "solver_phase": {
         "step": 27,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0009586639353222269,
           -0.00016078696897058351,
@@ -4565,7 +4621,8 @@
       "post_step_geometry": {
         "step": 27,
         "phase": "post_step_geometry",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0012414244003485205,
           -9.641645023573424e-05,
@@ -4790,7 +4847,8 @@
       "solver_phase": {
         "step": 28,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0012414244003485205,
           -9.641645023573424e-05,
@@ -5012,7 +5070,8 @@
       "post_step_geometry": {
         "step": 28,
         "phase": "post_step_geometry",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0015999151331647496,
           -3.646219025413496e-07,
@@ -5237,7 +5296,8 @@
       "solver_phase": {
         "step": 29,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0015999151331647496,
           -3.646219025413496e-07,
@@ -5459,7 +5519,8 @@
       "post_step_geometry": {
         "step": 29,
         "phase": "post_step_geometry",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0020313067354119415,
           0.0001275947655671621,
@@ -5684,7 +5745,8 @@
       "solver_phase": {
         "step": 30,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 2,
+        "visual_contact_mask": 2,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0020313067354119415,
           0.0001275947655671621,
@@ -5906,7 +5968,8 @@
       "post_step_geometry": {
         "step": 30,
         "phase": "post_step_geometry",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0025324154199981622,
           0.0002874481709563323,
@@ -6131,7 +6194,8 @@
       "solver_phase": {
         "step": 31,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0025324154199981622,
           0.0002874481709563323,
@@ -6353,7 +6417,8 @@
       "post_step_geometry": {
         "step": 31,
         "phase": "post_step_geometry",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0028912111129865184,
           0.00047582664667751074,
@@ -6578,7 +6643,8 @@
       "solver_phase": {
         "step": 32,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0028912111129865184,
           0.00047582664667751074,
@@ -6800,7 +6866,8 @@
       "post_step_geometry": {
         "step": 32,
         "phase": "post_step_geometry",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0033074052352912767,
           0.0006789114218366806,
@@ -7025,7 +7092,8 @@
       "solver_phase": {
         "step": 33,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0033074052352912767,
           0.0006789114218366806,
@@ -7247,7 +7315,8 @@
       "post_step_geometry": {
         "step": 33,
         "phase": "post_step_geometry",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0036905914422185426,
           0.0009113178127822353,
@@ -7472,7 +7541,8 @@
       "solver_phase": {
         "step": 34,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 2,
         "qpos": [
           0.0036905914422185426,
           0.0009113178127822353,
@@ -7694,7 +7764,8 @@
       "post_step_geometry": {
         "step": 34,
         "phase": "post_step_geometry",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 2,
         "qpos": [
           0.004123554732984149,
           0.0011650980967495414,
@@ -7919,7 +7990,8 @@
       "solver_phase": {
         "step": 35,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 2,
         "qpos": [
           0.004123554732984149,
           0.0011650980967495414,
@@ -8141,7 +8213,8 @@
       "post_step_geometry": {
         "step": 35,
         "phase": "post_step_geometry",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 3,
         "qpos": [
           0.004567530081454159,
           0.001446320314683324,
@@ -8514,7 +8587,8 @@
       "solver_phase": {
         "step": 36,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 3,
         "qpos": [
           0.004567530081454159,
           0.001446320314683324,
@@ -8884,7 +8958,8 @@
       "post_step_geometry": {
         "step": 36,
         "phase": "post_step_geometry",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 3,
         "qpos": [
           0.004819014092838249,
           0.0016807931601582442,
@@ -9257,7 +9332,8 @@
       "solver_phase": {
         "step": 37,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 3,
         "qpos": [
           0.004819014092838249,
           0.0016807931601582442,
@@ -9627,7 +9703,8 @@
       "post_step_geometry": {
         "step": 37,
         "phase": "post_step_geometry",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 3,
         "qpos": [
           0.004921700275697724,
           0.001843037223028677,
@@ -10000,7 +10077,8 @@
       "solver_phase": {
         "step": 38,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 3,
         "qpos": [
           0.004921700275697724,
           0.001843037223028677,
@@ -10370,7 +10448,8 @@
       "post_step_geometry": {
         "step": 38,
         "phase": "post_step_geometry",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 1,
         "qpos": [
           0.00487146450320687,
           0.0019301299042334275,
@@ -10595,7 +10674,8 @@
       "solver_phase": {
         "step": 39,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 1,
         "qpos": [
           0.00487146450320687,
           0.0019301299042334275,
@@ -10817,7 +10897,8 @@
       "post_step_geometry": {
         "step": 39,
         "phase": "post_step_geometry",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 3,
         "qpos": [
           0.00466359408870444,
           0.0019073475990208923,
@@ -11190,7 +11271,8 @@
       "solver_phase": {
         "step": 40,
         "phase": "solver_phase_pre_step",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 3,
         "qpos": [
           0.00466359408870444,
           0.0019073475990208923,
@@ -11560,7 +11642,8 @@
       "post_step_geometry": {
         "step": 40,
         "phase": "post_step_geometry",
-        "contact_mask": 3,
+        "visual_contact_mask": 3,
+        "solver_contact_mask": 3,
         "qpos": [
           0.004339123732570096,
           0.0018125839771420877,

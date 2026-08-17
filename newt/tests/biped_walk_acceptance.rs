@@ -44,7 +44,7 @@ struct OracleFixture {
 #[derive(Debug)]
 struct Checkpoint {
     step: u32,
-    contact_mask: u8,
+    visual_contact_mask: u8,
     qpos: Vec<f64>,
     qvel: Vec<f64>,
 }
@@ -60,7 +60,8 @@ struct NewtRun {
 #[derive(Debug)]
 struct PhaseCheckpoint {
     step: u32,
-    contact_mask: u8,
+    visual_contact_mask: u8,
+    solver_contact_mask: u8,
     qpos: Vec<f64>,
     qvel: Vec<f64>,
     contacts: Vec<PhaseContact>,
@@ -77,13 +78,33 @@ struct PhaseContact {
 
 fn solver_phase_fixture() -> Vec<PhaseCheckpoint> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source = fs::read_to_string(root.join("tests/references/biped_walk_v3_diagnostics.json"))
-        .expect("biped solver-phase diagnostics fixture");
+    parse_phase_fixture(
+        &root.join("tests/references/biped_walk_v3_diagnostics.json"),
+        "mujoco",
+        "solver phase before mj_step; post-step mj_forward separately",
+    )
+}
+
+fn newt_solver_phase_fixture() -> Vec<PhaseCheckpoint> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    parse_phase_fixture(
+        &root.join("tests/references/biped_walk_v3_newt_diagnostics.json"),
+        "newt",
+        "solver phase before world.step; post-step geometry omitted",
+    )
+}
+
+fn parse_phase_fixture(path: &Path, engine: &str, capture: &str) -> Vec<PhaseCheckpoint> {
+    let source =
+        fs::read_to_string(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     let object = expect_object(json::parse(&source).expect("biped diagnostics JSON is valid"));
-    assert_eq!(expect_string(object_value(&object, "mujoco")), "3.11.0");
+    assert_eq!(expect_string(object_value(&object, "engine")), engine);
+    if engine == "mujoco" {
+        assert_eq!(expect_string(object_value(&object, "mujoco")), "3.11.0");
+    }
     assert_eq!(
         expect_string(object_value(&object, "contact_capture")),
-        "solver phase before mj_step; post-step mj_forward separately"
+        capture
     );
     match object_value(&object, "records") {
         Value::Array(records) => records
@@ -145,7 +166,8 @@ fn parse_phase_checkpoint(object: &[(String, Value)]) -> PhaseCheckpoint {
     let qvel = expect_f64_vec(object_value(object, "qvel"));
     PhaseCheckpoint {
         step: expect_u32(object_value(object, "step")),
-        contact_mask: expect_u8(object_value(object, "contact_mask")),
+        visual_contact_mask: expect_u8(object_value(object, "visual_contact_mask")),
+        solver_contact_mask: expect_u8(object_value(object, "solver_contact_mask")),
         qpos,
         qvel,
         contacts,
@@ -169,7 +191,8 @@ fn phase_checkpoint_from_newt(step: usize, scene: &newt::model::Scene) -> PhaseC
         .collect();
     PhaseCheckpoint {
         step: step as u32,
-        contact_mask: solver_contact_mask(scene, &phase.contacts),
+        visual_contact_mask: visual_contact_mask(scene),
+        solver_contact_mask: solver_contact_mask(scene, &phase.contacts),
         qpos: qpos.into_iter().map(f64::from).collect(),
         qvel: qvel.into_iter().map(f64::from).collect(),
         contacts,
@@ -270,12 +293,12 @@ fn fixture(level: &str) -> OracleFixture {
     let mut checkpoints = Vec::with_capacity(checkpoint_count);
     for _ in 0..checkpoint_count {
         let step = cursor.u32();
-        let contact_mask = cursor.u8();
+        let visual_contact_mask = cursor.u8();
         let qpos = (0..QPOS_COUNT).map(|_| cursor.f64()).collect();
         let qvel = (0..QVEL_COUNT).map(|_| cursor.f64()).collect();
         checkpoints.push(Checkpoint {
             step,
-            contact_mask,
+            visual_contact_mask,
             qpos,
             qvel,
         });
@@ -399,7 +422,7 @@ fn run_newt(assist_scale: f32, steps: usize) -> NewtRun {
     let (initial_qpos, initial_qvel) = initial_biped_qpos_qvel();
     checkpoints.push(Checkpoint {
         step: 0,
-        contact_mask: 0,
+        visual_contact_mask: 0,
         qpos: initial_qpos.into_iter().map(f64::from).collect(),
         qvel: initial_qvel.into_iter().map(f64::from).collect(),
     });
@@ -410,11 +433,11 @@ fn run_newt(assist_scale: f32, steps: usize) -> NewtRun {
         |step, scene| {
             phase_checkpoints.push(phase_checkpoint_from_newt(step, scene));
             if step > 0 {
-                let contact_mask = visual_contact_mask(scene);
+                let visual_contact_mask = visual_contact_mask(scene);
                 let (qpos, qvel) = extract_biped_qpos_qvel(scene);
                 checkpoints.push(Checkpoint {
                     step: step as u32,
-                    contact_mask,
+                    visual_contact_mask,
                     qpos: qpos.into_iter().map(f64::from).collect(),
                     qvel: qvel.into_iter().map(f64::from).collect(),
                 });
@@ -458,7 +481,7 @@ fn assert_level(level: &str, expected_newt_fall_step: Option<u32>) {
         .min(newt.first_fall_step.unwrap_or(source.steps_requested));
     let mut max_qpos = 0.0f64;
     let mut max_qvel = 0.0f64;
-    let mut first_contact_mismatch = None;
+    let mut first_visual_mask_mismatch = None;
     for step in 0..=compare_steps {
         let expected = &source.checkpoints[step as usize];
         let actual = &newt.checkpoints[step as usize];
@@ -466,12 +489,14 @@ fn assert_level(level: &str, expected_newt_fall_step: Option<u32>) {
         assert_eq!(actual.step, step);
         if step <= 12 {
             assert_eq!(
-                actual.contact_mask, expected.contact_mask,
+                actual.visual_contact_mask, expected.visual_contact_mask,
                 "{level} visual contact mask diverged in the closed early window at step {step}"
             );
         }
-        if first_contact_mismatch.is_none() && expected.contact_mask != actual.contact_mask {
-            first_contact_mismatch = Some(step);
+        if first_visual_mask_mismatch.is_none()
+            && expected.visual_contact_mask != actual.visual_contact_mask
+        {
+            first_visual_mask_mismatch = Some(step);
         }
         let step_qpos = actual
             .qpos
@@ -509,7 +534,7 @@ fn assert_level(level: &str, expected_newt_fall_step: Option<u32>) {
     };
     assert_measured_metrics(level, &source, &newt.result);
     println!(
-        "assist={:.1} source={} newt={} source_fall={:?} newt_fall={:?} compare_steps={} first_contact_mismatch={:?} qpos_max={max_qpos:.6e} qvel_max={max_qvel:.6e} source_distance={:.6} newt_distance={:.6} source_cadence={:.3} newt_cadence={:.3} source_step={:.6} newt_step={:.6} source_stride={:.6} newt_stride={:.6} source_clearance={:.6} newt_clearance={:.6} source_final_root={:.6} newt_final_root={:.6}",
+        "assist={:.1} source={} newt={} source_fall={:?} newt_fall={:?} compare_steps={} first_visual_mask_mismatch={:?} qpos_max={max_qpos:.6e} qvel_max={max_qvel:.6e} source_distance={:.6} newt_distance={:.6} source_cadence={:.3} newt_cadence={:.3} source_step={:.6} newt_step={:.6} source_stride={:.6} newt_stride={:.6} source_clearance={:.6} newt_clearance={:.6} source_final_root={:.6} newt_final_root={:.6}",
         source.assist_scale,
         if source_complete {
             "complete"
@@ -524,7 +549,7 @@ fn assert_level(level: &str, expected_newt_fall_step: Option<u32>) {
         source_fall_step,
         newt.first_fall_step,
         compare_steps,
-        first_contact_mismatch,
+        first_visual_mask_mismatch,
         source.distance,
         metrics.forward_distance,
         source.cadence,
@@ -540,7 +565,7 @@ fn assert_level(level: &str, expected_newt_fall_step: Option<u32>) {
     );
     assert!(max_qpos.is_finite() && max_qvel.is_finite());
     assert_ne!(
-        first_contact_mismatch,
+        first_visual_mask_mismatch,
         Some(12),
         "the step-12 visual contact divergence must stay closed"
     );
@@ -726,10 +751,70 @@ fn extract_biped_qpos_qvel(scene: &newt::model::Scene) -> BipedState {
 
 #[test]
 fn v3_diagnostic_fixture_records_geom_manifolds() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let source = solver_phase_fixture();
-    assert_eq!(source.len(), 41);
-    for (step, checkpoint) in source.iter().enumerate() {
+    let recorded_newt = newt_solver_phase_fixture();
+    assert_phase_fixture_shape(&source, 41);
+    assert_phase_fixture_shape(&recorded_newt, 41);
+    assert_eq!(source[18].visual_contact_mask, 2);
+    assert_eq!(source[18].solver_contact_mask, 0);
+    assert_eq!(recorded_newt[18].visual_contact_mask, 2);
+    assert_eq!(recorded_newt[18].solver_contact_mask, 0);
+    let step25 = &source[25];
+    assert_eq!(step25.visual_contact_mask, 2);
+    assert_eq!(step25.solver_contact_mask, 2);
+    assert_eq!(step25.contacts.len(), 1);
+    assert_eq!(
+        step25.contacts[0].geom_pair,
+        ["ground".to_string(), "right_foot_geom".to_string()]
+    );
+    assert!((step25.contacts[0].dist + 0.00030427783267333863).abs() < 1e-12);
+    assert_eq!(step25.contacts[0].row_indices, vec![0, 1, 2, 3]);
+
+    let first_structural_mismatch =
+        compare_phase_fixtures("mujoco/newt", &source, &recorded_newt, 36);
+    assert_eq!(
+        first_structural_mismatch,
+        Some(25),
+        "solver-phase contact or row divergence moved; update the fixture and diagnosis"
+    );
+
+    let newt = run_newt(0.4, 36);
+    assert_eq!(newt.phase_checkpoints.len(), 37);
+    assert_eq!(
+        compare_phase_fixtures(
+            "fixture/live newt",
+            &recorded_newt,
+            &newt.phase_checkpoints,
+            36
+        ),
+        None,
+        "the parsed newt solver-phase fixture must match the live capture"
+    );
+    let mut first_qpos_bound_exceed = None;
+    let mut first_qvel_bound_exceed = None;
+    for (step, (expected, actual)) in source
+        .iter()
+        .zip(&newt.phase_checkpoints)
+        .take(37)
+        .enumerate()
+    {
+        let qpos_gap = max_gap(&actual.qpos, &expected.qpos);
+        let qvel_gap = max_gap(&actual.qvel, &expected.qvel);
+        if qpos_gap > EARLY_QPOS_GAP_BOUND && first_qpos_bound_exceed.is_none() {
+            first_qpos_bound_exceed = Some(step);
+        }
+        if qvel_gap > EARLY_QVEL_GAP_BOUND && first_qvel_bound_exceed.is_none() {
+            first_qvel_bound_exceed = Some(step);
+        }
+    }
+    println!(
+        "solver_phase_first_bound_exceed qpos={first_qpos_bound_exceed:?} qvel={first_qvel_bound_exceed:?} structural={first_structural_mismatch:?}"
+    );
+}
+
+fn assert_phase_fixture_shape(checkpoints: &[PhaseCheckpoint], expected_len: usize) {
+    assert_eq!(checkpoints.len(), expected_len);
+    for (step, checkpoint) in checkpoints.iter().enumerate() {
         assert_eq!(checkpoint.step, step as u32);
         assert_eq!(checkpoint.qpos.len(), QPOS_COUNT);
         assert_eq!(checkpoint.qvel.len(), QVEL_COUNT);
@@ -739,99 +824,57 @@ fn v3_diagnostic_fixture_records_geom_manifolds() {
         );
         assert_contact_rows(checkpoint);
     }
-    let step25 = &source[25];
-    assert_eq!(step25.contact_mask, 2);
-    assert_eq!(step25.contacts.len(), 1);
-    assert_eq!(
-        step25.contacts[0].geom_pair,
-        ["ground".to_string(), "right_foot_geom".to_string()]
-    );
-    assert!((step25.contacts[0].dist + 0.00030427783267333863).abs() < 1e-12);
-    assert_eq!(step25.contacts[0].row_indices, vec![0, 1, 2, 3]);
+}
 
-    let newt = run_newt(0.4, 36);
-    assert_eq!(newt.phase_checkpoints.len(), 37);
+fn compare_phase_fixtures(
+    label: &str,
+    expected: &[PhaseCheckpoint],
+    actual: &[PhaseCheckpoint],
+    last_step: usize,
+) -> Option<usize> {
     let mut first_structural_mismatch = None;
-    let mut first_qpos_bound_exceed = None;
-    let mut first_qvel_bound_exceed = None;
-    for (step, (expected, actual)) in source
-        .iter()
-        .zip(&newt.phase_checkpoints)
-        .take(37)
-        .enumerate()
-    {
-        assert_eq!(actual.step, step as u32);
-        assert_eq!(actual.qpos.len(), QPOS_COUNT);
-        assert_eq!(actual.qvel.len(), QVEL_COUNT);
-        assert_contact_rows(actual);
-        let qpos_gap = max_gap(&actual.qpos, &expected.qpos);
-        let qvel_gap = max_gap(&actual.qvel, &expected.qvel);
-        if qpos_gap > EARLY_QPOS_GAP_BOUND && first_qpos_bound_exceed.is_none() {
-            first_qpos_bound_exceed = Some(step);
-        }
-        if qvel_gap > EARLY_QVEL_GAP_BOUND && first_qvel_bound_exceed.is_none() {
-            first_qvel_bound_exceed = Some(step);
-        }
-        let structural_match = phase_structure_matches(expected, actual);
+    for step in 0..=last_step {
+        let expected_checkpoint = &expected[step];
+        let actual_checkpoint = &actual[step];
+        assert_eq!(actual_checkpoint.step, step as u32, "{label} step number");
+        assert_contact_rows(actual_checkpoint);
+        let structural_match = phase_structure_matches(expected_checkpoint, actual_checkpoint);
         if !structural_match && first_structural_mismatch.is_none() {
             first_structural_mismatch = Some(step);
         }
         if structural_match {
-            for (expected_contact, actual_contact) in expected.contacts.iter().zip(&actual.contacts)
+            for (expected_contact, actual_contact) in expected_checkpoint
+                .contacts
+                .iter()
+                .zip(&actual_checkpoint.contacts)
             {
                 assert!(
                     max_gap(&actual_contact.position, &expected_contact.position) <= 0.02,
-                    "step {step} contact position gap exceeds 0.02"
+                    "{label} step {step} contact position gap exceeds 0.02"
                 );
                 assert!(
                     (actual_contact.dist - expected_contact.dist).abs() <= 0.02,
-                    "step {step} contact depth gap exceeds 0.02"
+                    "{label} step {step} contact depth gap exceeds 0.02"
                 );
             }
         }
         println!(
-            "solver_phase_gap step={step} qpos={qpos_gap:.6e} qvel={qvel_gap:.6e} oracle_mask={} newt_mask={} oracle_contacts={} newt_contacts={} structural_match={structural_match}",
-            expected.contact_mask,
-            actual.contact_mask,
-            expected.contacts.len(),
-            actual.contacts.len(),
+            "solver_phase_fixture={label} step={step} visual_masks={}/{} solver_masks={}/{} contacts={}/{} rows={}/{} structural_match={structural_match}",
+            expected_checkpoint.visual_contact_mask,
+            actual_checkpoint.visual_contact_mask,
+            expected_checkpoint.solver_contact_mask,
+            actual_checkpoint.solver_contact_mask,
+            expected_checkpoint.contacts.len(),
+            actual_checkpoint.contacts.len(),
+            expected_checkpoint.row_to_contact.len(),
+            actual_checkpoint.row_to_contact.len(),
         );
     }
-    assert_eq!(
-        first_structural_mismatch,
-        Some(18),
-        "solver-phase manifold divergence moved; update the fixture and diagnosis"
-    );
-    println!(
-        "solver_phase_first_bound_exceed qpos={first_qpos_bound_exceed:?} qvel={first_qvel_bound_exceed:?} structural={first_structural_mismatch:?}"
-    );
-
-    let newt_path = root.join("tests/references/biped_walk_v3_newt_diagnostics.json");
-    let newt_diagnostics = fs::read_to_string(newt_path).expect("newt biped diagnostics fixture");
-    let newt_object = expect_object(json::parse(&newt_diagnostics).expect("newt diagnostics JSON"));
-    assert_eq!(expect_string(object_value(&newt_object, "engine")), "newt");
-    assert_eq!(
-        expect_string(object_value(&newt_object, "contact_capture")),
-        "post-step detect_contacts; not solver phase"
-    );
-    let newt_records = match object_value(&newt_object, "records") {
-        Value::Array(records) => records,
-        other => panic!(
-            "newt diagnostic records must be an array, got {}",
-            other.type_name()
-        ),
-    };
-    let step25 = expect_object(newt_records[3].clone());
-    assert_eq!(expect_u32(object_value(&step25, "step")), 25);
-    assert_eq!(expect_u32(object_value(&step25, "rows")), 8);
-    assert_eq!(
-        expect_usize_vec(object_value(&step25, "row_to_contact")),
-        vec![0, 0, 0, 0, 1, 1, 1, 1]
-    );
+    first_structural_mismatch
 }
 
 fn phase_structure_matches(expected: &PhaseCheckpoint, actual: &PhaseCheckpoint) -> bool {
-    expected.contact_mask == actual.contact_mask
+    expected.solver_contact_mask == actual.solver_contact_mask
         && expected.row_to_contact == actual.row_to_contact
         && expected.contacts.len() == actual.contacts.len()
         && expected
