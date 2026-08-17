@@ -299,10 +299,10 @@ parity bounds. Mesh-local route pose orientations are excluded from the CI
 value comparison because MuJoCo's mesh compiler can choose different
 principal-axis frames across platforms. Mesh contact positions and normals are
 transformed by subtracting the owning body position and applying the inverse
-owning body rotation. Plane-mesh additionally uses the compiled mesh-geom
-position as its origin and applies the inverse compiled mesh-geom rotation
-because MuJoCo's plane-convex contact construction follows that
-platform-dependent frame. CI retains all three vector components. It uses
+owning body rotation. It then removes the compiled mesh-geom position and
+rotation and maps the result through a basis built from the labeled compiled
+mesh vertices. This removes only the reviewed compiler-frame transform while
+retaining direction. CI compares all three vector components. It uses
 geometry and penetration rank for stable contact correspondence, then full
 transformed vectors as tie-breakers. The Rust fixture keeps world-frame values
 for route replay.

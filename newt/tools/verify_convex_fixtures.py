@@ -93,37 +93,98 @@ def inverse_rotate(quaternion: list[float], vector: list[float]) -> list[float]:
     ]
 
 
-def body_frame_contact(
-    body_pose: dict,
-    frame_pose: dict,
-    contact: dict,
-    use_frame_origin: bool,
-) -> dict:
-    origin_pose = frame_pose if use_frame_origin else body_pose
-    relative_position = [
-        contact["position"][index] - origin_pose["position"][index]
-        for index in range(3)
+def quaternion_multiply(left: list[float], right: list[float]) -> list[float]:
+    lw, lx, ly, lz = left
+    rw, rx, ry, rz = right
+    return [
+        lw * rw - lx * rx - ly * ry - lz * rz,
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
     ]
+
+
+def quaternion_conjugate(quaternion: list[float]) -> list[float]:
+    return [quaternion[0], -quaternion[1], -quaternion[2], -quaternion[3]]
+
+
+def dot(left: list[float], right: list[float]) -> float:
+    return sum(left[index] * right[index] for index in range(3))
+
+
+def subtract(left: list[float], right: list[float]) -> list[float]:
+    return [left[index] - right[index] for index in range(3)]
+
+
+def scale(vector: list[float], factor: float) -> list[float]:
+    return [component * factor for component in vector]
+
+
+def cross(left: list[float], right: list[float]) -> list[float]:
+    return [
+        left[1] * right[2] - left[2] * right[1],
+        left[2] * right[0] - left[0] * right[2],
+        left[0] * right[1] - left[1] * right[0],
+    ]
+
+
+def normalize(vector: list[float]) -> list[float]:
+    length = math.sqrt(dot(vector, vector))
+    assert length > 0.0
+    return scale(vector, 1.0 / length)
+
+
+def mesh_basis(mesh: dict) -> tuple[list[float], list[float], list[float]]:
+    vertices = mesh["vertices"]
+    origin = vertices[0]
+    first = normalize(subtract(vertices[1], origin))
+    second_unscaled = subtract(vertices[2], origin)
+    second = normalize(subtract(second_unscaled, scale(first, dot(second_unscaled, first))))
+    third = normalize(cross(first, second))
+    return first, second, third
+
+
+def basis_coordinates(basis: tuple[list[float], list[float], list[float]], vector: list[float]) -> list[float]:
+    return [dot(axis, vector) for axis in basis]
+
+
+def body_frame_contact(body_pose: dict, geom_pose: dict, mesh: dict, contact: dict) -> dict:
+    body_position = body_pose["position"]
+    body_orientation = body_pose["orientation_wxyz"]
+    relative_position = inverse_rotate(
+        body_orientation,
+        subtract(contact["position"], body_position),
+    )
+    geom_position = inverse_rotate(
+        body_orientation,
+        subtract(geom_pose["position"], body_position),
+    )
+    relative_position = subtract(relative_position, geom_position)
+    relative_orientation = quaternion_multiply(
+        quaternion_conjugate(body_orientation), geom_pose["orientation_wxyz"]
+    )
+    mesh_position = inverse_rotate(relative_orientation, relative_position)
+    mesh_normal = inverse_rotate(
+        relative_orientation,
+        inverse_rotate(body_orientation, contact["frame_normal"]),
+    )
+    basis = mesh_basis(mesh)
     return {
         "geom": tuple(contact["geom"]),
-        "position": inverse_rotate(
-            frame_pose["orientation_wxyz"], relative_position
-        ),
-        "frame_normal": inverse_rotate(
-            frame_pose["orientation_wxyz"], contact["frame_normal"]
-        ),
+        "position": basis_coordinates(basis, mesh_position),
+        "frame_normal": basis_coordinates(basis, mesh_normal),
         "penetration": float(contact["penetration"]),
     }
 
 
 def sorted_body_frame_contacts(
     body_pose: dict,
-    frame_pose: dict,
+    geom_pose: dict,
+    mesh: dict,
     contacts: list[dict],
-    use_frame_origin: bool,
 ) -> list[dict]:
     transformed = [
-        body_frame_contact(body_pose, frame_pose, contact, use_frame_origin)
+        body_frame_contact(body_pose, geom_pose, mesh, contact)
         for contact in contacts
     ]
     return sorted(
@@ -233,27 +294,17 @@ def compare_route_oracle(
             assert len(committed_pose["contacts"]) == len(fresh_pose["contacts"])
             mesh_pair = "mesh" in committed_probe["pair"]
             if mesh_pair:
-                committed_contact_frame = (
-                    committed_pose["pose_b"]
-                    if committed_probe["pair"] == "plane-mesh"
-                    else committed_pose["body_pose_b"]
-                )
-                fresh_contact_frame = (
-                    fresh_pose["pose_b"]
-                    if fresh_probe["pair"] == "plane-mesh"
-                    else fresh_pose["body_pose_b"]
-                )
                 committed_contacts = sorted_body_frame_contacts(
                     committed_pose["body_pose_b"],
-                    committed_contact_frame,
+                    committed_pose["pose_b"],
+                    committed_probe["mesh"],
                     committed_pose["contacts"],
-                    committed_probe["pair"] == "plane-mesh",
                 )
                 fresh_contacts = sorted_body_frame_contacts(
                     fresh_pose["body_pose_b"],
-                    fresh_contact_frame,
+                    fresh_pose["pose_b"],
+                    fresh_probe["mesh"],
                     fresh_pose["contacts"],
-                    fresh_probe["pair"] == "plane-mesh",
                 )
             else:
                 committed_contacts = committed_pose["contacts"]
@@ -342,6 +393,15 @@ def run_ci_regression_self_test() -> None:
                 "pair": "mesh-mesh",
                 "mujoco_route": "mjc_Convex",
                 "source_xml": "test.xml",
+                "mesh": {
+                    "vertices": [
+                        [0.0, 0.0, 0.0],
+                        [1.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    "faces": [],
+                },
                 "poses": [
                     {
                         "id": "near_touch",
