@@ -17,7 +17,7 @@
 //!   - capsule vs capsule
 //!   - box vs box (full OBB SAT with edge-edge cross axes — closes the
 //!     NEWT-5 rotated-stack incident)
-//!   - all listed non-hfield convex CCD pairs use deterministic GJK plus EPA
+//!   - enabled non-hfield convex CCD pairs use deterministic GJK plus EPA
 //!
 //! MuJoCo 3.11.0 routes sphere-{ellipsoid,mesh} through `mjc_Convex` and
 //! plane-{ellipsoid,mesh} through `mjc_PlaneConvex`. Newt matches these routes
@@ -25,10 +25,13 @@
 //! - Deferred pairs (silently emit no contact + [`is_pair_supported`]
 //!   returns `false` so the world validator can reject them):
 //!   - box vs {sphere, capsule}  (unchanged from tier 2)
+//!   - capsule vs {ellipsoid, cylinder, mesh}
+//!   - ellipsoid vs {ellipsoid, cylinder, box, mesh}
+//!   - cylinder vs {cylinder, box, mesh}
 //!   - hfield vs {cylinder, ellipsoid, mesh}
 //!
-//! Deferred pairs are limited to unsupported hfield combinations and the
-//! existing box-sphere and box-capsule gaps. They are called out in the docs.
+//! Deferred pairs have no oracle evidence in this change. They are called out
+//! in the docs instead of silently producing empty contact buffers.
 //!
 //! # Margin / gap semantics
 //!
@@ -222,20 +225,10 @@ fn supported_shape_pair(a: &GeomShape, b: &GeomShape) -> bool {
             | (GeomShape::Sphere { .. }, GeomShape::Mesh { .. })
             | (GeomShape::Sphere { .. }, GeomShape::Hfield { .. })
             | (GeomShape::Capsule { .. }, GeomShape::Capsule { .. })
-            | (GeomShape::Capsule { .. }, GeomShape::Cylinder { .. })
-            | (GeomShape::Capsule { .. }, GeomShape::Ellipsoid { .. })
-            | (GeomShape::Capsule { .. }, GeomShape::Mesh { .. })
             | (GeomShape::Box { .. }, GeomShape::Box { .. })
-            | (GeomShape::Box { .. }, GeomShape::Ellipsoid { .. })
             | (GeomShape::Box { .. }, GeomShape::Mesh { .. })
             | (GeomShape::Box { .. }, GeomShape::Hfield { .. })
             | (GeomShape::Capsule { .. }, GeomShape::Hfield { .. })
-            | (GeomShape::Cylinder { .. }, GeomShape::Cylinder { .. })
-            | (GeomShape::Cylinder { .. }, GeomShape::Box { .. })
-            | (GeomShape::Cylinder { .. }, GeomShape::Ellipsoid { .. })
-            | (GeomShape::Cylinder { .. }, GeomShape::Mesh { .. })
-            | (GeomShape::Ellipsoid { .. }, GeomShape::Ellipsoid { .. })
-            | (GeomShape::Ellipsoid { .. }, GeomShape::Mesh { .. })
             | (GeomShape::Mesh { .. }, GeomShape::Mesh { .. })
     )
 }
@@ -4454,6 +4447,10 @@ mod tests {
             position: Vec3::ZERO,
             orientation: Quat::IDENTITY,
         };
+        let rotated_pose = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::from_axis_angle(Vec3::Y, 0.7),
+        };
         let capsule = CcdShape::Capsule {
             pose: &pose,
             radius: 0.2,
@@ -4484,6 +4481,30 @@ mod tests {
         assert!(ellipsoid.support(Vec3::Z).z > 0.39);
         assert!(box_shape.support(-Vec3::Y).y < -0.29);
         assert!(mesh.support(Vec3::Y).y > 0.9);
+
+        let rotated_capsule = CcdShape::Capsule {
+            pose: &rotated_pose,
+            radius: 0.2,
+            half_height: 0.5,
+        };
+        let rotated_cylinder = CcdShape::Cylinder {
+            pose: &rotated_pose,
+            radius: 0.2,
+            half_height: 0.5,
+        };
+        let rotated_ellipsoid = CcdShape::Ellipsoid {
+            pose: &rotated_pose,
+            semi_axes: Vec3::new(0.2, 0.3, 0.4),
+        };
+        let rotated_box = CcdShape::Box {
+            pose: &rotated_pose,
+            half_extents: Vec3::new(0.2, 0.3, 0.4),
+        };
+        let rotated_axis = rotated_pose.rotate(Vec3::Z);
+        assert!(rotated_capsule.support(rotated_axis).dot(rotated_axis) > 0.69);
+        assert!(rotated_cylinder.support(rotated_axis).dot(rotated_axis) > 0.49);
+        assert!(rotated_ellipsoid.support(rotated_axis).dot(rotated_axis) > 0.39);
+        assert!(rotated_box.support(rotated_axis).dot(rotated_axis) > 0.39);
     }
 
     #[test]

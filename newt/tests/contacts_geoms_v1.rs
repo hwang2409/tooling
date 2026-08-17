@@ -803,6 +803,16 @@ fn analytic_convex_route_probes_are_fixture_backed() {
                     Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
                     vec![route_mesh(probe)],
                 ),
+                "box-mesh" => (
+                    Geom::r#box(0, Vec3::splat(0.25), Vec3::ZERO, Quat::IDENTITY, 0.5),
+                    Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+                    vec![route_mesh(probe)],
+                ),
+                "mesh-mesh" => (
+                    Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+                    Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+                    vec![route_mesh(probe)],
+                ),
                 other => panic!("unsupported route probe pair {other}"),
             };
             let actual = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &meshes);
@@ -945,33 +955,109 @@ fn is_pair_supported_covers_new_and_reject_lists() {
         GeomShape::Sphere { radius: 1.0 },
         GeomShape::Mesh { mesh_id: 0 },
     ));
-    // CCD routes.
+    // Enabled convex CCD routes.
     assert!(is_pair_supported(
-        GeomShape::Cylinder {
-            radius: 1.0,
-            half_height: 1.0
-        },
-        GeomShape::Cylinder {
-            radius: 1.0,
-            half_height: 1.0
-        },
-    ));
-    assert!(is_pair_supported(
-        GeomShape::Ellipsoid {
-            semi_axes: Vec3::splat(1.0)
-        },
         GeomShape::Box {
             half_extents: Vec3::splat(1.0)
         },
+        GeomShape::Mesh { mesh_id: 0 },
     ));
     assert!(is_pair_supported(
         GeomShape::Mesh { mesh_id: 0 },
         GeomShape::Mesh { mesh_id: 1 },
     ));
+    // Deferred tail routes stay rejected until they have oracle evidence.
+    for (a, b) in [
+        (
+            GeomShape::Capsule {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+            GeomShape::Ellipsoid {
+                semi_axes: Vec3::splat(1.0),
+            },
+        ),
+        (
+            GeomShape::Capsule {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+            GeomShape::Cylinder {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+        ),
+        (
+            GeomShape::Capsule {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+            GeomShape::Mesh { mesh_id: 0 },
+        ),
+        (
+            GeomShape::Ellipsoid {
+                semi_axes: Vec3::splat(1.0),
+            },
+            GeomShape::Ellipsoid {
+                semi_axes: Vec3::splat(1.0),
+            },
+        ),
+        (
+            GeomShape::Ellipsoid {
+                semi_axes: Vec3::splat(1.0),
+            },
+            GeomShape::Cylinder {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+        ),
+        (
+            GeomShape::Ellipsoid {
+                semi_axes: Vec3::splat(1.0),
+            },
+            GeomShape::Box {
+                half_extents: Vec3::splat(1.0),
+            },
+        ),
+        (
+            GeomShape::Ellipsoid {
+                semi_axes: Vec3::splat(1.0),
+            },
+            GeomShape::Mesh { mesh_id: 0 },
+        ),
+        (
+            GeomShape::Cylinder {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+            GeomShape::Cylinder {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+        ),
+        (
+            GeomShape::Cylinder {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+            GeomShape::Box {
+                half_extents: Vec3::splat(1.0),
+            },
+        ),
+        (
+            GeomShape::Cylinder {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+            GeomShape::Mesh { mesh_id: 0 },
+        ),
+    ] {
+        assert!(!is_pair_supported(a, b));
+    }
 }
 
 #[test]
-fn world_validate_supported_pairs_accepts_ccd_cylinder_cylinder() {
+fn world_validate_supported_pairs_rejects_deferred_ccd_pairs() {
     let mut world = World::new();
     world.gravity = Vec3::ZERO;
     let b1 = Body::solid_box(1.0, Vec3::splat(0.1), Vec3::ZERO, Quat::IDENTITY);
@@ -1001,14 +1087,14 @@ fn world_validate_supported_pairs_accepts_ccd_cylinder_cylinder() {
     ));
     let unsupported = world.validate_supported_pairs();
     assert!(
-        !unsupported
+        unsupported
             .iter()
             .any(|u| u.geom_a == g1.min(g2) && u.geom_b == g1.max(g2))
     );
 }
 
 #[test]
-fn all_new_convex_ccd_routes_emit_one_contact() {
+fn enabled_convex_ccd_routes_emit_one_contact() {
     let pose_a = GeomPose {
         position: Vec3::ZERO,
         orientation: Quat::IDENTITY,
@@ -1019,46 +1105,6 @@ fn all_new_convex_ccd_routes_emit_one_contact() {
     };
     let mesh = unit_tetrahedron();
     let cases = [
-        (
-            Geom::capsule(0, 0.2, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
-            Geom::ellipsoid(1, Vec3::splat(0.3), Vec3::ZERO, Quat::IDENTITY, 0.5),
-        ),
-        (
-            Geom::capsule(0, 0.2, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
-            Geom::cylinder(1, 0.25, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
-        ),
-        (
-            Geom::capsule(0, 0.2, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
-            Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
-        ),
-        (
-            Geom::ellipsoid(0, Vec3::splat(0.3), Vec3::ZERO, Quat::IDENTITY, 0.5),
-            Geom::ellipsoid(1, Vec3::splat(0.3), Vec3::ZERO, Quat::IDENTITY, 0.5),
-        ),
-        (
-            Geom::ellipsoid(0, Vec3::splat(0.3), Vec3::ZERO, Quat::IDENTITY, 0.5),
-            Geom::cylinder(1, 0.25, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
-        ),
-        (
-            Geom::ellipsoid(0, Vec3::splat(0.3), Vec3::ZERO, Quat::IDENTITY, 0.5),
-            Geom::r#box(1, Vec3::splat(0.25), Vec3::ZERO, Quat::IDENTITY, 0.5),
-        ),
-        (
-            Geom::ellipsoid(0, Vec3::splat(0.3), Vec3::ZERO, Quat::IDENTITY, 0.5),
-            Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
-        ),
-        (
-            Geom::cylinder(0, 0.25, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
-            Geom::cylinder(1, 0.25, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
-        ),
-        (
-            Geom::cylinder(0, 0.25, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
-            Geom::r#box(1, Vec3::splat(0.25), Vec3::ZERO, Quat::IDENTITY, 0.5),
-        ),
-        (
-            Geom::cylinder(0, 0.25, 0.3, Vec3::ZERO, Quat::IDENTITY, 0.5),
-            Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
-        ),
         (
             Geom::r#box(0, Vec3::splat(0.25), Vec3::ZERO, Quat::IDENTITY, 0.5),
             Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
@@ -1079,6 +1125,124 @@ fn all_new_convex_ccd_routes_emit_one_contact() {
             std::slice::from_ref(&mesh),
         );
         assert_eq!(actual.len, 1, "ccd route {index} did not emit one contact");
+    }
+}
+
+fn build_dynamic_anchor_world(mesh_mesh: bool) -> World {
+    let mut world = World::new();
+    world.dt = 0.005;
+    world.gravity = if mesh_mesh {
+        Vec3::ZERO
+    } else {
+        Vec3::new(0.0, 0.0, -9.81)
+    };
+    let mesh_id = world.add_mesh(unit_tetrahedron());
+    let mut static_mesh = Geom::mesh(0, mesh_id, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    static_mesh.body = None;
+    world.add_geom(static_mesh);
+    let body = if mesh_mesh {
+        Body::principal_axis(
+            1.0,
+            0.166667,
+            0.166667,
+            0.166667,
+            Vec3::new(0.2, 0.2, 0.2),
+            Quat::IDENTITY,
+        )
+    } else {
+        Body::solid_box(
+            1.0,
+            Vec3::splat(0.25),
+            Vec3::new(0.0, 0.0, 0.1),
+            Quat::IDENTITY,
+        )
+    };
+    let body_id = world.add_body(body);
+    world.bodies[body_id].angular_velocity_body = if mesh_mesh {
+        Vec3::new(1.0, 0.7, -0.4)
+    } else {
+        Vec3::ZERO
+    };
+    if mesh_mesh {
+        world.add_geom(Geom::mesh(
+            body_id,
+            mesh_id,
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            0.5,
+        ));
+    } else {
+        world.add_geom(Geom::r#box(
+            body_id,
+            Vec3::splat(0.25),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            0.5,
+        ));
+    }
+    world
+}
+
+#[test]
+fn dynamic_enabled_convex_anchors_are_fixture_backed() {
+    let document = json::parse(include_str!("references/contact_dynamic_anchors.json"))
+        .expect("dynamic anchor fixture must parse");
+    for case in route_array(&document, "cases") {
+        let source_xml = route_string(case, "source_xml");
+        let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/references")
+            .join(source_xml);
+        assert!(source_path.is_file(), "{source_xml}: source XML is missing");
+        let mesh_mesh = route_string(case, "id") == "mesh-mesh-tumble";
+        let mut world = build_dynamic_anchor_world(mesh_mesh);
+        let mut simulated_step = 0;
+        for sample in route_array(case, "samples") {
+            let target_step = route_number(sample, "step") as usize;
+            while simulated_step < target_step {
+                world.step();
+                simulated_step += 1;
+            }
+            let current_step = target_step;
+            let expected_position = route_numbers(sample, "position");
+            let expected_orientation = route_numbers(sample, "orientation_wxyz");
+            let expected_position = Vec3::new(
+                expected_position[0],
+                expected_position[1],
+                expected_position[2],
+            );
+            let expected_orientation = Quat::new(
+                expected_orientation[1],
+                expected_orientation[2],
+                expected_orientation[3],
+                expected_orientation[0],
+            );
+            let bounds = route_object(
+                route_object(case, "bounds"),
+                if current_step <= 20 { "early" } else { "full" },
+            );
+            let position_bound = route_number(bounds, "position");
+            let orientation_bound = route_number(bounds, "orientation");
+            let contact_bound = route_number(bounds, "contact_count") as usize;
+            assert!(
+                (world.bodies[0].position - expected_position).length() <= position_bound,
+                "{source_xml}/step-{current_step}: position bound"
+            );
+            assert!(
+                ((world.bodies[0].orientation.x - expected_orientation.x).powi(2)
+                    + (world.bodies[0].orientation.y - expected_orientation.y).powi(2)
+                    + (world.bodies[0].orientation.z - expected_orientation.z).powi(2)
+                    + (world.bodies[0].orientation.w - expected_orientation.w).powi(2))
+                .sqrt()
+                    <= orientation_bound,
+                "{source_xml}/step-{current_step}: orientation bound"
+            );
+            let expected_contacts = route_number(sample, "contacts") as usize;
+            let actual_contacts = world.detect_contacts().len();
+            assert!(
+                actual_contacts.abs_diff(expected_contacts) <= contact_bound,
+                "{source_xml}/step-{current_step}: contact count bound"
+            );
+        }
     }
 }
 

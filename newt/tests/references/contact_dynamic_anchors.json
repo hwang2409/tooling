@@ -1,0 +1,126 @@
+{
+  "mujoco": "3.11.0",
+  "capture_provenance": {
+    "script": "tools/capture_convex_dynamic_anchors.py",
+    "date": "2026-08-17",
+    "method": "mj_step from each source_xml; snapshots at steps 0, 20, and 100"
+  },
+  "windows": {
+    "early": 20,
+    "full": 100
+  },
+  "cases": [
+    {
+      "id": "box-mesh-drop",
+      "source_xml": "contact_dynamic_box_mesh.xml",
+      "route": "mjc_Convex",
+      "bounds": {
+        "early": {"position": 0.9, "orientation": 1.1, "contact_count": 3},
+        "full": {"position": 0.4, "orientation": 1.1, "contact_count": 3}
+      },
+      "samples": [
+        {
+          "step": 0,
+          "position": [
+            0.0,
+            0.0,
+            0.1
+          ],
+          "orientation_wxyz": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "contacts": 4
+        },
+        {
+          "step": 20,
+          "position": [
+            -0.4539252101074332,
+            -0.006370136677953394,
+            0.06823497910044439
+          ],
+          "orientation_wxyz": [
+            0.9997537568239062,
+            -0.0005395107011647574,
+            0.010533421058115782,
+            0.019523874756372454
+          ],
+          "contacts": 0
+        },
+        {
+          "step": 100,
+          "position": [
+            -2.407815520359535,
+            -0.03368441682654908,
+            -1.0315560065287974
+          ],
+          "orientation_wxyz": [
+            0.9928008852480639,
+            -0.0031237050576677187,
+            0.0642932966988448,
+            0.10100998325397165
+          ],
+          "contacts": 0
+        }
+      ]
+    },
+    {
+      "id": "mesh-mesh-tumble",
+      "source_xml": "contact_dynamic_mesh_mesh.xml",
+      "route": "mjc_Convex",
+      "bounds": {
+        "early": {"position": 0.1, "orientation": 0.1, "contact_count": 1},
+        "full": {"position": 0.3, "orientation": 0.3, "contact_count": 1}
+      },
+      "samples": [
+        {
+          "step": 0,
+          "position": [
+            0.2,
+            0.2,
+            0.2
+          ],
+          "orientation_wxyz": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "contacts": 1
+        },
+        {
+          "step": 20,
+          "position": [
+            0.43733121520764656,
+            0.44844218340885317,
+            0.44088672503562665
+          ],
+          "orientation_wxyz": [
+            0.9982688468527343,
+            0.04600781805486602,
+            0.03254379668690426,
+            -0.01683720221248188
+          ],
+          "contacts": 0
+        },
+        {
+          "step": 100,
+          "position": [
+            1.460483640103117,
+            1.519590884639,
+            1.4793979583747212
+          ],
+          "orientation_wxyz": [
+            0.9534192303357555,
+            0.23598065922937878,
+            0.1669574875378403,
+            -0.08619801071193528
+          ],
+          "contacts": 0
+        }
+      ]
+    }
+  ]
+}
