@@ -1631,14 +1631,12 @@ impl World {
 
 /// Which narrow-phase dispatch to use when enumerating contacts. Penalty
 /// keeps the legacy vertex-vs-face primary for box-box pairs. The solver
-/// dispatch uses the full free-body manifold and the legacy tree manifold.
-/// Plane colliders use the shared source-parity primitive rules in both paths.
+/// dispatch uses the solver manifold for every constraint row. Plane
+/// colliders use the shared source-parity primitive rules in both paths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContactManifold {
     Legacy,
-    /// Preserve the pre-NEWT-26 solver manifolds in one world pass:
-    /// free-body rows use the full solver manifold, while tree rows keep the
-    /// legacy tree contact manifold.
+    /// Use the full solver manifold for free-body and tree constraint rows.
     Solver,
 }
 
@@ -1712,13 +1710,7 @@ fn collect_contacts_full(
                 narrow_phase(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes)
             }
             ContactManifold::Solver => {
-                let tree_contact = matches!(geoms[a].attachment(), GeomAttach::Link(_, _))
-                    || matches!(geoms[b].attachment(), GeomAttach::Link(_, _));
-                if tree_contact {
-                    narrow_phase(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes)
-                } else {
-                    narrow_phase_solver(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes)
-                }
+                narrow_phase_solver(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes)
             }
         };
         for c in buf.as_slice() {
