@@ -344,3 +344,28 @@ fn box_plane_fixture_covers_cap_and_exact_margin() {
         );
     }
 }
+
+#[test]
+fn box_plane_cap_truncates_newt_candidates_above_four() {
+    // This tilted near-cube keeps four corner heights at the representable
+    // zero boundary, so six candidates pass the same ldist predicate.
+    let plane = Geom::static_plane(Vec3::ZERO, Vec3::Z, 1.0);
+    let plane_pose = geom_world_pose(&plane, Vec3::ZERO, Quat::IDENTITY);
+    let box_pose = GeomPose {
+        position: Vec3::new(0.0, 0.0, -0.01),
+        orientation: Quat::new(0.38268343, 0.0, 0.0, 0.9238796),
+    };
+    let contacts = box_plane(
+        1,
+        &box_pose,
+        Vec3::new(0.5, 0.49999702, 0.49999702),
+        1.0,
+        0.0,
+        0.0,
+        0,
+        &plane,
+        &plane_pose,
+    );
+    assert_eq!(contacts.candidate_count, 6);
+    assert_eq!(contacts.len, 4);
+}

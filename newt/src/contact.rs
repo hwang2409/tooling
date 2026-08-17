@@ -85,6 +85,8 @@ pub struct Contact {
 pub struct ContactBuf {
     pub contacts: [Contact; 4],
     pub len: usize,
+    /// Number of candidates offered to the bounded output buffer.
+    pub candidate_count: usize,
 }
 
 impl Default for ContactBuf {
@@ -107,9 +109,11 @@ impl ContactBuf {
         Self {
             contacts: [placeholder; 4],
             len: 0,
+            candidate_count: 0,
         }
     }
     pub fn push(&mut self, c: Contact) {
+        self.candidate_count += 1;
         if self.len < self.contacts.len() {
             self.contacts[self.len] = c;
             self.len += 1;
@@ -207,9 +211,9 @@ pub fn sphere_plane(
 ///
 /// The collider scans all eight corners in bit order, keeps corners whose
 /// local plane-relative height is non-positive, skips corners outside the
-/// margin, and stops after four contacts. It does not sort by depth. Contact
-/// positions are the midpoint between the corner and the plane along the
-/// plane normal.
+/// margin, and retains the first four outputs in the bounded contact buffer.
+/// It does not sort by depth. Contact positions are the midpoint between the
+/// corner and the plane along the plane normal.
 #[allow(clippy::too_many_arguments)]
 pub fn box_plane(
     idx_box: usize,
@@ -260,9 +264,6 @@ pub fn box_plane(
             friction,
             gap,
         });
-        if out.len == 4 {
-            break;
-        }
     }
     out
 }

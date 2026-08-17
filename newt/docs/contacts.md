@@ -247,7 +247,7 @@ bit-identical to tier 1 — the tier-1 tumbling golden still passes.
 | file | pin |
 |------|-----|
 | `tests/contacts_rest.rs` | sphere on plane converges to `δ_eq = m g / k`; second-half stddev of z stays below `5e-5` (no bounce growth). |
-| `tests/contacts_box_plane.rs` | fixture-driven box-plane manifolds match MuJoCo 3.11.0 contact count, scan order, midpoint positions, and depths; deep-over-four cap and exact-margin cases are covered; repeated runs are byte-identical. |
+| `tests/contacts_box_plane.rs` | fixture-driven box-plane manifolds match MuJoCo 3.11.0 contact count, scan order, midpoint positions, and depths; deep-over-four and exact-margin anchors are covered; a six-candidate newt pose proves the four-contact buffer cap; repeated runs are byte-identical. |
 | `tests/contacts_friction.rs::box_below_friction_angle_stays_put` | box at θ = 22° on a μ = 0.5 tilted-gravity incline (below `atan(0.5) ≈ 26.6°`) drifts less than 0.15 m in 4 s. |
 | `tests/contacts_friction.rs::box_above_friction_angle_slides_downslope` | box at θ = 32° on a μ = 0.5 incline (above threshold) slides more than 1 m in 4 s (direction verified). |
 | `tests/contacts_friction.rs::friction_coefficient_zero_removes_static_hold` | μ = 0 sanity: box slides freely at any nonzero angle. |
