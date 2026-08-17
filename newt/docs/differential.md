@@ -64,15 +64,24 @@ those units.
 | joint_limit_swing  | 6.56e-2           | 1.5e-1     | 3.09e-1           | 1.2e+0     | bounded divergence |
 | velocity_cartpole  | 2.70e-7           | 1.0e-6     | 5.77e-7           | 2.0e-6     | parity             |
 | filtered_motor_pendulum | 2.56e-4      | 6.0e-4     | 1.34e-3           | 3.0e-3     | bounded divergence |
+| tendon_cylinder_lift | 8.83e-8 | 2.0e-7 | 4.58e-7 | 1.0e-6 | parity; matched Euler PGS |
+| tendon_pulley_2to1 | 1.58e-7 | 4.0e-7 | 1.32e-6 | 3.0e-6 | parity; matched Euler PGS |
+| tendon_mixed_wrap | 1.06e-7 | 3.0e-7 | 5.04e-7 | 1.0e-6 | parity; matched Euler PGS |
 | mocap_rangefinder | 0                  | 1.0e-6     | 0                  | 1.0e-6     | parity; sensors 2.4e-8 |
 
 ### NEWT-27 spatial tendon probes
 
 The cylinder and pulley extension has committed hand and finite-difference
 probes in `tests/tendon_wrap_cylinder.rs`. The probes cover tangent length,
-shortest-side selection, divisor scaling, and the analytic Jacobian. A
-trajectory capture row needs a MuJoCo scene capture before it can state a
-measured bound; no fitted bound is recorded here.
+shortest-side selection, divisor scaling, and the analytic Jacobian.
+
+Three matched MuJoCo 3.11.0 Euler/PGS captures are committed in
+`tests/references/`: `tendon_cylinder_lift`, `tendon_pulley_2to1`, and
+`tendon_mixed_wrap`. The measured maxima and asserted bounds are in the
+scorecard above. Each scenario has a permanent differential test.
+
+The finite-difference probes report maximum relative Jacobian errors of
+`2.883e-3` for the cylinder wrap and `1.195e-3` for the pulley branches.
 
 `mocap_rangefinder` also compares all seven `sensordata` values at each
 sample. The maximum direct sensor error is `2.4e-8`, below the `2.0e-6`

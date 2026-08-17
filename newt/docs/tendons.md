@@ -226,7 +226,7 @@ as every other sensor kind (see `docs/sensors.md`).
 
 ## Differential parity (MuJoCo oracle)
 
-Two scenarios captured in `tests/references/`:
+Five scenarios are captured in `tests/references/`:
 
 - `tendon_coupled.xml` + `.bin`: two coupled pendulums under gravity
   with a fixed tendon. Observed max qpos 5.6e-8, qvel 3.7e-7 over 2 s
@@ -241,6 +241,18 @@ Both bounds sit at f32-quantization scale — a mapping bug (wrong sign,
 dropped chain-rule) would blow either by orders. See
 `docs/differential.md` for the scorecard row format.
 
+The NEWT-27 matched-Euler/PGS captures add three spatial-wrap rows:
+
+| Scenario | qpos observed / bound | qvel observed / bound |
+|---|---:|---:|
+| `tendon_cylinder_lift` | `8.83e-8 / 2.0e-7` | `4.58e-7 / 1.0e-6` |
+| `tendon_pulley_2to1` | `1.58e-7 / 4.0e-7` | `1.32e-6 / 3.0e-6` |
+| `tendon_mixed_wrap` | `1.06e-7 / 3.0e-7` | `5.04e-7 / 1.0e-6` |
+
+The symmetry-broken cylinder actuator golden is
+`tests/goldens/tendon_wrap_cylinder.bin`. Regeneration is guarded to
+macOS aarch64, like the existing tendon golden.
+
 ## Demo
 
 ```text
@@ -254,3 +266,10 @@ is drawn in cyan; the sphere in blue-grey wireframe; the box in yellow
 wireframe; the anchor as a white crosshair. Verified visually: cable
 routes from anchor over the sphere down to the box, box lifts as the
 motor pulls, arc appears when engaged.
+
+The cylinder and pulley demo uses the standard MP4 pipeline. Its default
+run renders 600 video frames (10 seconds) at 3.00x simulation speed:
+
+```text
+cargo run --release --example tendon_cylinder_pulley
+```

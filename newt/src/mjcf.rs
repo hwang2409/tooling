@@ -2402,14 +2402,16 @@ impl Loader {
                             "only one wrap geom is allowed between consecutive sites",
                         );
                     }
-                    let ty = child.attr("type").unwrap_or("sphere");
-                    if ty != "sphere" && ty != "cylinder" {
-                        return fail(
-                            &cp,
-                            format!(
-                                "spatial tendon wrap type \"{ty}\" is not supported (expected sphere|cylinder)"
-                            ),
-                        );
+                    let declared_ty = child.attr("type");
+                    if let Some(ty) = declared_ty {
+                        if ty != "sphere" && ty != "cylinder" {
+                            return fail(
+                                &cp,
+                                format!(
+                                    "spatial tendon wrap type \"{ty}\" is not supported (expected sphere|cylinder)"
+                                ),
+                            );
+                        }
                     }
                     for (k, _) in &child.attrs {
                         if k != "geom" && k != "type" && k != "sidesite" {
@@ -2421,10 +2423,10 @@ impl Loader {
                         MjcfError::new(cp.clone(), format!("unknown geom \"{gn}\""))
                     })?;
                     let g = &self.world.geoms[gidx];
-                    let (radius, axis_local) = match g.shape {
-                        crate::geom::GeomShape::Sphere { radius } => (radius, Vec3::Z),
+                    let (radius, axis_local, geom_ty) = match g.shape {
+                        crate::geom::GeomShape::Sphere { radius } => (radius, Vec3::Z, "sphere"),
                         crate::geom::GeomShape::Cylinder { radius, .. } => {
-                            (radius, g.local_orientation.rotate(Vec3::Z))
+                            (radius, g.local_orientation.rotate(Vec3::Z), "cylinder")
                         }
                         other => {
                             return fail(
@@ -2435,6 +2437,16 @@ impl Loader {
                             );
                         }
                     };
+                    if let Some(ty) = declared_ty {
+                        if ty != geom_ty {
+                            return fail(
+                                &cp,
+                                format!(
+                                    "wrap geom \"{gn}\" has type {geom_ty}, not declared type {ty}"
+                                ),
+                            );
+                        }
+                    }
                     let (center_local, link_wrap) = match g.attachment() {
                         crate::geom::GeomAttach::Static => (g.local_offset, None),
                         crate::geom::GeomAttach::Link(_, link_idx) => {
@@ -2468,7 +2480,7 @@ impl Loader {
                     } else {
                         None
                     };
-                    pending_wrap = Some(if ty == "sphere" {
+                    pending_wrap = Some(if geom_ty == "sphere" {
                         SpatialWrap::Sphere(WrapSphere {
                             link: link_wrap,
                             center_local,

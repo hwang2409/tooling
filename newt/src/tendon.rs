@@ -683,8 +683,10 @@ fn is_intersect_2d(a0: [f32; 2], a1: [f32; 2], b0: [f32; 2], b1: [f32; 2]) -> bo
 }
 
 fn circle_arc_length(a: [f32; 2], b: [f32; 2], solution: usize, radius: f32) -> f32 {
-    let an = [a[0] / radius, a[1] / radius];
-    let bn = [b[0] / radius, b[1] / radius];
+    let a_len = (a[0] * a[0] + a[1] * a[1]).sqrt();
+    let b_len = (b[0] * b[0] + b[1] * b[1]).sqrt();
+    let an = [a[0] / a_len, a[1] / a_len];
+    let bn = [b[0] / b_len, b[1] / b_len];
     let dot = an[0] * bn[0] + an[1] * bn[1];
     let cross = a[1] * b[0] - a[0] * b[1];
     let mut angle = atan2((1.0 - dot * dot).max(0.0).sqrt(), dot.clamp(-1.0, 1.0));

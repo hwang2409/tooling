@@ -126,10 +126,66 @@ fn cylinder_jacobian_matches_finite_difference() {
     let lp = newt::tendon::tendon_kinematics(&tendon, &plus, &forward_kinematics(&plus)).length;
     let lm = newt::tendon::tendon_kinematics(&tendon, &minus, &forward_kinematics(&minus)).length;
     let fd = (lp - lm) / (2.0 * h);
+    let analytic = base.jacobian[tree.v_offset[1]];
+    let rel = (fd - analytic).abs() / fd.abs().max(1.0e-6);
+    println!("cylinder jacobian fd max rel error = {rel:.3e}");
     assert!(
-        (fd - base.jacobian[tree.v_offset[1]]).abs() < 2.0e-3,
-        "fd={fd} analytic={}",
-        base.jacobian[tree.v_offset[1]]
+        (fd - analytic).abs() < 2.0e-3,
+        "fd={fd} analytic={analytic}"
+    );
+}
+
+#[test]
+fn pulley_jacobian_matches_finite_difference() {
+    let mut tree = fixed_tree();
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::Slide {
+            axis: Vec3::Z,
+            range: None,
+            damping: 0.0,
+            armature: 0.0,
+            limit: JointLimit::DEFAULT,
+        },
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    let tendon = Tendon::spatial_branches(vec![
+        SpatialTendonBranch {
+            sites: vec![
+                site(None, Vec3::new(-1.0, 0.0, 0.0)),
+                site(Some(1), Vec3::ZERO),
+            ],
+            segments: vec![SpatialSegment { wrap: None }],
+            divisor: 1.0,
+        },
+        SpatialTendonBranch {
+            sites: vec![
+                site(None, Vec3::new(1.0, 0.0, 0.0)),
+                site(Some(1), Vec3::ZERO),
+            ],
+            segments: vec![SpatialSegment { wrap: None }],
+            divisor: 2.0,
+        },
+    ]);
+    tree.set_slide_position(1, 0.3);
+    let h = 1.0e-4;
+    let base = newt::tendon::tendon_kinematics(&tendon, &tree, &forward_kinematics(&tree));
+    let mut plus = tree.clone();
+    plus.set_slide_position(1, 0.3 + h);
+    let mut minus = tree.clone();
+    minus.set_slide_position(1, 0.3 - h);
+    let lp = newt::tendon::tendon_kinematics(&tendon, &plus, &forward_kinematics(&plus)).length;
+    let lm = newt::tendon::tendon_kinematics(&tendon, &minus, &forward_kinematics(&minus)).length;
+    let fd = (lp - lm) / (2.0 * h);
+    let analytic = base.jacobian[tree.v_offset[1]];
+    let rel = (fd - analytic).abs() / fd.abs().max(1.0e-6);
+    println!("pulley jacobian fd max rel error = {rel:.3e}");
+    assert!(
+        (fd - analytic).abs() < 2.0e-3,
+        "fd={fd} analytic={analytic}"
     );
 }
 
@@ -173,5 +229,10 @@ fn json_and_mjcf_accept_cylinder_and_pulley_branches() {
 
     let mjcf = r#"<mujoco><worldbody><body name="root"><inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/><site name="a" pos="-2 0 0"/><site name="b" pos="2 0 0"/><site name="c" pos="0 1 0"/><site name="d" pos="0 3 0"/><geom name="cyl" type="cylinder" size="0.5 1"/></body></worldbody><tendon><spatial name="c"><site site="a"/><geom geom="cyl"/><site site="b"/><pulley divisor="2"/><site site="c"/><site site="d"/></spatial></tendon></mujoco>"#;
     let scene = newt::mjcf::load_mjcf_str(mjcf).expect("mjcf tendon");
-    assert!(scene.tendons_by_name.contains_key("c"));
+    let tendon = &scene.world.trees[0].tendons[0];
+    assert!(matches!(
+        &tendon.kind,
+        TendonKind::Spatial { branches }
+            if matches!(branches[0].segments[0].wrap, Some(SpatialWrap::Cylinder(_)))
+    ));
 }

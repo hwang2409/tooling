@@ -25,6 +25,7 @@ fn site(link: Option<usize>, position_local: Vec3) -> SpatialTendonSite {
 
 fn build_world() -> World {
     let mut world = World::new();
+    world.dt = 0.005;
     world.gravity = Vec3::new(0.0, 0.0, -9.81);
     let mut tree = Tree::new();
     tree.push_link(Link::new(
@@ -102,6 +103,63 @@ fn line(fb: &mut Framebuffer, a: (i32, i32), b: (i32, i32), color: u32) {
     }
 }
 
+fn upper_tangent(p: Vec3, radius: f32) -> Vec3 {
+    let d2 = p.x * p.x + p.y * p.y;
+    let tangent = (d2 - radius * radius).max(0.0).sqrt();
+    let scale = radius * radius / d2;
+    let perp_scale = radius * tangent / d2;
+    let plus = Vec3::new(
+        scale * p.x - perp_scale * p.y,
+        scale * p.y + perp_scale * p.x,
+        0.0,
+    );
+    let minus = Vec3::new(
+        scale * p.x + perp_scale * p.y,
+        scale * p.y - perp_scale * p.x,
+        0.0,
+    );
+    if plus.y > minus.y { plus } else { minus }
+}
+
+fn wrapped_path(fb: &mut Framebuffer, width: usize, height: usize, mass: Vec3) {
+    let anchor = Vec3::new(-1.8, 0.2, 0.0);
+    let radius = 0.4;
+    let tangent_a = upper_tangent(anchor, radius);
+    let tangent_b = upper_tangent(Vec3::new(1.4, 0.2, 0.0), radius);
+    let color = argb8888(0xff, 70, 220, 240);
+    line(
+        fb,
+        project(anchor, width, height),
+        project(tangent_a, width, height),
+        color,
+    );
+    let start = newt::math::atan2(tangent_a.y, tangent_a.x);
+    let end = newt::math::atan2(tangent_b.y, tangent_b.x);
+    let mut previous = tangent_a;
+    for i in 1..=24 {
+        let t = i as f32 / 24.0;
+        let angle = start + (end - start) * t;
+        let current = Vec3::new(
+            radius * newt::math::cos(angle),
+            radius * newt::math::sin(angle),
+            0.0,
+        );
+        line(
+            fb,
+            project(previous, width, height),
+            project(current, width, height),
+            color,
+        );
+        previous = current;
+    }
+    line(
+        fb,
+        project(tangent_b, width, height),
+        project(mass, width, height),
+        color,
+    );
+}
+
 fn frame(world: &World, width: usize, height: usize, step: usize) -> Framebuffer {
     let mut fb = Framebuffer::new(width, height);
     fb.clear(argb8888(0xff, 12, 14, 22));
@@ -121,12 +179,7 @@ fn frame(world: &World, width: usize, height: usize, step: usize) -> Framebuffer
     }
     let poses = forward_kinematics(&world.trees[0]);
     let mass = poses[1].0;
-    line(
-        &mut fb,
-        project(Vec3::new(-1.8, 0.2, 0.0), width, height),
-        project(mass, width, height),
-        argb8888(0xff, 70, 220, 240),
-    );
+    wrapped_path(&mut fb, width, height, mass);
     line(
         &mut fb,
         project(Vec3::new(-1.8, -0.8, 0.0), width, height),
@@ -150,7 +203,7 @@ fn frame(world: &World, width: usize, height: usize, step: usize) -> Framebuffer
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut frames = 600usize;
+    let mut frames = 6000usize;
     let mut out = PathBuf::from("newt-tendon-cylinder-pulley.mp4");
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -169,6 +222,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         simulated = step;
         frame(&world, 640, 360, step)
     })?;
-    println!("wrote {}", out.display());
+    println!(
+        "wrote {} ({} video frames, {:.2}x simulation speed)",
+        out.display(),
+        frames / showcase_support::SIM_STEPS_PER_VIDEO_FRAME,
+        showcase_support::video_speed_factor(world.dt),
+    );
     Ok(())
 }

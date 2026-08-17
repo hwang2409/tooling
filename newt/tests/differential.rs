@@ -194,6 +194,24 @@ fn tolerance(name: &str) -> Tolerance {
             qpos: 3.0e-7,
             qvel: 3.0e-6,
         },
+        // Matched-Euler cylinder lift capture. Observed max qpos 8.83e-8,
+        // qvel 4.58e-7; bounds leave measured headroom.
+        "tendon_cylinder_lift" => Tolerance {
+            qpos: 2.0e-7,
+            qvel: 1.0e-6,
+        },
+        // Matched-Euler 2:1 pulley capture. Observed max qpos 1.58e-7,
+        // qvel 1.32e-6; bounds leave measured headroom.
+        "tendon_pulley_2to1" => Tolerance {
+            qpos: 4.0e-7,
+            qvel: 3.0e-6,
+        },
+        // Matched-Euler mixed sphere and cylinder capture. Observed max qpos
+        // 1.06e-7, qvel 5.04e-7; bounds leave measured headroom.
+        "tendon_mixed_wrap" => Tolerance {
+            qpos: 3.0e-7,
+            qvel: 1.0e-6,
+        },
         "mocap_rangefinder" => Tolerance {
             qpos: 1.0e-6,
             qvel: 1.0e-6,
@@ -1358,6 +1376,24 @@ fn differential_tendon_coupled() {
 fn differential_tendon_wrap() {
     let d = run_scenario(&scenario("tendon_wrap"));
     assert_within_tolerance("tendon_wrap", &d);
+}
+
+#[test]
+fn differential_tendon_cylinder_lift() {
+    let d = run_scenario(&scenario("tendon_cylinder_lift"));
+    assert_within_tolerance("tendon_cylinder_lift", &d);
+}
+
+#[test]
+fn differential_tendon_pulley_2to1() {
+    let d = run_scenario(&scenario("tendon_pulley_2to1"));
+    assert_within_tolerance("tendon_pulley_2to1", &d);
+}
+
+#[test]
+fn differential_tendon_mixed_wrap() {
+    let d = run_scenario(&scenario("tendon_mixed_wrap"));
+    assert_within_tolerance("tendon_mixed_wrap", &d);
 }
 
 #[test]

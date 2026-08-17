@@ -127,6 +127,30 @@
       "horizon_note": "2.0 s hanging mass on a spatial tendon wrapping a sphere. Validates v2 tier-3 site position Jacobian + sphere-wrap tangent-arc geometry + envelope-theorem force distribution."
     },
     {
+      "name": "tendon_cylinder_lift",
+      "mjcf": "tendon_cylinder_lift.xml",
+      "n_steps": 400,
+      "stride": 20,
+      "actuator_targets": {"lift_motor": 2.5},
+      "horizon_note": "2.0 s matched-Euler cylinder-wrapped tendon actuator lifting a slide mass. Validates 2D circle side selection, sidesite choice, axial lift, and the actuator Jacobian."
+    },
+    {
+      "name": "tendon_pulley_2to1",
+      "mjcf": "tendon_pulley_2to1.xml",
+      "n_steps": 400,
+      "stride": 20,
+      "actuator_targets": {"pulley_motor": 2.5},
+      "horizon_note": "2.0 s matched-Euler 2:1 pulley branch actuator. Validates branch length and Jacobian divisor scaling against MuJoCo."
+    },
+    {
+      "name": "tendon_mixed_wrap",
+      "mjcf": "tendon_mixed_wrap.xml",
+      "n_steps": 400,
+      "stride": 20,
+      "init_qpos": [0.2],
+      "horizon_note": "2.0 s matched-Euler passive tendon through sphere and cylinder wraps. Validates mixed-chain length and envelope-theorem forces."
+    },
+    {
       "name": "mocap_rangefinder",
       "mjcf": "mocap_rangefinder.xml",
       "n_steps": 100,
