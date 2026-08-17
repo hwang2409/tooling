@@ -131,13 +131,19 @@ def compare_route_oracle(
                     f"{path}.{geom}.position",
                     maxima,
                 )
-                compare_vector(
-                    committed_pose[geom]["orientation_wxyz"],
-                    fresh_pose[geom]["orientation_wxyz"],
-                    "orientation_wxyz",
-                    f"{path}.{geom}.orientation_wxyz",
-                    maxima,
-                )
+                # MuJoCo's mesh compiler may choose different principal-axis
+                # frames across platforms. The fixture keeps that frame for
+                # the Rust route replay, so CI compares the contact samples
+                # and stable positions, but not this mesh-local orientation.
+                mesh_frame = "mesh" in committed_probe["pair"]
+                if not mesh_frame:
+                    compare_vector(
+                        committed_pose[geom]["orientation_wxyz"],
+                        fresh_pose[geom]["orientation_wxyz"],
+                        "orientation_wxyz",
+                        f"{path}.{geom}.orientation_wxyz",
+                        maxima,
+                    )
             assert len(committed_pose["contacts"]) == len(fresh_pose["contacts"])
             for index, (committed_contact, fresh_contact) in enumerate(
                 zip(committed_pose["contacts"], fresh_pose["contacts"])
