@@ -1,7 +1,8 @@
 use newt::contact::{Contact, box_hfield, capsule_hfield, sphere_hfield};
-use newt::geom::{GeomPose, HeightField};
+use newt::geom::{GeomAttach, GeomPose, GeomShape, HeightField, geom_world_pose};
 use newt::json::{self, Value};
 use newt::math::{Quat, Vec3};
+use newt::mjcf::load_mjcf_str;
 
 fn object<'a>(value: &'a Value, name: &str) -> &'a Value {
     let Value::Object(fields) = value else {
@@ -98,6 +99,133 @@ fn close_vec(actual: Vec3, expected: Vec3, tolerance: f32) {
     );
 }
 
+fn close_scalar(actual: f32, expected: f32, tolerance: f32, label: &str) {
+    assert!(
+        (actual - expected).abs() <= tolerance,
+        "{label}: {actual} != {expected}"
+    );
+}
+
+fn assert_source_matches_case(
+    source: &newt::model::Scene,
+    name: &str,
+    case: &Value,
+    shape: &str,
+    expected_field: &HeightField,
+    expected_pose: GeomPose,
+) {
+    assert!(
+        !source.world.geoms.is_empty(),
+        "{name}: source has no geoms"
+    );
+    assert!(
+        !source.world.hfields.is_empty(),
+        "{name}: source has no hfields"
+    );
+    let field_geom = source
+        .geoms_by_name
+        .get(&format!("field_geom_{name}"))
+        .map(|&index| &source.world.geoms[index])
+        .unwrap_or_else(|| panic!("{name}: source hfield geom is missing"));
+    let hfield_id = match field_geom.shape {
+        GeomShape::Hfield { hfield_id } => hfield_id,
+        other => panic!("{name}: source field geom has shape {other:?}"),
+    };
+    let loaded_field = &source.world.hfields[hfield_id];
+    assert_eq!(loaded_field.nrow, expected_field.nrow, "{name}: nrow");
+    assert_eq!(loaded_field.ncol, expected_field.ncol, "{name}: ncol");
+    for (index, (&actual, &expected)) in loaded_field
+        .size
+        .iter()
+        .zip(expected_field.size.iter())
+        .enumerate()
+    {
+        close_scalar(actual, expected, 1.0e-6, &format!("{name}: size[{index}]"));
+    }
+    assert_eq!(
+        loaded_field.data.len(),
+        expected_field.data.len(),
+        "{name}: data length"
+    );
+    for (index, (&actual, &expected)) in loaded_field
+        .data
+        .iter()
+        .zip(expected_field.data.iter())
+        .enumerate()
+    {
+        close_scalar(actual, expected, 1.0e-6, &format!("{name}: data[{index}]"));
+    }
+
+    let shape_geom = source
+        .geoms_by_name
+        .get(&format!("shape_{name}"))
+        .map(|&index| &source.world.geoms[index])
+        .unwrap_or_else(|| panic!("{name}: source shape geom is missing"));
+    match (shape, shape_geom.shape) {
+        ("sphere", GeomShape::Sphere { radius }) => close_scalar(
+            radius,
+            number(object(case, "radius"), "radius"),
+            1.0e-6,
+            &format!("{name}: radius"),
+        ),
+        (
+            "capsule",
+            GeomShape::Capsule {
+                radius,
+                half_height,
+            },
+        ) => {
+            close_scalar(
+                radius,
+                number(object(case, "radius"), "radius"),
+                1.0e-6,
+                &format!("{name}: radius"),
+            );
+            close_scalar(
+                half_height,
+                number(object(case, "half_height"), "half_height"),
+                1.0e-6,
+                &format!("{name}: half_height"),
+            );
+        }
+        ("box", GeomShape::Box { half_extents }) => {
+            let expected = numbers(object(case, "half_extents"), "half_extents");
+            close_scalar(
+                half_extents.x,
+                expected[0],
+                1.0e-6,
+                &format!("{name}: half x"),
+            );
+            close_scalar(
+                half_extents.y,
+                expected[1],
+                1.0e-6,
+                &format!("{name}: half y"),
+            );
+            close_scalar(
+                half_extents.z,
+                expected[2],
+                1.0e-6,
+                &format!("{name}: half z"),
+            );
+        }
+        _ => panic!("{name}: source shape does not match JSON shape {shape}"),
+    }
+    let (parent_position, parent_orientation) = match shape_geom.attachment() {
+        GeomAttach::Static => (Vec3::ZERO, Quat::IDENTITY),
+        GeomAttach::Body(index) => {
+            let body = &source.world.bodies[index];
+            (body.position, body.orientation)
+        }
+        GeomAttach::Link(_, _) => panic!("{name}: source shape is attached to a tree link"),
+    };
+    let loaded_pose = geom_world_pose(shape_geom, parent_position, parent_orientation);
+    close_vec(loaded_pose.position, expected_pose.position, 1.0e-5);
+    for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+        close_vec(loaded_pose.rotate(axis), expected_pose.rotate(axis), 1.0e-5);
+    }
+}
+
 #[test]
 fn parsed_mujoco_heightfield_contacts_match_all_adversarial_poses() {
     let document = json::parse(include_str!("references/hfield_conformance.json"))
@@ -119,6 +247,8 @@ fn parsed_mujoco_heightfield_contacts_match_all_adversarial_poses() {
             .join(source_xml);
         let source = std::fs::read_to_string(&source_path)
             .unwrap_or_else(|error| panic!("{name}: cannot read {source_xml}: {error}"));
+        let source_scene = load_mjcf_str(&source)
+            .unwrap_or_else(|error| panic!("{name}: source XML does not load: {error}"));
         assert!(
             source.contains(&format!("case: {name}")),
             "{name}: source XML does not bind this case"
@@ -150,6 +280,7 @@ fn parsed_mujoco_heightfield_contacts_match_all_adversarial_poses() {
             orientation: Quat::IDENTITY,
         };
         let shape_pose = pose(object(case, "pose"));
+        assert_source_matches_case(&source_scene, name, case, shape, &field, shape_pose);
         let actual = match shape.as_str() {
             "sphere" => sphere_hfield(
                 0,

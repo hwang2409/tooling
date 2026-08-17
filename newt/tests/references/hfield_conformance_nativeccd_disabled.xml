@@ -1,5 +1,25 @@
 <mujoco model="hfield_conformance_nativeccd_disabled">
+  <compiler angle="radian"/>
   <option><flag nativeccd="disable"/></option>
-  <!-- case: steep_box -->
-  <!-- case: box_base_crossing -->
+  <asset>
+    <hfield name="field_steep_box" nrow="2" ncol="2" size="1 1 1 0.2" elevation="0 1 0 1"/>
+    <hfield name="field_box_base_crossing" nrow="2" ncol="2" size="1 1 1 0.2" elevation="1 1 1 1"/>
+  </asset>
+  <worldbody>
+    <!-- case: steep_box -->
+    <geom name="field_geom_steep_box" type="hfield" hfield="field_steep_box"/>
+    <body name="body_steep_box" pos="0 0 0.45" euler="0 0.4 0">
+      <freejoint name="joint_steep_box"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="shape_steep_box" type="box" size="0.25 0.25 0.25"/>
+    </body>
+
+    <!-- case: box_base_crossing -->
+    <geom name="field_geom_box_base_crossing" type="hfield" hfield="field_box_base_crossing"/>
+    <body name="body_box_base_crossing" pos="0 0 -0.1">
+      <freejoint name="joint_box_base_crossing"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="shape_box_base_crossing" type="box" size="0.2 0.2 0.2"/>
+    </body>
+  </worldbody>
 </mujoco>

@@ -119,6 +119,14 @@ precise declaration is:
 <option><flag nativeccd="disable"/></option>
 ```
 
+The per-mode provenance XMLs are complete models. Each contains the declared
+hfield asset, its hfield geom, and every sourced shape body with its captured
+pose. `tools/capture_hfield_conformance.py` loads those XMLs in MuJoCo,
+filters one declared pair at a time, runs `mj_forward`, and rewrites the
+contact rows in `tests/references/hfield_conformance.json`. The Rust harness
+also loads each declared XML through the newt MJCF loader and checks the
+hfield grid, size, shape parameters, and world pose against that case.
+
 Newt's box-hfield narrow phase matches that mode's contact count and minimum
 penetration depths on the committed probe 6 and probe 8 fixtures. Probe 8
 also matches the contact normals exactly. MuJoCo exposes one hfield geom, so

@@ -1,9 +1,61 @@
 <mujoco model="hfield_conformance_default">
+  <compiler angle="radian"/>
   <option/>
-  <!-- case: saddle_sphere -->
-  <!-- case: steep_sphere -->
-  <!-- case: ridge_capsule -->
-  <!-- case: outer_top_side_sphere -->
-  <!-- case: cell_boundary_sphere -->
-  <!-- case: base_side_sphere -->
+  <asset>
+    <hfield name="field_saddle_sphere" nrow="2" ncol="2" size="1 1 1 0.2" elevation="1 0 0 1"/>
+    <hfield name="field_steep_sphere" nrow="2" ncol="2" size="1 1 1 0.2" elevation="0 1 0 1"/>
+    <hfield name="field_ridge_capsule" nrow="2" ncol="2" size="1 1 1 0.2" elevation="1 0 0 1"/>
+    <hfield name="field_outer_top_side_sphere" nrow="2" ncol="2" size="1 1 1 0.2" elevation="0 0 0 0"/>
+    <hfield name="field_cell_boundary_sphere" nrow="2" ncol="3" size="1.5 1 1 0.2" elevation="0 0 0 0 0 0"/>
+    <hfield name="field_base_side_sphere" nrow="2" ncol="2" size="1 1 1 0.2" elevation="0 0 0 0"/>
+  </asset>
+  <worldbody>
+    <!-- case: saddle_sphere -->
+    <geom name="field_geom_saddle_sphere" type="hfield" hfield="field_saddle_sphere"/>
+    <body name="body_saddle_sphere" pos="0 0 0.35">
+      <freejoint name="joint_saddle_sphere"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="shape_saddle_sphere" type="sphere" size="0.3"/>
+    </body>
+
+    <!-- case: steep_sphere -->
+    <geom name="field_geom_steep_sphere" type="hfield" hfield="field_steep_sphere"/>
+    <body name="body_steep_sphere" pos="0 0 0.7">
+      <freejoint name="joint_steep_sphere"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="shape_steep_sphere" type="sphere" size="0.3"/>
+    </body>
+
+    <!-- case: ridge_capsule -->
+    <geom name="field_geom_ridge_capsule" type="hfield" hfield="field_ridge_capsule"/>
+    <body name="body_ridge_capsule" pos="0 0 0.45">
+      <freejoint name="joint_ridge_capsule"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="shape_ridge_capsule" type="capsule" size="0.1 0.35"/>
+    </body>
+
+    <!-- case: outer_top_side_sphere -->
+    <geom name="field_geom_outer_top_side_sphere" type="hfield" hfield="field_outer_top_side_sphere"/>
+    <body name="body_outer_top_side_sphere" pos="1.02 0 0.02">
+      <freejoint name="joint_outer_top_side_sphere"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="shape_outer_top_side_sphere" type="sphere" size="0.05"/>
+    </body>
+
+    <!-- case: cell_boundary_sphere -->
+    <geom name="field_geom_cell_boundary_sphere" type="hfield" hfield="field_cell_boundary_sphere"/>
+    <body name="body_cell_boundary_sphere" pos="0 0 0.15">
+      <freejoint name="joint_cell_boundary_sphere"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="shape_cell_boundary_sphere" type="sphere" size="0.2"/>
+    </body>
+
+    <!-- case: base_side_sphere -->
+    <geom name="field_geom_base_side_sphere" type="hfield" hfield="field_base_side_sphere"/>
+    <body name="body_base_side_sphere" pos="1 0 -0.1">
+      <freejoint name="joint_base_side_sphere"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="shape_base_side_sphere" type="sphere" size="0.05"/>
+    </body>
+  </worldbody>
 </mujoco>
