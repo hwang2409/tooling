@@ -1800,17 +1800,33 @@ impl Loader {
                     MjcfError::new(&child_path, "hfield requires inline data or elevation")
                 })?;
             let source_data = parse_f32_list(data_attr, &child_path, "data")?;
+            let nrow = usize::try_from(nrow)
+                .map_err(|_| MjcfError::new(&child_path, "hfield nrow must be positive"))?;
+            let ncol = usize::try_from(ncol)
+                .map_err(|_| MjcfError::new(&child_path, "hfield ncol must be positive"))?;
+            let expected_data_len = nrow.checked_mul(ncol).ok_or_else(|| {
+                MjcfError::new(&child_path, "hfield dimensions overflow elevation count")
+            })?;
+            if source_data.len() != expected_data_len {
+                return fail(
+                    &child_path,
+                    format!(
+                        "hfield data length must be {expected_data_len}, got {}",
+                        source_data.len()
+                    ),
+                );
+            }
             // MuJoCo stores inline hfield rows from the opposite local-Y
             // edge. Reverse rows at the loader boundary so row zero maps to
             // local y = -size_y in the engine grid.
             let mut data = Vec::with_capacity(source_data.len());
-            for row in (0..nrow as usize).rev() {
-                let begin = row * ncol as usize;
-                data.extend_from_slice(&source_data[begin..begin + ncol as usize]);
+            for row in (0..nrow).rev() {
+                let begin = row * ncol;
+                data.extend_from_slice(&source_data[begin..begin + ncol]);
             }
             let hfield = HeightField {
-                nrow: nrow as usize,
-                ncol: ncol as usize,
+                nrow,
+                ncol,
                 size: [
                     size_values[0],
                     size_values[1],
@@ -4172,6 +4188,79 @@ mod tests {
             scene.world.geoms[0].shape,
             GeomShape::Hfield { hfield_id: 0 }
         );
+    }
+
+    #[test]
+    fn hfield_inline_data_length_is_validated_before_row_reversal() {
+        let short = err(r#"<mujoco><asset><hfield name="terrain" nrow="2" ncol="2"
+                 size="1 1 1 0.2" elevation="0"/></asset></mujoco>"#);
+        assert!(
+            short.message.contains("length must be 4"),
+            "{}",
+            short.message
+        );
+
+        let long = err(r#"<mujoco><asset><hfield name="terrain" nrow="2" ncol="2"
+                 size="1 1 1 0.2" elevation="0 0 0 0 0"/></asset></mujoco>"#);
+        assert!(
+            long.message.contains("length must be 4"),
+            "{}",
+            long.message
+        );
+    }
+
+    #[test]
+    fn hfield_inline_dimensions_and_sizes_are_rejected() {
+        let bad_dims = err(r#"<mujoco><asset><hfield name="terrain" nrow="1" ncol="2"
+                 size="1 1 1 0.2" elevation="0 0"/></asset></mujoco>"#);
+        assert!(
+            bad_dims.message.contains("must be ≥ 2"),
+            "{}",
+            bad_dims.message
+        );
+
+        let short_size = err(r#"<mujoco><asset><hfield name="terrain" nrow="2" ncol="2"
+                 size="1 1 1" elevation="0 0 0 0"/></asset></mujoco>"#);
+        assert!(
+            short_size.message.contains("expected 4 numbers"),
+            "{}",
+            short_size.message
+        );
+
+        let bad_size = err(r#"<mujoco><asset><hfield name="terrain" nrow="2" ncol="2"
+                 size="1 1 -1 0.2" elevation="0 0 0 0"/></asset></mujoco>"#);
+        assert!(bad_size.message.contains("size[2]"), "{}", bad_size.message);
+    }
+
+    #[test]
+    fn hfield_row_order_flip_mutant_is_killed_at_matching_world_coordinates() {
+        let loaded = load_mjcf_str(
+            r#"<mujoco><asset>
+              <hfield name="terrain" nrow="2" ncol="2" size="2 3 4 0.5"
+                      elevation="0 0.25 0.5 0.75"/>
+            </asset></mujoco>"#,
+        )
+        .expect("asymmetric hfield should load")
+        .world
+        .hfields[0]
+            .clone();
+        let programmatic = HeightField {
+            nrow: 2,
+            ncol: 2,
+            size: [2.0, 3.0, 4.0, 0.5],
+            data: vec![0.5, 0.75, 0.0, 0.25],
+        };
+        for row in 0..2 {
+            for col in 0..2 {
+                assert_eq!(
+                    loaded.height(row, col),
+                    programmatic.height(row, col),
+                    "world row {row}, col {col}"
+                );
+            }
+        }
+        assert_eq!(loaded.height(0, 0), 2.0);
+        assert_eq!(loaded.height(1, 1), 1.0);
     }
 
     #[test]

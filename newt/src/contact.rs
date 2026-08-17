@@ -141,6 +141,33 @@ impl ContactBuf {
             i -= 1;
         }
     }
+
+    /// Add a deepest candidate unless the same manifold point is already kept.
+    /// Heightfield cells share edges, so this avoids spending a cap slot on a
+    /// duplicate triangle contact.
+    pub fn push_deepest_unique(&mut self, c: Contact) {
+        self.candidate_count += 1;
+        if (0..self.len).any(|i| {
+            let prior = self.contacts[i];
+            (c.position_world - prior.position_world).length_squared() < 1.0e-12
+                && (c.normal_world - prior.normal_world).length_squared() < 1.0e-12
+        }) {
+            return;
+        }
+        if self.len < self.contacts.len() {
+            self.contacts[self.len] = c;
+            self.len += 1;
+        } else if c.penetration > self.contacts[self.len - 1].penetration {
+            self.contacts[self.len - 1] = c;
+        } else {
+            return;
+        }
+        let mut i = self.len - 1;
+        while i > 0 && self.contacts[i].penetration > self.contacts[i - 1].penetration {
+            self.contacts.swap(i, i - 1);
+            i -= 1;
+        }
+    }
     pub fn as_slice(&self) -> &[Contact] {
         &self.contacts[..self.len]
     }
@@ -1702,9 +1729,120 @@ fn hfield_cell_triangles(hfield: &HeightField, row: usize, col: usize) -> [(Vec3
     [(p00, p10, p11), (p00, p11, p01)]
 }
 
-fn hfield_tri_normal(a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
-    let n = (b - a).cross(c - a).normalize();
-    if n.z < 0.0 { -n } else { n }
+/// Return the closed triangular prism for one heightfield cell.
+///
+/// The top triangle follows the fixed cell diagonal. Its copy at
+/// `z = -base_depth` is the base face. The three connecting quadrilaterals
+/// are split into triangles so every candidate uses the same closest-point
+/// primitive. Face winding is corrected against the prism centroid, which
+/// keeps side and base normals outward for every slope.
+fn hfield_cell_prism_triangles(
+    hfield: &HeightField,
+    row: usize,
+    col: usize,
+    triangle: usize,
+) -> [(Vec3, Vec3, Vec3); 8] {
+    let triangle = hfield_cell_triangles(hfield, row, col)[triangle];
+    let (t0, t1, t2) = triangle;
+    let base_z = -hfield.size[3];
+    let b0 = Vec3::new(t0.x, t0.y, base_z);
+    let b1 = Vec3::new(t1.x, t1.y, base_z);
+    let b2 = Vec3::new(t2.x, t2.y, base_z);
+    let centroid = (t0 + t1 + t2 + b0 + b1 + b2) / 6.0;
+    let raw = [
+        (t0, t1, t2),
+        (b0, b2, b1),
+        (t1, t0, b0),
+        (t1, b0, b1),
+        (t2, t1, b1),
+        (t2, b1, b2),
+        (t0, t2, b2),
+        (t0, b2, b0),
+    ];
+    std::array::from_fn(|i| {
+        let (a, b, c) = raw[i];
+        let n = (b - a).cross(c - a).normalize();
+        if n.dot(centroid - a) > 0.0 {
+            (a, c, b)
+        } else {
+            (a, b, c)
+        }
+    })
+}
+
+fn hfield_prism_triangles(
+    hfield: &HeightField,
+    row: usize,
+    col: usize,
+) -> [[(Vec3, Vec3, Vec3); 8]; 2] {
+    [
+        hfield_cell_prism_triangles(hfield, row, col, 0),
+        hfield_cell_prism_triangles(hfield, row, col, 1),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+struct HfieldSurface {
+    point: Vec3,
+    source_point: Vec3,
+    normal: Vec3,
+    distance: f32,
+    inside: bool,
+}
+
+/// Find the nearest closed-prism surface to a point.
+///
+/// For an interior point, `normal` is the outward normal of the nearest face
+/// and `distance` is the distance to that face. For an exterior point, the
+/// normal points from the prism surface toward the point. This gives sphere,
+/// capsule, and box candidates the same finite-prism signed-distance rule.
+fn hfield_point_surface(point: Vec3, faces: &[(Vec3, Vec3, Vec3); 8]) -> HfieldSurface {
+    hfield_point_surface_masked(point, faces, &[true; 8])
+}
+
+fn hfield_point_surface_masked(
+    point: Vec3,
+    faces: &[(Vec3, Vec3, Vec3); 8],
+    include: &[bool; 8],
+) -> HfieldSurface {
+    let mut inside = true;
+    let mut best_dist2 = f32::INFINITY;
+    let mut best_point = Vec3::ZERO;
+    let mut best_face_normal = Vec3::Z;
+    let mut best_delta_normal = Vec3::Z;
+    for (face_index, &(a, b, c)) in faces.iter().enumerate() {
+        let face_normal = (b - a).cross(c - a).normalize();
+        if (point - a).dot(face_normal) > 1.0e-6 {
+            inside = false;
+        }
+        if !include[face_index] {
+            continue;
+        }
+        let q = closest_point_on_triangle(point, a, b, c);
+        let delta = point - q;
+        let dist2 = delta.length_squared();
+        if dist2 < best_dist2 {
+            best_dist2 = dist2;
+            best_point = q;
+            best_delta_normal = if dist2 > 1.0e-12 {
+                delta / dist2.sqrt()
+            } else {
+                face_normal
+            };
+            best_face_normal = face_normal;
+        }
+    }
+    HfieldSurface {
+        point: best_point,
+        source_point: point,
+        normal: if inside {
+            best_face_normal
+        } else {
+            best_delta_normal
+        },
+        distance: best_dist2.sqrt(),
+        inside,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1725,33 +1863,153 @@ fn hfield_sphere_candidates(
         .inverse_rotate(center - hfield_pose.position);
     for row in 0..hfield.nrow - 1 {
         for col in 0..hfield.ncol - 1 {
-            for (a, b, c) in hfield_cell_triangles(hfield, row, col) {
-                let q = closest_point_on_triangle(center_local, a, b, c);
-                let delta = center_local - q;
-                let distance = delta.length();
-                let n = hfield_tri_normal(a, b, c);
-                let signed = (center_local - q).dot(n);
-                let raw_dist = if signed < 0.0 {
-                    signed - radius
+            for faces in hfield_prism_triangles(hfield, row, col) {
+                let surface = hfield_point_surface(center_local, &faces);
+                let raw_dist = if surface.inside {
+                    -surface.distance - radius
                 } else {
-                    distance - radius
+                    surface.distance - radius
                 };
                 let penetration = margin - raw_dist;
                 if penetration <= 0.0 {
                     continue;
                 }
-                let normal_local = if signed < 0.0 || distance <= 1.0e-9 {
-                    n
-                } else {
-                    delta / distance
-                };
-                let contact_local = q;
-                let contact_world = hfield_pose.point_to_world(contact_local);
-                out.push_deepest(Contact {
+                let sphere_surface = center_local - surface.normal * radius;
+                let contact_local = (surface.point + sphere_surface) * 0.5;
+                out.push_deepest_unique(Contact {
                     geom_a: idx_sphere,
                     geom_b: idx_hfield,
-                    position_world: contact_world,
-                    normal_world: hfield_pose.rotate(normal_local),
+                    position_world: hfield_pose.point_to_world(contact_local),
+                    normal_world: hfield_pose.rotate(surface.normal),
+                    penetration,
+                    friction,
+                    gap,
+                });
+            }
+        }
+    }
+}
+
+/// Find the closest pair between a capsule center segment and one prism
+/// surface. Endpoint, edge, and face-intersection candidates cover the full
+/// swept-sphere contact, including a capsule resting on a ridge.
+fn hfield_segment_surface(
+    start: Vec3,
+    end: Vec3,
+    faces: &[(Vec3, Vec3, Vec3); 8],
+) -> HfieldSurface {
+    let mut inside = true;
+    let midpoint = (start + end) * 0.5;
+    let mut best_dist2 = f32::INFINITY;
+    let mut best_point = Vec3::ZERO;
+    let mut best_source_point = start;
+    let mut best_face_normal = Vec3::Z;
+    let mut best_delta_normal = Vec3::Z;
+    for &(a, b, c) in faces {
+        let face_normal = (b - a).cross(c - a).normalize();
+        if (start - a).dot(face_normal) > 1.0e-6
+            || (end - a).dot(face_normal) > 1.0e-6
+            || (midpoint - a).dot(face_normal) > 1.0e-6
+        {
+            inside = false;
+        }
+        let mut consider = |segment_point: Vec3, face_point: Vec3| {
+            let dist2 = (segment_point - face_point).length_squared();
+            if dist2 < best_dist2 {
+                best_dist2 = dist2;
+                best_point = face_point;
+                best_source_point = segment_point;
+                best_delta_normal = if dist2 > 1.0e-12 {
+                    (segment_point - face_point) / dist2.sqrt()
+                } else {
+                    face_normal
+                };
+                best_face_normal = face_normal;
+            }
+        };
+        consider(start, closest_point_on_triangle(start, a, b, c));
+        consider(end, closest_point_on_triangle(end, a, b, c));
+        for (edge_a, edge_b) in [(a, b), (b, c), (c, a)] {
+            let (segment_point, edge_point) =
+                closest_points_on_segments(start, end, edge_a, edge_b);
+            consider(segment_point, edge_point);
+        }
+        let segment_delta = end - start;
+        let denominator = segment_delta.dot(face_normal);
+        if denominator.abs() > 1.0e-9 {
+            let t = (a - start).dot(face_normal) / denominator;
+            if (0.0..=1.0).contains(&t) {
+                let intersection = start + segment_delta * t;
+                if point_in_triangle(intersection, a, b, c, face_normal) {
+                    consider(intersection, intersection);
+                }
+            }
+        } else if (start - a).dot(face_normal).abs() <= 1.0e-6
+            && point_in_triangle(midpoint, a, b, c, face_normal)
+        {
+            consider(midpoint, midpoint);
+        }
+    }
+    HfieldSurface {
+        point: best_point,
+        source_point: best_source_point,
+        normal: if inside {
+            best_face_normal
+        } else {
+            best_delta_normal
+        },
+        distance: best_dist2.sqrt(),
+        inside,
+    }
+}
+
+fn point_in_triangle(point: Vec3, a: Vec3, b: Vec3, c: Vec3, normal: Vec3) -> bool {
+    let ab = (b - a).cross(point - a).dot(normal);
+    let bc = (c - b).cross(point - b).dot(normal);
+    let ca = (a - c).cross(point - c).dot(normal);
+    ab >= -1.0e-6 && bc >= -1.0e-6 && ca >= -1.0e-6
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hfield_capsule_candidates(
+    start: Vec3,
+    end: Vec3,
+    radius: f32,
+    hfield_pose: &GeomPose,
+    hfield: &HeightField,
+    friction: f32,
+    margin: f32,
+    gap: f32,
+    idx_capsule: usize,
+    idx_hfield: usize,
+    out: &mut ContactBuf,
+) {
+    let start_local = hfield_pose
+        .orientation
+        .inverse_rotate(start - hfield_pose.position);
+    let end_local = hfield_pose
+        .orientation
+        .inverse_rotate(end - hfield_pose.position);
+    for row in 0..hfield.nrow - 1 {
+        for col in 0..hfield.ncol - 1 {
+            for faces in hfield_prism_triangles(hfield, row, col) {
+                let surface = hfield_segment_surface(start_local, end_local, &faces);
+                let raw_dist = if surface.inside {
+                    -surface.distance - radius
+                } else {
+                    surface.distance - radius
+                };
+                let penetration = margin - raw_dist;
+                if penetration <= 0.0 {
+                    continue;
+                }
+                let capsule_surface = surface.source_point - surface.normal * radius;
+                let contact_local = (surface.point + capsule_surface) * 0.5;
+                out.push_deepest_unique(Contact {
+                    geom_a: idx_capsule,
+                    geom_b: idx_hfield,
+                    position_world: hfield_pose.point_to_world(contact_local),
+                    normal_world: hfield_pose.rotate(surface.normal),
                     penetration,
                     friction,
                     gap,
@@ -1778,8 +2036,8 @@ fn dedup_contacts(out: &mut ContactBuf) {
     out.len = write;
 }
 
-/// Sphere vs MuJoCo heightfield. Each grid cell is decomposed into two
-/// triangular prisms; the top triangle is the narrow-phase surface.
+/// Sphere vs MuJoCo heightfield. Each grid cell is decomposed into two closed
+/// triangular prisms with top, base, and side faces.
 #[allow(clippy::too_many_arguments)]
 pub fn sphere_hfield(
     idx_sphere: usize,
@@ -1825,31 +2083,28 @@ pub fn capsule_hfield(
     gap: f32,
 ) -> ContactBuf {
     let axis = capsule_pose.rotate(Vec3::Z);
-    let endpoints = [
-        capsule_pose.position + axis * half_height,
-        capsule_pose.position - axis * half_height,
-    ];
+    let start = capsule_pose.position + axis * half_height;
+    let end = capsule_pose.position - axis * half_height;
     let mut out = ContactBuf::new();
-    for center in endpoints {
-        hfield_sphere_candidates(
-            center,
-            radius,
-            hfield_pose,
-            hfield,
-            friction,
-            margin,
-            gap,
-            idx_capsule,
-            idx_hfield,
-            &mut out,
-        );
-    }
+    hfield_capsule_candidates(
+        start,
+        end,
+        radius,
+        hfield_pose,
+        hfield,
+        friction,
+        margin,
+        gap,
+        idx_capsule,
+        idx_hfield,
+        &mut out,
+    );
     dedup_contacts(&mut out);
     out
 }
 
-/// Box vs heightfield. Every box vertex is tested against every prism top
-/// triangle. The bounded output keeps the four deepest candidates.
+/// Box vs heightfield. Every box vertex is tested against the closed prism
+/// faces. The bounded output keeps the four deepest candidates.
 #[allow(clippy::too_many_arguments)]
 pub fn box_hfield(
     idx_box: usize,
@@ -1863,6 +2118,10 @@ pub fn box_hfield(
     gap: f32,
 ) -> ContactBuf {
     let mut out = ContactBuf::new();
+    let box_center_local = hfield_pose
+        .orientation
+        .inverse_rotate(box_pose.position - hfield_pose.position);
+    let allow_base_contacts = box_center_local.z <= -hfield.size[3];
     for i in 0..8 {
         let local = Vec3::new(
             if i & 1 == 0 {
@@ -1887,20 +2146,49 @@ pub fn box_hfield(
             .inverse_rotate(vertex - hfield_pose.position);
         for row in 0..hfield.nrow - 1 {
             for col in 0..hfield.ncol - 1 {
-                for (a, b, c) in hfield_cell_triangles(hfield, row, col) {
-                    let q = closest_point_on_triangle(vertex_local, a, b, c);
-                    let n = hfield_tri_normal(a, b, c);
-                    let raw_dist = (vertex_local - q).dot(n);
-                    if raw_dist > margin {
+                for (triangle, faces) in hfield_prism_triangles(hfield, row, col)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let include = if triangle == 0 {
+                        [
+                            true,
+                            allow_base_contacts,
+                            true,
+                            true,
+                            true,
+                            true,
+                            false,
+                            false,
+                        ]
+                    } else {
+                        [
+                            true,
+                            allow_base_contacts,
+                            false,
+                            false,
+                            true,
+                            true,
+                            true,
+                            true,
+                        ]
+                    };
+                    let surface = hfield_point_surface_masked(vertex_local, &faces, &include);
+                    if !surface.inside && surface.distance > margin {
                         continue;
                     }
+                    let raw_dist = if surface.inside {
+                        -surface.distance
+                    } else {
+                        surface.distance
+                    };
                     let penetration = margin - raw_dist;
-                    let contact_world = hfield_pose.point_to_world(q);
-                    out.push_deepest(Contact {
+                    let contact_local = (vertex_local + surface.point) * 0.5;
+                    out.push_deepest_unique(Contact {
                         geom_a: idx_box,
                         geom_b: idx_hfield,
-                        position_world: contact_world,
-                        normal_world: hfield_pose.rotate(n),
+                        position_world: hfield_pose.point_to_world(contact_local),
+                        normal_world: hfield_pose.rotate(surface.normal),
                         penetration,
                         friction,
                         gap,
@@ -2411,8 +2699,11 @@ fn try_narrow_phase(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geom::{Geom, geom_world_pose};
+    use crate::body::Body;
+    use crate::geom::{Geom, HeightField, geom_world_pose};
     use crate::math::{Quat, Vec3};
+    use crate::solver::SolverMode;
+    use crate::world::{Integrator, World};
 
     fn approx(a: f32, b: f32, tol: f32) -> bool {
         (a - b).abs() < tol
@@ -2486,12 +2777,16 @@ mod tests {
         assert_eq!(buf.len, 1);
         assert!(approx(buf.contacts[0].penetration, 0.1, 1e-6));
         assert!(approx_vec(buf.contacts[0].normal_world, Vec3::Z, 1e-6));
-        assert!(approx_vec(buf.contacts[0].position_world, Vec3::ZERO, 1e-6));
+        assert!(approx_vec(
+            buf.contacts[0].position_world,
+            Vec3::new(0.0, 0.0, -0.05),
+            1e-6
+        ));
         assert!(buf.candidate_count >= 2);
     }
 
     #[test]
-    fn hfield_ramp_capsule_and_box_have_upward_normals() {
+    fn hfield_ramp_capsule_and_box_have_prism_normals() {
         let field = HeightField {
             nrow: 2,
             ncol: 2,
@@ -2541,8 +2836,332 @@ mod tests {
             box_contacts
                 .as_slice()
                 .iter()
+                .all(|c| (c.normal_world.length() - 1.0).abs() < 1e-5)
+        );
+        assert!(
+            box_contacts
+                .as_slice()
+                .iter()
                 .all(|c| c.normal_world.z > 0.0)
         );
+    }
+
+    fn identity_pose(position: Vec3) -> GeomPose {
+        GeomPose {
+            position,
+            orientation: Quat::IDENTITY,
+        }
+    }
+
+    #[test]
+    fn hfield_cell_boundary_continuity_sweep_kills_vertical_sampling_mutant() {
+        let field = HeightField {
+            nrow: 2,
+            ncol: 2,
+            size: [1.0, 1.0, 1.0, 0.2],
+            data: vec![0.2, 0.2, 0.2, 0.2],
+        };
+        let field_pose = identity_pose(Vec3::ZERO);
+        let left = sphere_hfield(
+            0,
+            &identity_pose(Vec3::new(-1.0e-4, 0.0, 0.35)),
+            0.2,
+            1,
+            &field_pose,
+            &field,
+            0.5,
+            0.0,
+            0.0,
+        );
+        let right = sphere_hfield(
+            0,
+            &identity_pose(Vec3::new(1.0e-4, 0.0, 0.35)),
+            0.2,
+            1,
+            &field_pose,
+            &field,
+            0.5,
+            0.0,
+            0.0,
+        );
+        assert_eq!(left.len, right.len);
+        assert!((left.contacts[0].penetration - right.contacts[0].penetration).abs() < 1.0e-5);
+        assert!(
+            (left.contacts[0].position_world.z - right.contacts[0].position_world.z).abs() < 1.0e-5
+        );
+        assert!(approx_vec(
+            left.contacts[0].normal_world,
+            right.contacts[0].normal_world,
+            1.0e-5
+        ));
+    }
+
+    #[test]
+    fn hfield_saddle_and_steep_faces_kill_vertical_sampling_mutant() {
+        let field = HeightField {
+            nrow: 2,
+            ncol: 2,
+            size: [1.0, 1.0, 1.0, 0.2],
+            data: vec![1.0, 0.0, 0.0, 1.0],
+        };
+        let field_pose = identity_pose(Vec3::ZERO);
+        let saddle = sphere_hfield(
+            0,
+            &identity_pose(Vec3::new(0.0, 0.0, 0.35)),
+            0.3,
+            1,
+            &field_pose,
+            &field,
+            0.5,
+            0.0,
+            0.0,
+        );
+        assert_eq!(saddle.len, 2);
+        assert!(
+            saddle
+                .as_slice()
+                .iter()
+                .all(|c| c.normal_world.z.abs() < 1.0e-5)
+        );
+        assert!(saddle.as_slice().iter().any(|c| c.normal_world.x > 0.6));
+        assert!(saddle.as_slice().iter().any(|c| c.normal_world.y > 0.6));
+
+        let steep_field = HeightField {
+            data: vec![0.0, 1.0, 0.0, 1.0],
+            ..field
+        };
+        let steep = sphere_hfield(
+            0,
+            &identity_pose(Vec3::new(0.0, 0.0, 0.7)),
+            0.3,
+            1,
+            &field_pose,
+            &steep_field,
+            0.5,
+            0.0,
+            0.0,
+        );
+        assert_eq!(steep.len, 2);
+        assert!(steep.as_slice().iter().all(|c| c.normal_world.z > 0.8));
+        assert!(steep.as_slice().iter().any(|c| c.normal_world.x < -0.4));
+        assert!((steep.contacts[0].position_world.x - 0.107082).abs() < 2.0e-5);
+        assert!((steep.contacts[0].position_world.z - 0.485836).abs() < 2.0e-5);
+        assert!((steep.contacts[0].penetration - 0.1211146).abs() < 2.0e-5);
+        assert!((steep.contacts[1].position_world.x - 0.057578).abs() < 2.0e-5);
+        assert!((steep.contacts[1].position_world.y - 0.057578).abs() < 2.0e-5);
+        assert!((steep.contacts[1].position_world.z - 0.469690).abs() < 2.0e-5);
+    }
+
+    #[test]
+    fn hfield_ridge_capsule_uses_segment_sweep() {
+        let field = HeightField {
+            nrow: 2,
+            ncol: 2,
+            size: [1.0, 1.0, 1.0, 0.2],
+            data: vec![1.0, 0.0, 0.0, 1.0],
+        };
+        let contacts = capsule_hfield(
+            0,
+            &identity_pose(Vec3::new(0.0, 0.0, 0.45)),
+            0.1,
+            0.35,
+            1,
+            &identity_pose(Vec3::ZERO),
+            &field,
+            0.5,
+            0.0,
+            0.0,
+        );
+        assert_eq!(contacts.len, 2);
+        assert!(contacts.as_slice().iter().all(|c| c.penetration > 0.09));
+        assert!(
+            contacts
+                .as_slice()
+                .iter()
+                .all(|c| c.normal_world.z.abs() < 1.0e-5)
+        );
+    }
+
+    #[test]
+    fn hfield_steep_box_fixture_has_prism_contacts() {
+        let field = HeightField {
+            nrow: 2,
+            ncol: 2,
+            size: [1.0, 1.0, 1.0, 0.2],
+            data: vec![0.0, 1.0, 0.0, 1.0],
+        };
+        let contacts = box_hfield(
+            0,
+            &GeomPose {
+                position: Vec3::new(0.0, 0.0, 0.45),
+                orientation: Quat::from_axis_angle(Vec3::Y, 0.4),
+            },
+            Vec3::splat(0.25),
+            1,
+            &identity_pose(Vec3::ZERO),
+            &field,
+            0.5,
+            0.0,
+            0.0,
+        );
+        assert!(!contacts.as_slice().is_empty());
+        assert!(
+            contacts
+                .as_slice()
+                .iter()
+                .all(|c| c.normal_world.length() > 0.99)
+        );
+        let oracle = include_str!("../tests/references/hfield_conformance.json");
+        assert!(oracle.contains("\"steep_box\""));
+    }
+
+    #[test]
+    fn hfield_base_side_fixture_kills_base_face_mutant() {
+        let field = flat_hfield();
+        let contacts = sphere_hfield(
+            0,
+            &identity_pose(Vec3::new(1.0, 0.0, -0.1)),
+            0.05,
+            1,
+            &identity_pose(Vec3::ZERO),
+            &field,
+            0.5,
+            0.0,
+            0.0,
+        );
+        assert_eq!(contacts.len, 1);
+        let contact = contacts.contacts[0];
+        assert!(contact.normal_world.x > 0.99);
+        assert!((contact.position_world.x - 0.975).abs() < 1.0e-5);
+        assert!((contact.penetration - 0.05).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn hfield_outside_footprint_fixture_kills_side_projection_mutant() {
+        let field = flat_hfield();
+        let contacts = sphere_hfield(
+            0,
+            &identity_pose(Vec3::new(1.04, 0.0, 0.0)),
+            0.05,
+            1,
+            &identity_pose(Vec3::ZERO),
+            &field,
+            0.5,
+            0.0,
+            0.0,
+        );
+        assert_eq!(contacts.len, 1);
+        let contact = contacts.contacts[0];
+        assert!(contact.normal_world.x > 0.99);
+        assert!((contact.position_world.x - 0.995).abs() < 1.0e-5);
+        assert!((contact.penetration - 0.01).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn hfield_contact_cap_mutant_is_killed_by_deepest_four_fixture() {
+        let field = HeightField {
+            nrow: 3,
+            ncol: 3,
+            size: [1.0, 1.0, 1.0, 0.2],
+            data: vec![0.0; 9],
+        };
+        let pose = identity_pose(Vec3::new(0.0, 0.0, 0.15));
+        let first = box_hfield(
+            0,
+            &pose,
+            Vec3::new(0.8, 0.8, 0.2),
+            1,
+            &identity_pose(Vec3::ZERO),
+            &field,
+            0.5,
+            0.0,
+            0.0,
+        );
+        let second = box_hfield(
+            0,
+            &pose,
+            Vec3::new(0.8, 0.8, 0.2),
+            1,
+            &identity_pose(Vec3::ZERO),
+            &field,
+            0.5,
+            0.0,
+            0.0,
+        );
+        assert!(first.candidate_count > 4);
+        assert_eq!(first.len, 4, "{first:?}");
+        assert_eq!(first.contacts, second.contacts);
+        assert!(
+            first
+                .as_slice()
+                .windows(2)
+                .all(|w| w[0].penetration >= w[1].penetration)
+        );
+    }
+
+    #[test]
+    fn hfield_in_step_onset_is_captured_once() {
+        let mut world = World::new();
+        world.dt = 0.1;
+        world.integrator = Integrator::Euler;
+        world.solver.mode = SolverMode::Pgs;
+        world.gravity = Vec3::ZERO;
+        world.add_hfield(flat_hfield());
+        world.add_geom(Geom::static_hfield(0, Vec3::ZERO, Quat::IDENTITY, 0.5));
+        let body = world.add_body(Body::solid_sphere(
+            1.0,
+            0.2,
+            Vec3::new(0.0, 0.0, 0.25),
+            Quat::IDENTITY,
+        ));
+        world.bodies[body].linear_velocity.z = -0.5;
+        world.add_geom(Geom::sphere(body, 0.2, Vec3::ZERO, 0.5));
+        world.set_solver_phase_capture(true);
+        world.capture_solver_phase();
+        assert!(
+            world
+                .solver_phase_diagnostics()
+                .unwrap()
+                .contacts
+                .is_empty()
+        );
+        world.step();
+        assert!(
+            world
+                .solver_phase_diagnostics()
+                .unwrap()
+                .contacts
+                .is_empty()
+        );
+        assert!(world.detect_contacts().is_empty());
+        world.step();
+        assert!(
+            world
+                .solver_phase_diagnostics()
+                .unwrap()
+                .contacts
+                .is_empty()
+        );
+        assert_eq!(world.detect_contacts().len(), 1);
+        assert!(world.contact_detection_count() >= 4);
+    }
+
+    #[test]
+    fn hfield_normal_orientation_fixture_kills_normal_flip_mutant() {
+        let field = flat_hfield();
+        let contact = sphere_hfield(
+            0,
+            &identity_pose(Vec3::new(0.0, 0.0, 0.15)),
+            0.2,
+            1,
+            &identity_pose(Vec3::ZERO),
+            &field,
+            0.5,
+            0.0,
+            0.0,
+        )
+        .contacts[0];
+        assert!(contact.normal_world.dot(Vec3::Z) > 0.99);
     }
 
     #[test]
