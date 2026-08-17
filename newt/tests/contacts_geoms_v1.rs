@@ -10,6 +10,7 @@
 use newt::body::Body;
 use newt::contact::{is_pair_supported, narrow_phase};
 use newt::geom::{ConvexMesh, Geom, GeomPose, GeomShape, geom_world_pose};
+use newt::json::{self, Value};
 use newt::math::{FRAC_PI_2, FRAC_PI_4, Mat3, Quat, Vec3};
 use newt::world::World;
 
@@ -19,6 +20,129 @@ use newt::world::World;
 
 fn approx(a: f32, b: f32, tol: f32) -> bool {
     (a - b).abs() < tol
+}
+
+fn close_vec(actual: Vec3, expected: Vec3, tolerance: f32) {
+    assert!(
+        (actual - expected).length() <= tolerance,
+        "{actual:?} != {expected:?}"
+    );
+}
+
+fn close_scalar(actual: f32, expected: f32, tolerance: f32, label: &str) {
+    assert!(
+        (actual - expected).abs() <= tolerance,
+        "{label}: {actual} != {expected}"
+    );
+}
+
+fn route_object<'a>(value: &'a Value, key: &str) -> &'a Value {
+    let Value::Object(fields) = value else {
+        panic!("route fixture value must be an object");
+    };
+    fields
+        .iter()
+        .find(|(field, _)| field == key)
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| panic!("route fixture is missing {key}"))
+}
+
+fn route_string<'a>(value: &'a Value, key: &str) -> &'a str {
+    let Value::String(value) = route_object(value, key) else {
+        panic!("route fixture field {key} must be a string");
+    };
+    value
+}
+
+fn route_number(value: &Value, key: &str) -> f32 {
+    let Value::Number(value) = route_object(value, key) else {
+        panic!("route fixture field {key} must be a number");
+    };
+    *value as f32
+}
+
+fn route_numbers(value: &Value, key: &str) -> Vec<f32> {
+    let Value::Array(values) = route_object(value, key) else {
+        panic!("route fixture field {key} must be an array");
+    };
+    values
+        .iter()
+        .map(|value| {
+            let Value::Number(value) = value else {
+                panic!("route fixture array {key} must contain numbers");
+            };
+            *value as f32
+        })
+        .collect()
+}
+
+fn route_array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
+    let Value::Array(values) = route_object(value, key) else {
+        panic!("route fixture field {key} must be an array");
+    };
+    values
+}
+
+fn route_pose(value: &Value, key: &str) -> GeomPose {
+    let pose = route_object(value, key);
+    let position = route_numbers(pose, "position");
+    let orientation = route_numbers(pose, "orientation_wxyz");
+    GeomPose {
+        position: Vec3::new(position[0], position[1], position[2]),
+        orientation: Quat::new(
+            orientation[1],
+            orientation[2],
+            orientation[3],
+            orientation[0],
+        ),
+    }
+}
+
+fn route_mesh(value: &Value) -> ConvexMesh {
+    let mesh = route_object(value, "mesh");
+    let Value::Array(vertices) = route_object(mesh, "vertices") else {
+        panic!("route fixture mesh vertices must be an array");
+    };
+    let vertices = vertices
+        .iter()
+        .map(|vertex| {
+            let Value::Array(values) = vertex else {
+                panic!("route fixture mesh vertex must be an array");
+            };
+            let values: Vec<f32> = values
+                .iter()
+                .map(|value| {
+                    let Value::Number(value) = value else {
+                        panic!("route fixture mesh vertex must contain numbers");
+                    };
+                    *value as f32
+                })
+                .collect();
+            Vec3::new(values[0], values[1], values[2])
+        })
+        .collect();
+    let Value::Array(faces) = route_object(mesh, "faces") else {
+        panic!("route fixture mesh faces must be an array");
+    };
+    let faces = faces
+        .iter()
+        .map(|face| {
+            let Value::Array(values) = face else {
+                panic!("route fixture mesh face must be an array");
+            };
+            let values: Vec<u32> = values
+                .iter()
+                .map(|value| {
+                    let Value::Number(value) = value else {
+                        panic!("route fixture mesh face must contain numbers");
+                    };
+                    *value as u32
+                })
+                .collect();
+            [values[0], values[1], values[2]]
+        })
+        .collect();
+    ConvexMesh { vertices, faces }
 }
 
 /// Tetrahedron with vertices at `(0,0,0), (1,0,0), (0,1,0), (0,0,1)`. Used
@@ -532,6 +656,204 @@ fn sphere_touching_mesh_face_gives_correct_penetration() {
         "sphere-mesh penetration {} vs 0.1",
         c.penetration
     );
+}
+
+#[test]
+fn analytic_convex_route_probes_are_stable_against_default_oracle_cases() {
+    // These four fixed poses are the MuJoCo 3.11.0 route probes documented in
+    // docs/contacts.md. MuJoCo uses mjc_Convex for the first two pairs and
+    // mjc_PlaneConvex for the last two. Newt keeps its analytic colliders
+    // because the measured construction differences are documented there.
+    let sphere = Geom::sphere(0, 0.2, Vec3::ZERO, 0.5);
+    let sphere_pose = GeomPose {
+        position: Vec3::new(0.6, 0.0, 0.0),
+        orientation: Quat::IDENTITY,
+    };
+    let ellipsoid = Geom::ellipsoid(1, Vec3::new(0.5, 0.3, 0.2), Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let ellipsoid_pose = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let sphere_ellipsoid = narrow_phase(
+        0,
+        &sphere,
+        &sphere_pose,
+        1,
+        &ellipsoid,
+        &ellipsoid_pose,
+        &[],
+    );
+    assert_eq!(sphere_ellipsoid.len, 1);
+    let contact = sphere_ellipsoid.contacts[0];
+    close_vec(contact.position_world, Vec3::new(0.5, 0.0, 0.0), 1.0e-6);
+    close_vec(contact.normal_world, Vec3::X, 1.0e-6);
+    close_scalar(contact.penetration, 0.1, 1.0e-6, "sphere-ellipsoid depth");
+
+    let mesh_id = 0;
+    let mesh = Geom::mesh(1, mesh_id, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let mesh_pose = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let sphere_mesh = narrow_phase(
+        0,
+        &sphere,
+        &GeomPose {
+            position: Vec3::new(0.2, 0.2, -0.1),
+            orientation: Quat::IDENTITY,
+        },
+        1,
+        &mesh,
+        &mesh_pose,
+        &[unit_tetrahedron()],
+    );
+    assert_eq!(sphere_mesh.len, 1);
+    let contact = sphere_mesh.contacts[0];
+    close_vec(contact.position_world, Vec3::new(0.2, 0.2, 0.0), 1.0e-6);
+    close_vec(contact.normal_world, -Vec3::Z, 1.0e-6);
+    close_scalar(contact.penetration, 0.1, 1.0e-6, "sphere-mesh depth");
+
+    let plane = Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5);
+    let plane_pose = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let plane_ellipsoid = narrow_phase(
+        0,
+        &plane,
+        &plane_pose,
+        1,
+        &ellipsoid,
+        &GeomPose {
+            position: Vec3::new(0.0, 0.0, 0.1),
+            orientation: Quat::IDENTITY,
+        },
+        &[],
+    );
+    assert_eq!(plane_ellipsoid.len, 1);
+    let contact = plane_ellipsoid.contacts[0];
+    close_vec(contact.position_world, Vec3::ZERO, 1.0e-6);
+    close_vec(contact.normal_world, -Vec3::Z, 1.0e-6);
+    close_scalar(contact.penetration, 0.1, 1.0e-6, "plane-ellipsoid depth");
+
+    let plane_mesh = narrow_phase(
+        0,
+        &plane,
+        &plane_pose,
+        1,
+        &mesh,
+        &GeomPose {
+            position: Vec3::new(0.0, 0.0, -0.1),
+            orientation: Quat::IDENTITY,
+        },
+        &[unit_tetrahedron()],
+    );
+    assert_eq!(plane_mesh.len, 3);
+    for contact in plane_mesh.as_slice() {
+        close_vec(contact.normal_world, -Vec3::Z, 1.0e-6);
+        close_scalar(
+            contact.position_world.z,
+            0.0,
+            1.0e-6,
+            "plane-mesh position z",
+        );
+        close_scalar(contact.penetration, 0.1, 1.0e-6, "plane-mesh depth");
+    }
+}
+
+#[test]
+fn analytic_convex_route_probes_are_fixture_backed() {
+    let document = json::parse(include_str!("references/contact_route_probes.json"))
+        .expect("route probe fixture must parse");
+    for probe in route_array(&document, "probes") {
+        let source_xml = route_string(probe, "source_xml");
+        let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/references")
+            .join(source_xml);
+        assert!(
+            source_path.is_file(),
+            "{source_xml}: source XML from fixture is missing"
+        );
+        let bounds = route_object(probe, "bounds");
+        let position_bound = route_number(bounds, "position");
+        let normal_bound = route_number(bounds, "normal");
+        let penetration_bound = route_number(bounds, "penetration");
+        let count_delta = route_number(bounds, "count_delta") as isize;
+        for pose in route_array(probe, "poses") {
+            let pose_id = route_string(pose, "id");
+            let pair = route_string(probe, "pair");
+            let pose_a = route_pose(pose, "pose_a");
+            let pose_b = route_pose(pose, "pose_b");
+            let (geom_a, geom_b, meshes) = match pair {
+                "sphere-ellipsoid" => (
+                    Geom::sphere(0, 0.2, Vec3::ZERO, 0.5),
+                    Geom::ellipsoid(1, Vec3::new(0.5, 0.3, 0.2), Vec3::ZERO, Quat::IDENTITY, 0.5),
+                    Vec::new(),
+                ),
+                "sphere-mesh" => (
+                    Geom::sphere(0, 0.2, Vec3::ZERO, 0.5),
+                    Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+                    vec![route_mesh(probe)],
+                ),
+                "plane-ellipsoid" => (
+                    Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5),
+                    Geom::ellipsoid(1, Vec3::new(0.5, 0.3, 0.2), Vec3::ZERO, Quat::IDENTITY, 0.5),
+                    Vec::new(),
+                ),
+                "plane-mesh" => (
+                    Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5),
+                    Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+                    vec![route_mesh(probe)],
+                ),
+                other => panic!("unsupported route probe pair {other}"),
+            };
+            let actual = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &meshes);
+            let expected = route_array(pose, "contacts");
+            let expected_count = if expected.is_empty() {
+                0
+            } else {
+                expected.len() as isize + count_delta
+            };
+            assert_eq!(
+                actual.len as isize, expected_count,
+                "{source_xml}/{pose_id}: contact count"
+            );
+            for (index, expected) in expected.iter().enumerate() {
+                let expected_position = route_numbers(expected, "position");
+                let expected_normal = route_numbers(expected, "frame_normal");
+                let expected_normal = Vec3::new(
+                    -expected_normal[0],
+                    -expected_normal[1],
+                    -expected_normal[2],
+                );
+                let expected_position = Vec3::new(
+                    expected_position[0],
+                    expected_position[1],
+                    expected_position[2],
+                );
+                let contact = actual.contacts[index];
+                let position_error = (contact.position_world - expected_position).length();
+                let normal_error = (contact.normal_world - expected_normal).length();
+                let penetration_error =
+                    (contact.penetration - route_number(expected, "penetration")).abs();
+                println!(
+                    "route[{source_xml}/{pose_id}/{index}] position={position_error:.6e} normal={normal_error:.6e} penetration={penetration_error:.6e}"
+                );
+                assert!(
+                    position_error <= position_bound,
+                    "{source_xml}/{pose_id}/{index}: position error {position_error:.6e} > {position_bound:.6e}"
+                );
+                assert!(
+                    normal_error <= normal_bound,
+                    "{source_xml}/{pose_id}/{index}: normal error {normal_error:.6e} > {normal_bound:.6e}"
+                );
+                assert!(
+                    penetration_error <= penetration_bound,
+                    "{source_xml}/{pose_id}/{index}: penetration error {penetration_error:.6e} > {penetration_bound:.6e}"
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

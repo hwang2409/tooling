@@ -1,0 +1,55 @@
+<mujoco model="contact_route_sphere_mesh">
+  <option gravity="0 0 0"/>
+  <asset>
+    <mesh name="tetra" vertex="0 0 0 1 0 0 0 1 0 0 0 1"
+          face="0 2 1 0 1 3 0 3 2 1 2 3"/>
+  </asset>
+  <contact>
+    <pair geom1="sphere_no_contact" geom2="mesh_no_contact"/>
+    <pair geom1="sphere_shallow" geom2="mesh_shallow"/>
+    <pair geom1="sphere_deep" geom2="mesh_deep"/>
+    <pair geom1="sphere_off_axis" geom2="mesh_off_axis"/>
+  </contact>
+  <worldbody>
+    <body name="sphere_no_contact" pos="0.2 0.2 -0.5">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="sphere_no_contact" type="sphere" size="0.2"/>
+    </body>
+    <body name="mesh_no_contact">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="mesh_no_contact" type="mesh" mesh="tetra"/>
+    </body>
+    <body name="sphere_shallow" pos="0.2 0.2 -0.1">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="sphere_shallow" type="sphere" size="0.2"/>
+    </body>
+    <body name="mesh_shallow">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="mesh_shallow" type="mesh" mesh="tetra"/>
+    </body>
+    <body name="sphere_deep" pos="0.2 0.2 -0.01">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="sphere_deep" type="sphere" size="0.2"/>
+    </body>
+    <body name="mesh_deep">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="mesh_deep" type="mesh" mesh="tetra"/>
+    </body>
+    <body name="sphere_off_axis" pos="0.38 0.2 -0.08">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="sphere_off_axis" type="sphere" size="0.2"/>
+    </body>
+    <body name="mesh_off_axis" euler="0.3 0.2 0.4">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <geom name="mesh_off_axis" type="mesh" mesh="tetra"/>
+    </body>
+  </worldbody>
+</mujoco>

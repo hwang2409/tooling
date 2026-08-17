@@ -189,12 +189,14 @@
     {
       "name": "steep_box",
       "shape": "box",
-      "position_tolerance": 0.8,
-      "normal_bound": 0.0145,
+      "order": "source",
+      "position_tolerance": 0.27,
+      "normal_bound": 0.8,
+      "penetration_bound": 0.32,
       "provenance": {
-        "mode": "legacy",
-        "nativeccd": "disable",
-        "source_xml": "hfield_conformance_nativeccd_disabled.xml"
+        "mode": "default",
+        "nativeccd": "default",
+        "source_xml": "hfield_conformance_default_box.xml"
       },
       "field": {
         "nrow": 2,
@@ -233,40 +235,42 @@
       "contacts": [
         {
           "position": [
-            -0.11569289011558942,
-            0.1502655754230211,
-            0.3357701687267611
+            0.1697285182987922,
+            0.2205871010344961,
+            0.3424986804421783
           ],
           "normal": [
-            0.29672063700052786,
-            -0.6476257885614951,
-            0.7018103031219353
+            0.5783089848419898,
+            -0.7931546470733924,
+            0.19095660207730275
           ],
-          "penetration": 0.38748660079258757
+          "penetration": 0.07416687041810216
         },
         {
           "position": [
-            0.13122985226976885,
-            -0.14602822210824484,
-            0.3853971777891754
+            0.16598840205030713,
+            -0.17746367422363107,
+            0.39715386423800014
           ],
           "normal": [
-            -0.7461301645468772,
-            0.5799443811165231,
-            0.32703867105378104
+            -0.6033663081701917,
+            6.283171235076136e-16,
+            0.7974641673235693
           ],
-          "penetration": 0.36498459087323737
+          "penetration": 0.17669787804401668
         }
       ]
     },
     {
       "name": "box_base_crossing",
       "shape": "box",
-      "position_tolerance": 1.0,
+      "position_tolerance": 0.05,
+      "normal_bound": 0.42,
+      "penetration_bound": 0.025,
       "provenance": {
-        "mode": "legacy",
-        "nativeccd": "disable",
-        "source_xml": "hfield_conformance_nativeccd_disabled.xml"
+        "mode": "default",
+        "nativeccd": "default",
+        "source_xml": "hfield_conformance_default_box.xml"
       },
       "field": {
         "nrow": 2,
@@ -299,29 +303,29 @@
       "contacts": [
         {
           "position": [
-            -0.12500000000000003,
-            0.12500000000000003,
-            -0.07916666666666668
+            -0.10847457627118645,
+            0.05932203389830509,
+            -0.11694915254237288
           ],
           "normal": [
-            0.7071067811865476,
-            -0.7071067811865476,
-            0.0
+            0.7065618047809736,
+            -0.5888015039841449,
+            0.3925343359894298
           ],
-          "penetration": 0.28284271247461895
+          "penetration": 0.2590726617530236
         },
         {
           "position": [
-            0.12500000000000003,
-            -0.12500000000000003,
-            -0.07916666666666669
+            0.05932203389830512,
+            -0.10847457627118642,
+            -0.1169491525423729
           ],
           "normal": [
-            -0.7071067811865476,
-            0.7071067811865476,
-            -4.906538933386799e-17
+            -0.5888015039841447,
+            0.7065618047809739,
+            0.3925343359894297
           ],
-          "penetration": 0.28284271247461895
+          "penetration": 0.2590726617530236
         }
       ]
     },
@@ -484,5 +488,11 @@
         }
       ]
     }
-  ]
+  ],
+  "capture_provenance": {
+    "script": "tools/capture_hfield_conformance.py",
+    "mujoco": "3.11.0",
+    "date": "2026-08-17",
+    "method": "mj_forward static contacts from each declared source_xml"
+  }
 }

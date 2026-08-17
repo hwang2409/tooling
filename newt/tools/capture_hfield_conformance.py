@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 from pathlib import Path
 
@@ -68,6 +69,12 @@ def main() -> int:
 
     fixture_path = args.references / "hfield_conformance.json"
     document = json.loads(fixture_path.read_text(encoding="utf-8"))
+    document["capture_provenance"] = {
+        "script": "tools/capture_hfield_conformance.py",
+        "mujoco": mujoco.__version__,
+        "date": datetime.date.today().isoformat(),
+        "method": "mj_forward static contacts from each declared source_xml",
+    }
     for case in document["cases"]:
         source = args.references / case["provenance"]["source_xml"]
         contacts, ngeom, nhfield = capture_case(mujoco, source, case)

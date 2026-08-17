@@ -46,6 +46,16 @@ fn optional_number(value: &Value, name: &str) -> Option<f32> {
         .map(|(_, value)| number(value, name))
 }
 
+fn optional_string<'a>(value: &'a Value, name: &str) -> Option<&'a str> {
+    let Value::Object(fields) = value else {
+        panic!("case must be an object");
+    };
+    fields
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| string(value, name))
+}
+
 fn pose(value: &Value) -> GeomPose {
     let position = numbers(object(value, "position"), "position");
     let orientation = if let Some(angle) = match value {
@@ -328,14 +338,17 @@ fn parsed_mujoco_heightfield_contacts_match_all_adversarial_poses() {
         let mut actual = actual.as_slice().to_vec();
         let position_tolerance = optional_number(case, "position_tolerance").unwrap_or(5.0e-3);
         let normal_bound = optional_number(case, "normal_bound").unwrap_or(5.0e-3);
-        let order = |a: &Contact, b: &Contact| {
-            b.penetration
-                .total_cmp(&a.penetration)
-                .then_with(|| a.position_world.x.total_cmp(&b.position_world.x))
-                .then_with(|| a.position_world.y.total_cmp(&b.position_world.y))
-        };
-        expected.sort_by(order);
-        actual.sort_by(order);
+        let penetration_bound = optional_number(case, "penetration_bound").unwrap_or(5.0e-3);
+        if optional_string(case, "order") != Some("source") {
+            let order = |a: &Contact, b: &Contact| {
+                b.penetration
+                    .total_cmp(&a.penetration)
+                    .then_with(|| a.position_world.x.total_cmp(&b.position_world.x))
+                    .then_with(|| a.position_world.y.total_cmp(&b.position_world.y))
+            };
+            expected.sort_by(order);
+            actual.sort_by(order);
+        }
         assert_eq!(actual.len(), expected.len(), "{name}");
         for (actual, expected) in actual.iter().zip(expected) {
             close_vec(
@@ -345,7 +358,7 @@ fn parsed_mujoco_heightfield_contacts_match_all_adversarial_poses() {
             );
             close_vec(actual.normal_world, expected.normal_world, normal_bound);
             assert!(
-                (actual.penetration - expected.penetration).abs() <= 5.0e-3,
+                (actual.penetration - expected.penetration).abs() <= penetration_bound,
                 "{name}: {actual:?} != {expected:?}"
             );
         }

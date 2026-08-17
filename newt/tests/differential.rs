@@ -1257,7 +1257,7 @@ fn assert_hfield_early_window(
         .copied()
         .fold(0.0, f64::max);
     println!(
-        "differential[{name}] early window through step {last_step}: qpos={qpos:.6e} qvel={qvel:.6e}; chaotic onset follows"
+        "differential[{name}] early window through step {last_step}: qpos={qpos:.6e} qvel={qvel:.6e}; later samples are checked separately"
     );
     assert!(
         qpos <= qpos_bound,
@@ -1560,6 +1560,32 @@ fn differential_hfield_steep_box_ccd_disabled_anchor() {
         Tolerance {
             qpos: 7.0e-3,
             qvel: 1.5e-1,
+        },
+    );
+}
+
+#[test]
+fn differential_hfield_steep_box_ccd_default_anchor() {
+    let spec = scenario("hfield_box_steep_ccd_default");
+    let d = run_scenario(&spec);
+    assert_hfield_early_window(
+        "hfield_box_steep_ccd_default",
+        &d,
+        spec.stride,
+        50,
+        2.0e-6,
+        2.0e-6,
+    );
+    println!(
+        "differential[hfield_box_steep_ccd_default] measured qpos={:.6e} qvel={:.6e}",
+        d.qpos_max, d.qvel_max
+    );
+    assert_within_bounds(
+        "hfield_box_steep_ccd_default",
+        &d,
+        Tolerance {
+            qpos: 1.5e-4,
+            qvel: 8.0e-3,
         },
     );
 }
