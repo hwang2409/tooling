@@ -199,8 +199,8 @@ pub struct Tree {
     /// Actuators attached to hinge/slide joints (tier 4, generalized in
     /// v2 tier 2 — see [`Actuator`]). Controls settable per step via
     /// [`Tree::set_actuator_target`].
-    /// Activation state (when `dyn_type = Filter`) is integrated once per
-    /// step at the end of [`rk4_step`].
+    /// Filter activation is integrated once per step at the end of
+    /// [`rk4_step`]. Muscle activation follows the RK4 mechanical stages.
     pub actuators: Vec<Actuator>,
     /// Per-link user-applied world-frame wrenches at each link's COM,
     /// `(force_world, torque_world)`. Length equals `links.len()`; grows
@@ -374,13 +374,22 @@ impl Tree {
         self.actuators[actuator_idx].ctrl = ctrl;
     }
 
-    /// Integrate every actuator's activation state forward by `dt`
-    /// (forward Euler on the filter ODE). Called at the end of
-    /// [`rk4_step`] — see [`crate::actuator`] for the ZOH-per-step
-    /// convention.
+    /// Integrate every actuator's boundary activation state forward by `dt`.
+    /// Euler uses this for filters and muscles. RK4 uses it only for filters;
+    /// muscle activation is integrated by the RK4 stages.
     pub fn integrate_activations(&mut self, dt: f32) {
         for a in &mut self.actuators {
             a.integrate_activation(dt);
+        }
+    }
+
+    /// Integrate only filter activations at the end of an RK4 step.
+    /// Muscle activations are integrated by the RK4 stages themselves.
+    fn integrate_filter_activations(&mut self, dt: f32) {
+        for a in &mut self.actuators {
+            if matches!(a.dyn_type, crate::actuator::DynType::Filter) {
+                a.integrate_activation(dt);
+            }
         }
     }
 
@@ -1574,27 +1583,34 @@ where
     let ext1 = compute_ext_wrenches(&s0);
     let k1 = aba(&s0, &poses1, gravity, &ext1);
     let (dq1, dv1) = tree_deriv(&s0, &k1);
+    let da1 = muscle_activation_deriv(&s0);
 
     // k2 at s0 + k1 * dt/2
-    let s1 = tree_advance(&s0, &dq1, &dv1, dt * 0.5);
+    let mut s1 = tree_advance(&s0, &dq1, &dv1, dt * 0.5);
+    advance_muscle_activation(&mut s1, &s0, &da1, dt * 0.5);
     let poses2 = forward_kinematics(&s1);
     let ext2 = compute_ext_wrenches(&s1);
     let k2 = aba(&s1, &poses2, gravity, &ext2);
     let (dq2, dv2) = tree_deriv(&s1, &k2);
+    let da2 = muscle_activation_deriv(&s1);
 
     // k3 at s0 + k2 * dt/2
-    let s2 = tree_advance(&s0, &dq2, &dv2, dt * 0.5);
+    let mut s2 = tree_advance(&s0, &dq2, &dv2, dt * 0.5);
+    advance_muscle_activation(&mut s2, &s0, &da2, dt * 0.5);
     let poses3 = forward_kinematics(&s2);
     let ext3 = compute_ext_wrenches(&s2);
     let k3 = aba(&s2, &poses3, gravity, &ext3);
     let (dq3, dv3) = tree_deriv(&s2, &k3);
+    let da3 = muscle_activation_deriv(&s2);
 
     // k4 at s0 + k3 * dt
-    let s3 = tree_advance(&s0, &dq3, &dv3, dt);
+    let mut s3 = tree_advance(&s0, &dq3, &dv3, dt);
+    advance_muscle_activation(&mut s3, &s0, &da3, dt);
     let poses4 = forward_kinematics(&s3);
     let ext4 = compute_ext_wrenches(&s3);
     let k4 = aba(&s3, &poses4, gravity, &ext4);
     let (dq4, dv4) = tree_deriv(&s3, &k4);
+    let da4 = muscle_activation_deriv(&s3);
 
     // Combine and write back into tree.
     let sixth = 1.0 / 6.0;
@@ -1603,6 +1619,12 @@ where
     }
     for j in 0..s0.qdot.len() {
         tree.qdot[j] = s0.qdot[j] + (dv1[j] + 2.0 * dv2[j] + 2.0 * dv3[j] + dv4[j]) * (dt * sixth);
+    }
+    for (i, actuator) in tree.actuators.iter_mut().enumerate() {
+        if matches!(actuator.dyn_type, crate::actuator::DynType::Muscle) {
+            actuator.act = s0.actuators[i].act
+                + (da1[i] + 2.0 * da2[i] + 2.0 * da3[i] + da4[i]) * (dt * sixth);
+        }
     }
     if s0.links.first().is_some_and(|link| link.mocap) {
         let root_nq = s0.links[0].joint.nq();
@@ -1636,13 +1658,9 @@ where
             tree.q[off + 3] = q.w;
         }
     }
-    // Activation-state update. Filter actuators use forward Euler on
-    // `act' = (u - act)/tau`, integrated ONCE per RK4 step at the
-    // boundary. The four RK4 sub-stages above saw `act` from step start
-    // (ZOH), so this update takes effect on the NEXT step — mirroring
-    // the ZOH convention for ctrl/qfrc_applied/applied_wrenches. Non-
-    // filter actuators are no-ops here. See docs/actuators.md.
-    tree.integrate_activations(dt);
+    // Filter actuators keep the existing end-of-step Euler update. Muscle
+    // activations were advanced at each RK4 stage and are already final.
+    tree.integrate_filter_activations(dt);
 }
 
 /// One semi-implicit Euler step on a tree.
@@ -1814,6 +1832,31 @@ fn tree_advance(origin: &Tree, dq: &[f32], dv: &[f32], dt: f32) -> Tree {
         *slot = origin.qdot[j] + dv[j] * dt;
     }
     out
+}
+
+fn muscle_activation_deriv(tree: &Tree) -> Vec<f32> {
+    tree.actuators
+        .iter()
+        .map(|actuator| {
+            if matches!(actuator.dyn_type, crate::actuator::DynType::Muscle) {
+                crate::actuator::muscle_dynamics(
+                    actuator.ctrl,
+                    actuator.act,
+                    actuator.muscle_dyn_prm,
+                )
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+fn advance_muscle_activation(tree: &mut Tree, origin: &Tree, deriv: &[f32], dt: f32) {
+    for (i, actuator) in tree.actuators.iter_mut().enumerate() {
+        if matches!(actuator.dyn_type, crate::actuator::DynType::Muscle) {
+            actuator.act = origin.actuators[i].act + deriv[i] * dt;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

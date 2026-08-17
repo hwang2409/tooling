@@ -1,0 +1,300 @@
+{
+  "oracle": "MuJoCo 3.11.0",
+  "params": [
+    0.75,
+    1.05,
+    -1.0,
+    200.0,
+    0.5,
+    1.6,
+    1.5,
+    1.3,
+    1.2
+  ],
+  "lengthrange": [
+    0.0,
+    1.0
+  ],
+  "acc0": 2.0,
+  "dynprm": [
+    0.1,
+    0.2,
+    0.4
+  ],
+  "gain": [
+    {
+      "length": 0.0,
+      "velocity": -5.0,
+      "value": -0.0
+    },
+    {
+      "length": 0.0,
+      "velocity": -2.5,
+      "value": -12.5
+    },
+    {
+      "length": 0.0,
+      "velocity": 0.0,
+      "value": -50.0
+    },
+    {
+      "length": 0.0,
+      "velocity": 0.25,
+      "value": -54.37499999999999
+    },
+    {
+      "length": 0.0,
+      "velocity": 2.5,
+      "value": -60.0
+    },
+    {
+      "length": 0.25,
+      "velocity": -5.0,
+      "value": -0.0
+    },
+    {
+      "length": 0.25,
+      "velocity": -2.5,
+      "value": -18.874999999999996
+    },
+    {
+      "length": 0.25,
+      "velocity": 0.0,
+      "value": -75.49999999999999
+    },
+    {
+      "length": 0.25,
+      "velocity": 0.25,
+      "value": -82.10624999999997
+    },
+    {
+      "length": 0.25,
+      "velocity": 2.5,
+      "value": -90.59999999999998
+    },
+    {
+      "length": 0.5,
+      "velocity": -5.0,
+      "value": -0.0
+    },
+    {
+      "length": 0.5,
+      "velocity": -2.5,
+      "value": -23.0
+    },
+    {
+      "length": 0.5,
+      "velocity": 0.0,
+      "value": -92.0
+    },
+    {
+      "length": 0.5,
+      "velocity": 0.25,
+      "value": -100.05
+    },
+    {
+      "length": 0.5,
+      "velocity": 2.5,
+      "value": -110.39999999999999
+    },
+    {
+      "length": 0.8333333,
+      "velocity": -5.0,
+      "value": -0.0
+    },
+    {
+      "length": 0.8333333,
+      "velocity": -2.5,
+      "value": -24.999999999999982
+    },
+    {
+      "length": 0.8333333,
+      "velocity": 0.0,
+      "value": -99.99999999999993
+    },
+    {
+      "length": 0.8333333,
+      "velocity": 0.25,
+      "value": -108.74999999999991
+    },
+    {
+      "length": 0.8333333,
+      "velocity": 2.5,
+      "value": -119.99999999999991
+    },
+    {
+      "length": 1.0,
+      "velocity": -5.0,
+      "value": -0.0
+    },
+    {
+      "length": 1.0,
+      "velocity": -2.5,
+      "value": -24.652777777777775
+    },
+    {
+      "length": 1.0,
+      "velocity": 0.0,
+      "value": -98.6111111111111
+    },
+    {
+      "length": 1.0,
+      "velocity": 0.25,
+      "value": -107.23958333333331
+    },
+    {
+      "length": 1.0,
+      "velocity": 2.5,
+      "value": -118.33333333333331
+    }
+  ],
+  "bias": [
+    {
+      "length": 0.0,
+      "value": 0.0
+    },
+    {
+      "length": 0.25,
+      "value": 0.0
+    },
+    {
+      "length": 0.5,
+      "value": 0.0
+    },
+    {
+      "length": 0.8333333,
+      "value": 0.0
+    },
+    {
+      "length": 1.0,
+      "value": -1.8055555555555582
+    }
+  ],
+  "dynamics": [
+    {
+      "activation": 0.0,
+      "control": 0.0,
+      "value": 0.0
+    },
+    {
+      "activation": 0.0,
+      "control": 0.25,
+      "value": 5.000000000000001
+    },
+    {
+      "activation": 0.0,
+      "control": 0.5,
+      "value": 10.000000000000002
+    },
+    {
+      "activation": 0.0,
+      "control": 0.75,
+      "value": 15.000000000000004
+    },
+    {
+      "activation": 0.0,
+      "control": 1.0,
+      "value": 20.000000000000004
+    },
+    {
+      "activation": 0.25,
+      "control": 0.0,
+      "value": -1.09375
+    },
+    {
+      "activation": 0.25,
+      "control": 0.25,
+      "value": 0.0
+    },
+    {
+      "activation": 0.25,
+      "control": 0.5,
+      "value": 2.8571428571428563
+    },
+    {
+      "activation": 0.25,
+      "control": 0.75,
+      "value": 5.714285714285713
+    },
+    {
+      "activation": 0.25,
+      "control": 1.0,
+      "value": 8.57142857142857
+    },
+    {
+      "activation": 0.5,
+      "control": 0.0,
+      "value": -3.125
+    },
+    {
+      "activation": 0.5,
+      "control": 0.25,
+      "value": -1.5625
+    },
+    {
+      "activation": 0.5,
+      "control": 0.5,
+      "value": 0.0
+    },
+    {
+      "activation": 0.5,
+      "control": 0.75,
+      "value": 2.0
+    },
+    {
+      "activation": 0.5,
+      "control": 1.0,
+      "value": 4.0
+    },
+    {
+      "activation": 0.75,
+      "control": 0.0,
+      "value": -6.09375
+    },
+    {
+      "activation": 0.75,
+      "control": 0.25,
+      "value": -4.0625
+    },
+    {
+      "activation": 0.75,
+      "control": 0.5,
+      "value": -2.03125
+    },
+    {
+      "activation": 0.75,
+      "control": 0.75,
+      "value": 0.0
+    },
+    {
+      "activation": 0.75,
+      "control": 1.0,
+      "value": 1.5384615384615383
+    },
+    {
+      "activation": 1.0,
+      "control": 0.0,
+      "value": -10.0
+    },
+    {
+      "activation": 1.0,
+      "control": 0.25,
+      "value": -7.5
+    },
+    {
+      "activation": 1.0,
+      "control": 0.5,
+      "value": -5.0
+    },
+    {
+      "activation": 1.0,
+      "control": 0.75,
+      "value": -2.5
+    },
+    {
+      "activation": 1.0,
+      "control": 1.0,
+      "value": 0.0
+    }
+  ]
+}

@@ -30,7 +30,7 @@
 //! - `General { .. }` — the raw gain/bias/gear composition; use for
 //!   parameter shapes the shorthands can't cover.
 //!
-//! # Activation dynamics (`DynType::Filter`)
+//! # Activation dynamics
 //!
 //! When `dyn_type = Filter`, the actuator carries a scalar activation state
 //! `act` that lags the (clamped) control input:
@@ -45,15 +45,14 @@
 //! act ← act + (dt/tau) * (u - act)
 //! ```
 //!
-//! ZOH within the step: the RK4 sub-stages of `Tree::step` read `act`
-//! unchanged; `Tree::integrate_activations(dt)` is called ONCE per step
-//! (see [`crate::tree::rk4_step`]). This matches the ZOH convention already
-//! used for `ctrl`, `qfrc_applied`, and `applied_wrenches` (documented in
-//! `docs/actuators.md`) and mirrors MuJoCo's Euler activation integrator
-//! for `integrator=Euler`. For `integrator=RK4` MuJoCo also integrates
-//! activation with the same RK4 stages; the difference shows up in the
-//! filtered-motor differential scenario as a bounded, documented residual
-//! (see `docs/differential.md`).
+//! Filter state uses the existing forward-Euler boundary update. Muscle state
+//! uses the same integrator stages as the mechanical state under RK4, and a
+//! boundary Euler update under Euler. Muscle force reads the stage activation.
+
+//! Muscle gain and bias use MuJoCo's normalized force-length-velocity curves.
+//! The result is negative because actuator force follows MuJoCo's convention.
+//! Muscle length and velocity are transmission-space values, so `gear` is
+//! applied before the curves and again to the resulting generalized force.
 //!
 //! Edge case: `dt >= tau`. Forward Euler overshoots when `dt/tau > 1`
 //! and oscillates when `dt/tau > 2`. This is stated behavior — MuJoCo's
@@ -106,6 +105,8 @@ pub enum GainType {
     Fixed,
     /// `g = gainprm[0] + gainprm[1]*(gear*q) + gainprm[2]*(gear*qdot)`.
     Affine,
+    /// `g = mju_muscleGain(length, velocity, lengthrange, acc0, prm)`.
+    Muscle,
 }
 
 /// Which side of the general model the bias samples on. Affine sampling
@@ -116,6 +117,8 @@ pub enum BiasType {
     None,
     /// `b = biasprm[0] + biasprm[1]*(gear*q) + biasprm[2]*(gear*qdot)`.
     Affine,
+    /// `b = mju_muscleBias(length, lengthrange, acc0, prm)`.
+    Muscle,
 }
 
 /// Activation dynamics.
@@ -127,6 +130,9 @@ pub enum DynType {
     /// `act' = (u - act) / tau`, integrated with forward Euler at each
     /// step boundary. `u` is the clamped `ctrl`. `dynprm[0] = tau`.
     Filter,
+    /// MuJoCo muscle activation dynamics. Parameters live in
+    /// [`Actuator::muscle_dyn_prm`].
+    Muscle,
 }
 
 /// Fast-path evaluation variant. Each shorthand carries the parameters
@@ -149,6 +155,16 @@ pub enum ActuatorFlavor {
         gain_prm: [f32; 3],
         bias_type: BiasType,
         bias_prm: [f32; 3],
+        gear: f32,
+    },
+    /// MuJoCo muscle gain and bias curves. The two parameter vectors are
+    /// kept separately because `<general>` permits distinct arrays, while
+    /// `<muscle>` supplies the same nine values to both functions.
+    Muscle {
+        gain_prm: [f32; 9],
+        bias_prm: [f32; 9],
+        length_range: [f32; 2],
+        acc0: f32,
         gear: f32,
     },
 }
@@ -180,6 +196,9 @@ pub struct Actuator {
     /// Activation-dynamics parameter vector. `dyn_prm[0]` is the filter
     /// time constant `tau` (seconds) for `DynType::Filter`.
     pub dyn_prm: [f32; 1],
+    /// Muscle activation parameters `(tau_act, tau_deact, tausmooth)`.
+    /// Unused by non-muscle actuators.
+    pub muscle_dyn_prm: [f32; 3],
     /// Optional `(lo, hi)` clamp applied to `ctrl` before it enters
     /// `gain*signal + bias` (and before activation integration).
     /// `None` = no clamp.
@@ -211,6 +230,7 @@ impl Actuator {
             flavor: ActuatorFlavor::Position { kp, kv },
             dyn_type: DynType::None,
             dyn_prm: [0.0],
+            muscle_dyn_prm: [0.0; 3],
             ctrl_range: None,
             force_range: symmetric_range(force_range),
             ctrl: target,
@@ -242,6 +262,7 @@ impl Actuator {
             flavor: ActuatorFlavor::Velocity { kv },
             dyn_type: DynType::None,
             dyn_prm: [0.0],
+            muscle_dyn_prm: [0.0; 3],
             ctrl_range: None,
             force_range: symmetric_range(force_range),
             ctrl: 0.0,
@@ -257,6 +278,7 @@ impl Actuator {
             flavor: ActuatorFlavor::Motor { gear },
             dyn_type: DynType::None,
             dyn_prm: [0.0],
+            muscle_dyn_prm: [0.0; 3],
             ctrl_range: None,
             force_range: symmetric_range(force_range),
             ctrl: 0.0,
@@ -306,11 +328,92 @@ impl Actuator {
             },
             dyn_type,
             dyn_prm,
+            muscle_dyn_prm: [0.0; 3],
             ctrl_range,
             force_range,
             ctrl: 0.0,
             act: 0.0,
         }
+    }
+
+    /// Build a MuJoCo muscle actuator. `gain_prm` and `bias_prm` use the
+    /// native nine-value order `(range[2], force, scale, lmin, lmax, vmax,
+    /// fpmax, fvmax)`. `length_range` is required because this subset does
+    /// not run MuJoCo's simulation-based compiler search.
+    #[allow(clippy::too_many_arguments)]
+    pub fn muscle(
+        link_idx: usize,
+        gain_prm: [f32; 9],
+        bias_prm: [f32; 9],
+        length_range: [f32; 2],
+        acc0: f32,
+        gear: f32,
+        dyn_prm: [f32; 3],
+        ctrl_range: Option<(f32, f32)>,
+        force_range: Option<(f32, f32)>,
+    ) -> Self {
+        assert!(
+            length_range[0] < length_range[1],
+            "muscle length_range must be increasing"
+        );
+        assert!(
+            acc0 >= 0.0 && acc0.is_finite(),
+            "muscle acc0 must be finite and >= 0"
+        );
+        assert!(dyn_prm[0] > 0.0, "muscle tau_act must be > 0");
+        assert!(dyn_prm[1] > 0.0, "muscle tau_deact must be > 0");
+        assert!(dyn_prm[2] >= 0.0, "muscle tausmooth must be >= 0");
+        if let Some((lo, hi)) = ctrl_range {
+            assert!(lo < hi, "ctrl_range must satisfy lo < hi");
+        }
+        if let Some((lo, hi)) = force_range {
+            assert!(lo <= hi, "force_range must satisfy lo <= hi");
+        }
+        Self {
+            link_idx,
+            tendon_target: None,
+            flavor: ActuatorFlavor::Muscle {
+                gain_prm,
+                bias_prm,
+                length_range,
+                acc0,
+                gear,
+            },
+            dyn_type: DynType::Muscle,
+            dyn_prm: [0.0],
+            muscle_dyn_prm: dyn_prm,
+            ctrl_range,
+            force_range,
+            ctrl: 0.0,
+            act: 0.0,
+        }
+    }
+
+    /// Build a `<general>` muscle actuator with distinct gain and bias
+    /// parameter arrays.
+    #[allow(clippy::too_many_arguments)]
+    pub fn general_muscle(
+        link_idx: usize,
+        gain_prm: [f32; 9],
+        bias_prm: [f32; 9],
+        length_range: [f32; 2],
+        acc0: f32,
+        gear: f32,
+        dyn_prm: [f32; 3],
+        ctrl_range: Option<(f32, f32)>,
+        force_range: Option<(f32, f32)>,
+    ) -> Self {
+        Self::muscle(
+            link_idx,
+            gain_prm,
+            bias_prm,
+            length_range,
+            acc0,
+            gear,
+            dyn_prm,
+            ctrl_range,
+            force_range,
+        )
     }
 
     // ---- tendon-transmission builder ---------------------------------
@@ -374,7 +477,7 @@ impl Actuator {
             } => {
                 let signal = match self.dyn_type {
                     DynType::None => self.clamped_ctrl(),
-                    DynType::Filter => self.act,
+                    DynType::Filter | DynType::Muscle => self.act,
                 };
                 // MuJoCo transmission-space sampling: for a joint
                 // transmission with scalar gear, `actuator_length = gear*q`
@@ -394,12 +497,28 @@ impl Actuator {
                 let g = match gain_type {
                     GainType::Fixed => gain_prm[0],
                     GainType::Affine => gain_prm[0] + gain_prm[1] * len_tr + gain_prm[2] * vel_tr,
+                    GainType::Muscle => unreachable!("muscle gain uses ActuatorFlavor::Muscle"),
                 };
                 let b = match bias_type {
                     BiasType::None => 0.0,
                     BiasType::Affine => bias_prm[0] + bias_prm[1] * len_tr + bias_prm[2] * vel_tr,
+                    BiasType::Muscle => unreachable!("muscle bias uses ActuatorFlavor::Muscle"),
                 };
                 (g * signal + b) * gear
+            }
+            ActuatorFlavor::Muscle {
+                gain_prm,
+                bias_prm,
+                length_range,
+                acc0,
+                gear,
+            } => {
+                let len_tr = len * gear;
+                let vel_tr = vel * gear;
+                let signal = self.act;
+                (muscle_gain(len_tr, vel_tr, length_range, acc0, gain_prm) * signal
+                    + muscle_bias(len_tr, length_range, acc0, bias_prm))
+                    * gear
             }
         };
         match self.force_range {
@@ -428,19 +547,34 @@ impl Actuator {
             } => {
                 let signal = match self.dyn_type {
                     DynType::None => self.clamped_ctrl(),
-                    DynType::Filter => self.act,
+                    DynType::Filter | DynType::Muscle => self.act,
                 };
                 let gain_velocity = match gain_type {
                     GainType::Fixed => 0.0,
                     GainType::Affine => gain_prm[2],
+                    GainType::Muscle => unreachable!("muscle gain uses ActuatorFlavor::Muscle"),
                 };
                 let bias_velocity = match bias_type {
                     BiasType::None => 0.0,
                     BiasType::Affine => bias_prm[2],
+                    BiasType::Muscle => unreachable!("muscle bias uses ActuatorFlavor::Muscle"),
                 };
                 // Keep the same transmission-space derivative as torque:
                 // both the sampled velocity and output force carry `gear`.
                 -gear * gear * (gain_velocity * signal + bias_velocity)
+            }
+            ActuatorFlavor::Muscle {
+                gain_prm,
+                length_range,
+                acc0,
+                gear,
+                ..
+            } => {
+                let len_tr = _len * gear;
+                let vel_tr = _vel * gear;
+                muscle_velocity_damping(len_tr, vel_tr, length_range, acc0, gain_prm, self.act)
+                    * gear
+                    * gear
             }
         }
     }
@@ -452,13 +586,147 @@ impl Actuator {
     /// the ZOH-within-step convention and its RK4 interaction.
     #[inline]
     pub fn integrate_activation(&mut self, dt: f32) {
-        if let DynType::Filter = self.dyn_type {
-            let tau = self.dyn_prm[0];
-            let u = self.clamped_ctrl();
-            // Explicit Euler: act += dt/tau * (u - act).
-            let alpha = dt / tau;
-            self.act += alpha * (u - self.act);
+        match self.dyn_type {
+            DynType::Filter => {
+                let tau = self.dyn_prm[0];
+                let u = self.clamped_ctrl();
+                // Explicit Euler: act += dt/tau * (u - act).
+                let alpha = dt / tau;
+                self.act += alpha * (u - self.act);
+            }
+            DynType::Muscle => {
+                self.act += dt * muscle_dynamics(self.ctrl, self.act, self.muscle_dyn_prm);
+            }
+            DynType::None => {}
         }
+    }
+}
+
+const MJ_MINVAL: f32 = 1.0e-15;
+
+/// Normalized MuJoCo muscle active force-length curve.
+#[inline]
+pub fn muscle_gain_length(length: f32, lmin: f32, lmax: f32) -> f32 {
+    if lmin <= length && length <= lmax {
+        let a = 0.5 * (lmin + 1.0);
+        let b = 0.5 * (1.0 + lmax);
+        if length <= a {
+            let x = (length - lmin) / (a - lmin).max(MJ_MINVAL);
+            0.5 * x * x
+        } else if length <= 1.0 {
+            let x = (1.0 - length) / (1.0 - a).max(MJ_MINVAL);
+            1.0 - 0.5 * x * x
+        } else if length <= b {
+            let x = (length - 1.0) / (b - 1.0).max(MJ_MINVAL);
+            1.0 - 0.5 * x * x
+        } else {
+            let x = (lmax - length) / (lmax - b).max(MJ_MINVAL);
+            0.5 * x * x
+        }
+    } else {
+        0.0
+    }
+}
+
+/// MuJoCo's muscle active force gain. The result is negative by convention.
+#[inline]
+pub fn muscle_gain(len: f32, vel: f32, length_range: [f32; 2], acc0: f32, prm: [f32; 9]) -> f32 {
+    let force = if prm[2] < 0.0 {
+        prm[3] / acc0.max(MJ_MINVAL)
+    } else {
+        prm[2]
+    };
+    let l0 = (length_range[1] - length_range[0]) / (prm[1] - prm[0]).max(MJ_MINVAL);
+    let l = prm[0] + (len - length_range[0]) / l0.max(MJ_MINVAL);
+    let v = vel / (l0 * prm[6]).max(MJ_MINVAL);
+    let fl = muscle_gain_length(l, prm[4], prm[5]);
+    let y = prm[8] - 1.0;
+    let fv = if v <= -1.0 {
+        0.0
+    } else if v <= 0.0 {
+        (v + 1.0) * (v + 1.0)
+    } else if v <= y {
+        prm[8] - (y - v) * (y - v) / y.max(MJ_MINVAL)
+    } else {
+        prm[8]
+    };
+    -force * fl * fv
+}
+
+/// MuJoCo's muscle passive force bias. The result is negative by convention.
+#[inline]
+pub fn muscle_bias(len: f32, length_range: [f32; 2], acc0: f32, prm: [f32; 9]) -> f32 {
+    let force = if prm[2] < 0.0 {
+        prm[3] / acc0.max(MJ_MINVAL)
+    } else {
+        prm[2]
+    };
+    let l0 = (length_range[1] - length_range[0]) / (prm[1] - prm[0]).max(MJ_MINVAL);
+    let l = prm[0] + (len - length_range[0]) / l0.max(MJ_MINVAL);
+    let b = 0.5 * (1.0 + prm[5]);
+    if l <= 1.0 {
+        0.0
+    } else if l <= b {
+        let x = (l - 1.0) / (b - 1.0).max(MJ_MINVAL);
+        -force * prm[7] * 0.5 * x * x
+    } else {
+        let x = (l - b) / (b - 1.0).max(MJ_MINVAL);
+        -force * prm[7] * (0.5 + x)
+    }
+}
+
+#[inline]
+fn muscle_velocity_damping(
+    len: f32,
+    vel: f32,
+    length_range: [f32; 2],
+    acc0: f32,
+    prm: [f32; 9],
+    act: f32,
+) -> f32 {
+    let force = if prm[2] < 0.0 {
+        prm[3] / acc0.max(MJ_MINVAL)
+    } else {
+        prm[2]
+    };
+    let l0 = (length_range[1] - length_range[0]) / (prm[1] - prm[0]).max(MJ_MINVAL);
+    let l = prm[0] + (len - length_range[0]) / l0.max(MJ_MINVAL);
+    let v = vel / (l0 * prm[6]).max(MJ_MINVAL);
+    let fl = muscle_gain_length(l, prm[4], prm[5]);
+    let y = prm[8] - 1.0;
+    let dfv = if v <= -1.0 {
+        0.0
+    } else if v <= 0.0 {
+        2.0 * (v + 1.0)
+    } else if v <= y {
+        2.0 * (y - v) / y.max(MJ_MINVAL)
+    } else {
+        0.0
+    };
+    force * fl * dfv / (l0 * prm[6]).max(MJ_MINVAL) * act
+}
+
+/// MuJoCo's piecewise muscle activation derivative.
+#[inline]
+pub fn muscle_dynamics(ctrl: f32, act: f32, prm: [f32; 3]) -> f32 {
+    let ctrl_clamp = ctrl.clamp(0.0, 1.0);
+    let act_clamp = act.clamp(0.0, 1.0);
+    let tau_act = prm[0] * (0.5 + 1.5 * act_clamp);
+    let tau_deact = prm[1] / (0.5 + 1.5 * act_clamp);
+    let dctrl = ctrl_clamp - act;
+    let tau = muscle_timescale(dctrl, tau_act, tau_deact, prm[2]);
+    dctrl / tau.max(MJ_MINVAL)
+}
+
+/// MuJoCo's hard or smoothed activation time-constant switch.
+#[inline]
+pub fn muscle_timescale(dctrl: f32, tau_act: f32, tau_deact: f32, smoothing_width: f32) -> f32 {
+    if smoothing_width < MJ_MINVAL {
+        if dctrl > 0.0 { tau_act } else { tau_deact }
+    } else {
+        let x = (dctrl / smoothing_width + 0.5).clamp(0.0, 1.0);
+        let sigmoid = x * x * x * (3.0 * x * (2.0 * x - 5.0) + 10.0);
+        tau_deact + (tau_act - tau_deact) * sigmoid
     }
 }
 
@@ -659,6 +927,66 @@ mod tests {
         a.ctrl = 5.0;
         a.act = 2.0;
         assert!(approx(a.torque(0.0, 0.0), 2.0, 1e-6));
+    }
+
+    #[test]
+    fn muscle_flv_hand_anchors_kill_wrong_fl_branch_boundary() {
+        let prm = [0.75, 1.05, -1.0, 200.0, 0.5, 1.6, 1.5, 1.3, 1.2];
+        let length_range = [0.0, 1.0];
+        let acc0 = 2.0;
+
+        assert_eq!(muscle_gain_length(0.5, prm[4], prm[5]), 0.0);
+        assert_eq!(muscle_gain_length(1.6, prm[4], prm[5]), 0.0);
+        assert!((muscle_gain(0.8333333, 0.0, length_range, acc0, prm) + 100.0).abs() < 1e-4);
+        assert_eq!(muscle_bias(0.8333333, length_range, acc0, prm), 0.0);
+
+        let passive_onset = length_range[0] + (1.0 - prm[0]) * 3.3333333;
+        assert!((muscle_bias(passive_onset, length_range, acc0, prm)).abs() < 1e-5);
+
+        let velocity_scale = 3.3333333 * prm[6];
+        assert!(muscle_gain(0.8333333, -velocity_scale, length_range, acc0, prm).abs() < 1e-4);
+        assert!(
+            (muscle_gain(
+                0.8333333,
+                velocity_scale * (prm[8] - 1.0),
+                length_range,
+                acc0,
+                prm
+            ) + 120.0)
+                .abs()
+                < 1e-4
+        );
+    }
+
+    #[test]
+    fn muscle_activation_uses_asymmetric_time_constants_kills_tau_swap() {
+        let prm = [0.1, 0.2, 0.0];
+        assert_eq!(muscle_dynamics(1.0, 0.0, prm), 20.0);
+        assert_eq!(muscle_dynamics(0.0, 1.0, prm), -10.0);
+
+        let mut act = 0.0;
+        act += 0.01 * muscle_dynamics(1.0, act, prm);
+        assert!((act - 0.2).abs() < 1e-6);
+        act += 0.01 * muscle_dynamics(0.0, act, prm);
+        assert!((act - 0.192).abs() < 1e-6);
+    }
+
+    #[test]
+    fn muscle_tausmooth_is_continuous_at_switch_center() {
+        let tau_act = 0.1;
+        let tau_deact = 0.2;
+        let tau = muscle_timescale(0.0, tau_act, tau_deact, 0.4);
+        assert!((tau - 0.15).abs() < 1e-6);
+        assert_eq!(muscle_timescale(-1.0, tau_act, tau_deact, 0.0), tau_deact);
+        assert_eq!(muscle_timescale(1.0, tau_act, tau_deact, 0.0), tau_act);
+    }
+
+    #[test]
+    fn muscle_gain_sign_is_negative_and_passive_force_is_not_dropped() {
+        let prm = [0.75, 1.05, 100.0, 200.0, 0.5, 1.6, 1.5, 1.3, 1.2];
+        let length_range = [0.0, 1.0];
+        assert!(muscle_gain(0.9, 0.0, length_range, 1.0, prm) < 0.0);
+        assert!(muscle_bias(1.0, length_range, 1.0, prm) < 0.0);
     }
 
     #[test]

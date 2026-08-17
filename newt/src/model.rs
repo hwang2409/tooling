@@ -2015,8 +2015,8 @@ fn parse_actuator(
     world: &World,
 ) -> Result<(String, usize, Actuator), ModelError> {
     let fields = get_object(v, path)?;
-    // Schema is a discriminated union on "type". Supported types (v2 tier 3):
-    //   position | velocity | motor | general
+    // Schema is a discriminated union on "type". Supported types:
+    //   position | velocity | motor | muscle | general
     // Transmission is either joint (default: `tree` + `link`) OR tendon
     // (`tree` + `tendon`). Full keyset is a union; per-type paths reject
     // unknowns after reading what they need.
@@ -2141,13 +2141,43 @@ fn parse_actuator(
             a.ctrl = target;
             a
         }
+        "muscle" => {
+            reject_unknown(
+                fields,
+                &[
+                    "name",
+                    "type",
+                    "tree",
+                    "link",
+                    "tendon",
+                    "lengthrange",
+                    "range",
+                    "force",
+                    "scale",
+                    "lmin",
+                    "lmax",
+                    "vmax",
+                    "fpmax",
+                    "fvmax",
+                    "timeconst",
+                    "tausmooth",
+                    "gear",
+                    "ctrlrange",
+                    "forcerange",
+                    "acc0",
+                    "target",
+                ],
+                path,
+            )?;
+            parse_muscle_actuator(fields, path, lidx, target)?
+        }
         "general" => parse_general_actuator(fields, path, lidx, target)?,
         other => {
             return fail(
                 &format!("{path}.type"),
                 format!(
                     "unknown actuator type \"{other}\"; expected one of \
-                     position, velocity, motor, general"
+                     position, velocity, motor, muscle, general"
                 ),
             );
         }
@@ -2227,6 +2257,12 @@ fn parse_general_actuator(
     lidx: usize,
     target: f32,
 ) -> Result<Actuator, ModelError> {
+    let muscle_typed = matches!(optional(fields, "gaintype"), Some(Value::String(v)) if v == "muscle")
+        || matches!(optional(fields, "biastype"), Some(Value::String(v)) if v == "muscle")
+        || matches!(optional(fields, "dyntype"), Some(Value::String(v)) if v == "muscle");
+    if muscle_typed {
+        return parse_general_muscle_actuator(fields, path, lidx, target);
+    }
     reject_unknown(
         fields,
         &[
@@ -2258,7 +2294,7 @@ fn parse_general_actuator(
         other => {
             return fail(
                 &format!("{path}.gaintype"),
-                format!("unknown gaintype \"{other}\"; expected fixed or affine"),
+                format!("unknown gaintype \"{other}\"; expected fixed, affine, or muscle"),
             );
         }
     };
@@ -2273,7 +2309,7 @@ fn parse_general_actuator(
         other => {
             return fail(
                 &format!("{path}.biastype"),
-                format!("unknown biastype \"{other}\"; expected none or affine"),
+                format!("unknown biastype \"{other}\"; expected none, affine, or muscle"),
             );
         }
     };
@@ -2292,7 +2328,7 @@ fn parse_general_actuator(
         other => {
             return fail(
                 &format!("{path}.dyntype"),
-                format!("unknown dyntype \"{other}\"; expected none or filter"),
+                format!("unknown dyntype \"{other}\"; expected none, filter, or muscle"),
             );
         }
     };
@@ -2322,6 +2358,243 @@ fn parse_general_actuator(
     );
     a.ctrl = target;
     Ok(a)
+}
+
+fn parse_muscle_actuator(
+    fields: &[(String, Value)],
+    path: &str,
+    lidx: usize,
+    target: f32,
+) -> Result<Actuator, ModelError> {
+    let length_range = parse_required_range(fields, "lengthrange", path)?;
+    let prm = parse_muscle_prm(fields, path)?;
+    let timeconst = parse_fixed_array(fields, "timeconst", path, [0.01, 0.04])?;
+    if timeconst[0] <= 0.0 || timeconst[1] <= 0.0 {
+        return fail(&format!("{path}.timeconst"), "time constants must be > 0");
+    }
+    let tausmooth = optional(fields, "tausmooth")
+        .map(|v| get_f32(v, &format!("{path}.tausmooth")))
+        .transpose()?
+        .unwrap_or(0.0);
+    if tausmooth < 0.0 {
+        return fail(&format!("{path}.tausmooth"), "tausmooth must be >= 0");
+    }
+    let gear = optional(fields, "gear")
+        .map(|v| get_f32(v, &format!("{path}.gear")))
+        .transpose()?
+        .unwrap_or(1.0);
+    let acc0 = optional(fields, "acc0")
+        .map(|v| get_f32(v, &format!("{path}.acc0")))
+        .transpose()?
+        .unwrap_or(1.0);
+    if acc0 < 0.0 {
+        return fail(&format!("{path}.acc0"), "acc0 must be >= 0");
+    }
+    let ctrl_range = parse_range(fields, "ctrlrange", path)?.or(Some((0.0, 1.0)));
+    let force_range = parse_range(fields, "forcerange", path)?;
+    let mut a = Actuator::muscle(
+        lidx,
+        prm,
+        prm,
+        length_range,
+        acc0,
+        gear,
+        [timeconst[0], timeconst[1], tausmooth],
+        ctrl_range,
+        force_range,
+    );
+    a.ctrl = target;
+    Ok(a)
+}
+
+fn parse_general_muscle_actuator(
+    fields: &[(String, Value)],
+    path: &str,
+    lidx: usize,
+    target: f32,
+) -> Result<Actuator, ModelError> {
+    reject_unknown(
+        fields,
+        &[
+            "name",
+            "type",
+            "tree",
+            "link",
+            "tendon",
+            "gaintype",
+            "gainprm",
+            "biastype",
+            "biasprm",
+            "gear",
+            "dyntype",
+            "dynprm",
+            "lengthrange",
+            "ctrlrange",
+            "forcerange",
+            "acc0",
+            "target",
+        ],
+        path,
+    )?;
+    let gain_type = optional(fields, "gaintype")
+        .map(|v| get_str(v, &format!("{path}.gaintype")))
+        .transpose()?
+        .unwrap_or("muscle");
+    let bias_type = optional(fields, "biastype")
+        .map(|v| get_str(v, &format!("{path}.biastype")))
+        .transpose()?
+        .unwrap_or("muscle");
+    let dyn_type = optional(fields, "dyntype")
+        .map(|v| get_str(v, &format!("{path}.dyntype")))
+        .transpose()?
+        .unwrap_or("muscle");
+    if gain_type != "muscle" || bias_type != "muscle" || dyn_type != "muscle" {
+        return fail(
+            path,
+            "muscle general requires gaintype, biastype, and dyntype=muscle",
+        );
+    }
+    let gain_prm = parse_prm9(fields, "gainprm", path, default_muscle_prm())?;
+    let bias_prm = parse_prm9(fields, "biasprm", path, gain_prm)?;
+    let length_range = parse_required_range(fields, "lengthrange", path)?;
+    let muscle_dyn = parse_fixed_array(fields, "dynprm", path, [0.01, 0.04, 0.0])?;
+    if muscle_dyn[0] <= 0.0 || muscle_dyn[1] <= 0.0 || muscle_dyn[2] < 0.0 {
+        return fail(
+            &format!("{path}.dynprm"),
+            "muscle dynprm requires positive time constants and nonnegative tausmooth",
+        );
+    }
+    let gear = optional(fields, "gear")
+        .map(|v| get_f32(v, &format!("{path}.gear")))
+        .transpose()?
+        .unwrap_or(1.0);
+    let acc0 = optional(fields, "acc0")
+        .map(|v| get_f32(v, &format!("{path}.acc0")))
+        .transpose()?
+        .unwrap_or(1.0);
+    if acc0 < 0.0 {
+        return fail(&format!("{path}.acc0"), "acc0 must be >= 0");
+    }
+    let ctrl_range = parse_range(fields, "ctrlrange", path)?.or(Some((0.0, 1.0)));
+    let force_range = parse_range(fields, "forcerange", path)?;
+    let mut a = Actuator::general_muscle(
+        lidx,
+        gain_prm,
+        bias_prm,
+        length_range,
+        acc0,
+        gear,
+        muscle_dyn,
+        ctrl_range,
+        force_range,
+    );
+    a.ctrl = target;
+    Ok(a)
+}
+
+fn default_muscle_prm() -> [f32; 9] {
+    [0.75, 1.05, -1.0, 200.0, 0.5, 1.6, 1.5, 1.3, 1.2]
+}
+
+fn parse_muscle_prm(fields: &[(String, Value)], path: &str) -> Result<[f32; 9], ModelError> {
+    let mut prm = default_muscle_prm();
+    for (key, start) in [
+        ("force", 2usize),
+        ("scale", 3),
+        ("lmin", 4),
+        ("lmax", 5),
+        ("vmax", 6),
+        ("fpmax", 7),
+        ("fvmax", 8),
+    ] {
+        if let Some(v) = optional(fields, key) {
+            prm[start] = get_f32(v, &format!("{path}.{key}"))?;
+        }
+    }
+    if optional(fields, "range").is_some() {
+        let range = parse_required_range(fields, "range", path)?;
+        prm[0] = range[0];
+        prm[1] = range[1];
+    }
+    if prm[0] >= prm[1]
+        || prm[4] < 0.0
+        || prm[5] <= prm[4]
+        || prm[6] <= 0.0
+        || prm[7] < 0.0
+        || prm[8] < 1.0
+    {
+        return fail(&format!("{path}.muscle"), "invalid muscle curve parameters");
+    }
+    Ok(prm)
+}
+
+fn parse_prm9(
+    fields: &[(String, Value)],
+    key: &str,
+    path: &str,
+    default: [f32; 9],
+) -> Result<[f32; 9], ModelError> {
+    let Some(v) = optional(fields, key) else {
+        return Ok(default);
+    };
+    let arr = get_array(v, &format!("{path}.{key}"))?;
+    if arr.len() != 9 {
+        return fail(
+            &format!("{path}.{key}"),
+            format!("expected 9 numbers, got {}", arr.len()),
+        );
+    }
+    let mut out = [0.0; 9];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = get_f32(&arr[i], &format!("{path}.{key}[{i}]"))?;
+    }
+    Ok(out)
+}
+
+fn parse_required_range(
+    fields: &[(String, Value)],
+    key: &str,
+    path: &str,
+) -> Result<[f32; 2], ModelError> {
+    let v = required(fields, key, path)?;
+    let arr = get_array(v, &format!("{path}.{key}"))?;
+    if arr.len() != 2 {
+        return fail(
+            &format!("{path}.{key}"),
+            format!("expected 2 numbers, got {}", arr.len()),
+        );
+    }
+    let out = [
+        get_f32(&arr[0], &format!("{path}.{key}[0]"))?,
+        get_f32(&arr[1], &format!("{path}.{key}[1]"))?,
+    ];
+    if out[0] >= out[1] {
+        return fail(&format!("{path}.{key}"), "range low must be < high");
+    }
+    Ok(out)
+}
+
+fn parse_fixed_array<const N: usize>(
+    fields: &[(String, Value)],
+    key: &str,
+    path: &str,
+    default: [f32; N],
+) -> Result<[f32; N], ModelError> {
+    let Some(v) = optional(fields, key) else {
+        return Ok(default);
+    };
+    let arr = get_array(v, &format!("{path}.{key}"))?;
+    if arr.len() != N {
+        return fail(
+            &format!("{path}.{key}"),
+            format!("expected {N} numbers, got {}", arr.len()),
+        );
+    }
+    let mut out = [0.0; N];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = get_f32(&arr[i], &format!("{path}.{key}[{i}]"))?;
+    }
+    Ok(out)
 }
 
 fn parse_prm3(

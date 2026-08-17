@@ -1,0 +1,16 @@
+<mujoco>
+  <option timestep="0.001" integrator="RK4" gravity="0 0 0"/>
+  <worldbody>
+    <body name="root">
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <body name="isometric">
+        <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+        <joint name="hinge" type="hinge" axis="0 1 0" damping="10"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <muscle name="twitch" joint="hinge" lengthrange="-1 1"
+            force="1" timeconst="0.03 0.09" tausmooth="0.2"/>
+  </actuator>
+</mujoco>

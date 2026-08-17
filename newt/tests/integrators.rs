@@ -184,6 +184,31 @@ fn implicitfast_folds_velocity_actuator_derivative() {
 }
 
 #[test]
+fn implicitfast_folds_muscle_velocity_derivative() {
+    let mut tree = damped_hinge(0.0);
+    tree.q[0] = 0.2;
+    let actuator = tree.add_actuator(Actuator::muscle(
+        1,
+        [0.75, 1.05, 100.0, 200.0, 0.5, 1.6, 1.5, 1.3, 1.2],
+        [0.75, 1.05, 100.0, 200.0, 0.5, 1.6, 1.5, 1.3, 1.2],
+        [0.0, 1.0],
+        1.0,
+        1.0,
+        [0.01, 0.04, 0.0],
+        None,
+        None,
+    ));
+    tree.actuators[actuator].act = 1.0;
+    tree.qdot[0] = 0.5;
+    let dt = 0.005;
+    let damping = tree.actuators[actuator].velocity_damping(tree.q[0], tree.qdot[0]);
+    assert!(damping > 0.0, "muscle FV curve must add velocity damping");
+    let explicit = tree.mass_matrix()[0];
+    let implicit = tree.implicit_mass_matrix(dt, true)[0];
+    assert!((implicit - explicit - dt * damping).abs() < 1e-5);
+}
+
+#[test]
 fn implicitfast_tendon_velocity_derivative_stays_explicit() {
     let mut tree = Tree::new();
     tree.push_link(Link::new(
