@@ -103,6 +103,11 @@ pub fn composition(name: &str) -> Composition {
             Vec3::new(3.4, -4.1, 2.6),
             Vec3::new(0.95, 0.25, 0.2),
         ),
+        "hfield" => Composition::new(
+            Vec3::new(0.0, 0.0, 0.65),
+            Vec3::new(4.2, -5.2, 3.0),
+            Vec3::new(0.35, 0.8, 0.25),
+        ),
         "cartpole" => Composition::new(
             Vec3::new(0.0, 0.0, 1.1),
             Vec3::new(0.0, -4.5, 1.6),
@@ -378,9 +383,40 @@ pub fn world_items(world: &World) -> Vec<Item> {
                     material,
                 ));
             }
+            GeomShape::Hfield { hfield_id } => {
+                items.push(item(
+                    hfield_mesh(&world.hfields[hfield_id]),
+                    transform(pose.position, pose.orientation, Vec3::new(1.0, 1.0, 1.0)),
+                    Material::new(Vec3::new(0.22, 0.34, 0.18), 0.0, 0.92),
+                ));
+            }
         }
     }
     items
+}
+
+fn hfield_mesh(hfield: &newt::geom::HeightField) -> Mesh {
+    let mut vertices = Vec::with_capacity(hfield.nrow * hfield.ncol);
+    for row in 0..hfield.nrow {
+        let y = -hfield.size[1] + 2.0 * hfield.size[1] * row as f32 / (hfield.nrow - 1) as f32;
+        for col in 0..hfield.ncol {
+            let x = -hfield.size[0] + 2.0 * hfield.size[0] * col as f32 / (hfield.ncol - 1) as f32;
+            vertices.push(MeshVertex::new(
+                Vec3::new(x, y, hfield.height(row, col)),
+                None,
+                None,
+            ));
+        }
+    }
+    let mut triangles = Vec::with_capacity((hfield.nrow - 1) * (hfield.ncol - 1) * 2);
+    for row in 0..hfield.nrow - 1 {
+        for col in 0..hfield.ncol - 1 {
+            let i = row * hfield.ncol + col;
+            triangles.push([i, i + 1, i + hfield.ncol + 1]);
+            triangles.push([i, i + hfield.ncol + 1, i + hfield.ncol]);
+        }
+    }
+    Mesh::new(vertices, triangles)
 }
 
 pub fn add_capsule(items: &mut Vec<Item>, a: NVec3, b: NVec3, radius: f32, material: Material) {
@@ -666,6 +702,10 @@ mod tests {
             GeomShape::Mesh { mesh_id } => {
                 bytes.push(6);
                 bytes.extend_from_slice(&(*mesh_id as u64).to_le_bytes());
+            }
+            GeomShape::Hfield { hfield_id } => {
+                bytes.push(7);
+                bytes.extend_from_slice(&(*hfield_id as u64).to_le_bytes());
             }
         }
     }
