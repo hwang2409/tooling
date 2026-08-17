@@ -1,0 +1,127 @@
+{
+  "mujoco": "3.11.0",
+  "capture_provenance": {
+    "script": "tools/capture_contact_route_probes.py",
+    "date": "2026-08-17",
+    "method": "mj_forward default contacts from each source_xml"
+  },
+  "probes": [
+    {
+      "id": "P1",
+      "pair": "sphere-ellipsoid",
+      "mujoco_route": "mjc_Convex",
+      "source_xml": "contact_route_sphere_ellipsoid.xml",
+      "contacts": [
+        {
+          "geom": [
+            0,
+            1
+          ],
+          "position": [
+            0.44999999999999996,
+            0.0,
+            0.0
+          ],
+          "frame_normal": [
+            -1.0,
+            0.0,
+            0.0
+          ],
+          "penetration": 0.10000000000000003
+        }
+      ]
+    },
+    {
+      "id": "P2",
+      "pair": "sphere-mesh",
+      "mujoco_route": "mjc_Convex",
+      "source_xml": "contact_route_sphere_mesh.xml",
+      "contacts": [
+        {
+          "geom": [
+            0,
+            1
+          ],
+          "position": [
+            0.19999999870404722,
+            0.20000000271699991,
+            0.05000000129616392
+          ],
+          "frame_normal": [
+            -8.639685024884111e-09,
+            1.8113332692570118e-08,
+            0.9999999999999998
+          ],
+          "penetration": 0.09999999740767213
+        }
+      ]
+    },
+    {
+      "id": "P3",
+      "pair": "plane-ellipsoid",
+      "mujoco_route": "mjc_PlaneConvex",
+      "source_xml": "contact_route_plane_ellipsoid.xml",
+      "contacts": [
+        {
+          "geom": [
+            0,
+            1
+          ],
+          "position": [
+            0.0,
+            0.0,
+            -0.05
+          ],
+          "frame_normal": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "penetration": 0.1
+        }
+      ]
+    },
+    {
+      "id": "P4",
+      "pair": "plane-mesh",
+      "mujoco_route": "mjc_PlaneConvex",
+      "source_xml": "contact_route_plane_mesh.xml",
+      "contacts": [
+        {
+          "geom": [
+            0,
+            1
+          ],
+          "position": [
+            -1.3626275607858673e-08,
+            1.0000000227654942,
+            -0.05000000681313781
+          ],
+          "frame_normal": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "penetration": 0.10000001362627561
+        },
+        {
+          "geom": [
+            0,
+            1
+          ],
+          "position": [
+            4.4870571702659845e-09,
+            4.4870571702659845e-09,
+            -0.04999999775647142
+          ],
+          "frame_normal": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "penetration": 0.09999999551294284
+        }
+      ]
+    }
+  ]
+}

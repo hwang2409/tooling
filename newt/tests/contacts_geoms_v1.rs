@@ -21,6 +21,20 @@ fn approx(a: f32, b: f32, tol: f32) -> bool {
     (a - b).abs() < tol
 }
 
+fn close_vec(actual: Vec3, expected: Vec3, tolerance: f32) {
+    assert!(
+        (actual - expected).length() <= tolerance,
+        "{actual:?} != {expected:?}"
+    );
+}
+
+fn close_scalar(actual: f32, expected: f32, tolerance: f32, label: &str) {
+    assert!(
+        (actual - expected).abs() <= tolerance,
+        "{label}: {actual} != {expected}"
+    );
+}
+
 /// Tetrahedron with vertices at `(0,0,0), (1,0,0), (0,1,0), (0,0,1)`. Used
 /// for mesh anchors. Faces oriented CCW from outside — the winding is only
 /// consumed by triangle iteration, not any topological check.
@@ -532,6 +546,109 @@ fn sphere_touching_mesh_face_gives_correct_penetration() {
         "sphere-mesh penetration {} vs 0.1",
         c.penetration
     );
+}
+
+#[test]
+fn analytic_convex_route_probes_are_stable_against_default_oracle_cases() {
+    // These four fixed poses are the MuJoCo 3.11.0 route probes documented in
+    // docs/contacts.md. MuJoCo uses mjc_Convex for the first two pairs and
+    // mjc_PlaneConvex for the last two. Newt keeps its analytic colliders
+    // because the measured construction differences are documented there.
+    let sphere = Geom::sphere(0, 0.2, Vec3::ZERO, 0.5);
+    let sphere_pose = GeomPose {
+        position: Vec3::new(0.6, 0.0, 0.0),
+        orientation: Quat::IDENTITY,
+    };
+    let ellipsoid = Geom::ellipsoid(1, Vec3::new(0.5, 0.3, 0.2), Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let ellipsoid_pose = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let sphere_ellipsoid = narrow_phase(
+        0,
+        &sphere,
+        &sphere_pose,
+        1,
+        &ellipsoid,
+        &ellipsoid_pose,
+        &[],
+    );
+    assert_eq!(sphere_ellipsoid.len, 1);
+    let contact = sphere_ellipsoid.contacts[0];
+    close_vec(contact.position_world, Vec3::new(0.5, 0.0, 0.0), 1.0e-6);
+    close_vec(contact.normal_world, Vec3::X, 1.0e-6);
+    close_scalar(contact.penetration, 0.1, 1.0e-6, "sphere-ellipsoid depth");
+
+    let mesh_id = 0;
+    let mesh = Geom::mesh(1, mesh_id, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let mesh_pose = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let sphere_mesh = narrow_phase(
+        0,
+        &sphere,
+        &GeomPose {
+            position: Vec3::new(0.2, 0.2, -0.1),
+            orientation: Quat::IDENTITY,
+        },
+        1,
+        &mesh,
+        &mesh_pose,
+        &[unit_tetrahedron()],
+    );
+    assert_eq!(sphere_mesh.len, 1);
+    let contact = sphere_mesh.contacts[0];
+    close_vec(contact.position_world, Vec3::new(0.2, 0.2, 0.0), 1.0e-6);
+    close_vec(contact.normal_world, -Vec3::Z, 1.0e-6);
+    close_scalar(contact.penetration, 0.1, 1.0e-6, "sphere-mesh depth");
+
+    let plane = Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5);
+    let plane_pose = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let plane_ellipsoid = narrow_phase(
+        0,
+        &plane,
+        &plane_pose,
+        1,
+        &ellipsoid,
+        &GeomPose {
+            position: Vec3::new(0.0, 0.0, 0.1),
+            orientation: Quat::IDENTITY,
+        },
+        &[],
+    );
+    assert_eq!(plane_ellipsoid.len, 1);
+    let contact = plane_ellipsoid.contacts[0];
+    close_vec(contact.position_world, Vec3::ZERO, 1.0e-6);
+    close_vec(contact.normal_world, -Vec3::Z, 1.0e-6);
+    close_scalar(contact.penetration, 0.1, 1.0e-6, "plane-ellipsoid depth");
+
+    let plane_mesh = narrow_phase(
+        0,
+        &plane,
+        &plane_pose,
+        1,
+        &mesh,
+        &GeomPose {
+            position: Vec3::new(0.0, 0.0, -0.1),
+            orientation: Quat::IDENTITY,
+        },
+        &[unit_tetrahedron()],
+    );
+    assert_eq!(plane_mesh.len, 3);
+    for contact in plane_mesh.as_slice() {
+        close_vec(contact.normal_world, -Vec3::Z, 1.0e-6);
+        close_scalar(
+            contact.position_world.z,
+            0.0,
+            1.0e-6,
+            "plane-mesh position z",
+        );
+        close_scalar(contact.penetration, 0.1, 1.0e-6, "plane-mesh depth");
+    }
 }
 
 // ---------------------------------------------------------------------------

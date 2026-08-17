@@ -1,0 +1,14 @@
+<mujoco model="contact_route_plane_mesh">
+  <option gravity="0 0 0"/>
+  <asset>
+    <mesh name="tetra" vertex="0 0 0 1 0 0 0 1 0 0 0 1"
+          face="0 2 1 0 1 3 0 3 2 1 2 3"/>
+  </asset>
+  <worldbody>
+    <geom name="plane" type="plane" size="2 2 0.1"/>
+    <body pos="0 0 -0.1">
+      <freejoint/>
+      <geom name="mesh" type="mesh" mesh="tetra"/>
+    </body>
+  </worldbody>
+</mujoco>

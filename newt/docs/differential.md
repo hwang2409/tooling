@@ -132,11 +132,12 @@ hfield grid, size, shape parameters, and world pose against that case.
 
 Newt's native GJK/EPA box-hfield narrow phase matches MuJoCo's default contact
 count. Contact construction remains bounded. The steep-box row asserts
-position `0.27`, normal `0.8`, and depth `0.32`; the base-crossing row asserts
-position `0.11`, normal `0.5`, and depth `0.04`. These are fixture bounds, not
-whole-trajectory claims. MuJoCo exposes one hfield geom, so it does not expose
-its internal prism id. The disabled-mode diagnostic matched the old contacts
-to the same cell and prism by normal and depth:
+position `0.27`, normal `0.8`, and depth `0.32`; fresh default capture tightened
+the base-crossing row to position `0.05`, normal `0.42`, and depth `0.025`.
+These are fixture bounds, not whole-trajectory claims. MuJoCo exposes one
+hfield geom, so it does not expose its internal prism id. The disabled-mode
+diagnostic matched the old contacts to the same cell and prism by normal and
+depth:
 
 | engine | contact | cell | prism | top triangle |
 |--------|---------:|------|-------:|--------------|
@@ -150,8 +151,15 @@ default rows above record the current measured bounds. The disabled rows are
 kept as a delta reference, not as native-CCD evidence.
 
 The direct dynamics anchor `hfield_box_steep_ccd_disabled` is a legacy-mode
-record. It measured `5.53e-3` qpos and `1.18e-1` qvel under the disabled
+record. It measured `4.78e-5` qpos and `2.77e-3` qvel under the disabled
 declaration. It does not certify native-CCD dynamics.
+
+The default-mode anchor `hfield_box_steep_ccd_default` uses the same 100-step
+Euler release with no nativeccd declaration. Its early window through step 50
+measured `1.16e-7` qpos and `6.58e-8` qvel. Across all 100 steps it measured
+`7.31e-5` qpos and `3.97e-3` qvel. The test asserts `2e-6` early-window bounds
+and `1.5e-4` qpos / `8e-3` qvel full-window bounds. This run stayed bounded;
+it did not show the review probe's chaotic regime.
 
 The stable differential rows also remain within the existing evidence tiers:
 the friction-slope final qpos residual is `2.64e-5`, and the hfield box early

@@ -17,6 +17,12 @@
 //!   - capsule vs capsule
 //!   - box vs box (full OBB SAT with edge-edge cross axes — closes the
 //!     NEWT-5 rotated-stack incident)
+//!
+//! MuJoCo 3.11.0 routes sphere-{ellipsoid,mesh} through `mjc_Convex` and
+//! plane-{ellipsoid,mesh} through `mjc_PlaneConvex`. Newt retains its analytic
+//! implementations for these four pairs. Their measured contact-construction
+//! differences are permanent probes in `contacts_geoms_v1.rs` and an open
+//! finding in `docs/contacts.md`.
 //! - Deferred pairs (silently emit no contact + [`is_pair_supported`]
 //!   returns `false` so the world validator can reject them):
 //!   - cylinder vs {cylinder, box, capsule, ellipsoid, mesh}
@@ -2958,9 +2964,13 @@ fn try_narrow_phase(
             geom_b,
             pose_b,
         ),
+        // MuJoCo calls mjc_PlaneConvex for plane-ellipsoid. Keep the existing
+        // analytic path until the documented construction finding is closed.
         (GeomShape::Ellipsoid { semi_axes }, GeomShape::Plane) => ellipsoid_plane(
             idx_a, pose_a, semi_axes, friction, margin, gap, idx_b, geom_b, pose_b,
         ),
+        // MuJoCo calls mjc_PlaneConvex for plane-mesh. See the route probe in
+        // tests/contacts_geoms_v1.rs before changing this construction.
         (GeomShape::Mesh { mesh_id }, GeomShape::Plane) => mesh_plane(
             idx_a,
             pose_a,
@@ -3002,9 +3012,13 @@ fn try_narrow_phase(
         ) => sphere_cylinder(
             idx_a, pose_a, rs, idx_b, pose_b, rc, hc, friction, margin, gap,
         ),
+        // MuJoCo calls mjc_Convex for sphere-ellipsoid. The analytic result is
+        // retained with its measured midpoint difference documented.
         (GeomShape::Sphere { radius: rs }, GeomShape::Ellipsoid { semi_axes }) => sphere_ellipsoid(
             idx_a, pose_a, rs, idx_b, pose_b, semi_axes, friction, margin, gap,
         ),
+        // MuJoCo calls mjc_Convex for sphere-mesh. The analytic result is
+        // retained with its measured midpoint/manifold difference documented.
         (GeomShape::Sphere { radius: rs }, GeomShape::Mesh { mesh_id }) => sphere_mesh(
             idx_a,
             pose_a,

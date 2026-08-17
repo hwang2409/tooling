@@ -1,0 +1,13 @@
+<mujoco model="contact_route_sphere_ellipsoid">
+  <option gravity="0 0 0"/>
+  <worldbody>
+    <body pos="0.6 0 0">
+      <freejoint/>
+      <geom name="sphere" type="sphere" size="0.2"/>
+    </body>
+    <body>
+      <freejoint/>
+      <geom name="ellipsoid" type="ellipsoid" size="0.5 0.3 0.2"/>
+    </body>
+  </worldbody>
+</mujoco>

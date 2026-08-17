@@ -1,0 +1,17 @@
+<mujoco model="contact_route_sphere_mesh">
+  <option gravity="0 0 0"/>
+  <asset>
+    <mesh name="tetra" vertex="0 0 0 1 0 0 0 1 0 0 0 1"
+          face="0 2 1 0 1 3 0 3 2 1 2 3"/>
+  </asset>
+  <worldbody>
+    <body pos="0.2 0.2 -0.1">
+      <freejoint/>
+      <geom name="sphere" type="sphere" size="0.2"/>
+    </body>
+    <body>
+      <freejoint/>
+      <geom name="mesh" type="mesh" mesh="tetra"/>
+    </body>
+  </worldbody>
+</mujoco>

@@ -1,0 +1,17 @@
+<mujoco model="hfield_box_steep_ccd_default">
+  <compiler angle="radian"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="Euler"
+          solver="PGS" cone="pyramidal" iterations="20"/>
+  <asset>
+    <hfield name="steep" nrow="2" ncol="2" size="1 1 1 0.2"
+            elevation="0 1 0 1"/>
+  </asset>
+  <worldbody>
+    <geom name="steep_geom" type="hfield" hfield="steep" friction="0.5"/>
+    <body name="box" pos="0 0 0.95" euler="0 0.4 0">
+      <freejoint name="box_root"/>
+      <inertial pos="0 0 0" mass="1.0" diaginertia="0.12 0.10 0.08"/>
+      <geom name="box_geom" type="box" size="0.25 0.25 0.25" friction="0.5"/>
+    </body>
+  </worldbody>
+</mujoco>
