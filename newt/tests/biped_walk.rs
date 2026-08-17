@@ -24,6 +24,9 @@ const CLEARANCE_MIN_M: f32 = 0.06;
 const RECORDED_DISTANCE_M: (f32, f32) = (2.51, 2.54);
 const RECORDED_CADENCE_BPM: (f32, f32) = (117.0, 118.2);
 const RECORDED_STEP_LENGTH_M: (f32, f32) = (0.371, 0.376);
+// Measured max is 0.20056267 m on the current 5,000-step run. The upper
+// bound leaves 1.44 mm for the exact MuJoCo midpoint box-plane anchor's
+// changed contact timing and foot trajectory.
 const RECORDED_CLEARANCE_M: (f32, f32) = (0.195, 0.202);
 
 fn assert_gait_metrics(result: &biped_walk_support::WalkResult, distance: f32) {

@@ -251,9 +251,10 @@ The Newton test set includes:
 - symmetry-broken PGS and Newton tree-contact byte goldens;
 - JSON and MJCF solver selection and loud elliptic rejection.
 
-Penalty goldens remain unchanged. The solver-mode tree goldens and matched
-tree-contact differential fixtures are new because PGS and Newton now own
-tree contact forces.
+Penalty keeps its legacy callback, but plane-manifold changes can still move
+penalty trajectories and their goldens. The solver-mode tree goldens and
+matched tree-contact differential fixtures are new because PGS and Newton now
+own tree contact forces.
 
 The measured cross-solver bounds use 120 steps and add modest headroom:
 

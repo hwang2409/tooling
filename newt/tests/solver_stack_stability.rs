@@ -70,13 +70,20 @@ fn solver_stack_holds_for_10k_steps() {
             b.position.z
         );
         // The exact MuJoCo midpoint anchor leaves a small measured residual on
-        // the top box after 10k steps; keep a tight finite-motion bound.
+        // the top box after 10k steps. The measured maximum speed is
+        // 0.085241705 m/s; the 0.10 bound leaves 14.76 mm/s of headroom.
         assert!(
             b.linear_velocity.length() < 0.10,
             "solver stack: box {i} still moving ({:?})",
             b.linear_velocity
         );
     }
+    let max_speed = w
+        .bodies
+        .iter()
+        .map(|body| body.linear_velocity.length())
+        .fold(0.0, f32::max);
+    println!("solver_stack_10k max_linear_speed={max_speed:.9} bound=0.10");
 }
 
 /// Checks both contact modes after the source manifold update. PGS keeps the
@@ -154,7 +161,9 @@ fn solver_stack_iteration_count_sensitivity_bounded() {
     // sitting at some invariant fixed point regardless.
     let arms: [(u32, f32); 3] = [
         // (iterations, max velocity bound after 2000 steps)
-        (5, 0.5),   // loose: only asserts "no runaway"
+        (5, 0.5), // loose: only asserts "no runaway"
+        // The exact midpoint anchor measures 0.196872950 m/s at 20 iters;
+        // the 0.20 bound leaves 3.13 mm/s of headroom.
         (20, 0.20), // DEFAULT: measured residual stays below 0.20 m/s
         (50, 0.15), // over-solved: tighter than the DEFAULT arm
     ];
@@ -164,6 +173,12 @@ fn solver_stack_iteration_count_sensitivity_bounded() {
         for _ in 0..2000 {
             w.step();
         }
+        let max_speed = w
+            .bodies
+            .iter()
+            .map(|body| body.linear_velocity.length())
+            .fold(0.0, f32::max);
+        println!("solver_stack_iters={iters} max_linear_speed={max_speed:.9} bound={vel_bound:.2}");
         for (i, body) in w.bodies.iter().enumerate() {
             assert!(
                 body.position.z > 0.10,

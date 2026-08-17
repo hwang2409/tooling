@@ -124,12 +124,11 @@ fn tolerance(name: &str) -> Tolerance {
             qpos: 7.0e-2,
             qvel: 8.0e-1,
         },
-        // Post-NEWT-14 box-box full-manifold fix: the stack now holds
-        // (see docs/differential.md, box_stack row). Observed max
-        // qpos 1.05e-2 m (first-bounce transient), qvel 1.03e-1 m/s.
-        // Bound leaves ~5× headroom on qpos and ~5× on qvel — enough
-        // to survive integrator noise but tight enough to catch any
-        // regression that lets the stack drift more than a centimetre.
+        // The exact MuJoCo box-plane manifold reopens the stack residual:
+        // observed max qpos 1.459283e-2 m and qvel 1.882446e-1 m/s.
+        // The box-box full-manifold fix still holds, but the plane midpoint
+        // anchor changes the finite-step settling impulse distribution.
+        // Bounds leave measured headroom and stay below the old collapse scale.
         "box_stack" => Tolerance {
             qpos: 5.0e-2,
             qvel: 5.0e-1,
