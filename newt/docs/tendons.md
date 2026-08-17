@@ -1,8 +1,8 @@
 # Tendons (v2 tier 3)
 
 Reference doc for `newt::tendon`. Covers the fixed and spatial tendon
-models, sphere-wrap geometry, actuator transmission, PGS limit rows, and
-the deferred cylinder/pulley branches.
+models, sphere/cylinder-wrap geometry, pulley branches, actuator transmission,
+and PGS limit rows.
 
 MuJoCo is the reference — every semantic choice below either matches
 MuJoCo's tendon path or is called out as a documented, tested deviation.
@@ -37,8 +37,9 @@ L = Σ_k length_k
 ```
 
 Each site is `(link, position_local)`. Each segment between adjacent
-sites optionally carries a `WrapSphere { link, center_local, radius,
-side_hint_world }`. The chain is walked in declaration order.
+sites optionally carries a sphere or infinite-cylinder wrap. A tendon
+without a pulley has one branch. Pulley branches contribute
+`branch_length / divisor`.
 
 ## Sphere wrap: the two-tangent-arc construction
 
@@ -102,6 +103,33 @@ containing `AB` and the perpendicular component of the hint. With no
 hint, the endpoint-inside-sphere case is ill-posed, so newt falls back
 to the straight segment and ignores the sphere. MuJoCo raises a
 compile-time error for this configuration.
+
+## Cylinder wrap
+
+MuJoCo treats a cylinder wrap as infinite along its local z axis. Newt
+projects both endpoints into the plane normal to that axis and applies the
+2D circle construction. The shortest tangent pair wins. A sidesite selects
+the pair whose circular arc points toward the projected sidesite.
+
+MJCF sidesites on another fixed tree are accepted and stored as world-static
+sites. Cross-tree sidesites with a moving joint remain rejected because their
+world dependency cannot fit one tree's tendon Jacobian.
+
+The 2D tangent points are lifted back to 3D. Their axial coordinates divide
+the endpoint axial change in proportion to the 2D path lengths. The central
+arc length uses `sqrt(arc² + axial_change²)`. This matches MuJoCo's
+`mju_wrap` construction and stays continuous at engagement.
+
+The envelope theorem supplies endpoint gradients from the 3D tangent lines.
+It also supplies the wrapping geom body contribution. Translation uses the
+sum of the two tangent forces. Rotation uses each force at its wrap point.
+
+## Pulley branches
+
+Each `<pulley divisor="d"/>` starts a new MJCF branch. The branch before
+the first pulley has divisor 1. Every branch length and Jacobian row is
+divided by its own divisor before summation. A physical 2:1 pulley uses
+one common branch with divisor 1 and two child branches with divisor 2.
 
 ## Actuator transmission on tendons
 
@@ -194,32 +222,15 @@ iterate the vector uniformly.
 TendonVel` reads `Ldot`. Both are 1 scalar. Same layout / offset rules
 as every other sensor kind (see `docs/sensors.md`).
 
-## Deferred (rejected loudly at load time)
+## Remaining limits
 
-- Cylinder wrap: `<geom type="cylinder"/>` under `<spatial>` is
-  rejected with `"cylinder wrap is deferred in v2 tier 3 (see
-  docs/tendons.md); use \"sphere\""`. Same message from both the JSON
-  and MJCF loaders. Deferred because a cylinder wrap needs a proper
-  side-plane construction (the tangent points live on a circle at the
-  cylinder's axis, not just in the segment-endpoint plane).
-- Pulley branches: `<pulley>` under `<spatial>` is rejected with
-  `"pulley branch is deferred in v2 tier 3"`. Deferred because
-  pulleys turn the spatial tendon into a tree of segments (not a
-  simple chain) and need Jacobian bookkeeping we don't yet emit.
 - Ball joints in a spatial tendon's ancestor chain: `panic!` from
   `site_position_and_jacobian`. Documented (would need a 3-column
   contribution per ball joint).
-- Sphere motion contribution: if a wrap sphere is attached to a body
-  and that body moves via forces the tendon itself applies, the
-  envelope theorem's `dL/dC · dC/dq` term is currently DROPPED. In the
-  demo the wrap sphere is world-static; in most real biomechanics
-  models the wrap object is body-attached but the body is driven by
-  its OWN inertia, not the tendon. Extend when this becomes a real
-  parity issue.
 
 ## Differential parity (MuJoCo oracle)
 
-Two scenarios captured in `tests/references/`:
+Five scenarios are captured in `tests/references/`:
 
 - `tendon_coupled.xml` + `.bin`: two coupled pendulums under gravity
   with a fixed tendon. Observed max qpos 5.6e-8, qvel 3.7e-7 over 2 s
@@ -234,6 +245,18 @@ Both bounds sit at f32-quantization scale — a mapping bug (wrong sign,
 dropped chain-rule) would blow either by orders. See
 `docs/differential.md` for the scorecard row format.
 
+The NEWT-27 matched-Euler/PGS captures add three spatial-wrap rows:
+
+| Scenario | qpos observed / bound | qvel observed / bound |
+|---|---:|---:|
+| `tendon_cylinder_lift` | `8.83e-8 / 2.0e-7` | `4.58e-7 / 1.0e-6` |
+| `tendon_pulley_2to1` | `1.95e-7 / 4.0e-7` | `1.18e-6 / 3.0e-6` |
+| `tendon_mixed_wrap` | `1.06e-7 / 3.0e-7` | `5.04e-7 / 1.0e-6` |
+
+The symmetry-broken cylinder actuator golden is
+`tests/goldens/tendon_wrap_cylinder.bin`. Regeneration is guarded to
+macOS aarch64, like the existing tendon golden.
+
 ## Demo
 
 ```text
@@ -247,3 +270,10 @@ is drawn in cyan; the sphere in blue-grey wireframe; the box in yellow
 wireframe; the anchor as a white crosshair. Verified visually: cable
 routes from anchor over the sphere down to the box, box lifts as the
 motor pulls, arc appears when engaged.
+
+The cylinder and pulley demo uses the standard MP4 pipeline. Its default
+run renders 600 video frames (10 seconds) at 3.00x simulation speed:
+
+```text
+cargo run --release --example tendon_cylinder_pulley
+```

@@ -1,0 +1,32 @@
+<!-- Differential scenario: one spatial tendon with a common branch and a
+  child branch divided by two. Both child endpoints move together, making
+  the measured length and actuator response expose the divisor semantics. -->
+<mujoco model="tendon_pulley_2to1">
+  <compiler angle="radian"/>
+  <option timestep="0.005" gravity="0 0 -9.81"
+          integrator="Euler" solver="PGS" cone="pyramidal" iterations="20"/>
+  <worldbody>
+    <body name="rig" pos="0 0 0">
+      <inertial pos="0 0 0" mass="1.0" diaginertia="1.0 1.0 1.0"/>
+      <site name="anchor" pos="-1 0 0"/>
+      <site name="branch_anchor" pos="1.7 0.35 0"/>
+      <body name="mass" pos="0 0 -1.0">
+        <inertial pos="0 0 0" mass="1.0" diaginertia="1e-3 1e-3 1e-3"/>
+        <joint name="lift" type="slide" axis="0 0 -1" pos="0 0 0" damping="4.0"/>
+        <site name="attach" pos="0 0 0"/>
+      </body>
+    </body>
+  </worldbody>
+  <tendon>
+    <spatial name="cable" springlength="1.0" stiffness="90" damping="8">
+      <site site="anchor"/>
+      <site site="attach"/>
+      <pulley divisor="2"/>
+      <site site="branch_anchor"/>
+      <site site="attach"/>
+    </spatial>
+  </tendon>
+  <actuator>
+    <motor name="pulley_motor" tendon="cable" gear="1" forcerange="-8 8"/>
+  </actuator>
+</mujoco>

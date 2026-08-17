@@ -30,7 +30,10 @@ use crate::joint::{JointKind, JointLimit};
 use crate::json::{self, Value};
 use crate::math::{Mat3, Quat, Vec3};
 use crate::sensor::{Sensor, SensorAttach, SensorKind, SiteFrame};
-use crate::tendon::{FixedTendonJoint, SpatialTendonSite, Tendon, WrapSphere};
+use crate::tendon::{
+    FixedTendonJoint, SpatialSegment, SpatialTendonBranch, SpatialTendonSite, SpatialWrap, Tendon,
+    WrapCylinder, WrapSphere,
+};
 use crate::tree::{Link, Tree, forward_kinematics};
 use crate::world::{Integrator, World};
 
@@ -2882,6 +2885,166 @@ fn auto_pairs_with_self_collision_filter(
 // tendon parser
 // ---------------------------------------------------------------------------
 
+fn parse_spatial_branch(
+    fields: &[(String, Value)],
+    path: &str,
+    tidx: usize,
+    tn: &str,
+    links_by_name: &[HashMap<String, usize>],
+) -> Result<SpatialTendonBranch, ModelError> {
+    let divisor = optional(fields, "divisor")
+        .map(|v| get_f32(v, &format!("{path}.divisor")))
+        .transpose()?
+        .unwrap_or(1.0);
+    if !divisor.is_finite() || divisor <= 0.0 {
+        return fail(&format!("{path}.divisor"), "divisor must be finite and > 0");
+    }
+    let sites_v = required(fields, "sites", path)?;
+    let sites_arr = get_array(sites_v, &format!("{path}.sites"))?;
+    if sites_arr.len() < 2 {
+        return fail(
+            &format!("{path}.sites"),
+            "spatial tendon branch must have ≥ 2 sites",
+        );
+    }
+    let mut sites = Vec::with_capacity(sites_arr.len());
+    for (i, sv) in sites_arr.iter().enumerate() {
+        let sp = format!("{path}.sites[{i}]");
+        let sfields = get_object(sv, &sp)?;
+        reject_unknown(sfields, &["link", "position"], &sp)?;
+        let link = if let Some(lv) = optional(sfields, "link") {
+            let ln = get_str(lv, &format!("{sp}.link"))?;
+            if ln == "world" {
+                None
+            } else {
+                Some(links_by_name[tidx].get(ln).copied().ok_or_else(|| {
+                    ModelError::new(
+                        format!("{sp}.link"),
+                        format!("unknown link \"{ln}\" in tree \"{tn}\""),
+                    )
+                })?)
+            }
+        } else {
+            None
+        };
+        sites.push(SpatialTendonSite {
+            link,
+            position_local: parse_vec3(
+                required(sfields, "position", &sp)?,
+                &format!("{sp}.position"),
+            )?,
+        });
+    }
+    let mut segments = vec![SpatialSegment { wrap: None }; sites.len() - 1];
+    if let Some(wv) = optional(fields, "wraps") {
+        let warr = get_array(wv, &format!("{path}.wraps"))?;
+        for (i, wv) in warr.iter().enumerate() {
+            let wp = format!("{path}.wraps[{i}]");
+            let wf = get_object(wv, &wp)?;
+            reject_unknown(
+                wf,
+                &[
+                    "segment",
+                    "kind",
+                    "link",
+                    "center",
+                    "radius",
+                    "side_hint",
+                    "sidesite",
+                    "axis",
+                ],
+                &wp,
+            )?;
+            let seg_value = get_f32(required(wf, "segment", &wp)?, &format!("{wp}.segment"))?;
+            if seg_value < 0.0 || seg_value != seg_value.floor() {
+                return fail(
+                    &format!("{wp}.segment"),
+                    "segment must be a nonnegative integer",
+                );
+            }
+            let seg_idx = seg_value as usize;
+            if seg_idx >= segments.len() {
+                return fail(
+                    &format!("{wp}.segment"),
+                    format!(
+                        "wrap segment {seg_idx} out of range (0..{})",
+                        segments.len()
+                    ),
+                );
+            }
+            if segments[seg_idx].wrap.is_some() {
+                return fail(
+                    &wp,
+                    format!("wrap segment {seg_idx} is specified more than once"),
+                );
+            }
+            let link = if let Some(lv) = optional(wf, "link") {
+                let ln = get_str(lv, &format!("{wp}.link"))?;
+                if ln == "world" {
+                    None
+                } else {
+                    Some(links_by_name[tidx].get(ln).copied().ok_or_else(|| {
+                        ModelError::new(
+                            format!("{wp}.link"),
+                            format!("unknown link \"{ln}\" in tree \"{tn}\""),
+                        )
+                    })?)
+                }
+            } else {
+                None
+            };
+            let center_local = parse_vec3(required(wf, "center", &wp)?, &format!("{wp}.center"))?;
+            let radius = get_f32(required(wf, "radius", &wp)?, &format!("{wp}.radius"))?;
+            if radius <= 0.0 {
+                return fail(&format!("{wp}.radius"), "radius must be > 0");
+            }
+            let kind = optional(wf, "kind")
+                .map(|v| get_str(v, &format!("{wp}.kind")))
+                .transpose()?
+                .unwrap_or("sphere");
+            let wrap = match kind {
+                "sphere" => SpatialWrap::Sphere(WrapSphere {
+                    link,
+                    center_local,
+                    radius,
+                    side_hint_world: optional(wf, "side_hint")
+                        .map(|v| parse_vec3(v, &format!("{wp}.side_hint")))
+                        .transpose()?,
+                }),
+                "cylinder" => SpatialWrap::Cylinder(WrapCylinder {
+                    link,
+                    center_local,
+                    radius,
+                    axis_local: optional(wf, "axis")
+                        .map(|v| parse_vec3(v, &format!("{wp}.axis")))
+                        .transpose()?
+                        .unwrap_or(Vec3::Z),
+                    sidesite: if let Some(v) = optional(wf, "sidesite") {
+                        Some(SpatialTendonSite {
+                            link: None,
+                            position_local: parse_vec3(v, &format!("{wp}.sidesite"))?,
+                        })
+                    } else {
+                        None
+                    },
+                }),
+                other => {
+                    return fail(
+                        &format!("{wp}.kind"),
+                        format!("unknown wrap kind \"{other}\" (expected sphere | cylinder)"),
+                    );
+                }
+            };
+            segments[seg_idx].wrap = Some(wrap);
+        }
+    }
+    Ok(SpatialTendonBranch {
+        sites,
+        segments,
+        divisor,
+    })
+}
+
 /// Parse one entry in the top-level `"tendons"` array.
 ///
 /// Schema (discriminated union on `"kind"`):
@@ -3002,6 +3165,7 @@ fn parse_tendon(
                     "kind",
                     "sites",
                     "wraps",
+                    "branches",
                     "springlength",
                     "stiffness",
                     "damping",
@@ -3009,124 +3173,40 @@ fn parse_tendon(
                 ],
                 path,
             )?;
-            let sites_v = required(fields, "sites", path)?;
-            let sites_arr = get_array(sites_v, &format!("{path}.sites"))?;
-            if sites_arr.len() < 2 {
-                return fail(
-                    &format!("{path}.sites"),
-                    "spatial tendon must have ≥ 2 sites",
-                );
-            }
-            let mut sites: Vec<SpatialTendonSite> = Vec::with_capacity(sites_arr.len());
-            for (i, sv) in sites_arr.iter().enumerate() {
-                let sp = format!("{path}.sites[{i}]");
-                let sfields = get_object(sv, &sp)?;
-                reject_unknown(sfields, &["link", "position"], &sp)?;
-                let link = if let Some(lv) = optional(sfields, "link") {
-                    let ln = get_str(lv, &format!("{sp}.link"))?;
-                    if ln == "world" {
-                        None
-                    } else {
-                        Some(links_by_name[tidx].get(ln).copied().ok_or_else(|| {
-                            ModelError::new(
-                                format!("{sp}.link"),
-                                format!("unknown link \"{ln}\" in tree \"{tn}\""),
-                            )
-                        })?)
-                    }
-                } else {
-                    None
-                };
-                let position_local = parse_vec3(
-                    required(sfields, "position", &sp)?,
-                    &format!("{sp}.position"),
-                )?;
-                sites.push(SpatialTendonSite {
-                    link,
-                    position_local,
-                });
-            }
-            let n_segments = sites.len() - 1;
-            let mut wraps: Vec<Option<WrapSphere>> = vec![None; n_segments];
-            if let Some(wv) = optional(fields, "wraps") {
-                let warr = get_array(wv, &format!("{path}.wraps"))?;
-                for (i, wv) in warr.iter().enumerate() {
-                    let wp = format!("{path}.wraps[{i}]");
-                    let wf = get_object(wv, &wp)?;
-                    reject_unknown(
-                        wf,
-                        &["segment", "kind", "link", "center", "radius", "side_hint"],
-                        &wp,
-                    )?;
-                    // `kind` is optional; defaults to "sphere". Cylinder /
-                    // pulley loudly rejected — no silent ignore.
-                    let kind = optional(wf, "kind")
-                        .map(|v| get_str(v, &format!("{wp}.kind")))
-                        .transpose()?
-                        .unwrap_or("sphere");
-                    match kind {
-                        "sphere" => {}
-                        "cylinder" => {
-                            return fail(
-                                &format!("{wp}.kind"),
-                                "cylinder wrap is deferred in v2 tier 3 (see docs/tendons.md); \
-                                 use \"sphere\"",
-                            );
-                        }
-                        "pulley" => {
-                            return fail(
-                                &format!("{wp}.kind"),
-                                "pulley wrap is deferred in v2 tier 3 (see docs/tendons.md)",
-                            );
-                        }
-                        other => {
-                            return fail(
-                                &format!("{wp}.kind"),
-                                format!("unknown wrap kind \"{other}\" (only \"sphere\")"),
-                            );
-                        }
-                    }
-                    let seg_idx =
-                        get_f32(required(wf, "segment", &wp)?, &format!("{wp}.segment"))? as usize;
-                    if seg_idx >= n_segments {
-                        return fail(
-                            &format!("{wp}.segment"),
-                            format!("wrap segment {seg_idx} out of range (0..{n_segments})"),
-                        );
-                    }
-                    let link = if let Some(lv) = optional(wf, "link") {
-                        let ln = get_str(lv, &format!("{wp}.link"))?;
-                        if ln == "world" {
-                            None
-                        } else {
-                            Some(links_by_name[tidx].get(ln).copied().ok_or_else(|| {
-                                ModelError::new(
-                                    format!("{wp}.link"),
-                                    format!("unknown link \"{ln}\" in tree \"{tn}\""),
-                                )
-                            })?)
-                        }
-                    } else {
-                        None
-                    };
-                    let center_local =
-                        parse_vec3(required(wf, "center", &wp)?, &format!("{wp}.center"))?;
-                    let radius = get_f32(required(wf, "radius", &wp)?, &format!("{wp}.radius"))?;
-                    if radius <= 0.0 {
-                        return fail(&format!("{wp}.radius"), "radius must be > 0");
-                    }
-                    let side_hint_world = optional(wf, "side_hint")
-                        .map(|v| parse_vec3(v, &format!("{wp}.side_hint")))
-                        .transpose()?;
-                    wraps[seg_idx] = Some(WrapSphere {
-                        link,
-                        center_local,
-                        radius,
-                        side_hint_world,
-                    });
+            let branches = if let Some(branches_v) = optional(fields, "branches") {
+                if optional(fields, "sites").is_some() || optional(fields, "wraps").is_some() {
+                    return fail(
+                        path,
+                        "spatial tendon accepts either top-level sites/wraps or branches, not both",
+                    );
                 }
-            }
-            let mut t = Tendon::spatial(sites, wraps);
+                let branches_arr = get_array(branches_v, &format!("{path}.branches"))?;
+                if branches_arr.is_empty() {
+                    return fail(
+                        &format!("{path}.branches"),
+                        "spatial tendon needs ≥ 1 branch",
+                    );
+                }
+                let mut branches = Vec::with_capacity(branches_arr.len());
+                for (i, bv) in branches_arr.iter().enumerate() {
+                    let bp = format!("{path}.branches[{i}]");
+                    let bf = get_object(bv, &bp)?;
+                    reject_unknown(bf, &["divisor", "sites", "wraps"], &bp)?;
+                    branches.push(parse_spatial_branch(bf, &bp, tidx, tn, links_by_name)?);
+                }
+                branches
+            } else {
+                vec![parse_spatial_branch(fields, path, tidx, tn, links_by_name)?]
+            };
+            let mut t = Tendon {
+                kind: crate::tendon::TendonKind::Spatial { branches },
+                springlength: None,
+                stiffness: 0.0,
+                damping: 0.0,
+                range: None,
+                limit_solref: None,
+                limit_solimp: None,
+            };
             parse_common(&mut t)?;
             t
         }

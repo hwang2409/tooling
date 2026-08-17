@@ -10,8 +10,8 @@
 //!
 //! Supported top-level elements (children of `<mujoco>`):
 //! `<compiler>`, `<option>`, `<default>`, `<worldbody>`, `<actuator>`,
-//! `<sensor>`, `<equality>`, `<contact>`, and `<keyframe>`. Anything else
-//! (e.g. `<asset>`, `<tendon>`, `<visual>`) is rejected with a clear
+//! `<sensor>`, `<tendon>`, `<equality>`, `<contact>`, and `<keyframe>`. Anything else
+//! (e.g. `<asset>`, `<visual>`) is rejected with a clear
 //! `unsupported in v2 tier 4` error naming the element.
 //!
 //! Body attributes: `name`, `pos`, `quat`, `euler`, `childclass`, `mocap`.
@@ -54,8 +54,11 @@ use crate::math::{self, Mat3, Quat, Vec3};
 use crate::model::{Scene, Site, SiteAttach};
 use crate::sensor::{Sensor, SensorAttach, SensorKind, SiteFrame};
 use crate::solver::SolImp;
-use crate::tendon::{FixedTendonJoint, SpatialTendonSite, Tendon, WrapSphere};
-use crate::tree::{Link, Tree};
+use crate::tendon::{
+    FixedTendonJoint, SpatialSegment, SpatialTendonBranch, SpatialTendonSite, SpatialWrap, Tendon,
+    WrapCylinder, WrapSphere,
+};
+use crate::tree::{Link, Tree, forward_kinematics};
 use crate::world::{Integrator, World};
 use crate::xml::{self, Element};
 
@@ -2326,15 +2329,16 @@ impl Loader {
         if self.tendons_by_name.contains_key(&name) {
             return fail(path, format!("duplicate tendon name \"{name}\""));
         }
-        // Ordered children: <site>, <geom>, <pulley> etc. Only <site> and
-        // <geom type="sphere"> are supported. Sites define the chain;
-        // <geom> nodes attach as wrap objects for the SEGMENT they appear
-        // in between two sites (MuJoCo's ordering rule).
+        // Ordered children: <site>, <geom>, and <pulley>. Each pulley starts
+        // a new independent branch. Geoms attach to the segment that follows
+        // them.
         let mut sites: Vec<SpatialTendonSite> = Vec::new();
-        let mut segments: Vec<Option<WrapSphere>> = Vec::new();
+        let mut segments: Vec<Option<SpatialWrap>> = Vec::new();
+        let mut branches: Vec<SpatialTendonBranch> = Vec::new();
+        let mut divisor = 1.0f32;
         let mut tree_idx: Option<usize> = None;
         // MJCF spatial tendon: alternate site → optional wrap → site → ...
-        let mut pending_wrap: Option<WrapSphere> = None;
+        let mut pending_wrap: Option<SpatialWrap> = None;
         let mut expecting_site = true;
         for child in e.child_elements() {
             let cp = child_path(path, &child.name, None);
@@ -2391,16 +2395,26 @@ impl Loader {
                     expecting_site = false;
                 }
                 "geom" => {
-                    // Between two sites: a wrap. Only sphere is supported.
-                    let ty = child.attr("type").unwrap_or("sphere");
-                    if ty != "sphere" {
+                    // Between two sites: a wrap.
+                    if sites.is_empty() {
+                        return fail(&cp, "wrap geom must follow a site");
+                    }
+                    if pending_wrap.is_some() {
                         return fail(
                             &cp,
-                            format!(
-                                "spatial tendon wrap type \"{ty}\" is not supported (v2 tier 3: sphere only; \
-                                 cylinder/pulley deferred — see docs/tendons.md)"
-                            ),
+                            "only one wrap geom is allowed between consecutive sites",
                         );
+                    }
+                    let declared_ty = child.attr("type");
+                    if let Some(ty) = declared_ty {
+                        if ty != "sphere" && ty != "cylinder" {
+                            return fail(
+                                &cp,
+                                format!(
+                                    "spatial tendon wrap type \"{ty}\" is not supported (expected sphere|cylinder)"
+                                ),
+                            );
+                        }
                     }
                     for (k, _) in &child.attrs {
                         if k != "geom" && k != "type" && k != "sidesite" {
@@ -2412,18 +2426,30 @@ impl Loader {
                         MjcfError::new(cp.clone(), format!("unknown geom \"{gn}\""))
                     })?;
                     let g = &self.world.geoms[gidx];
-                    let radius = match g.shape {
-                        crate::geom::GeomShape::Sphere { radius } => radius,
+                    let (radius, axis_local, geom_ty) = match g.shape {
+                        crate::geom::GeomShape::Sphere { radius } => (radius, Vec3::Z, "sphere"),
+                        crate::geom::GeomShape::Cylinder { radius, .. } => {
+                            (radius, g.local_orientation.rotate(Vec3::Z), "cylinder")
+                        }
                         other => {
                             return fail(
                                 &cp,
                                 format!(
-                                    "wrap geom \"{gn}\" is not a sphere (got {other:?}); spatial tendon \
-                                     wraps must reference a sphere geom"
+                                    "wrap geom \"{gn}\" is not a sphere or cylinder (got {other:?})"
                                 ),
                             );
                         }
                     };
+                    if let Some(ty) = declared_ty {
+                        if ty != geom_ty {
+                            return fail(
+                                &cp,
+                                format!(
+                                    "wrap geom \"{gn}\" has type {geom_ty}, not declared type {ty}"
+                                ),
+                            );
+                        }
+                    }
                     let (center_local, link_wrap) = match g.attachment() {
                         crate::geom::GeomAttach::Static => (g.local_offset, None),
                         crate::geom::GeomAttach::Link(_, link_idx) => {
@@ -2436,26 +2462,89 @@ impl Loader {
                             );
                         }
                     };
-                    let side_hint_world = if let Some(sn) = child.attr("sidesite") {
+                    let sidesite = if let Some(sn) = child.attr("sidesite") {
                         let sidx = self.sites_by_name.get(sn).copied().ok_or_else(|| {
                             MjcfError::new(cp.clone(), format!("unknown sidesite \"{sn}\""))
                         })?;
-                        Some(self.sites[sidx].local_offset)
+                        match self.sites[sidx].attach {
+                            SiteAttach::Link { tree, link } if Some(tree) == tree_idx => {
+                                Some(SpatialTendonSite {
+                                    link: Some(link),
+                                    position_local: self.sites[sidx].local_offset,
+                                })
+                            }
+                            SiteAttach::Link { tree, link } => {
+                                let mut cur = Some(link);
+                                while let Some(link_idx) = cur {
+                                    if !matches!(
+                                        self.world.trees[tree].links[link_idx].joint,
+                                        JointKind::Fixed
+                                    ) {
+                                        return fail(
+                                            &cp,
+                                            "cross-tree sidesite must belong to a fixed body",
+                                        );
+                                    }
+                                    cur = self.world.trees[tree].links[link_idx].parent;
+                                }
+                                let poses = forward_kinematics(&self.world.trees[tree]);
+                                let (position, orientation) = poses[link];
+                                Some(SpatialTendonSite {
+                                    link: None,
+                                    position_local: position
+                                        + orientation.rotate(self.sites[sidx].local_offset),
+                                })
+                            }
+                            SiteAttach::Body(_) => {
+                                return fail(&cp, "sidesite on a free body is not supported");
+                            }
+                        }
                     } else {
                         None
                     };
-                    pending_wrap = Some(WrapSphere {
-                        link: link_wrap,
-                        center_local,
-                        radius,
-                        side_hint_world,
+                    pending_wrap = Some(if geom_ty == "sphere" {
+                        SpatialWrap::Sphere(WrapSphere {
+                            link: link_wrap,
+                            center_local,
+                            radius,
+                            side_hint_world: sidesite.map(|s| s.position_local),
+                        })
+                    } else {
+                        SpatialWrap::Cylinder(WrapCylinder {
+                            link: link_wrap,
+                            center_local,
+                            axis_local,
+                            radius,
+                            sidesite,
+                        })
                     });
                 }
                 "pulley" => {
-                    return fail(
-                        &cp,
-                        "<pulley> spatial tendon branch is deferred in v2 tier 3 (see docs/tendons.md)",
-                    );
+                    if pending_wrap.is_some() {
+                        return fail(&cp, "<pulley> cannot follow a wrap without a closing site");
+                    }
+                    if sites.len() < 2 {
+                        return fail(&cp, "each pulley branch must contain at least two sites");
+                    }
+                    let branch_segments = segments
+                        .drain(..)
+                        .map(|wrap| SpatialSegment { wrap })
+                        .collect();
+                    branches.push(SpatialTendonBranch {
+                        sites: std::mem::take(&mut sites),
+                        segments: branch_segments,
+                        divisor,
+                    });
+                    for (k, _) in &child.attrs {
+                        if k != "divisor" {
+                            return fail(&cp, format!("<pulley> unknown attribute \"{k}\""));
+                        }
+                    }
+                    divisor = parse_f32(attr_required(child, "divisor", &cp)?, &cp, "divisor")?;
+                    if divisor <= 0.0 {
+                        return fail(&cp, "<pulley> divisor must be > 0");
+                    }
+                    expecting_site = true;
                 }
                 other => {
                     return fail(
@@ -2465,18 +2554,6 @@ impl Loader {
                 }
             }
         }
-        if !sites.is_empty() {
-            // Close the final segment. Note we push one segment slot per
-            // consecutive-site pair, so this is only pushed when at least
-            // 2 sites already exist.
-        }
-        // Reconstruct segments from the pending-wrap flow:
-        //   between sites k and k+1, wrap = the wrap emitted after site k.
-        // Simpler: assemble again. Rewrite the segment tracking to be
-        // explicit (the flow above only pushes on next-site).
-        // We already push_wrap on next-site; total segments = sites.len() - 1.
-        // If a wrap trailed the LAST site (i.e. no closing site), that's
-        // structurally invalid — reject.
         if pending_wrap.is_some() {
             return fail(
                 path,
@@ -2484,7 +2561,7 @@ impl Loader {
             );
         }
         if sites.len() < 2 {
-            return fail(path, "spatial tendon must have ≥ 2 sites");
+            return fail(path, "spatial tendon final branch must have ≥ 2 sites");
         }
         if segments.len() != sites.len() - 1 {
             return fail(
@@ -2496,8 +2573,24 @@ impl Loader {
                 ),
             );
         }
+        branches.push(SpatialTendonBranch {
+            sites,
+            segments: segments
+                .into_iter()
+                .map(|wrap| SpatialSegment { wrap })
+                .collect(),
+            divisor,
+        });
         let tidx = tree_idx.expect("spatial tendon: tree resolved by first site");
-        let mut tendon = Tendon::spatial(sites, segments);
+        let mut tendon = Tendon {
+            kind: crate::tendon::TendonKind::Spatial { branches },
+            springlength: None,
+            stiffness: 0.0,
+            damping: 0.0,
+            range: None,
+            limit_solref: None,
+            limit_solimp: None,
+        };
         self.set_tendon_passive_attrs(e, path, &mut tendon)?;
         tendon
             .validate(&self.world.trees[tidx])

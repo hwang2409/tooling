@@ -1,0 +1,31 @@
+<!-- Differential scenario: a passive spatial tendon passes over a sphere
+  and then an infinite cylinder before reaching a sliding mass. -->
+<mujoco model="tendon_mixed_wrap">
+  <compiler angle="radian"/>
+  <option timestep="0.005" gravity="0 0 -9.81"
+          integrator="Euler" solver="PGS" cone="pyramidal" iterations="20"/>
+  <worldbody>
+    <body name="rig" pos="0 0 0">
+      <inertial pos="0 0 0" mass="1.0" diaginertia="1.0 1.0 1.0"/>
+      <geom name="wrap_sphere" type="sphere" size="0.25" pos="-0.25 0 -0.35"/>
+      <geom name="wrap_cylinder" type="cylinder" size="0.25 1.0" pos="0.5 0 -0.35"/>
+      <site name="anchor" pos="-1 0 0"/>
+      <site name="side" pos="0.5 0.5 -0.35"/>
+      <site name="mid" pos="0.0 0 -0.8"/>
+      <body name="mass" pos="1.0 0 -1.0">
+        <inertial pos="0 0 0" mass="1.0" diaginertia="1e-3 1e-3 1e-3"/>
+        <joint name="lift" type="slide" axis="0 0 -1" pos="0 0 0" damping="4.0"/>
+        <site name="attach" pos="0 0 0"/>
+      </body>
+    </body>
+  </worldbody>
+  <tendon>
+    <spatial name="cable" springlength="2.4" stiffness="150" damping="10">
+      <site site="anchor"/>
+      <geom geom="wrap_sphere"/>
+      <site site="mid"/>
+      <geom geom="wrap_cylinder" sidesite="side"/>
+      <site site="attach"/>
+    </spatial>
+  </tendon>
+</mujoco>

@@ -63,8 +63,9 @@
 //! determined when `A`, `B`, `C` are non-colinear). When `A`, `B`, `C` are
 //! within `SIDE_HINT_COLINEARITY_EPS` of colinear, the wrap is skipped (or
 //! the sidesite hint is used to break the tie — see the `WrapSphere::
-//! side_hint_world` docs). Cylinder wrap and pulley branches are DEFERRED
-//! in this tier and rejected at load time with a clear message.
+//! side_hint_world` docs). Cylinder wrapping uses the same 2D circle
+//! construction in the plane normal to the cylinder axis. Pulley branches
+//! scale each branch's length and Jacobian by its divisor.
 //!
 //! # Determinism
 //!
@@ -132,12 +133,42 @@ pub struct WrapSphere {
     pub side_hint_world: Option<Vec3>,
 }
 
+/// Infinite cylinder used as a spatial-tendon wrap.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WrapCylinder {
+    /// Link the cylinder is attached to. `None` means world-fixed.
+    pub link: Option<usize>,
+    /// Cylinder center in the link frame, or world frame when `link` is None.
+    pub center_local: Vec3,
+    /// Cylinder axis in the link frame, or world frame when `link` is None.
+    pub axis_local: Vec3,
+    /// Cylinder radius.
+    pub radius: f32,
+    /// Optional sidesite. Its world position selects the preferred wrap side.
+    pub sidesite: Option<SpatialTendonSite>,
+}
+
+/// A spatial tendon wrap object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SpatialWrap {
+    Sphere(WrapSphere),
+    Cylinder(WrapCylinder),
+}
+
 /// One segment between adjacent sites in a spatial tendon. Straight or
-/// sphere-wrapped.
+/// wrapped.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SpatialSegment {
-    /// Optional sphere wrap. Straight segment when `None`.
-    pub wrap: Option<WrapSphere>,
+    /// Optional wrap. Straight segment when `None`.
+    pub wrap: Option<SpatialWrap>,
+}
+
+/// One independent branch of a spatial tendon.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpatialTendonBranch {
+    pub sites: Vec<SpatialTendonSite>,
+    pub segments: Vec<SpatialSegment>,
+    pub divisor: f32,
 }
 
 /// Kind-specific tendon data.
@@ -145,14 +176,8 @@ pub struct SpatialSegment {
 pub enum TendonKind {
     /// Linear combination of hinge/slide joint coordinates.
     Fixed { joints: Vec<FixedTendonJoint> },
-    /// Chain of sites plus per-segment wrap options.
-    Spatial {
-        /// Site chain (length ≥ 2).
-        sites: Vec<SpatialTendonSite>,
-        /// One entry per segment between consecutive sites
-        /// (`segments.len() == sites.len() - 1`).
-        segments: Vec<SpatialSegment>,
-    },
+    /// Independent site branches plus per-segment wrap options.
+    Spatial { branches: Vec<SpatialTendonBranch> },
 }
 
 /// One tendon. Attached to a `Tree` via `Tree::add_tendon`.
@@ -210,10 +235,32 @@ impl Tendon {
         }
         let segments = wraps
             .into_iter()
-            .map(|w| SpatialSegment { wrap: w })
+            .map(|w| SpatialSegment {
+                wrap: w.map(SpatialWrap::Sphere),
+            })
             .collect();
         Self {
-            kind: TendonKind::Spatial { sites, segments },
+            kind: TendonKind::Spatial {
+                branches: vec![SpatialTendonBranch {
+                    sites,
+                    segments,
+                    divisor: 1.0,
+                }],
+            },
+            springlength: None,
+            stiffness: 0.0,
+            damping: 0.0,
+            range: None,
+            limit_solref: None,
+            limit_solimp: None,
+        }
+    }
+
+    /// Construct a spatial tendon from independent pulley branches.
+    pub fn spatial_branches(branches: Vec<SpatialTendonBranch>) -> Self {
+        assert!(!branches.is_empty(), "spatial tendon needs ≥ 1 branch");
+        Self {
+            kind: TendonKind::Spatial { branches },
             springlength: None,
             stiffness: 0.0,
             damping: 0.0,
@@ -278,57 +325,87 @@ impl Tendon {
                     }
                 }
             }
-            TendonKind::Spatial { sites, segments } => {
-                if sites.len() < 2 {
-                    return Err("spatial tendon must have ≥ 2 sites".to_string());
+            TendonKind::Spatial { branches } => {
+                if branches.is_empty() {
+                    return Err("spatial tendon must have ≥ 1 branch".to_string());
                 }
-                if segments.len() != sites.len() - 1 {
-                    return Err(format!(
-                        "spatial tendon segments ({}) must equal sites-1 ({})",
-                        segments.len(),
-                        sites.len() - 1
-                    ));
-                }
-                for (i, s) in sites.iter().enumerate() {
-                    if let Some(l) = s.link {
-                        if l >= tree.links.len() {
-                            return Err(format!("spatial tendon site {i}: link {l} out of range"));
-                        }
+                for (branch_idx, branch) in branches.iter().enumerate() {
+                    if branch.sites.len() < 2 {
+                        return Err(format!(
+                            "spatial tendon branch {branch_idx} must have ≥ 2 sites"
+                        ));
                     }
-                    for c in [s.position_local.x, s.position_local.y, s.position_local.z] {
-                        if !c.is_finite() {
-                            return Err(format!(
-                                "spatial tendon site {i}: position must be finite"
-                            ));
-                        }
+                    if branch.segments.len() != branch.sites.len() - 1 {
+                        return Err(format!(
+                            "spatial tendon branch {branch_idx} segments ({}) must equal sites-1 ({})",
+                            branch.segments.len(),
+                            branch.sites.len() - 1
+                        ));
                     }
-                }
-                for (i, seg) in segments.iter().enumerate() {
-                    if let Some(w) = &seg.wrap {
-                        if let Some(l) = w.link {
+                    if !branch.divisor.is_finite() || branch.divisor <= 0.0 {
+                        return Err(format!(
+                            "spatial tendon branch {branch_idx} divisor must be finite and > 0"
+                        ));
+                    }
+                    for (i, s) in branch.sites.iter().enumerate() {
+                        if let Some(l) = s.link {
                             if l >= tree.links.len() {
                                 return Err(format!(
-                                    "spatial tendon segment {i} wrap: link {l} out of range"
+                                    "spatial tendon branch {branch_idx} site {i}: link {l} out of range"
                                 ));
                             }
-                            let mut ancestor = Some(l);
-                            while let Some(link_idx) = ancestor {
-                                if !matches!(tree.links[link_idx].joint, JointKind::Fixed) {
-                                    return Err(
-                                        "sphere wrap attached to a link whose ancestor chain "
-                                            .to_string()
-                                            + "contains non-Fixed DOFs is deferred in v2 tier 3 "
-                                            + "(see docs/tendons.md); attach the wrap to a "
-                                            + "fixed chain",
-                                    );
-                                }
-                                ancestor = tree.links[link_idx].parent;
+                        }
+                        for c in [s.position_local.x, s.position_local.y, s.position_local.z] {
+                            if !c.is_finite() {
+                                return Err(format!(
+                                    "spatial tendon branch {branch_idx} site {i}: position must be finite"
+                                ));
                             }
                         }
-                        if w.radius <= 0.0 {
-                            return Err(format!(
-                                "spatial tendon segment {i} wrap: radius must be > 0"
-                            ));
+                    }
+                    for (i, seg) in branch.segments.iter().enumerate() {
+                        if let Some(w) = &seg.wrap {
+                            let (link, center, radius) = match w {
+                                SpatialWrap::Sphere(w) => (w.link, w.center_local, w.radius),
+                                SpatialWrap::Cylinder(w) => (w.link, w.center_local, w.radius),
+                            };
+                            if let Some(l) = link {
+                                if l >= tree.links.len() {
+                                    return Err(format!(
+                                        "spatial tendon branch {branch_idx} segment {i} wrap: link {l} out of range"
+                                    ));
+                                }
+                            }
+                            if radius <= 0.0 {
+                                return Err(format!(
+                                    "spatial tendon branch {branch_idx} segment {i} wrap: radius must be > 0"
+                                ));
+                            }
+                            for c in [center.x, center.y, center.z] {
+                                if !c.is_finite() {
+                                    return Err(format!(
+                                        "spatial tendon branch {branch_idx} segment {i} wrap: center must be finite"
+                                    ));
+                                }
+                            }
+                            if let SpatialWrap::Cylinder(w) = w {
+                                if w.axis_local.length_squared()
+                                    <= SIDE_HINT_COLINEARITY_EPS * SIDE_HINT_COLINEARITY_EPS
+                                {
+                                    return Err(format!(
+                                        "spatial tendon branch {branch_idx} segment {i} cylinder axis must be nonzero"
+                                    ));
+                                }
+                                if let Some(site) = w.sidesite {
+                                    if let Some(l) = site.link {
+                                        if l >= tree.links.len() {
+                                            return Err(format!(
+                                                "spatial tendon branch {branch_idx} segment {i} sidesite link {l} out of range"
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -378,8 +455,19 @@ pub fn tendon_kinematics(tendon: &Tendon, tree: &Tree, poses: &[(Vec3, Quat)]) -
             }
             l
         }
-        TendonKind::Spatial { sites, segments } => {
-            spatial_length_and_jacobian(tree, poses, sites, segments, &mut jacobian)
+        TendonKind::Spatial { branches } => {
+            let mut total = 0.0;
+            for branch in branches {
+                total += spatial_length_and_jacobian(
+                    tree,
+                    poses,
+                    &branch.sites,
+                    &branch.segments,
+                    branch.divisor,
+                    &mut jacobian,
+                );
+            }
+            total
         }
     };
     let mut velocity = 0.0f32;
@@ -488,13 +576,39 @@ fn site_position_and_jacobian(
     SiteJacobian { world_pos, columns }
 }
 
-fn wrap_center_world(_tree: &Tree, poses: &[(Vec3, Quat)], w: &WrapSphere) -> Vec3 {
-    match w.link {
+fn wrap_center_world(poses: &[(Vec3, Quat)], link: Option<usize>, center_local: Vec3) -> Vec3 {
+    match link {
         Some(l) => {
             let (com, ori) = poses[l];
-            com + ori.rotate(w.center_local)
+            com + ori.rotate(center_local)
         }
-        None => w.center_local,
+        None => center_local,
+    }
+}
+
+fn wrap_point_jacobian(
+    tree: &Tree,
+    poses: &[(Vec3, Quat)],
+    link: Option<usize>,
+    world_point: Vec3,
+) -> SiteJacobian {
+    match link {
+        None => SiteJacobian {
+            world_pos: world_point,
+            columns: Vec::new(),
+        },
+        Some(link_idx) => {
+            let (com, ori) = poses[link_idx];
+            let local = ori.inverse_rotate(world_point - com);
+            site_position_and_jacobian(
+                tree,
+                poses,
+                &SpatialTendonSite {
+                    link: Some(link_idx),
+                    position_local: local,
+                },
+            )
+        }
     }
 }
 
@@ -504,6 +618,7 @@ fn spatial_length_and_jacobian(
     poses: &[(Vec3, Quat)],
     sites: &[SpatialTendonSite],
     segments: &[SpatialSegment],
+    divisor: f32,
     jacobian: &mut [f32],
 ) -> f32 {
     // Precompute all site Jacobians once.
@@ -515,14 +630,23 @@ fn spatial_length_and_jacobian(
     for (i, seg) in segments.iter().enumerate() {
         let a = &site_jacs[i];
         let b = &site_jacs[i + 1];
+        let mut segment_jacobian = vec![0.0f32; jacobian.len()];
         let seg_len = match &seg.wrap {
-            None => straight_segment_contribution(a, b, jacobian),
-            Some(w) => {
-                let c_world = wrap_center_world(tree, poses, w);
-                wrap_segment_contribution(a, b, c_world, w, jacobian)
-            }
+            None => straight_segment_contribution(a, b, &mut segment_jacobian),
+            Some(w) => match w {
+                SpatialWrap::Sphere(w) => {
+                    let c_world = wrap_center_world(poses, w.link, w.center_local);
+                    wrap_segment_contribution(tree, poses, a, b, c_world, w, &mut segment_jacobian)
+                }
+                SpatialWrap::Cylinder(w) => {
+                    cylinder_segment_contribution(tree, poses, a, b, w, &mut segment_jacobian)
+                }
+            },
         };
-        total_length += seg_len;
+        total_length += seg_len / divisor;
+        for (dst, src) in jacobian.iter_mut().zip(segment_jacobian) {
+            *dst += src / divisor;
+        }
     }
     total_length
 }
@@ -545,10 +669,188 @@ fn straight_segment_contribution(a: &SiteJacobian, b: &SiteJacobian, jacobian: &
     len
 }
 
+fn is_intersect_2d(a0: [f32; 2], a1: [f32; 2], b0: [f32; 2], b1: [f32; 2]) -> bool {
+    let da = [a1[0] - a0[0], a1[1] - a0[1]];
+    let db = [b1[0] - b0[0], b1[1] - b0[1]];
+    let det = da[0] * db[1] - da[1] * db[0];
+    if det == 0.0 {
+        return false;
+    }
+    let d = [b0[0] - a0[0], b0[1] - a0[1]];
+    let s = (d[0] * db[1] - d[1] * db[0]) / det;
+    let t = (d[0] * da[1] - d[1] * da[0]) / det;
+    (0.0..=1.0).contains(&s) && (0.0..=1.0).contains(&t)
+}
+
+fn circle_arc_length(a: [f32; 2], b: [f32; 2], solution: usize, radius: f32) -> f32 {
+    let a_len = (a[0] * a[0] + a[1] * a[1]).sqrt();
+    let b_len = (b[0] * b[0] + b[1] * b[1]).sqrt();
+    let an = [a[0] / a_len, a[1] / a_len];
+    let bn = [b[0] / b_len, b[1] / b_len];
+    let dot = an[0] * bn[0] + an[1] * bn[1];
+    let cross = a[1] * b[0] - a[0] * b[1];
+    let mut angle = atan2((1.0 - dot * dot).max(0.0).sqrt(), dot.clamp(-1.0, 1.0));
+    if (cross > 0.0 && solution == 1) || (cross < 0.0 && solution == 0) {
+        angle = crate::math::TAU - angle;
+    }
+    radius * angle
+}
+
+/// MuJoCo's 2D circle-wrap construction. Returns tangent points and arc
+/// length when the straight segment intersects the circle.
+fn circle_wrap_points(
+    end0: [f32; 2],
+    end1: [f32; 2],
+    side: Option<[f32; 2]>,
+    radius: f32,
+) -> Option<([[f32; 2]; 2], f32)> {
+    let sqlen0 = end0[0] * end0[0] + end0[1] * end0[1];
+    let sqlen1 = end1[0] * end1[0] + end1[1] * end1[1];
+    let sqrad = radius * radius;
+    if sqlen0 < sqrad || sqlen1 < sqrad || radius <= 0.0 {
+        return None;
+    }
+    let dif = [end1[0] - end0[0], end1[1] - end0[1]];
+    let dd = dif[0] * dif[0] + dif[1] * dif[1];
+    if dd < 1.0e-12 {
+        return None;
+    }
+    let a = (-(dif[0] * end0[0] + dif[1] * end0[1]) / dd).clamp(0.0, 1.0);
+    let closest = [end0[0] + a * dif[0], end0[1] + a * dif[1]];
+    let closest_sq = closest[0] * closest[0] + closest[1] * closest[1];
+    if closest_sq > sqrad && side.is_none_or(|s| s[0] * closest[0] + s[1] * closest[1] >= 0.0) {
+        return None;
+    }
+    let sqrt0 = (sqlen0 - sqrad).max(0.0).sqrt();
+    let sqrt1 = (sqlen1 - sqrad).max(0.0).sqrt();
+    let mut best = 0;
+    let mut best_good = f32::NEG_INFINITY;
+    for (i, sign) in [1.0f32, -1.0].into_iter().enumerate() {
+        let sol0 = [
+            (end0[0] * sqrad + sign * radius * end0[1] * sqrt0) / sqlen0,
+            (end0[1] * sqrad - sign * radius * end0[0] * sqrt0) / sqlen0,
+        ];
+        let sol1 = [
+            (end1[0] * sqrad - sign * radius * end1[1] * sqrt1) / sqlen1,
+            (end1[1] * sqrad + sign * radius * end1[0] * sqrt1) / sqlen1,
+        ];
+        let good = if let Some(side) = side {
+            let mid = [sol0[0] + sol1[0], sol0[1] + sol1[1]];
+            let mid_len = (mid[0] * mid[0] + mid[1] * mid[1]).sqrt();
+            if mid_len == 0.0 {
+                f32::NEG_INFINITY
+            } else {
+                (mid[0] / mid_len) * side[0] + (mid[1] / mid_len) * side[1]
+            }
+        } else {
+            let chord = [sol0[0] - sol1[0], sol0[1] - sol1[1]];
+            -(chord[0] * chord[0] + chord[1] * chord[1])
+        };
+        if is_intersect_2d(end0, sol0, end1, sol1) {
+            continue;
+        }
+        if good > best_good {
+            best = i;
+            best_good = good;
+        }
+    }
+    if best_good == f32::NEG_INFINITY {
+        return None;
+    }
+    let sign = if best == 0 { 1.0 } else { -1.0 };
+    let sol0 = [
+        (end0[0] * sqrad + sign * radius * end0[1] * sqrt0) / sqlen0,
+        (end0[1] * sqrad - sign * radius * end0[0] * sqrt0) / sqlen0,
+    ];
+    let sol1 = [
+        (end1[0] * sqrad - sign * radius * end1[1] * sqrt1) / sqlen1,
+        (end1[1] * sqrad + sign * radius * end1[0] * sqrt1) / sqlen1,
+    ];
+    Some(([sol0, sol1], circle_arc_length(sol0, sol1, best, radius)))
+}
+
+fn cylinder_basis(axis: Vec3) -> (Vec3, Vec3) {
+    let reference = if axis.x.abs() < 0.8 { Vec3::X } else { Vec3::Y };
+    let first = axis.cross(reference).normalize();
+    (first, axis.cross(first).normalize())
+}
+
+fn cylinder_segment_contribution(
+    tree: &Tree,
+    poses: &[(Vec3, Quat)],
+    a: &SiteJacobian,
+    b: &SiteJacobian,
+    wrap: &WrapCylinder,
+    jacobian: &mut [f32],
+) -> f32 {
+    let center = wrap_center_world(poses, wrap.link, wrap.center_local);
+    let axis = match wrap.link {
+        Some(link) => poses[link].1.rotate(wrap.axis_local).normalize(),
+        None => wrap.axis_local.normalize(),
+    };
+    let (basis0, basis1) = cylinder_basis(axis);
+    let pa = a.world_pos - center;
+    let pb = b.world_pos - center;
+    let end0 = [pa.dot(basis0), pa.dot(basis1)];
+    let end1 = [pb.dot(basis0), pb.dot(basis1)];
+    let side = wrap.sidesite.map(|s| {
+        let p = site_position_and_jacobian(tree, poses, &s).world_pos - center;
+        let radial = [p.dot(basis0), p.dot(basis1)];
+        let n = (radial[0] * radial[0] + radial[1] * radial[1]).sqrt();
+        if n == 0.0 {
+            [0.0, 0.0]
+        } else {
+            [wrap.radius * radial[0] / n, wrap.radius * radial[1] / n]
+        }
+    });
+    let Some(([ta2, tb2], arc)) = circle_wrap_points(end0, end1, side, wrap.radius) else {
+        return straight_segment_contribution(a, b, jacobian);
+    };
+    let radial_a =
+        ((end0[0] - ta2[0]) * (end0[0] - ta2[0]) + (end0[1] - ta2[1]) * (end0[1] - ta2[1])).sqrt();
+    let radial_b =
+        ((end1[0] - tb2[0]) * (end1[0] - tb2[0]) + (end1[1] - tb2[1]) * (end1[1] - tb2[1])).sqrt();
+    let total_2d = radial_a + arc + radial_b;
+    if total_2d == 0.0 {
+        return straight_segment_contribution(a, b, jacobian);
+    }
+    let za = pa.dot(axis);
+    let zb = pb.dot(axis);
+    let zta = za + (zb - za) * radial_a / total_2d;
+    let ztb = za + (zb - za) * (radial_a + arc) / total_2d;
+    let ta = center + basis0 * ta2[0] + basis1 * ta2[1] + axis * zta;
+    let tb = center + basis0 * tb2[0] + basis1 * tb2[1] + axis * ztb;
+    let u_a = (ta - a.world_pos).normalize();
+    let u_b = (tb - b.world_pos).normalize();
+    for &(slot, col) in &a.columns {
+        jacobian[slot as usize] -= u_a.dot(col);
+    }
+    for &(slot, col) in &b.columns {
+        jacobian[slot as usize] -= u_b.dot(col);
+    }
+    add_wrap_body_jacobian(
+        tree,
+        poses,
+        WrapForceData {
+            link: wrap.link,
+            center,
+            point_a: ta,
+            point_b: tb,
+            force_a: u_a,
+            force_b: u_b,
+        },
+        jacobian,
+    );
+    let central = (arc * arc + (ztb - zta) * (ztb - zta)).sqrt();
+    (ta - a.world_pos).length() + central + (b.world_pos - tb).length()
+}
+
 /// Wrap segment length + Jacobian. Returns straight length (with straight
 /// Jacobian contribution) when the segment doesn't actually intersect the
 /// sphere.
 fn wrap_segment_contribution(
+    tree: &Tree,
+    poses: &[(Vec3, Quat)],
     a: &SiteJacobian,
     b: &SiteJacobian,
     c: Vec3,
@@ -665,7 +967,63 @@ fn wrap_segment_contribution(
     for &(slot, col) in &b.columns {
         jacobian[slot as usize] -= u_b.dot(col);
     }
+    add_wrap_body_jacobian(
+        tree,
+        poses,
+        WrapForceData {
+            link: wrap.link,
+            center: c,
+            point_a: t_a_point,
+            point_b: t_b_point,
+            force_a: u_a,
+            force_b: u_b,
+        },
+        jacobian,
+    );
     seg_len
+}
+
+struct WrapForceData {
+    link: Option<usize>,
+    center: Vec3,
+    point_a: Vec3,
+    point_b: Vec3,
+    force_a: Vec3,
+    force_b: Vec3,
+}
+
+fn add_wrap_body_jacobian(
+    tree: &Tree,
+    poses: &[(Vec3, Quat)],
+    data: WrapForceData,
+    jacobian: &mut [f32],
+) {
+    let Some(link) = data.link else { return };
+    let center_jac = wrap_point_jacobian(tree, poses, Some(link), data.center);
+    let total_force = data.force_a + data.force_b;
+    for &(slot, col) in &center_jac.columns {
+        jacobian[slot as usize] += total_force.dot(col);
+    }
+    let point_a_jac = wrap_point_jacobian(tree, poses, Some(link), data.point_a);
+    for &(slot, col) in &point_a_jac.columns {
+        let center_col = center_jac
+            .columns
+            .iter()
+            .find(|(center_slot, _)| *center_slot == slot)
+            .map(|(_, center_col)| *center_col)
+            .unwrap_or(Vec3::ZERO);
+        jacobian[slot as usize] += data.force_a.dot(col - center_col);
+    }
+    let point_b_jac = wrap_point_jacobian(tree, poses, Some(link), data.point_b);
+    for &(slot, col) in &point_b_jac.columns {
+        let center_col = center_jac
+            .columns
+            .iter()
+            .find(|(center_slot, _)| *center_slot == slot)
+            .map(|(_, center_col)| *center_col)
+            .unwrap_or(Vec3::ZERO);
+        jacobian[slot as usize] += data.force_b.dot(col - center_col);
+    }
 }
 
 /// Colinear-fallback branch of wrap_segment_contribution when the sphere
