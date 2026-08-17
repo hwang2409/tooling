@@ -416,7 +416,7 @@ pose is queried at any time via
 Sites cannot be `static`. `local_orientation` is optional (identity by
 default).
 
-## actuators (PD position servos)
+## actuators
 
 ```json
 {
@@ -432,7 +432,7 @@ default).
 }
 ```
 
-- **type** — one of `"position"`, `"velocity"`, `"motor"`,
+- **type** — one of `"position"`, `"velocity"`, `"motor"`, `"muscle"`,
   `"general"`. Everything else is rejected. See
   [`docs/actuators.md`](actuators.md) for the model formulas.
 - **tree** / **link** — must reference a hinge OR slide link. Ball and
@@ -448,6 +448,15 @@ Type-specific fields:
   — matches MuJoCo's `<position dampratio="…"/>` idiom.
 - **velocity** — `kv` required. Torque = `kv · (ctrl − qdot)`.
 - **motor** — optional `gear` (default `1.0`). Torque = `gear · ctrl`.
+- **muscle** — requires `lengthrange: [lo, hi]`. Optional curve fields use
+  MuJoCo defaults: `range`, `force`, `scale`, `lmin`, `lmax`, `vmax`,
+  `fpmax`, and `fvmax`. `timeconst` defaults to `[0.01, 0.04]`,
+  `tausmooth` defaults to `0`, and `ctrlrange` defaults to `[0, 1]`.
+  `force: -1` uses `scale / max(MINVAL, acc0)`.
+- **general muscle** — set `gaintype`, `biastype`, and `dyntype` to
+  `"muscle"`. Use explicit nine-value `gainprm` and `biasprm`; omitted
+  `dynprm` uses MuJoCo's compiled `[1, 0, 0]`. Explicit `lengthrange` is
+  required. Unknown fields are rejected.
 - **general** — `gaintype ∈ {"fixed", "affine"}`, `gainprm` (3-array),
   `biastype ∈ {"none", "affine"}`, `biasprm` (3-array), `gear`,
   `dyntype ∈ {"none", "filter"}`, `dynprm` (scalar; filter tau for

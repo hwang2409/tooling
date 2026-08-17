@@ -26,9 +26,10 @@
 //! Site attributes: `name`, `pos`, `quat`, `class`.
 //! Inertial attributes: `pos` (must be zero — newt requires COM at body
 //! origin), `mass`, `diaginertia` OR `fullinertia`.
-//! Actuator (`<position>` / `<motor>`): `name`, `joint`, `kp` (position),
-//! `kv` OR `dampratio` (position), `forcerange`, `ctrlrange` (accepted
-//! but not enforced; documented), `gear` (motor: scalar only), `class`.
+//! Actuator (`<position>` / `<motor>` / `<general>` / `<muscle>`):
+//! shorthand fields plus MuJoCo muscle curves, activation dynamics, and
+//! joint or tendon transmissions. Muscle models require explicit
+//! `lengthrange`; see `docs/actuators.md` for the supported defaults.
 //! Sensor: `jointpos`, `jointvel`, `ballquat`, `ballangvel`, `framepos`,
 //! `framequat`, `gyro`, `accelerometer`, `velocimeter`, `magnetometer`,
 //! `rangefinder`, `framelinvel`, `frameangvel`, `subtreecom`, `touch`,
@@ -2880,7 +2881,8 @@ impl Loader {
                 "motor" => self.add_motor_actuator(child, &subpath)?,
                 "velocity" => self.add_velocity_actuator(child, &subpath)?,
                 "general" => self.add_general_actuator(child, &subpath)?,
-                "cylinder" | "damper" | "muscle" | "intvelocity" => {
+                "muscle" => self.add_muscle_actuator(child, &subpath)?,
+                "cylinder" | "damper" | "intvelocity" => {
                     return fail(
                         &subpath,
                         format!(
@@ -2894,7 +2896,7 @@ impl Loader {
                         &subpath,
                         format!(
                             "unknown <actuator> child <{other}>; supported: position, motor, \
-                             velocity, general"
+                             velocity, muscle, general"
                         ),
                     );
                 }
@@ -2998,6 +3000,7 @@ impl Loader {
         };
         actuator.ctrl = initial_target;
         actuator.ctrl_range = ctrl_range;
+        actuator.ctrl_limited = actuator.ctrl_range.is_some();
         if self.actuators_by_name.contains_key(&name) {
             return fail(path, format!("duplicate actuator name \"{name}\""));
         }
@@ -3070,6 +3073,7 @@ impl Loader {
             actuator = actuator.on_tendon(ti);
         }
         actuator.ctrl_range = ctrl_range;
+        actuator.ctrl_limited = actuator.ctrl_range.is_some();
         if self.actuators_by_name.contains_key(&name) {
             return fail(path, format!("duplicate actuator name \"{name}\""));
         }
@@ -3122,6 +3126,7 @@ impl Loader {
         }
         let mut actuator = Actuator::velocity(link_idx, kv, clamp);
         actuator.ctrl_range = ctrl_range;
+        actuator.ctrl_limited = actuator.ctrl_range.is_some();
         if self.actuators_by_name.contains_key(&name) {
             return fail(path, format!("duplicate actuator name \"{name}\""));
         }
@@ -3133,11 +3138,24 @@ impl Loader {
     fn add_general_actuator(&mut self, e: &Element, path: &str) -> Result<(), MjcfError> {
         let class = e.attr("class").unwrap_or(DefaultsTable::MAIN).to_string();
         let dc = self.defaults.lookup(&class).cloned().unwrap_or_default();
+        let is_muscle = matches!(
+            attr_with_default(e, "general", "gaintype", &dc),
+            Some("muscle")
+        ) || matches!(
+            attr_with_default(e, "general", "biastype", &dc),
+            Some("muscle")
+        ) || matches!(
+            attr_with_default(e, "general", "dyntype", &dc),
+            Some("muscle")
+        );
+        if is_muscle {
+            return self.add_general_muscle_actuator(e, path, &dc);
+        }
         for (k, _) in &e.attrs {
             match k.as_str() {
-                "name" | "joint" | "gaintype" | "gainprm" | "biastype" | "biasprm" | "gear"
-                | "dyntype" | "dynprm" | "actearly" | "ctrlrange" | "forcerange" | "class"
-                | "ctrllimited" | "forcelimited" => {}
+                "name" | "joint" | "tendon" | "gaintype" | "gainprm" | "biastype" | "biasprm"
+                | "gear" | "dyntype" | "dynprm" | "actearly" | "ctrlrange" | "forcerange"
+                | "class" | "ctrllimited" | "forcelimited" => {}
                 other => {
                     return fail(
                         path,
@@ -3147,8 +3165,7 @@ impl Loader {
             }
         }
         let name = attr_required(e, "name", path)?.to_string();
-        let joint_name = attr_required(e, "joint", path)?;
-        let (tree_idx, link_idx) = self.resolve_1dof_joint_for_actuator(joint_name, path)?;
+        let (tree_idx, link_idx, tendon_idx) = self.resolve_actuator_transmission(e, path)?;
 
         if let Some(v) = e.attr("actearly") {
             let flag = parse_bool(v, path, "actearly")?;
@@ -3264,12 +3281,251 @@ impl Loader {
         if self.actuators_by_name.contains_key(&name) {
             return fail(path, format!("duplicate actuator name \"{name}\""));
         }
+        let mut actuator = actuator;
+        if let Some(ti) = tendon_idx {
+            actuator = actuator.on_tendon(ti);
+        }
         let act_idx = self.world.trees[tree_idx].add_actuator(actuator);
         self.actuators_by_name.insert(name, (tree_idx, act_idx));
         Ok(())
     }
 
-    /// Read `joint="..."` OR `tendon="..."` and return
+    fn add_muscle_actuator(&mut self, e: &Element, path: &str) -> Result<(), MjcfError> {
+        let class = e.attr("class").unwrap_or(DefaultsTable::MAIN).to_string();
+        let dc = self.defaults.lookup(&class).cloned().unwrap_or_default();
+        for (k, _) in &e.attrs {
+            match k.as_str() {
+                "name" | "joint" | "tendon" | "lengthrange" | "gear" | "ctrlrange"
+                | "forcerange" | "class" | "ctrllimited" | "forcelimited" | "target"
+                | "timeconst" | "tausmooth" | "range" | "force" | "scale" | "lmin" | "lmax"
+                | "vmax" | "fpmax" | "fvmax" | "acc0" => {}
+                other => {
+                    return fail(
+                        path,
+                        format!("<muscle> attribute \"{other}\" not supported"),
+                    );
+                }
+            }
+        }
+        let name = attr_required(e, "name", path)?.to_string();
+        let (tree_idx, link_idx, tendon_idx) = self.resolve_actuator_transmission(e, path)?;
+        let length_src = attr_with_default(e, "muscle", "lengthrange", &dc)
+            .ok_or_else(|| MjcfError::new(path, "<muscle> requires explicit lengthrange"))?;
+        let length = parse_f32_list(length_src, path, "lengthrange")?;
+        require_len(&length, 2, path, "lengthrange")?;
+        if length[0] >= length[1] {
+            return fail(path, "lengthrange low must be < high");
+        }
+        let mut prm = [0.75, 1.05, -1.0, 200.0, 0.5, 1.6, 1.5, 1.3, 1.2];
+        for (attr, slot) in [
+            ("force", 2usize),
+            ("scale", 3),
+            ("lmin", 4),
+            ("lmax", 5),
+            ("vmax", 6),
+            ("fpmax", 7),
+            ("fvmax", 8),
+        ] {
+            if let Some(v) = attr_with_default(e, "muscle", attr, &dc) {
+                prm[slot] = parse_f32(v, path, attr)?;
+            }
+        }
+        if let Some(v) = attr_with_default(e, "muscle", "range", &dc) {
+            let nums = parse_f32_list(v, path, "range")?;
+            require_len(&nums, 2, path, "range")?;
+            prm[0] = nums[0];
+            prm[1] = nums[1];
+        }
+        if prm[0] >= prm[1] || prm[4] >= 1.0 || prm[5] <= 1.0 || prm[6] <= 0.0 || prm[7] < 0.0 {
+            return fail(path, "invalid muscle curve parameters");
+        }
+        let time_src = attr_with_default(e, "muscle", "timeconst", &dc).unwrap_or("0.01 0.04");
+        let time = parse_f32_list(time_src, path, "timeconst")?;
+        require_len(&time, 2, path, "timeconst")?;
+        if time[0] <= 0.0 || time[1] <= 0.0 {
+            return fail(path, "muscle time constants must be > 0");
+        }
+        let tausmooth = attr_with_default(e, "muscle", "tausmooth", &dc)
+            .map(|v| parse_f32(v, path, "tausmooth"))
+            .transpose()?
+            .unwrap_or(0.0);
+        if tausmooth < 0.0 {
+            return fail(path, "tausmooth must be >= 0");
+        }
+        let gear = attr_with_default(e, "muscle", "gear", &dc)
+            .map(|v| {
+                let nums = parse_f32_list(v, path, "gear")?;
+                if nums.len() != 1 && nums.len() != 6 {
+                    return fail(path, "muscle gear must have one scalar or six numbers");
+                }
+                if nums.iter().skip(1).any(|&x| x != 0.0) {
+                    return fail(path, "only scalar muscle gear is supported");
+                }
+                Ok(nums[0])
+            })
+            .transpose()?
+            .unwrap_or(1.0);
+        let acc0 = attr_with_default(e, "muscle", "acc0", &dc)
+            .map(|v| parse_f32(v, path, "acc0"))
+            .transpose()?
+            .unwrap_or(1.0);
+        if acc0 < 0.0 {
+            return fail(path, "acc0 must be >= 0");
+        }
+        let ctrl_range_src = attr_with_default(e, "muscle", "ctrlrange", &dc).is_some();
+        let ctrl_range =
+            parse_lo_hi_range_attr(e, "muscle", "ctrlrange", &dc, path)?.or(Some((0.0, 1.0)));
+        let force_range = parse_lo_hi_range_attr(e, "muscle", "forcerange", &dc, path)?;
+        let ctrl_limited = attr_with_default(e, "muscle", "ctrllimited", &dc)
+            .map(|v| parse_bool(v, path, "ctrllimited"))
+            .transpose()?
+            .unwrap_or(ctrl_range_src);
+        let force_limited = attr_with_default(e, "muscle", "forcelimited", &dc)
+            .map(|v| parse_bool(v, path, "forcelimited"))
+            .transpose()?
+            .unwrap_or(force_range.is_some());
+        let target = attr_with_default(e, "muscle", "target", &dc)
+            .map(|v| parse_f32(v, path, "target"))
+            .transpose()?
+            .unwrap_or(0.0);
+        let mut actuator = Actuator::muscle(
+            link_idx,
+            prm,
+            prm,
+            [length[0], length[1]],
+            acc0,
+            gear,
+            [time[0], time[1], tausmooth],
+            ctrl_range,
+            force_range,
+        );
+        actuator = actuator.with_limit_flags(ctrl_limited, force_limited);
+        actuator.ctrl = target;
+        if let Some(ti) = tendon_idx {
+            actuator = actuator.on_tendon(ti);
+        }
+        if self.actuators_by_name.contains_key(&name) {
+            return fail(path, format!("duplicate actuator name \"{name}\""));
+        }
+        let act_idx = self.world.trees[tree_idx].add_actuator(actuator);
+        self.actuators_by_name.insert(name, (tree_idx, act_idx));
+        Ok(())
+    }
+
+    fn add_general_muscle_actuator(
+        &mut self,
+        e: &Element,
+        path: &str,
+        dc: &DefaultClass,
+    ) -> Result<(), MjcfError> {
+        let name = attr_required(e, "name", path)?.to_string();
+        let (tree_idx, link_idx, tendon_idx) = self.resolve_actuator_transmission(e, path)?;
+        for (k, _) in &e.attrs {
+            match k.as_str() {
+                "name" | "joint" | "tendon" | "gaintype" | "gainprm" | "biastype" | "biasprm"
+                | "dyntype" | "dynprm" | "lengthrange" | "gear" | "ctrlrange" | "forcerange"
+                | "class" | "ctrllimited" | "forcelimited" | "acc0" => {}
+                other => {
+                    return fail(
+                        path,
+                        format!("<general> attribute \"{other}\" not supported"),
+                    );
+                }
+            }
+        }
+        let gain_type = attr_with_default(e, "general", "gaintype", dc).ok_or_else(|| {
+            MjcfError::new(path, "muscle general requires explicit gaintype=muscle")
+        })?;
+        let bias_type = attr_with_default(e, "general", "biastype", dc).ok_or_else(|| {
+            MjcfError::new(path, "muscle general requires explicit biastype=muscle")
+        })?;
+        let dyn_type = attr_with_default(e, "general", "dyntype", dc).ok_or_else(|| {
+            MjcfError::new(path, "muscle general requires explicit dyntype=muscle")
+        })?;
+        if gain_type != "muscle" || bias_type != "muscle" || dyn_type != "muscle" {
+            return fail(
+                path,
+                "muscle general requires gaintype, biastype, and dyntype=muscle",
+            );
+        }
+        let parse9 = |attr: &str| -> Result<[f32; 9], MjcfError> {
+            let src = attr_with_default(e, "general", attr, dc).ok_or_else(|| {
+                MjcfError::new(path, format!("muscle general requires explicit {attr}"))
+            })?;
+            let nums = parse_f32_list(src, path, attr)?;
+            if nums.len() != 9 {
+                return fail(path, format!("{attr} must have nine numbers"));
+            }
+            let mut out = [0.0; 9];
+            out.copy_from_slice(&nums);
+            Ok(out)
+        };
+        let gain_prm = parse9("gainprm")?;
+        let bias_prm = parse9("biasprm")?;
+        let length_src = attr_with_default(e, "general", "lengthrange", dc).ok_or_else(|| {
+            MjcfError::new(path, "<general muscle> requires explicit lengthrange")
+        })?;
+        let length = parse_f32_list(length_src, path, "lengthrange")?;
+        require_len(&length, 2, path, "lengthrange")?;
+        if length[0] >= length[1] {
+            return fail(path, "lengthrange low must be < high");
+        }
+        let dyn_src = attr_with_default(e, "general", "dynprm", dc).unwrap_or("1 0 0");
+        let muscle_dyn = parse_f32_list(dyn_src, path, "dynprm")?;
+        require_len(&muscle_dyn, 3, path, "dynprm")?;
+        if muscle_dyn[0] <= 0.0 || muscle_dyn[1] < 0.0 || muscle_dyn[2] < 0.0 {
+            return fail(
+                path,
+                "muscle dynprm requires positive time constants and nonnegative tausmooth",
+            );
+        }
+        let ctrl_range_src = attr_with_default(e, "general", "ctrlrange", dc).is_some();
+        let ctrl_range =
+            parse_lo_hi_range_attr(e, "general", "ctrlrange", dc, path)?.or(Some((0.0, 1.0)));
+        let force_range = parse_lo_hi_range_attr(e, "general", "forcerange", dc, path)?;
+        let ctrl_limited = attr_with_default(e, "general", "ctrllimited", dc)
+            .map(|v| parse_bool(v, path, "ctrllimited"))
+            .transpose()?
+            .unwrap_or(ctrl_range_src);
+        let force_limited = attr_with_default(e, "general", "forcelimited", dc)
+            .map(|v| parse_bool(v, path, "forcelimited"))
+            .transpose()?
+            .unwrap_or(force_range.is_some());
+        let gear = attr_with_default(e, "general", "gear", dc)
+            .map(|v| parse_f32(v, path, "gear"))
+            .transpose()?
+            .unwrap_or(1.0);
+        let acc0 = attr_with_default(e, "general", "acc0", dc)
+            .map(|v| parse_f32(v, path, "acc0"))
+            .transpose()?
+            .unwrap_or(1.0);
+        if acc0 < 0.0 {
+            return fail(path, "acc0 must be >= 0");
+        }
+        let mut actuator = Actuator::general_muscle(
+            link_idx,
+            gain_prm,
+            bias_prm,
+            [length[0], length[1]],
+            acc0,
+            gear,
+            [muscle_dyn[0], muscle_dyn[1], muscle_dyn[2]],
+            ctrl_range,
+            force_range,
+        );
+        actuator = actuator.with_limit_flags(ctrl_limited, force_limited);
+        if let Some(ti) = tendon_idx {
+            actuator = actuator.on_tendon(ti);
+        }
+        if self.actuators_by_name.contains_key(&name) {
+            return fail(path, format!("duplicate actuator name \"{name}\""));
+        }
+        let act_idx = self.world.trees[tree_idx].add_actuator(actuator);
+        self.actuators_by_name.insert(name, (tree_idx, act_idx));
+        Ok(())
+    }
+
+    /// Read the joint or tendon transmission and return
     /// `(tree_idx, link_idx, tendon_idx)`. `link_idx` is `0` when the
     /// actuator is tendon-transmission (ignored downstream); `tendon_idx`
     /// is `Some(i)` iff `tendon=` was present. Rejects both/neither

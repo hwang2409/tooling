@@ -1,0 +1,26 @@
+<mujoco>
+  <option timestep="0.002" integrator="RK4" gravity="0 0 -9.81"/>
+  <worldbody>
+    <body name="root">
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <site name="anchor" pos="-0.7 0 0"/>
+      <geom name="wrap" type="cylinder" pos="0 0 0" size="0.2 0.5"/>
+      <body name="lift" pos="0.7 0 0">
+        <inertial pos="0 0 0" mass="1" diaginertia="0.1 0.1 0.1"/>
+        <joint name="lift_joint" type="slide" axis="0 0 1" damping="0.2"/>
+        <site name="load" pos="0 0 0"/>
+      </body>
+    </body>
+  </worldbody>
+  <tendon>
+    <spatial name="wrapped">
+      <site site="anchor"/>
+      <geom geom="wrap" sidesite="load"/>
+      <site site="load"/>
+    </spatial>
+  </tendon>
+  <actuator>
+    <muscle name="wrapped_muscle" tendon="wrapped" gear="1"
+            lengthrange="0 2" force="1" timeconst="0.01 0.04"/>
+  </actuator>
+</mujoco>

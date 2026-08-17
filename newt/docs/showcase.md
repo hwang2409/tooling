@@ -23,7 +23,12 @@ cargo run --release --example hfield_demo -- --frames 1800 --out demo-hfield.mp4
 cargo run --release --example cartpole -- --frames 900 --out demo-cartpole.mp4
 cargo run --release --example cartpole -- --velocity --frames 900 --out demo-cartpole-velocity.mp4
 cargo run --release --example arm -- --frames 1800 --out demo-arm.mp4
+cargo run --release --example muscle_pendulum -- --frames 1800 --out demo-muscle-pendulum.mp4
 ```
+
+The muscle pendulum starts at zero activation, holds control at zero, drives
+from `0` to `1`, then returns to zero. The committed demo is 3.016667 seconds
+at 60 fps. Its HUD activation extrema are `0.000000..1.000000`.
 
 `--out` defaults to a demo-specific mp4 in the current directory. the
 implementation writes numbered ppm frames to a temporary directory, invokes

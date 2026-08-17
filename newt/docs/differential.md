@@ -352,6 +352,36 @@ The gap scales with `dt/tau` and the ctrl-step amplitude; it is much
 smaller than the bounded divergences on `sphere_drop_*` and
 `joint_limit_swing`, and it does not accumulate over the horizon.
 
+### muscle differential rows
+
+These rows use the same XML sources for MuJoCo and newt. MuJoCo 3.11.0
+captures live in `tests/references/muscle_*.json` and include post-step
+`qpos`, `qvel`, and `act` samples. Regenerate them with
+`tools/capture_muscle_differentials.py`.
+
+| scene | steps | qpos bound | qvel bound | act bound | purpose |
+|-------|------:|-----------:|-----------:|----------:|---------|
+| muscle_pendulum | 500 | 2.0e-6 | 3.0e-6 | 2.0e-6 | joint transmission and target pulse |
+| muscle_wrapped_tendon | 400 | 3.0e-6 | 4.0e-6 | 3.0e-6 | wrapped tendon lift |
+| muscle_isometric_twitch | 300 | 5.0e-7 | 5.0e-7 | 5.0e-7 | activation-only twitch |
+| muscle_pendulum_gear | 500 | 3.0e-6 | 5.0e-6 | 2.0e-6 | joint gear 1.7 |
+| muscle_wrapped_tendon_gear | 400 | 5.0e-6 | 6.0e-6 | 3.0e-6 | wrapped tendon gear 1.6 |
+
+The tests report separate maximum absolute errors for position, velocity, and
+activation. The current measurements are `7.15e-7 / 8.34e-7 / 2.98e-7` for
+the pendulum, `5.96e-7 / 1.43e-6 / 2.98e-7` for the wrapped tendon, and
+`1.40e-9 / 7.45e-9 / 1.19e-7` for the twitch. Gear scenes measure
+`2.38e-7 / 5.96e-7 / 2.98e-7` and `1.43e-6 / 2.38e-6 / 2.98e-7`.
+
+The function fixture has 160 targeted gain points, 16 bias points, and 143
+dynamics points. It covers both sides of each FL knot, the FV switch and
+saturations, and controls and activations outside `[0,1]`. Its measured
+float-tier maximum is `3.81e-5`; the test states a `6.0e-5` tolerance.
+
+The `muscle_rk4_limits` fixture uses `ctrlrange="0 0.5"`,
+`ctrllimited="true"`, `force="100"`, and `timestep="0.002"`. Its measured
+maximum errors are `3.58e-7` qpos, `1.91e-6` qvel, and `5.96e-8` act.
+
 ### joint_limit_swing (bounded divergence)
 
 Single-hinge pendulum with a `±0.6 rad` range limit, initial

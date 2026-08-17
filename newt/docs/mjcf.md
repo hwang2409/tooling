@@ -39,7 +39,7 @@ steps. If you touch either loader, keep the anchors green.
 | `<option>`   | Attributes below.                                         |
 | `<default>`  | Nested class inheritance; see [Defaults + classes](#defaults--classes). |
 | `<worldbody>`| Static geoms plus top-level `<body>` roots.               |
-| `<actuator>` | `<position>` and `<motor>` children.                      |
+| `<actuator>` | `<position>`, `<velocity>`, `<motor>`, `<general>`, and `<muscle>` children. |
 | `<sensor>`   | Sensor kinds listed below.                                |
 | `<equality>` | `<connect>`, `<weld>`, `<joint>` children.                |
 | `<contact>`  | `<pair>` XOR `<exclude>` children (exclusive).            |
@@ -47,7 +47,7 @@ steps. If you touch either loader, keep the anchors green.
 | `<asset>`    | Inline `<hfield>` assets only. PNG files are rejected without a decoder. |
 
 Rejected top-level elements (clean `unsupported in v2 tier 4` error):
-`<tendon>`, `<custom>`, `<visual>`, `<size>`,
+`<custom>`, `<visual>`, `<size>`,
 `<statistic>`, `<extension>`, `<include>`.
 
 ### `<compiler>`
@@ -208,9 +208,10 @@ capsule, and box pairs only.
 | `<position>` | `name`, `joint`, `kp`, `kv` OR `dampratio`, `forcerange`, `ctrlrange`, `class`, `ctrllimited`, `forcelimited`, `target` | `forcerange="lo hi"` maps to a symmetric `clamp = min(|lo|, |hi|)`. `ctrlrange="lo hi"` is enforced (clamps `ctrl` before torque eval, MuJoCo parity). `dampratio` uses a unit reflected-inertia estimate (`kv = 2·dr·sqrt(kp·1)`); pass `kv` for exact control. |
 | `<velocity>` | `name`, `joint`, `kv`, `forcerange`, `ctrlrange`, `class`, …               | Torque = `kv · (ctrl − qdot)`. Same clamp convention as `<position>`. |
 | `<motor>`    | `name`, `joint`, `gear`, `forcerange`, `ctrlrange`, `class`, …            | Torque = `gear · ctrl`. Only the first `gear` scalar is honored. Set the effective torque each step via `Tree::set_actuator_target`. |
-| `<general>`  | `name`, `joint`, `gaintype`, `gainprm`, `biastype`, `biasprm`, `gear`, `dyntype`, `dynprm`, `ctrlrange`, `forcerange`, `class`, `ctrllimited`, `forcelimited` | Full v2 tier-2 model. `gainprm`/`biasprm` accept 1..=3 numbers (tail defaults `[1,0,0]` / `[0,0,0]`). `dyntype="filter"` requires `dynprm` (tau) > 0. `actearly="true"` is rejected. `ctrlrange`/`forcerange` are asymmetric `"lo hi"`. See [`docs/actuators.md`](actuators.md) for the model. |
+| `<general>`  | `name`, `joint` or `tendon`, `gaintype`, `gainprm`, `biastype`, `biasprm`, `gear`, `dyntype`, `dynprm`, `lengthrange`, `ctrlrange`, `forcerange`, `class`, `ctrllimited`, `forcelimited` | Full actuator model. Muscle types require all three type fields to be `muscle` and require explicit `lengthrange`. See [`docs/actuators.md`](actuators.md). |
+| `<muscle>`   | `name`, `joint` or `tendon`, `lengthrange`, `range`, `force`, `scale`, `lmin`, `lmax`, `vmax`, `fpmax`, `fvmax`, `timeconst`, `tausmooth`, `gear`, `ctrlrange`, `forcerange`, `class` | MuJoCo muscle shortcut with default curve parameters and `ctrlrange="0 1"`. The loader rejects missing `lengthrange`. |
 
-`<cylinder>`, `<damper>`, `<muscle>`, `<intvelocity>` remain outside the subset.
+`<cylinder>`, `<damper>`, and `<intvelocity>` remain outside the subset.
 
 ### `<sensor>`
 

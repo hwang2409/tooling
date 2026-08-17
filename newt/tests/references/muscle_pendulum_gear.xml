@@ -1,0 +1,16 @@
+<mujoco>
+  <option timestep="0.002" integrator="RK4" gravity="0 0 -9.81"/>
+  <worldbody>
+    <body name="root">
+      <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+      <body name="pendulum">
+        <inertial pos="0 0 0" mass="1" diaginertia="0.0833333 0.0833333 0.001"/>
+        <joint name="hinge" type="hinge" axis="0 1 0" damping="0.2"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <muscle name="pendulum_muscle" joint="hinge" gear="1.7"
+            lengthrange="-1 1" force="1" timeconst="0.01 0.04"/>
+  </actuator>
+</mujoco>

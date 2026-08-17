@@ -344,6 +344,7 @@ fn ctrl_clamp_binds_before_force_clamp() {
     a.ctrl = 100.0;
     a.ctrl_range = Some((-2.0, 2.0));
     a.force_range = Some((-25.0, 25.0));
+    a = a.with_limit_flags(true, true);
     let t = a.torque(0.0, 0.0);
     assert!((t - 20.0).abs() < 1e-6, "expected 20, got {t}");
 
