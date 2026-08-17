@@ -296,8 +296,8 @@ identifiers remain exact. This tolerance is separate from the committed Newt
 parity bounds. Mesh-local route pose orientations are excluded from the CI
 value comparison because MuJoCo's mesh compiler can choose different
 principal-axis frames across platforms. Mesh contact positions are compared in
-that mesh-local frame. The Rust fixture keeps the world-frame values for route
-replay, and an edited world-frame contact still changes the local comparison.
+the owning body frame. The Rust fixture keeps the world-frame values for route
+replay, and an edited world-frame contact still changes the body-frame value.
 The verifier also runs a non-max sample mutation self-test in CI. The Rust
 fixture test also recomputes both maxima and requires exact float32 equality
 between each stored position/orientation bound and its stored maximum plus

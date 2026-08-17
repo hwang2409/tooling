@@ -141,6 +141,22 @@ def capture(mujoco, references: Path) -> dict:
                         "position": data.geom_xpos[geom_b].astype("float64").tolist(),
                         "orientation_wxyz": quat_b.tolist(),
                     },
+                    "body_pose_a": {
+                        "position": data.xpos[model.geom_bodyid[geom_a]]
+                        .astype("float64")
+                        .tolist(),
+                        "orientation_wxyz": data.xquat[model.geom_bodyid[geom_a]]
+                        .astype("float64")
+                        .tolist(),
+                    },
+                    "body_pose_b": {
+                        "position": data.xpos[model.geom_bodyid[geom_b]]
+                        .astype("float64")
+                        .tolist(),
+                        "orientation_wxyz": data.xquat[model.geom_bodyid[geom_b]]
+                        .astype("float64")
+                        .tolist(),
+                    },
                     "contacts": contacts,
                 }
             )

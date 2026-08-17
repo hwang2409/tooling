@@ -82,7 +82,7 @@ def inverse_rotate(quaternion: list[float], vector: list[float]) -> list[float]:
     ]
 
 
-def mesh_local_contact_position(pose: dict, contact: dict) -> list[float]:
+def body_local_contact_position(pose: dict, contact: dict) -> list[float]:
     relative = [
         contact["position"][index] - pose["position"][index]
         for index in range(3)
@@ -157,8 +157,8 @@ def compare_route_oracle(
                 )
                 # MuJoCo's mesh compiler may choose different principal-axis
                 # frames across platforms. The fixture keeps that frame for
-                # the Rust route replay, so CI compares the contact samples
-                # and stable positions, but not this mesh-local orientation.
+                # the Rust route replay, so CI compares contact samples in the
+                # owning body frame, but not this mesh-local orientation.
                 mesh_frame = "mesh" in committed_probe["pair"]
                 if not mesh_frame:
                     compare_vector(
@@ -177,11 +177,11 @@ def compare_route_oracle(
                 committed_position = committed_contact["position"]
                 fresh_position = fresh_contact["position"]
                 if "mesh" in committed_probe["pair"]:
-                    committed_position = mesh_local_contact_position(
-                        committed_pose["pose_b"], committed_contact
+                    committed_position = body_local_contact_position(
+                        committed_pose["body_pose_b"], committed_contact
                     )
-                    fresh_position = mesh_local_contact_position(
-                        fresh_pose["pose_b"], fresh_contact
+                    fresh_position = body_local_contact_position(
+                        fresh_pose["body_pose_b"], fresh_contact
                     )
                 compare_vector(
                     committed_position,
