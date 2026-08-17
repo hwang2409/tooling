@@ -13,6 +13,7 @@
 //! - Fully implemented pairs (tier 2 + v1 tier 2):
 //!   - plane vs {sphere, box, capsule, cylinder, ellipsoid, mesh}
 //!   - sphere vs {sphere, capsule, cylinder, ellipsoid, mesh}
+//!   - hfield vs {sphere, capsule, box}
 //!   - capsule vs capsule
 //!   - box vs box (full OBB SAT with edge-edge cross axes — closes the
 //!     NEWT-5 rotated-stack incident)
@@ -22,6 +23,7 @@
 //!   - ellipsoid vs {box, capsule, ellipsoid, mesh}
 //!   - mesh vs {box, capsule, mesh}
 //!   - box vs {sphere, capsule}  (unchanged from tier 2)
+//!   - hfield vs {cylinder, ellipsoid, mesh}
 //!
 //! Deferred pairs would each need a GJK or bespoke narrow-phase primitive
 //! and are called out in the docs. The v1 constraint solver ticket
@@ -44,7 +46,7 @@
 //! [`sphere_ellipsoid`]). Sorted results at the pair level live in
 //! [`crate::world`].
 
-use crate::geom::{ConvexMesh, Geom, GeomPose, GeomShape};
+use crate::geom::{ConvexMesh, Geom, GeomPose, GeomShape, HeightField};
 use crate::math::Vec3;
 
 /// One narrow-phase contact.
@@ -119,6 +121,26 @@ impl ContactBuf {
             self.len += 1;
         }
     }
+
+    /// Add a candidate while retaining the four deepest contacts in stable
+    /// order. This is the per-pair manifold cap seam used by multi-cell
+    /// heightfields.
+    pub fn push_deepest(&mut self, c: Contact) {
+        self.candidate_count += 1;
+        if self.len < self.contacts.len() {
+            self.contacts[self.len] = c;
+            self.len += 1;
+        } else if c.penetration > self.contacts[self.len - 1].penetration {
+            self.contacts[self.len - 1] = c;
+        } else {
+            return;
+        }
+        let mut i = self.len - 1;
+        while i > 0 && self.contacts[i].penetration > self.contacts[i - 1].penetration {
+            self.contacts.swap(i, i - 1);
+            i -= 1;
+        }
+    }
     pub fn as_slice(&self) -> &[Contact] {
         &self.contacts[..self.len]
     }
@@ -158,8 +180,11 @@ fn supported_shape_pair(a: &GeomShape, b: &GeomShape) -> bool {
             | (GeomShape::Sphere { .. }, GeomShape::Cylinder { .. })
             | (GeomShape::Sphere { .. }, GeomShape::Ellipsoid { .. })
             | (GeomShape::Sphere { .. }, GeomShape::Mesh { .. })
+            | (GeomShape::Sphere { .. }, GeomShape::Hfield { .. })
             | (GeomShape::Capsule { .. }, GeomShape::Capsule { .. })
             | (GeomShape::Box { .. }, GeomShape::Box { .. })
+            | (GeomShape::Box { .. }, GeomShape::Hfield { .. })
+            | (GeomShape::Capsule { .. }, GeomShape::Hfield { .. })
     )
 }
 
@@ -1662,6 +1687,232 @@ pub fn sphere_mesh(
     out
 }
 
+/// Return the two top triangles for one heightfield cell in field-local
+/// coordinates. The fixed diagonal is part of the prism decomposition.
+fn hfield_cell_triangles(hfield: &HeightField, row: usize, col: usize) -> [(Vec3, Vec3, Vec3); 2] {
+    let sx = hfield.size[0];
+    let sy = hfield.size[1];
+    let x = |c: usize| -sx + 2.0 * sx * c as f32 / (hfield.ncol - 1) as f32;
+    let y = |r: usize| -sy + 2.0 * sy * r as f32 / (hfield.nrow - 1) as f32;
+    let p = |r: usize, c: usize| Vec3::new(x(c), y(r), hfield.height(r, c));
+    let p00 = p(row, col);
+    let p10 = p(row, col + 1);
+    let p01 = p(row + 1, col);
+    let p11 = p(row + 1, col + 1);
+    [(p00, p10, p11), (p00, p11, p01)]
+}
+
+fn hfield_tri_normal(a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+    let n = (b - a).cross(c - a).normalize();
+    if n.z < 0.0 { -n } else { n }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hfield_sphere_candidates(
+    center: Vec3,
+    radius: f32,
+    hfield_pose: &GeomPose,
+    hfield: &HeightField,
+    friction: f32,
+    margin: f32,
+    gap: f32,
+    idx_sphere: usize,
+    idx_hfield: usize,
+    out: &mut ContactBuf,
+) {
+    let center_local = hfield_pose
+        .orientation
+        .inverse_rotate(center - hfield_pose.position);
+    for row in 0..hfield.nrow - 1 {
+        for col in 0..hfield.ncol - 1 {
+            for (a, b, c) in hfield_cell_triangles(hfield, row, col) {
+                let q = closest_point_on_triangle(center_local, a, b, c);
+                let delta = center_local - q;
+                let distance = delta.length();
+                let n = hfield_tri_normal(a, b, c);
+                let signed = (center_local - q).dot(n);
+                let raw_dist = if signed < 0.0 {
+                    signed - radius
+                } else {
+                    distance - radius
+                };
+                let penetration = margin - raw_dist;
+                if penetration <= 0.0 {
+                    continue;
+                }
+                let normal_local = if signed < 0.0 || distance <= 1.0e-9 {
+                    n
+                } else {
+                    delta / distance
+                };
+                let contact_local = q;
+                let contact_world = hfield_pose.point_to_world(contact_local);
+                out.push_deepest(Contact {
+                    geom_a: idx_sphere,
+                    geom_b: idx_hfield,
+                    position_world: contact_world,
+                    normal_world: hfield_pose.rotate(normal_local),
+                    penetration,
+                    friction,
+                    gap,
+                });
+            }
+        }
+    }
+}
+
+fn dedup_contacts(out: &mut ContactBuf) {
+    let mut write = 0;
+    for read in 0..out.len {
+        let candidate = out.contacts[read];
+        let duplicate = (0..write).any(|i| {
+            let prior = out.contacts[i];
+            (candidate.position_world - prior.position_world).length_squared() < 1.0e-12
+                && (candidate.normal_world - prior.normal_world).length_squared() < 1.0e-12
+        });
+        if !duplicate {
+            out.contacts[write] = candidate;
+            write += 1;
+        }
+    }
+    out.len = write;
+}
+
+/// Sphere vs MuJoCo heightfield. Each grid cell is decomposed into two
+/// triangular prisms; the top triangle is the narrow-phase surface.
+#[allow(clippy::too_many_arguments)]
+pub fn sphere_hfield(
+    idx_sphere: usize,
+    sphere_pose: &GeomPose,
+    radius: f32,
+    idx_hfield: usize,
+    hfield_pose: &GeomPose,
+    hfield: &HeightField,
+    friction: f32,
+    margin: f32,
+    gap: f32,
+) -> ContactBuf {
+    let mut out = ContactBuf::new();
+    hfield_sphere_candidates(
+        sphere_pose.position,
+        radius,
+        hfield_pose,
+        hfield,
+        friction,
+        margin,
+        gap,
+        idx_sphere,
+        idx_hfield,
+        &mut out,
+    );
+    dedup_contacts(&mut out);
+    out
+}
+
+/// Capsule vs heightfield. The two spherical end caps are the same endpoint
+/// decomposition used by the MuJoCo capsule-plane collider.
+#[allow(clippy::too_many_arguments)]
+pub fn capsule_hfield(
+    idx_capsule: usize,
+    capsule_pose: &GeomPose,
+    radius: f32,
+    half_height: f32,
+    idx_hfield: usize,
+    hfield_pose: &GeomPose,
+    hfield: &HeightField,
+    friction: f32,
+    margin: f32,
+    gap: f32,
+) -> ContactBuf {
+    let axis = capsule_pose.rotate(Vec3::Z);
+    let endpoints = [
+        capsule_pose.position + axis * half_height,
+        capsule_pose.position - axis * half_height,
+    ];
+    let mut out = ContactBuf::new();
+    for center in endpoints {
+        hfield_sphere_candidates(
+            center,
+            radius,
+            hfield_pose,
+            hfield,
+            friction,
+            margin,
+            gap,
+            idx_capsule,
+            idx_hfield,
+            &mut out,
+        );
+    }
+    dedup_contacts(&mut out);
+    out
+}
+
+/// Box vs heightfield. Every box vertex is tested against every prism top
+/// triangle. The bounded output keeps the four deepest candidates.
+#[allow(clippy::too_many_arguments)]
+pub fn box_hfield(
+    idx_box: usize,
+    box_pose: &GeomPose,
+    half_extents: Vec3,
+    idx_hfield: usize,
+    hfield_pose: &GeomPose,
+    hfield: &HeightField,
+    friction: f32,
+    margin: f32,
+    gap: f32,
+) -> ContactBuf {
+    let mut out = ContactBuf::new();
+    for i in 0..8 {
+        let local = Vec3::new(
+            if i & 1 == 0 {
+                -half_extents.x
+            } else {
+                half_extents.x
+            },
+            if i & 2 == 0 {
+                -half_extents.y
+            } else {
+                half_extents.y
+            },
+            if i & 4 == 0 {
+                -half_extents.z
+            } else {
+                half_extents.z
+            },
+        );
+        let vertex = box_pose.point_to_world(local);
+        let vertex_local = hfield_pose
+            .orientation
+            .inverse_rotate(vertex - hfield_pose.position);
+        for row in 0..hfield.nrow - 1 {
+            for col in 0..hfield.ncol - 1 {
+                for (a, b, c) in hfield_cell_triangles(hfield, row, col) {
+                    let q = closest_point_on_triangle(vertex_local, a, b, c);
+                    let n = hfield_tri_normal(a, b, c);
+                    let raw_dist = (vertex_local - q).dot(n);
+                    if raw_dist > margin {
+                        continue;
+                    }
+                    let penetration = margin - raw_dist;
+                    let contact_world = hfield_pose.point_to_world(q);
+                    out.push_deepest(Contact {
+                        geom_a: idx_box,
+                        geom_b: idx_hfield,
+                        position_world: contact_world,
+                        normal_world: hfield_pose.rotate(n),
+                        penetration,
+                        friction,
+                        gap,
+                    });
+                }
+            }
+        }
+    }
+    dedup_contacts(&mut out);
+    out
+}
+
 /// Closest point on triangle `(a, b, c)` to point `p`. Standard barycentric
 /// clamping (Ericson, *Real-Time Collision Detection*, §5.1.5).
 pub fn closest_point_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
@@ -1811,6 +2062,20 @@ pub fn narrow_phase(
     pose_b: &GeomPose,
     meshes: &[ConvexMesh],
 ) -> ContactBuf {
+    narrow_phase_with_hfields(idx_a, geom_a, pose_a, idx_b, geom_b, pose_b, meshes, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn narrow_phase_with_hfields(
+    idx_a: usize,
+    geom_a: &Geom,
+    pose_a: &GeomPose,
+    idx_b: usize,
+    geom_b: &Geom,
+    pose_b: &GeomPose,
+    meshes: &[ConvexMesh],
+    hfields: &[HeightField],
+) -> ContactBuf {
     dispatch_narrow_phase(
         idx_a,
         geom_a,
@@ -1819,6 +2084,7 @@ pub fn narrow_phase(
         geom_b,
         pose_b,
         meshes,
+        hfields,
         NarrowPhaseMode::LegacyPenalty,
     )
 }
@@ -1841,6 +2107,20 @@ pub fn narrow_phase_solver(
     pose_b: &GeomPose,
     meshes: &[ConvexMesh],
 ) -> ContactBuf {
+    narrow_phase_solver_with_hfields(idx_a, geom_a, pose_a, idx_b, geom_b, pose_b, meshes, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn narrow_phase_solver_with_hfields(
+    idx_a: usize,
+    geom_a: &Geom,
+    pose_a: &GeomPose,
+    idx_b: usize,
+    geom_b: &Geom,
+    pose_b: &GeomPose,
+    meshes: &[ConvexMesh],
+    hfields: &[HeightField],
+) -> ContactBuf {
     dispatch_narrow_phase(
         idx_a,
         geom_a,
@@ -1849,6 +2129,7 @@ pub fn narrow_phase_solver(
         geom_b,
         pose_b,
         meshes,
+        hfields,
         NarrowPhaseMode::FullManifold,
     )
 }
@@ -1874,6 +2155,7 @@ fn dispatch_narrow_phase(
     geom_b: &Geom,
     pose_b: &GeomPose,
     meshes: &[ConvexMesh],
+    hfields: &[HeightField],
     mode: NarrowPhaseMode,
 ) -> ContactBuf {
     let friction = combine_friction(geom_a.friction, geom_b.friction);
@@ -1893,14 +2175,14 @@ fn dispatch_narrow_phase(
     // debug_assert on the first arm guards against that regression for
     // asymmetric callers.
     let first = try_narrow_phase(
-        idx_a, geom_a, pose_a, idx_b, geom_b, pose_b, friction, margin, gap, meshes, mode,
+        idx_a, geom_a, pose_a, idx_b, geom_b, pose_b, friction, margin, gap, meshes, hfields, mode,
     );
     if let Some(buf) = first {
         debug_assert!(
             std::mem::discriminant(&geom_a.shape) == std::mem::discriminant(&geom_b.shape)
                 || try_narrow_phase(
                     idx_b, geom_b, pose_b, idx_a, geom_a, pose_a, friction, margin, gap, meshes,
-                    mode,
+                    hfields, mode,
                 )
                 .is_none(),
             "narrow_phase invariant violated: an asymmetric shape pair matched a primitive \
@@ -1910,7 +2192,7 @@ fn dispatch_narrow_phase(
         return buf;
     }
     if let Some(mut buf) = try_narrow_phase(
-        idx_b, geom_b, pose_b, idx_a, geom_a, pose_a, friction, margin, gap, meshes, mode,
+        idx_b, geom_b, pose_b, idx_a, geom_a, pose_a, friction, margin, gap, meshes, hfields, mode,
     ) {
         for c in buf.contacts.iter_mut().take(buf.len) {
             std::mem::swap(&mut c.geom_a, &mut c.geom_b);
@@ -1935,6 +2217,7 @@ fn try_narrow_phase(
     margin: f32,
     gap: f32,
     meshes: &[ConvexMesh],
+    hfields: &[HeightField],
     mode: NarrowPhaseMode,
 ) -> Option<ContactBuf> {
     Some(match (geom_a.shape, geom_b.shape) {
@@ -2046,6 +2329,17 @@ fn try_narrow_phase(
             margin,
             gap,
         ),
+        (GeomShape::Sphere { radius: rs }, GeomShape::Hfield { hfield_id }) => sphere_hfield(
+            idx_a,
+            pose_a,
+            rs,
+            idx_b,
+            pose_b,
+            &hfields[hfield_id],
+            friction,
+            margin,
+            gap,
+        ),
         (
             GeomShape::Capsule {
                 radius: ra,
@@ -2073,6 +2367,35 @@ fn try_narrow_phase(
                 idx_a, pose_a, half_a, idx_b, pose_b, half_b, friction, margin, gap,
             ),
         },
+        (
+            GeomShape::Capsule {
+                radius,
+                half_height,
+            },
+            GeomShape::Hfield { hfield_id },
+        ) => capsule_hfield(
+            idx_a,
+            pose_a,
+            radius,
+            half_height,
+            idx_b,
+            pose_b,
+            &hfields[hfield_id],
+            friction,
+            margin,
+            gap,
+        ),
+        (GeomShape::Box { half_extents }, GeomShape::Hfield { hfield_id }) => box_hfield(
+            idx_a,
+            pose_a,
+            half_extents,
+            idx_b,
+            pose_b,
+            &hfields[hfield_id],
+            friction,
+            margin,
+            gap,
+        ),
         // Deferred (see is_pair_supported): box-sphere, box-capsule,
         // cylinder-cylinder, cylinder-{box,capsule,ellipsoid,mesh},
         // ellipsoid-{box,capsule,ellipsoid,mesh},
@@ -2137,6 +2460,89 @@ mod tests {
         };
         let buf = sphere_plane(0, &sphere_pose, 1.0, 1.0, 0.0, 0.0, 1, &plane, &plane_pose);
         assert_eq!(buf.len, 0);
+    }
+
+    fn flat_hfield() -> HeightField {
+        HeightField {
+            nrow: 2,
+            ncol: 2,
+            size: [1.0, 1.0, 1.0, 0.2],
+            data: vec![0.0; 4],
+        }
+    }
+
+    #[test]
+    fn hfield_flat_sphere_matches_plane_anchor() {
+        let field = flat_hfield();
+        let field_pose = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let sphere_pose = GeomPose {
+            position: Vec3::new(0.0, 0.0, 0.4),
+            orientation: Quat::IDENTITY,
+        };
+        let buf = sphere_hfield(0, &sphere_pose, 0.5, 1, &field_pose, &field, 0.5, 0.0, 0.0);
+        assert_eq!(buf.len, 1);
+        assert!(approx(buf.contacts[0].penetration, 0.1, 1e-6));
+        assert!(approx_vec(buf.contacts[0].normal_world, Vec3::Z, 1e-6));
+        assert!(approx_vec(buf.contacts[0].position_world, Vec3::ZERO, 1e-6));
+        assert!(buf.candidate_count >= 2);
+    }
+
+    #[test]
+    fn hfield_ramp_capsule_and_box_have_upward_normals() {
+        let field = HeightField {
+            nrow: 2,
+            ncol: 2,
+            size: [1.0, 1.0, 1.0, 0.2],
+            data: vec![0.0, 0.0, 0.5, 0.5],
+        };
+        let field_pose = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let capsule_pose = GeomPose {
+            position: Vec3::new(0.0, 0.0, 0.35),
+            orientation: Quat::IDENTITY,
+        };
+        let capsule = capsule_hfield(
+            0,
+            &capsule_pose,
+            0.25,
+            0.0,
+            1,
+            &field_pose,
+            &field,
+            0.5,
+            0.0,
+            0.0,
+        );
+        assert!(!capsule.as_slice().is_empty());
+        assert!(capsule.as_slice().iter().all(|c| c.normal_world.z > 0.0));
+
+        let box_pose = GeomPose {
+            position: Vec3::new(0.0, 0.0, 0.25),
+            orientation: Quat::IDENTITY,
+        };
+        let box_contacts = box_hfield(
+            0,
+            &box_pose,
+            Vec3::splat(0.2),
+            1,
+            &field_pose,
+            &field,
+            0.5,
+            0.0,
+            0.0,
+        );
+        assert!(!box_contacts.as_slice().is_empty());
+        assert!(
+            box_contacts
+                .as_slice()
+                .iter()
+                .all(|c| c.normal_world.z > 0.0)
+        );
     }
 
     #[test]

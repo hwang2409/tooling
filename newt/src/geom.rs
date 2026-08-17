@@ -1,13 +1,12 @@
 //! Collision geometry: plane, sphere, box, capsule, cylinder, ellipsoid,
-//! convex mesh.
+//! convex mesh, and MuJoCo-style heightfields.
 //!
 //! # Attachment
 //!
 //! A geom belongs either to a body (`body: Some(index)`) or to the static
-//! world (`body: None`). Only the plane geom is allowed to be static in tier 2
-//! (an infinite half-space is naturally static; dynamic planes are not
-//! meaningful). All other shapes MUST attach to a body — the panic in
-//! [`Geom::sphere`] et al. is a construction-time check.
+//! world (`body: None`). Planes and hfields are naturally static world
+//! surfaces; dynamic planes are not meaningful. Other solid shapes attach to
+//! bodies through their constructors.
 //!
 //! # v1 tier 2 additions (cylinder, ellipsoid, mesh)
 //!
@@ -210,6 +209,64 @@ pub enum GeomShape {
     Mesh {
         mesh_id: usize,
     },
+    /// MuJoCo heightfield, referenced by index into
+    /// [`crate::world::World::hfields`].
+    Hfield {
+        hfield_id: usize,
+    },
+}
+
+/// A MuJoCo heightfield asset.
+///
+/// The grid is stored in row-major order. `size` is
+/// `(half_width_x, half_width_y, top_height, base_depth)`. Elevations are
+/// normalized to `[0, 1]`; the surface height is `elevation * top_height` and
+/// the base extends down to `-base_depth`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeightField {
+    pub nrow: usize,
+    pub ncol: usize,
+    pub size: [f32; 4],
+    pub data: Vec<f32>,
+}
+
+impl HeightField {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.nrow < 2 || self.ncol < 2 {
+            return Err(format!(
+                "heightfield grid must have at least 2 rows and 2 columns, got {}x{}",
+                self.nrow, self.ncol
+            ));
+        }
+        for (i, &v) in self.size.iter().enumerate() {
+            if !v.is_finite() || v <= 0.0 {
+                return Err(format!(
+                    "heightfield size[{i}] must be finite and > 0, got {v}"
+                ));
+            }
+        }
+        let expected = self.nrow.checked_mul(self.ncol).ok_or_else(|| {
+            "heightfield grid dimensions overflow the elevation count".to_string()
+        })?;
+        if self.data.len() != expected {
+            return Err(format!(
+                "heightfield data length must be {expected}, got {}",
+                self.data.len()
+            ));
+        }
+        for (i, &v) in self.data.iter().enumerate() {
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                return Err(format!(
+                    "heightfield data[{i}] must be finite and in [0, 1], got {v}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn height(&self, row: usize, col: usize) -> f32 {
+        self.data[row * self.ncol + col] * self.size[2]
+    }
 }
 
 /// Convex triangular mesh, stored once in [`crate::world::World::meshes`]
@@ -398,6 +455,31 @@ impl Geom {
             body: None,
             link: None,
             local_offset: point,
+            local_orientation: orientation,
+            friction,
+            solref: SolRef::DEFAULT,
+            margin: 0.0,
+            gap: 0.0,
+            condim: 3,
+            torsional_friction: 0.0,
+            rolling_friction: 0.0,
+            solimp: SolImp::DEFAULT,
+        }
+    }
+
+    /// Static heightfield attached to the world. The asset id indexes
+    /// [`crate::world::World::hfields`].
+    pub fn static_hfield(
+        hfield_id: usize,
+        position: Vec3,
+        orientation: Quat,
+        friction: f32,
+    ) -> Self {
+        Self {
+            shape: GeomShape::Hfield { hfield_id },
+            body: None,
+            link: None,
+            local_offset: position,
             local_orientation: orientation,
             friction,
             solref: SolRef::DEFAULT,
@@ -633,6 +715,32 @@ impl Geom {
     ) -> Self {
         Self {
             shape: GeomShape::Mesh { mesh_id },
+            body: Some(body),
+            link: None,
+            local_offset,
+            local_orientation,
+            friction,
+            solref: SolRef::DEFAULT,
+            margin: 0.0,
+            gap: 0.0,
+            condim: 3,
+            torsional_friction: 0.0,
+            rolling_friction: 0.0,
+            solimp: SolImp::DEFAULT,
+        }
+    }
+
+    /// Heightfield attached to a body. Heightfield assets are indexed by
+    /// [`crate::world::World::hfields`].
+    pub fn hfield(
+        body: usize,
+        hfield_id: usize,
+        local_offset: Vec3,
+        local_orientation: Quat,
+        friction: f32,
+    ) -> Self {
+        Self {
+            shape: GeomShape::Hfield { hfield_id },
             body: Some(body),
             link: None,
             local_offset,
@@ -1001,5 +1109,24 @@ mod tests {
             faces: vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
         };
         assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn heightfield_validate_rejects_bad_dimensions_and_data() {
+        let mut h = HeightField {
+            nrow: 1,
+            ncol: 2,
+            size: [1.0, 1.0, 1.0, 0.1],
+            data: vec![0.0, 0.0],
+        };
+        assert!(h.validate().is_err());
+        h.nrow = 2;
+        h.data = vec![0.0; 3];
+        assert!(h.validate().is_err());
+        h.data = vec![0.0, 0.0, 0.0, 1.2];
+        assert!(h.validate().is_err());
+        h.data[3] = 1.0;
+        h.size[0] = -1.0;
+        assert!(h.validate().is_err());
     }
 }
