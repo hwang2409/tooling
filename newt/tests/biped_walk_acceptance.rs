@@ -754,9 +754,12 @@ fn v3_diagnostic_fixture_records_geom_manifolds() {
     let mut first_structural_mismatch = None;
     let mut first_qpos_bound_exceed = None;
     let mut first_qvel_bound_exceed = None;
-    for step in 0..=36 {
-        let expected = &source[step];
-        let actual = &newt.phase_checkpoints[step];
+    for (step, (expected, actual)) in source
+        .iter()
+        .zip(&newt.phase_checkpoints)
+        .take(37)
+        .enumerate()
+    {
         assert_eq!(actual.step, step as u32);
         assert_eq!(actual.qpos.len(), QPOS_COUNT);
         assert_eq!(actual.qvel.len(), QVEL_COUNT);

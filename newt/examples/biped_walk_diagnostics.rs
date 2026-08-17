@@ -83,6 +83,7 @@ fn print_solver_phase(step: usize, scene: &newt::model::Scene, phase: &SolverPha
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_contact_set(
     label: &str,
     step: usize,

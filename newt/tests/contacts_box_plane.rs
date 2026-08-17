@@ -119,7 +119,7 @@ fn fixture_case(name: &str) -> (Vec3, Vec3, Quat, f32, usize, Vec<(Vec3, f32)>) 
         quaternion[3] as f32,
         quaternion[0] as f32,
     );
-    let contacts = match object_value(&case, "contacts") {
+    let contacts: Vec<(Vec3, f32)> = match object_value(&case, "contacts") {
         Value::Array(contacts) => contacts
             .into_iter()
             .map(|contact| {
