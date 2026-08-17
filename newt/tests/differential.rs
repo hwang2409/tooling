@@ -1566,8 +1566,8 @@ fn differential_hfield_steep_box_ccd_disabled_anchor() {
 
 #[test]
 fn differential_hfield_steep_box_ccd_default_anchor() {
-    let d = run_scenario(&scenario("hfield_box_steep_ccd_default"));
     let spec = scenario("hfield_box_steep_ccd_default");
+    let d = run_scenario(&spec);
     assert_hfield_early_window(
         "hfield_box_steep_ccd_default",
         &d,
