@@ -66,48 +66,61 @@ def compare_vector(
         )
 
 
-def contact_position_signature(pose: dict, contacts: list[dict]) -> list[float]:
-    vectors = [
-        [
-            contact["position"][index] - pose["position"][index]
-            for index in range(3)
-        ]
-        for contact in contacts
+def inverse_rotate(quaternion: list[float], vector: list[float]) -> list[float]:
+    """Apply the transpose of a WXYZ unit-quaternion rotation."""
+
+    w, x, y, z = quaternion
+    xx = x * x
+    yy = y * y
+    zz = z * z
+    wx = w * x
+    wy = w * y
+    wz = w * z
+    xy = x * y
+    xz = x * z
+    yz = y * z
+    vx, vy, vz = vector
+    return [
+        (1.0 - 2.0 * (yy + zz)) * vx
+        + 2.0 * (xy - wz) * vy
+        + 2.0 * (xz + wy) * vz,
+        2.0 * (xy + wz) * vx
+        + (1.0 - 2.0 * (xx + zz)) * vy
+        + 2.0 * (yz - wx) * vz,
+        2.0 * (xz - wy) * vx
+        + 2.0 * (yz + wx) * vy
+        + (1.0 - 2.0 * (xx + yy)) * vz,
     ]
-    norms = sorted(sum(component * component for component in vector) for vector in vectors)
-    distances = sorted(
-        sum(
-            (left[index] - right[index]) ** 2
-            for index in range(3)
-        )
-        for left_index, left in enumerate(vectors)
-        for right in vectors[left_index + 1 :]
-    )
-    return norms + distances
 
 
-def contact_normal_signature(pose: dict, contacts: list[dict]) -> list[float]:
-    vectors = [
-        [
-            contact["position"][index] - pose["position"][index]
-            for index in range(3)
-        ]
-        for contact in contacts
+def body_frame_contact(body_pose: dict, contact: dict) -> dict:
+    relative_position = [
+        contact["position"][index] - body_pose["position"][index]
+        for index in range(3)
     ]
-    normals = [contact["frame_normal"] for contact in contacts]
-    position_normal_dots = sorted(
-        sum(vector[index] * normal[index] for index in range(3))
-        for vector, normal in zip(vectors, normals)
+    return {
+        "geom": tuple(contact["geom"]),
+        "position": inverse_rotate(
+            body_pose["orientation_wxyz"], relative_position
+        ),
+        "frame_normal": inverse_rotate(
+            body_pose["orientation_wxyz"], contact["frame_normal"]
+        ),
+        "penetration": float(contact["penetration"]),
+    }
+
+
+def sorted_body_frame_contacts(body_pose: dict, contacts: list[dict]) -> list[dict]:
+    transformed = [body_frame_contact(body_pose, contact) for contact in contacts]
+    return sorted(
+        transformed,
+        key=lambda contact: (
+            tuple(contact["position"]),
+            tuple(contact["frame_normal"]),
+            contact["penetration"],
+            contact["geom"],
+        ),
     )
-    normal_norms = sorted(
-        sum(component * component for component in normal) for normal in normals
-    )
-    normal_dots = sorted(
-        sum(left[index] * right[index] for index in range(3))
-        for left_index, left in enumerate(normals)
-        for right in normals[left_index + 1 :]
-    )
-    return position_normal_dots + normal_norms + normal_dots
 
 
 def compare_dynamic_oracle(
@@ -188,52 +201,52 @@ def compare_route_oracle(
                         f"{path}.{geom}.orientation_wxyz",
                         maxima,
                     )
+            for body in ("body_pose_a", "body_pose_b"):
+                compare_vector(
+                    committed_pose[body]["position"],
+                    fresh_pose[body]["position"],
+                    "position",
+                    f"{path}.{body}.position",
+                    maxima,
+                )
+                compare_vector(
+                    committed_pose[body]["orientation_wxyz"],
+                    fresh_pose[body]["orientation_wxyz"],
+                    "orientation_wxyz",
+                    f"{path}.{body}.orientation_wxyz",
+                    maxima,
+                )
             assert len(committed_pose["contacts"]) == len(fresh_pose["contacts"])
             mesh_pair = "mesh" in committed_probe["pair"]
             if mesh_pair:
-                compare_vector(
-                    contact_position_signature(
-                        committed_pose["body_pose_b"], committed_pose["contacts"]
-                    ),
-                    contact_position_signature(
-                        fresh_pose["body_pose_b"], fresh_pose["contacts"]
-                    ),
-                    "position",
-                    f"{path}.contacts.position_signature",
-                    maxima,
+                committed_contacts = sorted_body_frame_contacts(
+                    committed_pose["body_pose_b"], committed_pose["contacts"]
                 )
-                compare_vector(
-                    contact_normal_signature(
-                        committed_pose["body_pose_b"], committed_pose["contacts"]
-                    ),
-                    contact_normal_signature(
-                        fresh_pose["body_pose_b"], fresh_pose["contacts"]
-                    ),
-                    "frame_normal",
-                    f"{path}.contacts.normal_signature",
-                    maxima,
+                fresh_contacts = sorted_body_frame_contacts(
+                    fresh_pose["body_pose_b"], fresh_pose["contacts"]
                 )
+            else:
+                committed_contacts = committed_pose["contacts"]
+                fresh_contacts = fresh_pose["contacts"]
             for index, (committed_contact, fresh_contact) in enumerate(
-                zip(committed_pose["contacts"], fresh_pose["contacts"])
+                zip(committed_contacts, fresh_contacts)
             ):
                 contact_path = f"{path}.contacts[{index}]"
                 assert committed_contact["geom"] == fresh_contact["geom"], contact_path
-                if not mesh_pair:
-                    compare_vector(
-                        committed_contact["position"],
-                        fresh_contact["position"],
-                        "position",
-                        f"{contact_path}.position",
-                        maxima,
-                    )
-                if not mesh_pair:
-                    compare_vector(
-                        committed_contact["frame_normal"],
-                        fresh_contact["frame_normal"],
-                        "frame_normal",
-                        f"{contact_path}.frame_normal",
-                        maxima,
-                    )
+                compare_vector(
+                    committed_contact["position"],
+                    fresh_contact["position"],
+                    "position",
+                    f"{contact_path}.position",
+                    maxima,
+                )
+                compare_vector(
+                    committed_contact["frame_normal"],
+                    fresh_contact["frame_normal"],
+                    "frame_normal",
+                    f"{contact_path}.frame_normal",
+                    maxima,
+                )
                 difference = abs(
                     float(committed_contact["penetration"])
                     - float(fresh_contact["penetration"])
@@ -286,8 +299,77 @@ def run_ci_regression_self_test() -> None:
     try:
         compare_dynamic_oracle(committed, fresh, {field: 0.0 for field in CI_ORACLE_TOLERANCE})
     except AssertionError:
-        return
-    raise AssertionError("CI oracle comparison accepted a non-max sample mutation")
+        pass
+    else:
+        raise AssertionError("CI oracle comparison accepted a non-max sample mutation")
+
+    fresh_route = {
+        "mujoco": "3.11.0",
+        "capture_provenance": {"script": "test", "method": "test"},
+        "probes": [
+            {
+                "id": "P6",
+                "pair": "mesh-mesh",
+                "mujoco_route": "mjc_Convex",
+                "source_xml": "test.xml",
+                "poses": [
+                    {
+                        "id": "near_touch",
+                        "geom_a": "mesh_a",
+                        "geom_b": "mesh_b",
+                        "pose_a": {
+                            "position": [0.0, 0.0, 0.0],
+                            "orientation_wxyz": [1.0, 0.0, 0.0, 0.0],
+                        },
+                        "pose_b": {
+                            "position": [1.0, 0.0, 0.0],
+                            "orientation_wxyz": [1.0, 0.0, 0.0, 0.0],
+                        },
+                        "body_pose_a": {
+                            "position": [0.0, 0.0, 0.0],
+                            "orientation_wxyz": [1.0, 0.0, 0.0, 0.0],
+                        },
+                        "body_pose_b": {
+                            "position": [0.0, 0.0, 0.0],
+                            "orientation_wxyz": [1.0, 0.0, 0.0, 0.0],
+                        },
+                        "contacts": [
+                            {
+                                "geom": [8, 9],
+                                "position": [
+                                    0.9991666682,
+                                    0.0001666682,
+                                    0.0001666682,
+                                ],
+                                "frame_normal": [
+                                    0.5773502692,
+                                    0.5773502692,
+                                    0.5773502692,
+                                ],
+                                "penetration": 0.0005773399,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    committed_route = json.loads(json.dumps(fresh_route))
+    # Match the review mutation: rotate one mesh contact position and normal
+    # around x while preserving both vectors' norms.
+    contact = committed_route["probes"][0]["poses"][0]["contacts"][0]
+    contact["position"][1] *= -1.0
+    contact["frame_normal"][1] *= -1.0
+    try:
+        compare_route_oracle(
+            committed_route,
+            fresh_route,
+            {field: 0.0 for field in CI_ORACLE_TOLERANCE},
+        )
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("CI oracle comparison accepted a mesh direction mutation")
 
 
 def dynamic_bounds(
