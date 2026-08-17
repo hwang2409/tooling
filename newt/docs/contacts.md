@@ -290,9 +290,11 @@ generated values. CI runs the same tool with `--ci`: it skips cross-platform
 fixture byte identity, compares every committed route contact sample and
 dynamic sample with fresh MuJoCo values, and uses those fresh Linux states for
 the Newt replay check. The reviewed cross-platform capture tolerance is `1e-6`
-for each compared position, orientation, normal, and penetration component;
-the current normalized macOS/Linux capture observed zero drift. Contact counts and sample
-identifiers remain exact. This tolerance is separate from the committed Newt
+for each compared position, orientation, normal, and penetration component.
+The final normalized macOS/Linux capture observed maxima of
+`5.3506e-8 / 1.1241e-15 / 1.3306e-8 / 2.6612e-8` for position, orientation,
+normal, and penetration. Contact counts and sample identifiers remain exact.
+This tolerance is separate from the committed Newt
 parity bounds. Mesh-local route pose orientations are excluded from the CI
 value comparison because MuJoCo's mesh compiler can choose different
 principal-axis frames across platforms. Mesh contact positions are compared in
