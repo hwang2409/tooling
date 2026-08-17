@@ -22,10 +22,10 @@
 //!   *effective*: with the pair's default stiffness, tangential drift at rest
 //!   under a subcritical tangent load is small enough for the incline anchor.
 //!
-//! Contact forces are applied as world-frame wrenches at the contact point
-//! and are recomputed at every RK4 sub-stage — that is the correct RK4 form
-//! for a forced ODE. The tier-1 empty-geom path is preserved bit-for-bit
-//! because every added term is `+ 0` when no contacts exist.
+//! Penalty contact forces are applied as world-frame wrenches at the contact
+//! point and are recomputed at every RK4 sub-stage. PGS and Newton assemble
+//! contacts once at Euler step start; their RK4 constraint forces use
+//! zero-order hold. The tier-1 empty-geom path stays bit-for-bit unchanged.
 //!
 //! # Determinism
 //!
@@ -142,6 +142,8 @@ pub struct World {
     #[doc(hidden)]
     checked_pairs: std::cell::Cell<u64>,
     #[doc(hidden)]
+    contact_detection_count: std::cell::Cell<u64>,
+    #[doc(hidden)]
     solver_phase_capture: bool,
     #[doc(hidden)]
     last_solver_phase: Option<SolverPhaseDiagnostics>,
@@ -244,6 +246,7 @@ impl World {
             sensors: SensorBank::new(),
             keyframes: Vec::new(),
             checked_pairs: std::cell::Cell::new(0),
+            contact_detection_count: std::cell::Cell::new(0),
             solver_phase_capture: false,
             last_solver_phase: None,
         }
@@ -263,6 +266,19 @@ impl World {
         self.last_solver_phase.as_ref()
     }
 
+    /// Return the number of constraint contact detection passes since the last
+    /// reset. This diagnostic seam proves one PGS/Newton step uses one pass.
+    #[doc(hidden)]
+    pub fn contact_detection_count(&self) -> u64 {
+        self.contact_detection_count.get()
+    }
+
+    /// Reset the constraint contact detection counter used by phase tests.
+    #[doc(hidden)]
+    pub fn reset_contact_detection_count(&self) {
+        self.contact_detection_count.set(0);
+    }
+
     /// Capture the current state through the same solver assembly used at the
     /// start of [`World::step`], without integrating. This supports an initial
     /// step-zero diagnostic record.
@@ -276,8 +292,9 @@ impl World {
             None => self.auto_pairs(),
         };
         let state = self.solver_phase_state();
-        let solution = self.solver_phase_solution(&pairs);
-        self.record_solver_phase(state, solution.as_ref(), &pairs);
+        let contacts = self.detect_contacts_for_step(&pairs);
+        let solution = self.solver_phase_solution(&contacts);
+        self.record_solver_phase(state, solution.as_ref(), &contacts);
     }
 
     /// Add a sensor to the world's sensor bank. Validates the sensor's
@@ -742,17 +759,10 @@ impl World {
 
     /// Advance the whole world by one fixed-dt step.
     ///
-    /// Contact forces are recomputed at each RK4 sub-stage from the
-    /// interpolated body states. This is the standard RK4 treatment for a
-    /// forced ODE (Butcher, *Numerical Methods for ODEs*, §3.1) and is
-    /// stable for the stiffness range v0 targets (`SolRef::DEFAULT` gives
-    /// a contact period ≈ 125 ms; `dt = 5 ms` is 25 samples per period).
-    /// Very stiff underdamped contacts still show some parasitic damping
-    /// (the intermediate stages sample deeper penetrations than the true
-    /// continuous solution reaches); the bouncing anchor picks parameters
-    /// that keep the effective restitution comfortably above zero. With no
-    /// geoms, this collapses to tier-1 gravity-only RK4 bit-for-bit, and
-    /// the golden `tumbling_3_body.bin` still passes.
+    /// Constraint modes follow MuJoCo's Euler phase order: position
+    /// kinematics, one collision pass, constraint assembly, solve, then
+    /// integration. Penalty mode keeps its live per-stage RK4 collision
+    /// callback. `detect_contacts` remains an explicit current-state query.
     pub fn step(&mut self) {
         self.solver
             .validate()
@@ -765,30 +775,42 @@ impl World {
             Some(p) => p.clone(),
             None => self.auto_pairs(),
         };
+        let contacts = matches!(self.solver.mode, SolverMode::Pgs | SolverMode::Newton)
+            .then(|| self.detect_contacts_for_step(&pairs));
         let solver_phase_state = self.solver_phase_capture.then(|| self.solver_phase_state());
-        let tree_contact_solution = self.solver_phase_solution(&pairs);
+        let tree_contact_solution = contacts
+            .as_deref()
+            .and_then(|contacts| self.solver_phase_solution(contacts));
         if let Some(state) = solver_phase_state {
-            self.record_solver_phase(state, tree_contact_solution.as_ref(), &pairs);
+            let phase_contacts = contacts.as_deref().map_or_else(
+                || self.detect_contacts_for_step(&pairs),
+                |contacts| contacts.to_vec(),
+            );
+            self.record_solver_phase(state, tree_contact_solution.as_ref(), &phase_contacts);
         }
         match self.integrator {
             Integrator::Rk4 => {
-                self.step_bodies(&pairs, tree_contact_solution.as_ref());
+                self.step_bodies(&pairs, contacts.as_deref(), tree_contact_solution.as_ref());
                 self.step_trees(&pairs, tree_contact_solution.as_ref());
             }
             Integrator::Euler => {
                 self.step_trees_euler(&pairs, false, tree_contact_solution.as_ref());
-                self.step_bodies_euler(&pairs, tree_contact_solution.as_ref());
+                self.step_bodies_euler(&pairs, contacts.as_deref(), tree_contact_solution.as_ref());
             }
             Integrator::ImplicitFast => {
                 self.step_trees_euler(&pairs, true, tree_contact_solution.as_ref());
-                self.step_bodies_euler(&pairs, tree_contact_solution.as_ref());
+                self.step_bodies_euler(&pairs, contacts.as_deref(), tree_contact_solution.as_ref());
             }
         }
         // Sensor evaluation runs strictly on post-step state — no
         // perturbation. Skipped when no sensors are declared so every
         // pre-v1-tier-6 golden path is bit-for-bit untouched.
         if !self.sensors.sensors.is_empty() {
-            self.evaluate_sensors(&pairs);
+            if let Some(contacts) = contacts.as_deref() {
+                self.evaluate_sensors_with_contacts(contacts);
+            } else {
+                self.evaluate_sensors(&pairs);
+            }
         }
     }
 
@@ -799,6 +821,11 @@ impl World {
     /// wanting a snapshot before the first integration) can force an
     /// evaluation.
     pub fn evaluate_sensors(&mut self, pairs: &[(usize, usize)]) {
+        let contacts = self.detect_contacts_for_step(pairs);
+        self.evaluate_sensors_with_contacts(&contacts);
+    }
+
+    fn evaluate_sensors_with_contacts(&mut self, contacts: &[Contact]) {
         // Take the sensor bank out temporarily so `build_sensor_inputs`
         // can borrow the rest of `self` immutably without conflicting
         // with the &mut we need for the writeback. A scope guard restores
@@ -818,7 +845,7 @@ impl World {
             world: self,
             bank: bank_taken,
         };
-        let inputs = guard.world.build_sensor_inputs(pairs);
+        let inputs = guard.world.build_sensor_inputs(contacts);
         crate::sensor::evaluate(&mut guard.bank, &inputs);
         // Guard's Drop restores the bank into `self.sensors`.
     }
@@ -827,39 +854,24 @@ impl World {
     /// solver-mode-appropriate wrench source (penalty vs PGS) so an
     /// accelerometer or touch reading sees the SAME contact forces the
     /// integrator did.
-    fn build_sensor_inputs<'a>(&'a self, pairs: &'a [(usize, usize)]) -> SensorInputs<'a> {
-        // Detect the full contact set from the same pipeline `step` uses.
-        // Split into free-body-only and per-tree lists so we can reuse the
-        // solver/penalty machinery downstream unchanged.
-        let mut free_pairs: Vec<(usize, usize)> = Vec::new();
-        for &(a, b) in pairs {
-            let att_a = self.geoms[a].attachment();
-            let att_b = self.geoms[b].attachment();
-            if !matches!(att_a, GeomAttach::Link(_, _)) && !matches!(att_b, GeomAttach::Link(_, _))
-            {
-                free_pairs.push((a, b));
-            }
-        }
-        // Match the narrow-phase manifold to the solver mode so sensor
-        // readings (touch, contact forces) see the same contact set the
-        // wrench pathway used this step.
-        let manifold = match self.solver.mode {
-            SolverMode::Pgs | SolverMode::Newton => ContactManifold::Full,
-            SolverMode::Penalty => ContactManifold::Legacy,
-        };
-        let free_body_contacts = collect_contacts(
-            &self.bodies,
-            &self.geoms,
-            &self.meshes,
-            &free_pairs,
-            manifold,
-        );
+    fn build_sensor_inputs<'a>(&'a self, contacts: &'a [Contact]) -> SensorInputs<'a> {
+        // Reuse the exact start-of-step contact set. Sensors must not trigger
+        // a second collision pass or observe a different manifold.
+        let free_body_contacts: Vec<Contact> = contacts
+            .iter()
+            .copied()
+            .filter(|contact| {
+                let att_a = self.geoms[contact.geom_a].attachment();
+                let att_b = self.geoms[contact.geom_b].attachment();
+                !matches!(att_a, GeomAttach::Link(_, _)) && !matches!(att_b, GeomAttach::Link(_, _))
+            })
+            .collect();
 
         // Body wrenches + per-contact normal forces (touch sensor input).
         let (mut body_wrenches, free_body_contact_forces): (Vec<(Vec3, Vec3)>, Vec<f32>) =
             match self.solver.mode {
                 SolverMode::Penalty => {
-                    let w = self.compute_wrenches(&self.bodies, pairs);
+                    let w = self.compute_wrenches(&self.bodies, contacts);
                     let f: Vec<f32> = free_body_contacts
                         .iter()
                         .map(|c| penalty_normal_force(c, &self.bodies, &self.trees, &self.geoms))
@@ -891,19 +903,19 @@ impl World {
         // Keep one original-indexed tree contact list. The solver solution
         // uses this exact order, so touch sensors cannot drift when a gap
         // contact is omitted from the compact row system.
-        let tree_contacts: Vec<Contact> =
-            collect_contacts_full(&self.bodies, &self.trees, &self.geoms, &self.meshes, pairs)
-                .into_iter()
-                .filter(|contact| {
-                    matches!(
-                        self.geoms[contact.geom_a].attachment(),
-                        GeomAttach::Link(_, _)
-                    ) || matches!(
-                        self.geoms[contact.geom_b].attachment(),
-                        GeomAttach::Link(_, _)
-                    )
-                })
-                .collect();
+        let tree_contacts: Vec<Contact> = contacts
+            .iter()
+            .copied()
+            .filter(|contact| {
+                matches!(
+                    self.geoms[contact.geom_a].attachment(),
+                    GeomAttach::Link(_, _)
+                ) || matches!(
+                    self.geoms[contact.geom_b].attachment(),
+                    GeomAttach::Link(_, _)
+                )
+            })
+            .collect();
         let tree_contact_solution = match self.solver.mode {
             SolverMode::Penalty => None,
             SolverMode::Pgs => Some(self.solve_tree_contact_sensor_solution(&tree_contacts, false)),
@@ -920,24 +932,12 @@ impl World {
             } else {
                 let mut wrenches = Vec::with_capacity(self.trees.len());
                 for (ti, tree) in self.trees.iter().enumerate() {
-                    let tree_pairs: Vec<(usize, usize)> = pairs
-                        .iter()
-                        .copied()
-                        .filter(|&(a, b)| {
-                            matches!(self.geoms[a].attachment(), GeomAttach::Link(t, _) if t == ti)
-                                || matches!(
-                                    self.geoms[b].attachment(),
-                                    GeomAttach::Link(t, _) if t == ti
-                                )
-                        })
-                        .collect();
                     wrenches.push(tree_wrenches_from_contacts(
                         tree,
                         ti,
                         &self.bodies,
                         &self.geoms,
-                        &self.meshes,
-                        &tree_pairs,
+                        contacts,
                     ));
                 }
                 let forces = tree_contacts
@@ -982,43 +982,45 @@ impl World {
     fn step_bodies(
         &mut self,
         pairs: &[(usize, usize)],
+        contacts: Option<&[Contact]>,
         tree_contact_solution: Option<&TreeContactSolution>,
     ) {
         let s0 = self.bodies.clone();
 
         // Solver mode dispatch:
-        // - `Penalty` recomputes contact wrenches at each RK4 sub-stage
-        //   (the tier-2 path, unchanged).
+        // - `Penalty` re-detects contacts at each RK4 sub-stage.
         // - `Pgs` solves the constraint system ONCE at s0 and holds those
         //   per-body wrenches constant (zero-order hold) across all four
         //   sub-stages. See newt/docs/solver.md, "Once-per-step under RK4",
         //   for the rationale + tradeoffs.
         let solver_zoh: Option<Vec<(Vec3, Vec3)>> = match self.solver.mode {
             SolverMode::Penalty => None,
-            SolverMode::Pgs | SolverMode::Newton => {
-                Some(self.compute_solver_wrenches(&s0, pairs, tree_contact_solution))
-            }
+            SolverMode::Pgs | SolverMode::Newton => Some(self.compute_solver_wrenches(
+                &s0,
+                contacts.expect("constraint contacts captured before body step"),
+                tree_contact_solution,
+            )),
         };
-        let sample_wrenches = |state: &[Body], pairs: &[(usize, usize)]| -> Vec<(Vec3, Vec3)> {
+        let sample_wrenches = |state: &[Body]| -> Vec<(Vec3, Vec3)> {
             match &solver_zoh {
                 Some(w) => w.clone(),
-                None => self.compute_wrenches(state, pairs),
+                None => self.compute_penalty_wrenches(state, pairs),
             }
         };
 
-        let ext1 = sample_wrenches(&s0, pairs);
+        let ext1 = sample_wrenches(&s0);
         let k1 = evaluate_all(&s0, self.gravity, &ext1);
 
         let s1 = advance_all(&s0, &k1, self.dt * 0.5);
-        let ext2 = sample_wrenches(&s1, pairs);
+        let ext2 = sample_wrenches(&s1);
         let k2 = evaluate_all(&s1, self.gravity, &ext2);
 
         let s2 = advance_all(&s0, &k2, self.dt * 0.5);
-        let ext3 = sample_wrenches(&s2, pairs);
+        let ext3 = sample_wrenches(&s2);
         let k3 = evaluate_all(&s2, self.gravity, &ext3);
 
         let s3 = advance_all(&s0, &k3, self.dt);
-        let ext4 = sample_wrenches(&s3, pairs);
+        let ext4 = sample_wrenches(&s3);
         let k4 = evaluate_all(&s3, self.gravity, &ext4);
 
         for i in 0..self.bodies.len() {
@@ -1059,13 +1061,16 @@ impl World {
     fn step_bodies_euler(
         &mut self,
         pairs: &[(usize, usize)],
+        contacts: Option<&[Contact]>,
         tree_contact_solution: Option<&TreeContactSolution>,
     ) {
         let ext = match self.solver.mode {
-            SolverMode::Penalty => self.compute_wrenches(&self.bodies, pairs),
-            SolverMode::Pgs | SolverMode::Newton => {
-                self.compute_solver_wrenches(&self.bodies, pairs, tree_contact_solution)
-            }
+            SolverMode::Penalty => self.compute_penalty_wrenches(&self.bodies, pairs),
+            SolverMode::Pgs | SolverMode::Newton => self.compute_solver_wrenches(
+                &self.bodies,
+                contacts.expect("constraint contacts captured before body step"),
+                tree_contact_solution,
+            ),
         };
         let accel = evaluate_all(&self.bodies, self.gravity, &ext);
         let dt = self.dt;
@@ -1103,16 +1108,16 @@ impl World {
         let solver_mode = self.solver.mode;
         let solver_iterations = self.solver.iterations;
         for ti in 0..n_trees {
-            // Filter pairs to those touching this tree (immutable borrow
-            // of self.geoms, released before the mem::take below).
             let mut tree_pairs: Vec<(usize, usize)> = Vec::new();
-            for &(a, b) in pairs {
-                let att_a = self.geoms[a].attachment();
-                let att_b = self.geoms[b].attachment();
-                let a_ours = matches!(att_a, GeomAttach::Link(t, _) if t == ti);
-                let b_ours = matches!(att_b, GeomAttach::Link(t, _) if t == ti);
-                if a_ours || b_ours {
-                    tree_pairs.push((a, b));
+            if matches!(solver_mode, SolverMode::Penalty) {
+                for &(a, b) in pairs {
+                    let att_a = self.geoms[a].attachment();
+                    let att_b = self.geoms[b].attachment();
+                    if matches!(att_a, GeomAttach::Link(t, _) if t == ti)
+                        || matches!(att_b, GeomAttach::Link(t, _) if t == ti)
+                    {
+                        tree_pairs.push((a, b));
+                    }
                 }
             }
             // Move the current tree out so the closure below can borrow
@@ -1167,17 +1172,16 @@ impl World {
                 // ends before we mutate self.trees[ti] on the next line.
                 let bodies_ref = &self.bodies;
                 let geoms_ref = &self.geoms;
-                let meshes_ref = &self.meshes;
                 tree_rk4_step(&mut tree, gravity, dt, |t| {
                     if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
                         vec![(Vec3::ZERO, Vec3::ZERO); t.links.len()]
                     } else {
-                        tree_wrenches_from_contacts(
+                        tree_wrenches_from_pairs(
                             t,
                             ti,
                             bodies_ref,
                             geoms_ref,
-                            meshes_ref,
+                            &self.meshes,
                             &tree_pairs,
                         )
                     }
@@ -1213,16 +1217,17 @@ impl World {
         let solver_iterations = self.solver.iterations;
         for ti in 0..self.trees.len() {
             let mut tree_pairs = Vec::new();
-            for &(a, b) in pairs {
-                let att_a = self.geoms[a].attachment();
-                let att_b = self.geoms[b].attachment();
-                if matches!(att_a, GeomAttach::Link(t, _) if t == ti)
-                    || matches!(att_b, GeomAttach::Link(t, _) if t == ti)
-                {
-                    tree_pairs.push((a, b));
+            if matches!(solver_mode, SolverMode::Penalty) {
+                for &(a, b) in pairs {
+                    let att_a = self.geoms[a].attachment();
+                    let att_b = self.geoms[b].attachment();
+                    if matches!(att_a, GeomAttach::Link(t, _) if t == ti)
+                        || matches!(att_b, GeomAttach::Link(t, _) if t == ti)
+                    {
+                        tree_pairs.push((a, b));
+                    }
                 }
             }
-
             let mut tree = std::mem::take(&mut self.trees[ti]);
             let prior_disable = tree.disable_penalty_limits;
             let mut solver_qfrc_delta = Vec::new();
@@ -1257,17 +1262,16 @@ impl World {
             {
                 let bodies_ref = &self.bodies;
                 let geoms_ref = &self.geoms;
-                let meshes_ref = &self.meshes;
                 tree_euler_step(&mut tree, gravity, dt, implicit_fast, |state| {
                     if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
                         vec![(Vec3::ZERO, Vec3::ZERO); state.links.len()]
                     } else {
-                        tree_wrenches_from_contacts(
+                        tree_wrenches_from_pairs(
                             state,
                             ti,
                             bodies_ref,
                             geoms_ref,
-                            meshes_ref,
+                            &self.meshes,
                             &tree_pairs,
                         )
                     }
@@ -1282,13 +1286,38 @@ impl World {
     }
 
     /// Public: detect all contacts against the current body/tree state.
-    /// Useful for tests that need to inspect contact geometry.
+    /// Useful for tests that need to inspect current contact geometry.
     pub fn detect_contacts(&self) -> Vec<Contact> {
         let pairs = match &self.pair_list {
             Some(p) => p.clone(),
             None => self.auto_pairs(),
         };
-        collect_contacts_full(&self.bodies, &self.trees, &self.geoms, &self.meshes, &pairs)
+        self.detect_contacts_with_manifold(&pairs, ContactManifold::Legacy)
+    }
+
+    fn detect_contacts_for_step(&self, pairs: &[(usize, usize)]) -> Vec<Contact> {
+        let manifold = match self.solver.mode {
+            SolverMode::Penalty => ContactManifold::Legacy,
+            SolverMode::Pgs | SolverMode::Newton => ContactManifold::Solver,
+        };
+        self.detect_contacts_with_manifold(pairs, manifold)
+    }
+
+    fn detect_contacts_with_manifold(
+        &self,
+        pairs: &[(usize, usize)],
+        manifold: ContactManifold,
+    ) -> Vec<Contact> {
+        self.contact_detection_count
+            .set(self.contact_detection_count.get() + 1);
+        collect_contacts_full(
+            &self.bodies,
+            &self.trees,
+            &self.geoms,
+            &self.meshes,
+            pairs,
+            manifold,
+        )
     }
 
     /// Compute per-body external wrench arrays for solver mode.
@@ -1300,34 +1329,27 @@ impl World {
     fn compute_solver_wrenches(
         &self,
         state: &[Body],
-        pairs: &[(usize, usize)],
+        contacts: &[Contact],
         tree_contact_solution: Option<&TreeContactSolution>,
     ) -> Vec<(Vec3, Vec3)> {
         // Filter pairs to free-body-only ones (both sides Body or
         // Static). `solve_free_bodies` returns per-body zero wrenches
         // when there are no contacts AND no free-body equalities, so
         // the outer fast path is redundant.
-        let mut free_pairs: Vec<(usize, usize)> = Vec::with_capacity(pairs.len());
-        for &(a, b) in pairs {
-            let att_a = self.geoms[a].attachment();
-            let att_b = self.geoms[b].attachment();
-            if matches!(att_a, GeomAttach::Link(_, _)) || matches!(att_b, GeomAttach::Link(_, _)) {
-                continue;
-            }
-            free_pairs.push((a, b));
-        }
-        let contacts = collect_contacts(
-            state,
-            &self.geoms,
-            &self.meshes,
-            &free_pairs,
-            ContactManifold::Full,
-        );
+        let free_contacts: Vec<Contact> = contacts
+            .iter()
+            .copied()
+            .filter(|contact| {
+                let att_a = self.geoms[contact.geom_a].attachment();
+                let att_b = self.geoms[contact.geom_b].attachment();
+                !matches!(att_a, GeomAttach::Link(_, _)) && !matches!(att_b, GeomAttach::Link(_, _))
+            })
+            .collect();
         let mut wrenches = match self.solver.mode {
             SolverMode::Pgs => solve_free_bodies(
                 state,
                 &self.geoms,
-                &contacts,
+                &free_contacts,
                 &self.equalities,
                 self.gravity,
                 self.dt,
@@ -1337,7 +1359,7 @@ impl World {
             SolverMode::Newton => crate::solver::solve_free_bodies_newton(
                 state,
                 &self.geoms,
-                &contacts,
+                &free_contacts,
                 &self.equalities,
                 self.gravity,
                 self.dt,
@@ -1363,13 +1385,12 @@ impl World {
     /// readings can index the result without a compact-row offset.
     fn compute_tree_contact_solution(
         &self,
-        pairs: &[(usize, usize)],
+        contacts: &[Contact],
         use_newton: bool,
     ) -> Option<TreeContactSolution> {
-        let contacts =
-            collect_contacts_full(&self.bodies, &self.trees, &self.geoms, &self.meshes, pairs);
         let tree_contacts: Vec<Contact> = contacts
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|contact| {
                 matches!(
                     self.geoms[contact.geom_a].attachment(),
@@ -1383,11 +1404,11 @@ impl World {
         Some(self.solve_tree_contact_sensor_solution(&tree_contacts, use_newton))
     }
 
-    fn solver_phase_solution(&self, pairs: &[(usize, usize)]) -> Option<TreeContactSolution> {
+    fn solver_phase_solution(&self, contacts: &[Contact]) -> Option<TreeContactSolution> {
         match self.solver.mode {
             SolverMode::Penalty => None,
-            SolverMode::Pgs => self.compute_tree_contact_solution(pairs, false),
-            SolverMode::Newton => self.compute_tree_contact_solution(pairs, true),
+            SolverMode::Pgs => self.compute_tree_contact_solution(contacts, false),
+            SolverMode::Newton => self.compute_tree_contact_solution(contacts, true),
         }
     }
 
@@ -1409,7 +1430,7 @@ impl World {
         &mut self,
         state: (Vec<f32>, Vec<f32>),
         solution: Option<&TreeContactSolution>,
-        pairs: &[(usize, usize)],
+        contacts: &[Contact],
     ) {
         let (contacts, row_to_contact, row_diagnostics, tree_qfrc) = match solution {
             Some(solution) => (
@@ -1419,24 +1440,19 @@ impl World {
                 solution.tree_qfrc.clone(),
             ),
             None => {
-                let contacts: Vec<Contact> = collect_contacts_full(
-                    &self.bodies,
-                    &self.trees,
-                    &self.geoms,
-                    &self.meshes,
-                    pairs,
-                )
-                .into_iter()
-                .filter(|contact| {
-                    matches!(
-                        self.geoms[contact.geom_a].attachment(),
-                        GeomAttach::Link(_, _)
-                    ) || matches!(
-                        self.geoms[contact.geom_b].attachment(),
-                        GeomAttach::Link(_, _)
-                    )
-                })
-                .collect();
+                let contacts: Vec<Contact> = contacts
+                    .iter()
+                    .copied()
+                    .filter(|contact| {
+                        matches!(
+                            self.geoms[contact.geom_a].attachment(),
+                            GeomAttach::Link(_, _)
+                        ) || matches!(
+                            self.geoms[contact.geom_b].attachment(),
+                            GeomAttach::Link(_, _)
+                        )
+                    })
+                    .collect();
                 (
                     contacts,
                     Vec::new(),
@@ -1484,12 +1500,11 @@ impl World {
     /// Returns `(force_world, torque_world_about_com)` for each body. Zero for
     /// bodies with no active contacts and (crucially) all-zero when
     /// `self.geoms` is empty, which preserves the tier-1 golden.
-    fn compute_wrenches(&self, state: &[Body], pairs: &[(usize, usize)]) -> Vec<(Vec3, Vec3)> {
-        let n = state.len();
-        let mut out = vec![(Vec3::ZERO, Vec3::ZERO); n];
-        if self.geoms.is_empty() {
-            return out;
-        }
+    fn compute_penalty_wrenches(
+        &self,
+        state: &[Body],
+        pairs: &[(usize, usize)],
+    ) -> Vec<(Vec3, Vec3)> {
         let contacts = collect_contacts(
             state,
             &self.geoms,
@@ -1497,14 +1512,72 @@ impl World {
             pairs,
             ContactManifold::Legacy,
         );
-        for c in &contacts {
-            apply_contact_wrench(&mut out, state, &self.geoms, c);
+        let mut out = vec![(Vec3::ZERO, Vec3::ZERO); state.len()];
+        for contact in &contacts {
+            apply_contact_wrench(&mut out, state, &self.geoms, contact);
         }
-        self.apply_mocap_wrenches(&mut out, state, pairs);
+        self.apply_mocap_wrenches_from_pairs(&mut out, state, pairs);
         out
     }
 
-    fn apply_mocap_wrenches(
+    fn compute_wrenches(&self, state: &[Body], contacts: &[Contact]) -> Vec<(Vec3, Vec3)> {
+        let n = state.len();
+        let mut out = vec![(Vec3::ZERO, Vec3::ZERO); n];
+        if self.geoms.is_empty() {
+            return out;
+        }
+        for c in contacts {
+            let att_a = self.geoms[c.geom_a].attachment();
+            let att_b = self.geoms[c.geom_b].attachment();
+            if matches!(att_a, GeomAttach::Link(_, _)) || matches!(att_b, GeomAttach::Link(_, _)) {
+                continue;
+            }
+            apply_contact_wrench(&mut out, state, &self.geoms, c);
+        }
+        self.apply_mocap_wrenches_from_contacts(&mut out, state, contacts);
+        out
+    }
+
+    fn apply_mocap_wrenches_from_contacts(
+        &self,
+        out: &mut [(Vec3, Vec3)],
+        bodies: &[Body],
+        contacts: &[Contact],
+    ) {
+        if !self
+            .trees
+            .iter()
+            .any(|tree| tree.links.first().is_some_and(|link| link.mocap))
+        {
+            return;
+        }
+        let poses: Vec<Vec<(Vec3, Quat)>> =
+            self.trees.iter().map(tree_forward_kinematics).collect();
+        for contact in contacts.iter().copied() {
+            let a = self.geoms[contact.geom_a].attachment();
+            let b = self.geoms[contact.geom_b].attachment();
+            let (body_idx, mocap_tree) = match (a, b) {
+                (GeomAttach::Body(body), GeomAttach::Link(tree, _)) => (body, tree),
+                (GeomAttach::Link(tree, _), GeomAttach::Body(body)) => (body, tree),
+                _ => continue,
+            };
+            if !self.trees[mocap_tree].links[0].mocap {
+                continue;
+            }
+            apply_one_mocap_wrench(MocapWrenchInput {
+                out,
+                bodies,
+                tree: &self.trees[mocap_tree],
+                tree_idx: mocap_tree,
+                link_poses: &poses[mocap_tree],
+                geoms: &self.geoms,
+                contact: &contact,
+                body_idx,
+            });
+        }
+    }
+
+    fn apply_mocap_wrenches_from_pairs(
         &self,
         out: &mut [(Vec3, Vec3)],
         bodies: &[Body],
@@ -1517,7 +1590,14 @@ impl World {
         {
             return;
         }
-        let contacts = collect_contacts_full(bodies, &self.trees, &self.geoms, &self.meshes, pairs);
+        let contacts = collect_contacts_full(
+            bodies,
+            &self.trees,
+            &self.geoms,
+            &self.meshes,
+            pairs,
+            ContactManifold::Legacy,
+        );
         let poses: Vec<Vec<(Vec3, Quat)>> =
             self.trees.iter().map(tree_forward_kinematics).collect();
         for contact in contacts {
@@ -1550,16 +1630,14 @@ impl World {
 // ---------------------------------------------------------------------------
 
 /// Which narrow-phase dispatch to use when enumerating contacts. Penalty
-/// keeps the legacy vertex-vs-face primary for box-box pairs;
-/// [`ContactManifold::Full`] routes box-box through SAT face-clipping so
-/// tilted face-face stacks see the 4-corner manifold instead of the
-/// 2-diagonal degenerate one (see NEWT-14 evidence in
-/// `docs/differential.md`). Plane colliders use the shared source-parity
-/// primitive rules in both paths.
+/// keeps the legacy vertex-vs-face primary for box-box pairs. The solver
+/// dispatch uses the solver manifold for every constraint row. Plane
+/// colliders use the shared source-parity primitive rules in both paths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContactManifold {
     Legacy,
-    Full,
+    /// Use the full solver manifold for free-body and tree constraint rows.
+    Solver,
 }
 
 fn collect_contacts(
@@ -1570,14 +1648,10 @@ fn collect_contacts(
     manifold: ContactManifold,
 ) -> Vec<Contact> {
     let mut out = Vec::new();
-    // Pre-compute world poses for every geom in stable index order.
     let poses: Vec<GeomPose> = geoms
         .iter()
         .map(|g| match g.attachment() {
             GeomAttach::Body(i) => geom_world_pose(g, state[i].position, state[i].orientation),
-            // Link-attached geoms cannot participate in the body-only path;
-            // return a static-style pose (unused because `apply_contact_wrench`
-            // ignores link geoms).
             GeomAttach::Link(_, _) | GeomAttach::Static => {
                 geom_world_pose(g, Vec3::ZERO, Quat::IDENTITY)
             }
@@ -1585,8 +1659,6 @@ fn collect_contacts(
         .collect();
 
     for &(a, b) in pairs {
-        // Skip pairs where either side is a tree link — those are handled
-        // in `step_trees`. Body-only path stays bit-identical to tier 2.
         let att_a = geoms[a].attachment();
         let att_b = geoms[b].attachment();
         if matches!(att_a, GeomAttach::Link(_, _)) || matches!(att_b, GeomAttach::Link(_, _)) {
@@ -1596,13 +1668,11 @@ fn collect_contacts(
             ContactManifold::Legacy => {
                 narrow_phase(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes)
             }
-            ContactManifold::Full => {
+            ContactManifold::Solver => {
                 narrow_phase_solver(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes)
             }
         };
-        for c in buf.as_slice() {
-            out.push(*c);
-        }
+        out.extend_from_slice(buf.as_slice());
     }
     out
 }
@@ -1615,6 +1685,7 @@ fn collect_contacts_full(
     geoms: &[Geom],
     meshes: &[ConvexMesh],
     pairs: &[(usize, usize)],
+    manifold: ContactManifold,
 ) -> Vec<Contact> {
     let mut out = Vec::new();
     // Cache each tree's link poses so we don't redo forward kinematics per
@@ -1634,7 +1705,14 @@ fn collect_contacts_full(
         .collect();
 
     for &(a, b) in pairs {
-        let buf = narrow_phase(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes);
+        let buf = match manifold {
+            ContactManifold::Legacy => {
+                narrow_phase(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes)
+            }
+            ContactManifold::Solver => {
+                narrow_phase_solver(a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes)
+            }
+        };
         for c in buf.as_slice() {
             out.push(*c);
         }
@@ -1653,6 +1731,39 @@ fn tree_wrenches_from_contacts(
     tree_idx: usize,
     bodies: &[Body],
     geoms: &[Geom],
+    contacts: &[Contact],
+) -> Vec<(Vec3, Vec3)> {
+    let mut out = vec![(Vec3::ZERO, Vec3::ZERO); tree.links.len()];
+    if contacts.is_empty() {
+        return out;
+    }
+    let link_poses = tree_forward_kinematics(tree);
+    for contact in contacts {
+        let a = geoms[contact.geom_a].attachment();
+        let b = geoms[contact.geom_b].attachment();
+        if !matches!(a, GeomAttach::Link(t, _) if t == tree_idx)
+            && !matches!(b, GeomAttach::Link(t, _) if t == tree_idx)
+        {
+            continue;
+        }
+        apply_tree_contact_wrench(
+            &mut out,
+            tree,
+            tree_idx,
+            &link_poses,
+            bodies,
+            geoms,
+            contact,
+        );
+    }
+    out
+}
+
+fn tree_wrenches_from_pairs(
+    tree: &Tree,
+    tree_idx: usize,
+    bodies: &[Body],
+    geoms: &[Geom],
     meshes: &[ConvexMesh],
     pairs: &[(usize, usize)],
 ) -> Vec<(Vec3, Vec3)> {
@@ -1663,7 +1774,6 @@ fn tree_wrenches_from_contacts(
     }
     // Forward kinematics for this tree (sub-stage state).
     let link_poses = tree_forward_kinematics(tree);
-    // Geom world poses restricted to geoms mentioned in `pairs`.
     let pose_of = |g: &Geom| -> GeomPose {
         match g.attachment() {
             GeomAttach::Static => geom_world_pose(g, Vec3::ZERO, Quat::IDENTITY),
@@ -1673,11 +1783,8 @@ fn tree_wrenches_from_contacts(
                     let (p, o) = link_poses[l];
                     geom_world_pose(g, p, o)
                 } else {
-                    // Other-tree pose from its stored state (step-start).
-                    // v0 does not support cross-tree contacts anyway; return
-                    // a static-style pose so a narrow-phase call is well-
-                    // defined but likely produces no penetration in the
-                    // demos we care about.
+                    // Other-tree pose from its stored state. v0 does not
+                    // support cross-tree contacts.
                     geom_world_pose(g, Vec3::ZERO, Quat::IDENTITY)
                 }
             }
@@ -1689,8 +1796,16 @@ fn tree_wrenches_from_contacts(
         let pose_a = pose_of(ga);
         let pose_b = pose_of(gb);
         let buf = narrow_phase(a, ga, &pose_a, b, gb, &pose_b, meshes);
-        for c in buf.as_slice() {
-            apply_tree_contact_wrench(&mut out, tree, tree_idx, &link_poses, bodies, geoms, c);
+        for contact in buf.as_slice() {
+            apply_tree_contact_wrench(
+                &mut out,
+                tree,
+                tree_idx,
+                &link_poses,
+                bodies,
+                geoms,
+                contact,
+            );
         }
     }
     out
@@ -2281,6 +2396,62 @@ mod tests {
         // t = 0.5 s. Expected z = ½ * (-10) * 0.25 = -1.25.
         let z = w.bodies[0].position.z;
         assert!((z - (-1.25)).abs() < 1e-3, "free-fall z {z}");
+    }
+
+    #[test]
+    fn contact_begins_at_step_start_and_detection_runs_once() {
+        for mode in [SolverMode::Pgs, SolverMode::Newton] {
+            let mut world = World::new();
+            world.integrator = Integrator::Euler;
+            world.solver.mode = mode;
+            world.gravity = Vec3::new(0.0, 0.0, -9.81);
+            world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.0));
+
+            let mut tree = Tree::new();
+            tree.push_link(crate::tree::Link::new(
+                None,
+                JointKind::Free,
+                (Vec3::new(0.0, 0.0, 0.502), Quat::IDENTITY),
+                (Vec3::ZERO, Quat::IDENTITY),
+                1.0,
+                crate::math::Mat3::diag(0.1, 0.1, 0.1),
+            ));
+            tree.qdot[5] = -0.4;
+            let tree_index = world.add_tree(tree);
+            let sphere = world.add_geom(Geom::sphere_on_link(tree_index, 0, 0.5, Vec3::ZERO, 0.0));
+            world
+                .add_sensor(crate::sensor::Sensor {
+                    name: "touch".into(),
+                    kind: crate::sensor::SensorKind::Touch { geom: sphere },
+                })
+                .unwrap();
+            world.set_solver_phase_capture(true);
+
+            world.capture_solver_phase();
+            assert!(
+                world
+                    .solver_phase_diagnostics()
+                    .unwrap()
+                    .contacts
+                    .is_empty()
+            );
+            world.reset_contact_detection_count();
+
+            // The first step starts above the plane. The next step starts after
+            // the contact begins, so its solver phase must contain the contact.
+            world.step();
+            assert_eq!(world.contact_detection_count(), 1);
+            assert!(
+                world
+                    .solver_phase_diagnostics()
+                    .unwrap()
+                    .contacts
+                    .is_empty()
+            );
+            world.step();
+            assert_eq!(world.contact_detection_count(), 2);
+            assert_eq!(world.solver_phase_diagnostics().unwrap().contacts.len(), 1);
+        }
     }
 
     #[test]

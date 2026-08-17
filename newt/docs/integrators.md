@@ -10,6 +10,19 @@ trajectory.
 | `Euler` | start of step | forward kinematics, collision, and PGS/Newton rows once at the current state | `qvel += dt*qacc`; integrate `qpos` from new `qvel` |
 | `ImplicitFast` | start of step | same one-solve pipeline as Euler | same velocity-first update, with joint and joint-actuator velocity terms folded into the solve |
 
+## contact phase mapping
+
+MuJoCo's Euler path runs forward position kinematics, collision detection,
+constraint assembly, the solver, and integration once per step. Newt's PGS and
+Newton paths use the contact set detected from the current positions at step
+start for that same sequence. Sensors reuse that set for the solver step.
+
+MuJoCo's RK4 path reruns the full pipeline, including collision detection, at
+each RK4 stage. Newt's penalty path keeps its live per-stage contact callback,
+which approximates that behavior. Newt's RK4 PGS and Newton paths keep their
+constraint solution at zero-order hold through the four stages. That is a
+known integration residual, separate from Euler contact phase parity.
+
 ## euler pipeline
 
 For `Euler`, one world step runs in this order:

@@ -7,8 +7,13 @@ mod biped_walk_support;
 
 use biped_walk_support::{GaitConfig, run_walk_with_solver_phase_observed};
 use newt::contact::Contact;
+use newt::geom::{GeomShape, geom_world_pose};
 use newt::json::{self, Value};
+use newt::math::Vec3;
+use newt::mjcf::load_mjcf_path;
+use newt::model::Scene;
 use newt::solver::SolverMode;
+use newt::tree::forward_kinematics;
 use newt::world::{Integrator, SolverPhaseDiagnostics};
 use std::fs;
 use std::path::Path;
@@ -20,6 +25,53 @@ const FALL_ROOT_COM_HEIGHT: f32 = 0.45 + 0.023298969;
 const COM_OFFSET_Z: f64 = 0.023298969;
 const EARLY_QPOS_GAP_BOUND: f64 = 0.08;
 const EARLY_QVEL_GAP_BOUND: f64 = 1.5;
+const STATE_INJECTION_POSITION_BOUND: f64 = 5e-4;
+const STATE_INJECTION_DEPTH_BOUND: f64 = 5e-6;
+const ONSET_DISTANCE_BOUND: f64 = 5e-6;
+const ONSET_DISTANCE_EXPECTED: [[f64; 4]; 7] = [
+    [
+        8.841191232e-2,
+        1.800464094e-2,
+        8.410302550e-2,
+        1.503205299e-2,
+    ],
+    [
+        8.388717473e-2,
+        1.479785144e-2,
+        7.941696793e-2,
+        1.162473857e-2,
+    ],
+    [
+        7.917407900e-2,
+        1.135447621e-2,
+        7.451750338e-2,
+        7.997453213e-3,
+    ],
+    [
+        7.424698025e-2,
+        7.689714432e-3,
+        6.942452490e-2,
+        4.150241613e-3,
+    ],
+    [
+        6.912415475e-2,
+        3.801345825e-3,
+        6.412933767e-2,
+        8.890032768e-5,
+    ],
+    [
+        6.379736960e-2,
+        -3.035515547e-4,
+        5.864073336e-2,
+        -4.183933139e-3,
+    ],
+    [
+        5.829266459e-2,
+        -2.890467644e-3,
+        5.298534036e-2,
+        -6.020486355e-3,
+    ],
+];
 
 #[derive(Debug)]
 struct OracleFixture {
@@ -209,6 +261,80 @@ fn extract_solver_phase_qpos_qvel(phase: &SolverPhaseDiagnostics) -> BipedState 
     qvel.extend_from_slice(&phase.qvel[0..3]);
     qvel.extend_from_slice(&phase.qvel[6..]);
     (qpos, qvel)
+}
+
+fn inject_biped_qpos(scene: &mut Scene, qpos: &[f64]) {
+    assert_eq!(qpos.len(), QPOS_COUNT);
+    let tree = &mut scene.world.trees[0];
+    tree.q[..3]
+        .iter_mut()
+        .zip(&qpos[..3])
+        .for_each(|(target, source)| *target = *source as f32);
+    tree.q[2] += COM_OFFSET_Z as f32;
+    tree.q[3] = qpos[4] as f32;
+    tree.q[4] = qpos[5] as f32;
+    tree.q[5] = qpos[6] as f32;
+    tree.q[6] = qpos[3] as f32;
+    tree.q[7..]
+        .iter_mut()
+        .zip(&qpos[7..])
+        .for_each(|(target, source)| *target = *source as f32);
+    tree.qdot.fill(0.0);
+}
+
+fn newt_contacts_at_injected_qpos(qpos: &[f64]) -> Vec<PhaseContact> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut scene =
+        load_mjcf_path(root.join("models/biped-walk.xml")).expect("biped-walk MJCF must load");
+    scene.world.integrator = Integrator::Euler;
+    scene.world.solver.mode = SolverMode::Newton;
+    scene.world.solver.cone = newt::solver::ConeKind::Pyramidal;
+    scene.world.set_solver_phase_capture(true);
+    inject_biped_qpos(&mut scene, qpos);
+    scene.world.step();
+    let phase = scene
+        .world
+        .solver_phase_diagnostics()
+        .expect("solver phase capture enabled")
+        .clone();
+    phase
+        .contacts
+        .iter()
+        .enumerate()
+        .map(|(contact_index, contact)| {
+            phase_contact_from_newt(&scene, contact_index, contact, &phase.row_to_contact)
+        })
+        .collect()
+}
+
+fn biped_foot_min_signed_distance(scene: &mut Scene, qpos: &[f64], foot: &str) -> f64 {
+    inject_biped_qpos(scene, qpos);
+    let geom_index = scene.geoms_by_name[foot];
+    let geom = scene.world.geoms[geom_index];
+    let (tree_index, link_index) = geom.link.expect("biped foot geom is link-attached");
+    let (link_position, link_orientation) =
+        forward_kinematics(&scene.world.trees[tree_index])[link_index];
+    let pose = geom_world_pose(&geom, link_position, link_orientation);
+    let half_extents = match geom.shape {
+        GeomShape::Box { half_extents } => half_extents,
+        shape => panic!("expected box foot geom, got {shape:?}"),
+    };
+    let mut minimum = f32::INFINITY;
+    for sx in [-1.0, 1.0] {
+        for sy in [-1.0, 1.0] {
+            for sz in [-1.0, 1.0] {
+                minimum = minimum.min(
+                    pose.point_to_world(Vec3::new(
+                        sx * half_extents.x,
+                        sy * half_extents.y,
+                        sz * half_extents.z,
+                    ))
+                    .z,
+                );
+            }
+        }
+    }
+    f64::from(minimum)
 }
 
 fn phase_contact_from_newt(
@@ -432,7 +558,7 @@ fn run_newt(assist_scale: f32, steps: usize) -> NewtRun {
         SolverMode::Newton,
         |step, scene| {
             phase_checkpoints.push(phase_checkpoint_from_newt(step, scene));
-            if step > 0 {
+            if (1..steps).contains(&step) {
                 let visual_contact_mask = visual_contact_mask(scene);
                 let (qpos, qvel) = extract_biped_qpos_qvel(scene);
                 checkpoints.push(Checkpoint {
@@ -442,19 +568,39 @@ fn run_newt(assist_scale: f32, steps: usize) -> NewtRun {
                     qvel: qvel.into_iter().map(f64::from).collect(),
                 });
             }
-            if step > 0
-                && first_fall_step.is_none()
-                && scene.world.trees[0].q[2] < FALL_ROOT_COM_HEIGHT
-            {
-                first_fall_step = Some(step as u32);
-            }
         },
     );
+    let final_step = steps;
+    checkpoints.push(checkpoint_from_trace(final_step, &result.trace));
+    for (step, state) in result.trace.chunks_exact(33).enumerate() {
+        if state[2] < FALL_ROOT_COM_HEIGHT {
+            first_fall_step = Some((step + 1) as u32);
+            break;
+        }
+    }
     NewtRun {
         result,
         first_fall_step,
         checkpoints,
         phase_checkpoints,
+    }
+}
+
+fn checkpoint_from_trace(step: usize, trace: &[f32]) -> Checkpoint {
+    assert!(step > 0);
+    let state = &trace[(step - 1) * 33..step * 33];
+    let mut qpos = state[..3].to_vec();
+    qpos[2] -= COM_OFFSET_Z as f32;
+    qpos.extend([state[6], state[3], state[4], state[5]]);
+    qpos.extend_from_slice(&state[7..17]);
+    let mut qvel = state[20..23].to_vec();
+    qvel.extend_from_slice(&state[17..20]);
+    qvel.extend_from_slice(&state[23..]);
+    Checkpoint {
+        step: step as u32,
+        visual_contact_mask: 0,
+        qpos: qpos.into_iter().map(f64::from).collect(),
+        qvel: qvel.into_iter().map(f64::from).collect(),
     }
 }
 
@@ -771,11 +917,12 @@ fn v3_diagnostic_fixture_records_geom_manifolds() {
     assert_eq!(step25.contacts[0].row_indices, vec![0, 1, 2, 3]);
 
     let structural_mismatches = compare_phase_fixtures("mujoco/newt", &source, &recorded_newt, 36);
-    // The source contact arrives one solver step before newt. This one-step
-    // latency window is the full measured mismatch set through step 36.
+    // The phase labels are now aligned to the contact set consumed by each
+    // Euler/Newton step. The fresh comparison still measures two structural
+    // mismatches, so keep the complete measured window visible.
     assert_eq!(
         structural_mismatches,
-        vec![25],
+        vec![25, 35],
         "solver-phase mismatch window changed; update the fixture and diagnosis"
     );
 
@@ -811,6 +958,106 @@ fn v3_diagnostic_fixture_records_geom_manifolds() {
     println!(
         "solver_phase_first_bound_exceed qpos={first_qpos_bound_exceed:?} qvel={first_qvel_bound_exceed:?} structural={structural_mismatches:?}"
     );
+}
+
+#[test]
+fn state_injected_contact_detection_matches_mujoco_onsets() {
+    let source = solver_phase_fixture();
+    for step in [25, 35] {
+        let expected = &source[step].contacts;
+        let actual = newt_contacts_at_injected_qpos(&source[step].qpos);
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "injected step {step} contact count"
+        );
+        for (expected, actual) in expected.iter().zip(&actual) {
+            assert_eq!(
+                actual.geom_pair, expected.geom_pair,
+                "injected step {step} pair"
+            );
+            assert_eq!(
+                actual.row_indices, expected.row_indices,
+                "injected step {step} rows"
+            );
+            let position_gap = max_gap(&actual.position, &expected.position);
+            let depth_gap = (actual.dist - expected.dist).abs();
+            println!(
+                "state_injection step={step} pair={:?} position_gap={position_gap:.9e} depth_gap={depth_gap:.9e}",
+                actual.geom_pair
+            );
+            assert!(
+                position_gap <= STATE_INJECTION_POSITION_BOUND,
+                "injected step {step} position expected={:?} actual={:?}",
+                expected.position,
+                actual.position
+            );
+            assert!(
+                depth_gap <= STATE_INJECTION_DEPTH_BOUND,
+                "injected step {step} depth expected={} actual={}",
+                expected.dist,
+                actual.dist
+            );
+        }
+        println!(
+            "state_injection step={step} contacts={} pairs={:?}",
+            actual.len(),
+            actual
+                .iter()
+                .map(|contact| contact.geom_pair.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn biped_contact_onset_distances_are_measured() {
+    let source = solver_phase_fixture();
+    let recorded_newt = newt_solver_phase_fixture();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut source_scene =
+        load_mjcf_path(root.join("models/biped-walk.xml")).expect("biped-walk MJCF must load");
+    let mut newt_scene =
+        load_mjcf_path(root.join("models/biped-walk.xml")).expect("biped-walk MJCF must load");
+    for step in 20..=26 {
+        let source_left =
+            biped_foot_min_signed_distance(&mut source_scene, &source[step].qpos, "left_foot_geom");
+        let source_right = biped_foot_min_signed_distance(
+            &mut source_scene,
+            &source[step].qpos,
+            "right_foot_geom",
+        );
+        let newt_left = biped_foot_min_signed_distance(
+            &mut newt_scene,
+            &recorded_newt[step].qpos,
+            "left_foot_geom",
+        );
+        let newt_right = biped_foot_min_signed_distance(
+            &mut newt_scene,
+            &recorded_newt[step].qpos,
+            "right_foot_geom",
+        );
+        println!(
+            "onset_distance step={step} source_left={source_left:.9e} source_right={source_right:.9e} newt_left={newt_left:.9e} newt_right={newt_right:.9e}"
+        );
+        let [
+            expected_source_left,
+            expected_source_right,
+            expected_newt_left,
+            expected_newt_right,
+        ] = ONSET_DISTANCE_EXPECTED[step - 20];
+        for (name, actual, expected) in [
+            ("source_left", source_left, expected_source_left),
+            ("source_right", source_right, expected_source_right),
+            ("newt_left", newt_left, expected_newt_left),
+            ("newt_right", newt_right, expected_newt_right),
+        ] {
+            assert!(
+                (actual - expected).abs() <= ONSET_DISTANCE_BOUND,
+                "step {step} {name} distance {actual:.9e} outside expected {expected:.9e} +/- {ONSET_DISTANCE_BOUND:.1e}"
+            );
+        }
+    }
 }
 
 fn assert_phase_fixture_shape(checkpoints: &[PhaseCheckpoint], expected_len: usize) {

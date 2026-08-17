@@ -5,8 +5,8 @@
 //! impulse after the original contact-index mapping.
 
 use newt::body::Body;
-use newt::contact::Contact;
-use newt::geom::Geom;
+use newt::contact::{Contact, narrow_phase, narrow_phase_solver};
+use newt::geom::{Geom, geom_world_pose};
 use newt::joint::JointKind;
 use newt::math::{Mat3, Quat, Vec3};
 use newt::sensor::{Sensor, SensorKind};
@@ -102,6 +102,46 @@ fn asymmetric_tree_world_with_iterations(mode: SolverMode, iterations: u32) -> W
     world
 }
 
+fn tilted_tree_box_box_world(mode: SolverMode) -> World {
+    let mut world = World::new();
+    world.dt = 0.005;
+    world.gravity = Vec3::ZERO;
+    world.solver = SolverConfig {
+        mode,
+        iterations: 40,
+        cone: ConeKind::Pyramidal,
+    };
+
+    let half = Vec3::splat(0.5);
+    let mut tree = free_sphere_tree(1.48);
+    let tree_orientation = Quat::from_axis_angle(Vec3::X, 0.005);
+    tree.q[3..7].copy_from_slice(&[
+        tree_orientation.x,
+        tree_orientation.y,
+        tree_orientation.z,
+        tree_orientation.w,
+    ]);
+    let tree_index = world.add_tree(tree);
+    world.add_geom(Geom::box_on_link(
+        tree_index,
+        0,
+        half,
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        0.0,
+    ));
+
+    let body = world.add_body(Body::solid_box(
+        1.0,
+        half,
+        Vec3::new(0.0, 0.0, 0.5),
+        Quat::from_axis_angle(Vec3::X, 0.01),
+    ));
+    world.add_geom(Geom::r#box(body, half, Vec3::ZERO, Quat::IDENTITY, 0.0));
+    world.set_solver_phase_capture(true);
+    world
+}
+
 #[test]
 fn tree_contact_cross_solver_iteration_probe() {
     let mut pgs = asymmetric_tree_world_with_iterations(SolverMode::Pgs, 400);
@@ -119,6 +159,51 @@ fn tree_contact_cross_solver_iteration_probe() {
         }
     }
     println!("tree contact pgs(400)/newton(40) max q={max_q:.6e} qdot={max_qdot:.6e}");
+}
+
+#[test]
+fn tilted_tree_box_box_onset_uses_solver_manifold_for_tree_rows() {
+    let probe_world = tilted_tree_box_box_world(SolverMode::Pgs);
+    let tree_geom = &probe_world.geoms[0];
+    let body_geom = &probe_world.geoms[1];
+    let tree_pose = geom_world_pose(
+        tree_geom,
+        Vec3::new(0.0, 0.0, 1.48),
+        Quat::from_axis_angle(Vec3::X, 0.005),
+    );
+    let body_pose = geom_world_pose(
+        body_geom,
+        Vec3::new(0.0, 0.0, 0.5),
+        Quat::from_axis_angle(Vec3::X, 0.01),
+    );
+    assert_eq!(
+        narrow_phase(0, tree_geom, &tree_pose, 1, body_geom, &body_pose, &[]).len,
+        4,
+        "legacy tree manifold mutant baseline"
+    );
+    assert_eq!(
+        narrow_phase_solver(0, tree_geom, &tree_pose, 1, body_geom, &body_pose, &[]).len,
+        1,
+        "tilted box-box solver manifold"
+    );
+    for mode in [SolverMode::Pgs, SolverMode::Newton] {
+        let mut world = tilted_tree_box_box_world(mode);
+        world.step();
+        let phase = world.solver_phase_diagnostics().unwrap();
+        assert_eq!(phase.contacts.len(), 1, "{mode:?} solver contact count");
+        assert_eq!(phase.row_to_contact.len(), 4, "{mode:?} solver row count");
+        let contact = phase.contacts[0];
+        assert!((contact.position_world.x - 0.5).abs() < 1.0e-5);
+        assert!((contact.position_world.y - 0.4949751).abs() < 1.0e-5);
+        assert!((contact.position_world.z - 1.004975).abs() < 1.0e-5);
+        assert!((contact.penetration - 0.02250594).abs() < 2.0e-5);
+        assert!(phase.tree_qfrc[0][5] > 1.0, "{mode:?} normal response");
+        assert!(world.trees[0].qdot[5] > 0.01, "{mode:?} tree response");
+        assert!(
+            world.bodies[0].linear_velocity.z < 0.0,
+            "{mode:?} body response"
+        );
+    }
 }
 
 #[test]
