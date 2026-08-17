@@ -1548,6 +1548,23 @@ fn differential_hfield_quasi_static_rows() {
 }
 
 #[test]
+fn differential_hfield_steep_box_ccd_disabled_anchor() {
+    let d = run_scenario(&scenario("hfield_box_steep_ccd_disabled"));
+    println!(
+        "differential[hfield_box_steep_ccd_disabled] measured qpos={:.6e} qvel={:.6e}",
+        d.qpos_max, d.qvel_max
+    );
+    assert_within_bounds(
+        "hfield_box_steep_ccd_disabled",
+        &d,
+        Tolerance {
+            qpos: 7.0e-3,
+            qvel: 1.5e-1,
+        },
+    );
+}
+
+#[test]
 fn differential_matched_euler_rows() {
     for name in ["ballistic", "double_pendulum", "sphere_drop", "box_stack"] {
         let d = run_scenario_with(&scenario(name), Some(Integrator::Euler), "_euler");

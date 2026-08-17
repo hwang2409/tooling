@@ -803,14 +803,41 @@ impl Loader {
                 }
             }
         }
-        if let Some(child) = e.child_elements().next() {
-            return fail(
-                path,
-                format!(
-                    "<option> child <{}> (option flags) not supported in the v1 subset",
-                    child.name
-                ),
-            );
+        for child in e.child_elements() {
+            if child.name != "flag" {
+                return fail(
+                    path,
+                    format!(
+                        "<option> child <{}> is not supported in the v1 subset",
+                        child.name
+                    ),
+                );
+            }
+            for (k, v) in &child.attrs {
+                match k.as_str() {
+                    // MuJoCo's legacy convex hfield path is selected by this
+                    // flag. Newt always uses that path, so the declaration is
+                    // accepted as an explicit parity-mode marker.
+                    "nativeccd" if v == "disable" => {}
+                    "nativeccd" => {
+                        return fail(
+                            path,
+                            format!(
+                                "<flag nativeccd=\"{v}\"> is unsupported; use nativeccd=\"disable\""
+                            ),
+                        );
+                    }
+                    other => {
+                        return fail(
+                            path,
+                            format!("<flag> attribute \"{other}\" is not supported"),
+                        );
+                    }
+                }
+            }
+            if child.child_elements().next().is_some() {
+                return fail(path, "<flag> cannot contain child elements");
+            }
         }
         if let Err(message) = self.world.solver.validate() {
             return fail(path, message);

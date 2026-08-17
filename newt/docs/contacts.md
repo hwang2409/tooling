@@ -186,6 +186,23 @@ separating axes, including box-edge features. Candidates use row, column,
 diagonal, and feature order. The existing per-pair cap retains the deepest
 four candidates.
 
+#### box hfield declared mode
+
+Box-hfield conformance uses MuJoCo's legacy convex hfield path, selected by
+the exact XML declaration
+`<option><flag nativeccd="disable"/></option>`. Newt matches MuJoCo's
+contact count and minimum-penetration depths in this mode. Probe 6 uses SAT
+support-feature positions, while MuJoCo uses per-prism MPR positions; the
+fixture records the measured construction tolerance of `0.8` per contact.
+The probe-6 diagnostic maps MuJoCo and newt contacts to the same cell `(0, 0)`
+and prisms `1` then `0`, so the position difference is a construction
+difference, not a cell-selection difference. The steep-field 100-step
+flag-disabled anchor bounds its dynamic effect at `7.0e-3` qpos and `1.5e-1`
+qvel.
+
+This declaration does not claim parity with MuJoCo's default native-CCD
+pipeline. That alignment remains an open finding.
+
 Hfield collision supports sphere, capsule, and box only. Mesh, cylinder, and
 ellipsoid pairs are deferred and rejected by active-pair validation. Hfield
 contacts enter the same in-step solver pass and penalty-stage callback as

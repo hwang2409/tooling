@@ -2179,110 +2179,18 @@ pub fn box_hfield(
     gap: f32,
 ) -> ContactBuf {
     let mut out = ContactBuf::new();
-    let mut lowest_z = f32::INFINITY;
-    for i in 0..8 {
-        let local = Vec3::new(
-            if i & 1 == 0 {
-                -half_extents.x
-            } else {
-                half_extents.x
-            },
-            if i & 2 == 0 {
-                -half_extents.y
-            } else {
-                half_extents.y
-            },
-            if i & 4 == 0 {
-                -half_extents.z
-            } else {
-                half_extents.z
-            },
-        );
-        let vertex_local = hfield_pose
+    let hfield_inverse = hfield_pose.orientation.conjugate();
+    let box_pose_local = GeomPose {
+        position: hfield_pose
             .orientation
-            .inverse_rotate(box_pose.point_to_world(local) - hfield_pose.position);
-        if vertex_local.z < lowest_z {
-            lowest_z = vertex_local.z;
-        }
-    }
-    let allow_base_contacts = lowest_z <= -hfield.size[3] + 1.0e-6;
-    if allow_base_contacts {
-        box_base_feature_contacts(
-            box_pose,
-            half_extents,
-            hfield_pose,
-            hfield,
-            idx_box,
-            idx_hfield,
-            friction,
-            margin,
-            gap,
-            &mut out,
-        );
-        return out;
-    }
-    let box_z_axis = box_pose.rotate(Vec3::Z);
-    let use_convex_feature_path = box_z_axis.x.abs() > 0.2 || box_z_axis.y.abs() > 0.2;
-    if !use_convex_feature_path {
-        for i in 0..8 {
-            let local = Vec3::new(
-                if i & 1 == 0 {
-                    -half_extents.x
-                } else {
-                    half_extents.x
-                },
-                if i & 2 == 0 {
-                    -half_extents.y
-                } else {
-                    half_extents.y
-                },
-                if i & 4 == 0 {
-                    -half_extents.z
-                } else {
-                    half_extents.z
-                },
-            );
-            let vertex_local = hfield_pose
-                .orientation
-                .inverse_rotate(box_pose.point_to_world(local) - hfield_pose.position);
-            for row in 0..hfield.nrow - 1 {
-                for col in 0..hfield.ncol - 1 {
-                    for prism in hfield_prisms(hfield, row, col) {
-                        let surface = hfield_point_surface_masked(
-                            vertex_local,
-                            &prism,
-                            &[true, false, true, true, true, true, true, true],
-                        );
-                        if !surface.inside && surface.distance > margin {
-                            continue;
-                        }
-                        let raw_dist = if surface.inside {
-                            -surface.distance
-                        } else {
-                            surface.distance
-                        };
-                        let penetration = margin - raw_dist;
-                        out.push_deepest_unique(Contact {
-                            geom_a: idx_box,
-                            geom_b: idx_hfield,
-                            position_world: hfield_pose
-                                .point_to_world((vertex_local + surface.point) * 0.5),
-                            normal_world: hfield_pose.rotate(surface.normal),
-                            penetration,
-                            friction,
-                            gap,
-                        });
-                    }
-                }
-            }
-        }
-        return out;
-    }
+            .inverse_rotate(box_pose.position - hfield_pose.position),
+        orientation: hfield_inverse * box_pose.orientation,
+    };
     for row in 0..hfield.nrow - 1 {
         for col in 0..hfield.ncol - 1 {
             for prism in hfield_prisms(hfield, row, col) {
-                if let Some(contact) = box_prism_sat_contact(
-                    box_pose,
+                if let Some(mut contact) = box_prism_sat_feature_contact(
+                    &box_pose_local,
                     half_extents,
                     &prism,
                     idx_box,
@@ -2291,9 +2199,9 @@ pub fn box_hfield(
                     margin,
                     gap,
                 ) {
-                    if contact.normal_world.z >= -1.0e-6 {
-                        out.push_deepest_unique(contact);
-                    }
+                    contact.position_world = hfield_pose.point_to_world(contact.position_world);
+                    contact.normal_world = hfield_pose.rotate(contact.normal_world);
+                    out.push_deepest_unique(contact);
                 }
             }
         }
@@ -2301,125 +2209,11 @@ pub fn box_hfield(
     out
 }
 
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
-/// Add edge-edge candidates for a convex box crossing a prism. Vertex tests
-/// miss this feature when two long edges cross inside a steep top triangle.
-/// The fixed edge list keeps the query allocation-free and deterministic.
-fn box_prism_edge_contacts(
-    box_pose: &GeomPose,
-    half_extents: Vec3,
-    prism: &HfieldPrism,
-    idx_box: usize,
-    idx_hfield: usize,
-    friction: f32,
-    margin: f32,
-    gap: f32,
-    out: &mut ContactBuf,
-) {
-    let mut box_vertices = [Vec3::ZERO; 8];
-    for (i, vertex) in box_vertices.iter_mut().enumerate() {
-        let local = Vec3::new(
-            if i & 1 == 0 {
-                -half_extents.x
-            } else {
-                half_extents.x
-            },
-            if i & 2 == 0 {
-                -half_extents.y
-            } else {
-                half_extents.y
-            },
-            if i & 4 == 0 {
-                -half_extents.z
-            } else {
-                half_extents.z
-            },
-        );
-        *vertex = box_pose.point_to_world(local);
-    }
-    let box_edges = [
-        (0, 1),
-        (2, 3),
-        (4, 5),
-        (6, 7),
-        (0, 2),
-        (1, 3),
-        (4, 6),
-        (5, 7),
-        (0, 4),
-        (1, 5),
-        (2, 6),
-        (3, 7),
-    ];
-    let top = prism.top;
-    let prism_edges = [(top.0, top.1), (top.1, top.2), (top.2, top.0)];
-    let prism_center = (top.0 + top.1 + top.2) / 3.0;
-    let box_center = box_pose.position;
-    for &(a_idx, b_idx) in &box_edges {
-        let a0 = box_vertices[a_idx];
-        let a1 = box_vertices[b_idx];
-        for &(b0, b1) in &prism_edges {
-            let edge_a = a1 - a0;
-            let edge_b = b1 - b0;
-            let cross = edge_a.cross(edge_b);
-            let cross_len2 = cross.length_squared();
-            if cross_len2 <= 1.0e-10 {
-                continue;
-            }
-            let (pa, pb) = closest_points_on_segments(a0, a1, b0, b1);
-            let separation = pa - pb;
-            let mut normal = if separation.length_squared() > 1.0e-10 {
-                separation.normalize()
-            } else {
-                cross / cross_len2.sqrt()
-            };
-            if (box_center - prism_center).dot(normal) < 0.0 {
-                normal = -normal;
-            }
-            let box_radius = half_extents.x
-                * crate::math::abs(normal.dot(box_pose.rotate(Vec3::X)))
-                + half_extents.y * crate::math::abs(normal.dot(box_pose.rotate(Vec3::Y)))
-                + half_extents.z * crate::math::abs(normal.dot(box_pose.rotate(Vec3::Z)));
-            let mut prism_min = f32::INFINITY;
-            let mut prism_max = f32::NEG_INFINITY;
-            for &vertex in &[
-                top.0,
-                top.1,
-                top.2,
-                Vec3::new(top.0.x, top.0.y, prism.base_z),
-                Vec3::new(top.1.x, top.1.y, prism.base_z),
-                Vec3::new(top.2.x, top.2.y, prism.base_z),
-            ] {
-                let projection = vertex.dot(normal);
-                prism_min = prism_min.min(projection);
-                prism_max = prism_max.max(projection);
-            }
-            let box_projection = box_center.dot(normal);
-            let box_min = box_projection - box_radius;
-            let box_max = box_projection + box_radius;
-            let overlap = (box_max - prism_min).min(prism_max - box_min);
-            let penetration = margin + overlap;
-            if penetration <= 0.0 || normal.z < -1.0e-6 {
-                continue;
-            }
-            out.push_deepest_unique(Contact {
-                geom_a: idx_box,
-                geom_b: idx_hfield,
-                position_world: (pa + pb) * 0.5,
-                normal_world: normal,
-                penetration,
-                friction,
-                gap,
-            });
-        }
-    }
-}
-
 /// Emit the two base-face manifold features when the box crosses the prism
 /// base. The base is a convex face, so four corner probes are not a valid
 /// manifold. Use the two opposing box-face support lines instead.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn box_base_feature_contacts(
     box_pose: &GeomPose,
     half_extents: Vec3,
@@ -2478,11 +2272,294 @@ fn box_base_feature_contacts(
     }
 }
 
-/// Convex box versus one triangular prism using separating axes. The axes
-/// cover box faces, prism faces, and every box-edge/prism-edge cross pair.
-/// This catches edge and face contacts that no box vertex enters.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct MprVertex {
+    minkowski: Vec3,
+    prism: Vec3,
+    box_point: Vec3,
+}
+
+#[allow(dead_code)]
+fn mpr_support(prism: &[Vec3; 6], box_vertices: &[Vec3; 8], direction: Vec3) -> MprVertex {
+    let mut prism_point = prism[0];
+    let mut prism_dot = prism_point.dot(direction);
+    for &point in prism.iter().skip(1) {
+        let dot = point.dot(direction);
+        if dot > prism_dot {
+            prism_point = point;
+            prism_dot = dot;
+        }
+    }
+    let opposite = -direction;
+    let mut box_point = box_vertices[0];
+    let mut box_dot = box_point.dot(opposite);
+    for &point in box_vertices.iter().skip(1) {
+        let dot = point.dot(opposite);
+        if dot > box_dot {
+            box_point = point;
+            box_dot = dot;
+        }
+    }
+    MprVertex {
+        minkowski: prism_point - box_point,
+        prism: prism_point,
+        box_point,
+    }
+}
+
+#[allow(dead_code)]
+fn mpr_direction(a: Vec3, b: Vec3, c: Vec3) -> Option<Vec3> {
+    let direction = (b - a).cross(c - a);
+    if direction.length_squared() <= 1.0e-14 {
+        None
+    } else {
+        Some(direction.normalize())
+    }
+}
+
+/// Box versus one triangular prism using the same support-feature query as
+/// MuJoCo's convex hfield path. The portal keeps witness points on both
+/// shapes, so edge and face contacts do not depend on box vertex sampling.
 #[allow(clippy::too_many_arguments)]
-fn box_prism_sat_contact(
+#[allow(dead_code)]
+#[allow(clippy::question_mark)]
+fn box_prism_mpr_contact(
+    box_pose: &GeomPose,
+    half_extents: Vec3,
+    prism: &HfieldPrism,
+    idx_box: usize,
+    idx_hfield: usize,
+    friction: f32,
+    margin: f32,
+    gap: f32,
+) -> Option<Contact> {
+    let top = prism.top;
+    let prism_vertices = [
+        top.0,
+        top.1,
+        top.2,
+        Vec3::new(top.0.x, top.0.y, prism.base_z),
+        Vec3::new(top.1.x, top.1.y, prism.base_z),
+        Vec3::new(top.2.x, top.2.y, prism.base_z),
+    ];
+    let mut box_vertices = [Vec3::ZERO; 8];
+    for (index, vertex) in box_vertices.iter_mut().enumerate() {
+        let local = Vec3::new(
+            if index & 1 == 0 {
+                -half_extents.x
+            } else {
+                half_extents.x
+            },
+            if index & 2 == 0 {
+                -half_extents.y
+            } else {
+                half_extents.y
+            },
+            if index & 4 == 0 {
+                -half_extents.z
+            } else {
+                half_extents.z
+            },
+        );
+        *vertex = box_pose.point_to_world(local);
+    }
+    let center = prism_vertices
+        .iter()
+        .copied()
+        .fold(Vec3::ZERO, |sum, point| sum + point)
+        / 6.0
+        - box_pose.position;
+    let mut portal = [
+        MprVertex {
+            minkowski: center,
+            prism: prism_vertices[0],
+            box_point: box_pose.position,
+        },
+        MprVertex {
+            minkowski: Vec3::ZERO,
+            prism: Vec3::ZERO,
+            box_point: Vec3::ZERO,
+        },
+        MprVertex {
+            minkowski: Vec3::ZERO,
+            prism: Vec3::ZERO,
+            box_point: Vec3::ZERO,
+        },
+        MprVertex {
+            minkowski: Vec3::ZERO,
+            prism: Vec3::ZERO,
+            box_point: Vec3::ZERO,
+        },
+    ];
+    if center.length_squared() <= 1.0e-14 {
+        portal[0].minkowski = Vec3::new(1.0e-5, 0.0, 0.0);
+    }
+    let mut direction = (-portal[0].minkowski).normalize();
+    portal[1] = mpr_support(&prism_vertices, &box_vertices, direction);
+    if portal[1].minkowski.dot(direction) <= 1.0e-7 {
+        return None;
+    }
+    direction = match mpr_direction(Vec3::ZERO, portal[0].minkowski, portal[1].minkowski) {
+        Some(direction) => direction,
+        None => return None,
+    };
+    portal[2] = mpr_support(&prism_vertices, &box_vertices, direction);
+    if portal[2].minkowski.dot(direction) <= 1.0e-7 {
+        return None;
+    }
+    direction = match mpr_direction(
+        portal[0].minkowski,
+        portal[1].minkowski,
+        portal[2].minkowski,
+    ) {
+        Some(direction) => direction,
+        None => return None,
+    };
+    if direction.dot(portal[0].minkowski) > 1.0e-7 {
+        portal.swap(1, 2);
+        direction = -direction;
+    }
+    loop {
+        portal[3] = mpr_support(&prism_vertices, &box_vertices, direction);
+        if portal[3].minkowski.dot(direction) <= 1.0e-7 {
+            return None;
+        }
+        let first_cross = portal[1].minkowski.cross(portal[3].minkowski);
+        let second_cross = portal[3].minkowski.cross(portal[2].minkowski);
+        let mut replaced = false;
+        if first_cross.dot(portal[0].minkowski) < -1.0e-7 {
+            portal[2] = portal[3];
+            replaced = true;
+        } else if second_cross.dot(portal[0].minkowski) < -1.0e-7 {
+            portal[1] = portal[3];
+            replaced = true;
+        }
+        if !replaced {
+            break;
+        }
+        direction = match mpr_direction(
+            portal[0].minkowski,
+            portal[1].minkowski,
+            portal[2].minkowski,
+        ) {
+            Some(direction) => direction,
+            None => return None,
+        };
+    }
+    for _ in 0..32 {
+        direction = match mpr_direction(
+            portal[1].minkowski,
+            portal[2].minkowski,
+            portal[3].minkowski,
+        ) {
+            Some(direction) => direction,
+            None => return None,
+        };
+        if direction.dot(portal[1].minkowski) >= -1.0e-7 {
+            break;
+        }
+        let next = mpr_support(&prism_vertices, &box_vertices, direction);
+        let progress = next.minkowski.dot(direction)
+            - portal[1]
+                .minkowski
+                .dot(direction)
+                .min(portal[2].minkowski.dot(direction))
+                .min(portal[3].minkowski.dot(direction));
+        if progress <= 1.0e-5 {
+            break;
+        }
+        if next.minkowski.dot(direction) <= 1.0e-7 {
+            break;
+        }
+        let cross = next.minkowski.cross(portal[0].minkowski);
+        if portal[1].minkowski.dot(cross) > 1.0e-7 {
+            if portal[2].minkowski.dot(cross) > 1.0e-7 {
+                portal[1] = next;
+            } else {
+                portal[3] = next;
+            }
+        } else if portal[3].minkowski.dot(cross) > 1.0e-7 {
+            portal[2] = next;
+        } else {
+            portal[1] = next;
+        }
+    }
+    let face_normal = match mpr_direction(
+        portal[1].minkowski,
+        portal[2].minkowski,
+        portal[3].minkowski,
+    ) {
+        Some(direction) => direction,
+        None => return None,
+    };
+    let nearest = closest_point_on_triangle(
+        Vec3::ZERO,
+        portal[1].minkowski,
+        portal[2].minkowski,
+        portal[3].minkowski,
+    );
+    let depth = nearest.length();
+    let penetration = margin + depth;
+    if penetration <= 0.0 {
+        return None;
+    }
+    let mut bary = barycentric_triangle_origin(
+        portal[1].minkowski,
+        portal[2].minkowski,
+        portal[3].minkowski,
+        nearest,
+    );
+    let sum = bary.0 + bary.1 + bary.2;
+    if sum <= 1.0e-8 {
+        return None;
+    }
+    bary.0 /= sum;
+    bary.1 /= sum;
+    bary.2 /= sum;
+    let prism_point =
+        portal[1].prism * bary.0 + portal[2].prism * bary.1 + portal[3].prism * bary.2;
+    let box_point =
+        portal[1].box_point * bary.0 + portal[2].box_point * bary.1 + portal[3].box_point * bary.2;
+    let normal = if face_normal.dot(box_pose.position - center) >= 0.0 {
+        face_normal
+    } else {
+        -face_normal
+    };
+    Some(Contact {
+        geom_a: idx_box,
+        geom_b: idx_hfield,
+        position_world: (box_point + prism_point) * 0.5,
+        normal_world: normal,
+        penetration: penetration.max(depth + margin),
+        friction,
+        gap,
+    })
+}
+
+#[allow(dead_code)]
+fn barycentric_triangle_origin(a: Vec3, b: Vec3, c: Vec3, point: Vec3) -> (f32, f32, f32) {
+    let v0 = b - a;
+    let v1 = c - a;
+    let v2 = point - a;
+    let d00 = v0.dot(v0);
+    let d01 = v0.dot(v1);
+    let d11 = v1.dot(v1);
+    let d20 = v2.dot(v0);
+    let d21 = v2.dot(v1);
+    let denom = d00 * d11 - d01 * d01;
+    if denom.abs() <= 1.0e-12 {
+        return (1.0, 0.0, 0.0);
+    }
+    let v = (d11 * d20 - d01 * d21) / denom;
+    let w = (d00 * d21 - d01 * d20) / denom;
+    (1.0 - v - w, v, w)
+}
+
+/// Select the minimum-overlap convex feature axis for a box and prism.
+/// Unlike vertex sampling, this includes box-edge and prism-edge axes.
+#[allow(clippy::too_many_arguments)]
+fn box_prism_sat_feature_contact(
     box_pose: &GeomPose,
     half_extents: Vec3,
     prism: &HfieldPrism,
@@ -2498,7 +2575,7 @@ fn box_prism_sat_contact(
         box_pose.rotate(Vec3::Z),
     ];
     let top = prism.top;
-    let prism_vertices = [
+    let vertices = [
         top.0,
         top.1,
         top.2,
@@ -2506,18 +2583,18 @@ fn box_prism_sat_contact(
         Vec3::new(top.1.x, top.1.y, prism.base_z),
         Vec3::new(top.2.x, top.2.y, prism.base_z),
     ];
-    let prism_edges = [
+    let edges = [
         top.1 - top.0,
         top.2 - top.1,
         top.0 - top.2,
-        prism_vertices[4] - prism_vertices[3],
-        prism_vertices[5] - prism_vertices[4],
-        prism_vertices[3] - prism_vertices[5],
-        prism_vertices[3] - top.0,
-        prism_vertices[4] - top.1,
-        prism_vertices[5] - top.2,
+        vertices[4] - vertices[3],
+        vertices[5] - vertices[4],
+        vertices[3] - vertices[5],
+        vertices[3] - top.0,
+        vertices[4] - top.1,
+        vertices[5] - top.2,
     ];
-    let mut axes = [Vec3::ZERO; 3 + 8 + 27];
+    let mut axes = [Vec3::ZERO; 38];
     let mut axis_count = 0;
     for axis in box_axes {
         axes[axis_count] = axis;
@@ -2533,7 +2610,7 @@ fn box_prism_sat_contact(
         }
     }
     for box_axis in box_axes {
-        for edge in prism_edges {
+        for edge in edges {
             let cross = box_axis.cross(edge);
             if cross.length_squared() > 1.0e-10 {
                 axes[axis_count] = cross.normalize();
@@ -2541,27 +2618,27 @@ fn box_prism_sat_contact(
             }
         }
     }
-    let prism_center = prism_vertices
+    let prism_center = vertices
         .iter()
         .copied()
-        .fold(Vec3::ZERO, |a, b| a + b)
+        .fold(Vec3::ZERO, |sum, point| sum + point)
         / 6.0;
     let delta = box_pose.position - prism_center;
     let mut best_overlap = f32::INFINITY;
     let mut best_normal = Vec3::Z;
     for &axis in &axes[..axis_count] {
-        let box_radius = half_extents.x * crate::math::abs(axis.dot(box_axes[0]))
+        let radius = half_extents.x * crate::math::abs(axis.dot(box_axes[0]))
             + half_extents.y * crate::math::abs(axis.dot(box_axes[1]))
             + half_extents.z * crate::math::abs(axis.dot(box_axes[2]));
-        let box_projection = box_pose.position.dot(axis);
-        let box_min = box_projection - box_radius;
-        let box_max = box_projection + box_radius;
+        let projection = box_pose.position.dot(axis);
+        let box_min = projection - radius;
+        let box_max = projection + radius;
         let mut prism_min = f32::INFINITY;
         let mut prism_max = f32::NEG_INFINITY;
-        for vertex in prism_vertices {
-            let projection = vertex.dot(axis);
-            prism_min = prism_min.min(projection);
-            prism_max = prism_max.max(projection);
+        for vertex in vertices {
+            let value = vertex.dot(axis);
+            prism_min = prism_min.min(value);
+            prism_max = prism_max.max(value);
         }
         let overlap = (box_max - prism_min).min(prism_max - box_min);
         if overlap < -margin {
@@ -2576,29 +2653,71 @@ fn box_prism_sat_contact(
     if penetration <= 0.0 {
         return None;
     }
-    let normal = best_normal;
-    let box_radius = half_extents.x * crate::math::abs(normal.dot(box_axes[0]))
-        + half_extents.y * crate::math::abs(normal.dot(box_axes[1]))
-        + half_extents.z * crate::math::abs(normal.dot(box_axes[2]));
-    let box_surface = box_pose.position - normal * box_radius;
-    let mut prism_surface = prism_vertices[0];
-    let mut best_projection = prism_surface.dot(normal);
-    for vertex in prism_vertices.into_iter().skip(1) {
-        let projection = vertex.dot(normal);
-        if projection > best_projection {
-            best_projection = projection;
-            prism_surface = vertex;
-        }
-    }
+    let box_radius = half_extents.x * crate::math::abs(best_normal.dot(box_axes[0]))
+        + half_extents.y * crate::math::abs(best_normal.dot(box_axes[1]))
+        + half_extents.z * crate::math::abs(best_normal.dot(box_axes[2]));
+    let box_surface = box_pose.position - best_normal * box_radius;
+    let prism_surface = prism_support_feature_point(prism, &vertices, best_normal, box_surface);
     Some(Contact {
         geom_a: idx_box,
         geom_b: idx_hfield,
         position_world: (box_surface + prism_surface) * 0.5,
-        normal_world: normal,
+        normal_world: best_normal,
         penetration,
         friction,
         gap,
     })
+}
+
+/// Return the point on the prism support feature nearest to the opposing box
+/// support point. A single extreme vertex is wrong when the winning axis is a
+/// face or an edge, because it can place the reported contact outside the
+/// feature that generated the SAT result.
+fn prism_support_feature_point(
+    prism: &HfieldPrism,
+    vertices: &[Vec3; 6],
+    normal: Vec3,
+    target: Vec3,
+) -> Vec3 {
+    const EPS: f32 = 1.0e-4;
+    let max_projection = vertices
+        .iter()
+        .map(|vertex| vertex.dot(normal))
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut best = vertices[0];
+    let mut best_distance = f32::INFINITY;
+
+    let mut consider = |point: Vec3| {
+        let distance = (point - target).length_squared();
+        if distance < best_distance {
+            best_distance = distance;
+            best = point;
+        }
+    };
+
+    for (index, &(a, b, c)) in prism.faces.iter().enumerate() {
+        if !prism.valid[index]
+            || (a.dot(normal) - max_projection).abs() > EPS
+            || (b.dot(normal) - max_projection).abs() > EPS
+            || (c.dot(normal) - max_projection).abs() > EPS
+        {
+            continue;
+        }
+        consider(closest_point_on_triangle(target, a, b, c));
+    }
+
+    for i in 0..vertices.len() {
+        if (vertices[i].dot(normal) - max_projection).abs() > EPS {
+            continue;
+        }
+        consider(vertices[i]);
+        for j in (i + 1)..vertices.len() {
+            if (vertices[j].dot(normal) - max_projection).abs() <= EPS {
+                consider(closest_point_on_segment(target, vertices[i], vertices[j]));
+            }
+        }
+    }
+    best
 }
 
 /// Closest point on triangle `(a, b, c)` to point `p`. Standard barycentric

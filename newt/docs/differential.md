@@ -110,6 +110,51 @@ sample. The maximum direct sensor error is `2.4e-8`, below the `2.0e-6`
 sensor bound. It covers rangefinder ray casting, mocap site attachment,
 velocimeter output, and magnetic-field frame conversion.
 
+### hfield box declared-mode finding
+
+The box conformance rows use MuJoCo's legacy convex hfield pipeline. The
+precise declaration is:
+
+```xml
+<option><flag nativeccd="disable"/></option>
+```
+
+Newt's box-hfield narrow phase matches that mode's contact count, minimum
+penetration depths, and feature normals on the committed probe 6 and probe 8
+fixtures. MuJoCo exposes one hfield geom, so it does not expose its internal
+prism id. A diagnostic matched each contact to the same cell and prism by its
+normal and depth:
+
+| engine | contact | cell | prism | top triangle |
+|--------|---------:|------|-------:|--------------|
+| MuJoCo MPR | 0 | (0, 0) | 1 | (p00, p11, p01) |
+| MuJoCo MPR | 1 | (0, 0) | 0 | (p00, p10, p11) |
+| newt SAT | 0 | (0, 0) | 1 | (p00, p11, p01) |
+| newt SAT | 1 | (0, 0) | 0 | (p00, p10, p11) |
+
+Probe 6 uses different contact-position constructions. MuJoCo's per-prism
+MPR and newt's SAT support-feature construction produced measured position
+residuals of `0.07246` and `0.04990` in the current implementation. The
+fixture keeps the dictated conservative per-contact position bound of `0.8`.
+The normal residual on the second edge feature is `1.43e-2`; the harness
+records this measured MPR-versus-SAT feature tolerance. Counts and depths are
+the parity criteria.
+
+The direct dynamics anchor is `hfield_box_steep_ccd_disabled`: a tilted box
+released above the steep cell for 100 Euler steps under the same
+`nativeccd=disable` declaration. Its measured maximum divergence is
+`5.53e-3` qpos and `1.18e-1` qvel. The asserted bounds are `7.0e-3` and
+`1.5e-1`. This bounds the dynamic effect of the position construction.
+
+The stable differential rows also remain within the existing evidence tiers:
+the friction-slope final qpos residual is `2.64e-5`, and the hfield box early
+window is `4.19e-6` qvel. These rows support the bound; they do not replace
+the steep-field anchor.
+
+Sphere and capsule hfield probes remain on default MuJoCo captures. Alignment
+with MuJoCo's default native-CCD contact set remains an open finding. The
+flag-disabled result does not claim native-CCD parity.
+
 ### sphere_drop solref sweep
 
 The old fit is removed. Under RK4, the remaining transient is an

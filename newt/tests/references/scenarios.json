@@ -173,6 +173,13 @@
       "horizon_note": "1.0 s tilted box settling on uneven hfield terrain; matched Euler PGS."
     },
     {
+      "name": "hfield_box_steep_ccd_disabled",
+      "mjcf": "hfield_box_steep_ccd_disabled.xml",
+      "n_steps": 100,
+      "stride": 10,
+      "horizon_note": "0.2 s steep-cell box release using MuJoCo nativeccd=disable; bounds the SAT-versus-MPR position construction difference."
+    },
+    {
       "name": "hfield_capsule_waves",
       "mjcf": "hfield_capsule_waves.xml",
       "n_steps": 500,
