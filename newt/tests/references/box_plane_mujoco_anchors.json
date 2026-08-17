@@ -1,0 +1,75 @@
+{
+  "mujoco_version": "3.11.0",
+  "model": "inline plane + free box",
+  "collider": "mjc_PlaneBox",
+  "source": "google-deepmind/mujoco/src/engine/engine_collision_primitive.c",
+  "capture": "MjModel.from_xml_string followed by mj_forward",
+  "half_extents": [0.5, 0.4, 0.3],
+  "cases": [
+    {
+      "name": "flat_rest",
+      "position": [0.0, 0.0, 0.2],
+      "quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+      "margin": 0.0,
+      "contacts": [
+        {"position": [-0.5, -0.4, -0.05], "dist": -0.1},
+        {"position": [0.5, -0.4, -0.05], "dist": -0.1},
+        {"position": [-0.5, 0.4, -0.05], "dist": -0.1},
+        {"position": [0.5, 0.4, -0.05], "dist": -0.1}
+      ]
+    },
+    {
+      "name": "edge_tilt",
+      "position": [0.0, 0.0, 0.4],
+      "quaternion_wxyz": [0.923879533, 0.382683433, 0.0, 0.0],
+      "margin": 0.0,
+      "contacts": [
+        {"position": [-0.5, -0.070710678, -0.047487373], "dist": -0.094974747},
+        {"position": [0.5, -0.070710678, -0.047487373], "dist": -0.094974747}
+      ]
+    },
+    {
+      "name": "corner_tilt",
+      "position": [0.0, 0.0, 0.4],
+      "quaternion_wxyz": [0.962425198, 0.192012681, 0.192012681, 0.0],
+      "margin": 0.0,
+      "contacts": [
+        {"position": [0.32275733, -0.22275733, -0.094196736], "dist": -0.188393472}
+      ]
+    },
+    {
+      "name": "deep_penetration",
+      "position": [0.12, -0.07, -0.1],
+      "quaternion_wxyz": [0.996389675, 0.0, 0.0, 0.084897683],
+      "margin": 0.0,
+      "contacts": [
+        {"position": [-0.305119444, -0.548825081, -0.2], "dist": -0.4},
+        {"position": [0.680465323, -0.379642732, -0.2], "dist": -0.4},
+        {"position": [-0.440465323, 0.239642732, -0.2], "dist": -0.4},
+        {"position": [0.545119444, 0.408825081, -0.2], "dist": -0.4}
+      ]
+    },
+    {
+      "name": "shallow_margin",
+      "position": [0.12, -0.07, 0.3005],
+      "quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+      "margin": 0.001,
+      "contacts": [
+        {"position": [-0.38, -0.47, 0.00025], "dist": 0.0005},
+        {"position": [0.62, -0.47, 0.00025], "dist": 0.0005},
+        {"position": [-0.38, 0.33, 0.00025], "dist": 0.0005},
+        {"position": [0.62, 0.33, 0.00025], "dist": 0.0005}
+      ]
+    },
+    {
+      "name": "sliding_approach",
+      "position": [0.37, -0.21, 0.4],
+      "quaternion_wxyz": [0.993956098, 0.0, 0.109778301, 0.0],
+      "margin": 0.0,
+      "contacts": [
+        {"position": [0.792479838, -0.61, -0.000942023], "dist": -0.001884046},
+        {"position": [0.792479838, 0.19, -0.000942023], "dist": -0.001884046}
+      ]
+    }
+  ]
+}

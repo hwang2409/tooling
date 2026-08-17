@@ -1610,7 +1610,6 @@ fn apply_tree_contact_wrench(
     let solref = combine_solref(ga.solref, gb.solref);
     let (k, c) = solref_to_kc(solref, m_eff);
     let c_tangent = c;
-
     // Point velocities.
     let (v_a, _wa, r_a) = point_velocity_generic(
         ga,
@@ -1813,7 +1812,6 @@ fn apply_contact_wrench(
     let solref = combine_solref(ga.solref, gb.solref);
     let (k, c) = solref_to_kc(solref, m_eff);
     let c_tangent = c;
-
     // Point velocities at the contact.
     let (v_a, w_a_world, r_a) = point_velocity(state, ga, contact.position_world);
     let (v_b, w_b_world, r_b) = point_velocity(state, gb, contact.position_world);

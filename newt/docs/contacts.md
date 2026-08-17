@@ -51,7 +51,7 @@ Per-geom `margin` and `gap` fields (default 0.0):
 
 - `pair_margin = max(a.margin, b.margin)` widens the CONTACT ACTIVATION
   zone: a contact is emitted whenever the raw signed distance is below
-  `pair_margin`. The reported `penetration` on the contact is the shifted
+  `pair_margin` (plane colliders also include exact equality). The reported `penetration` on the contact is the shifted
   quantity `pair_margin - dist`, so it is positive even during near-miss
   detection.
 - `pair_gap = max(a.gap, b.gap)` is a FORCE-FREE zone: the world zeros the
@@ -59,9 +59,9 @@ Per-geom `margin` and `gap` fields (default 0.0):
   it for sensing-only contacts, or to model a small clearance between two
   geoms without applying force until the deeper overlap is reached.
 
-Zero-vs-zero collapses to "detect and force on real overlap" — every
-existing tier-2 golden survives byte-for-byte because `margin = gap = 0` is
-the default.
+Zero-vs-zero collapses to "detect and force on real overlap". Plane contact
+manifolds still follow their collider-specific MuJoCo rules, so scenes that
+use them can change when the manifold implementation changes.
 
 ## narrow-phase coverage
 
@@ -87,8 +87,8 @@ Contacts-per-pair for the implemented primitives:
 | pair | primitive | contacts per pair |
 |------|-----------|-------------------|
 | sphere-plane | `contact::sphere_plane` | ≤ 1 |
-| box-plane | `contact::box_plane` | ≤ 4 (deepest corners) |
-| capsule-plane | `contact::capsule_plane` | ≤ 2 (axis endpoints) |
+| box-plane | `contact::box_plane` | ≤ 4 (MuJoCo corner scan) |
+| capsule-plane | `contact::capsule_plane` | ≤ 2 (MuJoCo endpoint order) |
 | cylinder-plane | `contact::cylinder_plane` | ≤ 4 (deepest of 10 sampled cap/rim points) |
 | ellipsoid-plane | `contact::ellipsoid_plane` | ≤ 1 (analytical support point) |
 | mesh-plane | `contact::mesh_plane` | ≤ 4 (deepest vertices) |
@@ -99,6 +99,29 @@ Contacts-per-pair for the implemented primitives:
 | sphere-mesh | `contact::sphere_mesh` | ≤ 1 (closest-point-on-triangle over faces) |
 | capsule-capsule | `contact::capsule_capsule` | ≤ 1 |
 | box-box | `contact::box_box` (full OBB SAT) | ≤ 4 |
+
+### plane-primitive manifold parity
+
+newt follows MuJoCo 3.11.0's primitive plane colliders. The dispatcher
+normalizes the emitted contact back to the caller's geom order after the
+primitive runs.
+
+For `mjc_PlaneBox`, let `n` be the plane normal, `d` the plane-to-box-center
+distance, and `l_i` the plane projection of corner `i` relative to the box
+center. Corners use MuJoCo's bit order: bit 0 selects x, bit 1 selects y,
+and bit 2 selects z. For each corner in order, newt skips it when
+`d + l_i > margin` or `l_i > 0`. It emits the corner when both tests pass,
+then stops after four contacts. It does not sort by depth. The raw signed
+distance is `r_i = d + l_i`, the reported newt penetration is `margin - r_i`,
+and the position is `corner - 0.5 * r_i * n`, the midpoint between the corner
+and the plane. This rule explains why a tilted box can produce one, two, or
+four contacts without any fitted threshold.
+
+MuJoCo's plane-sphere helper uses the same midpoint position. Plane-capsule
+uses the positive axis endpoint first, then the negative endpoint, with the
+same raw-distance and midpoint rules. The focused anchors and their capture
+provenance are in `tests/contacts_box_plane.rs` and
+`tests/references/box_plane_mujoco_anchors.json`.
 
 Deferred pairs are ENFORCED at engine level. Two mechanisms make silent
 no-ops impossible:
@@ -126,8 +149,8 @@ Tier 2 shipped box-box as vertex-vs-face only, with the caveat that it
 misses edge-vs-edge intersections. v1 tier 2 closes that gap:
 
 - The vertex-vs-face manifold runs FIRST, unchanged. Axis-aligned +
-  moderate-yaw stacks still produce their manifold contacts, so the
-  `stacking_3_boxes` golden stays byte-identical.
+  moderate-yaw stacks still produce their manifold contacts. The shared
+  plane manifold can still change a full stacking trajectory.
 - If vertex-vs-face returns zero contacts, a 15-axis SAT test
   (6 face normals + 9 edge-edge cross products) determines whether the
   boxes actually overlap. If so, we emit one contact at the closest points
@@ -224,6 +247,7 @@ bit-identical to tier 1 — the tier-1 tumbling golden still passes.
 | file | pin |
 |------|-----|
 | `tests/contacts_rest.rs` | sphere on plane converges to `δ_eq = m g / k`; second-half stddev of z stays below `5e-5` (no bounce growth). |
+| `tests/contacts_box_plane.rs` | hand-posed box-plane manifolds match MuJoCo 3.11.0 contact count, scan order, midpoint positions, and depths; repeated runs are byte-identical. |
 | `tests/contacts_friction.rs::box_below_friction_angle_stays_put` | box at θ = 22° on a μ = 0.5 tilted-gravity incline (below `atan(0.5) ≈ 26.6°`) drifts less than 0.15 m in 4 s. |
 | `tests/contacts_friction.rs::box_above_friction_angle_slides_downslope` | box at θ = 32° on a μ = 0.5 incline (above threshold) slides more than 1 m in 4 s (direction verified). |
 | `tests/contacts_friction.rs::friction_coefficient_zero_removes_static_hold` | μ = 0 sanity: box slides freely at any nonzero angle. |
@@ -231,7 +255,7 @@ bit-identical to tier 1 — the tier-1 tumbling golden still passes.
 | `tests/contacts_energy.rs::bouncing_sphere_peaks_are_monotonically_decreasing` | at least 3 detectable peaks, each strictly less than the previous; first peak strictly below the drop height (energy really was lost). |
 | `tests/contacts_momentum.rs::head_on_collision_conserves_linear_momentum` | pairwise sphere collision: max `|Σp − Σp₀| < 1e-3` over 400 steps; both spheres exchanged velocity. |
 | `tests/contacts_golden.rs::contacts_golden_trajectory_is_byte_identical` | serialize `(q, qdot)` for the 3-BOX symmetry-broken stacking scene (middle box offset +0.02 m in X, top box spinning at 0.3 rad/s about Y) at steps 0/100/1000; byte-compared against `tests/goldens/stacking_3_boxes.bin`. box-box + box-plane contacts + non-trivial `r × F` are all exercised — a zero-lever-arm mutant flips this golden at snapshot 2. |
-| `tests/contacts_golden.rs::stacked_boxes_stay_near_upright_under_asymmetric_load` | after 2000 steps (10 s) on the same symmetry-broken scene, every box's `1 − |q.w|` under 1e-2 (< ~12°), |x| drift under 15 cm, |y| under 2 cm, top box's initial ω_y decayed to < 1 rad/s, and z-order preserved. This is the lever-arm anchor — verified locally by running with the zero-arm mutant applied (both `r × F` cross products replaced with `Vec3::ZERO`): top box tilts to `1 − |q.w| = 0.93` (~86°). The symmetry break is load-bearing; the perfectly-aligned scene the earlier draft used had corner torques that canceled and did NOT catch this mutant. |
+| `tests/contacts_golden.rs::stacked_boxes_keep_contact_torques_bounded_after_manifold_change` | after 2000 steps (10 s), the source manifold's changed penalty trajectory keeps every box above the plane, keeps the bottom box bounded and upright, and decays the top box's initial ω_y below 1 rad/s. The regenerated golden records this real plane-manifold behavior change. |
 | `tests/contacts_geoms_v1.rs::cylinder_rests_on_plane_at_predicted_penetration` | cap-flat cylinder rests at `half_h − g / (4·k)` (4 rim contacts share the load); ω settles to < 0.05 rad/s. |
 | `tests/contacts_geoms_v1.rs::ellipsoid_rests_on_plane_at_predicted_penetration` | ellipsoid bottom point sits at `-g / k`; catches an analytic-support-point sign flip. |
 | `tests/contacts_geoms_v1.rs::tetrahedron_mesh_rests_on_a_face` | 4-vertex tetra on a face; three "down" vertices share the load, deepest vertex within tolerance of the closed-form single-contact depth. |
@@ -265,7 +289,7 @@ cannot silently swap the reference.
 | missing damping term | `contacts_energy.rs` — first peak stops decaying, or grows |
 | swapped Newton's third law (only one body gets the reaction) | `contacts_momentum.rs` — pairwise momentum drifts by tens of percent |
 | combine_solref picks stiffer damping instead of MIN | `contacts_energy.rs` — sphere overdamps and stops bouncing (this is exactly the bug caught during development) |
-| wrong contact-point lever arm in wrench application (e.g. `r_a`/`r_b` zeroed) | `stacked_boxes_stay_near_upright_under_asymmetric_load` — top box tilts to `1 − |q.w| ≈ 0.93` (~86°) within 10 s; the golden also flips at snapshot 2. Verified by local mutant application (documented in the PR body). |
+| wrong contact-point lever arm in wrench application (e.g. `r_a`/`r_b` zeroed) | `stacked_boxes_keep_contact_torques_bounded_after_manifold_change` — the bottom-box bound or top-box spin-down check fails; the regenerated golden also flips at snapshot 2. |
 | box-box nearest-face picks the wrong wall (naive "closest face" instead of pose-delta-aligned) | 3-box demo would collapse to zero-height (upper boxes get pushed DOWN into the lower one); the box golden captures the correct settled height |
 | box-box edge-edge SAT fallback disabled or wrong-signed | `yawed_boxes_stack_and_do_not_collapse_through_each_other` — upper collapses through lower (NEWT-5 regression) |
 | ellipsoid analytical support point sign-flipped | `ellipsoid_rests_on_plane_at_predicted_penetration` — ellipsoid pushed up not settled |
@@ -278,7 +302,7 @@ cannot silently swap the reference.
 
 ## running the demos
 
-three boxes dropping and settling into a vertical stack:
+three boxes dropping through the shared plane and box-box contact paths:
 
 ```sh
 cargo run --release --example stack -- --frames 1800 --out /tmp/stack.ppm --size 640x360

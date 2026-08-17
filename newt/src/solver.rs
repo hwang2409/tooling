@@ -430,7 +430,7 @@ pub fn project_pyramidal(f: f32, cap: f32) -> f32 {
 use crate::body::Body;
 use crate::contact::Contact;
 use crate::equality::{DISTANCE_DEGENERATE_EPS, Equality};
-use crate::geom::{Geom, GeomAttach, GeomShape, SolRef, combine_solref};
+use crate::geom::{Geom, GeomAttach, SolRef, combine_solref};
 use crate::math::{Quat, Vec3};
 use crate::world::tangent_basis;
 
@@ -741,7 +741,7 @@ fn solve_free_bodies_diag_mode(
 
         let n_world = c.normal_world;
         let (t1_world, t2_world) = tangent_basis(n_world);
-        let contact_position = solver_contact_position(c, ga, gb);
+        let contact_position = c.position_world;
         let arm_a = match body_a {
             Some(i) => contact_position - bodies[i as usize].position,
             None => Vec3::ZERO,
@@ -1097,27 +1097,6 @@ struct PerContact {
     mu_slide: f32,
     mu_torsion: f32,
     mu_roll: f32,
-}
-
-/// MuJoCo places a sphere-plane contact at the midpoint of the two opposing
-/// surfaces. Penalty mode keeps its legacy surface anchor; solver rows use
-/// this midpoint so angular Jacobians match `efc_J`.
-fn solver_contact_position(contact: &Contact, geom_a: &Geom, geom_b: &Geom) -> Vec3 {
-    let sphere_plane = matches!(geom_a.shape, GeomShape::Sphere { .. })
-        && matches!(geom_b.shape, GeomShape::Plane)
-        || matches!(geom_a.shape, GeomShape::Plane)
-            && matches!(geom_b.shape, GeomShape::Sphere { .. });
-    if sphere_plane {
-        let margin = if geom_a.margin > geom_b.margin {
-            geom_a.margin
-        } else {
-            geom_b.margin
-        };
-        let raw_penetration = contact.penetration - margin;
-        contact.position_world + contact.normal_world * (0.5 * raw_penetration)
-    } else {
-        contact.position_world
-    }
 }
 
 /// Assemble and solve the dense free-body Newton system. The response matrix
