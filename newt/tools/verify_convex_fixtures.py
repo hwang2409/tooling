@@ -6,6 +6,9 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import math
+import os
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -16,12 +19,105 @@ def without_date(document: dict) -> dict:
     return result
 
 
+def orientation_error(newt: list[float], mujoco: list[float]) -> float:
+    direct = math.sqrt(sum((a - b) ** 2 for a, b in zip(newt, mujoco)))
+    negated = math.sqrt(sum((a + b) ** 2 for a, b in zip(newt, mujoco)))
+    return min(direct, negated)
+
+
+def dynamic_bounds(
+    dynamic: dict,
+    replay: dict,
+    tolerance: dict,
+    window_limits: tuple[tuple[str, int], ...],
+) -> dict:
+    replay_cases = {case["id"]: case for case in replay["cases"]}
+    bounds_cases = []
+    for expected_case in dynamic["cases"]:
+        replay_case = replay_cases.get(expected_case["id"])
+        assert replay_case is not None, expected_case["id"]
+        expected_samples = {sample["step"]: sample for sample in expected_case["samples"]}
+        replay_samples = {sample["step"]: sample for sample in replay_case["samples"]}
+        assert expected_samples.keys() == replay_samples.keys(), expected_case["id"]
+        errors = {}
+        for step, expected in expected_samples.items():
+            actual = replay_samples[step]
+            position = math.sqrt(
+                sum(
+                    (actual_value - expected_value) ** 2
+                    for actual_value, expected_value in zip(
+                        actual["position"], expected["position"]
+                    )
+                )
+            )
+            orientation = orientation_error(
+                actual["orientation_wxyz"], expected["orientation_wxyz"]
+            )
+            contacts = abs(actual["contacts"] - expected["contacts"])
+            errors[step] = {
+                "position": position,
+                "orientation": orientation,
+                "contact_count": contacts,
+            }
+        generated_windows = {}
+        for name, end_step in window_limits:
+            window_errors = [error for step, error in errors.items() if step <= end_step]
+            observed = {
+                field: max(error[field] for error in window_errors)
+                for field in ("position", "orientation", "contact_count")
+            }
+            generated_windows[name] = {
+                "observed_max": observed,
+                "position": observed["position"] + tolerance["position"],
+                "orientation": observed["orientation"] + tolerance["orientation"],
+                "contact_count": observed["contact_count"],
+            }
+        bounds_cases.append({"id": expected_case["id"], **generated_windows})
+    return {
+        "method": "Newt replay maxima plus reviewed tolerance over every captured step",
+        "review_tolerance": tolerance,
+        "cases": bounds_cases,
+    }
+
+
+def run_newt_replay(references: Path, output: Path, update_bounds: bool) -> dict:
+    environment = os.environ.copy()
+    environment["NEWT_DYNAMIC_REPLAY_OUTPUT"] = str(output)
+    if update_bounds:
+        environment["NEWT_DYNAMIC_REPLAY_ONLY"] = "1"
+    result = subprocess.run(
+        [
+            "cargo",
+            "test",
+            "--test",
+            "contacts_geoms_v1",
+            "dynamic_enabled_convex_anchors_are_fixture_backed",
+            "--quiet",
+            "--",
+            "--nocapture",
+        ],
+        cwd=references.parent.parent,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stdout + result.stderr)
+    return json.loads(output.read_text(encoding="utf-8"))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--references",
         type=Path,
         default=Path(__file__).resolve().parent.parent / "tests" / "references",
+    )
+    parser.add_argument(
+        "--update-bounds",
+        action="store_true",
+        help="write bounds generated from the full Newt replay",
     )
     args = parser.parse_args()
     import mujoco  # type: ignore[import-not-found]
@@ -46,7 +142,7 @@ def main() -> int:
             "capture_provenance": {
                 "script": "tools/capture_convex_dynamic_anchors.py",
                 "date": datetime.date.today().isoformat(),
-                "method": "mj_step from each source_xml; snapshots at steps 0, 20, and 100",
+                "method": "mj_step from each source_xml; snapshots at every step 0 through 100",
             },
             "windows": {name: step for name, step in WINDOWS},
             "cases": [capture_case(mujoco, args.references, case) for case in CASES],
@@ -59,18 +155,24 @@ def main() -> int:
         )
         assert without_date(generated_routes) == without_date(expected_routes)
         assert without_date(generated_dynamic) == without_date(expected_dynamic)
+    bounds_path = args.references / "contact_dynamic_anchor_bounds.json"
     bounds = json.loads(
-        (args.references / "contact_dynamic_anchor_bounds.json").read_text(
-            encoding="utf-8"
-        )
+        bounds_path.read_text(encoding="utf-8")
     )
     assert len(bounds["cases"]) >= 2, "dynamic bounds need two independent anchors"
-    for case in bounds["cases"]:
-        for window in ("early", "full"):
-            observed = case[window]["observed_max"]
-            bound = case[window]
-            for field in ("position", "orientation", "contact_count"):
-                assert observed[field] <= bound[field], (case["id"], window, field)
+    with tempfile.TemporaryDirectory(prefix="newt-convex-replay-") as temp:
+        replay = run_newt_replay(
+            args.references,
+            Path(temp) / "contact_dynamic_replay.json",
+            args.update_bounds,
+        )
+    generated_bounds = dynamic_bounds(
+        expected_dynamic, replay, bounds["review_tolerance"], WINDOWS
+    )
+    if args.update_bounds:
+        bounds_path.write_text(json.dumps(generated_bounds, indent=2) + "\n", encoding="utf-8")
+    else:
+        assert bounds == generated_bounds, "dynamic bounds are not generated from full replay"
     print("verified MuJoCo route samples, dynamic samples, and reviewed bounds")
     return 0
 

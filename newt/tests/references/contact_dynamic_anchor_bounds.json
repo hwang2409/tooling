@@ -1,5 +1,5 @@
 {
-  "method": "newt replay error maxima plus reviewed tolerance",
+  "method": "Newt replay maxima plus reviewed tolerance over every captured step",
   "review_tolerance": {
     "position": 0.0001,
     "orientation": 0.0001
@@ -8,30 +8,46 @@
     {
       "id": "mesh-mesh-tumble",
       "early": {
-        "observed_max": {"position": 0.01864111982, "orientation": 0.003240427701, "contact_count": 0},
-        "position": 0.01874111982,
-        "orientation": 0.003340427701,
+        "observed_max": {
+          "position": 0.01864111080457465,
+          "orientation": 0.0032404295765696344,
+          "contact_count": 0
+        },
+        "position": 0.01874111080457465,
+        "orientation": 0.0033404295765696343,
         "contact_count": 0
       },
       "full": {
-        "observed_max": {"position": 0.1280665249, "orientation": 0.003570100293, "contact_count": 0},
-        "position": 0.1281665249,
-        "orientation": 0.003670100293,
+        "observed_max": {
+          "position": 0.12806650365409014,
+          "orientation": 0.003570104385418837,
+          "contact_count": 0
+        },
+        "position": 0.12816650365409013,
+        "orientation": 0.003670104385418837,
         "contact_count": 0
       }
     },
     {
       "id": "mesh-mesh-rotated-drop",
       "early": {
-        "observed_max": {"position": 0.018640846, "orientation": 0.0030140555, "contact_count": 0},
-        "position": 0.018740846,
-        "orientation": 0.0031140555,
+        "observed_max": {
+          "position": 0.018640835705437595,
+          "orientation": 0.003014054000409253,
+          "contact_count": 0
+        },
+        "position": 0.018740835705437595,
+        "orientation": 0.0031140540004092527,
         "contact_count": 0
       },
       "full": {
-        "observed_max": {"position": 0.12806424, "orientation": 0.0034046443, "contact_count": 0},
-        "position": 0.12816424,
-        "orientation": 0.0035046443,
+        "observed_max": {
+          "position": 0.12806417782697743,
+          "orientation": 0.0034046383784593686,
+          "contact_count": 0
+        },
+        "position": 0.12816417782697742,
+        "orientation": 0.0035046383784593685,
         "contact_count": 0
       }
     }

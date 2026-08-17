@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture MuJoCo early/full-window anchors for enabled convex routes."""
+"""Capture every MuJoCo state in the enabled convex-route windows."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ CASES = (
     ),
 )
 WINDOWS = (("early", 20), ("full", 100))
+FULL_WINDOW = max(window for _, window in WINDOWS)
 
 
 def capture_case(mujoco, references: Path, case: tuple) -> dict:
@@ -46,21 +47,20 @@ def capture_case(mujoco, references: Path, case: tuple) -> dict:
         data.qvel[3:6] = np.array(angular_velocity)
     mujoco.mj_forward(model, data)
     samples = []
-    for step in range(max(window for _, window in WINDOWS) + 1):
-        if step in {0, 20, 100}:
-            samples.append(
-                {
-                    "step": step,
-                    "position": data.xpos[body_id].astype("float64").tolist(),
-                    "orientation_wxyz": data.xquat[body_id].astype("float64").tolist(),
-                    "contacts": sum(
-                        1
-                        for index in range(data.ncon)
-                        if geom_id in {int(data.contact[index].geom[0]), int(data.contact[index].geom[1])}
-                    ),
-                }
-            )
-        if step < max(window for _, window in WINDOWS):
+    for step in range(FULL_WINDOW + 1):
+        samples.append(
+            {
+                "step": step,
+                "position": data.xpos[body_id].astype("float64").tolist(),
+                "orientation_wxyz": data.xquat[body_id].astype("float64").tolist(),
+                "contacts": sum(
+                    1
+                    for index in range(data.ncon)
+                    if geom_id in {int(data.contact[index].geom[0]), int(data.contact[index].geom[1])}
+                ),
+            }
+        )
+        if step < FULL_WINDOW:
             mujoco.mj_step(model, data)
     return {"id": case_id, "source_xml": source_xml, "route": "mjc_Convex", "samples": samples}
 
@@ -78,7 +78,7 @@ def main() -> int:
         "capture_provenance": {
             "script": "tools/capture_convex_dynamic_anchors.py",
             "date": datetime.date.today().isoformat(),
-            "method": "mj_step from each source_xml; snapshots at steps 0, 20, and 100",
+            "method": "mj_step from each source_xml; snapshots at every step 0 through 100",
         },
         "windows": {name: step for name, step in WINDOWS},
         "cases": [capture_case(mujoco, args.references, case) for case in CASES],

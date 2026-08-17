@@ -277,14 +277,15 @@ and mutation coverage before enabling any of them.
 The box-mesh and mesh-mesh probes remain in `contact_route_probes.json` as
 open and shipped findings. Route bounds are reviewed in
 `contact_route_probe_bounds.json`. The shipped mesh-mesh dynamic anchors use
-the executable XML sources and compare steps 0, 20, and 100. The tumble
-anchor bounds are `0.0187411 / 0.00334043 / 0` for the early window and
-`0.128167 / 0.0036701 / 0` for the full window. The rotated-drop anchor
-bounds are `0.0187408 / 0.00311406 / 0` for the early window and
-`0.128164 / 0.00350465 / 0` for the full window. Each position and orientation
-bound is the measured replay maximum plus the reviewed `1e-4` tolerance.
-`tools/verify_convex_fixtures.py` reruns both pinned MuJoCo captures, compares
-all generated samples, and checks both reviewed dynamic bounds.
+the executable XML sources and capture every step from 0 through 100. The
+tumble anchor bounds are `0.01874111 / 0.00334043 / 0` for the early window
+and `0.1281665 / 0.00367010 / 0` for the full window. The rotated-drop anchor
+bounds are `0.01874084 / 0.00311405 / 0` for the early window and
+`0.1281642 / 0.00350464 / 0` for the full window. Each position and
+orientation bound is the measured per-step replay maximum plus the reviewed
+`1e-4` tolerance. `tools/verify_convex_fixtures.py` reruns both pinned MuJoCo
+captures, replays Newt over every captured step, computes both window maxima,
+and rejects bounds that do not equal those generated values.
 
 The plane-mesh route intentionally stays at two rows. MuJoCo can add a third
 row through its mesh graph neighbor walk. Newt's graph walk is not implemented
@@ -410,7 +411,7 @@ is bit-identical to tier 1 — the tier-1 tumbling golden still passes.
 | `tests/contacts_geoms_v1.rs::sphere_touching_ellipsoid_gives_penetration_matching_axial_case` | sphere on the +X support-axis of an anisotropic ellipsoid; catches the Newton-solver convergence and normal orientation. |
 | `tests/contacts_geoms_v1.rs::sphere_touching_mesh_face_gives_correct_penetration` | sphere below a mesh face; catches closest-point-on-triangle bugs. |
 | `tests/contacts_geoms_v1.rs::analytic_convex_route_probes_are_fixture_backed` | six MuJoCo route probes with parsed XML provenance and reviewed bounds; corrupted fixture data or XML fails the test. |
-| `tests/contacts_geoms_v1.rs::dynamic_enabled_convex_anchors_are_fixture_backed` | two independent mesh-mesh anchors compare fixture-backed steps 0, 20, and 100 position, orientation, and contact-count bounds. |
+| `tests/contacts_geoms_v1.rs::dynamic_enabled_convex_anchors_are_fixture_backed` | two independent mesh-mesh anchors replay every fixture step from 0 through 100 and compare per-step position, orientation, and contact-count errors with generated bounds. |
 | `tests/contacts_geoms_v1.rs::enabled_convex_ccd_routes_emit_one_contact` | one-contact smoke coverage for the enabled mesh-mesh CCD route. |
 | `tests/contacts_geoms_v1.rs::margin_fires_contact_before_geoms_touch` | plane margin 0.05, sphere just above touch: contact fires with shifted penetration `= margin − dist`. |
 | `tests/contacts_geoms_v1.rs::gap_zeros_the_normal_force_while_penetration_is_below_it` | pen ≤ gap gives free-fall acceleration on the sphere despite an active contact record. |

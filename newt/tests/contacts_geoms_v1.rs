@@ -14,6 +14,8 @@ use newt::json::{self, Value};
 use newt::math::{FRAC_PI_2, FRAC_PI_4, Mat3, Quat, Vec3};
 use newt::world::World;
 use newt::xml;
+use std::fmt::Write as _;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -1233,6 +1235,38 @@ fn build_dynamic_anchor_world(rotated: bool) -> World {
     world
 }
 
+type DynamicReplaySample = (usize, Vec3, Quat, usize);
+
+fn write_dynamic_replay(path: &Path, cases: &[(String, Vec<DynamicReplaySample>)]) {
+    let mut document = String::from("{\"cases\":[");
+    for (case_index, (case_id, samples)) in cases.iter().enumerate() {
+        if case_index != 0 {
+            document.push(',');
+        }
+        write!(document, "{{\"id\":\"{case_id}\",\"samples\":[").unwrap();
+        for (sample_index, (step, position, orientation, contacts)) in samples.iter().enumerate() {
+            if sample_index != 0 {
+                document.push(',');
+            }
+            write!(
+                document,
+                "{{\"step\":{step},\"position\":[{:?},{:?},{:?}],\"orientation_wxyz\":[{:?},{:?},{:?},{:?}],\"contacts\":{contacts}}}",
+                position.x,
+                position.y,
+                position.z,
+                orientation.w,
+                orientation.x,
+                orientation.y,
+                orientation.z,
+            )
+            .unwrap();
+        }
+        document.push_str("]}");
+    }
+    document.push_str("]}\n");
+    std::fs::write(path, document).expect("dynamic replay output must be writable");
+}
+
 #[test]
 fn dynamic_enabled_convex_anchors_are_fixture_backed() {
     let document = json::parse(include_str!("references/contact_dynamic_anchors.json"))
@@ -1246,6 +1280,8 @@ fn dynamic_enabled_convex_anchors_are_fixture_backed() {
         cases.len() >= 2,
         "dynamic evidence needs two independent anchors"
     );
+    let replay_only = std::env::var_os("NEWT_DYNAMIC_REPLAY_ONLY").is_some();
+    let mut replay_cases = Vec::with_capacity(cases.len());
     for case in cases {
         let source_xml = route_string(case, "source_xml");
         let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1265,9 +1301,21 @@ fn dynamic_enabled_convex_anchors_are_fixture_backed() {
             .find(|candidate| route_string(candidate, "id") == case_id)
             .unwrap_or_else(|| panic!("missing bounds for dynamic case {case_id}"));
         let mut world = build_dynamic_anchor_world(rotated);
+        let samples = route_array(case, "samples");
+        assert_eq!(
+            samples.len(),
+            101,
+            "{case_id}: full dynamic window is incomplete"
+        );
         let mut simulated_step = 0;
-        for sample in route_array(case, "samples") {
+        let mut replay_samples = Vec::with_capacity(samples.len());
+        let mut window_max = [(0.0_f32, 0.0_f32, 0_usize); 2];
+        for (expected_step, sample) in samples.iter().enumerate() {
             let target_step = route_number(sample, "step") as usize;
+            assert_eq!(
+                target_step, expected_step,
+                "{case_id}: sample steps must be contiguous"
+            );
             while simulated_step < target_step {
                 world.step();
                 simulated_step += 1;
@@ -1286,40 +1334,82 @@ fn dynamic_enabled_convex_anchors_are_fixture_backed() {
                 expected_orientation[3],
                 expected_orientation[0],
             );
-            let bounds = route_object(
-                bounds_case,
-                if current_step <= 20 { "early" } else { "full" },
-            );
-            let observed = route_object(bounds, "observed_max");
-            for field in ["position", "orientation", "contact_count"] {
-                assert!(
-                    route_number(observed, field) <= route_number(bounds, field),
-                    "{case_id}/{current_step}: observed {field} exceeds reviewed bound"
-                );
+            let bounds = if replay_only {
+                None
+            } else {
+                Some(route_object(
+                    bounds_case,
+                    if current_step <= 20 { "early" } else { "full" },
+                ))
+            };
+            let position_error = (world.bodies[0].position - expected_position).length();
+            let orientation_error = ((world.bodies[0].orientation.x - expected_orientation.x)
+                .powi(2)
+                + (world.bodies[0].orientation.y - expected_orientation.y).powi(2)
+                + (world.bodies[0].orientation.z - expected_orientation.z).powi(2)
+                + (world.bodies[0].orientation.w - expected_orientation.w).powi(2))
+            .sqrt();
+            let expected_contacts = route_number(sample, "contacts") as usize;
+            let actual_contacts = world.detect_contacts().len();
+            let contact_error = actual_contacts.abs_diff(expected_contacts);
+            let full = &mut window_max[1];
+            full.0 = full.0.max(position_error);
+            full.1 = full.1.max(orientation_error);
+            full.2 = full.2.max(contact_error);
+            if current_step <= 20 {
+                let early = &mut window_max[0];
+                early.0 = early.0.max(position_error);
+                early.1 = early.1.max(orientation_error);
+                early.2 = early.2.max(contact_error);
             }
-            let position_bound = route_number(bounds, "position");
-            let orientation_bound = route_number(bounds, "orientation");
+            replay_samples.push((
+                current_step,
+                world.bodies[0].position,
+                world.bodies[0].orientation,
+                actual_contacts,
+            ));
+            if replay_only {
+                continue;
+            }
+            let bounds = bounds.expect("dynamic bounds must be available during verification");
+            let position_bound = route_number(bounds, "position") as f32;
+            let orientation_bound = route_number(bounds, "orientation") as f32;
             let contact_bound = route_number(bounds, "contact_count") as usize;
             assert!(
-                (world.bodies[0].position - expected_position).length() <= position_bound,
+                position_error <= position_bound,
                 "{source_xml}/step-{current_step}: position bound"
             );
             assert!(
-                ((world.bodies[0].orientation.x - expected_orientation.x).powi(2)
-                    + (world.bodies[0].orientation.y - expected_orientation.y).powi(2)
-                    + (world.bodies[0].orientation.z - expected_orientation.z).powi(2)
-                    + (world.bodies[0].orientation.w - expected_orientation.w).powi(2))
-                .sqrt()
-                    <= orientation_bound,
+                orientation_error <= orientation_bound,
                 "{source_xml}/step-{current_step}: orientation bound"
             );
-            let expected_contacts = route_number(sample, "contacts") as usize;
-            let actual_contacts = world.detect_contacts().len();
             assert!(
-                actual_contacts.abs_diff(expected_contacts) <= contact_bound,
+                contact_error <= contact_bound,
                 "{source_xml}/step-{current_step}: contact count bound"
             );
         }
+        if !replay_only {
+            for (window_name, window) in [("early", &window_max[0]), ("full", &window_max[1])] {
+                let observed = route_object(route_object(bounds_case, window_name), "observed_max");
+                assert!(
+                    (route_number(observed, "position") as f32 - window.0).abs() <= 1.0e-6,
+                    "{case_id}/{window_name} position: stored={} computed={}",
+                    route_number(observed, "position"),
+                    window.0
+                );
+                assert!(
+                    (route_number(observed, "orientation") as f32 - window.1).abs() <= 1.0e-6,
+                    "{case_id}/{window_name} orientation: stored={} computed={}",
+                    route_number(observed, "orientation"),
+                    window.1
+                );
+                assert_eq!(route_number(observed, "contact_count") as usize, window.2);
+            }
+        }
+        replay_cases.push((case_id.to_string(), replay_samples));
+    }
+    if let Some(path) = std::env::var_os("NEWT_DYNAMIC_REPLAY_OUTPUT") {
+        write_dynamic_replay(Path::new(&path), &replay_cases);
     }
 }
 
