@@ -833,9 +833,30 @@ where
             right_clearance,
             self_contact_force,
         );
-        observer(step + 1, &scene);
+        if capture_initial_observer {
+            if step > 0 {
+                // `World::step` captured the phase consumed by this step.
+                // Report it with the same step number after integration.
+                observer(step, &scene);
+            }
+        } else {
+            observer(step + 1, &scene);
+        }
         trace.extend_from_slice(&tree.q);
         trace.extend_from_slice(&tree.qdot);
+    }
+
+    if capture_initial_observer {
+        // Prepare the final start phase without integrating it. This gives
+        // the phase capture the same 0..=N range as the MuJoCo fixture.
+        let time = config.steps as f32 * DT;
+        controller.apply_balance(&mut scene, time);
+        let tree_snapshot = scene.world.trees[0].clone();
+        controller.before_step(&tree_snapshot, time);
+        let targets = controller.targets(&tree_snapshot, time);
+        controller.apply_targets(&mut scene, targets);
+        scene.world.capture_solver_phase();
+        observer(config.steps, &scene);
     }
 
     let tree = &scene.world.trees[0];

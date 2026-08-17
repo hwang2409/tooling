@@ -432,7 +432,7 @@ fn run_newt(assist_scale: f32, steps: usize) -> NewtRun {
         SolverMode::Newton,
         |step, scene| {
             phase_checkpoints.push(phase_checkpoint_from_newt(step, scene));
-            if step > 0 {
+            if (1..steps).contains(&step) {
                 let visual_contact_mask = visual_contact_mask(scene);
                 let (qpos, qvel) = extract_biped_qpos_qvel(scene);
                 checkpoints.push(Checkpoint {
@@ -442,19 +442,39 @@ fn run_newt(assist_scale: f32, steps: usize) -> NewtRun {
                     qvel: qvel.into_iter().map(f64::from).collect(),
                 });
             }
-            if step > 0
-                && first_fall_step.is_none()
-                && scene.world.trees[0].q[2] < FALL_ROOT_COM_HEIGHT
-            {
-                first_fall_step = Some(step as u32);
-            }
         },
     );
+    let final_step = steps;
+    checkpoints.push(checkpoint_from_trace(final_step, &result.trace));
+    for (step, state) in result.trace.chunks_exact(33).enumerate() {
+        if state[2] < FALL_ROOT_COM_HEIGHT {
+            first_fall_step = Some((step + 1) as u32);
+            break;
+        }
+    }
     NewtRun {
         result,
         first_fall_step,
         checkpoints,
         phase_checkpoints,
+    }
+}
+
+fn checkpoint_from_trace(step: usize, trace: &[f32]) -> Checkpoint {
+    assert!(step > 0);
+    let state = &trace[(step - 1) * 33..step * 33];
+    let mut qpos = state[..3].to_vec();
+    qpos[2] -= COM_OFFSET_Z as f32;
+    qpos.extend([state[6], state[3], state[4], state[5]]);
+    qpos.extend_from_slice(&state[7..17]);
+    let mut qvel = state[20..23].to_vec();
+    qvel.extend_from_slice(&state[17..20]);
+    qvel.extend_from_slice(&state[23..]);
+    Checkpoint {
+        step: step as u32,
+        visual_contact_mask: 0,
+        qpos: qpos.into_iter().map(f64::from).collect(),
+        qvel: qvel.into_iter().map(f64::from).collect(),
     }
 }
 
@@ -771,11 +791,12 @@ fn v3_diagnostic_fixture_records_geom_manifolds() {
     assert_eq!(step25.contacts[0].row_indices, vec![0, 1, 2, 3]);
 
     let structural_mismatches = compare_phase_fixtures("mujoco/newt", &source, &recorded_newt, 36);
-    // The source contact arrives one solver step before newt. This one-step
-    // latency window is the full measured mismatch set through step 36.
+    // The phase labels are now aligned to the contact set consumed by each
+    // Euler/Newton step. The fresh comparison still measures two structural
+    // mismatches, so keep the complete measured window visible.
     assert_eq!(
         structural_mismatches,
-        vec![25],
+        vec![25, 35],
         "solver-phase mismatch window changed; update the fixture and diagnosis"
     );
 

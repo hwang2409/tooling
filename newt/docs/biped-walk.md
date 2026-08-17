@@ -198,10 +198,10 @@ the outcome class matches at all four levels. newt falls at `551` for assist
 the manifold update did not improve the fall-step result. TARGET is not
 reached.
 
-status: the isolated manifold finding is closed. solver-phase parity remains
-open. both fixtures store visual support masks and solver contact masks
-separately. post-step visual geometry is not the state consumed by either
-solver.
+status: the isolated manifold finding is closed. the solver phase now uses the
+current Euler-step contact set. the fresh parity comparison still has a
+residual window, so solver-phase parity is not closed. both fixtures store
+visual support masks and solver contact masks separately.
 
 the diagnostic capture now records two phases. MuJoCo records contacts and
 rows before `mj_step`. newt records the contacts consumed inside `world.step`.
@@ -209,71 +209,31 @@ post-step `mj_forward` and `detect_contacts` records stay separate visual
 geometry evidence.
 
 at solver step `18`, the visual mask is `2` on both sides, while both solver
-contact masks remain `0`. the first solver-phase manifold mismatch is step
-`25`: MuJoCo solves one `ground/right_foot_geom` contact with four rows while
-newt solves its step-24 zero-contact state. the post-step refresh then shows
-two contacts and eight rows on both sides. at solver step `36`, both sides
-solve four contacts and 16 rows. this timing mismatch is the current parity
-blocker.
+contact masks remain `0`. at step `25`, MuJoCo has one
+`ground/right_foot_geom` contact with four rows. newt has two contacts and
+eight rows from its current state. at step `35`, MuJoCo has two right-foot
+contacts, while newt has two left-foot and two right-foot contacts. at step
+`36`, both sides solve four contacts and 16 rows.
 
-at solver step `25`, source and newt constraint-force maxima are `112.489` and
-`0.000`; row reference-acceleration maxima are `124.015` and `0.000`. At step
-`36`, the maxima are `503.445` and `574.786`; row reference-acceleration
-maxima are `155.270` and `152.956`. Newt keeps its internal `from B into A`
-normal convention and flips only the diagnostic view.
+the phase fixture records contact geometry and row mappings. Newt keeps its
+internal `from B into A` normal convention and flips only the diagnostic view.
 
 the complete measured solver structural mismatch set through step `36` is
-`[25]`. this is a one-step contact-latency window: source solves the first
-contact at step `25`, while newt consumes it at step `26`. the acceptance test
-asserts the complete set, not only its first element. step `18` is only a
-visual-mask checkpoint; its solver masks and contacts are both zero. the first
-solver-phase qvel residual bound exceeds at step `26` (`1.636116`), after the
-missed source contact has been consumed. the candidate cause is phase timing,
-not manifold geometry. the `0.4` fall-step gap remains an honest closed-loop
-finding.
+`[25, 35]`. the acceptance test asserts this complete fresh set. step `18` is
+only a visual-mask checkpoint; its solver masks and contacts are both zero.
+the phase-labeling error that hid step `35` is closed. the remaining steps are
+contact-manifold and trajectory differences, not a prior-step contact set.
+the `0.4` fall-step gap remains an honest Euler/Newton finding.
 
-the per-step solver-phase residual trail is the next ticket's comparison
-specification:
+the per-step solver-phase residual trail remains the comparison specification:
 
-| step | qpos max | qvel max | source solver mask | newt solver mask | source contacts | newt contacts | structure |
-|---:|---:|---:|---:|---:|---:|---:|:---:|
-| 0 | 5.325e-8 | 0.000e0 | 0 | 0 | 0 | 0 | match |
-| 1 | 5.325e-8 | 0.000e0 | 0 | 0 | 0 | 0 | match |
-| 2 | 3.146e-7 | 5.820e-5 | 0 | 0 | 0 | 0 | match |
-| 3 | 1.559e-6 | 3.105e-4 | 0 | 0 | 0 | 0 | match |
-| 4 | 5.047e-6 | 6.976e-4 | 0 | 0 | 0 | 0 | match |
-| 5 | 1.033e-5 | 1.057e-3 | 0 | 0 | 0 | 0 | match |
-| 6 | 1.707e-5 | 1.349e-3 | 0 | 0 | 0 | 0 | match |
-| 7 | 2.496e-5 | 1.577e-3 | 0 | 0 | 0 | 0 | match |
-| 8 | 3.369e-5 | 1.746e-3 | 0 | 0 | 0 | 0 | match |
-| 9 | 4.303e-5 | 1.868e-3 | 0 | 0 | 0 | 0 | match |
-| 10 | 5.278e-5 | 1.950e-3 | 0 | 0 | 0 | 0 | match |
-| 11 | 6.277e-5 | 1.999e-3 | 0 | 0 | 0 | 0 | match |
-| 12 | 7.287e-5 | 2.040e-3 | 0 | 0 | 0 | 0 | match |
-| 13 | 8.241e-5 | 2.028e-3 | 0 | 0 | 0 | 0 | match |
-| 14 | 7.666e-5 | 2.819e-3 | 0 | 0 | 0 | 0 | match |
-| 15 | 1.792e-4 | 2.050e-2 | 0 | 0 | 0 | 0 | match |
-| 16 | 2.737e-4 | 1.891e-2 | 0 | 0 | 0 | 0 | match |
-| 17 | 3.939e-4 | 2.403e-2 | 0 | 0 | 0 | 0 | match |
-| 18 | 5.009e-4 | 2.141e-2 | 0 | 0 | 0 | 0 | match |
-| 19 | 6.142e-4 | 2.264e-2 | 0 | 0 | 0 | 0 | match |
-| 20 | 7.578e-4 | 2.873e-2 | 0 | 0 | 0 | 0 | match |
-| 21 | 8.295e-4 | 2.390e-2 | 0 | 0 | 0 | 0 | match |
-| 22 | 9.045e-4 | 2.474e-2 | 0 | 0 | 0 | 0 | match |
-| 23 | 9.526e-4 | 2.454e-2 | 0 | 0 | 0 | 0 | match |
-| 24 | 1.004e-3 | 2.443e-2 | 0 | 0 | 0 | 0 | match |
-| 25 | 1.046e-3 | 2.401e-2 | 2 | 0 | 1 | 0 | mismatch |
-| 26 | 8.197e-3 | 1.636e0 | 2 | 2 | 2 | 2 | match |
-| 27 | 9.501e-3 | 2.609e-1 | 2 | 2 | 2 | 2 | match |
-| 28 | 8.315e-3 | 2.373e-1 | 2 | 2 | 2 | 2 | match |
-| 29 | 6.569e-3 | 3.492e-1 | 2 | 2 | 2 | 2 | match |
-| 30 | 4.997e-3 | 3.143e-1 | 2 | 2 | 2 | 2 | match |
-| 31 | 3.851e-3 | 2.384e-1 | 2 | 2 | 2 | 2 | match |
-| 32 | 4.389e-3 | 2.778e-1 | 2 | 2 | 2 | 2 | match |
-| 33 | 5.117e-3 | 3.016e-1 | 2 | 2 | 2 | 2 | match |
-| 34 | 5.933e-3 | 2.529e-1 | 2 | 2 | 2 | 2 | match |
-| 35 | 7.191e-3 | 2.516e-1 | 2 | 2 | 2 | 2 | match |
-| 36 | 8.357e-3 | 2.332e-1 | 3 | 3 | 4 | 4 | match |
+| steps | source contact set | newt contact set | structure |
+|---|---|---|:---:|
+| `0..24` | no contacts | no contacts | match |
+| `25` | one right-foot contact | two right-foot contacts | mismatch |
+| `26..34` | two right-foot contacts | two right-foot contacts | match |
+| `35` | two right-foot contacts | two left-foot and two right-foot contacts | mismatch |
+| `36` | two left-foot and two right-foot contacts | two left-foot and two right-foot contacts | match |
 
 the measured trace gaps through the newt fall are:
 

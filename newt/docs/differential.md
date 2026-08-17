@@ -11,6 +11,11 @@ Each row of the scorecard is the MEASURED maximum divergence over the
 sample points of the trajectory, the tolerance the CI test asserts,
 and the verdict.
 
+NEWT-26 targets the Euler PGS/Newton configuration. Those paths now detect
+contacts once at step start and solve that current set. Penalty RK4 keeps live
+per-stage collision evaluation. RK4 PGS/Newton keeps constraint zero-order
+hold; that residual is separate from Euler phase ordering.
+
 The rule (from the arc's integrity standard, verbatim in NEWT-13's
 contract): a divergence beyond physical reasonableness is a FINDING
 to report, not to hide. Bounds are set from measurement plus ~2×
@@ -189,6 +194,11 @@ fix remains in place; this is a separate plane-contact effect.
 
 The stack does not collapse. The scorecard now reports this as bounded
 divergence, not recovered parity.
+
+The Euler/Newton remeasurement is `1.729087e-2 m` qpos and
+`1.179916e-1 m/s` qvel. The phase change did not tighten this hypothesis.
+The biped 0.4 sweep also remains an Euler/Newton result and did not close its
+fall-step gap.
 
 The v1 investigation hypothesized three possible causes (PGS
 under-convergence, contact ordering, box-box narrow-phase

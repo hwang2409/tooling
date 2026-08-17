@@ -234,13 +234,12 @@ torque `r_arm × F`. static geoms absorb the reaction silently.
 
 ### integration
 
-contact forces are recomputed at each RK4 sub-stage from the interpolated
-body state — standard RK4-on-forced-ODE treatment. very stiff underdamped
-contacts show some parasitic RK4 damping (the intermediate stages sample
-deeper penetrations than the true continuous solution reaches); the bouncing
-anchor picks a `dampratio` and `dt` combination that keeps the effective
-restitution comfortably above zero. with no geoms at all, the RK4 loop is
-bit-identical to tier 1 — the tier-1 tumbling golden still passes.
+penalty contact forces are recomputed at each RK4 sub-stage from the
+interpolated body or tree state. this is the live forced-ODE path and mirrors
+MuJoCo's RK4 collision reevaluation. PGS and Newton instead assemble contacts
+once at Euler step start. their RK4 constraint forces use zero-order hold;
+that is a separate integration residual. with no geoms at all, the RK4 loop
+is bit-identical to tier 1 — the tier-1 tumbling golden still passes.
 
 ## anchor tests
 

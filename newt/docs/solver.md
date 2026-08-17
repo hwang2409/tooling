@@ -11,9 +11,25 @@ the convex dual problem. Ship both condim 1 (frictionless) and condim 3
 (sliding, normal + 2 tangents), both pyramidal and elliptic friction
 cones, and constraint-based joint limits for hinge/slide range.
 
-Penalty remains the default legacy path. The MuJoCo plane manifold is shared
-by both modes, so affected penalty contact scenes can change trajectory; those
-golden changes are documented with the manifold update.
+Penalty remains the default legacy path. Its RK4 callback detects and evaluates
+contacts at every stage. PGS and Newton assemble one current-position contact
+set at Euler step start, then solve that set before integration.
+
+## step pipeline
+
+For Euler and implicitfast, newt maps the MuJoCo order as follows:
+
+1. forward position kinematics;
+2. one collision pass from the current positions;
+3. contact and limit row assembly;
+4. PGS or Newton solve;
+5. velocity and position integration;
+6. post-step sensor evaluation.
+
+The PGS and Newton row system consumes the contacts from step 2. It does not
+collect a prior-step set or run a second collision pass for the solver step.
+Penalty does not enter this path. It keeps its live RK4 stage callback and its
+single current-state Euler wrench evaluation.
 
 ## Model reference
 
@@ -206,13 +222,18 @@ Both are hand-derived:
 Both cone kinds live behind `world.solver.cone`; the shipped tests
 exercise both under the friction incline anchor.
 
-## Integration path — once-per-step under RK4
+## Constraint integration path — once-per-step under RK4
 
 MuJoCo uses one Euler step per constraint solve. Newt integrates with
-RK4 (design spec — kept for accuracy on the free-body path). We keep
-RK4 but solve the constraint ONCE per step and hold the resulting
+RK4 (design spec — kept for accuracy on the free-body path). For PGS and
+Newton, we solve the constraint ONCE per step and hold the resulting
 per-body wrenches / per-DOF forces constant across all four RK4
 sub-stages (zero-order hold, ZOH).
+
+MuJoCo RK4 reruns collision and constraint assembly at each stage. Newt's
+penalty mode keeps a live per-stage callback to approximate that behavior.
+The PGS/Newton ZOH path is a separate documented residual. Euler does not use
+this ZOH path.
 
 **Consequences (documented honestly):**
 
