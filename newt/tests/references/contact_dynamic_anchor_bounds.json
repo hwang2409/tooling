@@ -9,22 +9,22 @@
       "id": "mesh-mesh-tumble",
       "early": {
         "observed_max": {
-          "position": 0.01864111080457465,
-          "orientation": 0.0032404295765696344,
+          "position": 0.018641119822859764,
+          "orientation": 0.003240427700802684,
           "contact_count": 0
         },
-        "position": 0.01874111080457465,
-        "orientation": 0.0033404295765696343,
+        "position": 0.018741119652986526,
+        "orientation": 0.00334042776376009,
         "contact_count": 0
       },
       "full": {
         "observed_max": {
-          "position": 0.12806650365409014,
-          "orientation": 0.003570104385418837,
+          "position": 0.1280665248632431,
+          "orientation": 0.0035701002925634384,
           "contact_count": 0
         },
-        "position": 0.12816650365409013,
-        "orientation": 0.003670104385418837,
+        "position": 0.12816652655601501,
+        "orientation": 0.0036701003555208445,
         "contact_count": 0
       }
     },
@@ -32,22 +32,22 @@
       "id": "mesh-mesh-rotated-drop",
       "early": {
         "observed_max": {
-          "position": 0.018640835705437595,
-          "orientation": 0.003014054000409253,
+          "position": 0.018640846014022827,
+          "orientation": 0.0030140553135424852,
           "contact_count": 0
         },
-        "position": 0.018740835705437595,
-        "orientation": 0.0031140540004092527,
+        "position": 0.01874084584414959,
+        "orientation": 0.0031140553764998913,
         "contact_count": 0
       },
       "full": {
         "observed_max": {
-          "position": 0.12806417782697743,
-          "orientation": 0.0034046383784593686,
+          "position": 0.12806424498558044,
+          "orientation": 0.0034046443179249763,
           "contact_count": 0
         },
-        "position": 0.12816417782697742,
-        "orientation": 0.0035046383784593685,
+        "position": 0.12816424667835236,
+        "orientation": 0.0035046443808823824,
         "contact_count": 0
       }
     }

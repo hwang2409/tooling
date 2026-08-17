@@ -1236,6 +1236,7 @@ fn build_dynamic_anchor_world(rotated: bool) -> World {
 }
 
 type DynamicReplaySample = (usize, Vec3, Quat, usize);
+const DYNAMIC_REVIEW_TOLERANCE: f32 = 1.0e-4;
 
 fn write_dynamic_replay(path: &Path, cases: &[(String, Vec<DynamicReplaySample>)]) {
     let mut document = String::from("{\"cases\":[");
@@ -1275,6 +1276,15 @@ fn dynamic_enabled_convex_anchors_are_fixture_backed() {
         "references/contact_dynamic_anchor_bounds.json"
     ))
     .expect("dynamic anchor bounds fixture must parse");
+    let review_tolerance = route_object(&bounds_document, "review_tolerance");
+    assert_eq!(
+        route_number(review_tolerance, "position").to_bits(),
+        DYNAMIC_REVIEW_TOLERANCE.to_bits()
+    );
+    assert_eq!(
+        route_number(review_tolerance, "orientation").to_bits(),
+        DYNAMIC_REVIEW_TOLERANCE.to_bits()
+    );
     let cases = route_array(&document, "cases");
     assert!(
         cases.len() >= 2,
@@ -1390,20 +1400,40 @@ fn dynamic_enabled_convex_anchors_are_fixture_backed() {
         }
         if !replay_only {
             for (window_name, window) in [("early", &window_max[0]), ("full", &window_max[1])] {
-                let observed = route_object(route_object(bounds_case, window_name), "observed_max");
+                let window_fixture = route_object(bounds_case, window_name);
+                let observed = route_object(window_fixture, "observed_max");
+                let observed_position = route_number(observed, "position");
+                let observed_orientation = route_number(observed, "orientation");
                 assert!(
-                    (route_number(observed, "position") as f32 - window.0).abs() <= 1.0e-6,
+                    (observed_position - window.0).abs() <= 1.0e-6,
                     "{case_id}/{window_name} position: stored={} computed={}",
-                    route_number(observed, "position"),
+                    observed_position,
                     window.0
                 );
                 assert!(
-                    (route_number(observed, "orientation") as f32 - window.1).abs() <= 1.0e-6,
+                    (observed_orientation - window.1).abs() <= 1.0e-6,
                     "{case_id}/{window_name} orientation: stored={} computed={}",
-                    route_number(observed, "orientation"),
+                    observed_orientation,
                     window.1
                 );
                 assert_eq!(route_number(observed, "contact_count") as usize, window.2);
+                let expected_position_bound = observed_position + DYNAMIC_REVIEW_TOLERANCE;
+                let expected_orientation_bound = observed_orientation + DYNAMIC_REVIEW_TOLERANCE;
+                assert_eq!(
+                    route_number(window_fixture, "position").to_bits(),
+                    expected_position_bound.to_bits(),
+                    "{case_id}/{window_name} position bound is not max + tolerance"
+                );
+                assert_eq!(
+                    route_number(window_fixture, "orientation").to_bits(),
+                    expected_orientation_bound.to_bits(),
+                    "{case_id}/{window_name} orientation bound is not max + tolerance"
+                );
+                assert_eq!(
+                    route_number(window_fixture, "contact_count") as usize,
+                    window.2,
+                    "{case_id}/{window_name} contact bound is not the measured maximum"
+                );
             }
         }
         replay_cases.push((case_id.to_string(), replay_samples));

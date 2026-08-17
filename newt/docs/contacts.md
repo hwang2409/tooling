@@ -285,7 +285,9 @@ bounds are `0.01874084 / 0.00311405 / 0` for the early window and
 orientation bound is the measured per-step replay maximum plus the reviewed
 `1e-4` tolerance. `tools/verify_convex_fixtures.py` reruns both pinned MuJoCo
 captures, replays Newt over every captured step, computes both window maxima,
-and rejects bounds that do not equal those generated values.
+and rejects bounds that do not equal those generated values. The Rust fixture
+test also recomputes both maxima and requires exact float32 equality between
+each stored position/orientation bound and its stored maximum plus `1e-4`.
 
 The plane-mesh route intentionally stays at two rows. MuJoCo can add a third
 row through its mesh graph neighbor walk. Newt's graph walk is not implemented
@@ -411,7 +413,7 @@ is bit-identical to tier 1 — the tier-1 tumbling golden still passes.
 | `tests/contacts_geoms_v1.rs::sphere_touching_ellipsoid_gives_penetration_matching_axial_case` | sphere on the +X support-axis of an anisotropic ellipsoid; catches the Newton-solver convergence and normal orientation. |
 | `tests/contacts_geoms_v1.rs::sphere_touching_mesh_face_gives_correct_penetration` | sphere below a mesh face; catches closest-point-on-triangle bugs. |
 | `tests/contacts_geoms_v1.rs::analytic_convex_route_probes_are_fixture_backed` | six MuJoCo route probes with parsed XML provenance and reviewed bounds; corrupted fixture data or XML fails the test. |
-| `tests/contacts_geoms_v1.rs::dynamic_enabled_convex_anchors_are_fixture_backed` | two independent mesh-mesh anchors replay every fixture step from 0 through 100 and compare per-step position, orientation, and contact-count errors with generated bounds. |
+| `tests/contacts_geoms_v1.rs::dynamic_enabled_convex_anchors_are_fixture_backed` | two independent mesh-mesh anchors replay every fixture step from 0 through 100, compare per-step errors with generated bounds, and require exact maximum-plus-tolerance bound encoding. |
 | `tests/contacts_geoms_v1.rs::enabled_convex_ccd_routes_emit_one_contact` | one-contact smoke coverage for the enabled mesh-mesh CCD route. |
 | `tests/contacts_geoms_v1.rs::margin_fires_contact_before_geoms_touch` | plane margin 0.05, sphere just above touch: contact fires with shifted penetration `= margin − dist`. |
 | `tests/contacts_geoms_v1.rs::gap_zeros_the_normal_force_while_penetration_is_below_it` | pen ≤ gap gives free-fall acceleration on the sphere despite an active contact record. |

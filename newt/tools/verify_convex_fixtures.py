@@ -8,6 +8,7 @@ import datetime
 import json
 import math
 import os
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -20,9 +21,18 @@ def without_date(document: dict) -> dict:
 
 
 def orientation_error(newt: list[float], mujoco: list[float]) -> float:
-    direct = math.sqrt(sum((a - b) ** 2 for a, b in zip(newt, mujoco)))
-    negated = math.sqrt(sum((a + b) ** 2 for a, b in zip(newt, mujoco)))
-    return min(direct, negated)
+    squares = [
+        float32(float32(actual) - float32(expected)) ** 2
+        for actual, expected in zip(newt, mujoco)
+    ]
+    total = float32(float32(squares[0]) + float32(squares[1]))
+    total = float32(total + float32(squares[2]))
+    total = float32(total + float32(squares[3]))
+    return float32(math.sqrt(total))
+
+
+def float32(value: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", value))[0]
 
 
 def dynamic_bounds(
@@ -42,14 +52,22 @@ def dynamic_bounds(
         errors = {}
         for step, expected in expected_samples.items():
             actual = replay_samples[step]
-            position = math.sqrt(
-                sum(
-                    (actual_value - expected_value) ** 2
-                    for actual_value, expected_value in zip(
-                        actual["position"], expected["position"]
+            position_squares = [
+                float32(
+                    float32(
+                        float32(actual_value) - float32(expected_value)
                     )
+                    ** 2
                 )
+                for actual_value, expected_value in zip(
+                    actual["position"], expected["position"]
+                )
+            ]
+            position_total = float32(
+                float32(position_squares[0]) + float32(position_squares[1])
             )
+            position_total = float32(position_total + float32(position_squares[2]))
+            position = float32(math.sqrt(position_total))
             orientation = orientation_error(
                 actual["orientation_wxyz"], expected["orientation_wxyz"]
             )
@@ -63,13 +81,20 @@ def dynamic_bounds(
         for name, end_step in window_limits:
             window_errors = [error for step, error in errors.items() if step <= end_step]
             observed = {
-                field: max(error[field] for error in window_errors)
-                for field in ("position", "orientation", "contact_count")
+                "position": float32(max(error["position"] for error in window_errors)),
+                "orientation": float32(
+                    max(error["orientation"] for error in window_errors)
+                ),
+                "contact_count": max(error["contact_count"] for error in window_errors),
             }
             generated_windows[name] = {
                 "observed_max": observed,
-                "position": observed["position"] + tolerance["position"],
-                "orientation": observed["orientation"] + tolerance["orientation"],
+                "position": float32(
+                    observed["position"] + float32(tolerance["position"])
+                ),
+                "orientation": float32(
+                    observed["orientation"] + float32(tolerance["orientation"])
+                ),
                 "contact_count": observed["contact_count"],
             }
         bounds_cases.append({"id": expected_case["id"], **generated_windows})
