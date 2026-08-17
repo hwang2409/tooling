@@ -157,6 +157,27 @@
       "stride": 10,
       "compare_sensors": true,
       "horizon_note": "0.5 s direct rangefinder, velocimeter, and magnetometer comparison on a mocap body."
+    },
+    {
+      "name": "hfield_sphere_ramp",
+      "mjcf": "hfield_sphere_ramp.xml",
+      "n_steps": 500,
+      "stride": 25,
+      "horizon_note": "1.0 s sphere rolling down an uneven hfield ramp; matched Euler PGS."
+    },
+    {
+      "name": "hfield_box_terrain",
+      "mjcf": "hfield_box_terrain.xml",
+      "n_steps": 500,
+      "stride": 25,
+      "horizon_note": "1.0 s tilted box settling on uneven hfield terrain; matched Euler PGS."
+    },
+    {
+      "name": "hfield_capsule_waves",
+      "mjcf": "hfield_capsule_waves.xml",
+      "n_steps": 500,
+      "stride": 25,
+      "horizon_note": "1.0 s tilted capsule crossing a wavy hfield; matched Euler PGS."
     }
   ]
 }

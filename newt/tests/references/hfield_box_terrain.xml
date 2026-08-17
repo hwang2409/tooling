@@ -1,0 +1,17 @@
+<mujoco model="hfield_box_terrain">
+  <compiler angle="radian"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="Euler"
+          solver="PGS" cone="pyramidal" iterations="20"/>
+  <asset>
+    <hfield name="terrain" nrow="4" ncol="4" size="2 2 0.7 0.2"
+            elevation="0 0.2 0.1 0.3 0.15 0.45 0.25 0.5 0.05 0.35 0.2 0.4 0.25 0.55 0.35 0.6"/>
+  </asset>
+  <worldbody>
+    <geom name="terrain_geom" type="hfield" hfield="terrain" friction="0.7"/>
+    <body name="box" pos="0.15 -0.2 1.25" euler="0.06 -0.04 0.03">
+      <freejoint name="box_root"/>
+      <inertial pos="0 0 0" mass="1.0" diaginertia="0.12 0.10 0.08"/>
+      <geom name="box_geom" type="box" size="0.3 0.24 0.2" friction="0.7"/>
+    </body>
+  </worldbody>
+</mujoco>

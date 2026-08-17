@@ -26,6 +26,7 @@ stiffness parameter.
 | `Cylinder { radius, half_height }` (v1) | solid cylinder, axis along local Z (MuJoCo convention). |
 | `Ellipsoid { semi_axes }` (v1) | 3 semi-axes along body-frame X/Y/Z. |
 | `Mesh { mesh_id }` (v1) | reference into [`World::meshes`]. See "convex mesh trust model" below. |
+| `Hfield { hfield_id }` (v3) | reference into `World::hfields`; normalized elevation grid with a finite base box. |
 
 inertia helpers for uniform-density variants live in `newt::geom`: solid
 sphere, box, capsule, cylinder, ellipsoid. `Body::solid_*` constructors call
@@ -72,15 +73,16 @@ before giving up. "Impl" = shipping in `contact::narrow_phase`, "Deferred" =
 returns an empty buffer AND is flagged by
 `World::validate_supported_pairs()`.
 
-|              | Plane   | Sphere  | Box     | Capsule | Cylinder | Ellipsoid | Mesh    |
-|--------------|---------|---------|---------|---------|----------|-----------|---------|
-| **Plane**    | —       | Impl    | Impl    | Impl    | Impl     | Impl      | Impl    |
-| **Sphere**   | Impl    | Impl    | Deferred| Impl    | Impl     | Impl      | Impl    |
-| **Box**      | Impl    | Deferred| Impl    | Deferred| Deferred | Deferred  | Deferred|
-| **Capsule**  | Impl    | Impl    | Deferred| Impl    | Deferred | Deferred  | Deferred|
-| **Cylinder** | Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred|
-| **Ellipsoid**| Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred|
-| **Mesh**     | Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred|
+|              | Plane   | Sphere  | Box     | Capsule | Cylinder | Ellipsoid | Mesh    | Hfield |
+|--------------|---------|---------|---------|---------|----------|-----------|---------|--------|
+| **Plane**    | —       | Impl    | Impl    | Impl    | Impl     | Impl      | Impl    | —      |
+| **Sphere**   | Impl    | Impl    | Deferred| Impl    | Impl     | Impl      | Impl    | Impl   |
+| **Box**      | Impl    | Deferred| Impl    | Deferred| Deferred | Deferred  | Deferred| Impl   |
+| **Capsule**  | Impl    | Impl    | Deferred| Impl    | Deferred | Deferred  | Deferred| Impl   |
+| **Cylinder** | Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred| —      |
+| **Ellipsoid**| Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred| —      |
+| **Mesh**     | Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred| —      |
+| **Hfield**   | —       | Impl    | Impl    | Impl    | —        | —         | —       | —      |
 
 Contacts-per-pair for the implemented primitives:
 
@@ -97,6 +99,9 @@ Contacts-per-pair for the implemented primitives:
 | sphere-cylinder | `contact::sphere_cylinder` | ≤ 1 (closest point) |
 | sphere-ellipsoid | `contact::sphere_ellipsoid` | ≤ 1 (12-iter Newton) |
 | sphere-mesh | `contact::sphere_mesh` | ≤ 1 (closest-point-on-triangle over faces) |
+| sphere-hfield | `contact::sphere_hfield` | ≤ 4 deepest prism candidates |
+| capsule-hfield | `contact::capsule_hfield` | ≤ 4 deepest endpoint candidates |
+| box-hfield | `contact::box_hfield` | ≤ 4 deepest vertex candidates |
 | capsule-capsule | `contact::capsule_capsule` | ≤ 1 |
 | box-box | `contact::box_box` (full OBB SAT) | ≤ 4 |
 
@@ -165,6 +170,24 @@ now stack (previously the upper collapsed straight through).
 `mesh_plane` iterates VERTICES. This is exact for a convex polyhedron —
 the deepest point on the mesh in any direction is always a vertex — so a
 tetrahedron resting on a face emits contacts at its three "down" vertices.
+
+### heightfields
+
+`HeightField` stores an `nrow × ncol` row-major grid and
+`size = (half_width_x, half_width_y, top_height, base_depth)`. Data values
+are normalized to `[0, 1]`. The surface height is `data * top_height`; the
+finite base extends to `-base_depth`.
+
+Each cell uses the fixed `00 → 11` diagonal. Its two top triangles, copied at
+the base depth, define the triangular-prism decomposition. Sphere and capsule
+collision use the closest point on each top triangle. Box collision tests each
+box vertex against those triangles. Candidates use row, column, diagonal, and
+vertex order. The existing per-pair cap retains the deepest four candidates.
+
+Hfield collision supports sphere, capsule, and box only. Mesh, cylinder, and
+ellipsoid pairs are deferred and rejected by active-pair validation. Hfield
+contacts enter the same in-step solver pass and penalty-stage callback as
+other contacts.
 
 pair filtering: when `World::pair_list` is `None`, pairs are enumerated as
 `(i, j)` with `i < j` over the geom vector, skipping same-body pairs and

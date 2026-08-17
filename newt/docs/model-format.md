@@ -43,6 +43,7 @@ zero hinge axes — every branch has a dedicated unit test in
   "bodies":   [ ... ],
   "trees":    [ ... ],
   "meshes":   [ ... ],
+  "hfields":  [ ... ],
   "geoms":    [ ... ],
   "sites":    [ ... ],
   "actuators":[ ... ],
@@ -221,6 +222,30 @@ lookup by name resolves to a mesh id used at runtime.
   section in [`docs/contacts.md`](contacts.md). The loader runs only
   structural checks; convexity itself is not verified.
 
+## hfields
+
+Heightfield assets use normalized row-major elevation data:
+
+```json
+{
+  "name": "terrain",
+  "nrow": 3,
+  "ncol": 3,
+  "size": [2, 2, 0.8, 0.2],
+  "data": [0, 0.2, 0.3, 0.1, 0.4, 0.5, 0.2, 0.5, 0.7]
+}
+```
+
+`nrow` and `ncol` are at least 2. `size` is
+`[half_width_x, half_width_y, top_height, base_depth]`, with all values
+positive. `data` may also be named `elevation`; it must contain exactly
+`nrow*ncol` values in `[0,1]`. PNG files are not part of the zero-dependency
+subset.
+
+Reference a field from a geom with
+`{"kind":"hfield","hfield":"terrain"}`. Hfield collision supports
+sphere, capsule, and box pairs. Mesh and other primitive pairs are rejected.
+
 ## geoms
 
 ```json
@@ -248,6 +273,8 @@ lookup by name resolves to a mesh id used at runtime.
     - `{"kind":"ellipsoid","semi_axes":[ax,ay,az]}` (v1)
     - `{"kind":"mesh","mesh":"NAME"}` (v1 — references the top-level
       `meshes` asset table)
+    - `{"kind":"hfield","hfield":"NAME"}` (v3 — references the top-level
+      `hfields` asset table)
 - **attach** — one of:
     - `{"kind":"static"}` — only plane geoms may be static.
     - `{"kind":"body","body":"NAME"}` — attaches to a free body.

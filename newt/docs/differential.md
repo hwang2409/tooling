@@ -68,6 +68,9 @@ those units.
 | tendon_pulley_2to1 | 1.95e-7 | 4.0e-7 | 1.18e-6 | 3.0e-6 | parity; matched Euler PGS |
 | tendon_mixed_wrap | 1.06e-7 | 3.0e-7 | 5.04e-7 | 1.0e-6 | parity; matched Euler PGS |
 | mocap_rangefinder | 0                  | 1.0e-6     | 0                  | 1.0e-6     | parity; sensors 2.4e-8 |
+| hfield_sphere_ramp | 3.211479e-1       | 5.0e-1     | 1.101810     | 2.0        | bounded hfield terrain divergence |
+| hfield_box_terrain | 1.906255           | 2.5        | 43.93162     | 55.0       | bounded multi-cell terrain divergence |
+| hfield_capsule_waves | 4.643577        | 5.5        | 90.03303     | 120.0      | bounded wavy-terrain divergence |
 
 ### NEWT-27 spatial tendon probes
 
@@ -82,6 +85,20 @@ scorecard above. Each scenario has a permanent differential test.
 
 The finite-difference probes report maximum relative Jacobian errors of
 `2.883e-3` for the cylinder wrap and `1.195e-3` for the pulley branches.
+
+### NEWT-28 heightfield captures
+
+MuJoCo 3.11.0 Euler/PGS captures are committed in
+`tests/references/hfield_*.bin`, with matching XML provenance. The three
+scenes cover a sphere on a ramp, a box on uneven terrain, and a capsule on
+waves. The measured maxima are listed above. The wide bounds are explicit:
+the current prism-top candidate model keeps the contact set bounded, but it
+does not claim trajectory parity for rolling and multi-cell transitions yet.
+The fixtures remain required regression evidence until those residuals close.
+The matching Newton/Euler captures measure qpos/qvel maxima of
+`(0.650158, 5.043927)`, `(1.871275, 63.14738)`, and `(2.437249,
+109.1951)` for sphere, box, and capsule respectively. Their asserted bounds
+are `(1.0, 8.0)`, `(2.5, 75.0)`, and `(3.0, 130.0)`.
 
 `mocap_rangefinder` also compares all seven `sensordata` values at each
 sample. The maximum direct sensor error is `2.4e-8`, below the `2.0e-6`

@@ -216,6 +216,18 @@ fn tolerance(name: &str) -> Tolerance {
             qpos: 1.0e-6,
             qvel: 1.0e-6,
         },
+        "hfield_sphere_ramp" => Tolerance {
+            qpos: 0.5,
+            qvel: 2.0,
+        },
+        "hfield_box_terrain" => Tolerance {
+            qpos: 2.5,
+            qvel: 55.0,
+        },
+        "hfield_capsule_waves" => Tolerance {
+            qpos: 5.5,
+            qvel: 120.0,
+        },
         other => panic!("no tolerance for scenario {other:?}"),
     }
 }
@@ -1195,6 +1207,18 @@ fn matched_integrator_tolerance(name: &str) -> Tolerance {
             qpos: 2.0e-2,
             qvel: 5.0e-1,
         },
+        "hfield_sphere_ramp" => Tolerance {
+            qpos: 1.0,
+            qvel: 8.0,
+        },
+        "hfield_box_terrain" => Tolerance {
+            qpos: 2.5,
+            qvel: 75.0,
+        },
+        "hfield_capsule_waves" => Tolerance {
+            qpos: 3.0,
+            qvel: 130.0,
+        },
         other => panic!("no matched-integrator tolerance for {other:?}"),
     }
 }
@@ -1400,6 +1424,50 @@ fn differential_tendon_mixed_wrap() {
 fn differential_mocap_rangefinder() {
     let d = run_scenario(&scenario("mocap_rangefinder"));
     assert_within_tolerance("mocap_rangefinder", &d);
+}
+
+#[test]
+fn differential_hfield_euler_pgs_rows() {
+    for name in [
+        "hfield_sphere_ramp",
+        "hfield_box_terrain",
+        "hfield_capsule_waves",
+    ] {
+        let d = run_scenario(&scenario(name));
+        assert_within_tolerance(name, &d);
+    }
+}
+
+#[test]
+fn differential_hfield_newton_euler_rows() {
+    for name in [
+        "hfield_sphere_ramp",
+        "hfield_box_terrain",
+        "hfield_capsule_waves",
+    ] {
+        let d = run_scenario_with_solver(
+            &scenario(name),
+            Some(Integrator::Euler),
+            Some(SolverMode::Newton),
+            "_newton_euler",
+        );
+        let bound = match name {
+            "hfield_sphere_ramp" => Tolerance {
+                qpos: 1.0,
+                qvel: 8.0,
+            },
+            "hfield_box_terrain" => Tolerance {
+                qpos: 2.5,
+                qvel: 75.0,
+            },
+            "hfield_capsule_waves" => Tolerance {
+                qpos: 3.0,
+                qvel: 130.0,
+            },
+            _ => unreachable!(),
+        };
+        assert_within_bounds(&format!("{name} Newton Euler"), &d, bound);
+    }
 }
 
 #[test]
