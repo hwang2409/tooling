@@ -1,0 +1,9 @@
+<mujoco model="hfield_conformance_default">
+  <option/>
+  <!-- case: saddle_sphere -->
+  <!-- case: steep_sphere -->
+  <!-- case: ridge_capsule -->
+  <!-- case: outer_top_side_sphere -->
+  <!-- case: cell_boundary_sphere -->
+  <!-- case: base_side_sphere -->
+</mujoco>

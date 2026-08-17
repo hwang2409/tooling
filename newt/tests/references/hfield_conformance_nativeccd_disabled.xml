@@ -1,0 +1,5 @@
+<mujoco model="hfield_conformance_nativeccd_disabled">
+  <option><flag nativeccd="disable"/></option>
+  <!-- case: steep_box -->
+  <!-- case: box_base_crossing -->
+</mujoco>

@@ -21,6 +21,13 @@ fn number(value: &Value, name: &str) -> f32 {
     *value as f32
 }
 
+fn string<'a>(value: &'a Value, name: &str) -> &'a str {
+    let Value::String(value) = value else {
+        panic!("{name} must be a string");
+    };
+    value
+}
+
 fn numbers(value: &Value, name: &str) -> Vec<f32> {
     let Value::Array(values) = value else {
         panic!("{name} must be an array");
@@ -98,19 +105,41 @@ fn parsed_mujoco_heightfield_contacts_match_all_adversarial_poses() {
     let Value::Array(cases) = object(&document, "cases") else {
         panic!("cases must be an array");
     };
-    let provenance = object(&document, "provenance");
-    assert_eq!(
-        match object(provenance, "box_mode") {
-            Value::String(value) => value,
-            _ => panic!("box_mode provenance must be a string"),
-        },
-        "nativeccd=disable via <option><flag nativeccd=\"disable\"/></option>"
-    );
     for case in cases {
         let name = match object(case, "name") {
             Value::String(name) => name,
             _ => panic!("case name must be a string"),
         };
+        let provenance = object(case, "provenance");
+        let mode = string(object(provenance, "mode"), "mode");
+        let nativeccd = string(object(provenance, "nativeccd"), "nativeccd");
+        let source_xml = string(object(provenance, "source_xml"), "source_xml");
+        let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/references")
+            .join(source_xml);
+        let source = std::fs::read_to_string(&source_path)
+            .unwrap_or_else(|error| panic!("{name}: cannot read {source_xml}: {error}"));
+        assert!(
+            source.contains(&format!("case: {name}")),
+            "{name}: source XML does not bind this case"
+        );
+        match nativeccd {
+            "default" => {
+                assert_eq!(mode, "default", "{name}: default mode mismatch");
+                assert!(
+                    !source.contains("nativeccd=\"disable\""),
+                    "{name}: default source XML disables nativeccd"
+                );
+            }
+            "disable" => {
+                assert_eq!(mode, "legacy", "{name}: legacy mode mismatch");
+                assert!(
+                    source.contains("<flag nativeccd=\"disable\"/>"),
+                    "{name}: legacy source XML lacks nativeccd=disable"
+                );
+            }
+            _ => panic!("{name}: unsupported nativeccd state {nativeccd}"),
+        }
         let shape = match object(case, "shape") {
             Value::String(shape) => shape,
             _ => panic!("case shape must be a string"),
@@ -167,7 +196,7 @@ fn parsed_mujoco_heightfield_contacts_match_all_adversarial_poses() {
         let mut expected: Vec<Contact> = expected_values.iter().map(contact).collect();
         let mut actual = actual.as_slice().to_vec();
         let position_tolerance = optional_number(case, "position_tolerance").unwrap_or(5.0e-3);
-        let normal_tolerance = optional_number(case, "normal_tolerance").unwrap_or(5.0e-3);
+        let normal_bound = optional_number(case, "normal_bound").unwrap_or(5.0e-3);
         let order = |a: &Contact, b: &Contact| {
             b.penetration
                 .total_cmp(&a.penetration)
@@ -183,7 +212,7 @@ fn parsed_mujoco_heightfield_contacts_match_all_adversarial_poses() {
                 expected.position_world,
                 position_tolerance,
             );
-            close_vec(actual.normal_world, expected.normal_world, normal_tolerance);
+            close_vec(actual.normal_world, expected.normal_world, normal_bound);
             assert!(
                 (actual.penetration - expected.penetration).abs() <= 5.0e-3,
                 "{name}: {actual:?} != {expected:?}"

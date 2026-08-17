@@ -4257,6 +4257,19 @@ mod tests {
     }
 
     #[test]
+    fn hfield_all_equal_elevation_normalizes_to_zero() {
+        let scene = load_mjcf_str(
+            r#"<mujoco><asset><hfield name="terrain" nrow="2" ncol="2"
+                 size="2 3 4 0.5" elevation="7 7 7 7"/></asset></mujoco>"#,
+        )
+        .expect("equal elevations should load");
+        let hfield = &scene.world.hfields[0];
+        assert_eq!(hfield.data, vec![0.0; 4]);
+        assert_eq!(hfield.height(0, 0), 0.0);
+        assert_eq!(hfield.height(1, 1), 0.0);
+    }
+
+    #[test]
     fn hfield_inline_dimensions_and_sizes_are_rejected() {
         let bad_dims = err(r#"<mujoco><asset><hfield name="terrain" nrow="1" ncol="2"
                  size="1 1 1 0.2" elevation="0 0"/></asset></mujoco>"#);

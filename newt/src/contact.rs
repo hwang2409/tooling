@@ -2209,69 +2209,6 @@ pub fn box_hfield(
     out
 }
 
-/// Emit the two base-face manifold features when the box crosses the prism
-/// base. The base is a convex face, so four corner probes are not a valid
-/// manifold. Use the two opposing box-face support lines instead.
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-fn box_base_feature_contacts(
-    box_pose: &GeomPose,
-    half_extents: Vec3,
-    hfield_pose: &GeomPose,
-    hfield: &HeightField,
-    idx_box: usize,
-    idx_hfield: usize,
-    friction: f32,
-    margin: f32,
-    gap: f32,
-    out: &mut ContactBuf,
-) {
-    let center = hfield_pose
-        .orientation
-        .inverse_rotate(box_pose.position - hfield_pose.position);
-    let basis = [
-        hfield_pose
-            .orientation
-            .inverse_rotate(box_pose.rotate(Vec3::X)),
-        hfield_pose
-            .orientation
-            .inverse_rotate(box_pose.rotate(Vec3::Y)),
-        hfield_pose
-            .orientation
-            .inverse_rotate(box_pose.rotate(Vec3::Z)),
-    ];
-    let box_radius = half_extents.x * crate::math::abs(basis[0].z)
-        + half_extents.y * crate::math::abs(basis[1].z)
-        + half_extents.z * crate::math::abs(basis[2].z);
-    let box_min = center.z - box_radius;
-    let box_max = center.z + box_radius;
-    if box_min >= -hfield.size[3] {
-        return;
-    }
-    let top = hfield.size[2];
-    let overlap = (box_max.min(top) - box_min.max(-hfield.size[3])) + margin;
-    if overlap <= 0.0 {
-        return;
-    }
-    let normal = hfield_pose.rotate(-Vec3::Z);
-    let support_offset = basis[1] * half_extents.y;
-    for offset in [-support_offset, support_offset] {
-        let mut point = center + offset;
-        // The two support lines land on opposite sides of the fixed cell
-        // diagonal. Their base anchors use the corresponding box-face depth.
-        point.z = center.z + offset.y * 0.25;
-        out.push_deepest_unique(Contact {
-            geom_a: idx_box,
-            geom_b: idx_hfield,
-            position_world: hfield_pose.point_to_world(point),
-            normal_world: normal,
-            penetration: overlap,
-            friction,
-            gap,
-        });
-    }
-}
-
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct MprVertex {
@@ -3373,6 +3310,30 @@ mod tests {
     }
 
     #[test]
+    fn hfield_internal_crease_has_no_wall_contact() {
+        let field = flat_hfield();
+        let contacts = sphere_hfield(
+            0,
+            &identity_pose(Vec3::new(0.02, 0.02, -0.05)),
+            0.1,
+            1,
+            &identity_pose(Vec3::ZERO),
+            &field,
+            0.5,
+            0.0,
+            0.0,
+        );
+        assert_eq!(contacts.len, 1, "{contacts:?}");
+        assert!(
+            contacts
+                .as_slice()
+                .iter()
+                .all(|contact| contact.normal_world.z > 0.99),
+            "{contacts:?}"
+        );
+    }
+
+    #[test]
     fn hfield_cell_boundary_continuity_sweep_kills_vertical_sampling_mutant() {
         let field = HeightField {
             nrow: 2,
@@ -3532,6 +3493,27 @@ mod tests {
         let contact = contacts.contacts[0];
         assert!(contact.normal_world.x > 0.99);
         assert!((contact.position_world.x - 0.975).abs() < 1.0e-5);
+        assert!((contact.penetration - 0.05).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn hfield_base_center_fixture_kills_base_face_mutant() {
+        let field = flat_hfield();
+        let contacts = sphere_hfield(
+            0,
+            &identity_pose(Vec3::new(0.0, 0.0, -0.25)),
+            0.1,
+            1,
+            &identity_pose(Vec3::ZERO),
+            &field,
+            0.5,
+            0.0,
+            0.0,
+        );
+        assert_eq!(contacts.len, 1, "{contacts:?}");
+        let contact = contacts.contacts[0];
+        assert!(contact.normal_world.z < -0.99, "{contact:?}");
+        assert!((contact.position_world.z + 0.175).abs() < 1.0e-5);
         assert!((contact.penetration - 0.05).abs() < 1.0e-5);
     }
 

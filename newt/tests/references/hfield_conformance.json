@@ -1,14 +1,11 @@
 {
   "mujoco": "3.11.0",
   "capture": "static mj_forward contacts; elevation rows are MuJoCo storage order",
-  "provenance": {
-    "box_mode": "nativeccd=disable via <option><flag nativeccd=\"disable\"/></option>",
-    "sphere_capsule_mode": "MuJoCo default nativeccd mode"
-  },
   "cases": [
     {
       "name": "saddle_sphere",
       "shape": "sphere",
+      "provenance": {"mode": "default", "nativeccd": "default", "source_xml": "hfield_conformance_default.xml"},
       "field": {"nrow": 2, "ncol": 2, "size": [1, 1, 1, 0.2], "data": [0, 1, 1, 0]},
       "pose": {"position": [0, 0, 0.35]},
       "radius": 0.3,
@@ -20,6 +17,7 @@
     {
       "name": "steep_sphere",
       "shape": "sphere",
+      "provenance": {"mode": "default", "nativeccd": "default", "source_xml": "hfield_conformance_default.xml"},
       "field": {"nrow": 2, "ncol": 2, "size": [1, 1, 1, 0.2], "data": [0, 1, 0, 1]},
       "pose": {"position": [0, 0, 0.7]},
       "radius": 0.3,
@@ -31,6 +29,7 @@
     {
       "name": "ridge_capsule",
       "shape": "capsule",
+      "provenance": {"mode": "default", "nativeccd": "default", "source_xml": "hfield_conformance_default.xml"},
       "field": {"nrow": 2, "ncol": 2, "size": [1, 1, 1, 0.2], "data": [0, 1, 1, 0]},
       "pose": {"position": [0, 0, 0.45]},
       "radius": 0.1,
@@ -44,7 +43,8 @@
       "name": "steep_box",
       "shape": "box",
       "position_tolerance": 0.8,
-      "normal_tolerance": 0.02,
+      "normal_bound": 0.0145,
+      "provenance": {"mode": "legacy", "nativeccd": "disable", "source_xml": "hfield_conformance_nativeccd_disabled.xml"},
       "field": {"nrow": 2, "ncol": 2, "size": [1, 1, 1, 0.2], "data": [0, 1, 0, 1]},
       "pose": {"position": [0, 0, 0.45], "axis": [0, 1, 0], "angle": 0.4},
       "half_extents": [0.25, 0.25, 0.25],
@@ -57,6 +57,7 @@
       "name": "box_base_crossing",
       "shape": "box",
       "position_tolerance": 1.0,
+      "provenance": {"mode": "legacy", "nativeccd": "disable", "source_xml": "hfield_conformance_nativeccd_disabled.xml"},
       "field": {"nrow": 2, "ncol": 2, "size": [1, 1, 1, 0.2], "data": [1, 1, 1, 1]},
       "pose": {"position": [0, 0, -0.1]},
       "half_extents": [0.2, 0.2, 0.2],
@@ -68,6 +69,7 @@
     {
       "name": "outer_top_side_sphere",
       "shape": "sphere",
+      "provenance": {"mode": "default", "nativeccd": "default", "source_xml": "hfield_conformance_default.xml"},
       "field": {"nrow": 2, "ncol": 2, "size": [1, 1, 1, 0.2], "data": [0, 0, 0, 0]},
       "pose": {"position": [1.02, 0, 0.02]},
       "radius": 0.05,
@@ -78,6 +80,7 @@
     {
       "name": "cell_boundary_sphere",
       "shape": "sphere",
+      "provenance": {"mode": "default", "nativeccd": "default", "source_xml": "hfield_conformance_default.xml"},
       "field": {"nrow": 2, "ncol": 3, "size": [1.5, 1, 1, 0.2], "data": [0, 0, 0, 0, 0, 0]},
       "pose": {"position": [0, 0, 0.15]},
       "radius": 0.2,
@@ -89,6 +92,7 @@
     {
       "name": "base_side_sphere",
       "shape": "sphere",
+      "provenance": {"mode": "default", "nativeccd": "default", "source_xml": "hfield_conformance_default.xml"},
       "field": {"nrow": 2, "ncol": 2, "size": [1, 1, 1, 0.2], "data": [0, 0, 0, 0]},
       "pose": {"position": [1, 0, -0.1]},
       "radius": 0.05,

@@ -119,11 +119,11 @@ precise declaration is:
 <option><flag nativeccd="disable"/></option>
 ```
 
-Newt's box-hfield narrow phase matches that mode's contact count, minimum
-penetration depths, and feature normals on the committed probe 6 and probe 8
-fixtures. MuJoCo exposes one hfield geom, so it does not expose its internal
-prism id. A diagnostic matched each contact to the same cell and prism by its
-normal and depth:
+Newt's box-hfield narrow phase matches that mode's contact count and minimum
+penetration depths on the committed probe 6 and probe 8 fixtures. Probe 8
+also matches the contact normals exactly. MuJoCo exposes one hfield geom, so
+it does not expose its internal prism id. A diagnostic matched each contact to
+the same cell and prism by its normal and depth:
 
 | engine | contact | cell | prism | top triangle |
 |--------|---------:|------|-------:|--------------|
@@ -132,13 +132,16 @@ normal and depth:
 | newt SAT | 0 | (0, 0) | 1 | (p00, p11, p01) |
 | newt SAT | 1 | (0, 0) | 0 | (p00, p10, p11) |
 
-Probe 6 uses different contact-position constructions. MuJoCo's per-prism
-MPR and newt's SAT support-feature construction produced measured position
-residuals of `0.07246` and `0.04990` in the current implementation. The
-fixture keeps the dictated conservative per-contact position bound of `0.8`.
-The normal residual on the second edge feature is `1.43e-2`; the harness
-records this measured MPR-versus-SAT feature tolerance. Counts and depths are
-the parity criteria.
+Probe 6 uses different contact constructions. MuJoCo's per-prism MPR and
+newt's SAT support-feature construction produced measured position residuals
+of `0.07246` and `0.04990`. The fixture uses the dictated conservative
+per-contact position bound of `0.8`. The second contact's normal residual is
+`1.43e-2`. SAT selects a unique minimum-penetration axis, the box-local Z
+axis crossed with the internal `p11-p00` prism edge, at overlap `0.3649474`.
+The next candidate is `0.5107937`, so this is not a tie or axis-quantization
+bug. It is a construction difference between MuJoCo's per-prism MPR and
+newt's SAT. The fixture records the measured normal bound `1.45e-2`; probe 6
+does not claim exact normal parity. Counts and depths remain exact criteria.
 
 The direct dynamics anchor is `hfield_box_steep_ccd_disabled`: a tilted box
 released above the steep cell for 100 Euler steps under the same
