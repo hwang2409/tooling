@@ -454,8 +454,9 @@ Type-specific fields:
   `tausmooth` defaults to `0`, and `ctrlrange` defaults to `[0, 1]`.
   `force: -1` uses `scale / max(MINVAL, acc0)`.
 - **general muscle** — set `gaintype`, `biastype`, and `dyntype` to
-  `"muscle"`. Use nine-value `gainprm` and `biasprm`, three-value
-  `dynprm`, and explicit `lengthrange`. Unknown fields are rejected.
+  `"muscle"`. Use explicit nine-value `gainprm` and `biasprm`; omitted
+  `dynprm` uses MuJoCo's compiled `[1, 0, 0]`. Explicit `lengthrange` is
+  required. Unknown fields are rejected.
 - **general** — `gaintype ∈ {"fixed", "affine"}`, `gainprm` (3-array),
   `biastype ∈ {"none", "affine"}`, `biasprm` (3-array), `gear`,
   `dyntype ∈ {"none", "filter"}`, `dynprm` (scalar; filter tau for

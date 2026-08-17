@@ -200,12 +200,17 @@ pub struct Actuator {
     /// Unused by non-muscle actuators.
     pub muscle_dyn_prm: [f32; 3],
     /// Optional `(lo, hi)` clamp applied to `ctrl` before it enters
-    /// `gain*signal + bias` (and before activation integration).
-    /// `None` = no clamp.
+    /// `gain*signal + bias` (and before activation integration). The range
+    /// is stored separately from `ctrl_limited` because MuJoCo can carry a
+    /// range while the corresponding limited flag is false.
     pub ctrl_range: Option<(f32, f32)>,
     /// Optional `(lo, hi)` clamp applied to the joint torque after gear
-    /// multiplication. `None` = no clamp.
+    /// multiplication when `force_limited` is true.
     pub force_range: Option<(f32, f32)>,
+    /// Whether `ctrl_range` is active.
+    pub ctrl_limited: bool,
+    /// Whether `force_range` is active.
+    pub force_limited: bool,
     /// User command, ZOH per step. Setter: [`crate::tree::Tree::set_actuator_target`]
     /// (kept under the v0 name for API stability; MuJoCo would call this
     /// `data.ctrl[i]`).
@@ -233,6 +238,8 @@ impl Actuator {
             muscle_dyn_prm: [0.0; 3],
             ctrl_range: None,
             force_range: symmetric_range(force_range),
+            ctrl_limited: false,
+            force_limited: force_range > 0.0,
             ctrl: target,
             act: 0.0,
         }
@@ -265,6 +272,8 @@ impl Actuator {
             muscle_dyn_prm: [0.0; 3],
             ctrl_range: None,
             force_range: symmetric_range(force_range),
+            ctrl_limited: false,
+            force_limited: force_range > 0.0,
             ctrl: 0.0,
             act: 0.0,
         }
@@ -281,6 +290,8 @@ impl Actuator {
             muscle_dyn_prm: [0.0; 3],
             ctrl_range: None,
             force_range: symmetric_range(force_range),
+            ctrl_limited: false,
+            force_limited: force_range > 0.0,
             ctrl: 0.0,
             act: 0.0,
         }
@@ -331,6 +342,8 @@ impl Actuator {
             muscle_dyn_prm: [0.0; 3],
             ctrl_range,
             force_range,
+            ctrl_limited: ctrl_range.is_some(),
+            force_limited: force_range.is_some(),
             ctrl: 0.0,
             act: 0.0,
         }
@@ -361,7 +374,7 @@ impl Actuator {
             "muscle acc0 must be finite and >= 0"
         );
         assert!(dyn_prm[0] > 0.0, "muscle tau_act must be > 0");
-        assert!(dyn_prm[1] > 0.0, "muscle tau_deact must be > 0");
+        assert!(dyn_prm[1] >= 0.0, "muscle tau_deact must be >= 0");
         assert!(dyn_prm[2] >= 0.0, "muscle tausmooth must be >= 0");
         if let Some((lo, hi)) = ctrl_range {
             assert!(lo < hi, "ctrl_range must satisfy lo < hi");
@@ -384,6 +397,8 @@ impl Actuator {
             muscle_dyn_prm: dyn_prm,
             ctrl_range,
             force_range,
+            ctrl_limited: ctrl_range.is_some(),
+            force_limited: force_range.is_some(),
             ctrl: 0.0,
             act: 0.0,
         }
@@ -416,6 +431,13 @@ impl Actuator {
         )
     }
 
+    /// Set MuJoCo-style limit flags after loading a range.
+    pub fn with_limit_flags(mut self, ctrl_limited: bool, force_limited: bool) -> Self {
+        self.ctrl_limited = ctrl_limited;
+        self.force_limited = force_limited;
+        self
+    }
+
     // ---- tendon-transmission builder ---------------------------------
 
     /// Retarget a joint-mode actuator at a tendon. Consumes `self` and
@@ -443,9 +465,10 @@ impl Actuator {
     /// `dyn_type == Filter`.
     #[inline]
     pub fn clamped_ctrl(&self) -> f32 {
-        match self.ctrl_range {
-            Some((lo, hi)) => clamp_range(self.ctrl, lo, hi),
-            None => self.ctrl,
+        match (self.ctrl_limited, self.ctrl_range) {
+            (true, Some((lo, hi))) => clamp_range(self.ctrl, lo, hi),
+            (true, None) => self.ctrl,
+            (false, _) => self.ctrl,
         }
     }
 
@@ -521,9 +544,10 @@ impl Actuator {
                     * gear
             }
         };
-        match self.force_range {
-            Some((lo, hi)) => clamp_range(raw, lo, hi),
-            None => raw,
+        match (self.force_limited, self.force_range) {
+            (true, Some((lo, hi))) => clamp_range(raw, lo, hi),
+            (true, None) => raw,
+            (false, _) => raw,
         }
     }
 
@@ -595,7 +619,8 @@ impl Actuator {
                 self.act += alpha * (u - self.act);
             }
             DynType::Muscle => {
-                self.act += dt * muscle_dynamics(self.ctrl, self.act, self.muscle_dyn_prm);
+                self.act +=
+                    dt * muscle_dynamics(self.clamped_ctrl(), self.act, self.muscle_dyn_prm);
             }
             DynType::None => {}
         }
@@ -646,7 +671,8 @@ pub fn muscle_gain(len: f32, vel: f32, length_range: [f32; 2], acc0: f32, prm: [
     } else if v <= 0.0 {
         (v + 1.0) * (v + 1.0)
     } else if v <= y {
-        prm[8] - (y - v) * (y - v) / y.max(MJ_MINVAL)
+        let y_safe = if y.abs() > MJ_MINVAL { y } else { MJ_MINVAL };
+        prm[8] - (y - v) * (y - v) / y_safe
     } else {
         prm[8]
     };
@@ -998,6 +1024,7 @@ mod tests {
         a.ctrl = 100.0;
         a.ctrl_range = Some((-2.0, 2.0));
         a.force_range = Some((-25.0, 25.0));
+        a = a.with_limit_flags(true, true);
         assert!(approx(a.torque(0.0, 0.0), 20.0, 1e-6));
         // Bump ctrl clamp so force clamp is the binder.
         a.ctrl_range = Some((-100.0, 100.0));

@@ -3000,6 +3000,7 @@ impl Loader {
         };
         actuator.ctrl = initial_target;
         actuator.ctrl_range = ctrl_range;
+        actuator.ctrl_limited = actuator.ctrl_range.is_some();
         if self.actuators_by_name.contains_key(&name) {
             return fail(path, format!("duplicate actuator name \"{name}\""));
         }
@@ -3072,6 +3073,7 @@ impl Loader {
             actuator = actuator.on_tendon(ti);
         }
         actuator.ctrl_range = ctrl_range;
+        actuator.ctrl_limited = actuator.ctrl_range.is_some();
         if self.actuators_by_name.contains_key(&name) {
             return fail(path, format!("duplicate actuator name \"{name}\""));
         }
@@ -3124,6 +3126,7 @@ impl Loader {
         }
         let mut actuator = Actuator::velocity(link_idx, kv, clamp);
         actuator.ctrl_range = ctrl_range;
+        actuator.ctrl_limited = actuator.ctrl_range.is_some();
         if self.actuators_by_name.contains_key(&name) {
             return fail(path, format!("duplicate actuator name \"{name}\""));
         }
@@ -3333,13 +3336,7 @@ impl Loader {
             prm[0] = nums[0];
             prm[1] = nums[1];
         }
-        if prm[0] >= prm[1]
-            || prm[4] < 0.0
-            || prm[5] <= prm[4]
-            || prm[6] <= 0.0
-            || prm[7] < 0.0
-            || prm[8] < 1.0
-        {
+        if prm[0] >= prm[1] || prm[4] >= 1.0 || prm[5] <= 1.0 || prm[6] <= 0.0 || prm[7] < 0.0 {
             return fail(path, "invalid muscle curve parameters");
         }
         let time_src = attr_with_default(e, "muscle", "timeconst", &dc).unwrap_or("0.01 0.04");
@@ -3375,14 +3372,18 @@ impl Loader {
         if acc0 < 0.0 {
             return fail(path, "acc0 must be >= 0");
         }
+        let ctrl_range_src = attr_with_default(e, "muscle", "ctrlrange", &dc).is_some();
         let ctrl_range =
             parse_lo_hi_range_attr(e, "muscle", "ctrlrange", &dc, path)?.or(Some((0.0, 1.0)));
         let force_range = parse_lo_hi_range_attr(e, "muscle", "forcerange", &dc, path)?;
-        for attr in ["ctrllimited", "forcelimited"] {
-            if let Some(v) = e.attr(attr) {
-                let _ = parse_bool(v, path, attr)?;
-            }
-        }
+        let ctrl_limited = attr_with_default(e, "muscle", "ctrllimited", &dc)
+            .map(|v| parse_bool(v, path, "ctrllimited"))
+            .transpose()?
+            .unwrap_or(ctrl_range_src);
+        let force_limited = attr_with_default(e, "muscle", "forcelimited", &dc)
+            .map(|v| parse_bool(v, path, "forcelimited"))
+            .transpose()?
+            .unwrap_or(force_range.is_some());
         let target = attr_with_default(e, "muscle", "target", &dc)
             .map(|v| parse_f32(v, path, "target"))
             .transpose()?
@@ -3398,6 +3399,7 @@ impl Loader {
             ctrl_range,
             force_range,
         );
+        actuator = actuator.with_limit_flags(ctrl_limited, force_limited);
         actuator.ctrl = target;
         if let Some(ti) = tendon_idx {
             actuator = actuator.on_tendon(ti);
@@ -3422,7 +3424,7 @@ impl Loader {
             match k.as_str() {
                 "name" | "joint" | "tendon" | "gaintype" | "gainprm" | "biastype" | "biasprm"
                 | "dyntype" | "dynprm" | "lengthrange" | "gear" | "ctrlrange" | "forcerange"
-                | "class" | "acc0" => {}
+                | "class" | "ctrllimited" | "forcelimited" | "acc0" => {}
                 other => {
                     return fail(
                         path,
@@ -3431,19 +3433,25 @@ impl Loader {
                 }
             }
         }
-        let gain_type = attr_with_default(e, "general", "gaintype", dc).unwrap_or("muscle");
-        let bias_type = attr_with_default(e, "general", "biastype", dc).unwrap_or("muscle");
-        let dyn_type = attr_with_default(e, "general", "dyntype", dc).unwrap_or("muscle");
+        let gain_type = attr_with_default(e, "general", "gaintype", dc).ok_or_else(|| {
+            MjcfError::new(path, "muscle general requires explicit gaintype=muscle")
+        })?;
+        let bias_type = attr_with_default(e, "general", "biastype", dc).ok_or_else(|| {
+            MjcfError::new(path, "muscle general requires explicit biastype=muscle")
+        })?;
+        let dyn_type = attr_with_default(e, "general", "dyntype", dc).ok_or_else(|| {
+            MjcfError::new(path, "muscle general requires explicit dyntype=muscle")
+        })?;
         if gain_type != "muscle" || bias_type != "muscle" || dyn_type != "muscle" {
             return fail(
                 path,
                 "muscle general requires gaintype, biastype, and dyntype=muscle",
             );
         }
-        let parse9 = |attr: &str, default: [f32; 9]| -> Result<[f32; 9], MjcfError> {
-            let Some(src) = attr_with_default(e, "general", attr, dc) else {
-                return Ok(default);
-            };
+        let parse9 = |attr: &str| -> Result<[f32; 9], MjcfError> {
+            let src = attr_with_default(e, "general", attr, dc).ok_or_else(|| {
+                MjcfError::new(path, format!("muscle general requires explicit {attr}"))
+            })?;
             let nums = parse_f32_list(src, path, attr)?;
             if nums.len() != 9 {
                 return fail(path, format!("{attr} must have nine numbers"));
@@ -3452,11 +3460,8 @@ impl Loader {
             out.copy_from_slice(&nums);
             Ok(out)
         };
-        let gain_prm = parse9(
-            "gainprm",
-            [0.75, 1.05, -1.0, 200.0, 0.5, 1.6, 1.5, 1.3, 1.2],
-        )?;
-        let bias_prm = parse9("biasprm", gain_prm)?;
+        let gain_prm = parse9("gainprm")?;
+        let bias_prm = parse9("biasprm")?;
         let length_src = attr_with_default(e, "general", "lengthrange", dc).ok_or_else(|| {
             MjcfError::new(path, "<general muscle> requires explicit lengthrange")
         })?;
@@ -3465,18 +3470,27 @@ impl Loader {
         if length[0] >= length[1] {
             return fail(path, "lengthrange low must be < high");
         }
-        let dyn_src = attr_with_default(e, "general", "dynprm", dc).unwrap_or("0.01 0.04 0");
+        let dyn_src = attr_with_default(e, "general", "dynprm", dc).unwrap_or("1 0 0");
         let muscle_dyn = parse_f32_list(dyn_src, path, "dynprm")?;
         require_len(&muscle_dyn, 3, path, "dynprm")?;
-        if muscle_dyn[0] <= 0.0 || muscle_dyn[1] <= 0.0 || muscle_dyn[2] < 0.0 {
+        if muscle_dyn[0] <= 0.0 || muscle_dyn[1] < 0.0 || muscle_dyn[2] < 0.0 {
             return fail(
                 path,
                 "muscle dynprm requires positive time constants and nonnegative tausmooth",
             );
         }
+        let ctrl_range_src = attr_with_default(e, "general", "ctrlrange", dc).is_some();
         let ctrl_range =
             parse_lo_hi_range_attr(e, "general", "ctrlrange", dc, path)?.or(Some((0.0, 1.0)));
         let force_range = parse_lo_hi_range_attr(e, "general", "forcerange", dc, path)?;
+        let ctrl_limited = attr_with_default(e, "general", "ctrllimited", dc)
+            .map(|v| parse_bool(v, path, "ctrllimited"))
+            .transpose()?
+            .unwrap_or(ctrl_range_src);
+        let force_limited = attr_with_default(e, "general", "forcelimited", dc)
+            .map(|v| parse_bool(v, path, "forcelimited"))
+            .transpose()?
+            .unwrap_or(force_range.is_some());
         let gear = attr_with_default(e, "general", "gear", dc)
             .map(|v| parse_f32(v, path, "gear"))
             .transpose()?
@@ -3499,6 +3513,7 @@ impl Loader {
             ctrl_range,
             force_range,
         );
+        actuator = actuator.with_limit_flags(ctrl_limited, force_limited);
         if let Some(ti) = tendon_idx {
             actuator = actuator.on_tendon(ti);
         }

@@ -2164,6 +2164,8 @@ fn parse_actuator(
                     "gear",
                     "ctrlrange",
                     "forcerange",
+                    "ctrllimited",
+                    "forcelimited",
                     "acc0",
                     "target",
                 ],
@@ -2390,8 +2392,17 @@ fn parse_muscle_actuator(
     if acc0 < 0.0 {
         return fail(&format!("{path}.acc0"), "acc0 must be >= 0");
     }
+    let ctrl_range_src = optional(fields, "ctrlrange").is_some();
     let ctrl_range = parse_range(fields, "ctrlrange", path)?.or(Some((0.0, 1.0)));
     let force_range = parse_range(fields, "forcerange", path)?;
+    let ctrl_limited = optional(fields, "ctrllimited")
+        .map(|v| get_bool(v, &format!("{path}.ctrllimited")))
+        .transpose()?
+        .unwrap_or(ctrl_range_src);
+    let force_limited = optional(fields, "forcelimited")
+        .map(|v| get_bool(v, &format!("{path}.forcelimited")))
+        .transpose()?
+        .unwrap_or(force_range.is_some());
     let mut a = Actuator::muscle(
         lidx,
         prm,
@@ -2403,6 +2414,7 @@ fn parse_muscle_actuator(
         ctrl_range,
         force_range,
     );
+    a = a.with_limit_flags(ctrl_limited, force_limited);
     a.ctrl = target;
     Ok(a)
 }
@@ -2431,6 +2443,8 @@ fn parse_general_muscle_actuator(
             "lengthrange",
             "ctrlrange",
             "forcerange",
+            "ctrllimited",
+            "forcelimited",
             "acc0",
             "target",
         ],
@@ -2439,26 +2453,41 @@ fn parse_general_muscle_actuator(
     let gain_type = optional(fields, "gaintype")
         .map(|v| get_str(v, &format!("{path}.gaintype")))
         .transpose()?
-        .unwrap_or("muscle");
+        .ok_or_else(|| {
+            ModelError::new(
+                format!("{path}.gaintype"),
+                "muscle general requires explicit gaintype=muscle",
+            )
+        })?;
     let bias_type = optional(fields, "biastype")
         .map(|v| get_str(v, &format!("{path}.biastype")))
         .transpose()?
-        .unwrap_or("muscle");
+        .ok_or_else(|| {
+            ModelError::new(
+                format!("{path}.biastype"),
+                "muscle general requires explicit biastype=muscle",
+            )
+        })?;
     let dyn_type = optional(fields, "dyntype")
         .map(|v| get_str(v, &format!("{path}.dyntype")))
         .transpose()?
-        .unwrap_or("muscle");
+        .ok_or_else(|| {
+            ModelError::new(
+                format!("{path}.dyntype"),
+                "muscle general requires explicit dyntype=muscle",
+            )
+        })?;
     if gain_type != "muscle" || bias_type != "muscle" || dyn_type != "muscle" {
         return fail(
             path,
             "muscle general requires gaintype, biastype, and dyntype=muscle",
         );
     }
-    let gain_prm = parse_prm9(fields, "gainprm", path, default_muscle_prm())?;
-    let bias_prm = parse_prm9(fields, "biasprm", path, gain_prm)?;
+    let gain_prm = parse_prm9_required(fields, "gainprm", path)?;
+    let bias_prm = parse_prm9_required(fields, "biasprm", path)?;
     let length_range = parse_required_range(fields, "lengthrange", path)?;
-    let muscle_dyn = parse_fixed_array(fields, "dynprm", path, [0.01, 0.04, 0.0])?;
-    if muscle_dyn[0] <= 0.0 || muscle_dyn[1] <= 0.0 || muscle_dyn[2] < 0.0 {
+    let muscle_dyn = parse_fixed_array(fields, "dynprm", path, [1.0, 0.0, 0.0])?;
+    if muscle_dyn[0] <= 0.0 || muscle_dyn[1] < 0.0 || muscle_dyn[2] < 0.0 {
         return fail(
             &format!("{path}.dynprm"),
             "muscle dynprm requires positive time constants and nonnegative tausmooth",
@@ -2475,8 +2504,17 @@ fn parse_general_muscle_actuator(
     if acc0 < 0.0 {
         return fail(&format!("{path}.acc0"), "acc0 must be >= 0");
     }
+    let ctrl_range_src = optional(fields, "ctrlrange").is_some();
     let ctrl_range = parse_range(fields, "ctrlrange", path)?.or(Some((0.0, 1.0)));
     let force_range = parse_range(fields, "forcerange", path)?;
+    let ctrl_limited = optional(fields, "ctrllimited")
+        .map(|v| get_bool(v, &format!("{path}.ctrllimited")))
+        .transpose()?
+        .unwrap_or(ctrl_range_src);
+    let force_limited = optional(fields, "forcelimited")
+        .map(|v| get_bool(v, &format!("{path}.forcelimited")))
+        .transpose()?
+        .unwrap_or(force_range.is_some());
     let mut a = Actuator::general_muscle(
         lidx,
         gain_prm,
@@ -2488,6 +2526,7 @@ fn parse_general_muscle_actuator(
         ctrl_range,
         force_range,
     );
+    a = a.with_limit_flags(ctrl_limited, force_limited);
     a.ctrl = target;
     Ok(a)
 }
@@ -2516,13 +2555,7 @@ fn parse_muscle_prm(fields: &[(String, Value)], path: &str) -> Result<[f32; 9], 
         prm[0] = range[0];
         prm[1] = range[1];
     }
-    if prm[0] >= prm[1]
-        || prm[4] < 0.0
-        || prm[5] <= prm[4]
-        || prm[6] <= 0.0
-        || prm[7] < 0.0
-        || prm[8] < 1.0
-    {
+    if prm[0] >= prm[1] || prm[4] >= 1.0 || prm[5] <= 1.0 || prm[6] <= 0.0 || prm[7] < 0.0 {
         return fail(&format!("{path}.muscle"), "invalid muscle curve parameters");
     }
     Ok(prm)
@@ -2549,6 +2582,20 @@ fn parse_prm9(
         *slot = get_f32(&arr[i], &format!("{path}.{key}[{i}]"))?;
     }
     Ok(out)
+}
+
+fn parse_prm9_required(
+    fields: &[(String, Value)],
+    key: &str,
+    path: &str,
+) -> Result<[f32; 9], ModelError> {
+    if optional(fields, key).is_none() {
+        return fail(
+            &format!("{path}.{key}"),
+            format!("muscle general requires explicit {key}"),
+        );
+    }
+    parse_prm9(fields, key, path, [0.0; 9])
 }
 
 fn parse_required_range(

@@ -1,9 +1,12 @@
+use std::fs;
+
 use newt::actuator::Actuator;
 use newt::body::Body;
 use newt::dynamics::{bias_forces, cholesky, cholesky_solve, mass_matrix};
 use newt::joint::{JointKind, JointLimit};
+use newt::json::{self, Value};
 use newt::math::{Mat3, Quat, Vec3};
-use newt::mjcf::load_mjcf_str;
+use newt::mjcf::{load_mjcf_path, load_mjcf_str};
 use newt::model::load_str;
 use newt::tendon::{FixedTendonJoint, Tendon, tendon_kinematics};
 use newt::tree::{Link, Tree, aba, forward_kinematics};
@@ -276,6 +279,128 @@ fn implicitfast_tendon_velocity_derivative_stays_explicit() {
             dense_qacc[slot]
         );
     }
+}
+
+#[test]
+fn implicitfast_muscle_tendon_velocity_term_stays_explicit() {
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::IDENTITY,
+    ));
+    for _ in 0..2 {
+        let parent = tree.links.len() - 1;
+        tree.push_link(Link::new(
+            Some(parent),
+            JointKind::hinge(Vec3::Z),
+            (Vec3::ZERO, Quat::IDENTITY),
+            (Vec3::ZERO, Quat::IDENTITY),
+            1.0,
+            Mat3::IDENTITY,
+        ));
+    }
+    let tendon = tree.add_tendon(Tendon::fixed(vec![
+        FixedTendonJoint { link: 1, coef: 1.0 },
+        FixedTendonJoint { link: 2, coef: 2.0 },
+    ]));
+    let actuator = tree.add_actuator(
+        Actuator::muscle(
+            0,
+            [0.75, 1.05, 1.0, 200.0, 0.5, 1.6, 1.5, 1.3, 1.2],
+            [0.75, 1.05, 1.0, 200.0, 0.5, 1.6, 1.5, 1.3, 1.2],
+            [0.0, 2.0],
+            1.0,
+            1.0,
+            [0.01, 0.04, 0.0],
+            None,
+            None,
+        )
+        .on_tendon(tendon),
+    );
+    tree.actuators[actuator].act = 1.0;
+    tree.qdot[tree.v_offset[1]] = 0.5;
+    tree.qdot[tree.v_offset[2]] = -0.25;
+
+    let poses = forward_kinematics(&tree);
+    let kin = tendon_kinematics(&tree.tendons[tendon], &tree, &poses);
+    let force = tree.actuators[actuator].torque(kin.length, kin.velocity);
+    let mut rhs = vec![0.0; tree.nv()];
+    for (slot, &coef) in kin.jacobian.iter().enumerate() {
+        rhs[slot] += coef * force;
+    }
+    let mass = mass_matrix(&tree);
+    let bias = bias_forces(&tree, Vec3::ZERO);
+    for (slot, value) in rhs.iter_mut().enumerate() {
+        *value -= bias[slot];
+    }
+    let factor = cholesky(&mass, tree.nv()).expect("dense mass matrix should be positive definite");
+    let dense_qacc = cholesky_solve(&factor, tree.nv(), &rhs);
+
+    let mut world = World::new();
+    world.integrator = Integrator::ImplicitFast;
+    world.dt = 0.005;
+    world.gravity = Vec3::ZERO;
+    world.add_tree(tree);
+    let before = world.trees[0].qdot.clone();
+    world.step();
+    for slot in [world.trees[0].v_offset[1], world.trees[0].v_offset[2]] {
+        let observed = (world.trees[0].qdot[slot] - before[slot]) / world.dt;
+        assert!(
+            (observed - dense_qacc[slot]).abs() < 1e-4,
+            "muscle tendon qacc slot {slot}: observed {observed}, dense {}",
+            dense_qacc[slot]
+        );
+    }
+}
+
+#[test]
+fn implicitfast_joint_muscle_matches_mujoco_capture() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/references");
+    let fixture = fs::read_to_string(root.join("muscle_implicitfast_joint.json"))
+        .expect("implicitfast fixture readable");
+    let document = json::parse(&fixture).expect("implicitfast fixture valid");
+    let rows = match field(&document, "rows") {
+        Value::Array(rows) => rows,
+        _ => panic!("rows must be an array"),
+    };
+    let mut scene = load_mjcf_path(root.join("muscle_implicitfast_joint.xml"))
+        .expect("implicitfast joint scene loads");
+    let actuator = scene.actuators_by_name.values().next().unwrap().1;
+    for row in rows {
+        scene.world.trees[0].actuators[actuator].ctrl = 1.0;
+        scene.world.step();
+        let qpos = first_number(field(row, "qpos"), "qpos");
+        let qvel = first_number(field(row, "qvel"), "qvel");
+        let act = first_number(field(row, "act"), "act");
+        assert!((scene.world.trees[0].q[0] - qpos).abs() < 3e-6);
+        assert!((scene.world.trees[0].qdot[0] - qvel).abs() < 5e-6);
+        assert!((scene.world.trees[0].actuators[actuator].act - act).abs() < 2e-6);
+    }
+}
+
+fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
+    let Value::Object(fields) = value else {
+        panic!("expected object for {name}")
+    };
+    fields
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value)
+        .unwrap()
+}
+
+fn first_number(value: &Value, name: &str) -> f32 {
+    let Value::Array(values) = value else {
+        panic!("{name} must be an array")
+    };
+    let Value::Number(number) = values.first().unwrap() else {
+        panic!("{name}[0] must be a number")
+    };
+    *number as f32
 }
 
 #[test]

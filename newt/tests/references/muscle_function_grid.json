@@ -23,64 +23,74 @@
   ],
   "gain": [
     {
-      "length": 0.0,
-      "velocity": -5.0,
-      "value": -0.0
+      "length": 0.49,
+      "velocity": -1.000001,
+      "value": -58.56816271590766
     },
     {
-      "length": 0.0,
-      "velocity": -2.5,
-      "value": -12.5
+      "length": 0.49,
+      "velocity": -1.0,
+      "value": -58.56819200000001
     },
     {
-      "length": 0.0,
+      "length": 0.49,
+      "velocity": -0.999999,
+      "value": -58.56822128409965
+    },
+    {
+      "length": 0.49,
+      "velocity": -1e-06,
+      "value": -91.51276339488365
+    },
+    {
+      "length": 0.49,
       "velocity": 0.0,
-      "value": -50.0
+      "value": -91.5128
     },
     {
-      "length": 0.0,
-      "velocity": 0.25,
-      "value": -54.37499999999999
+      "length": 0.49,
+      "velocity": 1e-06,
+      "value": -91.5128366051017
     },
     {
-      "length": 0.0,
-      "velocity": 2.5,
-      "value": -60.0
+      "length": 0.49,
+      "velocity": 0.199999,
+      "value": -98.10169231588569
     },
     {
-      "length": 0.25,
-      "velocity": -5.0,
-      "value": -0.0
+      "length": 0.49,
+      "velocity": 0.2,
+      "value": -98.1017216
     },
     {
-      "length": 0.25,
-      "velocity": -2.5,
-      "value": -18.874999999999996
+      "length": 0.49,
+      "velocity": 0.200001,
+      "value": -98.1017508840777
     },
     {
-      "length": 0.25,
-      "velocity": 0.0,
-      "value": -75.49999999999999
-    },
-    {
-      "length": 0.25,
-      "velocity": 0.25,
-      "value": -82.10624999999997
-    },
-    {
-      "length": 0.25,
-      "velocity": 2.5,
-      "value": -90.59999999999998
+      "length": 0.49,
+      "velocity": 1.0,
+      "value": -109.81536
     },
     {
       "length": 0.5,
-      "velocity": -5.0,
-      "value": -0.0
+      "velocity": -1.000001,
+      "value": -58.879970560003684
     },
     {
       "length": 0.5,
-      "velocity": -2.5,
-      "value": -23.0
+      "velocity": -1.0,
+      "value": -58.88000000000001
+    },
+    {
+      "length": 0.5,
+      "velocity": -0.999999,
+      "value": -58.880029440003675
+    },
+    {
+      "length": 0.5,
+      "velocity": -1e-06,
+      "value": -91.99996320000368
     },
     {
       "length": 0.5,
@@ -89,48 +99,298 @@
     },
     {
       "length": 0.5,
-      "velocity": 0.25,
-      "value": -100.05
+      "velocity": 1e-06,
+      "value": -92.0000367999816
     },
     {
       "length": 0.5,
-      "velocity": 2.5,
+      "velocity": 0.199999,
+      "value": -98.6239705599816
+    },
+    {
+      "length": 0.5,
+      "velocity": 0.2,
+      "value": -98.62400000000001
+    },
+    {
+      "length": 0.5,
+      "velocity": 0.200001,
+      "value": -98.6240294399816
+    },
+    {
+      "length": 0.5,
+      "velocity": 1.0,
       "value": -110.39999999999999
     },
     {
-      "length": 0.8333333,
-      "velocity": -5.0,
-      "value": -0.0
+      "length": 0.500001,
+      "velocity": -1.000001,
+      "value": -58.880001279942256
     },
     {
-      "length": 0.8333333,
-      "velocity": -2.5,
-      "value": -24.999999999999982
+      "length": 0.500001,
+      "velocity": -1.0,
+      "value": -58.88003071995394
     },
     {
-      "length": 0.8333333,
+      "length": 0.500001,
+      "velocity": -0.999999,
+      "value": -58.88006015997296
+    },
+    {
+      "length": 0.500001,
+      "velocity": -1e-06,
+      "value": -92.00001119991249
+    },
+    {
+      "length": 0.500001,
       "velocity": 0.0,
-      "value": -99.99999999999993
+      "value": -92.00004799992801
     },
     {
-      "length": 0.8333333,
-      "velocity": 0.25,
-      "value": -108.74999999999991
+      "length": 0.500001,
+      "velocity": 1e-06,
+      "value": -92.00008479992881
     },
     {
-      "length": 0.8333333,
-      "velocity": 2.5,
-      "value": -119.99999999999991
+      "length": 0.500001,
+      "velocity": 0.199999,
+      "value": -98.62402201588907
+    },
+    {
+      "length": 0.500001,
+      "velocity": 0.2,
+      "value": -98.62405145592284
+    },
+    {
+      "length": 0.500001,
+      "velocity": 0.200001,
+      "value": -98.6240808959198
+    },
+    {
+      "length": 0.500001,
+      "velocity": 1.0,
+      "value": -110.40005759991361
+    },
+    {
+      "length": 0.749999,
+      "velocity": -1.000001,
+      "value": -63.67996047996174
+    },
+    {
+      "length": 0.749999,
+      "velocity": -1.0,
+      "value": -63.67999231995393
+    },
+    {
+      "length": 0.749999,
+      "velocity": -0.999999,
+      "value": -63.68002415995405
+    },
+    {
+      "length": 0.749999,
+      "velocity": -1e-06,
+      "value": -99.49994819993677
+    },
+    {
+      "length": 0.749999,
+      "velocity": 0.0,
+      "value": -99.499987999928
+    },
+    {
+      "length": 0.749999,
+      "velocity": 1e-06,
+      "value": -99.5000277999033
+    },
+    {
+      "length": 0.749999,
+      "velocity": 0.199999,
+      "value": -106.66395529590675
+    },
+    {
+      "length": 0.749999,
+      "velocity": 0.2,
+      "value": -106.66398713592282
+    },
+    {
+      "length": 0.749999,
+      "velocity": 0.200001,
+      "value": -106.66401897589908
+    },
+    {
+      "length": 0.749999,
+      "velocity": 1.0,
+      "value": -119.39998559991359
+    },
+    {
+      "length": 0.75,
+      "velocity": -1.000001,
+      "value": -63.67996816000398
+    },
+    {
+      "length": 0.75,
+      "velocity": -1.0,
+      "value": -63.680000000000014
+    },
+    {
+      "length": 0.75,
+      "velocity": -0.999999,
+      "value": -63.68003184000397
+    },
+    {
+      "length": 0.75,
+      "velocity": -1e-06,
+      "value": -99.49996020000397
+    },
+    {
+      "length": 0.75,
+      "velocity": 0.0,
+      "value": -99.5
+    },
+    {
+      "length": 0.75,
+      "velocity": 1e-06,
+      "value": -99.5000397999801
+    },
+    {
+      "length": 0.75,
+      "velocity": 0.199999,
+      "value": -106.6639681599801
+    },
+    {
+      "length": 0.75,
+      "velocity": 0.2,
+      "value": -106.664
+    },
+    {
+      "length": 0.75,
+      "velocity": 0.200001,
+      "value": -106.66403183998011
+    },
+    {
+      "length": 0.75,
+      "velocity": 1.0,
+      "value": -119.39999999999999
+    },
+    {
+      "length": 0.750001,
+      "velocity": -1.000001,
+      "value": -63.67997583995407
+    },
+    {
+      "length": 0.750001,
+      "velocity": -1.0,
+      "value": -63.68000767995394
+    },
+    {
+      "length": 0.750001,
+      "velocity": -0.999999,
+      "value": -63.68003951996174
+    },
+    {
+      "length": 0.750001,
+      "velocity": -1e-06,
+      "value": -99.49997219992719
+    },
+    {
+      "length": 0.750001,
+      "velocity": 0.0,
+      "value": -99.500011999928
+    },
+    {
+      "length": 0.750001,
+      "velocity": 1e-06,
+      "value": -99.5000517999129
+    },
+    {
+      "length": 0.750001,
+      "velocity": 0.199999,
+      "value": -106.66398102389908
+    },
+    {
+      "length": 0.750001,
+      "velocity": 0.2,
+      "value": -106.66401286392284
+    },
+    {
+      "length": 0.750001,
+      "velocity": 0.200001,
+      "value": -106.66404470390677
+    },
+    {
+      "length": 0.750001,
+      "velocity": 1.0,
+      "value": -119.4000143999136
+    },
+    {
+      "length": 0.999999,
+      "velocity": -1.000001,
+      "value": -63.111090222188835
+    },
+    {
+      "length": 0.999999,
+      "velocity": -1.0,
+      "value": -63.11112177774579
+    },
+    {
+      "length": 0.999999,
+      "velocity": -0.999999,
+      "value": -63.111153333310604
+    },
+    {
+      "length": 0.999999,
+      "velocity": -1e-06,
+      "value": -98.6110883332806
+    },
+    {
+      "length": 0.999999,
+      "velocity": 0.0,
+      "value": -98.61112777772777
+    },
+    {
+      "length": 0.999999,
+      "velocity": 1e-06,
+      "value": -98.61116722215915
+    },
+    {
+      "length": 0.999999,
+      "velocity": 0.199999,
+      "value": -105.71109742214355
+    },
+    {
+      "length": 0.999999,
+      "velocity": 0.2,
+      "value": -105.71112897772419
+    },
+    {
+      "length": 0.999999,
+      "velocity": 0.200001,
+      "value": -105.71116053326534
+    },
+    {
+      "length": 0.999999,
+      "velocity": 1.0,
+      "value": -118.33335333327332
     },
     {
       "length": 1.0,
-      "velocity": -5.0,
-      "value": -0.0
+      "velocity": -1.000001,
+      "value": -63.1110795555595
     },
     {
       "length": 1.0,
-      "velocity": -2.5,
-      "value": -24.652777777777775
+      "velocity": -1.0,
+      "value": -63.111111111111114
+    },
+    {
+      "length": 1.0,
+      "velocity": -0.999999,
+      "value": -63.111142666670595
+    },
+    {
+      "length": 1.0,
+      "velocity": -1e-06,
+      "value": -98.6110716666706
     },
     {
       "length": 1.0,
@@ -139,22 +399,433 @@
     },
     {
       "length": 1.0,
-      "velocity": 0.25,
-      "value": -107.23958333333331
+      "velocity": 1e-06,
+      "value": -98.61115055553581
     },
     {
       "length": 1.0,
-      "velocity": 2.5,
+      "velocity": 0.199999,
+      "value": -105.71107955553582
+    },
+    {
+      "length": 1.0,
+      "velocity": 0.2,
+      "value": -105.71111111111111
+    },
+    {
+      "length": 1.0,
+      "velocity": 0.200001,
+      "value": -105.71114266664694
+    },
+    {
+      "length": 1.0,
+      "velocity": 1.0,
       "value": -118.33333333333331
+    },
+    {
+      "length": 1.000001,
+      "velocity": -1.000001,
+      "value": -63.111068888866164
+    },
+    {
+      "length": 1.000001,
+      "velocity": -1.0,
+      "value": -63.11110044441245
+    },
+    {
+      "length": 1.000001,
+      "velocity": -0.999999,
+      "value": -63.1111319999666
+    },
+    {
+      "length": 1.000001,
+      "velocity": -1e-06,
+      "value": -98.6110549999606
+    },
+    {
+      "length": 1.000001,
+      "velocity": 0.0,
+      "value": -98.61109444439444
+    },
+    {
+      "length": 1.000001,
+      "velocity": 1e-06,
+      "value": -98.61113388881249
+    },
+    {
+      "length": 1.000001,
+      "velocity": 0.199999,
+      "value": -105.71106168882089
+    },
+    {
+      "length": 1.000001,
+      "velocity": 0.2,
+      "value": -105.71109324439084
+    },
+    {
+      "length": 1.000001,
+      "velocity": 0.200001,
+      "value": -105.71112479992135
+    },
+    {
+      "length": 1.000001,
+      "velocity": 1.0,
+      "value": -118.33331333327332
+    },
+    {
+      "length": 1.299999,
+      "velocity": -1.000001,
+      "value": -57.03111246217886
+    },
+    {
+      "length": 1.299999,
+      "velocity": -1.0,
+      "value": -57.03114097774579
+    },
+    {
+      "length": 1.299999,
+      "velocity": -0.999999,
+      "value": -57.03116949331983
+    },
+    {
+      "length": 1.299999,
+      "velocity": -1e-06,
+      "value": -89.11112213326824
+    },
+    {
+      "length": 1.299999,
+      "velocity": 0.0,
+      "value": -89.11115777772778
+    },
+    {
+      "length": 1.299999,
+      "velocity": 1e-06,
+      "value": -89.11119342217307
+    },
+    {
+      "length": 1.299999,
+      "velocity": 0.199999,
+      "value": -95.52713262213587
+    },
+    {
+      "length": 1.299999,
+      "velocity": 0.2,
+      "value": -95.52716113772419
+    },
+    {
+      "length": 1.299999,
+      "velocity": 0.200001,
+      "value": -95.52718965327685
+    },
+    {
+      "length": 1.299999,
+      "velocity": 1.0,
+      "value": -106.93338933327334
+    },
+    {
+      "length": 1.3,
+      "velocity": -1.000001,
+      "value": -57.03108259555912
+    },
+    {
+      "length": 1.3,
+      "velocity": -1.0,
+      "value": -57.031111111111116
+    },
+    {
+      "length": 1.3,
+      "velocity": -0.999999,
+      "value": -57.03113962667022
+    },
+    {
+      "length": 1.3,
+      "velocity": -1e-06,
+      "value": -89.11107546667021
+    },
+    {
+      "length": 1.3,
+      "velocity": 0.0,
+      "value": -89.1111111111111
+    },
+    {
+      "length": 1.3,
+      "velocity": 1e-06,
+      "value": -89.11114675553772
+    },
+    {
+      "length": 1.3,
+      "velocity": 0.199999,
+      "value": -95.52708259553772
+    },
+    {
+      "length": 1.3,
+      "velocity": 0.2,
+      "value": -95.52711111111111
+    },
+    {
+      "length": 1.3,
+      "velocity": 0.200001,
+      "value": -95.52713962664883
+    },
+    {
+      "length": 1.3,
+      "velocity": 1.0,
+      "value": -106.93333333333332
+    },
+    {
+      "length": 1.300001,
+      "velocity": -1.000001,
+      "value": -57.03105272887539
+    },
+    {
+      "length": 1.300001,
+      "velocity": -1.0,
+      "value": -57.031081244412455
+    },
+    {
+      "length": 1.300001,
+      "velocity": -0.999999,
+      "value": -57.03110975995662
+    },
+    {
+      "length": 1.300001,
+      "velocity": -1e-06,
+      "value": -89.11102879997223
+    },
+    {
+      "length": 1.300001,
+      "velocity": 0.0,
+      "value": -89.11106444439444
+    },
+    {
+      "length": 1.300001,
+      "velocity": 1e-06,
+      "value": -89.11110008880239
+    },
+    {
+      "length": 1.300001,
+      "velocity": 0.199999,
+      "value": -95.5270325688324
+    },
+    {
+      "length": 1.300001,
+      "velocity": 0.2,
+      "value": -95.52706108439085
+    },
+    {
+      "length": 1.300001,
+      "velocity": 0.200001,
+      "value": -95.52708959991365
+    },
+    {
+      "length": 1.300001,
+      "velocity": 1.0,
+      "value": -106.93327733327332
+    },
+    {
+      "length": 1.599999,
+      "velocity": -1.000001,
+      "value": -45.191137582168516
+    },
+    {
+      "length": 1.599999,
+      "velocity": -1.0,
+      "value": -45.191160177745786
+    },
+    {
+      "length": 1.599999,
+      "velocity": -0.999999,
+      "value": -45.191182773328684
+    },
+    {
+      "length": 1.599999,
+      "velocity": -1e-06,
+      "value": -70.61115953325549
+    },
+    {
+      "length": 1.599999,
+      "velocity": 0.0,
+      "value": -70.61118777772778
+    },
+    {
+      "length": 1.599999,
+      "velocity": 1e-06,
+      "value": -70.61121602218877
+    },
+    {
+      "length": 1.599999,
+      "velocity": 0.199999,
+      "value": -75.69517070212996
+    },
+    {
+      "length": 1.599999,
+      "velocity": 0.2,
+      "value": -75.69519329772419
+    },
+    {
+      "length": 1.599999,
+      "velocity": 0.200001,
+      "value": -75.69521589329015
+    },
+    {
+      "length": 1.599999,
+      "velocity": 1.0,
+      "value": -84.73342533327333
+    },
+    {
+      "length": 1.6,
+      "velocity": -1.000001,
+      "value": -45.19108851555839
+    },
+    {
+      "length": 1.6,
+      "velocity": -1.0,
+      "value": -45.191111111111134
+    },
+    {
+      "length": 1.6,
+      "velocity": -0.999999,
+      "value": -45.1911337066695
+    },
+    {
+      "length": 1.6,
+      "velocity": -1e-06,
+      "value": -70.6110828666695
+    },
+    {
+      "length": 1.6,
+      "velocity": 0.0,
+      "value": -70.61111111111113
+    },
+    {
+      "length": 1.6,
+      "velocity": 1e-06,
+      "value": -70.61113935554145
+    },
+    {
+      "length": 1.6,
+      "velocity": 0.199999,
+      "value": -75.69508851554144
+    },
+    {
+      "length": 1.6,
+      "velocity": 0.2,
+      "value": -75.69511111111113
+    },
+    {
+      "length": 1.6,
+      "velocity": 0.200001,
+      "value": -75.69513370665257
+    },
+    {
+      "length": 1.6,
+      "velocity": 1.0,
+      "value": -84.73333333333335
+    },
+    {
+      "length": 1.600001,
+      "velocity": -1.000001,
+      "value": -45.19103944888427
+    },
+    {
+      "length": 1.600001,
+      "velocity": -1.0,
+      "value": -45.191062044412476
+    },
+    {
+      "length": 1.600001,
+      "velocity": -0.999999,
+      "value": -45.191084639946304
+    },
+    {
+      "length": 1.600001,
+      "velocity": -1e-06,
+      "value": -70.61100619998352
+    },
+    {
+      "length": 1.600001,
+      "velocity": 0.0,
+      "value": -70.61103444439448
+    },
+    {
+      "length": 1.600001,
+      "velocity": 1e-06,
+      "value": -70.61106268879414
+    },
+    {
+      "length": 1.600001,
+      "velocity": 0.199999,
+      "value": -75.69500632884574
+    },
+    {
+      "length": 1.600001,
+      "velocity": 0.2,
+      "value": -75.69502892439088
+    },
+    {
+      "length": 1.600001,
+      "velocity": 0.200001,
+      "value": -75.69505151990778
+    },
+    {
+      "length": 1.600001,
+      "velocity": 1.0,
+      "value": -84.73324133327337
+    },
+    {
+      "length": 1.61,
+      "velocity": -1.000001,
+      "value": -44.69722209582501
+    },
+    {
+      "length": 1.61,
+      "velocity": -1.0,
+      "value": -44.69724444444445
+    },
+    {
+      "length": 1.61,
+      "velocity": -0.999999,
+      "value": -44.69726679306945
+    },
+    {
+      "length": 1.61,
+      "velocity": -1e-06,
+      "value": -69.83941650866946
+    },
+    {
+      "length": 1.61,
+      "velocity": 0.0,
+      "value": -69.83944444444444
+    },
+    {
+      "length": 1.61,
+      "velocity": 1e-06,
+      "value": -69.83947238020825
+    },
+    {
+      "length": 1.61,
+      "velocity": 0.199999,
+      "value": -74.86786209580825
+    },
+    {
+      "length": 1.61,
+      "velocity": 0.2,
+      "value": -74.86788444444444
+    },
+    {
+      "length": 1.61,
+      "velocity": 0.200001,
+      "value": -74.8679067930527
+    },
+    {
+      "length": 1.61,
+      "velocity": 1.0,
+      "value": -83.80733333333332
     }
   ],
   "bias": [
     {
-      "length": 0.0,
-      "value": 0.0
-    },
-    {
-      "length": 0.25,
+      "length": 0.49,
       "value": 0.0
     },
     {
@@ -162,19 +833,192 @@
       "value": 0.0
     },
     {
-      "length": 0.8333333,
+      "length": 0.500001,
       "value": 0.0
+    },
+    {
+      "length": 0.749999,
+      "value": 0.0
+    },
+    {
+      "length": 0.75,
+      "value": 0.0
+    },
+    {
+      "length": 0.750001,
+      "value": 0.0
+    },
+    {
+      "length": 0.999999,
+      "value": -1.8055338889538948
     },
     {
       "length": 1.0,
       "value": -1.8055555555555582
+    },
+    {
+      "length": 1.000001,
+      "value": -1.8055772222872215
+    },
+    {
+      "length": 1.299999,
+      "value": -14.155494888953875
+    },
+    {
+      "length": 1.3,
+      "value": -14.155555555555576
+    },
+    {
+      "length": 1.300001,
+      "value": -14.155616222287234
+    },
+    {
+      "length": 1.599999,
+      "value": -38.20545588895389
+    },
+    {
+      "length": 1.6,
+      "value": -38.20555555555554
+    },
+    {
+      "length": 1.600001,
+      "value": -38.205655222287184
+    },
+    {
+      "length": 1.61,
+      "value": -39.208722222222235
     }
   ],
   "dynamics": [
     {
+      "activation": -1.0,
+      "control": -1.0,
+      "value": 20.000000000000004
+    },
+    {
+      "activation": -1.0,
+      "control": -0.5,
+      "value": 20.000000000000004
+    },
+    {
+      "activation": -1.0,
+      "control": 0.0,
+      "value": 20.000000000000004
+    },
+    {
+      "activation": -1.0,
+      "control": 0.1,
+      "value": 22.000000000000007
+    },
+    {
+      "activation": -1.0,
+      "control": 0.25,
+      "value": 25.000000000000007
+    },
+    {
+      "activation": -1.0,
+      "control": 0.5,
+      "value": 30.000000000000007
+    },
+    {
+      "activation": -1.0,
+      "control": 0.75,
+      "value": 35.00000000000001
+    },
+    {
+      "activation": -1.0,
+      "control": 0.9,
+      "value": 38.00000000000001
+    },
+    {
+      "activation": -1.0,
+      "control": 1.0,
+      "value": 40.00000000000001
+    },
+    {
+      "activation": -1.0,
+      "control": 1.1,
+      "value": 40.00000000000001
+    },
+    {
+      "activation": -1.0,
+      "control": 2.0,
+      "value": 40.00000000000001
+    },
+    {
+      "activation": -0.5,
+      "control": -1.0,
+      "value": 10.000000000000002
+    },
+    {
+      "activation": -0.5,
+      "control": -0.5,
+      "value": 10.000000000000002
+    },
+    {
+      "activation": -0.5,
+      "control": 0.0,
+      "value": 10.000000000000002
+    },
+    {
+      "activation": -0.5,
+      "control": 0.1,
+      "value": 12.000000000000002
+    },
+    {
+      "activation": -0.5,
+      "control": 0.25,
+      "value": 15.000000000000004
+    },
+    {
+      "activation": -0.5,
+      "control": 0.5,
+      "value": 20.000000000000004
+    },
+    {
+      "activation": -0.5,
+      "control": 0.75,
+      "value": 25.000000000000007
+    },
+    {
+      "activation": -0.5,
+      "control": 0.9,
+      "value": 28.000000000000004
+    },
+    {
+      "activation": -0.5,
+      "control": 1.0,
+      "value": 30.000000000000007
+    },
+    {
+      "activation": -0.5,
+      "control": 1.1,
+      "value": 30.000000000000007
+    },
+    {
+      "activation": -0.5,
+      "control": 2.0,
+      "value": 30.000000000000007
+    },
+    {
+      "activation": 0.0,
+      "control": -1.0,
+      "value": 0.0
+    },
+    {
+      "activation": 0.0,
+      "control": -0.5,
+      "value": 0.0
+    },
+    {
       "activation": 0.0,
       "control": 0.0,
       "value": 0.0
+    },
+    {
+      "activation": 0.0,
+      "control": 0.1,
+      "value": 1.159682899207248
     },
     {
       "activation": 0.0,
@@ -193,13 +1037,98 @@
     },
     {
       "activation": 0.0,
+      "control": 0.9,
+      "value": 18.000000000000004
+    },
+    {
+      "activation": 0.0,
       "control": 1.0,
       "value": 20.000000000000004
+    },
+    {
+      "activation": 0.0,
+      "control": 1.1,
+      "value": 20.000000000000004
+    },
+    {
+      "activation": 0.0,
+      "control": 2.0,
+      "value": 20.000000000000004
+    },
+    {
+      "activation": 0.1,
+      "control": -1.0,
+      "value": -0.35389478329527296
+    },
+    {
+      "activation": 0.1,
+      "control": -0.5,
+      "value": -0.35389478329527296
+    },
+    {
+      "activation": 0.1,
+      "control": 0.0,
+      "value": -0.35389478329527296
+    },
+    {
+      "activation": 0.1,
+      "control": 0.1,
+      "value": 0.0
+    },
+    {
+      "activation": 0.1,
+      "control": 0.25,
+      "value": 2.177202302401248
+    },
+    {
+      "activation": 0.1,
+      "control": 0.5,
+      "value": 6.153846153846154
+    },
+    {
+      "activation": 0.1,
+      "control": 0.75,
+      "value": 10.0
+    },
+    {
+      "activation": 0.1,
+      "control": 0.9,
+      "value": 12.307692307692308
+    },
+    {
+      "activation": 0.1,
+      "control": 1.0,
+      "value": 13.846153846153847
+    },
+    {
+      "activation": 0.1,
+      "control": 1.1,
+      "value": 13.846153846153847
+    },
+    {
+      "activation": 0.1,
+      "control": 2.0,
+      "value": 13.846153846153847
+    },
+    {
+      "activation": 0.25,
+      "control": -1.0,
+      "value": -1.09375
+    },
+    {
+      "activation": 0.25,
+      "control": -0.5,
+      "value": -1.09375
     },
     {
       "activation": 0.25,
       "control": 0.0,
       "value": -1.09375
+    },
+    {
+      "activation": 0.25,
+      "control": 0.1,
+      "value": -0.6628166877370416
     },
     {
       "activation": 0.25,
@@ -218,13 +1147,43 @@
     },
     {
       "activation": 0.25,
+      "control": 0.9,
+      "value": 7.428571428571427
+    },
+    {
+      "activation": 0.25,
       "control": 1.0,
       "value": 8.57142857142857
+    },
+    {
+      "activation": 0.25,
+      "control": 1.1,
+      "value": 8.57142857142857
+    },
+    {
+      "activation": 0.25,
+      "control": 2.0,
+      "value": 8.57142857142857
+    },
+    {
+      "activation": 0.5,
+      "control": -1.0,
+      "value": -3.125
+    },
+    {
+      "activation": 0.5,
+      "control": -0.5,
+      "value": -3.125
     },
     {
       "activation": 0.5,
       "control": 0.0,
       "value": -3.125
+    },
+    {
+      "activation": 0.5,
+      "control": 0.1,
+      "value": -2.5
     },
     {
       "activation": 0.5,
@@ -243,13 +1202,43 @@
     },
     {
       "activation": 0.5,
+      "control": 0.9,
+      "value": 3.2
+    },
+    {
+      "activation": 0.5,
       "control": 1.0,
       "value": 4.0
+    },
+    {
+      "activation": 0.5,
+      "control": 1.1,
+      "value": 4.0
+    },
+    {
+      "activation": 0.5,
+      "control": 2.0,
+      "value": 4.0
+    },
+    {
+      "activation": 0.75,
+      "control": -1.0,
+      "value": -6.09375
+    },
+    {
+      "activation": 0.75,
+      "control": -0.5,
+      "value": -6.09375
     },
     {
       "activation": 0.75,
       "control": 0.0,
       "value": -6.09375
+    },
+    {
+      "activation": 0.75,
+      "control": 0.1,
+      "value": -5.28125
     },
     {
       "activation": 0.75,
@@ -268,13 +1257,98 @@
     },
     {
       "activation": 0.75,
+      "control": 0.9,
+      "value": 0.9266857449277823
+    },
+    {
+      "activation": 0.75,
       "control": 1.0,
       "value": 1.5384615384615383
+    },
+    {
+      "activation": 0.75,
+      "control": 1.1,
+      "value": 1.5384615384615383
+    },
+    {
+      "activation": 0.75,
+      "control": 2.0,
+      "value": 1.5384615384615383
+    },
+    {
+      "activation": 0.9,
+      "control": -1.0,
+      "value": -8.325
+    },
+    {
+      "activation": 0.9,
+      "control": -0.5,
+      "value": -8.325
+    },
+    {
+      "activation": 0.9,
+      "control": 0.0,
+      "value": -8.325
+    },
+    {
+      "activation": 0.9,
+      "control": 0.1,
+      "value": -7.4
+    },
+    {
+      "activation": 0.9,
+      "control": 0.25,
+      "value": -6.0125
+    },
+    {
+      "activation": 0.9,
+      "control": 0.5,
+      "value": -3.7
+    },
+    {
+      "activation": 0.9,
+      "control": 0.75,
+      "value": -1.3718375115892945
+    },
+    {
+      "activation": 0.9,
+      "control": 0.9,
+      "value": 0.0
+    },
+    {
+      "activation": 0.9,
+      "control": 1.0,
+      "value": 0.5648425468602546
+    },
+    {
+      "activation": 0.9,
+      "control": 1.1,
+      "value": 0.5648425468602546
+    },
+    {
+      "activation": 0.9,
+      "control": 2.0,
+      "value": 0.5648425468602546
+    },
+    {
+      "activation": 1.0,
+      "control": -1.0,
+      "value": -10.0
+    },
+    {
+      "activation": 1.0,
+      "control": -0.5,
+      "value": -10.0
     },
     {
       "activation": 1.0,
       "control": 0.0,
       "value": -10.0
+    },
+    {
+      "activation": 1.0,
+      "control": 0.1,
+      "value": -9.0
     },
     {
       "activation": 1.0,
@@ -293,8 +1367,243 @@
     },
     {
       "activation": 1.0,
+      "control": 0.9,
+      "value": -0.9061946902654864
+    },
+    {
+      "activation": 1.0,
       "control": 1.0,
       "value": 0.0
+    },
+    {
+      "activation": 1.0,
+      "control": 1.1,
+      "value": 0.0
+    },
+    {
+      "activation": 1.0,
+      "control": 2.0,
+      "value": 0.0
+    },
+    {
+      "activation": 1.1,
+      "control": -1.0,
+      "value": -11.0
+    },
+    {
+      "activation": 1.1,
+      "control": -0.5,
+      "value": -11.0
+    },
+    {
+      "activation": 1.1,
+      "control": 0.0,
+      "value": -11.0
+    },
+    {
+      "activation": 1.1,
+      "control": 0.1,
+      "value": -10.0
+    },
+    {
+      "activation": 1.1,
+      "control": 0.25,
+      "value": -8.5
+    },
+    {
+      "activation": 1.1,
+      "control": 0.5,
+      "value": -6.000000000000001
+    },
+    {
+      "activation": 1.1,
+      "control": 0.75,
+      "value": -3.500000000000001
+    },
+    {
+      "activation": 1.1,
+      "control": 0.9,
+      "value": -2.0000000000000004
+    },
+    {
+      "activation": 1.1,
+      "control": 1.0,
+      "value": -0.9061946902654876
+    },
+    {
+      "activation": 1.1,
+      "control": 1.1,
+      "value": -0.9061946902654876
+    },
+    {
+      "activation": 1.1,
+      "control": 2.0,
+      "value": -0.9061946902654876
+    },
+    {
+      "activation": 1.5,
+      "control": -1.0,
+      "value": -15.0
+    },
+    {
+      "activation": 1.5,
+      "control": -0.5,
+      "value": -15.0
+    },
+    {
+      "activation": 1.5,
+      "control": 0.0,
+      "value": -15.0
+    },
+    {
+      "activation": 1.5,
+      "control": 0.1,
+      "value": -13.999999999999998
+    },
+    {
+      "activation": 1.5,
+      "control": 0.25,
+      "value": -12.5
+    },
+    {
+      "activation": 1.5,
+      "control": 0.5,
+      "value": -10.0
+    },
+    {
+      "activation": 1.5,
+      "control": 0.75,
+      "value": -7.5
+    },
+    {
+      "activation": 1.5,
+      "control": 0.9,
+      "value": -5.999999999999999
+    },
+    {
+      "activation": 1.5,
+      "control": 1.0,
+      "value": -5.0
+    },
+    {
+      "activation": 1.5,
+      "control": 1.1,
+      "value": -5.0
+    },
+    {
+      "activation": 1.5,
+      "control": 2.0,
+      "value": -5.0
+    },
+    {
+      "activation": 2.0,
+      "control": -1.0,
+      "value": -20.0
+    },
+    {
+      "activation": 2.0,
+      "control": -0.5,
+      "value": -20.0
+    },
+    {
+      "activation": 2.0,
+      "control": 0.0,
+      "value": -20.0
+    },
+    {
+      "activation": 2.0,
+      "control": 0.1,
+      "value": -18.999999999999996
+    },
+    {
+      "activation": 2.0,
+      "control": 0.25,
+      "value": -17.5
+    },
+    {
+      "activation": 2.0,
+      "control": 0.5,
+      "value": -15.0
+    },
+    {
+      "activation": 2.0,
+      "control": 0.75,
+      "value": -12.5
+    },
+    {
+      "activation": 2.0,
+      "control": 0.9,
+      "value": -11.0
+    },
+    {
+      "activation": 2.0,
+      "control": 1.0,
+      "value": -10.0
+    },
+    {
+      "activation": 2.0,
+      "control": 1.1,
+      "value": -10.0
+    },
+    {
+      "activation": 2.0,
+      "control": 2.0,
+      "value": -10.0
+    },
+    {
+      "activation": 3.0,
+      "control": -1.0,
+      "value": -30.0
+    },
+    {
+      "activation": 3.0,
+      "control": -0.5,
+      "value": -30.0
+    },
+    {
+      "activation": 3.0,
+      "control": 0.0,
+      "value": -30.0
+    },
+    {
+      "activation": 3.0,
+      "control": 0.1,
+      "value": -28.999999999999996
+    },
+    {
+      "activation": 3.0,
+      "control": 0.25,
+      "value": -27.5
+    },
+    {
+      "activation": 3.0,
+      "control": 0.5,
+      "value": -25.0
+    },
+    {
+      "activation": 3.0,
+      "control": 0.75,
+      "value": -22.5
+    },
+    {
+      "activation": 3.0,
+      "control": 0.9,
+      "value": -21.0
+    },
+    {
+      "activation": 3.0,
+      "control": 1.0,
+      "value": -20.0
+    },
+    {
+      "activation": 3.0,
+      "control": 1.1,
+      "value": -20.0
+    },
+    {
+      "activation": 3.0,
+      "control": 2.0,
+      "value": -20.0
     }
   ]
 }

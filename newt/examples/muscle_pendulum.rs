@@ -1,6 +1,6 @@
 //! Muscle-driven pendulum showcase.
 //!
-//! Run with `cargo run --release --example muscle_pendulum -- --frames 900
+//! Run with `cargo run --release --example muscle_pendulum -- --frames 1800
 //! --out muscle-pendulum.mp4`. The video uses the standard chimy2 pipeline.
 
 mod showcase_support;
@@ -14,7 +14,7 @@ use newt::tree::{Link, Tree, forward_kinematics, rk4_step};
 use std::path::PathBuf;
 
 fn args() -> (usize, PathBuf, (usize, usize)) {
-    let mut frames = 900;
+    let mut frames = 1800;
     let mut output = PathBuf::from("newt-muscle-pendulum.mp4");
     let mut size = (640, 360);
     let mut values = std::env::args().skip(1);
@@ -111,18 +111,35 @@ fn frame(tree: &Tree, width: usize, height: usize, step: usize) -> Framebuffer {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (frames, output, (width, height)) = args();
     let mut tree = build_tree();
-    let mut last_step = 0;
     let gravity = Vec3::new(0.0, 0.0, -9.81);
-    showcase_support::write_video(&output, frames, |step| {
-        for _ in last_step..step {
-            tree.actuators[0].ctrl = if step < frames / 2 { 1.0 } else { 0.3 };
+    let mut writer = showcase_support::VideoWriter::new(&output)?;
+    writer.push(&frame(&tree, width, height, 0))?;
+    let mut simulated = 0;
+    let mut min_activation = tree.actuators[0].act;
+    let mut max_activation = min_activation;
+    while simulated < frames {
+        let next = simulated + showcase_support::SIM_STEPS_PER_VIDEO_FRAME.min(frames - simulated);
+        for step in simulated..next {
+            tree.actuators[0].ctrl = if step < frames / 3 {
+                0.0
+            } else if step < 2 * frames / 3 {
+                1.0
+            } else {
+                0.0
+            };
             rk4_step(&mut tree, gravity, 0.005, |_| {
                 vec![(Vec3::ZERO, Vec3::ZERO); 2]
             });
+            min_activation = min_activation.min(tree.actuators[0].act);
+            max_activation = max_activation.max(tree.actuators[0].act);
         }
-        last_step = step;
-        frame(&tree, width, height, step)
-    })?;
-    println!("wrote {} ({frames} simulation steps)", output.display());
+        writer.push(&frame(&tree, width, height, next))?;
+        simulated = next;
+    }
+    writer.finish()?;
+    println!(
+        "wrote {} ({frames} simulation steps, activation {min_activation:.6}..{max_activation:.6})",
+        output.display()
+    );
     Ok(())
 }

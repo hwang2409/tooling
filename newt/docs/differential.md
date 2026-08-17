@@ -359,14 +359,24 @@ captures live in `tests/references/muscle_*.json` and include post-step
 `qpos`, `qvel`, and `act` samples. Regenerate them with
 `tools/capture_muscle_differentials.py`.
 
-| scene | steps | measured max error | stated bound | purpose |
-|-------|------:|-------------------:|-------------:|---------|
-| muscle_pendulum | 500 | 8.35e-7 | 5.0e-2 | joint transmission and target pulse |
-| muscle_wrapped_tendon | 400 | 1.43e-6 | 5.0e-2 | wrapped tendon lift |
-| muscle_isometric_twitch | 300 | 1.19e-7 | 5.0e-2 | activation-only twitch |
+| scene | steps | qpos bound | qvel bound | act bound | purpose |
+|-------|------:|-----------:|-----------:|----------:|---------|
+| muscle_pendulum | 500 | 2.0e-6 | 3.0e-6 | 2.0e-6 | joint transmission and target pulse |
+| muscle_wrapped_tendon | 400 | 3.0e-6 | 4.0e-6 | 3.0e-6 | wrapped tendon lift |
+| muscle_isometric_twitch | 300 | 5.0e-7 | 5.0e-7 | 5.0e-7 | activation-only twitch |
+| muscle_pendulum_gear | 500 | 3.0e-6 | 5.0e-6 | 2.0e-6 | joint gear 1.7 |
+| muscle_wrapped_tendon_gear | 400 | 5.0e-6 | 6.0e-6 | 3.0e-6 | wrapped tendon gear 1.6 |
 
-The measured values are maximum absolute error across every state and
-activation sample. The test prints the measured value on every run.
+The tests report separate maximum absolute errors for position, velocity, and
+activation. The current measurements are `7.15e-7 / 8.34e-7 / 2.98e-7` for
+the pendulum, `5.96e-7 / 1.43e-6 / 2.98e-7` for the wrapped tendon, and
+`1.40e-9 / 7.45e-9 / 1.19e-7` for the twitch. Gear scenes measure
+`2.38e-7 / 5.96e-7 / 2.98e-7` and `1.43e-6 / 2.38e-6 / 2.98e-7`.
+
+The function fixture has 160 targeted gain points, 16 bias points, and 143
+dynamics points. It covers both sides of each FL knot, the FV switch and
+saturations, and controls and activations outside `[0,1]`. Its measured
+float-tier maximum is `3.81e-5`; the test states a `6.0e-5` tolerance.
 
 ### joint_limit_swing (bounded divergence)
 

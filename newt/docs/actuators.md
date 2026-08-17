@@ -163,13 +163,17 @@ explicit because their `JᵀJ` contribution is dense.
 <general name="g" joint="hinge" gaintype="muscle"
          biastype="muscle" dyntype="muscle" lengthrange="0 1"
          gainprm="0.75 1.05 -1 200 0.5 1.6 1.5 1.3 1.2"
+         biasprm="0.75 1.05 -1 200 0.5 1.6 1.5 1.3 1.2"
          dynprm="0.01 0.04 0"/>
 ```
 
 JSON uses `type:"muscle"` with `lengthrange`, curve fields, `timeconst`,
-and optional `gear`, `ctrlrange`, `forcerange`, and `acc0`. A general JSON
-actuator uses nine-value `gainprm` and `biasprm`, plus three-value
-`dynprm`. Both loaders reject unknown fields.
+and optional `gear`, `ctrlrange`, `forcerange`, `ctrllimited`, `forcelimited`,
+and `acc0`. A muscle general actuator requires explicit `gaintype`,
+`biastype`, `dyntype`, `gainprm`, and `biasprm`; omitted `dynprm` compiles as
+`[1,0,0]`. A range is active by default when its matching limited flag is
+omitted. Both loaders reject unknown fields and missing muscle-general
+parameters.
 
 ### byte-identity: Position ↔ v0 PdServo
 

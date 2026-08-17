@@ -35,7 +35,7 @@ fn array<const N: usize>(value: &Value, name: &str) -> [f32; N] {
 fn close(actual: f32, expected: f32, label: &str) -> f32 {
     let error = (actual - expected).abs();
     assert!(
-        error <= 2.0e-5,
+        error <= 6.0e-5,
         "{label}: actual={actual:?}, expected={expected:?}, error={error:?}"
     );
     error
@@ -63,6 +63,7 @@ fn muscle_functions_match_mujoco_grid_at_float_tier() {
             &format!("gain[{index}]"),
         ));
     }
+    assert_eq!(gain_cases.len(), 160, "targeted gain grid size");
 
     let Value::Array(bias_cases) = field(&document, "bias") else {
         panic!("bias must be an array");
@@ -76,6 +77,7 @@ fn muscle_functions_match_mujoco_grid_at_float_tier() {
             &format!("bias[{index}]"),
         ));
     }
+    assert_eq!(bias_cases.len(), 16, "targeted bias grid size");
 
     let dynprm = array::<3>(field(&document, "dynprm"), "dynprm");
     let Value::Array(dynamics_cases) = field(&document, "dynamics") else {
@@ -91,5 +93,6 @@ fn muscle_functions_match_mujoco_grid_at_float_tier() {
             &format!("dynamics[{index}]"),
         ));
     }
+    assert_eq!(dynamics_cases.len(), 143, "targeted dynamics grid size");
     eprintln!("muscle function grid: maximum float error {max_error:.6e}");
 }

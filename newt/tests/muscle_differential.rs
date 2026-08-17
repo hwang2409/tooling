@@ -37,7 +37,20 @@ fn first_number(value: &Value, name: &str) -> f32 {
     number(&values[0], name)
 }
 
-fn run_case(name: &str, pulse_end: usize, second_ctrl: f32, bound: f32, dt: f32, gravity: Vec3) {
+struct Bounds {
+    qpos: f32,
+    qvel: f32,
+    act: f32,
+}
+
+fn run_case(
+    name: &str,
+    pulse_end: usize,
+    second_ctrl: f32,
+    bounds: Bounds,
+    dt: f32,
+    gravity: Vec3,
+) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/references");
     let xml = root.join(format!("{name}.xml"));
     let fixture = root.join(format!("{name}.json"));
@@ -50,7 +63,9 @@ fn run_case(name: &str, pulse_end: usize, second_ctrl: f32, bound: f32, dt: f32,
     let mut scene = load_mjcf_path(&xml).expect("matched MJCF loads");
     let actuator_idx = scene.actuators_by_name.values().next().unwrap().1;
     let tree = &mut scene.world.trees[0];
-    let mut max_error = 0.0f32;
+    let mut max_qpos = 0.0f32;
+    let mut max_qvel = 0.0f32;
+    let mut max_act = 0.0f32;
     for (step, row) in rows.iter().enumerate() {
         tree.actuators[actuator_idx].ctrl = if step < pulse_end { 1.0 } else { second_ctrl };
         let link_count = tree.links.len();
@@ -60,14 +75,25 @@ fn run_case(name: &str, pulse_end: usize, second_ctrl: f32, bound: f32, dt: f32,
         let qpos = first_number(field(row, "qpos"), "qpos");
         let qvel = first_number(field(row, "qvel"), "qvel");
         let act = first_number(field(row, "act"), "act");
-        max_error = max_error.max((tree.q[0] - qpos).abs());
-        max_error = max_error.max((tree.qdot[0] - qvel).abs());
-        max_error = max_error.max((tree.actuators[actuator_idx].act - act).abs());
+        max_qpos = max_qpos.max((tree.q[0] - qpos).abs());
+        max_qvel = max_qvel.max((tree.qdot[0] - qvel).abs());
+        max_act = max_act.max((tree.actuators[actuator_idx].act - act).abs());
     }
-    eprintln!("{name}: measured max error {max_error:.6e}, bound {bound:.6e}");
+    eprintln!("{name}: qpos {max_qpos:.6e}, qvel {max_qvel:.6e}, act {max_act:.6e}");
     assert!(
-        max_error <= bound,
-        "{name}: max error {max_error} > {bound}"
+        max_qpos <= bounds.qpos,
+        "{name}: qpos error {max_qpos} > {}",
+        bounds.qpos
+    );
+    assert!(
+        max_qvel <= bounds.qvel,
+        "{name}: qvel error {max_qvel} > {}",
+        bounds.qvel
+    );
+    assert!(
+        max_act <= bounds.act,
+        "{name}: act error {max_act} > {}",
+        bounds.act
     );
 }
 
@@ -77,7 +103,11 @@ fn muscle_pendulum_matches_mujoco() {
         "muscle_pendulum",
         250,
         0.35,
-        5.0e-2,
+        Bounds {
+            qpos: 2.0e-6,
+            qvel: 3.0e-6,
+            act: 2.0e-6,
+        },
         0.002,
         Vec3::new(0.0, 0.0, -9.81),
     );
@@ -89,7 +119,11 @@ fn wrapped_tendon_muscle_matches_mujoco() {
         "muscle_wrapped_tendon",
         400,
         1.0,
-        5.0e-2,
+        Bounds {
+            qpos: 3.0e-6,
+            qvel: 4.0e-6,
+            act: 3.0e-6,
+        },
         0.002,
         Vec3::new(0.0, 0.0, -9.81),
     );
@@ -101,8 +135,44 @@ fn isometric_twitch_activation_matches_mujoco() {
         "muscle_isometric_twitch",
         50,
         0.0,
-        5.0e-2,
+        Bounds {
+            qpos: 5.0e-7,
+            qvel: 5.0e-7,
+            act: 5.0e-7,
+        },
         0.001,
         Vec3::ZERO,
+    );
+}
+
+#[test]
+fn gear_joint_muscle_matches_mujoco() {
+    run_case(
+        "muscle_pendulum_gear",
+        250,
+        0.35,
+        Bounds {
+            qpos: 3.0e-6,
+            qvel: 5.0e-6,
+            act: 2.0e-6,
+        },
+        0.002,
+        Vec3::new(0.0, 0.0, -9.81),
+    );
+}
+
+#[test]
+fn gear_wrapped_tendon_muscle_matches_mujoco() {
+    run_case(
+        "muscle_wrapped_tendon_gear",
+        400,
+        1.0,
+        Bounds {
+            qpos: 5.0e-6,
+            qvel: 6.0e-6,
+            act: 3.0e-6,
+        },
+        0.002,
+        Vec3::new(0.0, 0.0, -9.81),
     );
 }

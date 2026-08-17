@@ -11,10 +11,21 @@ import mujoco
 PARAMS = [0.75, 1.05, -1.0, 200.0, 0.5, 1.6, 1.5, 1.3, 1.2]
 LENGTH_RANGE = [0.0, 1.0]
 ACC0 = 2.0
-LENGTHS = [0.0, 0.25, 0.5, 0.8333333, 1.0]
-VELOCITIES = [-5.0, -2.5, 0.0, 0.25, 2.5]
-ACTIVATIONS = [0.0, 0.25, 0.5, 0.75, 1.0]
-CONTROLS = [0.0, 0.25, 0.5, 0.75, 1.0]
+# 319 points. Lengths are placed on both sides of every FL knot. The
+# normalized values become physical lengths through the compiled range.
+NORMALIZED_LENGTHS = [
+    0.49, 0.5, 0.500001, 0.749999, 0.75, 0.750001,
+    0.999999, 1.0, 1.000001, 1.299999, 1.3, 1.300001,
+    1.599999, 1.6, 1.600001, 1.61,
+]
+LENGTHS = [LENGTH_RANGE[0] + value * (LENGTH_RANGE[1] - LENGTH_RANGE[0])
+           for value in NORMALIZED_LENGTHS]
+VELOCITIES = [-1.000001, -1.0, -0.999999, -0.000001, 0.0,
+              0.000001, 0.199999, 0.2, 0.200001, 1.0]
+ACTIVATIONS = [-1.0, -0.5, 0.0, 0.1, 0.25, 0.5, 0.75,
+               0.9, 1.0, 1.1, 1.5, 2.0, 3.0]
+CONTROLS = [-1.0, -0.5, 0.0, 0.1, 0.25, 0.5, 0.75,
+            0.9, 1.0, 1.1, 2.0]
 
 
 def main() -> None:
@@ -51,6 +62,7 @@ def main() -> None:
                     "value": mujoco.mju_muscleDynamics(control, activation, dynprm),
                 }
             )
+    assert len(gain) + len(bias) + len(dynamics) == 319
     document = {
         "oracle": "MuJoCo 3.11.0",
         "params": PARAMS,

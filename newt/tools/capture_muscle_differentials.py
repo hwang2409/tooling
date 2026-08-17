@@ -15,6 +15,12 @@ CASES = {
         "ctrl": lambda step: 1.0 if step < 50 else 0.0,
         "steps": 300,
     },
+    "muscle_pendulum_gear": {
+        "ctrl": lambda step: 1.0 if step < 250 else 0.35,
+        "steps": 500,
+    },
+    "muscle_wrapped_tendon_gear": {"ctrl": lambda step: 1.0, "steps": 400},
+    "muscle_implicitfast_joint": {"ctrl": lambda step: 1.0, "steps": 120},
 }
 
 
