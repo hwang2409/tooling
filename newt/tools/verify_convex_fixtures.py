@@ -93,28 +93,38 @@ def inverse_rotate(quaternion: list[float], vector: list[float]) -> list[float]:
     ]
 
 
-def body_frame_contact(body_pose: dict, geom_pose: dict, contact: dict) -> dict:
+def body_frame_contact(
+    body_pose: dict,
+    frame_pose: dict,
+    contact: dict,
+    use_frame_origin: bool,
+) -> dict:
+    origin_pose = frame_pose if use_frame_origin else body_pose
     relative_position = [
-        contact["position"][index] - body_pose["position"][index]
+        contact["position"][index] - origin_pose["position"][index]
         for index in range(3)
     ]
     return {
         "geom": tuple(contact["geom"]),
         "position": inverse_rotate(
-            geom_pose["orientation_wxyz"], relative_position
+            frame_pose["orientation_wxyz"], relative_position
         ),
         "frame_normal": inverse_rotate(
-            geom_pose["orientation_wxyz"], contact["frame_normal"]
+            frame_pose["orientation_wxyz"], contact["frame_normal"]
         ),
         "penetration": float(contact["penetration"]),
     }
 
 
 def sorted_body_frame_contacts(
-    body_pose: dict, geom_pose: dict, contacts: list[dict]
+    body_pose: dict,
+    frame_pose: dict,
+    contacts: list[dict],
+    use_frame_origin: bool,
 ) -> list[dict]:
     transformed = [
-        body_frame_contact(body_pose, geom_pose, contact) for contact in contacts
+        body_frame_contact(body_pose, frame_pose, contact, use_frame_origin)
+        for contact in contacts
     ]
     return sorted(
         transformed,
@@ -237,11 +247,13 @@ def compare_route_oracle(
                     committed_pose["body_pose_b"],
                     committed_contact_frame,
                     committed_pose["contacts"],
+                    committed_probe["pair"] == "plane-mesh",
                 )
                 fresh_contacts = sorted_body_frame_contacts(
                     fresh_pose["body_pose_b"],
                     fresh_contact_frame,
                     fresh_pose["contacts"],
+                    fresh_probe["pair"] == "plane-mesh",
                 )
             else:
                 committed_contacts = committed_pose["contacts"]
