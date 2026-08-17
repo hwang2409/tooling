@@ -21,6 +21,7 @@ CASES = {
     },
     "muscle_wrapped_tendon_gear": {"ctrl": lambda step: 1.0, "steps": 400},
     "muscle_implicitfast_joint": {"ctrl": lambda step: 1.0, "steps": 120},
+    "muscle_rk4_limits": {"ctrl": lambda step: 1.0, "steps": 100},
 }
 
 

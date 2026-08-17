@@ -1840,7 +1840,7 @@ fn muscle_activation_deriv(tree: &Tree) -> Vec<f32> {
         .map(|actuator| {
             if matches!(actuator.dyn_type, crate::actuator::DynType::Muscle) {
                 crate::actuator::muscle_dynamics(
-                    actuator.ctrl,
+                    actuator.clamped_ctrl(),
                     actuator.act,
                     actuator.muscle_dyn_prm,
                 )

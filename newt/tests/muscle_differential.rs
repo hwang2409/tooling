@@ -176,3 +176,19 @@ fn gear_wrapped_tendon_muscle_matches_mujoco() {
         Vec3::new(0.0, 0.0, -9.81),
     );
 }
+
+#[test]
+fn rk4_muscle_limits_match_mujoco_capture() {
+    run_case(
+        "muscle_rk4_limits",
+        100,
+        1.0,
+        Bounds {
+            qpos: 3.0e-6,
+            qvel: 5.0e-6,
+            act: 3.0e-6,
+        },
+        0.002,
+        Vec3::new(0.0, 0.0, -9.81),
+    );
+}

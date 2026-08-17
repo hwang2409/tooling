@@ -256,7 +256,6 @@ fn implicitfast_tendon_velocity_derivative_stays_explicit() {
     }
     let factor = cholesky(&mass, tree.nv()).expect("dense mass matrix should be positive definite");
     let dense_qacc = cholesky_solve(&factor, tree.nv(), &rhs);
-
     let mut world = World::new();
     world.integrator = Integrator::ImplicitFast;
     world.dt = 0.005;
@@ -339,6 +338,18 @@ fn implicitfast_muscle_tendon_velocity_term_stays_explicit() {
     }
     let factor = cholesky(&mass, tree.nv()).expect("dense mass matrix should be positive definite");
     let dense_qacc = cholesky_solve(&factor, tree.nv(), &rhs);
+    let tendon_damping = tree.actuators[actuator].velocity_damping(kin.length, kin.velocity);
+    assert!(tendon_damping > 0.0);
+    // This is the rejected scalar-fold mutant: it puts the tendon damping
+    // into every diagonal entry instead of keeping the dense tendon term
+    // explicit. The non-diagonal Jacobian makes the error observable.
+    let mut mutant_mass = mass.clone();
+    for slot in 0..tree.nv() {
+        mutant_mass[slot * tree.nv() + slot] += 0.005 * tendon_damping;
+    }
+    let mutant_factor =
+        cholesky(&mutant_mass, tree.nv()).expect("mutant matrix is positive definite");
+    let mutant_qacc = cholesky_solve(&mutant_factor, tree.nv(), &rhs);
 
     let mut world = World::new();
     world.integrator = Integrator::ImplicitFast;
@@ -347,14 +358,20 @@ fn implicitfast_muscle_tendon_velocity_term_stays_explicit() {
     world.add_tree(tree);
     let before = world.trees[0].qdot.clone();
     world.step();
+    let mut mutant_error = 0.0f32;
     for slot in [world.trees[0].v_offset[1], world.trees[0].v_offset[2]] {
         let observed = (world.trees[0].qdot[slot] - before[slot]) / world.dt;
+        mutant_error = mutant_error.max((mutant_qacc[slot] - dense_qacc[slot]).abs());
         assert!(
             (observed - dense_qacc[slot]).abs() < 1e-4,
             "muscle tendon qacc slot {slot}: observed {observed}, dense {}",
             dense_qacc[slot]
         );
     }
+    assert!(
+        mutant_error > 1.5e-3,
+        "scalar-fold mutant error {mutant_error}"
+    );
 }
 
 #[test]

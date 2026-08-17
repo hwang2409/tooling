@@ -378,6 +378,10 @@ dynamics points. It covers both sides of each FL knot, the FV switch and
 saturations, and controls and activations outside `[0,1]`. Its measured
 float-tier maximum is `3.81e-5`; the test states a `6.0e-5` tolerance.
 
+The `muscle_rk4_limits` fixture uses `ctrlrange="0 0.5"`,
+`ctrllimited="true"`, `force="100"`, and `timestep="0.002"`. Its measured
+maximum errors are `3.58e-7` qpos, `1.91e-6` qvel, and `5.96e-8` act.
+
 ### joint_limit_swing (bounded divergence)
 
 Single-hinge pendulum with a `±0.6 rad` range limit, initial

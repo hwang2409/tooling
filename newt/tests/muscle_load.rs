@@ -87,17 +87,33 @@ fn muscle_general_requires_gain_and_bias_parameters() {
     let error = load_mjcf_str(&missing_bias).expect_err("missing biasprm must reject");
     assert!(error.message.contains("biasprm"), "{error}");
 
-    let missing_gain = r#"{
+    let missing_gain = MJCF.replace("gainprm=\"0.75 1.05 -1 200 0.5 1.6 1.5 1.3 1.2\"", "");
+    let error = load_mjcf_str(&missing_gain).expect_err("missing gainprm must reject");
+    assert!(error.message.contains("gainprm"), "{error}");
+
+    let complete_general = r#"{
       "trees":[{"name":"tree","links":[
         {"name":"root","joint":{"kind":"fixed"},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}},
         {"name":"hinge","parent":"root","joint":{"kind":"hinge","axis":[0,1,0]},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}}
       ]}],
       "actuators":[{"name":"g","type":"general","tree":"tree","link":"hinge",
         "gaintype":"muscle","biastype":"muscle","dyntype":"muscle",
+        "gainprm":[0.75,1.05,-1,200,0.5,1.6,1.5,1.3,1.2],
         "biasprm":[0.75,1.05,-1,200,0.5,1.6,1.5,1.3,1.2],"lengthrange":[0,1]}]
     }"#;
-    let error = load_str(missing_gain).expect_err("missing gainprm must reject");
+    let missing_gain = complete_general.replace(
+        "        \"gainprm\":[0.75,1.05,-1,200,0.5,1.6,1.5,1.3,1.2],\n",
+        "",
+    );
+    let error = load_str(&missing_gain).expect_err("missing gainprm must reject");
     assert!(error.to_string().contains("gainprm"), "{error}");
+
+    let missing_bias = complete_general.replace(
+        "        \"biasprm\":[0.75,1.05,-1,200,0.5,1.6,1.5,1.3,1.2],",
+        "",
+    );
+    let error = load_str(&missing_bias).expect_err("missing biasprm must reject");
+    assert!(error.to_string().contains("biasprm"), "{error}");
 }
 
 #[test]
@@ -106,6 +122,23 @@ fn muscle_general_dynprm_omission_matches_compiled_default() {
     let scene = load_mjcf_str(&source).expect("omitted dynprm should load");
     assert_eq!(
         scene.world.trees[0].actuators[1].muscle_dyn_prm,
+        [1.0, 0.0, 0.0]
+    );
+
+    let json = r#"{
+      "trees":[{"name":"tree","links":[
+        {"name":"root","joint":{"kind":"fixed"},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}},
+        {"name":"hinge","parent":"root","joint":{"kind":"hinge","axis":[0,1,0]},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}}
+      ]}],
+      "actuators":[{"name":"g","type":"general","tree":"tree","link":"hinge",
+        "gaintype":"muscle","biastype":"muscle","dyntype":"muscle",
+        "gainprm":[0.75,1.05,-1,200,0.5,1.6,1.5,1.3,1.2],
+        "biasprm":[0.75,1.05,-1,200,0.5,1.6,1.5,1.3,1.2],
+        "lengthrange":[0,1]}]
+    }"#;
+    let scene = load_str(json).expect("JSON omitted dynprm should load");
+    assert_eq!(
+        scene.world.trees[0].actuators[0].muscle_dyn_prm,
         [1.0, 0.0, 0.0]
     );
 }
