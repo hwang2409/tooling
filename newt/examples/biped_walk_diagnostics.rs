@@ -74,6 +74,10 @@ fn main() {
                 let condim = scene.world.geoms[contact.geom_a]
                     .condim
                     .min(scene.world.geoms[contact.geom_b].condim);
+                // MuJoCo records its frame from geom1 to geom2. Newt's
+                // internal normal points from geom_b into geom_a, so invert
+                // it only in this oracle-facing diagnostic.
+                let normal = -contact.normal_world;
                 let (t1, t2) = world::tangent_basis(contact.normal_world);
                 let row_indices = row_to_contact
                     .iter()
@@ -81,14 +85,14 @@ fn main() {
                     .filter_map(|(row, &mapped)| (mapped == contact_index).then_some(row))
                     .collect::<Vec<_>>();
                 println!(
-                    " contact={contact_index} geom_pair={geom_a}/{geom_b} position={:?} normal={:?} condim={condim} frame=[{:?},{:?},{:?}] rows={:?} penetration={:.9}",
+                    " contact={contact_index} geom_pair={geom_a}/{geom_b} position={:?} normal={:?} condim={condim} frame=[{:?},{:?},{:?}] rows={:?} dist={:.9}",
                     contact.position_world,
-                    contact.normal_world,
-                    contact.normal_world,
+                    normal,
+                    normal,
                     t1,
                     t2,
                     row_indices,
-                    contact.penetration,
+                    -contact.penetration,
                 );
             }
         },

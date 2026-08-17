@@ -106,6 +106,11 @@ def capture(assist_scale: float, steps: int, output: Path) -> None:
         targets = controller.targets(config, data.time, data=data)
         biped._apply_controls(mujoco_module, model, data, targets)
         mujoco_module.mj_step(model, data)
+        # mj_step leaves data.contact at the solver state used for the step,
+        # while qpos and qvel already contain the post-step state. Refresh the
+        # contact manifold so this diagnostic compares the same post-step
+        # configuration that newt.world.detect_contacts reports.
+        mujoco_module.mj_forward(model, data)
         records.append(record(step))
     payload = {
         "mujoco": mujoco.__version__,

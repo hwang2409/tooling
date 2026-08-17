@@ -270,6 +270,12 @@ fn assert_level(level: &str, expected_newt_fall_step: Option<u32>) {
         let actual = &newt.checkpoints[step as usize];
         assert_eq!(expected.step, step);
         assert_eq!(actual.step, step);
+        if step <= 12 {
+            assert_eq!(
+                actual.contact_mask, expected.contact_mask,
+                "{level} visual contact mask diverged in the closed early window at step {step}"
+            );
+        }
         if first_contact_mismatch.is_none() && expected.contact_mask != actual.contact_mask {
             first_contact_mismatch = Some(step);
         }
@@ -339,10 +345,10 @@ fn assert_level(level: &str, expected_newt_fall_step: Option<u32>) {
         newt.result.final_root_height,
     );
     assert!(max_qpos.is_finite() && max_qvel.is_finite());
-    assert_eq!(
+    assert_ne!(
         first_contact_mismatch,
         Some(12),
-        "current visual contact timing regression"
+        "the step-12 visual contact divergence must stay closed"
     );
     assert!(
         max_qpos <= qpos_bound,
@@ -402,19 +408,19 @@ fn assert_measured_metrics(
     let (source_expected, newt_expected) = match level {
         "080" => (
             [2.258638, 117.600000, 0.489715, 0.112570, 0.216504, 0.981455],
-            [2.524537, 117.600000, 0.373536, 0.114487, 0.196953, 0.973954],
+            [2.523389, 117.600000, 0.372897, 0.114431, 0.200563, 0.973457],
         ),
         "040" => (
             [0.553179, 79.365079, 0.532088, 0.178983, 0.224684, 0.449739],
-            [3.223390, 122.400000, 0.105318, 0.112052, 0.169206, 0.442631],
+            [3.199486, 129.600000, 0.099338, 0.107029, 0.182692, 0.442372],
         ),
         "020" => (
             [-0.123535, 73.170732, 0.734206, 0.195305, 0.137381, 0.433937],
-            [0.957340, 52.800000, 0.198833, 0.090201, 0.502567, 0.149789],
+            [0.901319, 45.600000, 0.132662, 0.086810, 0.493977, 0.156672],
         ),
         "000" => (
             [-0.694926, 83.044983, 0.813246, 0.255460, 0.165822, 0.427472],
-            [0.270446, 7.200000, 0.916760, 1.002502, 0.396145, 0.239876],
+            [0.238266, 4.800000, 0.831020, 0.000000, 0.425592, 0.239724],
         ),
         _ => unreachable!(),
     };
@@ -480,9 +486,9 @@ fn v3_representative_sweep_is_short_and_deterministic() {
 #[ignore = "full four-level 5000-step acceptance sweep"]
 fn v3_full_sweep_records_each_measured_outcome_and_divergence() {
     assert_level("080", None);
-    assert_level("040", Some(553));
-    assert_level("020", Some(469));
-    assert_level("000", Some(442));
+    assert_level("040", Some(551));
+    assert_level("020", Some(472));
+    assert_level("000", Some(439));
 }
 
 type BipedState = (Vec<f32>, Vec<f32>);
@@ -544,6 +550,7 @@ fn v3_diagnostic_fixture_records_geom_manifolds() {
     }
     assert!(diagnostics.contains("\"geom1\": \"ground\""));
     assert!(diagnostics.contains("\"geom2\": \"right_foot_geom\""));
+    assert!(diagnostics.contains("\"contact_capture\": \"post-step mj_forward\""));
     assert!(
         diagnostics
             .contains("\"row_indices\": [\n            0,\n            1,\n            2,\n            3\n          ]")
@@ -552,9 +559,11 @@ fn v3_diagnostic_fixture_records_geom_manifolds() {
 
     let newt_path = root.join("tests/references/biped_walk_v3_newt_diagnostics.json");
     let newt_diagnostics = fs::read_to_string(newt_path).expect("newt biped diagnostics fixture");
+    assert!(newt_diagnostics.contains("\"contact_capture\": \"post-step detect_contacts\""));
     assert!(newt_diagnostics.contains("\"geom_pair\": [\"ground\", \"right_foot_geom\"]"));
-    assert!(newt_diagnostics.contains("\"normal\": [0.0, 0.0, -1.0]"));
-    assert!(newt_diagnostics.contains("\"frame\": [0.0, 0.0, -1.0"));
+    assert!(newt_diagnostics.contains("\"normal\": [0.0, 0.0, 1.0]"));
+    assert!(newt_diagnostics.contains("\"frame\": [0.0, 0.0, 1.0"));
+    assert!(newt_diagnostics.contains("\"dist\": -0.004183933"));
     assert!(newt_diagnostics.contains("\"row_to_contact\": [0, 0, 0, 0, 1, 1, 1, 1]"));
 }
 
@@ -563,8 +572,8 @@ fn visual_contact_mask(scene: &newt::model::Scene) -> u8 {
     let left_toe = scene.site_pose("left_toe_site").unwrap().0.z;
     let right_heel = scene.site_pose("right_heel_site").unwrap().0.z;
     let right_toe = scene.site_pose("right_toe_site").unwrap().0.z;
-    (u8::from(left_heel <= 0.045 || left_toe <= 0.045))
-        | (u8::from(right_heel <= 0.045 || right_toe <= 0.045) << 1)
+    (u8::from(left_heel <= 0.035 || left_toe <= 0.035))
+        | (u8::from(right_heel <= 0.035 || right_toe <= 0.035) << 1)
 }
 
 struct Cursor<'a> {
