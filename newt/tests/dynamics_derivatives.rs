@@ -207,6 +207,60 @@ fn ball_position_derivative_has_three_tangent_columns() {
 }
 
 #[test]
+fn sibling_ball_joint_does_not_break_tendon_derivatives() {
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::Slide {
+            axis: Vec3::X,
+            range: None,
+            damping: 0.0,
+            armature: 0.0,
+            limit: newt::joint::JointLimit::DEFAULT,
+        },
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::Ball {
+            damping: 0.0,
+            armature: 0.0,
+        },
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    tree.add_tendon(Tendon::spatial(
+        vec![
+            SpatialTendonSite {
+                link: None,
+                position_local: Vec3::new(-1.0, 0.0, 0.0),
+            },
+            SpatialTendonSite {
+                link: Some(1),
+                position_local: Vec3::new(1.0, 0.0, 0.0),
+            },
+        ],
+        vec![None],
+    ));
+
+    let derivatives = tree.derivatives(Vec3::ZERO, &zero_wrenches(&tree));
+    assert_eq!(derivatives.qacc_q.len(), 1);
+}
+
+#[test]
 fn saturated_velocity_actuator_has_zero_velocity_derivative() {
     let mut tree = pendulum(0.0);
     tree.add_actuator(Actuator::velocity(1, 10.0, 1.0));

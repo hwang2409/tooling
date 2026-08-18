@@ -634,7 +634,34 @@ fn differential_poses(tree: &Tree, poses: &[(Vec3, Quat)], column: usize) -> Vec
                 }
             }
             JointKind::Ball { .. } => {
-                panic!("spatial tendon position derivatives do not support ball joints")
+                let parent = out[link.parent.expect("ball has parent")];
+                let off = tree.q_offset[i];
+                let q = Quat::new(
+                    tree.q[off],
+                    tree.q[off + 1],
+                    tree.q[off + 2],
+                    tree.q[off + 3],
+                );
+                let rotation = q.to_mat3();
+                let derivative_rotation =
+                    if column >= tree.v_offset[i] && column < tree.v_offset[i] + 3 {
+                        rotation * Mat3::skew(basis_vec(column - tree.v_offset[i]))
+                    } else {
+                        Mat3::ZERO
+                    };
+                let orientation = parent.orientation * rotation;
+                let dorientation =
+                    parent.dorientation * rotation + parent.orientation * derivative_rotation;
+                let offset = link.joint_offset_in_parent.0;
+                let joint_position = parent.position + parent.orientation * offset;
+                let djoint_position = parent.dposition + parent.dorientation * offset;
+                let child_offset = link.joint_offset_in_child.0;
+                DifferentialPose {
+                    position: joint_position - orientation * child_offset,
+                    orientation,
+                    dposition: djoint_position - dorientation * child_offset,
+                    dorientation,
+                }
             }
         };
         out.push(pose);
@@ -718,7 +745,11 @@ fn differential_site(
                 columns.push((tree.v_offset[i] as u32, parent.orientation * axis));
                 d_columns.push((tree.v_offset[i] as u32, parent.dorientation * axis));
             }
-            JointKind::Ball { .. } => unreachable!(),
+            JointKind::Ball { .. } => {
+                panic!(
+                    "spatial tendon position derivatives do not support ball joints on the tendon path"
+                )
+            }
         }
     }
     DifferentialSite {
