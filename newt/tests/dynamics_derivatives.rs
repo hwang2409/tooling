@@ -449,7 +449,7 @@ fn spatial_tendon_position_derivative_matches_hand_spring() {
     assert!((actual.qacc_q[0] + 100.0).abs() < 2.0e-4);
 }
 
-fn wrapped_slide_tree(wrap: SpatialWrap, springlength: f32) -> Tree {
+fn wrapped_slide_tree(wrap: SpatialWrap, springlength: f32, endpoint_on_slide: bool) -> Tree {
     let mut tree = Tree::new();
     tree.push_link(Link::new(
         None,
@@ -474,7 +474,7 @@ fn wrapped_slide_tree(wrap: SpatialWrap, springlength: f32) -> Tree {
                 position_local: Vec3::new(-2.0, 0.2, 0.0),
             },
             SpatialTendonSite {
-                link: None,
+                link: endpoint_on_slide.then_some(1),
                 position_local: Vec3::new(2.0, 0.2, 0.0),
             },
         ],
@@ -500,13 +500,13 @@ fn symmetric_wrap_length() -> f32 {
 fn cylinder_wrap_position_derivative_matches_hand_second_derivative() {
     let length = symmetric_wrap_length();
     let wrap = SpatialWrap::Cylinder(WrapCylinder {
-        link: Some(1),
+        link: None,
         center_local: Vec3::ZERO,
         axis_local: Vec3::Z,
         radius: 0.5,
         sidesite: None,
     });
-    let tree = wrapped_slide_tree(wrap, length - 1.0);
+    let tree = wrapped_slide_tree(wrap, length - 1.0, true);
     let actual = tree.derivatives(Vec3::ZERO, &zero_wrenches(&tree));
 
     // A symmetric axial lift has L(q)'' = 1/L(0). The spring force is -1,
@@ -528,7 +528,7 @@ fn sphere_wrap_position_derivative_matches_hand_second_derivative() {
         radius: 0.5,
         side_hint_world: None,
     });
-    let tree = wrapped_slide_tree(wrap, length - 1.0);
+    let tree = wrapped_slide_tree(wrap, length - 1.0, false);
     let actual = tree.derivatives(Vec3::ZERO, &zero_wrenches(&tree));
 
     let d_squared: f32 = 4.04;
