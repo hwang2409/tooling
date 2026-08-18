@@ -6,7 +6,10 @@
 use newt::actuator::Actuator;
 use newt::joint::JointKind;
 use newt::math::{Mat3, Quat, Vec3};
-use newt::tendon::{SpatialTendonSite, Tendon};
+use newt::tendon::{
+    SpatialSegment, SpatialTendonBranch, SpatialTendonSite, SpatialWrap, Tendon, WrapCylinder,
+    WrapSphere,
+};
 use newt::tree::{Link, Tree};
 
 fn pendulum(damping: f32) -> Tree {
@@ -444,6 +447,95 @@ fn spatial_tendon_position_derivative_matches_hand_spring() {
 
     let actual = tree.derivatives(Vec3::ZERO, &zero_wrenches(&tree));
     assert!((actual.qacc_q[0] + 100.0).abs() < 2.0e-4);
+}
+
+fn wrapped_slide_tree(wrap: SpatialWrap, springlength: f32) -> Tree {
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::IDENTITY,
+    ));
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::slide(Vec3::Z),
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::IDENTITY,
+    ));
+    let mut tendon = Tendon::spatial_branches(vec![SpatialTendonBranch {
+        sites: vec![
+            SpatialTendonSite {
+                link: None,
+                position_local: Vec3::new(-2.0, 0.2, 0.0),
+            },
+            SpatialTendonSite {
+                link: None,
+                position_local: Vec3::new(2.0, 0.2, 0.0),
+            },
+        ],
+        segments: vec![SpatialSegment { wrap: Some(wrap) }],
+        divisor: 1.0,
+    }]);
+    tendon.springlength = Some(springlength);
+    tendon.stiffness = 1.0;
+    tree.add_tendon(tendon);
+    tree
+}
+
+fn symmetric_wrap_length() -> f32 {
+    let d_squared = 4.04;
+    let tangent = (d_squared - 0.25).sqrt();
+    let cosine = -3.96 / d_squared;
+    let gamma = newt::math::atan2((1.0 - cosine * cosine).sqrt(), cosine);
+    let phi = (tangent / d_squared.sqrt()).asin();
+    2.0 * tangent + 0.5 * (gamma - 2.0 * phi)
+}
+
+#[test]
+fn cylinder_wrap_position_derivative_matches_hand_second_derivative() {
+    let length = symmetric_wrap_length();
+    let wrap = SpatialWrap::Cylinder(WrapCylinder {
+        link: Some(1),
+        center_local: Vec3::ZERO,
+        axis_local: Vec3::Z,
+        radius: 0.5,
+        sidesite: None,
+    });
+    let tree = wrapped_slide_tree(wrap, length - 1.0);
+    let actual = tree.derivatives(Vec3::ZERO, &zero_wrenches(&tree));
+
+    // A symmetric axial lift has L(q)'' = 1/L(0). The spring force is -1,
+    // and the slide mass is 1, so qacc_q = -1/L(0).
+    let expected = -1.0 / length;
+    assert!((actual.qacc_q[0] - expected).abs() < 2.0e-3);
+}
+
+#[test]
+fn sphere_wrap_position_derivative_matches_hand_second_derivative() {
+    let length = symmetric_wrap_length();
+    let wrap = SpatialWrap::Sphere(WrapSphere {
+        link: Some(1),
+        center_local: Vec3::ZERO,
+        radius: 0.5,
+        side_hint_world: None,
+    });
+    let tree = wrapped_slide_tree(wrap, length - 1.0);
+    let actual = tree.derivatives(Vec3::ZERO, &zero_wrenches(&tree));
+
+    let d_squared: f32 = 4.04;
+    let tangent = (d_squared - 0.25).sqrt();
+    let cosine = -3.96 / d_squared;
+    let sine = (1.0 - cosine * cosine).sqrt();
+    let gamma_second = -16.0 / (d_squared * d_squared * sine);
+    let phi_second = 0.5 / (d_squared * tangent);
+    let length_second = 2.0 / tangent + 0.5 * (gamma_second - 2.0 * phi_second);
+    let expected = -length_second;
+    assert!((actual.qacc_q[0] - expected).abs() < 2.0e-3);
 }
 
 #[test]
