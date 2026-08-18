@@ -46,7 +46,11 @@ fn allocation_count() -> usize {
 #[test]
 fn optimized_euler_muscle_step_allocations_are_stable() {
     const STEPS: usize = 16;
-    const EXPECTED_ALLOCATIONS: usize = 12;
+    // Each step allocates: tendon (2), external-force (2), and acceleration
+    // result buffers. Previous state (tier-3 first optimization pass) held at
+    // 12; NEWT-32 folds the ABA `tendon_qfrc` scratch into `AbaWorkspace` and
+    // drops the dead `ext_body` Vec, dropping the steady-state count to 10.
+    const EXPECTED_ALLOCATIONS: usize = 10;
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/references/muscle_pendulum.xml");
     let mut scene = load_mjcf_path(&path).expect("muscle scene should load");
     scene.world.integrator = Integrator::Euler;
