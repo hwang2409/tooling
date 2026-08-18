@@ -488,7 +488,7 @@ fn wrapped_slide_tree(wrap: SpatialWrap, springlength: f32) -> Tree {
 }
 
 fn symmetric_wrap_length() -> f32 {
-    let d_squared = 4.04;
+    let d_squared: f32 = 4.04;
     let tangent = (d_squared - 0.25).sqrt();
     let cosine = -3.96 / d_squared;
     let gamma = newt::math::atan2((1.0 - cosine * cosine).sqrt(), cosine);
