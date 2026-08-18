@@ -486,8 +486,8 @@ pub fn tendon_kinematics(tendon: &Tendon, tree: &Tree, poses: &[(Vec3, Quat)]) -
 /// Position derivative of the tendon Jacobian for one smooth configuration.
 ///
 /// The spatial path uses the same site and segment geometry as
-/// [`tendon_kinematics`]. Wrap branches keep their envelope Jacobian, but do
-/// not expose a second derivative in this tier.
+/// [`tendon_kinematics`]. Wrap branches differentiate their envelope
+/// Jacobian, including motion of an attached wrap body.
 pub(crate) struct TendonPositionDerivative {
     pub jacobian: Vec<f32>,
 }
@@ -510,15 +510,34 @@ pub(crate) fn tendon_position_derivative(
             .map(|site| differential_site(tree, &dposes, site))
             .collect();
         for (index, segment) in branch.segments.iter().enumerate() {
-            if segment.wrap.is_some() {
-                continue;
+            match &segment.wrap {
+                None => straight_segment_jacobian_derivative(
+                    &sites[index],
+                    &sites[index + 1],
+                    branch.divisor,
+                    &mut jacobian,
+                ),
+                Some(SpatialWrap::Sphere(wrap)) => sphere_segment_jacobian_derivative(
+                    tree,
+                    poses,
+                    &dposes,
+                    &sites[index],
+                    &sites[index + 1],
+                    wrap,
+                    branch.divisor,
+                    &mut jacobian,
+                ),
+                Some(SpatialWrap::Cylinder(wrap)) => cylinder_segment_jacobian_derivative(
+                    tree,
+                    poses,
+                    &dposes,
+                    &sites[index],
+                    &sites[index + 1],
+                    wrap,
+                    branch.divisor,
+                    &mut jacobian,
+                ),
             }
-            straight_segment_jacobian_derivative(
-                &sites[index],
-                &sites[index + 1],
-                branch.divisor,
-                &mut jacobian,
-            );
         }
     }
     TendonPositionDerivative { jacobian }
@@ -780,6 +799,826 @@ fn straight_segment_jacobian_derivative(
         let da_col = column_value(&a.d_columns, slot);
         let db_col = column_value(&b.d_columns, slot);
         *value += (dunit.dot(b_col - a_col) + unit.dot(db_col - da_col)) / divisor;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DifferentialScalar {
+    value: f32,
+    derivative: f32,
+}
+
+#[derive(Clone, Copy)]
+struct DifferentialVec2 {
+    value: [f32; 2],
+    derivative: [f32; 2],
+}
+
+#[derive(Clone, Copy)]
+struct DifferentialVec3 {
+    value: Vec3,
+    derivative: Vec3,
+}
+
+fn differential_scalar(value: f32, derivative: f32) -> DifferentialScalar {
+    DifferentialScalar { value, derivative }
+}
+
+fn differential_scalar_add(a: DifferentialScalar, b: DifferentialScalar) -> DifferentialScalar {
+    differential_scalar(a.value + b.value, a.derivative + b.derivative)
+}
+
+fn differential_scalar_sub(a: DifferentialScalar, b: DifferentialScalar) -> DifferentialScalar {
+    differential_scalar(a.value - b.value, a.derivative - b.derivative)
+}
+
+fn differential_scalar_mul(a: DifferentialScalar, b: DifferentialScalar) -> DifferentialScalar {
+    differential_scalar(
+        a.value * b.value,
+        a.derivative * b.value + a.value * b.derivative,
+    )
+}
+
+fn differential_scalar_div(a: DifferentialScalar, b: DifferentialScalar) -> DifferentialScalar {
+    differential_scalar(
+        a.value / b.value,
+        (a.derivative * b.value - a.value * b.derivative) / (b.value * b.value),
+    )
+}
+
+fn differential_scalar_sqrt(a: DifferentialScalar) -> DifferentialScalar {
+    if a.value <= 0.0 {
+        differential_scalar(0.0, 0.0)
+    } else {
+        let value = a.value.sqrt();
+        differential_scalar(value, a.derivative / (2.0 * value))
+    }
+}
+
+fn differential_vec2(value: [f32; 2], derivative: [f32; 2]) -> DifferentialVec2 {
+    DifferentialVec2 { value, derivative }
+}
+
+fn differential_vec2_add(a: DifferentialVec2, b: DifferentialVec2) -> DifferentialVec2 {
+    differential_vec2(
+        [a.value[0] + b.value[0], a.value[1] + b.value[1]],
+        [
+            a.derivative[0] + b.derivative[0],
+            a.derivative[1] + b.derivative[1],
+        ],
+    )
+}
+
+fn differential_vec2_sub(a: DifferentialVec2, b: DifferentialVec2) -> DifferentialVec2 {
+    differential_vec2(
+        [a.value[0] - b.value[0], a.value[1] - b.value[1]],
+        [
+            a.derivative[0] - b.derivative[0],
+            a.derivative[1] - b.derivative[1],
+        ],
+    )
+}
+
+fn differential_vec2_scale(
+    vector: DifferentialVec2,
+    scalar: DifferentialScalar,
+) -> DifferentialVec2 {
+    differential_vec2(
+        [
+            vector.value[0] * scalar.value,
+            vector.value[1] * scalar.value,
+        ],
+        [
+            vector.derivative[0] * scalar.value + vector.value[0] * scalar.derivative,
+            vector.derivative[1] * scalar.value + vector.value[1] * scalar.derivative,
+        ],
+    )
+}
+
+fn differential_vec3(value: Vec3, derivative: Vec3) -> DifferentialVec3 {
+    DifferentialVec3 { value, derivative }
+}
+
+fn differential_vec3_add(a: DifferentialVec3, b: DifferentialVec3) -> DifferentialVec3 {
+    differential_vec3(a.value + b.value, a.derivative + b.derivative)
+}
+
+fn differential_vec3_sub(a: DifferentialVec3, b: DifferentialVec3) -> DifferentialVec3 {
+    differential_vec3(a.value - b.value, a.derivative - b.derivative)
+}
+
+fn differential_vec3_scale(
+    vector: DifferentialVec3,
+    scalar: DifferentialScalar,
+) -> DifferentialVec3 {
+    differential_vec3(
+        vector.value * scalar.value,
+        vector.derivative * scalar.value + vector.value * scalar.derivative,
+    )
+}
+
+fn differential_vec3_dot(a: DifferentialVec3, b: DifferentialVec3) -> DifferentialScalar {
+    differential_scalar(
+        a.value.dot(b.value),
+        a.derivative.dot(b.value) + a.value.dot(b.derivative),
+    )
+}
+
+fn differential_vec3_cross(a: DifferentialVec3, b: DifferentialVec3) -> DifferentialVec3 {
+    differential_vec3(
+        a.value.cross(b.value),
+        a.derivative.cross(b.value) + a.value.cross(b.derivative),
+    )
+}
+
+fn differential_vec3_length(vector: DifferentialVec3) -> DifferentialScalar {
+    differential_scalar_sqrt(differential_vec3_dot(vector, vector))
+}
+
+fn differential_vec3_normalize(vector: DifferentialVec3) -> DifferentialVec3 {
+    differential_vec3_scale(
+        vector,
+        differential_scalar_div(
+            differential_scalar(1.0, 0.0),
+            differential_vec3_length(vector),
+        ),
+    )
+}
+
+fn differential_site_vector(site: &DifferentialSite) -> DifferentialVec3 {
+    differential_vec3(site.world_pos, site.d_world_pos)
+}
+
+fn differential_wrap_point(
+    tree: &Tree,
+    poses: &[(Vec3, Quat)],
+    dposes: &[DifferentialPose],
+    link: Option<usize>,
+    world_point: Vec3,
+) -> DifferentialSite {
+    match link {
+        None => DifferentialSite {
+            world_pos: world_point,
+            d_world_pos: Vec3::ZERO,
+            columns: Vec::new(),
+            d_columns: Vec::new(),
+        },
+        Some(link_idx) => {
+            let (com, orientation) = poses[link_idx];
+            let local = orientation.inverse_rotate(world_point - com);
+            differential_site(
+                tree,
+                dposes,
+                &SpatialTendonSite {
+                    link: Some(link_idx),
+                    position_local: local,
+                },
+            )
+        }
+    }
+}
+
+fn differential_column_value(columns: &[(u32, Vec3)], slot: usize) -> Vec3 {
+    columns
+        .iter()
+        .find(|(index, _)| *index as usize == slot)
+        .map(|(_, value)| *value)
+        .unwrap_or(Vec3::ZERO)
+}
+
+fn differential_wrap_endpoint_jacobian(
+    a: &DifferentialSite,
+    b: &DifferentialSite,
+    force_a: DifferentialVec3,
+    force_b: DifferentialVec3,
+    jacobian: &mut [f32],
+) {
+    for slot in 0..jacobian.len() {
+        let a_col = differential_vec3(
+            differential_column_value(&a.columns, slot),
+            differential_column_value(&a.d_columns, slot),
+        );
+        let b_col = differential_vec3(
+            differential_column_value(&b.columns, slot),
+            differential_column_value(&b.d_columns, slot),
+        );
+        jacobian[slot] -= differential_vec3_dot(force_a, a_col).derivative;
+        jacobian[slot] -= differential_vec3_dot(force_b, b_col).derivative;
+    }
+}
+
+fn differential_wrap_body_jacobian(
+    tree: &Tree,
+    poses: &[(Vec3, Quat)],
+    dposes: &[DifferentialPose],
+    link: Option<usize>,
+    center: Vec3,
+    point_a: Vec3,
+    point_b: Vec3,
+    force_a: DifferentialVec3,
+    force_b: DifferentialVec3,
+    jacobian: &mut [f32],
+) {
+    let Some(link) = link else { return };
+    let center = differential_wrap_point(tree, poses, dposes, Some(link), center);
+    let point_a = differential_wrap_point(tree, poses, dposes, Some(link), point_a);
+    let point_b = differential_wrap_point(tree, poses, dposes, Some(link), point_b);
+    let total_force = differential_vec3_add(force_a, force_b);
+    for slot in 0..jacobian.len() {
+        let center_col = differential_vec3(
+            differential_column_value(&center.columns, slot),
+            differential_column_value(&center.d_columns, slot),
+        );
+        let point_a_col = differential_vec3(
+            differential_column_value(&point_a.columns, slot),
+            differential_column_value(&point_a.d_columns, slot),
+        );
+        let point_b_col = differential_vec3(
+            differential_column_value(&point_b.columns, slot),
+            differential_column_value(&point_b.d_columns, slot),
+        );
+        let value = differential_vec3_dot(total_force, center_col);
+        let value = differential_scalar_add(
+            value,
+            differential_vec3_dot(force_a, differential_vec3_sub(point_a_col, center_col)),
+        );
+        let value = differential_scalar_add(
+            value,
+            differential_vec3_dot(force_b, differential_vec3_sub(point_b_col, center_col)),
+        );
+        jacobian[slot] += value.derivative;
+    }
+}
+
+fn sphere_segment_jacobian_derivative(
+    tree: &Tree,
+    poses: &[(Vec3, Quat)],
+    dposes: &[DifferentialPose],
+    a: &DifferentialSite,
+    b: &DifferentialSite,
+    wrap: &WrapSphere,
+    divisor: f32,
+    jacobian: &mut [f32],
+) {
+    let center = wrap_center_world(poses, wrap.link, wrap.center_local);
+    let center_site = differential_wrap_point(tree, poses, dposes, wrap.link, center);
+    let a_point = differential_site_vector(a);
+    let b_point = differential_site_vector(b);
+    let center_point = differential_site_vector(&center_site);
+    let radius_squared = wrap.radius * wrap.radius;
+    let a_from_center = differential_vec3_sub(a_point, center_point);
+    let b_from_center = differential_vec3_sub(b_point, center_point);
+    let a_distance_squared = differential_vec3_dot(a_from_center, a_from_center);
+    let b_distance_squared = differential_vec3_dot(b_from_center, b_from_center);
+    if a_distance_squared.value <= radius_squared || b_distance_squared.value <= radius_squared {
+        straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+        return;
+    }
+    let ab = differential_vec3_sub(b_point, a_point);
+    let ab_length_squared = differential_vec3_dot(ab, ab);
+    if ab_length_squared.value == 0.0 {
+        return;
+    }
+    let closest = differential_scalar_div(
+        differential_scalar(
+            -a_from_center.value.dot(ab.value),
+            -a_from_center.derivative.dot(ab.value) - a_from_center.value.dot(ab.derivative),
+        ),
+        ab_length_squared,
+    );
+    let closest_point = differential_vec3_add(a_point, differential_vec3_scale(ab, closest));
+    let perpendicular = differential_vec3_sub(closest_point, center_point);
+    let inside_segment = (0.0..=1.0).contains(&closest.value);
+    if !inside_segment || perpendicular.value.length_squared() >= radius_squared {
+        straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+        return;
+    }
+    let plane_normal = differential_vec3_cross(a_from_center, b_from_center);
+    if plane_normal.value.length() < SIDE_HINT_COLINEARITY_EPS {
+        let Some(hint) = wrap.side_hint_world else {
+            straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+            return;
+        };
+        let ab_hat = ab.value / ab.value.length();
+        let hint_perpendicular = hint - ab_hat * hint.dot(ab_hat);
+        if hint_perpendicular.length_squared()
+            < SIDE_HINT_COLINEARITY_EPS * SIDE_HINT_COLINEARITY_EPS
+        {
+            straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+            return;
+        }
+        let unit_hint = differential_vec3(hint_perpendicular.normalize(), Vec3::ZERO);
+        let (point_a, point_b) =
+            sphere_tangent_points_with_hint(a_point, b_point, center_point, wrap.radius, unit_hint);
+        let force_a = differential_vec3_normalize(differential_vec3_sub(point_a, a_point));
+        let force_b = differential_vec3_normalize(differential_vec3_sub(point_b, b_point));
+        differential_wrap_endpoint_jacobian(a, b, force_a, force_b, jacobian);
+        differential_wrap_body_jacobian(
+            tree,
+            poses,
+            dposes,
+            wrap.link,
+            center,
+            point_a.value,
+            point_b.value,
+            force_a,
+            force_b,
+            jacobian,
+        );
+        for value in jacobian.iter_mut() {
+            *value /= divisor;
+        }
+        return;
+    }
+    let distance_a = differential_vec3_length(a_from_center);
+    let distance_b = differential_vec3_length(b_from_center);
+    let tangent_a = differential_scalar_sqrt(differential_scalar_sub(
+        differential_scalar_mul(distance_a, distance_a),
+        differential_scalar(radius_squared, 0.0),
+    ));
+    let tangent_b = differential_scalar_sqrt(differential_scalar_sub(
+        differential_scalar_mul(distance_b, distance_b),
+        differential_scalar(radius_squared, 0.0),
+    ));
+    let x_a = differential_vec3_scale(
+        a_from_center,
+        differential_scalar_div(differential_scalar(1.0, 0.0), distance_a),
+    );
+    let x_b = differential_vec3_scale(
+        b_from_center,
+        differential_scalar_div(differential_scalar(1.0, 0.0), distance_b),
+    );
+    let cb_perpendicular = differential_vec3_sub(
+        b_from_center,
+        differential_vec3_scale(x_a, differential_vec3_dot(b_from_center, x_a)),
+    );
+    if cb_perpendicular.value.length() == 0.0 {
+        straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+        return;
+    }
+    let y_a = differential_vec3_normalize(cb_perpendicular);
+    let point_a = differential_vec3_add(
+        center_point,
+        differential_vec3_add(
+            differential_vec3_scale(
+                x_a,
+                differential_scalar_div(differential_scalar(radius_squared, 0.0), distance_a),
+            ),
+            differential_vec3_scale(
+                y_a,
+                differential_scalar_div(
+                    differential_scalar_mul(differential_scalar(wrap.radius, 0.0), tangent_a),
+                    distance_a,
+                ),
+            ),
+        ),
+    );
+    let ca_perpendicular = differential_vec3_sub(
+        a_from_center,
+        differential_vec3_scale(x_b, differential_vec3_dot(a_from_center, x_b)),
+    );
+    if ca_perpendicular.value.length() == 0.0 {
+        straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+        return;
+    }
+    let y_b = differential_vec3_normalize(ca_perpendicular);
+    let point_b = differential_vec3_add(
+        center_point,
+        differential_vec3_add(
+            differential_vec3_scale(
+                x_b,
+                differential_scalar_div(differential_scalar(radius_squared, 0.0), distance_b),
+            ),
+            differential_vec3_scale(
+                y_b,
+                differential_scalar_div(
+                    differential_scalar_mul(differential_scalar(wrap.radius, 0.0), tangent_b),
+                    distance_b,
+                ),
+            ),
+        ),
+    );
+    let force_a = differential_vec3_normalize(differential_vec3_sub(point_a, a_point));
+    let force_b = differential_vec3_normalize(differential_vec3_sub(point_b, b_point));
+    differential_wrap_endpoint_jacobian(a, b, force_a, force_b, jacobian);
+    differential_wrap_body_jacobian(
+        tree,
+        poses,
+        dposes,
+        wrap.link,
+        center,
+        point_a.value,
+        point_b.value,
+        force_a,
+        force_b,
+        jacobian,
+    );
+    for value in jacobian.iter_mut() {
+        *value /= divisor;
+    }
+}
+
+fn sphere_tangent_points_with_hint(
+    a: DifferentialVec3,
+    b: DifferentialVec3,
+    center: DifferentialVec3,
+    radius: f32,
+    y_hint: DifferentialVec3,
+) -> (DifferentialVec3, DifferentialVec3) {
+    let a_from_center = differential_vec3_sub(a, center);
+    let b_from_center = differential_vec3_sub(b, center);
+    let distance_a = differential_vec3_length(a_from_center);
+    let distance_b = differential_vec3_length(b_from_center);
+    let radius_squared = radius * radius;
+    let tangent_a = differential_scalar_sqrt(differential_scalar_sub(
+        differential_scalar_mul(distance_a, distance_a),
+        differential_scalar(radius_squared, 0.0),
+    ));
+    let tangent_b = differential_scalar_sqrt(differential_scalar_sub(
+        differential_scalar_mul(distance_b, distance_b),
+        differential_scalar(radius_squared, 0.0),
+    ));
+    let x_a = differential_vec3_scale(
+        a_from_center,
+        differential_scalar_div(differential_scalar(1.0, 0.0), distance_a),
+    );
+    let x_b = differential_vec3_scale(
+        b_from_center,
+        differential_scalar_div(differential_scalar(1.0, 0.0), distance_b),
+    );
+    let point_a = differential_vec3_add(
+        center,
+        differential_vec3_add(
+            differential_vec3_scale(
+                x_a,
+                differential_scalar_div(differential_scalar(radius_squared, 0.0), distance_a),
+            ),
+            differential_vec3_scale(
+                y_hint,
+                differential_scalar_div(
+                    differential_scalar_mul(differential_scalar(radius, 0.0), tangent_a),
+                    distance_a,
+                ),
+            ),
+        ),
+    );
+    let point_b = differential_vec3_add(
+        center,
+        differential_vec3_add(
+            differential_vec3_scale(
+                x_b,
+                differential_scalar_div(differential_scalar(radius_squared, 0.0), distance_b),
+            ),
+            differential_vec3_scale(
+                y_hint,
+                differential_scalar_div(
+                    differential_scalar_mul(differential_scalar(radius, 0.0), tangent_b),
+                    distance_b,
+                ),
+            ),
+        ),
+    );
+    (point_a, point_b)
+}
+
+fn differential_vec2_dot(a: DifferentialVec2, b: DifferentialVec2) -> DifferentialScalar {
+    differential_scalar(
+        a.value[0] * b.value[0] + a.value[1] * b.value[1],
+        a.derivative[0] * b.value[0]
+            + a.value[0] * b.derivative[0]
+            + a.derivative[1] * b.value[1]
+            + a.value[1] * b.derivative[1],
+    )
+}
+
+fn differential_vec2_length(vector: DifferentialVec2) -> DifferentialScalar {
+    differential_scalar_sqrt(differential_vec2_dot(vector, vector))
+}
+
+fn differential_circle_arc_length(
+    a: DifferentialVec2,
+    b: DifferentialVec2,
+    solution: usize,
+    radius: f32,
+) -> DifferentialScalar {
+    let a_length = differential_vec2_length(a);
+    let b_length = differential_vec2_length(b);
+    let a_unit = differential_vec2_scale(
+        a,
+        differential_scalar_div(differential_scalar(1.0, 0.0), a_length),
+    );
+    let b_unit = differential_vec2_scale(
+        b,
+        differential_scalar_div(differential_scalar(1.0, 0.0), b_length),
+    );
+    let dot = differential_vec2_dot(a_unit, b_unit);
+    let sine_squared = differential_scalar_sub(
+        differential_scalar(1.0, 0.0),
+        differential_scalar_mul(dot, dot),
+    );
+    let sine = differential_scalar_sqrt(sine_squared);
+    let denominator = differential_scalar_add(
+        differential_scalar_mul(dot, dot),
+        differential_scalar_mul(sine, sine),
+    );
+    let angle = differential_scalar(
+        atan2(sine.value, dot.value),
+        (dot.value * sine.derivative - sine.value * dot.derivative) / denominator.value,
+    );
+    let cross = a.value[1] * b.value[0] - a.value[0] * b.value[1];
+    let angle = if (cross > 0.0 && solution == 1) || (cross < 0.0 && solution == 0) {
+        differential_scalar(crate::math::TAU - angle.value, -angle.derivative)
+    } else {
+        angle
+    };
+    differential_scalar(angle.value * radius, angle.derivative * radius)
+}
+
+fn differential_circle_wrap_points(
+    end0: DifferentialVec2,
+    end1: DifferentialVec2,
+    side: Option<DifferentialVec2>,
+    radius: f32,
+) -> Option<(DifferentialVec2, DifferentialVec2, DifferentialScalar)> {
+    let radius_squared = radius * radius;
+    let square_length0 = differential_vec2_dot(end0, end0);
+    let square_length1 = differential_vec2_dot(end1, end1);
+    if square_length0.value < radius_squared || square_length1.value < radius_squared {
+        return None;
+    }
+    let difference = differential_vec2_sub(end1, end0);
+    let difference_squared = differential_vec2_dot(difference, difference);
+    if difference_squared.value < 1.0e-12 {
+        return None;
+    }
+    let closest_fraction = differential_scalar(
+        (-(difference.value[0] * end0.value[0] + difference.value[1] * end0.value[1])
+            / difference_squared.value)
+            .clamp(0.0, 1.0),
+        0.0,
+    );
+    let closest =
+        differential_vec2_add(end0, differential_vec2_scale(difference, closest_fraction));
+    let closest_squared = differential_vec2_dot(closest, closest);
+    if closest_squared.value > radius_squared
+        && side.is_none_or(|s| s.value[0] * closest.value[0] + s.value[1] * closest.value[1] >= 0.0)
+    {
+        return None;
+    }
+    let tangent0 = differential_scalar_sqrt(differential_scalar_sub(
+        square_length0,
+        differential_scalar(radius_squared, 0.0),
+    ));
+    let tangent1 = differential_scalar_sqrt(differential_scalar_sub(
+        square_length1,
+        differential_scalar(radius_squared, 0.0),
+    ));
+    let mut best = 0;
+    let mut best_good = f32::NEG_INFINITY;
+    let mut best_solutions = None;
+    for (index, sign) in [1.0f32, -1.0].into_iter().enumerate() {
+        let solution0 = differential_vec2(
+            [
+                (end0.value[0] * radius_squared + sign * radius * end0.value[1] * tangent0.value)
+                    / square_length0.value,
+                (end0.value[1] * radius_squared - sign * radius * end0.value[0] * tangent0.value)
+                    / square_length0.value,
+            ],
+            [
+                (end0.derivative[0] * radius_squared
+                    + sign
+                        * radius
+                        * (end0.derivative[1] * tangent0.value
+                            + end0.value[1] * tangent0.derivative))
+                    / square_length0.value
+                    - (end0.value[0] * radius_squared
+                        + sign * radius * end0.value[1] * tangent0.value)
+                        * square_length0.derivative
+                        / (square_length0.value * square_length0.value),
+                (end0.derivative[1] * radius_squared
+                    - sign
+                        * radius
+                        * (end0.derivative[0] * tangent0.value
+                            + end0.value[0] * tangent0.derivative))
+                    / square_length0.value
+                    - (end0.value[1] * radius_squared
+                        - sign * radius * end0.value[0] * tangent0.value)
+                        * square_length0.derivative
+                        / (square_length0.value * square_length0.value),
+            ],
+        );
+        let solution1 = differential_vec2(
+            [
+                (end1.value[0] * radius_squared - sign * radius * end1.value[1] * tangent1.value)
+                    / square_length1.value,
+                (end1.value[1] * radius_squared + sign * radius * end1.value[0] * tangent1.value)
+                    / square_length1.value,
+            ],
+            [
+                (end1.derivative[0] * radius_squared
+                    - sign
+                        * radius
+                        * (end1.derivative[1] * tangent1.value
+                            + end1.value[1] * tangent1.derivative))
+                    / square_length1.value
+                    - (end1.value[0] * radius_squared
+                        - sign * radius * end1.value[1] * tangent1.value)
+                        * square_length1.derivative
+                        / (square_length1.value * square_length1.value),
+                (end1.derivative[1] * radius_squared
+                    + sign
+                        * radius
+                        * (end1.derivative[0] * tangent1.value
+                            + end1.value[0] * tangent1.derivative))
+                    / square_length1.value
+                    - (end1.value[1] * radius_squared
+                        + sign * radius * end1.value[0] * tangent1.value)
+                        * square_length1.derivative
+                        / (square_length1.value * square_length1.value),
+            ],
+        );
+        let good = if let Some(side) = side {
+            let midpoint = differential_vec2_add(solution0, solution1);
+            if midpoint.value[0] == 0.0 && midpoint.value[1] == 0.0 {
+                f32::NEG_INFINITY
+            } else {
+                let midpoint_length = (midpoint.value[0] * midpoint.value[0]
+                    + midpoint.value[1] * midpoint.value[1])
+                    .sqrt();
+                (midpoint.value[0] / midpoint_length) * side.value[0]
+                    + (midpoint.value[1] / midpoint_length) * side.value[1]
+            }
+        } else {
+            let chord = differential_vec2_sub(solution0, solution1);
+            -differential_vec2_dot(chord, chord).value
+        };
+        if is_intersect_2d(end0.value, solution0.value, end1.value, solution1.value) {
+            continue;
+        }
+        if good > best_good {
+            best = index;
+            best_good = good;
+            best_solutions = Some((solution0, solution1));
+        }
+    }
+    if best_good == f32::NEG_INFINITY {
+        return None;
+    }
+    let (solution0, solution1) = best_solutions?;
+    let arc = differential_circle_arc_length(solution0, solution1, best, radius);
+    Some((solution0, solution1, arc))
+}
+
+fn cylinder_segment_jacobian_derivative(
+    tree: &Tree,
+    poses: &[(Vec3, Quat)],
+    dposes: &[DifferentialPose],
+    a: &DifferentialSite,
+    b: &DifferentialSite,
+    wrap: &WrapCylinder,
+    divisor: f32,
+    jacobian: &mut [f32],
+) {
+    let center = wrap_center_world(poses, wrap.link, wrap.center_local);
+    let center_site = differential_wrap_point(tree, poses, dposes, wrap.link, center);
+    let center_point = differential_site_vector(&center_site);
+    let axis = match wrap.link {
+        Some(link) => differential_vec3(
+            poses[link].1.rotate(wrap.axis_local),
+            dposes[link].dorientation * wrap.axis_local,
+        ),
+        None => differential_vec3(wrap.axis_local, Vec3::ZERO),
+    };
+    let axis = differential_vec3_normalize(axis);
+    let reference = if axis.value.x.abs() < 0.8 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
+    let basis0 = differential_vec3_normalize(differential_vec3_cross(
+        axis,
+        differential_vec3(reference, Vec3::ZERO),
+    ));
+    let basis1 = differential_vec3_normalize(differential_vec3_cross(axis, basis0));
+    let a_point = differential_site_vector(a);
+    let b_point = differential_site_vector(b);
+    let a_relative = differential_vec3_sub(a_point, center_point);
+    let b_relative = differential_vec3_sub(b_point, center_point);
+    let end0 = differential_vec2(
+        [
+            differential_vec3_dot(a_relative, basis0).value,
+            differential_vec3_dot(a_relative, basis1).value,
+        ],
+        [
+            differential_vec3_dot(a_relative, basis0).derivative,
+            differential_vec3_dot(a_relative, basis1).derivative,
+        ],
+    );
+    let end1 = differential_vec2(
+        [
+            differential_vec3_dot(b_relative, basis0).value,
+            differential_vec3_dot(b_relative, basis1).value,
+        ],
+        [
+            differential_vec3_dot(b_relative, basis0).derivative,
+            differential_vec3_dot(b_relative, basis1).derivative,
+        ],
+    );
+    let side = wrap.sidesite.map(|site| {
+        let side = differential_site(tree, dposes, &site);
+        let relative = differential_vec3_sub(differential_site_vector(&side), center_point);
+        let radial = differential_vec2(
+            [
+                differential_vec3_dot(relative, basis0).value,
+                differential_vec3_dot(relative, basis1).value,
+            ],
+            [
+                differential_vec3_dot(relative, basis0).derivative,
+                differential_vec3_dot(relative, basis1).derivative,
+            ],
+        );
+        let length = differential_vec2_length(radial);
+        differential_vec2_scale(
+            radial,
+            differential_scalar_div(differential_scalar(wrap.radius, 0.0), length),
+        )
+    });
+    let Some((tangent_a, tangent_b, arc)) =
+        differential_circle_wrap_points(end0, end1, side, wrap.radius)
+    else {
+        straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+        return;
+    };
+    let radial_a = differential_vec2_length(differential_vec2_sub(end0, tangent_a));
+    let radial_b = differential_vec2_length(differential_vec2_sub(end1, tangent_b));
+    let total = differential_scalar_add(differential_scalar_add(radial_a, arc), radial_b);
+    if total.value == 0.0 {
+        straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+        return;
+    }
+    let za = differential_vec3_dot(a_relative, axis);
+    let zb = differential_vec3_dot(b_relative, axis);
+    let z_difference = differential_scalar_sub(zb, za);
+    let zta = differential_scalar_add(
+        za,
+        differential_scalar_mul(z_difference, differential_scalar_div(radial_a, total)),
+    );
+    let ztb = differential_scalar_add(
+        za,
+        differential_scalar_mul(
+            z_difference,
+            differential_scalar_div(differential_scalar_add(radial_a, arc), total),
+        ),
+    );
+    let point_a = differential_vec3_add(
+        center_point,
+        differential_vec3_add(
+            differential_vec3_add(
+                differential_vec3_scale(
+                    basis0,
+                    differential_scalar(tangent_a.value[0], tangent_a.derivative[0]),
+                ),
+                differential_vec3_scale(
+                    basis1,
+                    differential_scalar(tangent_a.value[1], tangent_a.derivative[1]),
+                ),
+            ),
+            differential_vec3_scale(axis, zta),
+        ),
+    );
+    let point_b = differential_vec3_add(
+        center_point,
+        differential_vec3_add(
+            differential_vec3_add(
+                differential_vec3_scale(
+                    basis0,
+                    differential_scalar(tangent_b.value[0], tangent_b.derivative[0]),
+                ),
+                differential_vec3_scale(
+                    basis1,
+                    differential_scalar(tangent_b.value[1], tangent_b.derivative[1]),
+                ),
+            ),
+            differential_vec3_scale(axis, ztb),
+        ),
+    );
+    let force_a = differential_vec3_normalize(differential_vec3_sub(point_a, a_point));
+    let force_b = differential_vec3_normalize(differential_vec3_sub(point_b, b_point));
+    differential_wrap_endpoint_jacobian(a, b, force_a, force_b, jacobian);
+    differential_wrap_body_jacobian(
+        tree,
+        poses,
+        dposes,
+        wrap.link,
+        center,
+        point_a.value,
+        point_b.value,
+        force_a,
+        force_b,
+        jacobian,
+    );
+    for value in jacobian.iter_mut() {
+        *value /= divisor;
     }
 }
 
