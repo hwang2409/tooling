@@ -686,6 +686,23 @@ impl Tree {
         crate::dynamics::derivatives(self, gravity, external_wrenches)
     }
 
+    /// Dense derivatives for constrained dynamics.
+    ///
+    /// The callback rebuilds world-frame contact or friction wrenches for
+    /// every perturbed state. Use this entry point when the external wrench
+    /// depends on `q`, `qdot`, or actuator controls. Fixed-wrench derivatives
+    /// should use [`Tree::derivatives`].
+    pub fn constrained_derivatives<F>(
+        &self,
+        gravity: Vec3,
+        external_wrenches: F,
+    ) -> crate::dynamics::Derivatives
+    where
+        F: Fn(&Tree) -> ExternalWrenches,
+    {
+        crate::dynamics::constrained_derivatives(self, gravity, external_wrenches)
+    }
+
     /// Inverse dynamics: generalized force required to produce `qddot`
     /// under `gravity` and `external_wrenches`. See
     /// [`crate::dynamics::inverse_dynamics`].
