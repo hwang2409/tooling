@@ -512,7 +512,11 @@ fn cylinder_wrap_position_derivative_matches_hand_second_derivative() {
     // A symmetric axial lift has L(q)'' = 1/L(0). The spring force is -1,
     // and the slide mass is 1, so qacc_q = -1/L(0).
     let expected = -1.0 / length;
-    assert!((actual.qacc_q[0] - expected).abs() < 2.0e-3);
+    assert!(
+        (actual.qacc_q[0] - expected).abs() < 2.0e-3,
+        "actual={} expected={expected}",
+        actual.qacc_q[0]
+    );
 }
 
 #[test]
