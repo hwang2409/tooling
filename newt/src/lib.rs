@@ -80,6 +80,7 @@ pub mod body;
 pub mod contact;
 pub mod dynamics;
 pub mod equality;
+pub(crate) mod forces;
 pub mod geom;
 pub mod jacobian;
 pub mod joint;

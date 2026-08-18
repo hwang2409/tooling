@@ -1151,6 +1151,7 @@ fn aba_with_velocity_implicit_workspace(
             crate::tendon::accumulate_tendon_passive(tree, poses, &mut tendon_qfrc);
         crate::tendon::accumulate_tendon_actuator_qfrc(tree, &mut tendon_state, &mut tendon_qfrc);
     }
+    let joint_forces = crate::forces::assemble_joint_forces(tree, &tendon_qfrc);
 
     // --- Pass 2: leaves→root, accumulate IA and pA. ---
     // Initialize each link's IA = spatial inertia and pA = velocity-product bias.
@@ -1165,12 +1166,8 @@ fn aba_with_velocity_implicit_workspace(
         // are world-frame at the link's COM, so they sum trivially before
         // the frame rotation.
         let (_pos, ori) = poses[i];
-        let (force_world_ext, torque_world_ext) = external_wrenches[i];
-        let (force_world_applied, torque_world_applied) = tree.applied_wrenches[i];
-        let force_world = force_world_ext + force_world_applied;
-        let torque_world = torque_world_ext + torque_world_applied;
-        // Add gravity as world-frame force at COM.
-        let force_world_total = force_world + gravity * link.mass;
+        let (force_world_total, torque_world) =
+            crate::forces::external_wrench_world(tree, i, gravity, external_wrenches);
         // Rotate world-frame wrench into body frame.
         let force_body = ori.inverse_rotate(force_world_total);
         let torque_body = ori.inverse_rotate(torque_world);
@@ -1198,71 +1195,15 @@ fn aba_with_velocity_implicit_workspace(
                 w.pa[parent] = w.pa[parent] + pa_parent_contrib;
             }
             JointKind::Hinge {
-                damping,
-                armature,
-                range,
-                limit,
-                ..
+                damping, armature, ..
+            }
+            | JointKind::Slide {
+                damping, armature, ..
             } => {
                 let parent = link.parent.expect("hinge must have parent");
                 let qdot_i = tree.qdot[tree.v_offset[i]];
                 let q_i = tree.q[tree.q_offset[i]];
-                let tau_lim = if tree.disable_penalty_limits {
-                    0.0
-                } else {
-                    joint_limit_scalar_force(q_i, qdot_i, range, limit)
-                };
-                let mut tau_act = 0.0;
-                for act in &tree.actuators {
-                    // Tendon-mode actuators are dispatched by
-                    // `accumulate_tendon_actuator_qfrc` (fed into
-                    // `tendon_qfrc` before pass 2) and MUST NOT double-
-                    // count via the joint-link scan.
-                    if act.tendon_target.is_none() && act.link_idx == i {
-                        tau_act += act.torque(q_i, qdot_i);
-                    }
-                }
-                let tau_scalar = tree.qfrc_applied[tree.v_offset[i]]
-                    + tendon_qfrc[tree.v_offset[i]]
-                    - damping * qdot_i
-                    + tau_lim
-                    + tau_act;
-                let damping_mass =
-                    implicit_mass_damping(tree, i, q_i, qdot_i, damping, velocity_implicit);
-                single_dof_pass2(w, tree, i, parent, armature, damping_mass, tau_scalar);
-            }
-            JointKind::Slide {
-                damping,
-                armature,
-                range,
-                limit,
-                ..
-            } => {
-                // Slide's pass-2 arithmetic is IDENTICAL to hinge's — both
-                // are 1-DOF with a scalar `Sᵀ IA S + armature`. The only
-                // difference is the semantic of `q_i` (radians vs meters)
-                // and the sign convention on the limit, both encoded in
-                // `joint_limit_scalar_force` and `single_dof_pass2` which
-                // work off `w.s[i]` cached from pass 1.
-                let parent = link.parent.expect("slide must have parent");
-                let qdot_i = tree.qdot[tree.v_offset[i]];
-                let q_i = tree.q[tree.q_offset[i]];
-                let tau_lim = if tree.disable_penalty_limits {
-                    0.0
-                } else {
-                    joint_limit_scalar_force(q_i, qdot_i, range, limit)
-                };
-                let mut tau_act = 0.0;
-                for act in &tree.actuators {
-                    if act.tendon_target.is_none() && act.link_idx == i {
-                        tau_act += act.torque(q_i, qdot_i);
-                    }
-                }
-                let tau_scalar = tree.qfrc_applied[tree.v_offset[i]]
-                    + tendon_qfrc[tree.v_offset[i]]
-                    - damping * qdot_i
-                    + tau_lim
-                    + tau_act;
+                let tau_scalar = joint_forces.scalar[i];
                 let damping_mass =
                     implicit_mass_damping(tree, i, q_i, qdot_i, damping, velocity_implicit);
                 single_dof_pass2(w, tree, i, parent, armature, damping_mass, tau_scalar);
@@ -1299,13 +1240,7 @@ fn aba_with_velocity_implicit_workspace(
                     .inverse()
                     .expect("ball articulated-inertia block is singular");
                 // Ball joint torque: qfrc_applied - damping * omega (isotropic).
-                let voff = tree.v_offset[i];
-                let omega = Vec3::new(tree.qdot[voff], tree.qdot[voff + 1], tree.qdot[voff + 2]);
-                let tau3 = Vec3::new(
-                    tree.qfrc_applied[voff] + tendon_qfrc[voff] - damping * omega.x,
-                    tree.qfrc_applied[voff + 1] + tendon_qfrc[voff + 1] - damping * omega.y,
-                    tree.qfrc_applied[voff + 2] + tendon_qfrc[voff + 2] - damping * omega.z,
-                );
+                let tau3 = joint_forces.ball[i];
 
                 // p_stage = pA + IA c
                 let ia_c = w.ia[i].times_motion(w.c[i]);
@@ -1368,26 +1303,7 @@ fn aba_with_velocity_implicit_workspace(
             // coordinates conjugate to the 6 slot layout (ω_body, v_body).
             // The solver path sets `disable_penalty_limits`, which gates this
             // channel on. Penalty callers keep the old free-root behavior.
-            let applied_free = tree.disable_penalty_limits;
-            let free_force = |slot: usize| {
-                if applied_free {
-                    tree.qfrc_applied[slot]
-                } else {
-                    0.0
-                }
-            };
-            let tau_free = SpatialForce::new(
-                Vec3::new(
-                    free_force(0) + tendon_qfrc[0],
-                    free_force(1) + tendon_qfrc[1],
-                    free_force(2) + tendon_qfrc[2],
-                ),
-                Vec3::new(
-                    free_force(3) + tendon_qfrc[3],
-                    free_force(4) + tendon_qfrc[4],
-                    free_force(5) + tendon_qfrc[5],
-                ),
-            );
+            let tau_free = joint_forces.free;
             let rhs = SpatialForce::new(
                 tau_free.torque - w.pa[0].torque,
                 tau_free.linear - w.pa[0].linear,
@@ -1580,7 +1496,7 @@ fn single_dof_pass2(
 /// `range = None`). Outside, a one-sided spring pulls the joint back
 /// toward the limit; a damping term on `qdot` activates too (also one-
 /// sided so it doesn't resist motion INTO the allowed range).
-fn joint_limit_scalar_force(
+pub(crate) fn joint_limit_scalar_force(
     q: f32,
     qdot: f32,
     range: Option<(f32, f32)>,

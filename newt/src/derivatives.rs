@@ -557,6 +557,7 @@ fn analytic_qacc_column(
     ];
     let mut tau = vec![(0.0, 0.0); n];
     let (tendon_qfrc, tendon_qfrc_derivative) = tendon_force_derivative(tree, column);
+    let joint_forces = crate::forces::assemble_joint_forces(tree, &tendon_qfrc);
 
     for i in 0..n {
         let link = &tree.links[i];
@@ -642,10 +643,8 @@ fn analytic_qacc_column(
             derivative: v[i].derivative.cross_force(iv.value)
                 + v[i].value.cross_force(iv.derivative),
         };
-        let (force_ext, torque_ext) = external_wrenches[i];
-        let (force_applied, torque_applied) = tree.applied_wrenches[i];
-        let force_world = force_ext + force_applied + gravity * link.mass;
-        let torque_world = torque_ext + torque_applied;
+        let (force_world, torque_world) =
+            crate::forces::external_wrench_world(tree, i, gravity, external_wrenches);
         let force_body = dmat3_transpose_vec(orientations[i], force_world);
         let torque_body = dmat3_transpose_vec(orientations[i], torque_world);
         let ext = DForce {
@@ -705,27 +704,7 @@ fn analytic_qacc_column(
                 let dq = if column == tree.v_offset[i] { 1.0 } else { 0.0 };
                 let tau_derivative =
                     tendon_qfrc_derivative[tree.v_offset[i]] + (qacc + actuator_derivative) * dq;
-                let u_value = tree.qfrc_applied[tree.v_offset[i]] + tendon_qfrc[tree.v_offset[i]]
-                    - if let JointKind::Hinge { damping, .. } | JointKind::Slide { damping, .. } =
-                        link.joint
-                    {
-                        damping * qdot
-                    } else {
-                        0.0
-                    }
-                    + joint_limit_scalar_force_for_derivative(
-                        q,
-                        qdot,
-                        range,
-                        limit,
-                        tree.disable_penalty_limits,
-                    )
-                    + tree
-                        .actuators
-                        .iter()
-                        .filter(|act| act.tendon_target.is_none() && act.link_idx == i)
-                        .map(|act| act.torque(q, qdot))
-                        .sum::<f32>();
+                let u_value = joint_forces.scalar[i];
                 let p_u_value = u_value - s_p;
                 let p_u_derivative = tau_derivative - ds_p;
                 let qdd_value = p_u_value / d_value;
@@ -749,9 +728,7 @@ fn analytic_qacc_column(
                 pa[parent] = df_add(pa[parent], dxf_transpose_force(xup[i], pa_full));
                 tau[i] = (u_value, tau_derivative);
             }
-            JointKind::Ball {
-                armature, damping, ..
-            } => {
+            JointKind::Ball { armature, .. } => {
                 let parent = link.parent.expect("ball joint parent");
                 let ia_s3 = [
                     dmat6_motion(
@@ -815,13 +792,7 @@ fn analytic_qacc_column(
                     spatial_dot_ms(s3[i][2], p_stage.derivative),
                 );
                 let off = tree.v_offset[i];
-                let tau_value = Vec3::new(
-                    tree.qfrc_applied[off] + tendon_qfrc[off] - damping * tree.qdot[off],
-                    tree.qfrc_applied[off + 1] + tendon_qfrc[off + 1]
-                        - damping * tree.qdot[off + 1],
-                    tree.qfrc_applied[off + 2] + tendon_qfrc[off + 2]
-                        - damping * tree.qdot[off + 2],
-                );
+                let tau_value = joint_forces.ball[i];
                 let tau_derivative = Vec3::new(
                     tendon_qfrc_derivative[off],
                     tendon_qfrc_derivative[off + 1],
@@ -866,19 +837,7 @@ fn analytic_qacc_column(
     let mut qacc_derivative = vec![0.0; nv];
     match tree.links[0].joint {
         JointKind::Free => {
-            let applied = tree.disable_penalty_limits;
-            let tau_value = SpatialForce::new(
-                Vec3::new(
-                    tendon_qfrc[0] + if applied { tree.qfrc_applied[0] } else { 0.0 },
-                    tendon_qfrc[1] + if applied { tree.qfrc_applied[1] } else { 0.0 },
-                    tendon_qfrc[2] + if applied { tree.qfrc_applied[2] } else { 0.0 },
-                ),
-                Vec3::new(
-                    tendon_qfrc[3] + if applied { tree.qfrc_applied[3] } else { 0.0 },
-                    tendon_qfrc[4] + if applied { tree.qfrc_applied[4] } else { 0.0 },
-                    tendon_qfrc[5] + if applied { tree.qfrc_applied[5] } else { 0.0 },
-                ),
-            );
+            let tau_value = joint_forces.free;
             let rhs = df_sub(
                 DForce {
                     value: tau_value,
@@ -1070,37 +1029,6 @@ fn qacc_limit_position_derivative(
     match range {
         Some((lo, _)) if q < lo => -limit.stiffness,
         Some((_, hi)) if q > hi => -limit.stiffness,
-        _ => 0.0,
-    }
-}
-
-fn joint_limit_scalar_force_for_derivative(
-    q: f32,
-    qdot: f32,
-    range: Option<(f32, f32)>,
-    limit: crate::joint::JointLimit,
-    disabled: bool,
-) -> f32 {
-    if disabled {
-        return 0.0;
-    }
-    match range {
-        Some((lo, _)) if q < lo => {
-            limit.stiffness * (lo - q)
-                + if qdot < 0.0 {
-                    -limit.damping * qdot
-                } else {
-                    0.0
-                }
-        }
-        Some((_, hi)) if q > hi => {
-            -limit.stiffness * (q - hi)
-                + if qdot > 0.0 {
-                    -limit.damping * qdot
-                } else {
-                    0.0
-                }
-        }
         _ => 0.0,
     }
 }
