@@ -811,6 +811,8 @@ fn solve_free_bodies_diag_mode(
             mu_slide: mu,
             mu_torsion,
             mu_roll,
+            h01_pair01: 0.0,
+            h01_pair23: 0.0,
         });
     }
 
@@ -909,6 +911,40 @@ fn solve_free_bodies_diag_mode(
         }
     }
 
+    // ---- Precompute cross-response terms for pyramidal facet pairs -------
+    // `row_cross_response` computes the (i,j) entry of `A = J M⁻¹ Jᵀ` for a
+    // pair of rows. It depends only on the rows and the start-of-step body
+    // state, not on iteration impulses, so we can precompute the two values
+    // each condim=3 pyramidal contact needs and reuse them across every PGS
+    // sweep. Previously `pgs_step_pyramidal_pair` called `row_cross_response`
+    // on every iteration and every contact, and each call allocated a fresh
+    // `Vec<BodyDelta>` scratch.
+    if cone == ConeKind::Pyramidal {
+        // Scratch buffer reused for both computations to avoid the per-call
+        // Vec allocation from the old `row_cross_response` implementation.
+        let mut response_scratch = vec![BodyDelta::default(); n_bodies];
+        for pc in per_contact.iter_mut() {
+            if pc.condim != 3 {
+                continue;
+            }
+            let sr = pc.start_row as usize;
+            pc.h01_pair01 = row_cross_response_into(
+                &rows[sr],
+                &rows[sr + 1],
+                bodies,
+                &inv_i_world,
+                &mut response_scratch,
+            );
+            pc.h01_pair23 = row_cross_response_into(
+                &rows[sr + 2],
+                &rows[sr + 3],
+                bodies,
+                &inv_i_world,
+                &mut response_scratch,
+            );
+        }
+    }
+
     // ---- Solve the shared regularized system -----------------------------
     // Newton and PGS consume the same H = J M⁻¹ Jᵀ + R and bias. This keeps
     // the solver switch a numerical method choice, not a second constraint
@@ -953,6 +989,7 @@ fn solve_free_bodies_diag_mode(
                     pgs_step_pyramidal_pair(
                         &rows,
                         pc.start_row as usize,
+                        pc.h01_pair01,
                         &mut impulses,
                         &mut body_delta,
                         bodies,
@@ -961,6 +998,7 @@ fn solve_free_bodies_diag_mode(
                     pgs_step_pyramidal_pair(
                         &rows,
                         pc.start_row as usize + 2,
+                        pc.h01_pair23,
                         &mut impulses,
                         &mut body_delta,
                         bodies,
@@ -1096,6 +1134,16 @@ struct PerContact {
     mu_slide: f32,
     mu_torsion: f32,
     mu_roll: f32,
+    /// Precomputed pyramidal cross-response `A_{i,i+1}` between the first
+    /// facet pair (`start_row`, `start_row+1`). Only meaningful for condim=3
+    /// under a pyramidal cone; zero otherwise. Cached so
+    /// `pgs_step_pyramidal_pair` does not re-invoke `row_cross_response` on
+    /// every iteration (it is state-independent — depends only on rows +
+    /// bodies + inv_i_world at solve start).
+    h01_pair01: f32,
+    /// Precomputed pyramidal cross-response between the second facet pair
+    /// (`start_row+2`, `start_row+3`).
+    h01_pair23: f32,
 }
 
 /// Assemble and solve the dense free-body Newton system. The response matrix
@@ -1233,10 +1281,16 @@ fn pgs_step_non_negative(
 /// Update one pair of opposing pyramidal facets as one 2D block.
 /// MuJoCo's PGS solver keeps the pair's non-negative cone constraint while
 /// minimizing the paired quadratic, rather than clamping each facet alone.
+///
+/// `h01` is the precomputed `A_{i,j}` cross-response for the facet pair. It
+/// is state-independent (see the precompute block in
+/// `solve_free_bodies_diag_mode`), so passing it in avoids redoing the
+/// scratch-allocating `row_cross_response` call on every iteration.
 #[allow(clippy::too_many_arguments)]
 fn pgs_step_pyramidal_pair(
     rows: &[ConstraintRow],
     ri: usize,
+    h01: f32,
     impulses: &mut [f32],
     body_delta: &mut [BodyDelta],
     bodies: &[Body],
@@ -1249,7 +1303,6 @@ fn pgs_step_pyramidal_pair(
     let residual_j = row_residual(&rows[rj], body_delta, bodies, inv_i_world)
         + rows[rj].reg * impulses[rj]
         + rows[rj].bias;
-    let h01 = row_cross_response(&rows[ri], &rows[rj], bodies, inv_i_world);
     let h00 = rows[ri].diag;
     let h11 = rows[rj].diag;
     let det = h00 * h11 - h01 * h01;
@@ -1279,15 +1332,23 @@ fn pgs_step_pyramidal_pair(
     apply_impulse_delta(&rows[rj], applied_j, body_delta, bodies, inv_i_world);
 }
 
-fn row_cross_response(
+/// Scratch-buffer-reusing cross-response: fills `scratch` with the body-delta
+/// resulting from a unit impulse on `applied_row`, then returns
+/// `row_residual(row, scratch, ...)`. The caller owns `scratch` and can reuse
+/// it across many calls, keeping the total allocation count independent of
+/// contact count.
+fn row_cross_response_into(
     row: &ConstraintRow,
     applied_row: &ConstraintRow,
     bodies: &[Body],
     inv_i_world: &[crate::math::Mat3],
+    scratch: &mut [BodyDelta],
 ) -> f32 {
-    let mut response = vec![BodyDelta::default(); bodies.len()];
-    apply_impulse_delta(applied_row, 1.0, &mut response, bodies, inv_i_world);
-    row_residual(row, &response, bodies, inv_i_world)
+    for slot in scratch.iter_mut() {
+        *slot = BodyDelta::default();
+    }
+    apply_impulse_delta(applied_row, 1.0, scratch, bodies, inv_i_world);
+    row_residual(row, scratch, bodies, inv_i_world)
 }
 
 /// Bilateral PGS update — no clamp. Used by equality rows.
