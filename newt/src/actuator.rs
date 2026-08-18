@@ -703,7 +703,24 @@ impl Actuator {
                 };
                 (gain_length * signal + bias_length) * gear * gear
             }
-            ActuatorFlavor::Muscle { .. } => 0.0,
+            ActuatorFlavor::Muscle {
+                gain_prm,
+                bias_prm,
+                length_range,
+                acc0,
+                gear,
+            } => {
+                gear * gear
+                    * muscle_position_derivative(
+                        len * gear,
+                        vel * gear,
+                        length_range,
+                        acc0,
+                        gain_prm,
+                        bias_prm,
+                        self.act,
+                    )
+            }
         };
         if !self.force_limited {
             return raw;
@@ -844,6 +861,73 @@ fn muscle_velocity_damping(
         0.0
     };
     force * fl * dfv / (l0 * prm[6]).max(MJ_MINVAL) * act
+}
+
+/// Return the derivative of muscle force with respect to transmission length.
+#[inline]
+fn muscle_position_derivative(
+    len: f32,
+    vel: f32,
+    length_range: [f32; 2],
+    acc0: f32,
+    gain_prm: [f32; 9],
+    bias_prm: [f32; 9],
+    act: f32,
+) -> f32 {
+    let force = if gain_prm[2] < 0.0 {
+        gain_prm[3] / acc0.max(MJ_MINVAL)
+    } else {
+        gain_prm[2]
+    };
+    let l0 = (length_range[1] - length_range[0]) / (gain_prm[1] - gain_prm[0]).max(MJ_MINVAL);
+    let l = gain_prm[0] + (len - length_range[0]) / l0.max(MJ_MINVAL);
+    let dl_dlen = 1.0 / l0.max(MJ_MINVAL);
+    let dfl = muscle_gain_length_derivative(l, gain_prm[4], gain_prm[5]);
+    let v = vel / (l0 * gain_prm[6]).max(MJ_MINVAL);
+    let y = gain_prm[8] - 1.0;
+    let fv = if v <= -1.0 {
+        0.0
+    } else if v <= 0.0 {
+        (v + 1.0) * (v + 1.0)
+    } else if v <= y {
+        let y_safe = if y.abs() > MJ_MINVAL { y } else { MJ_MINVAL };
+        gain_prm[8] - (y - v) * (y - v) / y_safe
+    } else {
+        gain_prm[8]
+    };
+    let dgain = -force * dfl * fv * dl_dlen;
+
+    let dbias_dl = if l <= 1.0 {
+        0.0
+    } else {
+        let b = 0.5 * (1.0 + bias_prm[5]);
+        let dbias = if l <= b {
+            let x = (l - 1.0) / (b - 1.0).max(MJ_MINVAL);
+            -force * bias_prm[7] * x / (b - 1.0).max(MJ_MINVAL)
+        } else {
+            -force * bias_prm[7] / (b - 1.0).max(MJ_MINVAL)
+        };
+        dbias * dl_dlen
+    };
+    dgain * act + dbias_dl
+}
+
+#[inline]
+fn muscle_gain_length_derivative(length: f32, lmin: f32, lmax: f32) -> f32 {
+    if !(lmin <= length && length <= lmax) {
+        return 0.0;
+    }
+    let a = 0.5 * (lmin + 1.0);
+    let b = 0.5 * (1.0 + lmax);
+    if length <= a {
+        (length - lmin) / (a - lmin).max(MJ_MINVAL).powi(2)
+    } else if length <= 1.0 {
+        (1.0 - length) / (1.0 - a).max(MJ_MINVAL).powi(2)
+    } else if length <= b {
+        -(length - 1.0) / (b - 1.0).max(MJ_MINVAL).powi(2)
+    } else {
+        -(lmax - length) / (lmax - b).max(MJ_MINVAL).powi(2)
+    }
 }
 
 /// MuJoCo's piecewise muscle activation derivative.

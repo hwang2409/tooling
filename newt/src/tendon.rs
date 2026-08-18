@@ -82,7 +82,7 @@
 
 use crate::geom::SolRef;
 use crate::joint::JointKind;
-use crate::math::{Quat, Vec3, asin, atan2};
+use crate::math::{Mat3, Quat, Vec3, asin, atan2};
 use crate::solver::SolImp;
 use crate::tree::Tree;
 
@@ -480,6 +480,292 @@ pub fn tendon_kinematics(tendon: &Tendon, tree: &Tree, poses: &[(Vec3, Quat)]) -
         length,
         velocity,
         jacobian,
+    }
+}
+
+/// Position derivative of the tendon Jacobian for one smooth configuration.
+///
+/// The spatial path uses the same site and segment geometry as
+/// [`tendon_kinematics`]. Wrap branches keep their envelope Jacobian, but do
+/// not expose a second derivative in this tier.
+pub(crate) struct TendonPositionDerivative {
+    pub jacobian: Vec<f32>,
+}
+
+pub(crate) fn tendon_position_derivative(
+    tendon: &Tendon,
+    tree: &Tree,
+    poses: &[(Vec3, Quat)],
+    column: usize,
+) -> TendonPositionDerivative {
+    let mut jacobian = vec![0.0; tree.nv()];
+    let TendonKind::Spatial { branches } = &tendon.kind else {
+        return TendonPositionDerivative { jacobian };
+    };
+    let dposes = differential_poses(tree, poses, column);
+    for branch in branches {
+        let sites: Vec<_> = branch
+            .sites
+            .iter()
+            .map(|site| differential_site(tree, &dposes, site))
+            .collect();
+        for (index, segment) in branch.segments.iter().enumerate() {
+            if segment.wrap.is_some() {
+                continue;
+            }
+            straight_segment_jacobian_derivative(
+                &sites[index],
+                &sites[index + 1],
+                branch.divisor,
+                &mut jacobian,
+            );
+        }
+    }
+    TendonPositionDerivative { jacobian }
+}
+
+#[derive(Clone, Copy)]
+struct DifferentialPose {
+    position: Vec3,
+    orientation: Mat3,
+    dposition: Vec3,
+    dorientation: Mat3,
+}
+
+fn differential_poses(tree: &Tree, poses: &[(Vec3, Quat)], column: usize) -> Vec<DifferentialPose> {
+    let mut out: Vec<DifferentialPose> = Vec::with_capacity(tree.links.len());
+    for (i, link) in tree.links.iter().enumerate() {
+        let pose = match link.joint {
+            JointKind::Free => {
+                let off = tree.v_offset[i];
+                let orientation = poses[i].1.to_mat3();
+                let dposition = if column >= off && column < off + 3 {
+                    basis_vec(column - off)
+                } else {
+                    Vec3::ZERO
+                };
+                let dorientation = if column >= off + 3 && column < off + 6 {
+                    orientation * Mat3::skew(basis_vec(column - off - 3))
+                } else {
+                    Mat3::ZERO
+                };
+                DifferentialPose {
+                    position: poses[i].0,
+                    orientation,
+                    dposition,
+                    dorientation,
+                }
+            }
+            JointKind::Fixed => {
+                let relative =
+                    link.joint_offset_in_parent.1 * link.joint_offset_in_child.1.conjugate();
+                let relative_mat = relative.to_mat3();
+                let (joint_position, djoint_position, parent_orientation, dparent_orientation) =
+                    if let Some(parent) = link.parent {
+                        let parent_pose = out[parent];
+                        let (offset, _) = link.joint_offset_in_parent;
+                        (
+                            parent_pose.position + parent_pose.orientation * offset,
+                            parent_pose.dposition + parent_pose.dorientation * offset,
+                            parent_pose.orientation,
+                            parent_pose.dorientation,
+                        )
+                    } else {
+                        (
+                            link.joint_offset_in_parent.0,
+                            Vec3::ZERO,
+                            Mat3::IDENTITY,
+                            Mat3::ZERO,
+                        )
+                    };
+                let orientation = parent_orientation * relative_mat;
+                let dorientation = dparent_orientation * relative_mat;
+                let offset = link.joint_offset_in_child.0;
+                DifferentialPose {
+                    position: joint_position - orientation * offset,
+                    orientation,
+                    dposition: djoint_position - dorientation * offset,
+                    dorientation,
+                }
+            }
+            JointKind::Hinge { axis, .. } => {
+                let parent = out[link.parent.expect("hinge has parent")];
+                let q = tree.q[tree.q_offset[i]];
+                let rotation = Quat::from_axis_angle(axis, q).to_mat3();
+                let drotation = if column == tree.v_offset[i] {
+                    Mat3::skew(axis) * rotation
+                } else {
+                    Mat3::ZERO
+                };
+                let orientation = parent.orientation * rotation;
+                let dorientation = parent.dorientation * rotation + parent.orientation * drotation;
+                let offset = link.joint_offset_in_parent.0;
+                let joint_position = parent.position + parent.orientation * offset;
+                let djoint_position = parent.dposition + parent.dorientation * offset;
+                let child_offset = link.joint_offset_in_child.0;
+                DifferentialPose {
+                    position: joint_position - orientation * child_offset,
+                    orientation,
+                    dposition: djoint_position - dorientation * child_offset,
+                    dorientation,
+                }
+            }
+            JointKind::Slide { axis, .. } => {
+                let parent = out[link.parent.expect("slide has parent")];
+                let q = tree.q[tree.q_offset[i]];
+                let orientation = parent.orientation;
+                let dorientation = parent.dorientation;
+                let offset = link.joint_offset_in_parent.0;
+                let joint_position = parent.position + parent.orientation * offset;
+                let djoint_position = parent.dposition + parent.dorientation * offset;
+                let slide = parent.orientation * (axis * q);
+                let dslide = parent.dorientation * (axis * q)
+                    + if column == tree.v_offset[i] {
+                        parent.orientation * axis
+                    } else {
+                        Vec3::ZERO
+                    };
+                let child_offset = link.joint_offset_in_child.0;
+                DifferentialPose {
+                    position: joint_position + slide - orientation * child_offset,
+                    orientation,
+                    dposition: djoint_position + dslide - dorientation * child_offset,
+                    dorientation,
+                }
+            }
+            JointKind::Ball { .. } => {
+                panic!("spatial tendon position derivatives do not support ball joints")
+            }
+        };
+        out.push(pose);
+    }
+    out
+}
+
+struct DifferentialSite {
+    world_pos: Vec3,
+    d_world_pos: Vec3,
+    columns: Vec<(u32, Vec3)>,
+    d_columns: Vec<(u32, Vec3)>,
+}
+
+fn differential_site(
+    tree: &Tree,
+    poses: &[DifferentialPose],
+    site: &SpatialTendonSite,
+) -> DifferentialSite {
+    let Some(link_idx) = site.link else {
+        return DifferentialSite {
+            world_pos: site.position_local,
+            d_world_pos: Vec3::ZERO,
+            columns: Vec::new(),
+            d_columns: Vec::new(),
+        };
+    };
+    let body = poses[link_idx];
+    let world_pos = body.position + body.orientation * site.position_local;
+    let d_world_pos = body.dposition + body.dorientation * site.position_local;
+    let mut columns = Vec::new();
+    let mut d_columns = Vec::new();
+    let mut chain = Vec::new();
+    let mut current = Some(link_idx);
+    while let Some(i) = current {
+        chain.push(i);
+        current = tree.links[i].parent;
+    }
+    chain.reverse();
+    for i in chain {
+        let link = &tree.links[i];
+        match link.joint {
+            JointKind::Free => {
+                let root = poses[i];
+                let r = world_pos - root.position;
+                let dr = d_world_pos - root.dposition;
+                for k in 0..3 {
+                    let e = basis_vec(k);
+                    let axis = root.orientation * e;
+                    let daxis = root.dorientation * e;
+                    columns.push(((tree.v_offset[i] + k) as u32, axis.cross(r)));
+                    d_columns.push((
+                        (tree.v_offset[i] + k) as u32,
+                        daxis.cross(r) + axis.cross(dr),
+                    ));
+                }
+                for k in 0..3 {
+                    let e = basis_vec(k);
+                    columns.push(((tree.v_offset[i] + 3 + k) as u32, root.orientation * e));
+                    d_columns.push(((tree.v_offset[i] + 3 + k) as u32, root.dorientation * e));
+                }
+            }
+            JointKind::Fixed => {}
+            JointKind::Hinge { axis, .. } => {
+                let parent = poses[link.parent.expect("hinge has parent")];
+                let offset = link.joint_offset_in_parent.0;
+                let joint = parent.position + parent.orientation * offset;
+                let djoint = parent.dposition + parent.dorientation * offset;
+                let axis_world = parent.orientation * axis;
+                let daxis_world = parent.dorientation * axis;
+                let r = world_pos - joint;
+                let dr = d_world_pos - djoint;
+                columns.push((tree.v_offset[i] as u32, axis_world.cross(r)));
+                d_columns.push((
+                    tree.v_offset[i] as u32,
+                    daxis_world.cross(r) + axis_world.cross(dr),
+                ));
+            }
+            JointKind::Slide { axis, .. } => {
+                let parent = poses[link.parent.expect("slide has parent")];
+                columns.push((tree.v_offset[i] as u32, parent.orientation * axis));
+                d_columns.push((tree.v_offset[i] as u32, parent.dorientation * axis));
+            }
+            JointKind::Ball { .. } => unreachable!(),
+        }
+    }
+    DifferentialSite {
+        world_pos,
+        d_world_pos,
+        columns,
+        d_columns,
+    }
+}
+
+fn straight_segment_jacobian_derivative(
+    a: &DifferentialSite,
+    b: &DifferentialSite,
+    divisor: f32,
+    jacobian: &mut [f32],
+) {
+    let delta = b.world_pos - a.world_pos;
+    let length = delta.length();
+    if length == 0.0 {
+        return;
+    }
+    let unit = delta / length;
+    let ddelta = b.d_world_pos - a.d_world_pos;
+    let dunit = (ddelta - unit * unit.dot(ddelta)) / length;
+    for (slot, value) in jacobian.iter_mut().enumerate() {
+        let a_col = column_value(&a.columns, slot);
+        let b_col = column_value(&b.columns, slot);
+        let da_col = column_value(&a.d_columns, slot);
+        let db_col = column_value(&b.d_columns, slot);
+        *value += (dunit.dot(b_col - a_col) + unit.dot(db_col - da_col)) / divisor;
+    }
+}
+
+fn column_value(columns: &[(u32, Vec3)], slot: usize) -> Vec3 {
+    columns
+        .iter()
+        .find(|(index, _)| *index as usize == slot)
+        .map(|(_, value)| *value)
+        .unwrap_or(Vec3::ZERO)
+}
+
+#[inline]
+fn basis_vec(index: usize) -> Vec3 {
+    match index {
+        0 => Vec3::X,
+        1 => Vec3::Y,
+        _ => Vec3::Z,
     }
 }
 
@@ -1081,6 +1367,7 @@ fn wrap_with_perp_hint(
 /// consumer (pass-2 tau assembly + actuator dispatch).
 pub struct TendonState {
     pub kinematics: Vec<TendonKinematics>,
+    pub forces: Vec<f32>,
 }
 
 /// Compute every tendon's kinematics AND accumulate passive spring/damper
@@ -1096,6 +1383,7 @@ pub fn accumulate_tendon_passive(
 ) -> TendonState {
     let n = tree.tendons.len();
     let mut kinematics = Vec::with_capacity(n);
+    let mut forces = Vec::with_capacity(n);
     for tendon in &tree.tendons {
         let kin = tendon_kinematics(tendon, tree, poses);
         // Passive scalar force at the tendon:
@@ -1115,9 +1403,10 @@ pub fn accumulate_tendon_passive(
                 }
             }
         }
+        forces.push(f_pass);
         kinematics.push(kin);
     }
-    TendonState { kinematics }
+    TendonState { kinematics, forces }
 }
 
 /// Accumulate per-tendon actuator force into qfrc. Called by ABA after
@@ -1126,7 +1415,7 @@ pub fn accumulate_tendon_passive(
 /// For a tendon actuator, the transmission-space length/velocity are
 /// `(gear · L, gear · Ldot)` — same convention as joint actuators. The
 /// resulting scalar force is distributed via `Jᵀ · F`.
-pub fn accumulate_tendon_actuator_qfrc(tree: &Tree, state: &TendonState, qfrc: &mut [f32]) {
+pub fn accumulate_tendon_actuator_qfrc(tree: &Tree, state: &mut TendonState, qfrc: &mut [f32]) {
     for act in &tree.actuators {
         if let Some(tid) = act.tendon_target {
             if tid >= state.kinematics.len() {
@@ -1135,6 +1424,7 @@ pub fn accumulate_tendon_actuator_qfrc(tree: &Tree, state: &TendonState, qfrc: &
             let kin = &state.kinematics[tid];
             // Actuator sees (len, vel) at the tendon.
             let torque = act.torque(kin.length, kin.velocity);
+            state.forces[tid] += torque;
             if torque != 0.0 {
                 for (i, &c) in kin.jacobian.iter().enumerate() {
                     if c != 0.0 {

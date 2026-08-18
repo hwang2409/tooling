@@ -1147,8 +1147,9 @@ fn aba_with_velocity_implicit_workspace(
     tendon_qfrc.clear();
     tendon_qfrc.resize(nv, 0.0);
     if !tree.tendons.is_empty() {
-        let tendon_state = crate::tendon::accumulate_tendon_passive(tree, poses, &mut tendon_qfrc);
-        crate::tendon::accumulate_tendon_actuator_qfrc(tree, &tendon_state, &mut tendon_qfrc);
+        let mut tendon_state =
+            crate::tendon::accumulate_tendon_passive(tree, poses, &mut tendon_qfrc);
+        crate::tendon::accumulate_tendon_actuator_qfrc(tree, &mut tendon_state, &mut tendon_qfrc);
     }
 
     // --- Pass 2: leaves→root, accumulate IA and pA. ---
@@ -1495,11 +1496,12 @@ fn aba_with_velocity_implicit_workspace(
 }
 
 /// Motion transform from parent body frame to a `Fixed`-jointed child's body
-/// frame. Assumes joint orientation offsets are identity (v0 convention).
+/// frame. The relative joint orientation matches `forward_kinematics`.
 pub(crate) fn xup_for_link(link: &Link, _unused: f32) -> Xform {
-    let (r_pj, _) = link.joint_offset_in_parent;
-    let (r_jc, _) = link.joint_offset_in_child;
-    let rot_c_from_p = Mat3::IDENTITY;
+    let (r_pj, q_pj) = link.joint_offset_in_parent;
+    let (r_jc, q_jc) = link.joint_offset_in_child;
+    let relative = q_pj * q_jc.conjugate();
+    let rot_c_from_p = relative.conjugate().to_mat3();
     let t_p_in_c = r_jc - rot_c_from_p * r_pj;
     Xform::new(rot_c_from_p, t_p_in_c)
 }
