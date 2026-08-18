@@ -473,6 +473,34 @@ fn muscle_position_derivative_matches_hand_force_length_curve() {
 }
 
 #[test]
+fn muscle_position_derivative_uses_distinct_bias_parameters() {
+    let mut tree = pendulum(0.0);
+    tree.links[1].joint = JointKind::hinge(Vec3::X);
+    tree.links[1].joint_offset_in_child = (Vec3::ZERO, Quat::IDENTITY);
+    let gain = [0.75, 1.05, 100.0, 200.0, 0.5, 1.6, 1.5, 1.3, 1.2];
+    let bias = [0.9, 1.1, 50.0, 100.0, 0.5, 1.6, 1.5, 2.0, 1.2];
+    let actuator = tree.add_actuator(Actuator::muscle(
+        1,
+        gain,
+        bias,
+        [0.0, 1.0],
+        1.0,
+        1.0,
+        [0.01, 0.04, 0.0],
+        None,
+        None,
+    ));
+    tree.actuators[actuator].act = 1.0;
+    tree.set_hinge_angle(1, 0.8);
+
+    // Gain contributes -4.8. Bias has l=1.06, b=1.3, and contributes
+    // -50*2*(0.06/0.3)*0.2/0.3 = -13.333333.
+    let expected = -(4.8 + 13.333333) / 0.02;
+    let actual = tree.derivatives(Vec3::ZERO, &zero_wrenches(&tree));
+    assert!((actual.qacc_q[0] - expected).abs() < 2.0e-3);
+}
+
+#[test]
 fn rotated_fixed_child_wrench_position_derivative_matches_hand_torque() {
     let mut tree = Tree::new();
     tree.push_link(Link::new(
