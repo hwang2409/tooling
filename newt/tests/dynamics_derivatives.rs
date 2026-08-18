@@ -1,11 +1,12 @@
 //! Analytic forward-dynamics derivative anchors.
 //!
-//! These tests use a one-link pendulum so each expected derivative comes
-//! from the closed-form torque balance, not from a finite difference of newt.
+//! Hand-derived anchors and saved MuJoCo transitionFD data cover the smooth
+//! derivative paths. No expected value comes from a Newt finite difference.
 
 use newt::actuator::Actuator;
 use newt::joint::JointKind;
 use newt::math::{Mat3, Quat, Vec3};
+use newt::tendon::{SpatialTendonSite, Tendon};
 use newt::tree::{Link, Tree};
 
 fn pendulum(damping: f32) -> Tree {
@@ -37,6 +38,56 @@ fn pendulum(damping: f32) -> Tree {
 
 fn zero_wrenches(tree: &Tree) -> Vec<(Vec3, Vec3)> {
     vec![(Vec3::ZERO, Vec3::ZERO); tree.links.len()]
+}
+
+fn fixture_values(fixture: &str) -> [f32; 4] {
+    let qacc = json_array(fixture, "qacc")[0];
+    let timestep = json_number(fixture, "timestep");
+    let a = json_array(fixture, "A");
+    let b = json_array(fixture, "B");
+    [
+        qacc,
+        a[2] / timestep,
+        (a[3] - 1.0) / timestep,
+        b[1] / timestep,
+    ]
+}
+
+fn json_number(fixture: &str, key: &str) -> f32 {
+    let start = fixture.find(&format!("\"{key}\"")).expect("fixture key") + key.len() + 2;
+    fixture[start..]
+        .split(|ch: char| {
+            !ch.is_ascii_digit() && ch != '.' && ch != '-' && ch != '+' && ch != 'e' && ch != 'E'
+        })
+        .find(|value| !value.is_empty())
+        .expect("fixture number")
+        .parse()
+        .expect("fixture value is a float")
+}
+
+fn json_array(fixture: &str, key: &str) -> Vec<f32> {
+    let key_start = fixture.find(&format!("\"{key}\"")).expect("fixture key");
+    let array_start = fixture[key_start..].find('[').expect("fixture array") + key_start;
+    let mut depth = 0;
+    let mut array_end = array_start;
+    for (offset, ch) in fixture[array_start..].char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    array_end = array_start + offset;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    fixture[array_start + 1..array_end]
+        .split(|ch: char| ch == '[' || ch == ']' || ch == ',' || ch.is_ascii_whitespace())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse().expect("fixture array value is a float"))
+        .collect()
 }
 
 #[test]
@@ -226,4 +277,182 @@ fn mixed_slide_and_hinge_velocity_anchor_is_hand_derived() {
     assert!((derivatives.qacc_qvel[3] + 0.9 / 1.72).abs() < 2.0e-5);
     assert!(derivatives.qacc_qvel[1].abs() < 1.0e-6);
     assert!(derivatives.qacc_qvel[2].abs() < 1.0e-6);
+}
+
+#[test]
+fn pendulum_matches_saved_mujoco_transition_fd_fixture() {
+    let expected = fixture_values(include_str!("fixtures/mujoco_pendulum_transition_fd.json"));
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::hinge(Vec3::X),
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::new(0.0, 0.0, -1.0), Quat::IDENTITY),
+        1.7,
+        Mat3::diag(0.02, 0.03, 0.04),
+    ));
+    tree.set_hinge_angle(1, 0.31);
+    tree.set_hinge_rate(1, 0.4);
+    tree.add_actuator(Actuator::motor(1, 2.4, 0.0));
+    tree.set_actuator_target(0, 0.2);
+
+    let actual = tree.derivatives(Vec3::new(0.0, 0.0, -9.81), &zero_wrenches(&tree));
+    assert!((actual.qacc[0] - expected[0]).abs() < 2.0e-5);
+    assert!((actual.qacc_q[0] - expected[1]).abs() < 2.0e-5);
+    assert!((actual.qacc_qvel[0] - expected[2]).abs() < 2.0e-5);
+    assert!((actual.qacc_ctrl[0] - expected[3]).abs() < 2.0e-5);
+}
+
+#[test]
+fn slide_matches_saved_mujoco_transition_fd_fixture() {
+    let expected = fixture_values(include_str!("fixtures/mujoco_slide_transition_fd.json"));
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::Slide {
+            axis: Vec3::X,
+            range: None,
+            damping: 0.6,
+            armature: 0.0,
+            limit: newt::joint::JointLimit::DEFAULT,
+        },
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        2.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    tree.set_slide_position(1, 0.17);
+    tree.set_slide_rate(1, 0.2);
+    tree.add_actuator(Actuator::motor(1, 1.3, 0.0));
+    tree.set_actuator_target(0, 0.2);
+
+    let actual = tree.derivatives(Vec3::ZERO, &zero_wrenches(&tree));
+    assert!((actual.qacc[0] - expected[0]).abs() < 2.0e-5);
+    assert!((actual.qacc_q[0] - expected[1]).abs() < 2.0e-5);
+    // MuJoCo's Euler damping regularization shifts these two entries by
+    // about 1e-3 from Newt's explicit damping path.
+    assert!((actual.qacc_qvel[0] - expected[2]).abs() < 2.0e-3);
+    assert!((actual.qacc_ctrl[0] - expected[3]).abs() < 2.0e-3);
+}
+
+#[test]
+fn spatial_tendon_position_derivative_matches_hand_spring() {
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::IDENTITY,
+    ));
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::slide(Vec3::Z),
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::IDENTITY,
+    ));
+    let mut tendon = Tendon::spatial(
+        vec![
+            SpatialTendonSite {
+                link: Some(0),
+                position_local: Vec3::ZERO,
+            },
+            SpatialTendonSite {
+                link: Some(1),
+                position_local: Vec3::ZERO,
+            },
+        ],
+        vec![None],
+    );
+    tendon.springlength = Some(0.4);
+    tendon.stiffness = 100.0;
+    tree.add_tendon(tendon);
+    tree.set_slide_position(1, 0.5);
+
+    let actual = tree.derivatives(Vec3::ZERO, &zero_wrenches(&tree));
+    assert!((actual.qacc_q[0] + 100.0).abs() < 2.0e-4);
+}
+
+#[test]
+fn muscle_position_derivative_matches_hand_force_length_curve() {
+    let mut tree = pendulum(0.0);
+    tree.links[1].joint = JointKind::hinge(Vec3::X);
+    tree.links[1].joint_offset_in_child = (Vec3::ZERO, Quat::IDENTITY);
+    let params = [0.75, 1.05, 100.0, 200.0, 0.5, 1.6, 1.5, 1.3, 1.2];
+    let actuator = tree.add_actuator(Actuator::muscle(
+        1,
+        params,
+        params,
+        [0.0, 1.0],
+        1.0,
+        1.0,
+        [0.01, 0.04, 0.0],
+        None,
+        None,
+    ));
+    tree.actuators[actuator].act = 1.0;
+    tree.set_hinge_angle(1, 0.8);
+
+    // l = 0.75 + 0.3q = 0.99, fl' = (1-l)/(1-0.75)^2 = 0.16.
+    // The active force derivative is -100 * 0.16 * 0.3 = -4.8.
+    let actual = tree.derivatives(Vec3::ZERO, &zero_wrenches(&tree));
+    assert!((actual.qacc_q[0] + 4.8 / 0.02).abs() < 2.0e-3);
+}
+
+#[test]
+fn rotated_fixed_child_wrench_position_derivative_matches_hand_torque() {
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::IDENTITY,
+    ));
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::hinge(Vec3::X),
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::IDENTITY,
+    ));
+    tree.push_link(Link::new(
+        Some(1),
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::new(0.0, 0.0, 1.0), Quat::IDENTITY),
+        1.0,
+        Mat3::diag(0.1, 0.1, 0.1),
+    ));
+    tree.links[2].joint_offset_in_parent.1 =
+        Quat::from_axis_angle(Vec3::X, core::f32::consts::FRAC_PI_2);
+    let angle = 0.4;
+    tree.set_hinge_angle(1, angle);
+    let mut external = zero_wrenches(&tree);
+    external[2].0 = Vec3::new(0.0, 0.0, 3.0);
+
+    let actual = tree.derivatives(Vec3::ZERO, &external);
+    let expected = -3.0 * angle.sin() / 2.1;
+    assert!((actual.qacc_q[0] - expected).abs() < 2.0e-4);
 }
