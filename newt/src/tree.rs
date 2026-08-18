@@ -1117,8 +1117,7 @@ fn aba_with_velocity_implicit_workspace(
     tendon_qfrc.clear();
     tendon_qfrc.resize(nv, 0.0);
     if !tree.tendons.is_empty() {
-        let tendon_state =
-            crate::tendon::accumulate_tendon_passive(tree, poses, &mut tendon_qfrc);
+        let tendon_state = crate::tendon::accumulate_tendon_passive(tree, poses, &mut tendon_qfrc);
         crate::tendon::accumulate_tendon_actuator_qfrc(tree, &tendon_state, &mut tendon_qfrc);
     }
 
@@ -1653,11 +1652,7 @@ pub(crate) fn rk4_step_with_workspace<F>(
     // makes, and keeps the arithmetic identical.
     let q0 = tree.q.clone();
     let qdot0 = tree.qdot.clone();
-    let act0: Vec<f32> = tree
-        .actuators
-        .iter()
-        .map(|actuator| actuator.act)
-        .collect();
+    let act0: Vec<f32> = tree.actuators.iter().map(|actuator| actuator.act).collect();
 
     // k1 — tree is already at s0.
     let poses1 = forward_kinematics(tree);
@@ -1730,8 +1725,7 @@ pub(crate) fn rk4_step_with_workspace<F>(
     }
     for (i, actuator) in tree.actuators.iter_mut().enumerate() {
         if matches!(actuator.dyn_type, crate::actuator::DynType::Muscle) {
-            actuator.act =
-                act0[i] + (da1[i] + 2.0 * da2[i] + 2.0 * da3[i] + da4[i]) * (dt * sixth);
+            actuator.act = act0[i] + (da1[i] + 2.0 * da2[i] + 2.0 * da3[i] + da4[i]) * (dt * sixth);
         }
     }
     if tree.links.first().is_some_and(|link| link.mocap) {
