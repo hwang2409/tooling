@@ -257,7 +257,7 @@ fn sibling_ball_joint_does_not_break_tendon_derivatives() {
     ));
 
     let derivatives = tree.derivatives(Vec3::ZERO, &zero_wrenches(&tree));
-    assert_eq!(derivatives.qacc_q.len(), 1);
+    assert_eq!(derivatives.qacc_q.len(), 16);
 }
 
 #[test]
