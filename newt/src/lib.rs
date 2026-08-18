@@ -38,8 +38,9 @@
 //!   query. See `docs/model-format.md`.
 //! - **v1 tier 3** (`dynamics`) — CRB mass matrix `M(q)`, RNE inverse
 //!   dynamics `τ(q, qdot, qddot)`, bias vector `h(q, qdot)`, and a hand-
-//!   rolled dense Cholesky factor + solve. Building blocks the v1 soft-
-//!   constraint solver consumes. See `docs/dynamics.md`.
+//!   rolled dense Cholesky factor + solve. It also exposes dense forward-
+//!   dynamics derivatives for actuator controls and generalized velocity.
+//!   See `docs/dynamics.md`.
 //! - **v1 tier 4** (`solver`) — MuJoCo soft-constraint contact model
 //!   (5-parameter SolImp, SolRef reference acceleration, regularized
 //!   dual) solved with fixed-iteration PGS. Ships condim 1 / 3, both

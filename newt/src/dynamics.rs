@@ -423,6 +423,390 @@ pub fn bias_forces(tree: &Tree, gravity: Vec3) -> Vec<f32> {
     inverse_dynamics(tree, &qddot, gravity, &ext)
 }
 
+/// Dense derivatives of the tree's explicit forward dynamics.
+///
+/// The acceleration is evaluated by [`crate::tree::aba`] with the current
+/// tree state and external wrenches. Matrices use row-major storage:
+/// `qacc_q` is `nv × nq`, `qacc_qvel` is `nv × nv`, and `qacc_ctrl` is
+/// `nv × nu`, where `nu` is `tree.actuators.len()`.
+///
+/// The velocity and control paths differentiate the rigid-body bias and
+/// actuator transmission directly. Position derivatives use the same
+/// independent ABA evaluation at either side of each position coordinate.
+/// This is the safe fallback at contact and quaternion branch boundaries;
+/// callers should use a small perturbation around smooth states.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Derivatives {
+    /// Forward acceleration at the evaluated state.
+    pub qacc: Vec<f32>,
+    /// `∂qacc/∂q`, row-major `nv × nq`.
+    pub qacc_q: Vec<f32>,
+    /// `∂qacc/∂qvel`, row-major `nv × nv`.
+    pub qacc_qvel: Vec<f32>,
+    /// `∂qacc/∂ctrl`, row-major `nv × nu`.
+    pub qacc_ctrl: Vec<f32>,
+}
+
+impl Derivatives {
+    /// Number of generalized acceleration rows.
+    pub fn nv(&self) -> usize {
+        self.qacc.len()
+    }
+
+    /// Number of position columns.
+    pub fn nq(&self) -> usize {
+        self.qacc_q.len() / self.nv().max(1)
+    }
+
+    /// Number of actuator control columns.
+    pub fn nu(&self) -> usize {
+        self.qacc_ctrl.len() / self.nv().max(1)
+    }
+}
+
+/// Compute dense explicit forward-dynamics derivatives for one tree.
+pub fn derivatives(
+    tree: &Tree,
+    gravity: Vec3,
+    external_wrenches: &ExternalWrenches,
+) -> Derivatives {
+    assert_eq!(
+        external_wrenches.len(),
+        tree.links.len(),
+        "external_wrenches length must equal number of links"
+    );
+    let poses = forward_kinematics(tree);
+    let qacc = crate::tree::aba(tree, &poses, gravity, external_wrenches);
+    let nv = tree.nv();
+
+    let mass = mass_matrix(tree);
+    let qacc_qvel_force = qacc_qvel_force_jacobian(tree, &poses);
+    let qacc_qvel = solve_mass_columns(&mass, nv, &qacc_qvel_force);
+    let qacc_ctrl_force = qacc_ctrl_force_jacobian(tree, &poses);
+    let qacc_ctrl = solve_mass_columns(&mass, nv, &qacc_ctrl_force);
+    let qacc_q = finite_difference_qacc_q(tree, gravity, external_wrenches);
+
+    Derivatives {
+        qacc,
+        qacc_q,
+        qacc_qvel,
+        qacc_ctrl,
+    }
+}
+
+/// Central-difference fallback for position coordinates. This remains
+/// independent of the velocity and control derivative paths above, so a
+/// contact or quaternion branch can only affect its own matrix.
+fn finite_difference_qacc_q(
+    tree: &Tree,
+    gravity: Vec3,
+    external_wrenches: &ExternalWrenches,
+) -> Vec<f32> {
+    let nv = tree.nv();
+    let nq = tree.nq();
+    let mut out = vec![0.0; nv * nq];
+    for column in 0..nq {
+        let mut plus = tree.clone();
+        let mut minus = tree.clone();
+        let step = 1.0e-4 * plus.q[column].abs().max(1.0);
+        plus.q[column] += step;
+        minus.q[column] -= step;
+        let plus_poses = forward_kinematics(&plus);
+        let minus_poses = forward_kinematics(&minus);
+        let plus_acc = crate::tree::aba(&plus, &plus_poses, gravity, external_wrenches);
+        let minus_acc = crate::tree::aba(&minus, &minus_poses, gravity, external_wrenches);
+        for row in 0..nv {
+            out[row * nq + column] = (plus_acc[row] - minus_acc[row]) / (2.0 * step);
+        }
+    }
+    out
+}
+
+/// Build `dτ/dqdot` for the explicit force balance
+/// `M qacc = τ - h`. RNE supplies the analytic `dh/dqdot` term.
+fn qacc_qvel_force_jacobian(tree: &Tree, poses: &[(Vec3, Quat)]) -> Vec<f32> {
+    let nv = tree.nv();
+    let mut force = vec![0.0; nv * nv];
+    let dh = bias_velocity_jacobian(tree);
+    for row in 0..nv {
+        for column in 0..nv {
+            force[row * nv + column] = -dh[row * nv + column];
+        }
+    }
+
+    for (i, link) in tree.links.iter().enumerate() {
+        let offset = tree.v_offset[i];
+        match link.joint {
+            JointKind::Free => {
+                for slot in offset..offset + 6 {
+                    force[slot * nv + slot] -= link.free_damping;
+                }
+            }
+            JointKind::Fixed => {}
+            JointKind::Hinge {
+                damping,
+                range,
+                limit,
+                ..
+            }
+            | JointKind::Slide {
+                damping,
+                range,
+                limit,
+                ..
+            } => {
+                force[offset * nv + offset] -= damping;
+                if !tree.disable_penalty_limits {
+                    force[offset * nv + offset] += joint_limit_velocity_derivative(
+                        tree.q[tree.q_offset[i]],
+                        tree.qdot[offset],
+                        range,
+                        limit,
+                    );
+                }
+                let q = tree.q[tree.q_offset[i]];
+                let qdot = tree.qdot[offset];
+                for act in &tree.actuators {
+                    if act.tendon_target.is_none() && act.link_idx == i {
+                        force[offset * nv + offset] -= act.velocity_damping(q, qdot);
+                    }
+                }
+            }
+            JointKind::Ball { damping, .. } => {
+                for slot in offset..offset + 3 {
+                    force[slot * nv + slot] -= damping;
+                }
+            }
+        }
+    }
+
+    if !tree.tendons.is_empty() {
+        for (tendon_idx, tendon) in tree.tendons.iter().enumerate() {
+            let kin = crate::tendon::tendon_kinematics(tendon, tree, poses);
+            for row in 0..nv {
+                for column in 0..nv {
+                    let jj = kin.jacobian[row] * kin.jacobian[column];
+                    if tendon.damping > 0.0 {
+                        force[row * nv + column] -= tendon.damping * jj;
+                    }
+                    for act in &tree.actuators {
+                        if act.tendon_target == Some(tendon_idx) {
+                            force[row * nv + column] -=
+                                act.velocity_damping(kin.length, kin.velocity) * jj;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    force
+}
+
+/// Build the generalized force columns from actuator controls.
+fn qacc_ctrl_force_jacobian(tree: &Tree, poses: &[(Vec3, Quat)]) -> Vec<f32> {
+    let nv = tree.nv();
+    let nu = tree.actuators.len();
+    let mut force = vec![0.0; nv * nu];
+    let tendon_kinematics: Vec<_> = tree
+        .tendons
+        .iter()
+        .map(|tendon| crate::tendon::tendon_kinematics(tendon, tree, poses))
+        .collect();
+    for (control, act) in tree.actuators.iter().enumerate() {
+        let (len, vel) = if let Some(tid) = act.tendon_target {
+            let kin = &tendon_kinematics[tid];
+            (kin.length, kin.velocity)
+        } else {
+            let q = tree.q[tree.q_offset[act.link_idx]];
+            let qdot = tree.qdot[tree.v_offset[act.link_idx]];
+            (q, qdot)
+        };
+        let derivative = act.control_derivative(len, vel);
+        if let Some(tid) = act.tendon_target {
+            for (row, &jacobian) in tendon_kinematics[tid].jacobian.iter().enumerate() {
+                force[row * nu + control] += jacobian * derivative;
+            }
+        } else {
+            force[tree.v_offset[act.link_idx] * nu + control] += derivative;
+        }
+    }
+    force
+}
+
+/// Solve `M X = rhs` for a row-major matrix whose columns are derivative
+/// force directions. The returned matrix has the same column count.
+fn solve_mass_columns(mass: &[f32], nv: usize, rhs: &[f32]) -> Vec<f32> {
+    if nv == 0 {
+        return Vec::new();
+    }
+    let columns = rhs.len() / nv;
+    let factor = cholesky(mass, nv).expect("tree mass matrix must be positive definite");
+    let mut out = vec![0.0; rhs.len()];
+    for column in 0..columns {
+        let mut b = vec![0.0; nv];
+        for row in 0..nv {
+            b[row] = rhs[row * columns + column];
+        }
+        let x = cholesky_solve(&factor, nv, &b);
+        for row in 0..nv {
+            out[row * columns + column] = x[row];
+        }
+    }
+    out
+}
+
+/// Analytic velocity derivative of the RNE bias vector.
+fn bias_velocity_jacobian(tree: &Tree) -> Vec<f32> {
+    let nv = tree.nv();
+    let n = tree.links.len();
+    let xup = compute_xup(tree);
+    let mut out = vec![0.0; nv * nv];
+    for column in 0..nv {
+        let mut v = vec![SpatialMotion::ZERO; n];
+        let mut a = vec![SpatialMotion::ZERO; n];
+        let mut dv = vec![SpatialMotion::ZERO; n];
+        let mut da = vec![SpatialMotion::ZERO; n];
+        let mut f = vec![SpatialForce::ZERO; n];
+        let mut df = vec![SpatialForce::ZERO; n];
+        for i in 0..n {
+            let link = &tree.links[i];
+            match link.joint {
+                JointKind::Free => {
+                    let offset = tree.v_offset[i];
+                    v[i] = SpatialMotion::new(
+                        Vec3::new(
+                            tree.qdot[offset],
+                            tree.qdot[offset + 1],
+                            tree.qdot[offset + 2],
+                        ),
+                        Vec3::new(
+                            tree.qdot[offset + 3],
+                            tree.qdot[offset + 4],
+                            tree.qdot[offset + 5],
+                        ),
+                    );
+                    dv[i] = SpatialMotion::new(
+                        Vec3::new(
+                            basis(column, offset),
+                            basis(column, offset + 1),
+                            basis(column, offset + 2),
+                        ),
+                        Vec3::new(
+                            basis(column, offset + 3),
+                            basis(column, offset + 4),
+                            basis(column, offset + 5),
+                        ),
+                    );
+                }
+                JointKind::Fixed => {
+                    if let Some(parent) = link.parent {
+                        v[i] = xup[i].motion(v[parent]);
+                        dv[i] = xup[i].motion(dv[parent]);
+                    }
+                }
+                JointKind::Hinge { .. } | JointKind::Slide { .. } => {
+                    let parent = link.parent.expect("single-DOF joint parent");
+                    let s = subspace_single(link);
+                    let qdot = tree.qdot[tree.v_offset[i]];
+                    let sq = s * qdot;
+                    v[i] = xup[i].motion(v[parent]) + sq;
+                    let dq = if column == tree.v_offset[i] { 1.0 } else { 0.0 };
+                    dv[i] = xup[i].motion(dv[parent]) + s * dq;
+                    a[i] = xup[i].motion(a[parent]) + v[i].cross_motion(sq);
+                    da[i] = xup[i].motion(da[parent])
+                        + dv[i].cross_motion(sq)
+                        + v[i].cross_motion(s * dq);
+                }
+                JointKind::Ball { .. } => {
+                    let parent = link.parent.expect("ball joint parent");
+                    let s3 = subspace_ball(link);
+                    let offset = tree.v_offset[i];
+                    let omega = Vec3::new(
+                        tree.qdot[offset],
+                        tree.qdot[offset + 1],
+                        tree.qdot[offset + 2],
+                    );
+                    let sq = s3[0] * omega.x + s3[1] * omega.y + s3[2] * omega.z;
+                    let domega = Vec3::new(
+                        basis(column, offset),
+                        basis(column, offset + 1),
+                        basis(column, offset + 2),
+                    );
+                    let dsq = s3[0] * domega.x + s3[1] * domega.y + s3[2] * domega.z;
+                    v[i] = xup[i].motion(v[parent]) + sq;
+                    dv[i] = xup[i].motion(dv[parent]) + dsq;
+                    a[i] = xup[i].motion(a[parent]) + v[i].cross_motion(sq);
+                    da[i] =
+                        xup[i].motion(da[parent]) + dv[i].cross_motion(sq) + v[i].cross_motion(dsq);
+                }
+            }
+            let inertia = Mat6::from_spatial_inertia(link.spatial_inertia());
+            let iv = inertia.times_motion(v[i]);
+            let div = inertia.times_motion(dv[i]);
+            f[i] = inertia.times_motion(a[i]) + v[i].cross_force(iv);
+            df[i] = inertia.times_motion(da[i]) + dv[i].cross_force(iv) + v[i].cross_force(div);
+        }
+        let mut column_out = vec![0.0; nv];
+        for i in (1..n).rev() {
+            let link = &tree.links[i];
+            match link.joint {
+                JointKind::Fixed => {
+                    let parent = link.parent.expect("fixed joint parent");
+                    df[parent] = df[parent] + xup[i].transpose_force(df[i]);
+                }
+                JointKind::Hinge { .. } | JointKind::Slide { .. } => {
+                    let offset = tree.v_offset[i];
+                    let parent = link.parent.expect("single-DOF joint parent");
+                    column_out[offset] = spatial_dot_ms(subspace_single(link), df[i]);
+                    df[parent] = df[parent] + xup[i].transpose_force(df[i]);
+                }
+                JointKind::Ball { .. } => {
+                    let offset = tree.v_offset[i];
+                    let parent = link.parent.expect("ball joint parent");
+                    let s3 = subspace_ball(link);
+                    for k in 0..3 {
+                        column_out[offset + k] = spatial_dot_ms(s3[k], df[i]);
+                    }
+                    df[parent] = df[parent] + xup[i].transpose_force(df[i]);
+                }
+                JointKind::Free => unreachable!("free joint only allowed at root"),
+            }
+        }
+        if matches!(tree.links[0].joint, JointKind::Free) {
+            let offset = tree.v_offset[0];
+            column_out[offset] = df[0].torque.x;
+            column_out[offset + 1] = df[0].torque.y;
+            column_out[offset + 2] = df[0].torque.z;
+            column_out[offset + 3] = df[0].linear.x;
+            column_out[offset + 4] = df[0].linear.y;
+            column_out[offset + 5] = df[0].linear.z;
+        }
+        for row in 0..nv {
+            out[row * nv + column] = column_out[row];
+        }
+    }
+    out
+}
+
+fn joint_limit_velocity_derivative(
+    q: f32,
+    qdot: f32,
+    range: Option<(f32, f32)>,
+    limit: crate::joint::JointLimit,
+) -> f32 {
+    let Some((lo, hi)) = range else { return 0.0 };
+    if (q < lo && qdot < 0.0) || (q > hi && qdot > 0.0) {
+        -limit.damping
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn basis(column: usize, slot: usize) -> f32 {
+    if column == slot { 1.0 } else { 0.0 }
+}
+
 // ---------------------------------------------------------------------------
 // CRB — composite rigid body mass matrix
 // ---------------------------------------------------------------------------

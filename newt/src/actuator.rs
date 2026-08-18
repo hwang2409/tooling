@@ -551,6 +551,60 @@ impl Actuator {
         }
     }
 
+    /// Return `∂torque/∂ctrl` at `(len, vel)` for the current actuator state.
+    ///
+    /// The result is zero when activation dynamics own the input signal, or
+    /// when a control or force clamp is active at the current point. Clamps
+    /// are piecewise smooth, so the endpoint convention uses the zero side.
+    #[inline]
+    pub fn control_derivative(&self, len: f32, vel: f32) -> f32 {
+        let du = match (self.ctrl_limited, self.ctrl_range) {
+            (true, Some((lo, hi))) if self.ctrl <= lo || self.ctrl >= hi => 0.0,
+            _ => 1.0,
+        };
+        if du == 0.0 {
+            return 0.0;
+        }
+        let raw = match self.flavor {
+            ActuatorFlavor::Position { kp, .. } => kp * du,
+            ActuatorFlavor::Velocity { kv } => kv * du,
+            ActuatorFlavor::Motor { gear } => gear * du,
+            ActuatorFlavor::General {
+                gain_type,
+                gain_prm,
+                bias_type: _,
+                bias_prm: _,
+                gear,
+            } => {
+                if !matches!(self.dyn_type, DynType::None) {
+                    0.0
+                } else {
+                    let len_tr = len * gear;
+                    let vel_tr = vel * gear;
+                    let gain = match gain_type {
+                        GainType::Fixed => gain_prm[0],
+                        GainType::Affine => {
+                            gain_prm[0] + gain_prm[1] * len_tr + gain_prm[2] * vel_tr
+                        }
+                        GainType::Muscle => unreachable!("muscle gain uses ActuatorFlavor::Muscle"),
+                    };
+                    gain * gear * du
+                }
+            }
+            ActuatorFlavor::Muscle { .. } => 0.0,
+        };
+        if !self.force_limited {
+            return raw;
+        }
+        let torque = self.torque(len, vel);
+        if let Some((lo, hi)) = self.force_range {
+            if torque <= lo || torque >= hi {
+                return 0.0;
+            }
+        }
+        raw
+    }
+
     /// Return the positive velocity coefficient in the actuator force law.
     ///
     /// This is `-∂τ/∂vel` before the force clamp. It is the derivative that

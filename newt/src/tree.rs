@@ -673,6 +673,19 @@ impl Tree {
         crate::dynamics::bias_forces(self, gravity)
     }
 
+    /// Dense explicit forward-dynamics derivatives at the current state.
+    ///
+    /// `external_wrenches` uses the same world-frame, per-link format as
+    /// [`crate::tree::aba`]. See [`crate::dynamics::Derivatives`] for matrix
+    /// layouts and the supported analytic paths.
+    pub fn derivatives(
+        &self,
+        gravity: Vec3,
+        external_wrenches: &ExternalWrenches,
+    ) -> crate::dynamics::Derivatives {
+        crate::dynamics::derivatives(self, gravity, external_wrenches)
+    }
+
     /// Inverse dynamics: generalized force required to produce `qddot`
     /// under `gravity` and `external_wrenches`. See
     /// [`crate::dynamics::inverse_dynamics`].

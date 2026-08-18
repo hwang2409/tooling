@@ -264,6 +264,9 @@ run cannot silently swap the reference bytes.
   trees with a few dozen DOFs where dense Cholesky is comfortable.
   Sparse factorization is a v3 item (see the design spec's frontier
   tier).
-- **No analytic derivatives.** Also v3.
+- **Derivatives.** `Tree::derivatives` returns dense `qacc` derivatives.
+  Control and velocity columns use the analytic actuator and RNE paths.
+  Position columns use an independent centered ABA fallback at nonsmooth
+  contact and quaternion branch boundaries.
 - **No solver.** RNE + CRB feed the future PGS constraint solver; this
   ticket lands only the building blocks.
