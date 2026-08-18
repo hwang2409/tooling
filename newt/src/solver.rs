@@ -1160,8 +1160,11 @@ fn solve_free_body_newton_impulses(
 ) -> crate::newton::NewtonResult {
     let n_rows = rows.len();
     let mut hessian = vec![0.0f32; n_rows * n_rows];
+    let mut response = vec![BodyDelta::default(); n_bodies];
     for j in 0..n_rows {
-        let mut response = vec![BodyDelta::default(); n_bodies];
+        for slot in response.iter_mut() {
+            *slot = BodyDelta::default();
+        }
         apply_impulse_delta(&rows[j], 1.0, &mut response, bodies, inv_i_world);
         for i in 0..n_rows {
             hessian[i * n_rows + j] = row_residual(&rows[i], &response, bodies, inv_i_world);
