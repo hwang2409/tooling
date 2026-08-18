@@ -657,6 +657,66 @@ impl Actuator {
         }
     }
 
+    /// Return `∂torque/∂vel` for explicit dynamics.
+    ///
+    /// Unlike [`Self::velocity_damping`], this derivative includes the active
+    /// force clamp. A saturated actuator has zero local velocity derivative.
+    #[inline]
+    pub fn velocity_derivative(&self, len: f32, vel: f32) -> f32 {
+        if self.force_limited {
+            if let Some((lo, hi)) = self.force_range {
+                let torque = self.torque(len, vel);
+                if torque <= lo || torque >= hi {
+                    return 0.0;
+                }
+            }
+        }
+        -self.velocity_damping(len, vel)
+    }
+
+    /// Return `∂torque/∂len` for explicit dynamics.
+    #[inline]
+    pub fn position_derivative(&self, len: f32, vel: f32) -> f32 {
+        let raw = match self.flavor {
+            ActuatorFlavor::Position { kp, .. } => -kp,
+            ActuatorFlavor::Velocity { .. } | ActuatorFlavor::Motor { .. } => 0.0,
+            ActuatorFlavor::General {
+                gain_type,
+                gain_prm,
+                bias_type,
+                bias_prm,
+                gear,
+            } => {
+                let signal = match self.dyn_type {
+                    DynType::None => self.clamped_ctrl(),
+                    DynType::Filter | DynType::Muscle => self.act,
+                };
+                let gain_length = match gain_type {
+                    GainType::Fixed => 0.0,
+                    GainType::Affine => gain_prm[1],
+                    GainType::Muscle => unreachable!("muscle gain uses ActuatorFlavor::Muscle"),
+                };
+                let bias_length = match bias_type {
+                    BiasType::None => 0.0,
+                    BiasType::Affine => bias_prm[1],
+                    BiasType::Muscle => unreachable!("muscle bias uses ActuatorFlavor::Muscle"),
+                };
+                (gain_length * signal + bias_length) * gear * gear
+            }
+            ActuatorFlavor::Muscle { .. } => 0.0,
+        };
+        if !self.force_limited {
+            return raw;
+        }
+        if let Some((lo, hi)) = self.force_range {
+            let torque = self.torque(len, vel);
+            if torque <= lo || torque >= hi {
+                return 0.0;
+            }
+        }
+        raw
+    }
+
     /// Advance activation state by one step using forward Euler on
     /// `act' = (u - act) / tau`. No-op for `DynType::None`.
     ///
