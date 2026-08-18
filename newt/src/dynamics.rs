@@ -979,7 +979,6 @@ fn analytic_qacc_column(
         n
     ];
     let mut tau = vec![(0.0, 0.0); n];
-    let mut tau_ball = vec![[0.0; 3]; n];
     let (tendon_qfrc, tendon_qfrc_derivative) = tendon_force_derivative(tree, column);
 
     for i in 0..n {
@@ -1260,7 +1259,6 @@ fn analytic_qacc_column(
                         derivative: du,
                     },
                 );
-                tau_ball[i] = [qdd.value.x, qdd.value.y, qdd.value.z];
                 let ia_full = dmat6_sub(ia[i], dmat6_ball_reduction(&ia_s3, &s3[i], d_inv));
                 let pa_full = df_add(
                     p_stage,
@@ -1288,7 +1286,6 @@ fn analytic_qacc_column(
         };
         n
     ];
-    let mut qacc = vec![0.0; nv];
     let mut qacc_derivative = vec![0.0; nv];
     match tree.links[0].joint {
         JointKind::Free => {
@@ -1325,14 +1322,6 @@ fn analytic_qacc_column(
             );
             acceleration[0] = d_solve_mat6(ia[0], rhs);
             let root = acceleration[0];
-            let root_values = [
-                root.value.angular.x,
-                root.value.angular.y,
-                root.value.angular.z,
-                root.value.linear.x,
-                root.value.linear.y,
-                root.value.linear.z,
-            ];
             let root_derivatives = [
                 root.derivative.angular.x,
                 root.derivative.angular.y,
@@ -1341,7 +1330,6 @@ fn analytic_qacc_column(
                 root.derivative.linear.y,
                 root.derivative.linear.z,
             ];
-            qacc[..6].copy_from_slice(&root_values);
             qacc_derivative[..6].copy_from_slice(&root_derivatives);
         }
         JointKind::Fixed => {}
@@ -1372,7 +1360,6 @@ fn analytic_qacc_column(
                         derivative: s[i] * qdd_derivative,
                     },
                 );
-                qacc[tree.v_offset[i]] = qdd_value;
                 qacc_derivative[tree.v_offset[i]] = qdd_derivative;
             }
             JointKind::Ball { .. } => {
@@ -1420,9 +1407,6 @@ fn analytic_qacc_column(
                             + s3[i][2] * qdd.derivative.z,
                     },
                 );
-                qacc[off] = qdd.value.x;
-                qacc[off + 1] = qdd.value.y;
-                qacc[off + 2] = qdd.value.z;
                 qacc_derivative[off] = qdd.derivative.x;
                 qacc_derivative[off + 1] = qdd.derivative.y;
                 qacc_derivative[off + 2] = qdd.derivative.z;
