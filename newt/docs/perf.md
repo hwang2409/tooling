@@ -151,11 +151,109 @@ ns/step because it records five `Instant` values per step. This is expected
 instrumentation cost and is absent from the default binary.
 
 the optimized Euler muscle path has a test-feature allocation guard. after
-three warmup steps, sixteen steady-state steps each make twelve allocation
-events. the guard checks both the stable count and the current count of twelve.
-the remaining events are existing tendon, external-force, and acceleration
-result buffers. run it with:
+three warmup steps, sixteen steady-state steps each make ten allocation
+events (pass 1 held it at twelve; pass 2 folded the ABA `tendon_qfrc`
+scratch into `AbaWorkspace` and dropped the dead `ext_body` Vec, moving
+the steady-state count to ten). the guard checks both the stable count
+and the current count of ten. the remaining events are existing tendon,
+external-force, and acceleration result buffers. run it with:
 
 ```text
 cargo test --manifest-path newt/Cargo.toml --test alloc_guard --features alloc-guard
 ```
+
+## pass 2
+
+pass 2 keeps every arithmetic order untouched. all four commits reuse
+scratch storage or hoist an invariant table; no reduction reorders and
+no golden regenerates. the full byte-identity golden suite and the
+`newt/tests/differential/` fixtures all pass after each commit, and the
+21-config bench checksums match byte-for-byte between pass-1 final and
+pass-2 head on every scene and every config.
+
+pass 2 measurements ran on the same Apple M5 Pro / macOS 26.5.1 / rustc
+1.95.0 machine, otherwise idle. every pass-2 number is a median-of-medians:
+each side (pass-1 baseline `ece1e35` and pass-2 head `0bb9db5`) got three
+back-to-back full 21-config bench runs; the reported ns/step is the median
+of the three per-config medians, which absorbs the run-to-run thermal
+variance that a single run exposes on the sub-microsecond scenes.
+
+### pass 2 baseline
+
+baseline commit: `ece1e35` (pass-1 final).
+
+| scene | config | median ns/step |
+| --- | --- | ---: |
+| sphere_drop | penalty-rk4 | 589.1 |
+| sphere_drop | pgs-euler | 2,184.2 |
+| sphere_drop | newton-euler | 1,238.7 |
+| box_stack | penalty-rk4 | 3,591.9 |
+| box_stack | pgs-euler | 26,505.8 |
+| box_stack | newton-euler | 77,370.5 |
+| biped_assisted_walk | penalty-rk4 | 22,948.8 |
+| biped_assisted_walk | pgs-euler | 50,581.7 |
+| biped_assisted_walk | newton-euler | 60,694.0 |
+| tendon_arm | penalty-rk4 | 3,271.9 |
+| tendon_arm | pgs-euler | 763.8 |
+| tendon_arm | newton-euler | 774.5 |
+| hfield_terrain_roll | penalty-rk4 | 2,905.7 |
+| hfield_terrain_roll | pgs-euler | 2,180.7 |
+| hfield_terrain_roll | newton-euler | 1,606.1 |
+| pile | penalty-rk4 | 3,936.2 |
+| pile | pgs-euler | 19,658.1 |
+| pile | newton-euler | 47,747.9 |
+| muscle_pendulum | penalty-rk4 | 1,616.7 |
+| muscle_pendulum | pgs-euler | 377.5 |
+| muscle_pendulum | newton-euler | 374.0 |
+
+### pass 2 optimizations
+
+each commit is independent and reversible. per-commit deltas cite the
+target-scene rows where the change is designed to bite; totals for every
+scene appear in the pass-2 final table. per-commit intermediates use
+median-of-two runs at that commit, so sub-microsecond scenes retain a
+few percent of thermal noise; the target-scene deltas below are outside
+that band.
+
+| commit | change | measured result |
+| --- | --- | --- |
+| `b68a970` | fold the ABA `tendon_qfrc` scratch into `AbaWorkspace`; drop the dead `ext_body` Vec | tendon_arm/penalty-rk4: 3,271.9 → 3,129.1 ns/step, 4.4% faster; muscle_pendulum/pgs-euler: 377.5 → 355.0 ns/step, 6.0% faster; muscle_pendulum/newton-euler: 374.0 → 354.5 ns/step, 5.2% faster; alloc-guard steady-state count dropped 12 → 10 |
+| `181c960` | precompute the pyramidal facet-pair cross-response once per contact | box_stack/pgs-euler: 29,215.4 → 23,362.4 ns/step, 20.0% faster; pile/pgs-euler: 20,615.8 → 17,220.8 ns/step, 16.5% faster; hfield_terrain_roll/pgs-euler: 2,469.3 → 2,108.0 ns/step, 14.6% faster |
+| `2255534` | reuse the Newton hessian response scratch across rows | box_stack/newton-euler: pass-2 baseline 77,370.5 → 63,474.3 ns/step head (Newton solver only — commit-local single-run intermediate hits thermal noise on this long-step scene, so attribution reported against the full pass-2 delta); pile/newton-euler: 47,747.9 → 39,030.7 ns/step |
+| `0bb9db5` | drop the four per-RK4-stage full tree clones; mutate the working tree in place, save only `q`, `qdot`, and per-muscle `act` | muscle_pendulum/penalty-rk4: 1,556.9 → 1,111.5 ns/step, 28.6% faster; tendon_arm/penalty-rk4: 3,169.0 → 2,582.3 ns/step, 18.5% faster; biped_assisted_walk/penalty-rk4: 23,165.5 → 22,249.4 ns/step, 4.0% faster |
+
+### pass 2 final table
+
+`change` is the median wall-time change vs pass-2 baseline (`ece1e35`,
+pass-1 final). negative values are faster. the final checksums matched
+the baseline checksums in all 21 rows.
+
+| scene | config | baseline ns/step | pass-2 ns/step | change |
+| --- | --- | ---: | ---: | ---: |
+| sphere_drop | penalty-rk4 | 589.1 | 578.5 | -1.8% |
+| sphere_drop | pgs-euler | 2,184.2 | 2,029.4 | -7.1% |
+| sphere_drop | newton-euler | 1,238.7 | 1,243.0 | +0.3% |
+| box_stack | penalty-rk4 | 3,591.9 | 3,573.2 | -0.5% |
+| box_stack | pgs-euler | 26,505.8 | 22,666.2 | -14.5% |
+| box_stack | newton-euler | 77,370.5 | 63,474.3 | -18.0% |
+| biped_assisted_walk | penalty-rk4 | 22,948.8 | 22,249.4 | -3.0% |
+| biped_assisted_walk | pgs-euler | 50,581.7 | 50,659.4 | +0.2% |
+| biped_assisted_walk | newton-euler | 60,694.0 | 59,684.5 | -1.7% |
+| tendon_arm | penalty-rk4 | 3,271.9 | 2,582.3 | -21.1% |
+| tendon_arm | pgs-euler | 763.8 | 758.3 | -0.7% |
+| tendon_arm | newton-euler | 774.5 | 758.2 | -2.1% |
+| hfield_terrain_roll | penalty-rk4 | 2,905.7 | 2,901.1 | -0.2% |
+| hfield_terrain_roll | pgs-euler | 2,180.7 | 2,093.5 | -4.0% |
+| hfield_terrain_roll | newton-euler | 1,606.1 | 1,582.4 | -1.5% |
+| pile | penalty-rk4 | 3,936.2 | 3,803.1 | -3.4% |
+| pile | pgs-euler | 19,658.1 | 17,292.8 | -12.0% |
+| pile | newton-euler | 47,747.9 | 39,030.7 | -18.3% |
+| muscle_pendulum | penalty-rk4 | 1,616.7 | 1,111.5 | -31.3% |
+| muscle_pendulum | pgs-euler | 377.5 | 357.1 | -5.4% |
+| muscle_pendulum | newton-euler | 374.0 | 359.2 | -3.9% |
+
+no final row regressed beyond run noise. the two nominally-positive rows
+(sphere_drop/newton-euler +0.3% and biped_assisted_walk/pgs-euler +0.2%)
+sit well inside each side's per-run p10/p90 spread across the three
+matched runs. every pass-2 checksum matched its pass-2 baseline
+checksum, so the byte-identity contract holds across the whole suite.
