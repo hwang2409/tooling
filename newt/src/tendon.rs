@@ -993,7 +993,7 @@ fn differential_wrap_endpoint_jacobian(
     force_b: DifferentialVec3,
     jacobian: &mut [f32],
 ) {
-    for slot in 0..jacobian.len() {
+    for (slot, value) in jacobian.iter_mut().enumerate() {
         let a_col = differential_vec3(
             differential_column_value(&a.columns, slot),
             differential_column_value(&a.d_columns, slot),
@@ -1002,11 +1002,12 @@ fn differential_wrap_endpoint_jacobian(
             differential_column_value(&b.columns, slot),
             differential_column_value(&b.d_columns, slot),
         );
-        jacobian[slot] -= differential_vec3_dot(force_a, a_col).derivative;
-        jacobian[slot] -= differential_vec3_dot(force_b, b_col).derivative;
+        *value -= differential_vec3_dot(force_a, a_col).derivative;
+        *value -= differential_vec3_dot(force_b, b_col).derivative;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn differential_wrap_body_jacobian(
     tree: &Tree,
     poses: &[(Vec3, Quat)],
@@ -1024,7 +1025,7 @@ fn differential_wrap_body_jacobian(
     let point_a = differential_wrap_point(tree, poses, dposes, Some(link), point_a);
     let point_b = differential_wrap_point(tree, poses, dposes, Some(link), point_b);
     let total_force = differential_vec3_add(force_a, force_b);
-    for slot in 0..jacobian.len() {
+    for (slot, value) in jacobian.iter_mut().enumerate() {
         let center_col = differential_vec3(
             differential_column_value(&center.columns, slot),
             differential_column_value(&center.d_columns, slot),
@@ -1037,19 +1038,20 @@ fn differential_wrap_body_jacobian(
             differential_column_value(&point_b.columns, slot),
             differential_column_value(&point_b.d_columns, slot),
         );
-        let value = differential_vec3_dot(total_force, center_col);
-        let value = differential_scalar_add(
-            value,
+        let contribution = differential_vec3_dot(total_force, center_col);
+        let contribution = differential_scalar_add(
+            contribution,
             differential_vec3_dot(force_a, differential_vec3_sub(point_a_col, center_col)),
         );
-        let value = differential_scalar_add(
-            value,
+        let contribution = differential_scalar_add(
+            contribution,
             differential_vec3_dot(force_b, differential_vec3_sub(point_b_col, center_col)),
         );
-        jacobian[slot] += value.derivative;
+        *value += contribution.derivative;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sphere_segment_jacobian_derivative(
     tree: &Tree,
     poses: &[(Vec3, Quat)],
@@ -1469,6 +1471,7 @@ fn differential_circle_wrap_points(
     Some((solution0, solution1, arc))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cylinder_segment_jacobian_derivative(
     tree: &Tree,
     poses: &[(Vec3, Quat)],

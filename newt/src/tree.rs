@@ -1155,7 +1155,7 @@ fn aba_with_velocity_implicit_workspace(
 
     // --- Pass 2: leaves→root, accumulate IA and pA. ---
     // Initialize each link's IA = spatial inertia and pA = velocity-product bias.
-    for i in 0..n {
+    for (i, (_, ori)) in poses.iter().enumerate() {
         let link = &tree.links[i];
         let si = link.spatial_inertia();
         let ia_i = Mat6::from_spatial_inertia(si);
@@ -1165,7 +1165,6 @@ fn aba_with_velocity_implicit_workspace(
         // tier-4). All expressed in body frame at COM. Both wrench channels
         // are world-frame at the link's COM, so they sum trivially before
         // the frame rotation.
-        let (_pos, ori) = poses[i];
         let (force_world_total, torque_world) =
             crate::forces::external_wrench_world(tree, i, gravity, external_wrenches);
         // Rotate world-frame wrench into body frame.
