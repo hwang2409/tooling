@@ -860,10 +860,18 @@ pub(crate) struct AbaWorkspace {
     qddot_ball: Vec<Vec3>,
     /// Per-link spatial acceleration (computed in pass 3, body frame at COM).
     a: Vec<SpatialMotion>,
+    /// Tendon-generated generalized force scratch (passive spring/damper +
+    /// tendon-actuator). Length = tree.nv(). Reused across ABA calls to
+    /// avoid an allocation per call.
+    tendon_qfrc: Vec<f32>,
 }
 
 impl AbaWorkspace {
     pub(crate) fn new(n: usize) -> Self {
+        Self::with_nv(n, 0)
+    }
+
+    fn with_nv(n: usize, nv: usize) -> Self {
         let zero_s3 = [SpatialMotion::ZERO; 3];
         let zero_f3 = [SpatialForce::ZERO; 3];
         Self {
@@ -883,12 +891,22 @@ impl AbaWorkspace {
             qddot_joint: vec![0.0; n],
             qddot_ball: vec![Vec3::ZERO; n],
             a: vec![SpatialMotion::ZERO; n],
+            tendon_qfrc: vec![0.0; nv],
         }
     }
 
     pub(crate) fn ensure_len(&mut self, n: usize) {
         if self.xup.len() != n {
             *self = Self::new(n);
+        }
+    }
+
+    /// Ensure the nv-sized scratch buffers match `nv`. Called at the start of
+    /// each ABA pass because `n` (link count) and `nv` are set independently
+    /// and callers only pass link count to `new`/`ensure_len`.
+    fn ensure_nv(&mut self, nv: usize) {
+        if self.tendon_qfrc.len() != nv {
+            self.tendon_qfrc.resize(nv, 0.0);
         }
     }
 }
@@ -998,9 +1016,11 @@ fn aba_with_velocity_implicit_workspace(
     workspace: &mut AbaWorkspace,
 ) -> Vec<f32> {
     let n = tree.links.len();
+    let nv = tree.nv();
     assert_eq!(poses.len(), n);
     assert_eq!(external_wrenches.len(), n);
     workspace.ensure_len(n);
+    workspace.ensure_nv(nv);
     let w = workspace;
 
     // --- Pass 1: compute Xup, S, v, c bottom-down. ---
@@ -1090,15 +1110,20 @@ fn aba_with_velocity_implicit_workspace(
     // Tendon contributions: compute passive spring/damper AND tendon-
     // attached actuator forces into a per-DOF buffer that pass 2 folds
     // into `tau_scalar` per link. Cached across the whole aba call.
-    let mut tendon_qfrc = vec![0.0f32; tree.nv()];
+    // Owns the workspace scratch for the rest of the function so the borrow
+    // checker doesn't have to reason about disjoint `w.*` field accesses in
+    // pass 2's mutation of `w.ia`/`w.pa` etc.
+    let mut tendon_qfrc = std::mem::take(&mut w.tendon_qfrc);
+    tendon_qfrc.clear();
+    tendon_qfrc.resize(nv, 0.0);
     if !tree.tendons.is_empty() {
-        let tendon_state = crate::tendon::accumulate_tendon_passive(tree, poses, &mut tendon_qfrc);
+        let tendon_state =
+            crate::tendon::accumulate_tendon_passive(tree, poses, &mut tendon_qfrc);
         crate::tendon::accumulate_tendon_actuator_qfrc(tree, &tendon_state, &mut tendon_qfrc);
     }
 
     // --- Pass 2: leaves→root, accumulate IA and pA. ---
     // Initialize each link's IA = spatial inertia and pA = velocity-product bias.
-    let mut ext_body: Vec<SpatialForce> = Vec::with_capacity(n);
     for i in 0..n {
         let link = &tree.links[i];
         let si = link.spatial_inertia();
@@ -1121,7 +1146,6 @@ fn aba_with_velocity_implicit_workspace(
         let torque_body = ori.inverse_rotate(torque_world);
         // Package as body-frame spatial force at COM (torque, linear).
         let f_ext_body = SpatialForce::new(torque_body, force_body);
-        ext_body.push(f_ext_body);
 
         let iv = ia_i.times_motion(w.v[i]);
         let bias = w.v[i].cross_force(iv);
@@ -1306,7 +1330,7 @@ fn aba_with_velocity_implicit_workspace(
 
     // --- Pass 3: root → leaves. ---
     // Solve for root acceleration a[0].
-    let mut qddot = vec![0.0; tree.nv()];
+    let mut qddot = vec![0.0; nv];
     match tree.links[0].joint {
         JointKind::Free => {
             // At root: IA[0] a[0] = tau_free_gen - pA[0]. The generalized
@@ -1435,6 +1459,9 @@ fn aba_with_velocity_implicit_workspace(
         }
     }
 
+    // Return the workspace-owned tendon_qfrc buffer so the next ABA call can
+    // reuse the allocation.
+    w.tendon_qfrc = tendon_qfrc;
     qddot
 }
 
