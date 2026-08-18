@@ -897,17 +897,25 @@ fn muscle_position_derivative(
     };
     let dgain = -force * dfl * fv * dl_dlen;
 
-    let dbias_dl = if l <= 1.0 {
+    let bias_force = if bias_prm[2] < 0.0 {
+        bias_prm[3] / acc0.max(MJ_MINVAL)
+    } else {
+        bias_prm[2]
+    };
+    let bias_l0 = (length_range[1] - length_range[0]) / (bias_prm[1] - bias_prm[0]).max(MJ_MINVAL);
+    let bias_l = bias_prm[0] + (len - length_range[0]) / bias_l0.max(MJ_MINVAL);
+    let bias_dl_dlen = 1.0 / bias_l0.max(MJ_MINVAL);
+    let dbias_dl = if bias_l <= 1.0 {
         0.0
     } else {
         let b = 0.5 * (1.0 + bias_prm[5]);
-        let dbias = if l <= b {
-            let x = (l - 1.0) / (b - 1.0).max(MJ_MINVAL);
-            -force * bias_prm[7] * x / (b - 1.0).max(MJ_MINVAL)
+        let dbias = if bias_l <= b {
+            let x = (bias_l - 1.0) / (b - 1.0).max(MJ_MINVAL);
+            -bias_force * bias_prm[7] * x / (b - 1.0).max(MJ_MINVAL)
         } else {
-            -force * bias_prm[7] / (b - 1.0).max(MJ_MINVAL)
+            -bias_force * bias_prm[7] / (b - 1.0).max(MJ_MINVAL)
         };
-        dbias * dl_dlen
+        dbias * bias_dl_dlen
     };
     dgain * act + dbias_dl
 }
