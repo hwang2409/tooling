@@ -1643,89 +1643,102 @@ pub(crate) fn rk4_step_with_workspace<F>(
 ) where
     F: FnMut(&Tree) -> ExternalWrenches,
 {
-    let s0 = tree.clone();
+    // Save only the state fields that RK4 sub-stages mutate: generalized
+    // position, velocity, and per-muscle activation. The rest of the tree
+    // (links, offsets, tendons, actuator params) is invariant across the
+    // step, so cloning it four times (as `tree.clone()` +
+    // `tree_advance().clone()` used to do) burned per-stage allocations
+    // scaling with tree size. Reusing the same working tree and swapping
+    // just these buffers preserves every read the callback / ABA path
+    // makes, and keeps the arithmetic identical.
+    let q0 = tree.q.clone();
+    let qdot0 = tree.qdot.clone();
+    let act0: Vec<f32> = tree
+        .actuators
+        .iter()
+        .map(|actuator| actuator.act)
+        .collect();
 
-    // k1
-    let poses1 = forward_kinematics(&s0);
-    let ext1 = compute_ext_wrenches(&s0);
+    // k1 — tree is already at s0.
+    let poses1 = forward_kinematics(tree);
+    let ext1 = compute_ext_wrenches(tree);
     let k1 = aba_with_velocity_implicit_workspace(
-        &s0,
+        tree,
         &poses1,
         gravity,
         &ext1,
         VelocityImplicit::Explicit,
         workspace,
     );
-    let (dq1, dv1) = tree_deriv(&s0, &k1);
-    let da1 = muscle_activation_deriv(&s0);
+    let (dq1, dv1) = tree_deriv(tree, &k1);
+    let da1 = muscle_activation_deriv(tree);
 
-    // k2 at s0 + k1 * dt/2
-    let mut s1 = tree_advance(&s0, &dq1, &dv1, dt * 0.5);
-    advance_muscle_activation(&mut s1, &s0, &da1, dt * 0.5);
-    let poses2 = forward_kinematics(&s1);
-    let ext2 = compute_ext_wrenches(&s1);
+    // Advance tree in-place to s0 + k1 * dt/2 for stage 2.
+    advance_tree_state(tree, &q0, &qdot0, &act0, &dq1, &dv1, &da1, dt * 0.5);
+    let poses2 = forward_kinematics(tree);
+    let ext2 = compute_ext_wrenches(tree);
     let k2 = aba_with_velocity_implicit_workspace(
-        &s1,
+        tree,
         &poses2,
         gravity,
         &ext2,
         VelocityImplicit::Explicit,
         workspace,
     );
-    let (dq2, dv2) = tree_deriv(&s1, &k2);
-    let da2 = muscle_activation_deriv(&s1);
+    let (dq2, dv2) = tree_deriv(tree, &k2);
+    let da2 = muscle_activation_deriv(tree);
 
-    // k3 at s0 + k2 * dt/2
-    let mut s2 = tree_advance(&s0, &dq2, &dv2, dt * 0.5);
-    advance_muscle_activation(&mut s2, &s0, &da2, dt * 0.5);
-    let poses3 = forward_kinematics(&s2);
-    let ext3 = compute_ext_wrenches(&s2);
+    // Advance tree in-place to s0 + k2 * dt/2 for stage 3.
+    advance_tree_state(tree, &q0, &qdot0, &act0, &dq2, &dv2, &da2, dt * 0.5);
+    let poses3 = forward_kinematics(tree);
+    let ext3 = compute_ext_wrenches(tree);
     let k3 = aba_with_velocity_implicit_workspace(
-        &s2,
+        tree,
         &poses3,
         gravity,
         &ext3,
         VelocityImplicit::Explicit,
         workspace,
     );
-    let (dq3, dv3) = tree_deriv(&s2, &k3);
-    let da3 = muscle_activation_deriv(&s2);
+    let (dq3, dv3) = tree_deriv(tree, &k3);
+    let da3 = muscle_activation_deriv(tree);
 
-    // k4 at s0 + k3 * dt
-    let mut s3 = tree_advance(&s0, &dq3, &dv3, dt);
-    advance_muscle_activation(&mut s3, &s0, &da3, dt);
-    let poses4 = forward_kinematics(&s3);
-    let ext4 = compute_ext_wrenches(&s3);
+    // Advance tree in-place to s0 + k3 * dt for stage 4.
+    advance_tree_state(tree, &q0, &qdot0, &act0, &dq3, &dv3, &da3, dt);
+    let poses4 = forward_kinematics(tree);
+    let ext4 = compute_ext_wrenches(tree);
     let k4 = aba_with_velocity_implicit_workspace(
-        &s3,
+        tree,
         &poses4,
         gravity,
         &ext4,
         VelocityImplicit::Explicit,
         workspace,
     );
-    let (dq4, dv4) = tree_deriv(&s3, &k4);
-    let da4 = muscle_activation_deriv(&s3);
+    let (dq4, dv4) = tree_deriv(tree, &k4);
+    let da4 = muscle_activation_deriv(tree);
 
-    // Combine and write back into tree.
+    // Combine and write back into tree. All reads use the saved
+    // start-of-step state so the arithmetic matches the original
+    // `s0 + (k1 + 2 k2 + 2 k3 + k4) / 6 · dt` combination exactly.
     let sixth = 1.0 / 6.0;
-    for j in 0..s0.q.len() {
-        tree.q[j] = s0.q[j] + (dq1[j] + 2.0 * dq2[j] + 2.0 * dq3[j] + dq4[j]) * (dt * sixth);
+    for j in 0..q0.len() {
+        tree.q[j] = q0[j] + (dq1[j] + 2.0 * dq2[j] + 2.0 * dq3[j] + dq4[j]) * (dt * sixth);
     }
-    for j in 0..s0.qdot.len() {
-        tree.qdot[j] = s0.qdot[j] + (dv1[j] + 2.0 * dv2[j] + 2.0 * dv3[j] + dv4[j]) * (dt * sixth);
+    for j in 0..qdot0.len() {
+        tree.qdot[j] = qdot0[j] + (dv1[j] + 2.0 * dv2[j] + 2.0 * dv3[j] + dv4[j]) * (dt * sixth);
     }
     for (i, actuator) in tree.actuators.iter_mut().enumerate() {
         if matches!(actuator.dyn_type, crate::actuator::DynType::Muscle) {
-            actuator.act = s0.actuators[i].act
-                + (da1[i] + 2.0 * da2[i] + 2.0 * da3[i] + da4[i]) * (dt * sixth);
+            actuator.act =
+                act0[i] + (da1[i] + 2.0 * da2[i] + 2.0 * da3[i] + da4[i]) * (dt * sixth);
         }
     }
-    if s0.links.first().is_some_and(|link| link.mocap) {
-        let root_nq = s0.links[0].joint.nq();
-        let root_nv = s0.links[0].joint.nv();
-        tree.q[..root_nq].copy_from_slice(&s0.q[..root_nq]);
-        tree.qdot[..root_nv].copy_from_slice(&s0.qdot[..root_nv]);
+    if tree.links.first().is_some_and(|link| link.mocap) {
+        let root_nq = tree.links[0].joint.nq();
+        let root_nv = tree.links[0].joint.nv();
+        tree.q[..root_nq].copy_from_slice(&q0[..root_nq]);
+        tree.qdot[..root_nv].copy_from_slice(&qdot0[..root_nv]);
     }
     // Renormalize free-root and ball-joint quaternions once at step end
     // (mirrors tier 1; mid-RK4 renormalization would break the linearity the
@@ -1937,17 +1950,34 @@ fn tree_deriv(tree: &Tree, qddot: &[f32]) -> (Vec<f32>, Vec<f32>) {
     (dq, dv)
 }
 
-/// Return a new tree state = `origin + (dq, dv) * dt`. Does not renormalize
-/// the quaternion (mid-RK4 stages preserve linearity).
-fn tree_advance(origin: &Tree, dq: &[f32], dv: &[f32], dt: f32) -> Tree {
-    let mut out = origin.clone();
-    for (j, slot) in out.q.iter_mut().enumerate() {
-        *slot = origin.q[j] + dq[j] * dt;
+/// Advance the tree's mutable state fields in-place to
+/// `origin + (dq, dv, da) * dt`. The original `tree_advance` returned a
+/// freshly cloned `Tree` so RK4 stages could hold four owned trees; this
+/// path mutates the working tree so all four stages share one allocation
+/// footprint. Does not renormalize the quaternion (mid-RK4 stages preserve
+/// linearity).
+#[allow(clippy::too_many_arguments)]
+fn advance_tree_state(
+    tree: &mut Tree,
+    q0: &[f32],
+    qdot0: &[f32],
+    act0: &[f32],
+    dq: &[f32],
+    dv: &[f32],
+    da: &[f32],
+    dt: f32,
+) {
+    for j in 0..q0.len() {
+        tree.q[j] = q0[j] + dq[j] * dt;
     }
-    for (j, slot) in out.qdot.iter_mut().enumerate() {
-        *slot = origin.qdot[j] + dv[j] * dt;
+    for j in 0..qdot0.len() {
+        tree.qdot[j] = qdot0[j] + dv[j] * dt;
     }
-    out
+    for (i, actuator) in tree.actuators.iter_mut().enumerate() {
+        if matches!(actuator.dyn_type, crate::actuator::DynType::Muscle) {
+            actuator.act = act0[i] + da[i] * dt;
+        }
+    }
 }
 
 fn muscle_activation_deriv(tree: &Tree) -> Vec<f32> {
@@ -1965,14 +1995,6 @@ fn muscle_activation_deriv(tree: &Tree) -> Vec<f32> {
             }
         })
         .collect()
-}
-
-fn advance_muscle_activation(tree: &mut Tree, origin: &Tree, deriv: &[f32], dt: f32) {
-    for (i, actuator) in tree.actuators.iter_mut().enumerate() {
-        if matches!(actuator.dyn_type, crate::actuator::DynType::Muscle) {
-            actuator.act = origin.actuators[i].act + deriv[i] * dt;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
