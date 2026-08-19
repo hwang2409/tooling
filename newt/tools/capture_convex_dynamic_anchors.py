@@ -38,8 +38,6 @@ def capture_case(mujoco, references: Path, case: tuple) -> dict:
     geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
     if body_id < 0 or geom_id < 0:
         raise ValueError(f"{source_xml}: missing body or geom")
-    model.geom_contype[:] = 0
-    model.geom_conaffinity[:] = 0
     model.geom_contype[:] = 1
     model.geom_conaffinity[:] = 1
     data = mujoco.MjData(model)

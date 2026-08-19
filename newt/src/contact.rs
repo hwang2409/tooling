@@ -2510,6 +2510,129 @@ fn ccd_closest_witness(simplex: &CcdSimplex) -> Option<(Vec3, Vec3)> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CcdDistanceCandidate {
+    point: Vec3,
+    weights: [f32; 4],
+}
+
+/// Return whether the origin is inside a non-degenerate tetrahedron.
+fn ccd_origin_inside_tetrahedron(simplex: &CcdSimplex) -> bool {
+    let a = simplex.points[0].minkowski;
+    let b = simplex.points[1].minkowski;
+    let c = simplex.points[2].minkowski;
+    let d = simplex.points[3].minkowski;
+    let ab = b - a;
+    let ac = c - a;
+    let ad = d - a;
+    let denominator = ab.cross(ac).dot(ad);
+    if denominator.abs() <= 1.0e-20 {
+        return false;
+    }
+    let ao = -a;
+    let weight_b = ao.cross(ac).dot(ad) / denominator;
+    let weight_c = ab.cross(ao).dot(ad) / denominator;
+    let weight_d = ab.cross(ac).dot(ao) / denominator;
+    let weight_a = 1.0 - weight_b - weight_c - weight_d;
+    [weight_a, weight_b, weight_c, weight_d]
+        .into_iter()
+        .all(|weight| (-1.0e-6..=1.0 + 1.0e-6).contains(&weight))
+}
+
+/// Find the closest point on one vertex, edge, or face region of a simplex.
+fn ccd_distance_candidate(simplex: &CcdSimplex, mask: u8) -> Option<CcdDistanceCandidate> {
+    let mut indices = [0usize; 3];
+    let mut index_len = 0;
+    for index in 0..simplex.len {
+        if mask & (1 << index) != 0 {
+            if index_len == indices.len() {
+                return None;
+            }
+            indices[index_len] = index;
+            index_len += 1;
+        }
+    }
+    let (point, subset_weights) = match index_len {
+        1 => (simplex.points[indices[0]].minkowski, [1.0, 0.0, 0.0]),
+        2 => {
+            let a = simplex.points[indices[0]].minkowski;
+            let b = simplex.points[indices[1]].minkowski;
+            let edge = b - a;
+            let denominator = edge.length_squared();
+            let t = if denominator > 1.0e-20 {
+                clamp01(-a.dot(edge) / denominator)
+            } else {
+                0.0
+            };
+            (a + edge * t, [1.0 - t, t, 0.0])
+        }
+        3 => {
+            let a = simplex.points[indices[0]].minkowski;
+            let b = simplex.points[indices[1]].minkowski;
+            let c = simplex.points[indices[2]].minkowski;
+            if (b - a).cross(c - a).length_squared() <= 1.0e-20 {
+                return None;
+            }
+            let point = closest_point_on_triangle(Vec3::ZERO, a, b, c);
+            let bary = barycentric_triangle_origin(a, b, c, point);
+            (point, [bary.0, bary.1, bary.2])
+        }
+        _ => return None,
+    };
+    let mut weights = [0.0; 4];
+    for (index, &weight) in indices[..index_len].iter().zip(subset_weights.iter()) {
+        weights[*index] = weight;
+    }
+    Some(CcdDistanceCandidate { point, weights })
+}
+
+/// Reduce a distance simplex by walking its vertex, edge, and face regions.
+///
+/// This is separate from `ccd_simplex_step`, which tests whether a simplex
+/// encloses the origin for the intersection phase. Distance GJK needs the
+/// closest Voronoi feature instead.
+fn ccd_distance_simplex_step(simplex: &mut CcdSimplex) -> Option<Vec3> {
+    if simplex.len == 4 && ccd_origin_inside_tetrahedron(simplex) {
+        return None;
+    }
+    let mut best: Option<CcdDistanceCandidate> = None;
+    for mask in 1..(1 << simplex.len) {
+        let Some(candidate) = ccd_distance_candidate(simplex, mask as u8) else {
+            continue;
+        };
+        if best
+            .is_none_or(|current| candidate.point.length_squared() < current.point.length_squared())
+        {
+            best = Some(candidate);
+        }
+    }
+    let best = best?;
+    let mut selected = [CcdVertex {
+        minkowski: Vec3::ZERO,
+        shape_a: Vec3::ZERO,
+        shape_b: Vec3::ZERO,
+    }; 4];
+    let mut selected_len = 0;
+    for index in 0..simplex.len {
+        if best.weights[index] > 1.0e-6 {
+            selected[selected_len] = simplex.points[index];
+            selected_len += 1;
+        }
+    }
+    if selected_len == 0 {
+        let mut largest_index = 0;
+        for index in 1..simplex.len {
+            if best.weights[index] > best.weights[largest_index] {
+                largest_index = index;
+            }
+        }
+        selected[0] = simplex.points[largest_index];
+        selected_len = 1;
+    }
+    simplex.set(&selected[..selected_len]);
+    Some(best.point)
+}
+
 fn ccd_distance_contact(
     simplex: &CcdSimplex,
     idx_a: usize,
@@ -2547,38 +2670,61 @@ fn ccd_distance_gjk(
     mut simplex: CcdSimplex,
     config: CcdSolverConfig,
 ) -> CcdSimplex {
+    let mut best_simplex = simplex;
+    let mut best_distance_squared = f32::INFINITY;
+    let mut previous_distance_squared = f32::INFINITY;
     for _ in 0..64 {
-        let Some((point_a, point_b)) = ccd_closest_witness(&simplex) else {
-            return simplex;
+        let Some(closest) = ccd_distance_simplex_step(&mut simplex) else {
+            return best_simplex;
         };
-        let closest = point_a - point_b;
         let distance_squared = closest.length_squared();
-        if distance_squared <= 1.0e-20 {
-            return simplex;
+        debug_assert!(
+            distance_squared
+                <= previous_distance_squared
+                    + config.distance_tolerance * previous_distance_squared.max(1.0),
+            "distance simplex reduction increased the distance"
+        );
+        previous_distance_squared = distance_squared;
+        if distance_squared < best_distance_squared {
+            best_distance_squared = distance_squared;
+            best_simplex = simplex;
         }
-        let mut direction = -closest;
+        if distance_squared <= 1.0e-20 {
+            return best_simplex;
+        }
+        let direction = -closest;
         let point = ccd_support(shape_a, shape_b, direction);
         let support_dot = point.minkowski.dot(direction);
         let support_progress = support_dot - closest.dot(direction);
         if support_progress <= config.gjk_support_epsilon {
-            return simplex;
+            return best_simplex;
+        }
+        if simplex.points[..simplex.len]
+            .iter()
+            .any(|candidate| (candidate.minkowski - point.minkowski).length_squared() <= 1.0e-20)
+        {
+            return best_simplex;
         }
         simplex.push(point);
-        if ccd_simplex_step(&mut simplex, &mut direction) {
-            return simplex;
-        }
-        let Some((next_a, next_b)) = ccd_closest_witness(&simplex) else {
-            return simplex;
+        let Some(next_closest) = ccd_distance_simplex_step(&mut simplex) else {
+            return best_simplex;
         };
-        let next_distance_squared = (next_a - next_b).length_squared();
+        let next_distance_squared = next_closest.length_squared();
+        debug_assert!(
+            next_distance_squared
+                <= distance_squared + config.distance_tolerance * distance_squared.max(1.0),
+            "distance GJK increased the distance"
+        );
+        if next_distance_squared < best_distance_squared {
+            best_distance_squared = next_distance_squared;
+            best_simplex = simplex;
+        }
         let improvement = distance_squared - next_distance_squared;
-        if improvement <= config.distance_tolerance * distance_squared.max(1.0)
-            && support_dot <= config.gjk_support_epsilon
-        {
-            return simplex;
+        if improvement <= config.distance_tolerance * distance_squared.max(1.0) {
+            return best_simplex;
         }
     }
-    simplex
+    best_simplex
 }
 
 /// Box versus one triangular prism using MuJoCo's native convex path shape:

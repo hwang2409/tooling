@@ -929,6 +929,17 @@ fn margin_fires_contact_before_geoms_touch() {
         "margin activation gave pen {} (expected 0.03)",
         c.penetration
     );
+    let swapped = narrow_phase(1, &plane, &plane_pose, 0, &sphere, &sphere_pose, &[]);
+    assert_eq!(swapped.len, 1);
+    let swapped_contact = swapped.as_slice()[0];
+    close_scalar(
+        swapped_contact.penetration,
+        c.penetration,
+        1.0e-5,
+        "swapped margin depth",
+    );
+    close_vec(swapped_contact.position_world, c.position_world, 1.0e-5);
+    close_vec(swapped_contact.normal_world, -c.normal_world, 1.0e-5);
 }
 
 #[test]
@@ -974,6 +985,11 @@ fn mesh_mesh_margin_uses_gjk_distance_witness() {
     ));
     assert_eq!(swapped.as_slice()[0].geom_a, 1);
     assert_eq!(swapped.as_slice()[0].geom_b, 0);
+    close_vec(
+        swapped.as_slice()[0].position_world,
+        contacts.as_slice()[0].position_world,
+        1.0e-5,
+    );
     close_vec(
         swapped.as_slice()[0].normal_world,
         -contacts.as_slice()[0].normal_world,
@@ -1022,7 +1038,66 @@ fn rotated_mesh_mesh_margin_uses_converged_distance_witness() {
     ));
     assert_eq!(swapped_contact.geom_a, 1);
     assert_eq!(swapped_contact.geom_b, 0);
+    close_vec(
+        swapped_contact.position_world,
+        contact.position_world,
+        1.0e-5,
+    );
     close_vec(swapped_contact.normal_world, -contact.normal_world, 1.0e-5);
+}
+
+#[test]
+fn rotated_y_mesh_mesh_margin_matches_distance_oracle() {
+    let mesh = unit_tetrahedron();
+    let mesh_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.02);
+    let mesh_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(0.0, -0.01, 1.01),
+        orientation: Quat::from_axis_angle(Vec3::Y, 23.0_f32.to_radians()),
+    };
+    let meshes = [mesh];
+
+    let contacts = narrow_phase(0, &mesh_a, &pose_a, 1, &mesh_b, &pose_b, &meshes);
+    assert_eq!(contacts.len, 1);
+    let contact = contacts.as_slice()[0];
+    close_scalar(
+        contact.penetration,
+        0.010_794_782,
+        2.0e-5,
+        "rotated-y distance oracle depth",
+    );
+    close_vec(
+        contact.normal_world,
+        Vec3::new(-0.390_725_3, -0.005456817, -0.920_491_16),
+        6.0e-3,
+    );
+    close_vec(
+        contact.position_world,
+        Vec3::new(0.001807937, -0.000000005, 1.004_232_5),
+        2.0e-5,
+    );
+
+    let swapped = narrow_phase(1, &mesh_b, &pose_b, 0, &mesh_a, &pose_a, &meshes);
+    assert_eq!(swapped.len, 1);
+    let swapped_contact = swapped.as_slice()[0];
+    assert_eq!(swapped_contact.geom_a, 1);
+    assert_eq!(swapped_contact.geom_b, 0);
+    close_scalar(
+        swapped_contact.penetration,
+        contact.penetration,
+        2.0e-5,
+        "swapped rotated-y depth",
+    );
+    close_vec(
+        swapped_contact.position_world,
+        contact.position_world,
+        2.0e-5,
+    );
+    close_vec(swapped_contact.normal_world, -contact.normal_world, 2.0e-5);
 }
 
 #[test]
@@ -1135,6 +1210,13 @@ fn is_pair_supported_covers_new_and_reject_lists() {
     ));
     // Box-mesh remains deferred because its rotated EPA witness normal is not
     // within the shipped route error tier.
+    assert!(!is_pair_supported(
+        GeomShape::Box {
+            half_extents: Vec3::splat(0.5)
+        },
+        GeomShape::Mesh { mesh_id: 0 },
+    ));
+    // Mesh-mesh has a verified convex distance witness route.
     assert!(is_pair_supported(
         GeomShape::Mesh { mesh_id: 0 },
         GeomShape::Mesh { mesh_id: 1 },
