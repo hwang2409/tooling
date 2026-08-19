@@ -48,10 +48,10 @@
 //! # Determinism
 //!
 //! Each function returns a fixed number of contacts in a fixed order for a
-//! given input; no HashMap iteration; geometric ties use coordinate keys, not
-//! input indices. Any iterative closest-point solver runs a FIXED number of
-//! iterations (see [`sphere_ellipsoid`]). Sorted results at the pair level
-//! live in [`crate::world`].
+//! given input; no HashMap iteration; support and simplex ties use geometric
+//! keys, while pair order uses stable geom ids. Any iterative closest-point
+//! solver runs a FIXED number of iterations (see [`sphere_ellipsoid`]). Sorted
+//! results at the pair level live in [`crate::world`].
 
 use crate::geom::{ConvexMesh, Geom, GeomPose, GeomShape, HeightField};
 use crate::math::Vec3;
@@ -2283,20 +2283,43 @@ impl CcdShape<'_> {
 }
 
 fn support_vertices(vertices: &[Vec3], direction: Vec3) -> Vec3 {
+    // Preserve the original tight tolerance for simplex-sized meshes. Larger
+    // mesh supports need a small axis-aligned allowance so f32 rounding does
+    // not drop one vertex from a planar support feature.
     const SUPPORT_TIE_EPSILON: f32 = 1.0e-12;
-    let mut point = vertices[0];
-    let mut best = point.dot(direction);
-    for &candidate in vertices.iter().skip(1) {
-        let dot = candidate.dot(direction);
-        let tied = (dot - best).abs() <= SUPPORT_TIE_EPSILON;
-        if dot > best + SUPPORT_TIE_EPSILON
-            || (tied && lexicographically_precedes(candidate, point))
-        {
-            point = candidate;
-            best = dot;
+    const AXIS_SUPPORT_TIE_EPSILON: f32 = 1.2e-7;
+    let direction_length = direction.length();
+    let axis_aligned = direction_length > 0.0
+        && (direction.x.abs() >= 0.999_999 * direction_length
+            || direction.y.abs() >= 0.999_999 * direction_length
+            || direction.z.abs() >= 0.999_999 * direction_length);
+    let tie_epsilon = if axis_aligned && vertices.len() > 4 {
+        AXIS_SUPPORT_TIE_EPSILON
+    } else {
+        SUPPORT_TIE_EPSILON
+    };
+    let best = vertices
+        .iter()
+        .map(|point| point.dot(direction))
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut centroid = Vec3::ZERO;
+    let mut selected = Vec3::ZERO;
+    let mut tied_count = 0;
+    for &candidate in vertices {
+        if (candidate.dot(direction) - best).abs() <= tie_epsilon {
+            centroid += candidate;
+            if tied_count == 0 || lexicographically_precedes(candidate, selected) {
+                selected = candidate;
+            }
+            tied_count += 1;
         }
     }
-    point
+    // Centroid planar support features instead of snapping to one corner.
+    if vertices.len() > 4 && tied_count >= 4 {
+        centroid / tied_count as f32
+    } else {
+        selected
+    }
 }
 
 // Hfield prism contacts keep their existing source-order tie behavior.
@@ -2369,61 +2392,6 @@ fn sort_ccd_vertices(vertices: &mut [CcdVertex]) {
             position -= 1;
         }
     }
-}
-
-fn ccd_mesh_key_vertex(mesh: &ConvexMesh, pose: &GeomPose, rank: usize) -> Vec3 {
-    for &candidate_local in &mesh.vertices {
-        let candidate = pose.point_to_world(candidate_local);
-        let mut less = 0;
-        let mut equal = 0;
-        for &other_local in &mesh.vertices {
-            let other = pose.point_to_world(other_local);
-            if lexicographically_precedes_exact(other, candidate) {
-                less += 1;
-            } else if same_vec3(other, candidate) {
-                equal += 1;
-            }
-        }
-        if less <= rank && rank < less + equal {
-            return candidate;
-        }
-    }
-    unreachable!("mesh key rank must refer to a mesh vertex")
-}
-
-fn ccd_mesh_key_precedes(
-    mesh_a: &ConvexMesh,
-    pose_a: &GeomPose,
-    mesh_b: &ConvexMesh,
-    pose_b: &GeomPose,
-) -> bool {
-    if mesh_a.vertices.len() != mesh_b.vertices.len() {
-        return mesh_a.vertices.len() < mesh_b.vertices.len();
-    }
-    for rank in 0..mesh_a.vertices.len() {
-        let vertex_a = ccd_mesh_key_vertex(mesh_a, pose_a, rank);
-        let vertex_b = ccd_mesh_key_vertex(mesh_b, pose_b, rank);
-        if same_vec3(vertex_a, vertex_b) {
-            continue;
-        }
-        return lexicographically_precedes_exact(vertex_a, vertex_b);
-    }
-    false
-}
-
-fn ccd_mesh_pair_should_swap(
-    geom_a: &Geom,
-    pose_a: &GeomPose,
-    geom_b: &Geom,
-    pose_b: &GeomPose,
-    meshes: &[ConvexMesh],
-) -> bool {
-    let (GeomShape::Mesh { mesh_id: mesh_id_a }, GeomShape::Mesh { mesh_id: mesh_id_b }) =
-        (geom_a.shape, geom_b.shape)
-    else {
-        unreachable!("ccd mesh pair key requires two meshes")
-    };
-    ccd_mesh_key_precedes(&meshes[mesh_id_b], pose_b, &meshes[mesh_id_a], pose_a)
 }
 
 fn support_vertices_transformed(vertices: &[Vec3], pose: &GeomPose, direction: Vec3) -> Vec3 {
@@ -3429,9 +3397,9 @@ fn dispatch_narrow_phase(
     let margin = combine_max(geom_a.margin, geom_b.margin);
     let gap = combine_max(geom_a.gap, geom_b.gap);
     if ccd_route_pair(&geom_a.shape, &geom_b.shape) {
-        // Run mesh-mesh CCD in the same order for a geometric pair, then
-        // restore the caller's labels and normal orientation.
-        let swap = ccd_mesh_pair_should_swap(geom_a, pose_a, geom_b, pose_b, meshes);
+        // Run mesh-mesh CCD in stable geom-id order, then restore the
+        // caller's labels and normal orientation.
+        let swap = idx_a > idx_b;
         let mut buf = if swap {
             try_narrow_phase(
                 idx_b, geom_b, pose_b, idx_a, geom_a, pose_a, friction, margin, gap, meshes,

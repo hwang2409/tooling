@@ -305,6 +305,76 @@ fn mesh_mesh_witness_is_invariant_to_vertex_order_and_argument_order() {
     }
 }
 
+#[test]
+fn coincident_mesh_mesh_swapped_order_flips_normal() {
+    let mesh = cube_mesh([0, 1, 2, 3, 4, 5, 6, 7]);
+    let meshes = [mesh];
+    let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+
+    let forward = narrow_phase(0, &geom_a, &pose, 1, &geom_b, &pose, &meshes);
+    let swapped = narrow_phase(1, &geom_b, &pose, 0, &geom_a, &pose, &meshes);
+    assert_eq!(forward.len, 1);
+    assert_eq!(swapped.len, 1);
+    let forward = forward.as_slice()[0];
+    let swapped = swapped.as_slice()[0];
+    assert!(forward.normal_world.length_squared() > 0.99);
+    close_vec(swapped.position_world, forward.position_world, 1.0e-6);
+    close_vec(swapped.normal_world, -forward.normal_world, 1.0e-6);
+    close_scalar(
+        swapped.penetration,
+        forward.penetration,
+        1.0e-6,
+        "coincident depth",
+    );
+}
+
+#[test]
+fn near_parallel_mesh_face_witness_is_continuous() {
+    let mesh = cube_mesh([0, 1, 2, 3, 4, 5, 6, 7]);
+    let meshes = [mesh];
+    let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.01);
+    let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(0.0, 1.0, 0.0),
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b_near_parallel = GeomPose {
+        position: Vec3::new(1.0e-7, 1.0, 0.0),
+        orientation: Quat::IDENTITY,
+    };
+
+    let face = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &meshes);
+    let near_parallel = narrow_phase(
+        0,
+        &geom_a,
+        &pose_a,
+        1,
+        &geom_b,
+        &pose_b_near_parallel,
+        &meshes,
+    );
+    assert_eq!(face.len, 1);
+    assert_eq!(near_parallel.len, 1);
+    let face = face.as_slice()[0];
+    let near_parallel = near_parallel.as_slice()[0];
+    close_vec(near_parallel.position_world, face.position_world, 1.0e-4);
+    close_scalar(
+        near_parallel.penetration,
+        face.penetration,
+        1.0e-4,
+        "near-parallel penetration",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Resting equilibrium anchors on plane (closed-form penetration)
 // ---------------------------------------------------------------------------
