@@ -29,8 +29,8 @@ pub(crate) trait Scalar: Copy {
     fn sub(self, rhs: Self) -> Self;
     fn mul(self, rhs: Self) -> Self;
     fn div(self, rhs: Self) -> Self;
-    fn sin(self) -> Self;
-    fn cos(self) -> Self;
+    fn sin_value(self) -> Self;
+    fn cos_value(self) -> Self;
     fn quaternion_matrix(x: Self, y: Self, z: Self, w: Self) -> [[Self; 3]; 3];
     fn mat3_mul_vec(matrix: [[Self; 3]; 3], vector: [Self; 3]) -> [Self; 3];
     fn mat3_transpose_mul_vec(matrix: [[Self; 3]; 3], vector: [Self; 3]) -> [Self; 3];
@@ -61,10 +61,10 @@ impl Scalar for f32 {
     fn div(self, rhs: Self) -> Self {
         self / rhs
     }
-    fn sin(self) -> Self {
+    fn sin_value(self) -> Self {
         crate::math::sin(self)
     }
-    fn cos(self) -> Self {
+    fn cos_value(self) -> Self {
         crate::math::cos(self)
     }
     fn quaternion_matrix(x: Self, y: Self, z: Self, w: Self) -> [[Self; 3]; 3] {
@@ -138,13 +138,13 @@ impl Scalar for Dual {
             derivative: (self.derivative * rhs.value - self.value * rhs.derivative) / denominator,
         }
     }
-    fn sin(self) -> Self {
+    fn sin_value(self) -> Self {
         Self {
             value: crate::math::sin(self.value),
             derivative: crate::math::cos(self.value) * self.derivative,
         }
     }
-    fn cos(self) -> Self {
+    fn cos_value(self) -> Self {
         Self {
             value: crate::math::cos(self.value),
             derivative: -crate::math::sin(self.value) * self.derivative,
@@ -754,8 +754,8 @@ fn axis_rotation<S: Scalar>(axis: Vec3, angle: S) -> GMat3<S> {
     let y = S::from_f32(axis.y);
     let z = S::from_f32(axis.z);
     let half = angle.mul(S::from_f32(0.5));
-    let s = half.sin();
-    let c = half.cos();
+    let s = Scalar::sin_value(half);
+    let c = Scalar::cos_value(half);
     quaternion_matrix(x.mul(s), y.mul(s), z.mul(s), c)
 }
 
@@ -764,8 +764,8 @@ fn transform<S: Scalar>(link: &Link, kind: JointKind, q: S) -> GXform<S> {
         JointKind::Hinge { axis, .. } => {
             let axis = axis.normalize();
             let half = S::zero().sub(q).mul(S::from_f32(0.5));
-            let s = half.sin();
-            let c = half.cos();
+            let s = Scalar::sin_value(half);
+            let c = Scalar::cos_value(half);
             let rotation = quaternion_matrix(
                 S::from_f32(axis.x).mul(s),
                 S::from_f32(axis.y).mul(s),
