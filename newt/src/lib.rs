@@ -73,6 +73,7 @@
 //!   target a tendon (motor / general etc.) with the same transmission-
 //!   space convention as joint transmissions. See `docs/tendons.md`.
 
+pub(crate) mod aba;
 pub mod actuator;
 #[doc(hidden)]
 pub mod benchmark;

@@ -1,7 +1,7 @@
 use crate::joint::JointKind;
 use crate::math::Vec3;
 use crate::spatial::SpatialForce;
-use crate::tree::{ExternalWrenches, Tree, joint_limit_scalar_force};
+use crate::tree::{Tree, joint_limit_scalar_force};
 
 pub(crate) fn assemble_joint_forces(
     tree: &Tree,
@@ -82,19 +82,4 @@ pub(crate) fn assemble_joint_forces(
     }
 
     free
-}
-
-pub(crate) fn external_wrench_world(
-    tree: &Tree,
-    link_idx: usize,
-    gravity: Vec3,
-    external_wrenches: &ExternalWrenches,
-) -> (Vec3, Vec3) {
-    let link = &tree.links[link_idx];
-    let (force_external, torque_external) = external_wrenches[link_idx];
-    let (force_applied, torque_applied) = tree.applied_wrenches[link_idx];
-    (
-        force_external + force_applied + gravity * link.mass,
-        torque_external + torque_applied,
-    )
 }
