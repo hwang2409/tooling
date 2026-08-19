@@ -286,25 +286,28 @@ orientation bound is the measured per-step replay maximum plus the reviewed
 `1e-4` tolerance. Local `tools/verify_convex_fixtures.py` reruns both pinned
 MuJoCo captures, checks byte identity, replays Newt over every captured step,
 computes both window maxima, and rejects bounds that do not equal those
-generated values. CI runs the same tool with `--ci`: it skips cross-platform
-fixture byte identity, compares every committed route contact sample and
-dynamic sample with fresh MuJoCo values, and uses those fresh Linux states for
-the Newt replay check. The reviewed cross-platform capture tolerance is `1e-6`
-for each compared position, orientation, normal, and penetration component.
+generated values. This committed-fixture verifier is part of the local
+validation gate. The optional `--ci` mode remains available for a fresh
+cross-platform MuJoCo comparison: it skips byte identity, compares every
+committed route contact sample and dynamic sample with fresh MuJoCo values,
+and uses those fresh states for the Newt replay check. The reviewed
+cross-platform capture tolerance is `1e-6` for each compared position,
+orientation, normal, and penetration component.
 The final normalized macOS/Linux capture observed maxima of
 `5.3506e-8 / 1.1241e-15 / 1.3306e-8 / 2.6612e-8` for position, orientation,
 normal, and penetration. Contact counts and sample identifiers remain exact.
 This tolerance is separate from the committed Newt
-parity bounds. Mesh-local route pose orientations are excluded from the CI
+parity bounds. Mesh-local route pose orientations are excluded from the `--ci`
 value comparison because MuJoCo's mesh compiler can choose different
 principal-axis frames across platforms. Mesh contact positions and normals are
 transformed into the owning body frame by subtracting the body position and
-applying the inverse body rotation. CI compares all three components of each
-transformed vector. When contact order differs, it uses geometry and the
-nearest complete position, normal, and penetration tuple for correspondence;
+applying the inverse body rotation. The `--ci` mode compares all three
+components of each transformed vector. When contact order differs, it uses
+geometry and the nearest complete position, normal, and penetration tuple for
+correspondence;
 it never reduces a contact to norms or dot products. The Rust fixture keeps
 world-frame values for route replay.
-The verifier also runs a non-max sample mutation self-test in CI. The Rust
+The verifier also runs a non-max sample mutation self-test in `--ci` mode. The Rust
 fixture test also recomputes both maxima and requires exact float32 equality
 between each stored position/orientation bound and its stored maximum plus
 `1e-4`.
@@ -507,15 +510,17 @@ three great circles per sphere so the spin is visible.
 
 ## verification
 
-fmt, clippy, tests, libm-free grep — same triple as tier 1:
+run the local gate from the repository root:
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cd newt
 cargo test
-grep -rnE '\.(sin|cos|tan|exp|ln|powf)\(' newt/src/ \
+cargo test --test alloc_guard --features alloc-guard
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+python3 tools/verify_convex_fixtures.py
+grep -rnE '\.(sin|cos|tan|exp|ln|powf)\(' src/ \
   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//'
 ```
 
-the grep must print nothing. `.github/workflows/newt.yml` runs the same
-four checks on every push and PR.
+the verifier must exit successfully. the grep must print nothing.
