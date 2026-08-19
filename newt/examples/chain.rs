@@ -5,7 +5,7 @@
 //!
 //! Run:
 //! ```text
-//! cargo run --release --example chain -- --frames 1200 --out /tmp/chain.ppm
+//! cargo run --release --example chain -- --frames 1200 --wireframe --out /tmp/chain.ppm
 //! ```
 
 use chimy2::demo::write_ppm;
@@ -20,10 +20,14 @@ use newt::world::World;
 
 use std::path::PathBuf;
 
-fn parse_args() -> (usize, PathBuf, (usize, usize)) {
+mod showcase_support;
+
+fn parse_args() -> (usize, PathBuf, (usize, usize), bool) {
     let mut frames = 1200usize;
-    let mut out = PathBuf::from("newt-chain.ppm");
+    let default_out = PathBuf::from("newt-chain.mp4");
+    let mut out = default_out.clone();
     let mut size = (640usize, 360usize);
+    let mut wireframe = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -34,10 +38,14 @@ fn parse_args() -> (usize, PathBuf, (usize, usize)) {
                 let (w, h) = s.split_once('x').expect("--size WxH");
                 size = (w.parse().unwrap(), h.parse().unwrap());
             }
+            "--wireframe" => wireframe = true,
             _ => panic!("unknown arg: {a}"),
         }
     }
-    (frames, out, size)
+    if wireframe && out == default_out {
+        out.set_extension("ppm");
+    }
+    (frames, out, size, wireframe)
 }
 
 const N_LINKS: usize = 5;
@@ -247,13 +255,30 @@ fn render(world: &World, width: usize, height: usize) -> Framebuffer {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (frames, out, (width, height)) = parse_args();
+    let (frames, out, (width, height), wireframe) = parse_args();
     let mut world = build_world();
-    for _ in 0..frames {
-        world.step();
+    if wireframe {
+        for _ in 0..frames {
+            world.step();
+        }
+        write_ppm(&out, &render(&world, width, height))?;
+        return Ok(());
     }
-    let fb = render(&world, width, height);
-    write_ppm(&out, &fb)?;
+    let mut simulated = 0;
+    showcase_support::write_video(&out, frames, |step| {
+        for _ in simulated..step {
+            world.step();
+        }
+        simulated = step;
+        let items = showcase_support::world_items(&world);
+        showcase_support::render_items(
+            &items,
+            showcase_support::composition("features"),
+            width,
+            height,
+            &format!("hinge chain  |  step {step}"),
+        )
+    })?;
     let final_link_pos = world.tree_link_pose(0, N_LINKS).0;
     println!(
         "wrote {} ({}x{}) — bottom link COM = {final_link_pos:?}",

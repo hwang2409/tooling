@@ -13,7 +13,7 @@ use chimy2::pipeline::Pipeline;
 use chimy2::shaders::{CookTorranceShader, CookTorranceUniforms, DirectionalLight, PointLight};
 
 use newt::geom::{GeomShape, geom_world_pose};
-use newt::math::{Quat, Vec3 as NVec3};
+use newt::math::{Quat, Vec3 as NVec3, asin, cos, sin};
 use newt::tree::forward_kinematics;
 use newt::world::World;
 
@@ -117,6 +117,31 @@ pub fn composition(name: &str) -> Composition {
             Vec3::new(0.0, 0.0, 1.0),
             Vec3::new(3.0, -0.2, 1.4),
             Vec3::new(0.8, 0.3, 0.75),
+        ),
+        "features" => Composition::new(
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(4.8, -7.5, 3.5),
+            Vec3::new(0.1, 0.75, 0.9),
+        ),
+        "compare" => Composition::new(
+            Vec3::new(0.0, 0.0, 1.6),
+            Vec3::new(7.8, -10.0, 5.4),
+            Vec3::new(0.95, 0.45, 0.1),
+        ),
+        "tumble" => Composition::new(
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(8.0, -10.0, 7.0),
+            Vec3::new(0.95, 0.5, 0.1),
+        ),
+        "linkage" => Composition::new(
+            Vec3::new(0.0, 0.0, 0.7),
+            Vec3::new(2.8, -4.0, 2.4),
+            Vec3::new(0.95, 0.45, 0.1),
+        ),
+        "pendulum" => Composition::new(
+            Vec3::new(0.0, 0.0, 0.6),
+            Vec3::new(4.5, 0.0, 1.0),
+            Vec3::new(0.1, 0.65, 0.9),
         ),
         _ => Composition::new(
             Vec3::new(0.0, 0.0, 1.0),
@@ -473,7 +498,9 @@ fn align_z(vector: NVec3) -> Quat {
     if dot < -0.9999 {
         return Quat::from_axis_angle(NVec3::X, PI);
     }
-    Quat::from_axis_angle(NVec3::Z.cross(direction).normalize(), dot.acos())
+    let angle = asin((1.0 - dot * dot).sqrt());
+    let angle = if dot < 0.0 { PI - angle } else { angle };
+    Quat::from_axis_angle(NVec3::Z.cross(direction).normalize(), angle)
 }
 
 fn vertex(position: Vec3) -> MeshVertex {
@@ -515,13 +542,13 @@ pub fn sphere_mesh(segments: usize, rings: usize) -> Mesh {
     for ring in 0..=rings {
         let v = ring as f32 / rings as f32;
         let phi = PI * v;
-        let z = phi.cos();
-        let radius = phi.sin();
+        let z = cos(phi);
+        let radius = sin(phi);
         for segment in 0..segments {
             let theta = 2.0 * PI * segment as f32 / segments as f32;
             vertices.push(vertex(Vec3::new(
-                radius * theta.cos(),
-                radius * theta.sin(),
+                radius * cos(theta),
+                radius * sin(theta),
                 z,
             )));
         }
@@ -547,8 +574,8 @@ fn cylinder_mesh(segments: usize, radius: f32, half_height: f32) -> Mesh {
         for segment in 0..segments {
             let theta = 2.0 * PI * segment as f32 / segments as f32;
             vertices.push(vertex(Vec3::new(
-                radius * theta.cos(),
-                radius * theta.sin(),
+                radius * cos(theta),
+                radius * sin(theta),
                 z,
             )));
         }
@@ -577,8 +604,8 @@ fn capsule_mesh(segments: usize, rings: usize, radius: f32, half_height: f32) ->
         for segment in 0..segments {
             let theta = 2.0 * PI * segment as f32 / segments as f32;
             vertices.push(vertex(Vec3::new(
-                ring_radius * theta.cos(),
-                ring_radius * theta.sin(),
+                ring_radius * cos(theta),
+                ring_radius * sin(theta),
                 z,
             )));
         }
@@ -588,7 +615,7 @@ fn capsule_mesh(segments: usize, rings: usize, radius: f32, half_height: f32) ->
     for ring in 0..=rings {
         let t = ring as f32 / rings as f32;
         let angle = -PI * 0.5 + t * PI * 0.5;
-        push_ring(radius * angle.cos(), -half_height + radius * angle.sin());
+        push_ring(radius * cos(angle), -half_height + radius * sin(angle));
     }
     // Include interior cylinder rings so the cylindrical section is explicit.
     for ring in 1..=rings + 1 {
@@ -599,7 +626,7 @@ fn capsule_mesh(segments: usize, rings: usize, radius: f32, half_height: f32) ->
     for ring in 1..=rings {
         let t = ring as f32 / rings as f32;
         let angle = t * PI * 0.5;
-        push_ring(radius * angle.cos(), half_height + radius * angle.sin());
+        push_ring(radius * cos(angle), half_height + radius * sin(angle));
     }
 
     let ring_count = vertices.len() / segments;

@@ -3,7 +3,7 @@
 //!
 //! Run:
 //! ```text
-//! cargo run --release --example tumble -- --frames 200 --out /tmp/tumble.ppm
+//! cargo run --release --example tumble -- --frames 200 --wireframe --out /tmp/tumble.ppm
 //! ```
 //!
 //! Deliberately minimal: no lighting, no rasterizer — just per-body world→view
@@ -15,16 +15,20 @@ use chimy2::demo::write_ppm;
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
 
+mod showcase_support;
+
 use newt::body::Body;
 use newt::math::{Quat, Vec3};
 use newt::world::World;
 
 use std::path::PathBuf;
 
-fn parse_args() -> (usize, PathBuf, (usize, usize)) {
+fn parse_args() -> (usize, PathBuf, (usize, usize), bool) {
     let mut frames = 200usize;
-    let mut out = PathBuf::from("newt-tumble.ppm");
+    let default_out = PathBuf::from("newt-tumble.mp4");
+    let mut out = default_out.clone();
     let mut size = (640usize, 360usize);
+    let mut wireframe = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -35,10 +39,14 @@ fn parse_args() -> (usize, PathBuf, (usize, usize)) {
                 let (w, h) = s.split_once('x').expect("--size WxH");
                 size = (w.parse().unwrap(), h.parse().unwrap());
             }
+            "--wireframe" => wireframe = true,
             _ => panic!("unknown arg: {a}"),
         }
     }
-    (frames, out, size)
+    if wireframe && out == default_out {
+        out.set_extension("ppm");
+    }
+    (frames, out, size, wireframe)
 }
 
 fn build_world() -> (World, [Vec3; 3]) {
@@ -202,16 +210,65 @@ fn render(world: &World, half_extents: &[Vec3; 3], width: usize, height: usize) 
     fb
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (frames, out, (width, height)) = parse_args();
-    let (mut world, half_extents) = build_world();
-
-    for _ in 0..frames {
-        world.step();
+fn render_solid(
+    world: &World,
+    half_extents: &[Vec3; 3],
+    width: usize,
+    height: usize,
+    step: usize,
+) -> Framebuffer {
+    let mut items = vec![showcase_support::item(
+        showcase_support::cuboid_mesh(chimy2::math::Vec3::new(6.0, 6.0, 0.04)),
+        showcase_support::transform(
+            Vec3::new(0.0, 0.0, -0.04),
+            Quat::IDENTITY,
+            chimy2::math::Vec3::new(1.0, 1.0, 1.0),
+        ),
+        showcase_support::Material::new(chimy2::math::Vec3::new(0.04, 0.05, 0.07), 0.0, 0.9),
+    )];
+    let colors = [
+        chimy2::math::Vec3::new(0.95, 0.55, 0.12),
+        chimy2::math::Vec3::new(0.1, 0.65, 0.9),
+        chimy2::math::Vec3::new(0.9, 0.18, 0.35),
+    ];
+    for (index, body) in world.bodies.iter().enumerate() {
+        items.push(showcase_support::item(
+            showcase_support::cuboid_mesh(showcase_support::to_cvec(half_extents[index])),
+            showcase_support::transform(
+                body.position,
+                body.orientation,
+                chimy2::math::Vec3::new(1.0, 1.0, 1.0),
+            ),
+            showcase_support::Material::new(colors[index], 0.2, 0.3),
+        ));
     }
+    showcase_support::render_items(
+        &items,
+        showcase_support::composition("tumble"),
+        width,
+        height,
+        &format!("tumbling rigid bodies  |  step {step}"),
+    )
+}
 
-    let fb = render(&world, &half_extents, width, height);
-    write_ppm(&out, &fb)?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (frames, out, (width, height), wireframe) = parse_args();
+    let (mut world, half_extents) = build_world();
+    if wireframe {
+        for _ in 0..frames {
+            world.step();
+        }
+        write_ppm(&out, &render(&world, &half_extents, width, height))?;
+        return Ok(());
+    }
+    let mut simulated = 0;
+    showcase_support::write_video(&out, frames, |step| {
+        for _ in simulated..step {
+            world.step();
+        }
+        simulated = step;
+        render_solid(&world, &half_extents, width, height, step)
+    })?;
     println!("wrote {} ({}x{})", out.display(), width, height);
     Ok(())
 }

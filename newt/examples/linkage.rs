@@ -1,8 +1,9 @@
 //! v1-tier-5 demo: a four-bar-style linkage built from two grounded
 //! hinges, a free coupler bar constrained by two `connect` equalities,
 //! and a `joint` coupling equality that slaves the follower hinge to
-//! `2 · crank`. One servo drives the crank; the whole assembly moves
-//! through the connect + coupling constraints.
+//! `-1 · crank`. One servo drives the crank; coupling drives the follower.
+//! The coupler bar stays at static reference anchors because tree-link
+//! connect anchors are not supported yet.
 //!
 //! Uses ALL four v1-tier-5 equality features:
 //! - `Connect` (×2, world-space anchor coincidence)
@@ -10,7 +11,7 @@
 //!
 //! Run:
 //! ```text
-//! cargo run --release --example linkage -- --frames 800 --out /tmp/linkage.ppm
+//! cargo run --release --example linkage -- --frames 800 --wireframe --out /tmp/linkage.ppm
 //! ```
 //!
 //! Wireframe PPM via chimy2, same rendering plumbing as the other
@@ -36,6 +37,8 @@ use newt::world::World;
 
 use std::path::PathBuf;
 
+mod showcase_support;
+
 /// Scene geometry — three fixed lengths that pin down the mechanism.
 const CRANK_LEN: f32 = 0.4;
 const FOLLOWER_LEN: f32 = 0.4;
@@ -45,10 +48,12 @@ const COUPLER_HALF: Vec3 = Vec3::new(0.4, 0.02, 0.02);
 const CRANK_PIVOT_X: f32 = -0.4;
 const FOLLOWER_PIVOT_X: f32 = 0.4;
 
-fn parse_args() -> (usize, PathBuf, (usize, usize)) {
+fn parse_args() -> (usize, PathBuf, (usize, usize), bool) {
     let mut frames = 800usize;
-    let mut out = PathBuf::from("newt-linkage.ppm");
+    let default_out = PathBuf::from("newt-linkage.mp4");
+    let mut out = default_out.clone();
     let mut size = (640usize, 360usize);
+    let mut wireframe = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -59,10 +64,14 @@ fn parse_args() -> (usize, PathBuf, (usize, usize)) {
                 let (w, h) = s.split_once('x').expect("--size WxH");
                 size = (w.parse().unwrap(), h.parse().unwrap());
             }
+            "--wireframe" => wireframe = true,
             _ => panic!("unknown arg: {a}"),
         }
     }
-    (frames, out, size)
+    if wireframe && out == default_out {
+        out.set_extension("ppm");
+    }
+    (frames, out, size, wireframe)
 }
 
 fn build_world() -> (World, usize, usize) {
@@ -125,8 +134,9 @@ fn build_world() -> (World, usize, usize) {
     let tree_idx = w.add_tree(tree);
 
     // Free coupler bar. World-space rest pose: horizontal at the level
-    // of the crank tips (z = 0.5 + CRANK_LEN when q = 0), spanning
-    // from crank tip to follower tip.
+    // of the crank tips (z = 0.5 + CRANK_LEN when q = 0). The Connect
+    // rows use these static rest points because tree-link anchors are not
+    // supported by the engine.
     let bar_z = 0.5 + CRANK_LEN;
     let bar_center = Vec3::new(0.5 * (CRANK_PIVOT_X + FOLLOWER_PIVOT_X), 0.0, bar_z);
     // Bar inertia — slender box.
@@ -151,13 +161,11 @@ fn build_world() -> (World, usize, usize) {
         solref,
         solimp,
     });
-    // NOTE: The two anchors above are STATIC world points — the crank
-    // and follower tips MOVE with the hinges, so the anchors as
-    // written won't actually track the hinge tips. This demo simplifies
-    // by putting both connect anchors at the world-space rest position
-    // of the tips; the joint coupling then correlates the two hinges
-    // 2:1 so the tips stay in geometric agreement with the coupler
-    // through the coupling constraint alone. A more general
+    // NOTE: The two anchors above are STATIC world points. The crank
+    // and follower tips move with the hinges, so these rows do not track
+    // the tips. The joint coupling demonstrates the supported hinge
+    // relationship while the bar demonstrates static-reference Connect
+    // rows. A more general
     // implementation would attach the connect equalities to the tree
     // link's body (v1 tier 6 will lift `Equality::Connect` to accept a
     // tree link + local anchor, matching MuJoCo's `equality/connect`
@@ -166,8 +174,7 @@ fn build_world() -> (World, usize, usize) {
         tree: tree_idx,
         link_a: follower,
         link_b: crank,
-        // follower = -1 · crank  (opposite sign so the two hinges
-        // sweep the coupler bar side-to-side in phase).
+        // follower = -1 · crank (the supported coupling relationship).
         polycoef: [0.0, -1.0, 0.0],
         solref,
         solimp,
@@ -340,19 +347,81 @@ fn render(w: &World, bar_idx: usize, width: usize, height: usize) -> Framebuffer
     fb
 }
 
+fn render_solid(
+    w: &World,
+    bar_idx: usize,
+    width: usize,
+    height: usize,
+    step: usize,
+) -> Framebuffer {
+    let poses = newt::tree::forward_kinematics(&w.trees[0]);
+    let crank_pivot = Vec3::new(CRANK_PIVOT_X, 0.0, 0.5);
+    let follower_pivot = Vec3::new(FOLLOWER_PIVOT_X, 0.0, 0.5);
+    let crank_tip = poses[1].0 + poses[1].1.rotate(Vec3::new(0.0, 0.0, CRANK_LEN * 0.5));
+    let follower_tip = poses[2].0 + poses[2].1.rotate(Vec3::new(0.0, 0.0, FOLLOWER_LEN * 0.5));
+    let mut items = vec![showcase_support::item(
+        showcase_support::cuboid_mesh(CVec3::new(2.5, 2.5, 0.04)),
+        showcase_support::transform(
+            Vec3::new(0.0, 0.0, -0.04),
+            Quat::IDENTITY,
+            CVec3::new(1.0, 1.0, 1.0),
+        ),
+        showcase_support::Material::new(CVec3::new(0.04, 0.05, 0.07), 0.0, 0.9),
+    )];
+    showcase_support::add_capsule(
+        &mut items,
+        crank_pivot,
+        crank_tip,
+        0.045,
+        showcase_support::Material::new(CVec3::new(0.95, 0.55, 0.12), 0.25, 0.3),
+    );
+    showcase_support::add_capsule(
+        &mut items,
+        follower_pivot,
+        follower_tip,
+        0.045,
+        showcase_support::Material::new(CVec3::new(0.1, 0.65, 0.9), 0.25, 0.3),
+    );
+    items.push(showcase_support::item(
+        showcase_support::cuboid_mesh(CVec3::new(COUPLER_HALF.x, COUPLER_HALF.y, COUPLER_HALF.z)),
+        showcase_support::transform(
+            w.bodies[bar_idx].position,
+            w.bodies[bar_idx].orientation,
+            CVec3::new(1.0, 1.0, 1.0),
+        ),
+        showcase_support::Material::new(CVec3::new(0.9, 0.18, 0.35), 0.2, 0.3),
+    ));
+    showcase_support::render_items(
+        &items,
+        showcase_support::composition("linkage"),
+        width,
+        height,
+        &format!("joint coupling  |  static connect reference  |  step {step}"),
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (frames, out, (width, height)) = parse_args();
+    let (frames, out, (width, height), wireframe) = parse_args();
     let (mut world, tree_idx, bar_idx) = build_world();
-    // Drive the crank through a smooth sinusoidal sweep so the linkage
-    // moves through a range large enough to see the coupler bar swing.
-    for step in 0..frames {
-        let t = step as f32 * world.dt;
-        let target = 0.4 * sin(0.8 * t);
-        world.trees[tree_idx].set_actuator_target(0, target);
-        world.step();
+    if wireframe {
+        for current in 0..frames {
+            let t = current as f32 * world.dt;
+            world.trees[tree_idx].set_actuator_target(0, 0.4 * sin(0.8 * t));
+            world.step();
+        }
+        write_ppm(&out, &render(&world, bar_idx, width, height))?;
+        return Ok(());
     }
-    let fb = render(&world, bar_idx, width, height);
-    write_ppm(&out, &fb)?;
+    let mut simulated = 0;
+    showcase_support::write_video(&out, frames, |step| {
+        for current in simulated..step {
+            let t = current as f32 * world.dt;
+            world.trees[tree_idx].set_actuator_target(0, 0.4 * sin(0.8 * t));
+            world.step();
+        }
+        simulated = step;
+        render_solid(&world, bar_idx, width, height, step)
+    })?;
     println!(
         "wrote {} ({}x{}) after {} frames",
         out.display(),
