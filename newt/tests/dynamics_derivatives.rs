@@ -658,7 +658,7 @@ fn mixed_wrap_position_derivative_matches_finite_difference(wrap: SpatialWrap, n
         let sphere_probe = Tendon::spatial_branches(vec![second_branch]);
         let wrapped_length = newt::tendon::tendon_kinematics(&sphere_probe, &tree, &poses).length;
         assert!(
-            wrapped_length < 4.0 - 1.0e-3,
+            wrapped_length > 2.0 + 1.0e-3,
             "sphere divisor-2 branch did not wrap: length={wrapped_length}"
         );
     }
