@@ -518,7 +518,7 @@ cargo test
 cargo test --test alloc_guard --features alloc-guard
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-python3 tools/verify_convex_fixtures.py
+~/me/fun/biped/.venv/bin/python tools/verify_convex_fixtures.py
 grep -rnE '\.(sin|cos|tan|exp|ln|powf)\(' src/ \
   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//'
 ```

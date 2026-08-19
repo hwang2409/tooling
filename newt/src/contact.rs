@@ -48,10 +48,10 @@
 //! # Determinism
 //!
 //! Each function returns a fixed number of contacts in a fixed order for a
-//! given input; no HashMap iteration; no sort-key that ties on floats. Any
-//! iterative closest-point solver runs a FIXED number of iterations (see
-//! [`sphere_ellipsoid`]). Sorted results at the pair level live in
-//! [`crate::world`].
+//! given input; no HashMap iteration; geometric ties use coordinate keys, not
+//! input indices. Any iterative closest-point solver runs a FIXED number of
+//! iterations (see [`sphere_ellipsoid`]). Sorted results at the pair level
+//! live in [`crate::world`].
 
 use crate::geom::{ConvexMesh, Geom, GeomPose, GeomShape, HeightField};
 use crate::math::Vec3;
@@ -2274,7 +2274,7 @@ impl CcdShape<'_> {
             Vec3::X
         };
         match self {
-            Self::Vertices(vertices) => support_vertices(vertices, direction),
+            Self::Vertices(vertices) => support_vertices_legacy(vertices, direction),
             Self::Mesh { pose, mesh } => {
                 support_vertices_transformed(&mesh.vertices, pose, direction)
             }
@@ -2283,6 +2283,24 @@ impl CcdShape<'_> {
 }
 
 fn support_vertices(vertices: &[Vec3], direction: Vec3) -> Vec3 {
+    const SUPPORT_TIE_EPSILON: f32 = 1.0e-12;
+    let mut point = vertices[0];
+    let mut best = point.dot(direction);
+    for &candidate in vertices.iter().skip(1) {
+        let dot = candidate.dot(direction);
+        let tied = (dot - best).abs() <= SUPPORT_TIE_EPSILON;
+        if dot > best + SUPPORT_TIE_EPSILON
+            || (tied && lexicographically_precedes(candidate, point))
+        {
+            point = candidate;
+            best = dot;
+        }
+    }
+    point
+}
+
+// Hfield prism contacts keep their existing source-order tie behavior.
+fn support_vertices_legacy(vertices: &[Vec3], direction: Vec3) -> Vec3 {
     let mut point = vertices[0];
     let mut best = point.dot(direction);
     for &candidate in vertices.iter().skip(1) {
@@ -2293,6 +2311,119 @@ fn support_vertices(vertices: &[Vec3], direction: Vec3) -> Vec3 {
         }
     }
     point
+}
+
+fn lexicographically_precedes(a: Vec3, b: Vec3) -> bool {
+    const EPSILON: f32 = 1.0e-6;
+    if (a.x - b.x).abs() > EPSILON {
+        return a.x < b.x;
+    }
+    if (a.y - b.y).abs() > EPSILON {
+        return a.y < b.y;
+    }
+    if (a.z - b.z).abs() > EPSILON {
+        return a.z < b.z;
+    }
+    if a.x != b.x {
+        return a.x < b.x;
+    }
+    if a.y != b.y {
+        return a.y < b.y;
+    }
+    a.z < b.z
+}
+
+fn lexicographically_precedes_exact(a: Vec3, b: Vec3) -> bool {
+    if a.x != b.x {
+        return a.x < b.x;
+    }
+    if a.y != b.y {
+        return a.y < b.y;
+    }
+    a.z < b.z
+}
+
+fn same_vec3(a: Vec3, b: Vec3) -> bool {
+    a.x == b.x && a.y == b.y && a.z == b.z
+}
+
+fn ccd_vertex_precedes(a: CcdVertex, b: CcdVertex) -> bool {
+    for (left, right) in [
+        (a.minkowski, b.minkowski),
+        (a.shape_a, b.shape_a),
+        (a.shape_b, b.shape_b),
+    ] {
+        if same_vec3(left, right) {
+            continue;
+        }
+        return lexicographically_precedes_exact(left, right);
+    }
+    false
+}
+
+fn sort_ccd_vertices(vertices: &mut [CcdVertex]) {
+    for index in 1..vertices.len() {
+        let mut position = index;
+        while position > 0 && ccd_vertex_precedes(vertices[position], vertices[position - 1]) {
+            vertices.swap(position, position - 1);
+            position -= 1;
+        }
+    }
+}
+
+fn ccd_mesh_key_vertex(mesh: &ConvexMesh, pose: &GeomPose, rank: usize) -> Vec3 {
+    for &candidate_local in &mesh.vertices {
+        let candidate = pose.point_to_world(candidate_local);
+        let mut less = 0;
+        let mut equal = 0;
+        for &other_local in &mesh.vertices {
+            let other = pose.point_to_world(other_local);
+            if lexicographically_precedes_exact(other, candidate) {
+                less += 1;
+            } else if same_vec3(other, candidate) {
+                equal += 1;
+            }
+        }
+        if less <= rank && rank < less + equal {
+            return candidate;
+        }
+    }
+    unreachable!("mesh key rank must refer to a mesh vertex")
+}
+
+fn ccd_mesh_key_precedes(
+    mesh_a: &ConvexMesh,
+    pose_a: &GeomPose,
+    mesh_b: &ConvexMesh,
+    pose_b: &GeomPose,
+) -> bool {
+    if mesh_a.vertices.len() != mesh_b.vertices.len() {
+        return mesh_a.vertices.len() < mesh_b.vertices.len();
+    }
+    for rank in 0..mesh_a.vertices.len() {
+        let vertex_a = ccd_mesh_key_vertex(mesh_a, pose_a, rank);
+        let vertex_b = ccd_mesh_key_vertex(mesh_b, pose_b, rank);
+        if same_vec3(vertex_a, vertex_b) {
+            continue;
+        }
+        return lexicographically_precedes_exact(vertex_a, vertex_b);
+    }
+    false
+}
+
+fn ccd_mesh_pair_should_swap(
+    geom_a: &Geom,
+    pose_a: &GeomPose,
+    geom_b: &Geom,
+    pose_b: &GeomPose,
+    meshes: &[ConvexMesh],
+) -> bool {
+    let (GeomShape::Mesh { mesh_id: mesh_id_a }, GeomShape::Mesh { mesh_id: mesh_id_b }) =
+        (geom_a.shape, geom_b.shape)
+    else {
+        unreachable!("ccd mesh pair key requires two meshes")
+    };
+    ccd_mesh_key_precedes(&meshes[mesh_id_b], pose_b, &meshes[mesh_id_a], pose_a)
 }
 
 fn support_vertices_transformed(vertices: &[Vec3], pose: &GeomPose, direction: Vec3) -> Vec3 {
@@ -2514,6 +2645,8 @@ fn ccd_closest_witness(simplex: &CcdSimplex) -> Option<(Vec3, Vec3)> {
 struct CcdDistanceCandidate {
     point: Vec3,
     weights: [f32; 4],
+    feature: [CcdVertex; 3],
+    feature_len: usize,
 }
 
 /// Return whether the origin is inside a non-degenerate tetrahedron.
@@ -2552,6 +2685,18 @@ fn ccd_distance_candidate(simplex: &CcdSimplex, mask: u8) -> Option<CcdDistanceC
             index_len += 1;
         }
     }
+    for index in 1..index_len {
+        let mut position = index;
+        while position > 0
+            && ccd_vertex_precedes(
+                simplex.points[indices[position]],
+                simplex.points[indices[position - 1]],
+            )
+        {
+            indices.swap(position, position - 1);
+            position -= 1;
+        }
+    }
     let (point, subset_weights) = match index_len {
         1 => (simplex.points[indices[0]].minkowski, [1.0, 0.0, 0.0]),
         2 => {
@@ -2583,7 +2728,39 @@ fn ccd_distance_candidate(simplex: &CcdSimplex, mask: u8) -> Option<CcdDistanceC
     for (index, &weight) in indices[..index_len].iter().zip(subset_weights.iter()) {
         weights[*index] = weight;
     }
-    Some(CcdDistanceCandidate { point, weights })
+    let mut feature = [simplex.points[indices[0]]; 3];
+    for (position, &index) in indices[..index_len].iter().enumerate() {
+        feature[position] = simplex.points[index];
+    }
+    Some(CcdDistanceCandidate {
+        point,
+        weights,
+        feature,
+        feature_len: index_len,
+    })
+}
+
+fn ccd_distance_candidate_precedes(
+    candidate: CcdDistanceCandidate,
+    current: CcdDistanceCandidate,
+) -> bool {
+    let candidate_distance = candidate.point.length_squared();
+    let current_distance = current.point.length_squared();
+    if candidate_distance != current_distance {
+        return candidate_distance < current_distance;
+    }
+    if candidate.feature_len != current.feature_len {
+        return candidate.feature_len < current.feature_len;
+    }
+    for index in 0..candidate.feature_len {
+        if ccd_vertex_precedes(candidate.feature[index], current.feature[index]) {
+            return true;
+        }
+        if ccd_vertex_precedes(current.feature[index], candidate.feature[index]) {
+            return false;
+        }
+    }
+    lexicographically_precedes(candidate.point, current.point)
 }
 
 /// Reduce a distance simplex by walking its vertex, edge, and face regions.
@@ -2600,9 +2777,7 @@ fn ccd_distance_simplex_step(simplex: &mut CcdSimplex) -> Option<Vec3> {
         let Some(candidate) = ccd_distance_candidate(simplex, mask as u8) else {
             continue;
         };
-        if best
-            .is_none_or(|current| candidate.point.length_squared() < current.point.length_squared())
-        {
+        if best.is_none_or(|current| ccd_distance_candidate_precedes(candidate, current)) {
             best = Some(candidate);
         }
     }
@@ -2622,13 +2797,18 @@ fn ccd_distance_simplex_step(simplex: &mut CcdSimplex) -> Option<Vec3> {
     if selected_len == 0 {
         let mut largest_index = 0;
         for index in 1..simplex.len {
-            if best.weights[index] > best.weights[largest_index] {
+            let weight_difference = best.weights[index] - best.weights[largest_index];
+            if weight_difference > 1.0e-6
+                || (weight_difference.abs() <= 1.0e-6
+                    && ccd_vertex_precedes(simplex.points[index], simplex.points[largest_index]))
+            {
                 largest_index = index;
             }
         }
         selected[0] = simplex.points[largest_index];
         selected_len = 1;
     }
+    sort_ccd_vertices(&mut selected[..selected_len]);
     simplex.set(&selected[..selected_len]);
     Some(best.point)
 }
@@ -3249,11 +3429,28 @@ fn dispatch_narrow_phase(
     let margin = combine_max(geom_a.margin, geom_b.margin);
     let gap = combine_max(geom_a.gap, geom_b.gap);
     if ccd_route_pair(&geom_a.shape, &geom_b.shape) {
-        return try_narrow_phase(
-            idx_a, geom_a, pose_a, idx_b, geom_b, pose_b, friction, margin, gap, meshes, hfields,
-            mode,
-        )
+        // Run mesh-mesh CCD in the same order for a geometric pair, then
+        // restore the caller's labels and normal orientation.
+        let swap = ccd_mesh_pair_should_swap(geom_a, pose_a, geom_b, pose_b, meshes);
+        let mut buf = if swap {
+            try_narrow_phase(
+                idx_b, geom_b, pose_b, idx_a, geom_a, pose_a, friction, margin, gap, meshes,
+                hfields, mode,
+            )
+        } else {
+            try_narrow_phase(
+                idx_a, geom_a, pose_a, idx_b, geom_b, pose_b, friction, margin, gap, meshes,
+                hfields, mode,
+            )
+        }
         .expect("ccd route shapes must be finite convex geoms");
+        if swap {
+            for c in buf.contacts.iter_mut().take(buf.len) {
+                std::mem::swap(&mut c.geom_a, &mut c.geom_b);
+                c.normal_world = -c.normal_world;
+            }
+        }
+        return buf;
     }
     // Try in the order given; if that combination isn't a known primitive,
     // swap and dispatch, then relabel the results (flipping normal and A/B).

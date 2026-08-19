@@ -186,6 +186,125 @@ fn unit_tetrahedron() -> ConvexMesh {
     }
 }
 
+fn cube_mesh(order: [usize; 8]) -> ConvexMesh {
+    let base_vertices = [
+        Vec3::new(-0.5, -0.5, -0.5),
+        Vec3::new(0.5, -0.5, -0.5),
+        Vec3::new(-0.5, 0.5, -0.5),
+        Vec3::new(0.5, 0.5, -0.5),
+        Vec3::new(-0.5, -0.5, 0.5),
+        Vec3::new(0.5, -0.5, 0.5),
+        Vec3::new(-0.5, 0.5, 0.5),
+        Vec3::new(0.5, 0.5, 0.5),
+    ];
+    let mut inverse = [0usize; 8];
+    for (new_index, &old_index) in order.iter().enumerate() {
+        inverse[old_index] = new_index;
+    }
+    let base_faces = [
+        [0, 2, 3],
+        [0, 3, 1],
+        [4, 5, 7],
+        [4, 7, 6],
+        [0, 1, 5],
+        [0, 5, 4],
+        [2, 6, 7],
+        [2, 7, 3],
+        [0, 4, 6],
+        [0, 6, 2],
+        [1, 3, 7],
+        [1, 7, 5],
+    ];
+    ConvexMesh {
+        vertices: order.iter().map(|&index| base_vertices[index]).collect(),
+        faces: base_faces
+            .into_iter()
+            .map(|face| {
+                [
+                    inverse[face[0]] as u32,
+                    inverse[face[1]] as u32,
+                    inverse[face[2]] as u32,
+                ]
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn mesh_mesh_witness_is_invariant_to_vertex_order_and_argument_order() {
+    let identity = [0, 1, 2, 3, 4, 5, 6, 7];
+    let permutations = [
+        identity,
+        [7, 6, 5, 4, 3, 2, 1, 0],
+        [1, 0, 3, 2, 5, 4, 7, 6],
+        [2, 3, 0, 1, 6, 7, 4, 5],
+        [4, 5, 6, 7, 0, 1, 2, 3],
+        [3, 1, 7, 5, 2, 0, 6, 4],
+        [6, 2, 4, 0, 7, 3, 5, 1],
+        [5, 7, 1, 3, 4, 6, 0, 2],
+    ];
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(1.01, 0.0, 0.0),
+        orientation: Quat::IDENTITY,
+    };
+    let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.02);
+    let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let reference_mesh = cube_mesh(identity);
+    let reference = narrow_phase(
+        0,
+        &geom_a,
+        &pose_a,
+        1,
+        &geom_b,
+        &pose_b,
+        std::slice::from_ref(&reference_mesh),
+    );
+    assert_eq!(reference.len, 1);
+    let expected = reference.as_slice()[0];
+
+    for order in permutations {
+        let permuted_geom_b = Geom::mesh(1, 1, Vec3::ZERO, Quat::IDENTITY, 0.5);
+        let meshes = [reference_mesh.clone(), cube_mesh(order)];
+        let actual = narrow_phase(0, &geom_a, &pose_a, 1, &permuted_geom_b, &pose_b, &meshes);
+        assert_eq!(
+            actual.len, 1,
+            "vertex order {order:?} changed contact count"
+        );
+        let contact = actual.as_slice()[0];
+        close_vec(contact.position_world, expected.position_world, 1.0e-6);
+        close_vec(contact.normal_world, expected.normal_world, 1.0e-6);
+        close_scalar(
+            contact.penetration,
+            expected.penetration,
+            1.0e-6,
+            "vertex-order penetration",
+        );
+
+        let swapped = narrow_phase(1, &permuted_geom_b, &pose_b, 0, &geom_a, &pose_a, &meshes);
+        assert_eq!(
+            swapped.len, 1,
+            "vertex order {order:?} changed swapped count"
+        );
+        let swapped_contact = swapped.as_slice()[0];
+        close_vec(
+            swapped_contact.position_world,
+            expected.position_world,
+            1.0e-6,
+        );
+        close_vec(swapped_contact.normal_world, -expected.normal_world, 1.0e-6);
+        close_scalar(
+            swapped_contact.penetration,
+            expected.penetration,
+            1.0e-6,
+            "swapped penetration",
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Resting equilibrium anchors on plane (closed-form penetration)
 // ---------------------------------------------------------------------------
