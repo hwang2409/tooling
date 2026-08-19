@@ -7,8 +7,7 @@
 //! cargo run --release --example pendulum -- --frames 900 --out /tmp/pendulum.ppm
 //! ```
 
-#![allow(dead_code)]
-
+use chimy2::demo::write_ppm;
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
 
@@ -20,10 +19,11 @@ use std::path::PathBuf;
 
 mod showcase_support;
 
-fn parse_args() -> (usize, PathBuf, (usize, usize)) {
+fn parse_args() -> (usize, PathBuf, (usize, usize), bool) {
     let mut frames = 900usize;
     let mut out = PathBuf::from("newt-pendulum.mp4");
     let mut size = (640usize, 360usize);
+    let mut wireframe = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -34,10 +34,11 @@ fn parse_args() -> (usize, PathBuf, (usize, usize)) {
                 let (w, h) = s.split_once('x').expect("--size WxH");
                 size = (w.parse().unwrap(), h.parse().unwrap());
             }
+            "--wireframe" => wireframe = true,
             _ => panic!("unknown arg: {a}"),
         }
     }
-    (frames, out, size)
+    (frames, out, size, wireframe)
 }
 
 const L1: f32 = 0.9;
@@ -239,11 +240,20 @@ fn render_solid(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (frames, out, (width, height)) = parse_args();
+    let (frames, out, (width, height), wireframe) = parse_args();
     let mut tree = build_tree();
     let dt = 0.005f32;
     let g = Vec3::new(0.0, 0.0, -9.81);
     let mut trail = Vec::with_capacity(frames);
+    if wireframe {
+        for _ in 0..frames {
+            rk4_step(&mut tree, g, dt, |_| vec![(Vec3::ZERO, Vec3::ZERO); 3]);
+            let poses = forward_kinematics(&tree);
+            trail.push(rod_endpoints(&tree, &poses, 2, L2).1);
+        }
+        write_ppm(&out, &render_frame(&tree, &trail, width, height))?;
+        return Ok(());
+    }
     let mut simulated = 0;
     showcase_support::write_video(&out, frames, |step| {
         for _ in simulated..step {

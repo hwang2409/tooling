@@ -20,8 +20,7 @@
 //! in the world XZ plane. A positive servo target angle rotates the
 //! crank tip toward -Z (following right-hand rule about +Y).
 
-#![allow(dead_code)]
-
+use chimy2::demo::write_ppm;
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
 
@@ -48,10 +47,11 @@ const COUPLER_HALF: Vec3 = Vec3::new(0.4, 0.02, 0.02);
 const CRANK_PIVOT_X: f32 = -0.4;
 const FOLLOWER_PIVOT_X: f32 = 0.4;
 
-fn parse_args() -> (usize, PathBuf, (usize, usize)) {
+fn parse_args() -> (usize, PathBuf, (usize, usize), bool) {
     let mut frames = 800usize;
     let mut out = PathBuf::from("newt-linkage.mp4");
     let mut size = (640usize, 360usize);
+    let mut wireframe = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -62,10 +62,11 @@ fn parse_args() -> (usize, PathBuf, (usize, usize)) {
                 let (w, h) = s.split_once('x').expect("--size WxH");
                 size = (w.parse().unwrap(), h.parse().unwrap());
             }
+            "--wireframe" => wireframe = true,
             _ => panic!("unknown arg: {a}"),
         }
     }
-    (frames, out, size)
+    (frames, out, size, wireframe)
 }
 
 fn build_world() -> (World, usize, usize) {
@@ -392,13 +393,22 @@ fn render_solid(
         showcase_support::composition("linkage"),
         width,
         height,
-        &format!("connect + joint coupling  |  step {step}"),
+        &format!("joint coupling  |  static connect reference  |  step {step}"),
     )
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (frames, out, (width, height)) = parse_args();
+    let (frames, out, (width, height), wireframe) = parse_args();
     let (mut world, tree_idx, bar_idx) = build_world();
+    if wireframe {
+        for current in 0..frames {
+            let t = current as f32 * world.dt;
+            world.trees[tree_idx].set_actuator_target(0, 0.4 * sin(0.8 * t));
+            world.step();
+        }
+        write_ppm(&out, &render(&world, bar_idx, width, height))?;
+        return Ok(());
+    }
     let mut simulated = 0;
     showcase_support::write_video(&out, frames, |step| {
         for current in simulated..step {

@@ -12,7 +12,7 @@ use chimy2::math::Vec3;
 use chimy2::present::{InputState, run_with_input};
 use newt::body::Body;
 use newt::geom::Geom;
-use newt::math::{Quat, Vec3 as NVec3};
+use newt::math::{Quat, Vec3 as NVec3, cos, sin};
 use newt::mjcf::load_mjcf_path;
 use newt::model::{Scene, load_from_path};
 use newt::solver::{SolverConfig, SolverMode};
@@ -128,9 +128,9 @@ impl Viewer {
         let items = showcase_support::world_items(&self.world);
         let position = self.target
             + Vec3::new(
-                self.yaw.sin() * self.pitch.cos() * self.distance,
-                self.yaw.cos() * self.pitch.cos() * self.distance,
-                self.pitch.sin() * self.distance,
+                sin(self.yaw) * cos(self.pitch) * self.distance,
+                cos(self.yaw) * cos(self.pitch) * self.distance,
+                sin(self.pitch) * self.distance,
             );
         let composition =
             showcase_support::Composition::new(self.target, position, Vec3::new(0.1, 0.65, 0.95));

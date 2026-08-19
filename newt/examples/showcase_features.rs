@@ -7,6 +7,7 @@ mod showcase_support;
 
 use chimy2::fb::Framebuffer;
 use chimy2::math::{Mat4, Vec3 as CVec3};
+use newt::actuator::Actuator;
 use newt::body::Body;
 use newt::equality::Equality;
 use newt::geom::{Geom, SolRef, solid_cylinder_inertia, solid_ellipsoid_inertia};
@@ -279,6 +280,64 @@ fn stack_world(mode: SolverMode, integrator: Integrator) -> World {
     world
 }
 
+fn integrator_world(integrator: Integrator) -> World {
+    let mut world = World::new();
+    world.dt = 0.005;
+    world.gravity = Vec3::new(0.0, 0.0, -9.81);
+    world.solver = solver();
+    world.integrator = integrator;
+    let plane = world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.8));
+    let mut tree = Tree::new();
+    tree.push_link(root(Vec3::new(0.0, 0.0, 1.5)));
+    let hinge = tree.push_link(Link::new(
+        Some(0),
+        JointKind::Hinge {
+            axis: Vec3::X,
+            range: None,
+            damping: 5.0,
+            armature: 0.02,
+            limit: newt::joint::JointLimit::DEFAULT,
+        },
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::new(0.0, 0.0, 0.5), Quat::IDENTITY),
+        0.8,
+        Mat3::diag(0.04, 0.04, 0.01),
+    ));
+    tree.add_actuator(Actuator::velocity(hinge, 18.0, 5.0));
+    let tree_id = world.add_tree(tree);
+    let capsule = world.add_geom(Geom::capsule_on_link(
+        tree_id,
+        hinge,
+        0.12,
+        0.38,
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        0.8,
+    ));
+    world.pair_list = Some(vec![(plane, capsule)]);
+    world.trees[tree_id].set_hinge_angle(hinge, 0.8);
+    world.trees[tree_id].set_actuator_target(0, 1.4);
+    world
+}
+
+fn assert_integrator_trajectories_differ() {
+    let mut euler = integrator_world(Integrator::Euler);
+    let mut implicit = integrator_world(Integrator::ImplicitFast);
+    for step in 0..600 {
+        let target = 1.4 * newt::math::sin(step as f32 * 0.013);
+        euler.trees[0].set_actuator_target(0, target);
+        implicit.trees[0].set_actuator_target(0, target);
+        euler.step();
+        implicit.step();
+    }
+    let position_delta = (euler.trees[0].q[0] - implicit.trees[0].q[0]).abs();
+    let velocity_delta = (euler.trees[0].qdot[0] - implicit.trees[0].qdot[0]).abs();
+    assert!(
+        position_delta + velocity_delta > 1.0e-6,
+        "Euler and ImplicitFast trajectories must differ"
+    );
+}
+
 fn render_compare(
     left: &World,
     right: &World,
@@ -427,25 +486,18 @@ fn run_sensors(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_compare(args: &Args, integrators: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let left_integrator = if integrators {
-        Integrator::Euler
+    let (mut left, mut right) = if integrators {
+        assert_integrator_trajectories_differ();
+        (
+            integrator_world(Integrator::Euler),
+            integrator_world(Integrator::ImplicitFast),
+        )
     } else {
-        Integrator::Rk4
+        (
+            stack_world(SolverMode::Pgs, Integrator::Rk4),
+            stack_world(SolverMode::Newton, Integrator::Rk4),
+        )
     };
-    let right_integrator = if integrators {
-        Integrator::ImplicitFast
-    } else {
-        Integrator::Rk4
-    };
-    let mut left = stack_world(SolverMode::Pgs, left_integrator);
-    let mut right = stack_world(
-        if integrators {
-            SolverMode::Pgs
-        } else {
-            SolverMode::Newton
-        },
-        right_integrator,
-    );
     let (width, height) = args.size;
     let mut simulated = 0;
     showcase_support::write_video(&args.out, args.frames, |step| {
@@ -455,7 +507,9 @@ fn run_compare(args: &Args, integrators: bool) -> Result<(), Box<dyn std::error:
         }
         simulated = step;
         let hud = if integrators {
-            format!("integrators  Euler                         ImplicitFast  |  step {step}")
+            format!(
+                "integrators  Euler damped servo       ImplicitFast damped servo  |  step {step}"
+            )
         } else {
             format!("solvers  PGS                              Newton  |  step {step}")
         };

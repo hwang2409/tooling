@@ -11,8 +11,7 @@
 //! The point is to prove newt's state can drive chimy2, not to exercise the
 //! full renderer (later tiers do that).
 
-#![allow(dead_code)]
-
+use chimy2::demo::write_ppm;
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
 
@@ -24,10 +23,11 @@ use newt::world::World;
 
 use std::path::PathBuf;
 
-fn parse_args() -> (usize, PathBuf, (usize, usize)) {
+fn parse_args() -> (usize, PathBuf, (usize, usize), bool) {
     let mut frames = 200usize;
     let mut out = PathBuf::from("newt-tumble.mp4");
     let mut size = (640usize, 360usize);
+    let mut wireframe = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -38,10 +38,11 @@ fn parse_args() -> (usize, PathBuf, (usize, usize)) {
                 let (w, h) = s.split_once('x').expect("--size WxH");
                 size = (w.parse().unwrap(), h.parse().unwrap());
             }
+            "--wireframe" => wireframe = true,
             _ => panic!("unknown arg: {a}"),
         }
     }
-    (frames, out, size)
+    (frames, out, size, wireframe)
 }
 
 fn build_world() -> (World, [Vec3; 3]) {
@@ -247,8 +248,15 @@ fn render_solid(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (frames, out, (width, height)) = parse_args();
+    let (frames, out, (width, height), wireframe) = parse_args();
     let (mut world, half_extents) = build_world();
+    if wireframe {
+        for _ in 0..frames {
+            world.step();
+        }
+        write_ppm(&out, &render(&world, &half_extents, width, height))?;
+        return Ok(());
+    }
     let mut simulated = 0;
     showcase_support::write_video(&out, frames, |step| {
         for _ in simulated..step {
