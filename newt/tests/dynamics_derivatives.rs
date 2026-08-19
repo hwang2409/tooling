@@ -587,8 +587,7 @@ fn cylinder_wrap_position_derivative_matches_hand_second_derivative() {
     );
 }
 
-#[test]
-fn cylinder_wrap_position_derivative_matches_mixed_branch_finite_difference() {
+fn mixed_wrap_position_derivative_matches_finite_difference(wrap: SpatialWrap, name: &str) {
     let mut tree = Tree::new();
     tree.push_link(Link::new(
         None,
@@ -614,15 +613,6 @@ fn cylinder_wrap_position_derivative_matches_mixed_branch_finite_difference() {
         1.0,
         Mat3::diag(1.0, 1.0, 1.0),
     ));
-    let cylinder = || {
-        SpatialWrap::Cylinder(WrapCylinder {
-            link: None,
-            center_local: Vec3::ZERO,
-            axis_local: Vec3::Z,
-            radius: 0.5,
-            sidesite: None,
-        })
-    };
     let mut tendon = Tendon::spatial_branches(vec![
         SpatialTendonBranch {
             sites: vec![
@@ -641,9 +631,7 @@ fn cylinder_wrap_position_derivative_matches_mixed_branch_finite_difference() {
             ],
             segments: vec![
                 SpatialSegment { wrap: None },
-                SpatialSegment {
-                    wrap: Some(cylinder()),
-                },
+                SpatialSegment { wrap: Some(wrap) },
             ],
             divisor: 1.0,
         },
@@ -658,9 +646,7 @@ fn cylinder_wrap_position_derivative_matches_mixed_branch_finite_difference() {
                     position_local: Vec3::new(2.0, -0.2, 0.0),
                 },
             ],
-            segments: vec![SpatialSegment {
-                wrap: Some(cylinder()),
-            }],
+            segments: vec![SpatialSegment { wrap: Some(wrap) }],
             divisor: 2.0,
         },
     ]);
@@ -695,11 +681,38 @@ fn cylinder_wrap_position_derivative_matches_mixed_branch_finite_difference() {
             let finite_difference = (plus_acc[row] - minus_acc[row]) / (2.0 * step);
             assert!(
                 (actual.qacc_q[row * 2 + column] - finite_difference).abs() < 2.0e-2,
-                "row={row} column={column} analytic={} fd={finite_difference}",
+                "wrap={name} row={row} column={column} analytic={} fd={finite_difference}",
                 actual.qacc_q[row * 2 + column]
             );
         }
     }
+}
+
+#[test]
+fn cylinder_wrap_position_derivative_matches_mixed_branch_finite_difference() {
+    mixed_wrap_position_derivative_matches_finite_difference(
+        SpatialWrap::Cylinder(WrapCylinder {
+            link: None,
+            center_local: Vec3::ZERO,
+            axis_local: Vec3::Z,
+            radius: 0.5,
+            sidesite: None,
+        }),
+        "cylinder",
+    );
+}
+
+#[test]
+fn sphere_wrap_position_derivative_matches_mixed_branch_finite_difference() {
+    mixed_wrap_position_derivative_matches_finite_difference(
+        SpatialWrap::Sphere(WrapSphere {
+            link: None,
+            center_local: Vec3::ZERO,
+            radius: 0.5,
+            side_hint_world: None,
+        }),
+        "sphere",
+    );
 }
 
 #[test]
