@@ -613,6 +613,20 @@ fn mixed_wrap_position_derivative_matches_finite_difference(wrap: SpatialWrap, n
         1.0,
         Mat3::diag(1.0, 1.0, 1.0),
     ));
+    let second_branch = SpatialTendonBranch {
+        sites: vec![
+            SpatialTendonSite {
+                link: None,
+                position_local: Vec3::new(-2.0, -0.2, 0.0),
+            },
+            SpatialTendonSite {
+                link: None,
+                position_local: Vec3::new(2.0, -0.2, 0.0),
+            },
+        ],
+        segments: vec![SpatialSegment { wrap: Some(wrap) }],
+        divisor: 2.0,
+    };
     let mut tendon = Tendon::spatial_branches(vec![
         SpatialTendonBranch {
             sites: vec![
@@ -635,24 +649,19 @@ fn mixed_wrap_position_derivative_matches_finite_difference(wrap: SpatialWrap, n
             ],
             divisor: 1.0,
         },
-        SpatialTendonBranch {
-            sites: vec![
-                SpatialTendonSite {
-                    link: None,
-                    position_local: Vec3::new(-2.0, -0.2, 0.0),
-                },
-                SpatialTendonSite {
-                    link: Some(2),
-                    position_local: Vec3::new(2.0, -0.2, 0.0),
-                },
-            ],
-            segments: vec![SpatialSegment { wrap: Some(wrap) }],
-            divisor: 2.0,
-        },
+        second_branch.clone(),
     ]);
     tree.set_hinge_angle(1, 0.31);
     tree.set_hinge_angle(2, -0.47);
     let poses = newt::tree::forward_kinematics(&tree);
+    if matches!(wrap, SpatialWrap::Sphere(_)) {
+        let sphere_probe = Tendon::spatial_branches(vec![second_branch]);
+        let wrapped_length = newt::tendon::tendon_kinematics(&sphere_probe, &tree, &poses).length;
+        assert!(
+            wrapped_length < 4.0 - 1.0e-3,
+            "sphere divisor-2 branch did not wrap: length={wrapped_length}"
+        );
+    }
     let length = newt::tendon::tendon_kinematics(&tendon, &tree, &poses).length;
     tendon.springlength = Some(length - 1.0);
     tendon.stiffness = 10.0;
