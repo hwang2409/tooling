@@ -588,7 +588,7 @@ fn cylinder_wrap_position_derivative_matches_hand_second_derivative() {
 }
 
 #[test]
-fn cylinder_wrap_position_derivative_matches_two_hinge_finite_difference() {
+fn cylinder_wrap_position_derivative_matches_mixed_branch_finite_difference() {
     let mut tree = Tree::new();
     tree.push_link(Link::new(
         None,
@@ -614,28 +614,56 @@ fn cylinder_wrap_position_derivative_matches_two_hinge_finite_difference() {
         1.0,
         Mat3::diag(1.0, 1.0, 1.0),
     ));
-    let mut tendon = Tendon::spatial_branches(vec![SpatialTendonBranch {
-        sites: vec![
-            SpatialTendonSite {
-                link: None,
-                position_local: Vec3::new(-2.0, 0.2, 0.0),
-            },
-            SpatialTendonSite {
-                link: Some(2),
-                position_local: Vec3::new(2.0, 0.2, 0.0),
-            },
-        ],
-        segments: vec![SpatialSegment {
-            wrap: Some(SpatialWrap::Cylinder(WrapCylinder {
-                link: None,
-                center_local: Vec3::ZERO,
-                axis_local: Vec3::Z,
-                radius: 0.5,
-                sidesite: None,
-            })),
-        }],
-        divisor: 1.0,
-    }]);
+    let cylinder = || {
+        SpatialWrap::Cylinder(WrapCylinder {
+            link: None,
+            center_local: Vec3::ZERO,
+            axis_local: Vec3::Z,
+            radius: 0.5,
+            sidesite: None,
+        })
+    };
+    let mut tendon = Tendon::spatial_branches(vec![
+        SpatialTendonBranch {
+            sites: vec![
+                SpatialTendonSite {
+                    link: None,
+                    position_local: Vec3::new(-2.0, 0.2, 0.0),
+                },
+                SpatialTendonSite {
+                    link: Some(1),
+                    position_local: Vec3::new(-2.0, 0.2, 0.0),
+                },
+                SpatialTendonSite {
+                    link: Some(2),
+                    position_local: Vec3::new(2.0, 0.2, 0.0),
+                },
+            ],
+            segments: vec![
+                SpatialSegment { wrap: None },
+                SpatialSegment {
+                    wrap: Some(cylinder()),
+                },
+            ],
+            divisor: 1.0,
+        },
+        SpatialTendonBranch {
+            sites: vec![
+                SpatialTendonSite {
+                    link: None,
+                    position_local: Vec3::new(-2.0, -0.2, 0.0),
+                },
+                SpatialTendonSite {
+                    link: Some(2),
+                    position_local: Vec3::new(2.0, -0.2, 0.0),
+                },
+            ],
+            segments: vec![SpatialSegment {
+                wrap: Some(cylinder()),
+            }],
+            divisor: 2.0,
+        },
+    ]);
     tree.set_hinge_angle(1, 0.31);
     tree.set_hinge_angle(2, -0.47);
     let poses = newt::tree::forward_kinematics(&tree);
