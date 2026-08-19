@@ -245,7 +245,9 @@ fn ccd_route_pair(a: &GeomShape, b: &GeomShape) -> bool {
                 | (_, GeomShape::Hfield { .. })
                 | (GeomShape::Sphere { .. }, GeomShape::Sphere { .. })
                 | (GeomShape::Sphere { .. }, GeomShape::Capsule { .. })
+                | (GeomShape::Capsule { .. }, GeomShape::Sphere { .. })
                 | (GeomShape::Sphere { .. }, GeomShape::Cylinder { .. })
+                | (GeomShape::Cylinder { .. }, GeomShape::Sphere { .. })
                 | (GeomShape::Sphere { .. }, GeomShape::Ellipsoid { .. })
                 | (GeomShape::Sphere { .. }, GeomShape::Mesh { .. })
                 | (GeomShape::Ellipsoid { .. }, GeomShape::Sphere { .. })
@@ -261,30 +263,17 @@ fn ccd_shape<'a>(
     meshes: &'a [ConvexMesh],
 ) -> Option<CcdShape<'a>> {
     match *shape {
-        GeomShape::Sphere { radius } => Some(CcdShape::Sphere { pose, radius }),
-        GeomShape::Capsule {
-            radius,
-            half_height,
-        } => Some(CcdShape::Capsule {
-            pose,
-            radius,
-            half_height,
-        }),
-        GeomShape::Cylinder {
-            radius,
-            half_height,
-        } => Some(CcdShape::Cylinder {
-            pose,
-            radius,
-            half_height,
-        }),
-        GeomShape::Ellipsoid { semi_axes } => Some(CcdShape::Ellipsoid { pose, semi_axes }),
-        GeomShape::Box { half_extents } => Some(CcdShape::Box { pose, half_extents }),
         GeomShape::Mesh { mesh_id } => Some(CcdShape::Mesh {
             pose,
             mesh: &meshes[mesh_id],
         }),
-        GeomShape::Plane | GeomShape::Hfield { .. } => None,
+        GeomShape::Plane
+        | GeomShape::Hfield { .. }
+        | GeomShape::Sphere { .. }
+        | GeomShape::Box { .. }
+        | GeomShape::Capsule { .. }
+        | GeomShape::Cylinder { .. }
+        | GeomShape::Ellipsoid { .. } => None,
     }
 }
 
@@ -2276,28 +2265,6 @@ struct CcdVertex {
 #[derive(Clone, Copy)]
 enum CcdShape<'a> {
     Vertices(&'a [Vec3]),
-    Sphere {
-        pose: &'a GeomPose,
-        radius: f32,
-    },
-    Capsule {
-        pose: &'a GeomPose,
-        radius: f32,
-        half_height: f32,
-    },
-    Cylinder {
-        pose: &'a GeomPose,
-        radius: f32,
-        half_height: f32,
-    },
-    Ellipsoid {
-        pose: &'a GeomPose,
-        semi_axes: Vec3,
-    },
-    Box {
-        pose: &'a GeomPose,
-        half_extents: Vec3,
-    },
     Mesh {
         pose: &'a GeomPose,
         mesh: &'a ConvexMesh,
@@ -2314,12 +2281,7 @@ impl CcdShape<'_> {
                     .fold(Vec3::ZERO, |sum, point| sum + point)
                     / vertices.len() as f32
             }
-            Self::Sphere { pose, .. }
-            | Self::Capsule { pose, .. }
-            | Self::Cylinder { pose, .. }
-            | Self::Ellipsoid { pose, .. }
-            | Self::Box { pose, .. }
-            | Self::Mesh { pose, .. } => pose.position,
+            Self::Mesh { pose, .. } => pose.position,
         }
     }
 
@@ -2331,81 +2293,6 @@ impl CcdShape<'_> {
         };
         match self {
             Self::Vertices(vertices) => support_vertices(vertices, direction),
-            Self::Sphere { pose, radius } => pose.position + direction.normalize() * radius,
-            Self::Capsule {
-                pose,
-                radius,
-                half_height,
-            } => {
-                let local_direction = pose.orientation.inverse_rotate(direction);
-                let endpoint = if local_direction.z >= 0.0 {
-                    Vec3::new(0.0, 0.0, half_height)
-                } else {
-                    Vec3::new(0.0, 0.0, -half_height)
-                };
-                pose.point_to_world(endpoint) + direction.normalize() * radius
-            }
-            Self::Cylinder {
-                pose,
-                radius,
-                half_height,
-            } => {
-                let local_direction = pose.orientation.inverse_rotate(direction);
-                let radial = Vec3::new(local_direction.x, local_direction.y, 0.0);
-                let radial_point = if radial.length_squared() > 1.0e-20 {
-                    radial.normalize() * radius
-                } else {
-                    Vec3::ZERO
-                };
-                pose.point_to_world(Vec3::new(
-                    radial_point.x,
-                    radial_point.y,
-                    if local_direction.z >= 0.0 {
-                        half_height
-                    } else {
-                        -half_height
-                    },
-                ))
-            }
-            Self::Ellipsoid { pose, semi_axes } => {
-                let local_direction = pose.orientation.inverse_rotate(direction);
-                let scaled = Vec3::new(
-                    semi_axes.x * local_direction.x,
-                    semi_axes.y * local_direction.y,
-                    semi_axes.z * local_direction.z,
-                );
-                let denom = scaled.length();
-                let local_point = if denom > 1.0e-20 {
-                    Vec3::new(
-                        semi_axes.x * scaled.x,
-                        semi_axes.y * scaled.y,
-                        semi_axes.z * scaled.z,
-                    ) / denom
-                } else {
-                    Vec3::new(0.0, 0.0, semi_axes.z)
-                };
-                pose.point_to_world(local_point)
-            }
-            Self::Box { pose, half_extents } => {
-                let local_direction = pose.orientation.inverse_rotate(direction);
-                pose.point_to_world(Vec3::new(
-                    if local_direction.x >= 0.0 {
-                        half_extents.x
-                    } else {
-                        -half_extents.x
-                    },
-                    if local_direction.y >= 0.0 {
-                        half_extents.y
-                    } else {
-                        -half_extents.y
-                    },
-                    if local_direction.z >= 0.0 {
-                        half_extents.z
-                    } else {
-                        -half_extents.z
-                    },
-                ))
-            }
             Self::Mesh { pose, mesh } => {
                 support_vertices_transformed(&mesh.vertices, pose, direction)
             }
@@ -2447,39 +2334,6 @@ fn ccd_support(a: CcdShape<'_>, b: CcdShape<'_>, direction: Vec3) -> CcdVertex {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ccd_axis_contact(
-    shape_a: CcdShape<'_>,
-    shape_b: CcdShape<'_>,
-    idx_a: usize,
-    idx_b: usize,
-    friction: f32,
-    margin: f32,
-    gap: f32,
-) -> Option<Contact> {
-    let center_delta = shape_b.center() - shape_a.center();
-    let distance = center_delta.length();
-    let axis = if distance > 1.0e-20 {
-        center_delta / distance
-    } else {
-        Vec3::X
-    };
-    let point_a = shape_a.support(axis);
-    let point_b = shape_b.support(-axis);
-    let penetration = (point_a - point_b).dot(axis) - distance + margin;
-    if penetration <= 0.0 {
-        return None;
-    }
-    Some(Contact {
-        geom_a: idx_a,
-        geom_b: idx_b,
-        position_world: (point_a + point_b) * 0.5,
-        normal_world: -axis,
-        penetration,
-        friction,
-        gap,
-    })
-}
-
 fn triple_product(a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
     b * a.dot(c) - a * b.dot(c)
 }
@@ -2489,6 +2343,25 @@ struct CcdSimplex {
     points: [CcdVertex; 4],
     len: usize,
 }
+
+#[derive(Clone, Copy)]
+struct CcdSolverConfig {
+    gjk_support_epsilon: f32,
+    epa_support_epsilon: f32,
+    max_epa_iterations: usize,
+}
+
+const CCD_MESH_CONFIG: CcdSolverConfig = CcdSolverConfig {
+    gjk_support_epsilon: 0.0,
+    epa_support_epsilon: 1.0e-7,
+    max_epa_iterations: 128,
+};
+
+const CCD_HFIELD_CONFIG: CcdSolverConfig = CcdSolverConfig {
+    gjk_support_epsilon: 1.0e-7,
+    epa_support_epsilon: 1.0e-5,
+    max_epa_iterations: 64,
+};
 
 impl CcdSimplex {
     fn new(point: CcdVertex) -> Self {
@@ -2596,6 +2469,93 @@ fn ccd_simplex_step(simplex: &mut CcdSimplex, direction: &mut Vec3) -> bool {
     false
 }
 
+fn ccd_weighted_witness(points: &[CcdVertex], weights: &[f32]) -> (Vec3, Vec3) {
+    let mut point_a = Vec3::ZERO;
+    let mut point_b = Vec3::ZERO;
+    for (point, &weight) in points.iter().zip(weights) {
+        point_a += point.shape_a * weight;
+        point_b += point.shape_b * weight;
+    }
+    (point_a, point_b)
+}
+
+fn ccd_triangle_witness(a: CcdVertex, b: CcdVertex, c: CcdVertex) -> (Vec3, Vec3) {
+    let nearest = closest_point_on_triangle(Vec3::ZERO, a.minkowski, b.minkowski, c.minkowski);
+    let bary = barycentric_triangle_origin(a.minkowski, b.minkowski, c.minkowski, nearest);
+    ccd_weighted_witness(&[a, b, c], &[bary.0, bary.1, bary.2])
+}
+
+/// Return the closest pair represented by a non-enclosing GJK simplex.
+/// Keeping the support witnesses avoids the center-axis approximation in the
+/// margin-only path, which is not a distance witness for arbitrary meshes.
+fn ccd_closest_witness(simplex: &CcdSimplex) -> Option<(Vec3, Vec3)> {
+    match simplex.len {
+        1 => Some((simplex.points[0].shape_a, simplex.points[0].shape_b)),
+        2 => {
+            let a = simplex.points[0];
+            let b = simplex.points[1];
+            let edge = b.minkowski - a.minkowski;
+            let denominator = edge.length_squared();
+            let t = if denominator > 1.0e-20 {
+                clamp01(-a.minkowski.dot(edge) / denominator)
+            } else {
+                0.0
+            };
+            Some(ccd_weighted_witness(&[a, b], &[1.0 - t, t]))
+        }
+        3 => Some(ccd_triangle_witness(
+            simplex.points[0],
+            simplex.points[1],
+            simplex.points[2],
+        )),
+        4 => {
+            let faces = [[0, 1, 2], [0, 3, 1], [0, 2, 3], [1, 3, 2]];
+            let mut best: Option<(Vec3, Vec3, f32)> = None;
+            for [a, b, c] in faces {
+                let (point_a, point_b) =
+                    ccd_triangle_witness(simplex.points[a], simplex.points[b], simplex.points[c]);
+                let distance_squared = (point_a - point_b).length_squared();
+                if best.is_none_or(|candidate| distance_squared < candidate.2) {
+                    best = Some((point_a, point_b, distance_squared));
+                }
+            }
+            best.map(|(point_a, point_b, _)| (point_a, point_b))
+        }
+        _ => None,
+    }
+}
+
+fn ccd_distance_contact(
+    simplex: &CcdSimplex,
+    idx_a: usize,
+    idx_b: usize,
+    friction: f32,
+    margin: f32,
+    gap: f32,
+) -> Option<Contact> {
+    let (point_a, point_b) = ccd_closest_witness(simplex)?;
+    let separation = point_b - point_a;
+    let raw_distance = separation.length();
+    let penetration = margin - raw_distance;
+    if penetration <= 0.0 {
+        return None;
+    }
+    let normal_world = if raw_distance > 1.0e-20 {
+        separation / raw_distance
+    } else {
+        Vec3::X
+    };
+    Some(Contact {
+        geom_a: idx_a,
+        geom_b: idx_b,
+        position_world: (point_a + point_b) * 0.5,
+        normal_world,
+        penetration,
+        friction,
+        gap,
+    })
+}
+
 /// Box versus one triangular prism using MuJoCo's native convex path shape:
 /// GJK finds an enclosing simplex and EPA expands it to the closest face.
 #[allow(clippy::too_many_arguments)]
@@ -2639,180 +2599,16 @@ fn box_prism_gjk_epa_contact(
         );
         *vertex = box_pose.point_to_world(local);
     }
-    let box_shape = CcdShape::Vertices(&box_vertices);
-    let prism_shape = CcdShape::Vertices(&prism_vertices);
-    let mut direction = prism_shape.center() - box_shape.center();
-    if direction.length_squared() <= 1.0e-20 {
-        direction = Vec3::X;
-    }
-    let mut simplex = CcdSimplex::new(ccd_support(box_shape, prism_shape, direction));
-    direction = -simplex.points[0].minkowski;
-    let mut enclosed = false;
-    for _ in 0..32 {
-        let point = ccd_support(box_shape, prism_shape, direction);
-        if point.minkowski.dot(direction) <= 1.0e-7 {
-            return None;
-        }
-        simplex.push(point);
-        if ccd_simplex_step(&mut simplex, &mut direction) {
-            enclosed = true;
-            break;
-        }
-    }
-    if !enclosed || simplex.len != 4 {
-        return None;
-    }
-
-    #[derive(Clone, Copy)]
-    struct CcdFace {
-        indices: [usize; 3],
-        normal: Vec3,
-        distance: f32,
-    }
-
-    fn ccd_face(vertices: &[CcdVertex; 32], indices: [usize; 3]) -> Option<CcdFace> {
-        let a = vertices[indices[0]].minkowski;
-        let b = vertices[indices[1]].minkowski;
-        let c = vertices[indices[2]].minkowski;
-        let raw = (b - a).cross(c - a);
-        if raw.length_squared() <= 1.0e-20 {
-            return None;
-        }
-        let mut normal = raw.normalize();
-        let mut distance = normal.dot(a);
-        let mut oriented = indices;
-        if distance < 0.0 {
-            oriented = [indices[0], indices[2], indices[1]];
-            normal = -normal;
-            distance = -distance;
-        }
-        Some(CcdFace {
-            indices: oriented,
-            normal,
-            distance,
-        })
-    }
-
-    let mut vertices = [CcdVertex {
-        minkowski: Vec3::ZERO,
-        shape_a: Vec3::ZERO,
-        shape_b: Vec3::ZERO,
-    }; 32];
-    vertices[..4].copy_from_slice(&simplex.points);
-    let mut vertex_len = 4;
-    let initial_faces = [[0, 1, 2], [0, 3, 1], [0, 2, 3], [1, 3, 2]];
-    let mut faces = [CcdFace {
-        indices: [0; 3],
-        normal: Vec3::Z,
-        distance: f32::INFINITY,
-    }; 64];
-    let mut face_len = 0;
-    for indices in initial_faces {
-        if let Some(face) = ccd_face(&vertices, indices) {
-            faces[face_len] = face;
-            face_len += 1;
-        }
-    }
-    let mut best_face = faces[0];
-    for _ in 0..64 {
-        let mut best_index = 0;
-        for index in 1..face_len {
-            if faces[index].distance < faces[best_index].distance {
-                best_index = index;
-            }
-        }
-        best_face = faces[best_index];
-        let support = ccd_support(box_shape, prism_shape, best_face.normal);
-        let support_distance = support.minkowski.dot(best_face.normal);
-        if support_distance - best_face.distance <= 1.0e-5 {
-            break;
-        }
-        if vertex_len == vertices.len() {
-            break;
-        }
-        vertices[vertex_len] = support;
-        let new_vertex = vertex_len;
-        vertex_len += 1;
-        let mut next_faces = [CcdFace {
-            indices: [0; 3],
-            normal: Vec3::Z,
-            distance: f32::INFINITY,
-        }; 64];
-        let mut next_len = 0;
-        let mut edges = [[0usize; 2]; 128];
-        let mut edge_len = 0;
-        for face in faces[..face_len].iter().copied() {
-            if face.normal.dot(support.minkowski) > face.distance + 1.0e-6 {
-                for edge in [
-                    [face.indices[0], face.indices[1]],
-                    [face.indices[1], face.indices[2]],
-                    [face.indices[2], face.indices[0]],
-                ] {
-                    let reverse = [edge[1], edge[0]];
-                    if let Some(index) = edges[..edge_len]
-                        .iter()
-                        .position(|candidate| *candidate == reverse)
-                    {
-                        edges[index] = edges[edge_len - 1];
-                        edge_len -= 1;
-                    } else {
-                        edges[edge_len] = edge;
-                        edge_len += 1;
-                    }
-                }
-            } else {
-                next_faces[next_len] = face;
-                next_len += 1;
-            }
-        }
-        for edge in edges[..edge_len].iter().copied() {
-            if next_len == next_faces.len() {
-                break;
-            }
-            if let Some(face) = ccd_face(&vertices, [edge[0], edge[1], new_vertex]) {
-                next_faces[next_len] = face;
-                next_len += 1;
-            }
-        }
-        faces = next_faces;
-        face_len = next_len;
-        if face_len == 0 {
-            return None;
-        }
-    }
-
-    let nearest = best_face.normal * best_face.distance;
-    let a = vertices[best_face.indices[0]].minkowski;
-    let b = vertices[best_face.indices[1]].minkowski;
-    let c = vertices[best_face.indices[2]].minkowski;
-    let mut bary = barycentric_triangle_origin(a, b, c, nearest);
-    let sum = bary.0 + bary.1 + bary.2;
-    if sum <= 1.0e-8 {
-        return None;
-    }
-    bary.0 /= sum;
-    bary.1 /= sum;
-    bary.2 /= sum;
-    let point_a = vertices[best_face.indices[0]].shape_a * bary.0
-        + vertices[best_face.indices[1]].shape_a * bary.1
-        + vertices[best_face.indices[2]].shape_a * bary.2;
-    let point_b = vertices[best_face.indices[0]].shape_b * bary.0
-        + vertices[best_face.indices[1]].shape_b * bary.1
-        + vertices[best_face.indices[2]].shape_b * bary.2;
-    let depth = best_face.distance;
-    let penetration = depth + margin;
-    if penetration <= 0.0 {
-        return None;
-    }
-    Some(Contact {
-        geom_a: idx_box,
-        geom_b: idx_hfield,
-        position_world: (point_a + point_b) * 0.5,
-        normal_world: -best_face.normal,
-        penetration,
+    ccd_convex_contact(
+        CcdShape::Vertices(&box_vertices),
+        CcdShape::Vertices(&prism_vertices),
+        CCD_HFIELD_CONFIG,
+        idx_box,
+        idx_hfield,
         friction,
+        margin,
         gap,
-    })
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -2851,6 +2647,7 @@ fn ccd_face(vertices: &[CcdVertex; 128], indices: [usize; 3]) -> Option<CcdFace>
 fn ccd_convex_contact(
     shape_a: CcdShape<'_>,
     shape_b: CcdShape<'_>,
+    config: CcdSolverConfig,
     idx_a: usize,
     idx_b: usize,
     friction: f32,
@@ -2866,8 +2663,8 @@ fn ccd_convex_contact(
     let mut enclosed = false;
     for _ in 0..32 {
         let point = ccd_support(shape_a, shape_b, direction);
-        if point.minkowski.dot(direction) <= 0.0 {
-            return ccd_axis_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap);
+        if point.minkowski.dot(direction) <= config.gjk_support_epsilon {
+            return ccd_distance_contact(&simplex, idx_a, idx_b, friction, margin, gap);
         }
         simplex.push(point);
         if ccd_simplex_step(&mut simplex, &mut direction) {
@@ -2876,7 +2673,7 @@ fn ccd_convex_contact(
         }
     }
     if !enclosed || simplex.len != 4 {
-        return ccd_axis_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap);
+        return ccd_distance_contact(&simplex, idx_a, idx_b, friction, margin, gap);
     }
 
     let mut vertices = [CcdVertex {
@@ -2899,10 +2696,10 @@ fn ccd_convex_contact(
         }
     }
     if face_len == 0 {
-        return ccd_axis_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap);
+        return ccd_distance_contact(&simplex, idx_a, idx_b, friction, margin, gap);
     }
     let mut best_face = faces[0];
-    for _ in 0..128 {
+    for _ in 0..config.max_epa_iterations {
         let mut best_index = 0;
         for index in 1..face_len {
             if faces[index].distance < faces[best_index].distance {
@@ -2912,7 +2709,7 @@ fn ccd_convex_contact(
         best_face = faces[best_index];
         let support = ccd_support(shape_a, shape_b, best_face.normal);
         let support_distance = support.minkowski.dot(best_face.normal);
-        if support_distance - best_face.distance <= 1.0e-7 {
+        if support_distance - best_face.distance <= config.epa_support_epsilon {
             break;
         }
         if vertex_len == vertices.len() {
@@ -3345,9 +3142,16 @@ fn try_narrow_phase(
         let shape_a = ccd_shape(&geom_a.shape, pose_a, meshes)?;
         let shape_b = ccd_shape(&geom_b.shape, pose_b, meshes)?;
         let mut out = ContactBuf::new();
-        if let Some(contact) =
-            ccd_convex_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap)
-        {
+        if let Some(contact) = ccd_convex_contact(
+            shape_a,
+            shape_b,
+            CCD_MESH_CONFIG,
+            idx_a,
+            idx_b,
+            friction,
+            margin,
+            gap,
+        ) {
             out.push(contact);
         }
         return Some(out);
@@ -4247,31 +4051,9 @@ mod tests {
 
     #[test]
     fn ccd_support_functions_preserve_shape_axes() {
-        let pose = GeomPose {
-            position: Vec3::ZERO,
-            orientation: Quat::IDENTITY,
-        };
         let rotated_pose = GeomPose {
             position: Vec3::ZERO,
             orientation: Quat::from_axis_angle(Vec3::Y, 0.7),
-        };
-        let capsule = CcdShape::Capsule {
-            pose: &pose,
-            radius: 0.2,
-            half_height: 0.5,
-        };
-        let cylinder = CcdShape::Cylinder {
-            pose: &pose,
-            radius: 0.2,
-            half_height: 0.5,
-        };
-        let ellipsoid = CcdShape::Ellipsoid {
-            pose: &pose,
-            semi_axes: Vec3::new(0.2, 0.3, 0.4),
-        };
-        let box_shape = CcdShape::Box {
-            pose: &pose,
-            half_extents: Vec3::new(0.2, 0.3, 0.4),
         };
         let vertices = [
             Vec3::new(-1.0, -1.0, -1.0),
@@ -4279,36 +4061,21 @@ mod tests {
             Vec3::new(-1.0, 1.0, -1.0),
             Vec3::new(-1.0, -1.0, 1.0),
         ];
-        let mesh = CcdShape::Vertices(&vertices);
-        assert!(capsule.support(Vec3::Z).z > 0.6);
-        assert!(cylinder.support(Vec3::X).x > 0.19);
-        assert!(ellipsoid.support(Vec3::Z).z > 0.39);
-        assert!(box_shape.support(-Vec3::Y).y < -0.29);
-        assert!(mesh.support(Vec3::Y).y > 0.9);
+        let vertices_shape = CcdShape::Vertices(&vertices);
+        assert!(vertices_shape.support(Vec3::Y).y > 0.9);
 
-        let rotated_capsule = CcdShape::Capsule {
-            pose: &rotated_pose,
-            radius: 0.2,
-            half_height: 0.5,
+        let mesh = ConvexMesh {
+            vertices: vertices.to_vec(),
+            faces: vec![[0, 1, 2], [0, 3, 1]],
         };
-        let rotated_cylinder = CcdShape::Cylinder {
+        let mesh_shape = CcdShape::Mesh {
             pose: &rotated_pose,
-            radius: 0.2,
-            half_height: 0.5,
+            mesh: &mesh,
         };
-        let rotated_ellipsoid = CcdShape::Ellipsoid {
-            pose: &rotated_pose,
-            semi_axes: Vec3::new(0.2, 0.3, 0.4),
-        };
-        let rotated_box = CcdShape::Box {
-            pose: &rotated_pose,
-            half_extents: Vec3::new(0.2, 0.3, 0.4),
-        };
-        let rotated_axis = rotated_pose.rotate(Vec3::Z);
-        assert!(rotated_capsule.support(rotated_axis).dot(rotated_axis) > 0.69);
-        assert!(rotated_cylinder.support(rotated_axis).dot(rotated_axis) > 0.49);
-        assert!(rotated_ellipsoid.support(rotated_axis).dot(rotated_axis) > 0.39);
-        assert!(rotated_box.support(rotated_axis).dot(rotated_axis) > 0.39);
+        let rotated_axis = rotated_pose.rotate(Vec3::Y);
+        assert!(mesh_shape.support(rotated_axis).dot(rotated_axis) > 0.9);
+        assert_eq!(vertices_shape.center(), Vec3::splat(-0.5));
+        assert_eq!(mesh_shape.center(), Vec3::ZERO);
     }
 
     #[test]

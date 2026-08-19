@@ -932,6 +932,29 @@ fn margin_fires_contact_before_geoms_touch() {
 }
 
 #[test]
+fn mesh_mesh_margin_uses_gjk_distance_witness() {
+    let mesh = unit_tetrahedron();
+    let mesh_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.02);
+    let mesh_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(1.01, 0.0, 0.0),
+        orientation: Quat::IDENTITY,
+    };
+
+    let contacts = narrow_phase(0, &mesh_a, &pose_a, 1, &mesh_b, &pose_b, &[mesh]);
+    assert_eq!(contacts.len, 1, "mesh margin gap should emit one contact");
+    assert!(
+        approx(contacts.as_slice()[0].penetration, 0.01, 1.0e-5),
+        "mesh margin gap penetration was {}",
+        contacts.as_slice()[0].penetration
+    );
+}
+
+#[test]
 fn plane_convex_exact_margin_equality_emits_contact() {
     let plane = Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5);
     let plane_pose = GeomPose {

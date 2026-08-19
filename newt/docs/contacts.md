@@ -76,9 +76,9 @@ empty buffer AND is flagged by `World::validate_supported_pairs()`.
 |              | Plane   | Sphere  | Box     | Capsule | Cylinder | Ellipsoid | Mesh    | Hfield |
 |--------------|---------|---------|---------|---------|----------|-----------|---------|--------|
 | **Plane**    | —       | Impl    | Impl    | Impl    | Impl     | Impl      | Impl    | —      |
-| **Sphere**   | Impl    | Impl    | Deferred| Impl    | Impl     | CCD       | CCD     | Impl   |
-| **Box**      | Impl    | Deferred| Deferred| Deferred| Deferred | Deferred  | Deferred| Impl   |
-| **Capsule**  | Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred| Impl   |
+| **Sphere**   | Impl    | Impl    | Deferred| Impl    | Impl     | Impl      | Impl    | Impl   |
+| **Box**      | Impl    | Deferred| Impl    | Deferred| Deferred | Deferred  | Deferred| Impl   |
+| **Capsule**  | Impl    | Impl    | Deferred| Impl    | Deferred | Deferred  | Deferred| Impl   |
 | **Cylinder** | Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred| —      |
 | **Ellipsoid**| Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | Deferred| —      |
 | **Mesh**     | Impl    | Impl    | Deferred| Deferred| Deferred | Deferred  | CCD     | —      |

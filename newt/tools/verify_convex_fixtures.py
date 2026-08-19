@@ -82,15 +82,25 @@ def inverse_rotate(quaternion: list[float], vector: list[float]) -> list[float]:
     vx, vy, vz = vector
     return [
         (1.0 - 2.0 * (yy + zz)) * vx
-        + 2.0 * (xy - wz) * vy
-        + 2.0 * (xz + wy) * vz,
-        2.0 * (xy + wz) * vx
+        + 2.0 * (xy + wz) * vy
+        + 2.0 * (xz - wy) * vz,
+        2.0 * (xy - wz) * vx
         + (1.0 - 2.0 * (xx + zz)) * vy
-        + 2.0 * (yz - wx) * vz,
-        2.0 * (xz - wy) * vx
-        + 2.0 * (yz + wx) * vy
+        + 2.0 * (yz + wx) * vz,
+        2.0 * (xz + wy) * vx
+        + 2.0 * (yz - wx) * vy
         + (1.0 - 2.0 * (xx + yy)) * vz,
     ]
+
+
+def run_inverse_rotate_self_test() -> None:
+    """Keep the verifier's body-frame transform pointed in the right direction."""
+
+    half = math.sqrt(0.5)
+    result = inverse_rotate([half, 0.0, 0.0, half], [1.0, 0.0, 0.0])
+    assert abs(result[0]) < 1.0e-6
+    assert result[1] < -1.0 + 1.0e-6
+    assert abs(result[2]) < 1.0e-6
 
 
 def subtract(left: list[float], right: list[float]) -> list[float]:
@@ -550,6 +560,7 @@ def main() -> int:
         help="use fresh MuJoCo states and tolerance bounds without byte identity",
     )
     args = parser.parse_args()
+    run_inverse_rotate_self_test()
     if args.ci:
         run_ci_regression_self_test()
         print("CI oracle mutation self-test passed")
