@@ -7,7 +7,8 @@
 //! cargo run --release --example roll -- --frames 400 --out /tmp/roll.ppm
 //! ```
 
-use chimy2::demo::write_ppm;
+#![allow(dead_code)]
+
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
 
@@ -18,9 +19,11 @@ use newt::world::World;
 
 use std::path::PathBuf;
 
+mod showcase_support;
+
 fn parse_args() -> (usize, PathBuf, (usize, usize)) {
     let mut frames = 400usize;
-    let mut out = PathBuf::from("newt-roll.ppm");
+    let mut out = PathBuf::from("newt-roll.mp4");
     let mut size = (640usize, 360usize);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -188,11 +191,21 @@ fn render(world: &World, width: usize, height: usize) -> Framebuffer {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (frames, out, (width, height)) = parse_args();
     let mut world = build_world();
-    for _ in 0..frames {
-        world.step();
-    }
-    let fb = render(&world, width, height);
-    write_ppm(&out, &fb)?;
+    let mut simulated = 0;
+    showcase_support::write_video(&out, frames, |step| {
+        for _ in simulated..step {
+            world.step();
+        }
+        simulated = step;
+        let items = showcase_support::world_items(&world);
+        showcase_support::render_items(
+            &items,
+            showcase_support::composition("features"),
+            width,
+            height,
+            &format!("rolling friction  |  step {step}"),
+        )
+    })?;
     println!(
         "wrote {} ({}x{}) — final body x positions: {:?}",
         out.display(),

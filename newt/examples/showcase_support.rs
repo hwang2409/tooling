@@ -118,6 +118,31 @@ pub fn composition(name: &str) -> Composition {
             Vec3::new(3.0, -0.2, 1.4),
             Vec3::new(0.8, 0.3, 0.75),
         ),
+        "features" => Composition::new(
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(4.8, -7.5, 3.5),
+            Vec3::new(0.1, 0.75, 0.9),
+        ),
+        "compare" => Composition::new(
+            Vec3::new(0.0, 0.0, 1.6),
+            Vec3::new(7.8, -10.0, 5.4),
+            Vec3::new(0.95, 0.45, 0.1),
+        ),
+        "tumble" => Composition::new(
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(8.0, -10.0, 7.0),
+            Vec3::new(0.95, 0.5, 0.1),
+        ),
+        "linkage" => Composition::new(
+            Vec3::new(0.0, 0.0, 0.7),
+            Vec3::new(2.8, -4.0, 2.4),
+            Vec3::new(0.95, 0.45, 0.1),
+        ),
+        "pendulum" => Composition::new(
+            Vec3::new(0.0, 0.0, 0.6),
+            Vec3::new(4.5, 0.0, 1.0),
+            Vec3::new(0.1, 0.65, 0.9),
+        ),
         _ => Composition::new(
             Vec3::new(0.0, 0.0, 1.0),
             Vec3::new(4.0, -5.0, 2.8),

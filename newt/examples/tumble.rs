@@ -11,9 +11,12 @@
 //! The point is to prove newt's state can drive chimy2, not to exercise the
 //! full renderer (later tiers do that).
 
-use chimy2::demo::write_ppm;
+#![allow(dead_code)]
+
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
+
+mod showcase_support;
 
 use newt::body::Body;
 use newt::math::{Quat, Vec3};
@@ -23,7 +26,7 @@ use std::path::PathBuf;
 
 fn parse_args() -> (usize, PathBuf, (usize, usize)) {
     let mut frames = 200usize;
-    let mut out = PathBuf::from("newt-tumble.ppm");
+    let mut out = PathBuf::from("newt-tumble.mp4");
     let mut size = (640usize, 360usize);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -202,16 +205,58 @@ fn render(world: &World, half_extents: &[Vec3; 3], width: usize, height: usize) 
     fb
 }
 
+fn render_solid(
+    world: &World,
+    half_extents: &[Vec3; 3],
+    width: usize,
+    height: usize,
+    step: usize,
+) -> Framebuffer {
+    let mut items = vec![showcase_support::item(
+        showcase_support::cuboid_mesh(chimy2::math::Vec3::new(6.0, 6.0, 0.04)),
+        showcase_support::transform(
+            Vec3::new(0.0, 0.0, -0.04),
+            Quat::IDENTITY,
+            chimy2::math::Vec3::new(1.0, 1.0, 1.0),
+        ),
+        showcase_support::Material::new(chimy2::math::Vec3::new(0.04, 0.05, 0.07), 0.0, 0.9),
+    )];
+    let colors = [
+        chimy2::math::Vec3::new(0.95, 0.55, 0.12),
+        chimy2::math::Vec3::new(0.1, 0.65, 0.9),
+        chimy2::math::Vec3::new(0.9, 0.18, 0.35),
+    ];
+    for (index, body) in world.bodies.iter().enumerate() {
+        items.push(showcase_support::item(
+            showcase_support::cuboid_mesh(showcase_support::to_cvec(half_extents[index])),
+            showcase_support::transform(
+                body.position,
+                body.orientation,
+                chimy2::math::Vec3::new(1.0, 1.0, 1.0),
+            ),
+            showcase_support::Material::new(colors[index], 0.2, 0.3),
+        ));
+    }
+    showcase_support::render_items(
+        &items,
+        showcase_support::composition("tumble"),
+        width,
+        height,
+        &format!("tumbling rigid bodies  |  step {step}"),
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (frames, out, (width, height)) = parse_args();
     let (mut world, half_extents) = build_world();
-
-    for _ in 0..frames {
-        world.step();
-    }
-
-    let fb = render(&world, &half_extents, width, height);
-    write_ppm(&out, &fb)?;
+    let mut simulated = 0;
+    showcase_support::write_video(&out, frames, |step| {
+        for _ in simulated..step {
+            world.step();
+        }
+        simulated = step;
+        render_solid(&world, &half_extents, width, height, step)
+    })?;
     println!("wrote {} ({}x{})", out.display(), width, height);
     Ok(())
 }

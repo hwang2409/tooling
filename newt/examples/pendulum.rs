@@ -7,7 +7,8 @@
 //! cargo run --release --example pendulum -- --frames 900 --out /tmp/pendulum.ppm
 //! ```
 
-use chimy2::demo::write_ppm;
+#![allow(dead_code)]
+
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
 
@@ -17,9 +18,11 @@ use newt::tree::{Link, Tree, forward_kinematics, rk4_step};
 
 use std::path::PathBuf;
 
+mod showcase_support;
+
 fn parse_args() -> (usize, PathBuf, (usize, usize)) {
     let mut frames = 900usize;
-    let mut out = PathBuf::from("newt-pendulum.ppm");
+    let mut out = PathBuf::from("newt-pendulum.mp4");
     let mut size = (640usize, 360usize);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -130,22 +133,7 @@ fn rod_endpoints(tree: &Tree, poses: &[(Vec3, Quat)], i: usize, l: f32) -> (Vec3
     (top, bot)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (frames, out, (width, height)) = parse_args();
-    let mut tree = build_tree();
-    let dt = 0.005f32;
-    let g = Vec3::new(0.0, 0.0, -9.81);
-
-    // Record tip positions for trail rendering.
-    let mut trail: Vec<Vec3> = Vec::with_capacity(frames);
-    for _ in 0..frames {
-        rk4_step(&mut tree, g, dt, |_| vec![(Vec3::ZERO, Vec3::ZERO); 3]);
-        let poses = forward_kinematics(&tree);
-        let (_top2, bot2) = rod_endpoints(&tree, &poses, 2, L2);
-        trail.push(bot2);
-    }
-
-    // Render final frame: rods + trail.
+fn render_frame(tree: &Tree, trail: &[Vec3], width: usize, height: usize) -> Framebuffer {
     let mut fb = Framebuffer::new(width, height);
     fb.clear(argb8888(0xff, 12, 14, 22));
     let camera = Mat4::perspective(
@@ -183,10 +171,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Rods at final frame.
-    let poses = forward_kinematics(&tree);
+    let poses = forward_kinematics(tree);
     let colors = [argb8888(0xff, 240, 200, 90), argb8888(0xff, 90, 220, 240)];
     for (i, &l) in [L1, L2].iter().enumerate() {
-        let (top, bot) = rod_endpoints(&tree, &poses, i + 1, l);
+        let (top, bot) = rod_endpoints(tree, &poses, i + 1, l);
         if let (Some(a), Some(b)) = (
             project(camera, top, width, height),
             project(camera, bot, width, height),
@@ -195,7 +183,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    write_ppm(&out, &fb)?;
+    fb
+}
+
+fn render_solid(
+    tree: &Tree,
+    trail: &[Vec3],
+    width: usize,
+    height: usize,
+    step: usize,
+) -> Framebuffer {
+    let poses = forward_kinematics(tree);
+    let mut items = vec![showcase_support::item(
+        showcase_support::cuboid_mesh(chimy2::math::Vec3::new(3.0, 3.0, 0.04)),
+        showcase_support::transform(
+            Vec3::new(0.0, 0.0, -0.04),
+            Quat::IDENTITY,
+            chimy2::math::Vec3::new(1.0, 1.0, 1.0),
+        ),
+        showcase_support::Material::new(chimy2::math::Vec3::new(0.04, 0.05, 0.07), 0.0, 0.9),
+    )];
+    for (index, &length) in [L1, L2].iter().enumerate() {
+        let (top, bottom) = rod_endpoints(tree, &poses, index + 1, length);
+        showcase_support::add_capsule(
+            &mut items,
+            top,
+            bottom,
+            0.055,
+            showcase_support::Material::new(
+                if index == 0 {
+                    chimy2::math::Vec3::new(0.95, 0.55, 0.12)
+                } else {
+                    chimy2::math::Vec3::new(0.1, 0.65, 0.9)
+                },
+                0.2,
+                0.3,
+            ),
+        );
+    }
+    for point in trail.iter().step_by(20) {
+        showcase_support::add_marker(
+            &mut items,
+            *point,
+            0.012,
+            showcase_support::Material::new(chimy2::math::Vec3::new(0.9, 0.2, 0.35), 0.1, 0.4),
+        );
+    }
+    showcase_support::render_items(
+        &items,
+        showcase_support::composition("pendulum"),
+        width,
+        height,
+        &format!("double pendulum  |  step {step}"),
+    )
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (frames, out, (width, height)) = parse_args();
+    let mut tree = build_tree();
+    let dt = 0.005f32;
+    let g = Vec3::new(0.0, 0.0, -9.81);
+    let mut trail = Vec::with_capacity(frames);
+    let mut simulated = 0;
+    showcase_support::write_video(&out, frames, |step| {
+        for _ in simulated..step {
+            rk4_step(&mut tree, g, dt, |_| vec![(Vec3::ZERO, Vec3::ZERO); 3]);
+            let poses = forward_kinematics(&tree);
+            trail.push(rod_endpoints(&tree, &poses, 2, L2).1);
+        }
+        simulated = step;
+        render_solid(&tree, &trail, width, height, step)
+    })?;
     println!(
         "wrote {} ({}x{}) — final θ1={:.3} θ2={:.3}",
         out.display(),

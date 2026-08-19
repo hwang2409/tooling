@@ -24,7 +24,30 @@ cargo run --release --example cartpole -- --frames 900 --out demo-cartpole.mp4
 cargo run --release --example cartpole -- --velocity --frames 900 --out demo-cartpole-velocity.mp4
 cargo run --release --example arm -- --frames 1800 --out demo-arm.mp4
 cargo run --release --example muscle_pendulum -- --frames 1800 --out demo-muscle-pendulum.mp4
+cargo run --release --example showcase_features -- --scene joints --frames 900 --out demo-joints.mp4
+cargo run --release --example showcase_features -- --scene equalities --frames 900 --out demo-equalities.mp4
+cargo run --release --example showcase_features -- --scene geoms --frames 900 --out demo-geoms.mp4
+cargo run --release --example showcase_features -- --scene sensors --frames 900 --out demo-sensors.mp4
+cargo run --release --example showcase_features -- --scene solvers --frames 900 --out demo-solvers.mp4
+cargo run --release --example showcase_features -- --scene integrators --frames 900 --out demo-integrators.mp4
+cargo run --release --example tendon_cylinder_pulley -- --frames 900 --out demo-tendon-cylinder-pulley.mp4
+cargo run --release --example chain -- --frames 900 --out demo-chain.mp4
+cargo run --release --example linkage -- --frames 900 --out demo-linkage.mp4
+cargo run --release --example pendulum -- --frames 900 --out demo-pendulum.mp4
+cargo run --release --example tumble -- --frames 900 --out demo-tumble.mp4
+cargo run --release --example roll -- --frames 900 --out demo-roll.mp4
 ```
+
+the joints scene shows hinge, ball, and slide joints. the equalities scene
+shows connect, weld, and distance rows; `linkage` adds joint coupling. the
+contacts scene shows capsule, cylinder, and ellipsoid geoms. the sensor scene
+renders live joint, velocity, and accelerometer values in its hud. the solver
+and integrator scenes run the same stack side by side with pgs/newton and
+euler/implicitfast.
+
+convex mesh ccd is not available on `origin/main` yet. the dedicated video is
+deferred until the convex ccd routes land; the existing `pile` demo covers
+supported convex mesh contacts.
 
 The muscle pendulum starts at zero activation, holds control at zero, drives
 from `0` to `1`, then returns to zero. The committed demo is 3.016667 seconds

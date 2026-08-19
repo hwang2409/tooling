@@ -20,7 +20,8 @@
 //! in the world XZ plane. A positive servo target angle rotates the
 //! crank tip toward -Z (following right-hand rule about +Y).
 
-use chimy2::demo::write_ppm;
+#![allow(dead_code)]
+
 use chimy2::fb::{Framebuffer, argb8888};
 use chimy2::math::{Mat4, Vec3 as CVec3, Vec4};
 
@@ -36,6 +37,8 @@ use newt::world::World;
 
 use std::path::PathBuf;
 
+mod showcase_support;
+
 /// Scene geometry — three fixed lengths that pin down the mechanism.
 const CRANK_LEN: f32 = 0.4;
 const FOLLOWER_LEN: f32 = 0.4;
@@ -47,7 +50,7 @@ const FOLLOWER_PIVOT_X: f32 = 0.4;
 
 fn parse_args() -> (usize, PathBuf, (usize, usize)) {
     let mut frames = 800usize;
-    let mut out = PathBuf::from("newt-linkage.ppm");
+    let mut out = PathBuf::from("newt-linkage.mp4");
     let mut size = (640usize, 360usize);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -340,19 +343,72 @@ fn render(w: &World, bar_idx: usize, width: usize, height: usize) -> Framebuffer
     fb
 }
 
+fn render_solid(
+    w: &World,
+    bar_idx: usize,
+    width: usize,
+    height: usize,
+    step: usize,
+) -> Framebuffer {
+    let poses = newt::tree::forward_kinematics(&w.trees[0]);
+    let crank_pivot = Vec3::new(CRANK_PIVOT_X, 0.0, 0.5);
+    let follower_pivot = Vec3::new(FOLLOWER_PIVOT_X, 0.0, 0.5);
+    let crank_tip = poses[1].0 + poses[1].1.rotate(Vec3::new(0.0, 0.0, CRANK_LEN * 0.5));
+    let follower_tip = poses[2].0 + poses[2].1.rotate(Vec3::new(0.0, 0.0, FOLLOWER_LEN * 0.5));
+    let mut items = vec![showcase_support::item(
+        showcase_support::cuboid_mesh(CVec3::new(2.5, 2.5, 0.04)),
+        showcase_support::transform(
+            Vec3::new(0.0, 0.0, -0.04),
+            Quat::IDENTITY,
+            CVec3::new(1.0, 1.0, 1.0),
+        ),
+        showcase_support::Material::new(CVec3::new(0.04, 0.05, 0.07), 0.0, 0.9),
+    )];
+    showcase_support::add_capsule(
+        &mut items,
+        crank_pivot,
+        crank_tip,
+        0.045,
+        showcase_support::Material::new(CVec3::new(0.95, 0.55, 0.12), 0.25, 0.3),
+    );
+    showcase_support::add_capsule(
+        &mut items,
+        follower_pivot,
+        follower_tip,
+        0.045,
+        showcase_support::Material::new(CVec3::new(0.1, 0.65, 0.9), 0.25, 0.3),
+    );
+    items.push(showcase_support::item(
+        showcase_support::cuboid_mesh(CVec3::new(COUPLER_HALF.x, COUPLER_HALF.y, COUPLER_HALF.z)),
+        showcase_support::transform(
+            w.bodies[bar_idx].position,
+            w.bodies[bar_idx].orientation,
+            CVec3::new(1.0, 1.0, 1.0),
+        ),
+        showcase_support::Material::new(CVec3::new(0.9, 0.18, 0.35), 0.2, 0.3),
+    ));
+    showcase_support::render_items(
+        &items,
+        showcase_support::composition("linkage"),
+        width,
+        height,
+        &format!("connect + joint coupling  |  step {step}"),
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (frames, out, (width, height)) = parse_args();
     let (mut world, tree_idx, bar_idx) = build_world();
-    // Drive the crank through a smooth sinusoidal sweep so the linkage
-    // moves through a range large enough to see the coupler bar swing.
-    for step in 0..frames {
-        let t = step as f32 * world.dt;
-        let target = 0.4 * sin(0.8 * t);
-        world.trees[tree_idx].set_actuator_target(0, target);
-        world.step();
-    }
-    let fb = render(&world, bar_idx, width, height);
-    write_ppm(&out, &fb)?;
+    let mut simulated = 0;
+    showcase_support::write_video(&out, frames, |step| {
+        for current in simulated..step {
+            let t = current as f32 * world.dt;
+            world.trees[tree_idx].set_actuator_target(0, 0.4 * sin(0.8 * t));
+            world.step();
+        }
+        simulated = step;
+        render_solid(&world, bar_idx, width, height, step)
+    })?;
     println!(
         "wrote {} ({}x{}) after {} frames",
         out.display(),
