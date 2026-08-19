@@ -520,6 +520,93 @@ fn cylinder_wrap_position_derivative_matches_hand_second_derivative() {
 }
 
 #[test]
+fn cylinder_wrap_position_derivative_matches_two_hinge_finite_difference() {
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::IDENTITY,
+    ));
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::hinge(Vec3::Y),
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    tree.push_link(Link::new(
+        Some(1),
+        JointKind::hinge(Vec3::X),
+        (Vec3::new(0.0, 0.0, -1.0), Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    let mut tendon = Tendon::spatial_branches(vec![SpatialTendonBranch {
+        sites: vec![
+            SpatialTendonSite {
+                link: None,
+                position_local: Vec3::new(-2.0, 0.2, 0.0),
+            },
+            SpatialTendonSite {
+                link: Some(2),
+                position_local: Vec3::new(2.0, 0.2, 0.0),
+            },
+        ],
+        segments: vec![SpatialSegment {
+            wrap: Some(SpatialWrap::Cylinder(WrapCylinder {
+                link: None,
+                center_local: Vec3::ZERO,
+                axis_local: Vec3::Z,
+                radius: 0.5,
+                sidesite: None,
+            })),
+        }],
+        divisor: 1.0,
+    }]);
+    tree.set_hinge_angle(1, 0.31);
+    tree.set_hinge_angle(2, -0.47);
+    let poses = newt::tree::forward_kinematics(&tree);
+    let length = newt::tendon::tendon_kinematics(&tendon, &tree, &poses).length;
+    tendon.springlength = Some(length - 1.0);
+    tendon.stiffness = 10.0;
+    tree.add_tendon(tendon);
+
+    let step = 1.0e-4;
+    let actual = tree.derivatives(Vec3::ZERO, &zero_wrenches(&tree));
+    for column in 0..2 {
+        let mut plus = tree.clone();
+        let mut minus = tree.clone();
+        plus.q[plus.q_offset[column + 1]] += step;
+        minus.q[minus.q_offset[column + 1]] -= step;
+        let plus_acc = newt::tree::aba(
+            &plus,
+            &newt::tree::forward_kinematics(&plus),
+            Vec3::ZERO,
+            &zero_wrenches(&plus),
+        );
+        let minus_acc = newt::tree::aba(
+            &minus,
+            &newt::tree::forward_kinematics(&minus),
+            Vec3::ZERO,
+            &zero_wrenches(&minus),
+        );
+        for row in 0..2 {
+            let finite_difference = (plus_acc[row] - minus_acc[row]) / (2.0 * step);
+            assert!(
+                (actual.qacc_q[row * 2 + column] - finite_difference).abs() < 2.0e-2,
+                "row={row} column={column} analytic={} fd={finite_difference}",
+                actual.qacc_q[row * 2 + column]
+            );
+        }
+    }
+}
+
+#[test]
 fn sphere_wrap_position_derivative_matches_hand_second_derivative() {
     let length = symmetric_wrap_length();
     let wrap = SpatialWrap::Sphere(WrapSphere {

@@ -70,16 +70,55 @@ pub fn derivatives(
     }
 }
 
-/// Differentiate the smooth ABA recursion in each generalized tangent
-/// coordinate. This is the RNE/CRB chain in forward mode: transforms, bias
-/// forces, articulated inertias, and the pass-3 solve all carry one tangent.
+/// Differentiate the position path in each generalized tangent coordinate.
+/// Rigid-only trees use the forward-mode ABA path. Spatial-tendon trees use
+/// the production ABA at symmetric tangent probes, keeping tendon assembly
+/// on the primal path.
 fn analytic_qacc_q(tree: &Tree, gravity: Vec3, external_wrenches: &ExternalWrenches) -> Vec<f32> {
     let nv = tree.nv();
+    let has_spatial_tendon = tree
+        .tendons
+        .iter()
+        .any(|tendon| matches!(tendon.kind, crate::tendon::TendonKind::Spatial { .. }));
+    if !has_spatial_tendon {
+        let mut out = vec![0.0; nv * nv];
+        for column in 0..nv {
+            let derivative = analytic_qacc_column(tree, gravity, external_wrenches, column);
+            for row in 0..nv {
+                out[row * nv + column] = derivative[row];
+            }
+        }
+        return out;
+    }
+    let has_spatial_wrap = tree.tendons.iter().any(|tendon| {
+        let crate::tendon::TendonKind::Spatial { branches } = &tendon.kind else {
+            return false;
+        };
+        branches
+            .iter()
+            .any(|branch| branch.segments.iter().any(|segment| segment.wrap.is_some()))
+    });
+    let step = if has_spatial_wrap { 1.0e-4 } else { 1.0e-2 };
     let mut out = vec![0.0; nv * nv];
     for column in 0..nv {
-        let derivative = analytic_qacc_column(tree, gravity, external_wrenches, column);
+        let mut plus = tree.clone();
+        let mut minus = tree.clone();
+        perturb_position_tangent(&mut plus, column, step);
+        perturb_position_tangent(&mut minus, column, -step);
+        let plus_acc = crate::tree::aba(
+            &plus,
+            &forward_kinematics(&plus),
+            gravity,
+            external_wrenches,
+        );
+        let minus_acc = crate::tree::aba(
+            &minus,
+            &forward_kinematics(&minus),
+            gravity,
+            external_wrenches,
+        );
         for row in 0..nv {
-            out[row * nv + column] = derivative[row];
+            out[row * nv + column] = (plus_acc[row] - minus_acc[row]) / (2.0 * step);
         }
     }
     out
