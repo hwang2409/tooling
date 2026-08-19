@@ -269,10 +269,10 @@ Box-mesh is deferred because the rotated probe reports normal error `1.0`.
 The following ten native CCD routes remain Deferred and fail active-pair
 validation: capsule-ellipsoid, capsule-cylinder, capsule-mesh,
 ellipsoid-ellipsoid, ellipsoid-cylinder, ellipsoid-box, ellipsoid-mesh,
-cylinder-cylinder, cylinder-box, and cylinder-mesh. Their support code has
-direct axis tests, but they have no MuJoCo fixture or dynamic parity claim.
-The follow-up ticket must add four-pose captures, early/full dynamic anchors,
-and mutation coverage before enabling any of them.
+cylinder-cylinder, cylinder-box, and cylinder-mesh. Their deferred-route
+support implementations are absent. Enabling one requires new narrow-phase
+code plus four-pose captures, early/full dynamic anchors, and mutation
+coverage before making a parity claim.
 
 The box-mesh and mesh-mesh probes remain in `contact_route_probes.json` as
 open and shipped findings. Route bounds are reviewed in

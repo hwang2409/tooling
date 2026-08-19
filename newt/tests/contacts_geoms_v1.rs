@@ -952,6 +952,77 @@ fn mesh_mesh_margin_uses_gjk_distance_witness() {
         "mesh margin gap penetration was {}",
         contacts.as_slice()[0].penetration
     );
+    assert!(contacts.as_slice()[0].normal_world.x < -0.99);
+
+    let swapped = narrow_phase(
+        1,
+        &mesh_b,
+        &pose_b,
+        0,
+        &mesh_a,
+        &pose_a,
+        &[unit_tetrahedron()],
+    );
+    assert_eq!(
+        swapped.len, 1,
+        "swapped mesh margin gap should emit one contact"
+    );
+    assert!(approx(
+        swapped.as_slice()[0].penetration,
+        contacts.as_slice()[0].penetration,
+        1.0e-5
+    ));
+    assert_eq!(swapped.as_slice()[0].geom_a, 1);
+    assert_eq!(swapped.as_slice()[0].geom_b, 0);
+    close_vec(
+        swapped.as_slice()[0].normal_world,
+        -contacts.as_slice()[0].normal_world,
+        1.0e-5,
+    );
+}
+
+#[test]
+fn rotated_mesh_mesh_margin_uses_converged_distance_witness() {
+    let mesh = unit_tetrahedron();
+    let mesh_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.02);
+    let mesh_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(0.0, 1.01, 0.0),
+        orientation: Quat::from_axis_angle(Vec3::X, 15.0_f32.to_radians()),
+    };
+    let meshes = [mesh];
+
+    let contacts = narrow_phase(0, &mesh_a, &pose_a, 1, &mesh_b, &pose_b, &meshes);
+    assert_eq!(
+        contacts.len, 1,
+        "rotated mesh margin gap should emit one contact"
+    );
+    let contact = contacts.as_slice()[0];
+    assert!(approx(contact.penetration, 0.010340718, 1.0e-5));
+    close_vec(
+        contact.normal_world,
+        Vec3::new(0.0, -0.9659258, -0.258_819),
+        1.0e-5,
+    );
+
+    let swapped = narrow_phase(1, &mesh_b, &pose_b, 0, &mesh_a, &pose_a, &meshes);
+    assert_eq!(
+        swapped.len, 1,
+        "swapped rotated mesh margin gap should emit one contact"
+    );
+    let swapped_contact = swapped.as_slice()[0];
+    assert!(approx(
+        swapped_contact.penetration,
+        contact.penetration,
+        1.0e-5
+    ));
+    assert_eq!(swapped_contact.geom_a, 1);
+    assert_eq!(swapped_contact.geom_b, 0);
+    close_vec(swapped_contact.normal_world, -contact.normal_world, 1.0e-5);
 }
 
 #[test]

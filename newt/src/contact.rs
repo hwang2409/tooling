@@ -236,25 +236,7 @@ fn supported_shape_pair(a: &GeomShape, b: &GeomShape) -> bool {
 }
 
 fn ccd_route_pair(a: &GeomShape, b: &GeomShape) -> bool {
-    (supported_shape_pair(a, b) || supported_shape_pair(b, a))
-        && !matches!(
-            (a, b),
-            (GeomShape::Plane, _)
-                | (_, GeomShape::Plane)
-                | (GeomShape::Hfield { .. }, _)
-                | (_, GeomShape::Hfield { .. })
-                | (GeomShape::Sphere { .. }, GeomShape::Sphere { .. })
-                | (GeomShape::Sphere { .. }, GeomShape::Capsule { .. })
-                | (GeomShape::Capsule { .. }, GeomShape::Sphere { .. })
-                | (GeomShape::Sphere { .. }, GeomShape::Cylinder { .. })
-                | (GeomShape::Cylinder { .. }, GeomShape::Sphere { .. })
-                | (GeomShape::Sphere { .. }, GeomShape::Ellipsoid { .. })
-                | (GeomShape::Sphere { .. }, GeomShape::Mesh { .. })
-                | (GeomShape::Ellipsoid { .. }, GeomShape::Sphere { .. })
-                | (GeomShape::Mesh { .. }, GeomShape::Sphere { .. })
-                | (GeomShape::Capsule { .. }, GeomShape::Capsule { .. })
-                | (GeomShape::Box { .. }, GeomShape::Box { .. })
-        )
+    matches!((a, b), (GeomShape::Mesh { .. }, GeomShape::Mesh { .. }))
 }
 
 fn ccd_shape<'a>(
@@ -2347,18 +2329,21 @@ struct CcdSimplex {
 #[derive(Clone, Copy)]
 struct CcdSolverConfig {
     gjk_support_epsilon: f32,
+    distance_tolerance: f32,
     epa_support_epsilon: f32,
     max_epa_iterations: usize,
 }
 
 const CCD_MESH_CONFIG: CcdSolverConfig = CcdSolverConfig {
     gjk_support_epsilon: 0.0,
+    distance_tolerance: 1.0e-10,
     epa_support_epsilon: 1.0e-7,
     max_epa_iterations: 128,
 };
 
 const CCD_HFIELD_CONFIG: CcdSolverConfig = CcdSolverConfig {
     gjk_support_epsilon: 1.0e-7,
+    distance_tolerance: 1.0e-10,
     epa_support_epsilon: 1.0e-5,
     max_epa_iterations: 64,
 };
@@ -2534,7 +2519,7 @@ fn ccd_distance_contact(
     gap: f32,
 ) -> Option<Contact> {
     let (point_a, point_b) = ccd_closest_witness(simplex)?;
-    let separation = point_b - point_a;
+    let separation = point_a - point_b;
     let raw_distance = separation.length();
     let penetration = margin - raw_distance;
     if penetration <= 0.0 {
@@ -2554,6 +2539,46 @@ fn ccd_distance_contact(
         friction,
         gap,
     })
+}
+
+fn ccd_distance_gjk(
+    shape_a: CcdShape<'_>,
+    shape_b: CcdShape<'_>,
+    mut simplex: CcdSimplex,
+    config: CcdSolverConfig,
+) -> CcdSimplex {
+    for _ in 0..64 {
+        let Some((point_a, point_b)) = ccd_closest_witness(&simplex) else {
+            return simplex;
+        };
+        let closest = point_a - point_b;
+        let distance_squared = closest.length_squared();
+        if distance_squared <= 1.0e-20 {
+            return simplex;
+        }
+        let mut direction = -closest;
+        let point = ccd_support(shape_a, shape_b, direction);
+        let support_dot = point.minkowski.dot(direction);
+        let support_progress = support_dot - closest.dot(direction);
+        if support_progress <= config.gjk_support_epsilon {
+            return simplex;
+        }
+        simplex.push(point);
+        if ccd_simplex_step(&mut simplex, &mut direction) {
+            return simplex;
+        }
+        let Some((next_a, next_b)) = ccd_closest_witness(&simplex) else {
+            return simplex;
+        };
+        let next_distance_squared = (next_a - next_b).length_squared();
+        let improvement = distance_squared - next_distance_squared;
+        if improvement <= config.distance_tolerance * distance_squared.max(1.0)
+            && support_dot <= config.gjk_support_epsilon
+        {
+            return simplex;
+        }
+    }
+    simplex
 }
 
 /// Box versus one triangular prism using MuJoCo's native convex path shape:
@@ -2661,16 +2686,21 @@ fn ccd_convex_contact(
     let mut simplex = CcdSimplex::new(ccd_support(shape_a, shape_b, direction));
     direction = -simplex.points[0].minkowski;
     let mut enclosed = false;
+    let mut separated = false;
     for _ in 0..32 {
         let point = ccd_support(shape_a, shape_b, direction);
         if point.minkowski.dot(direction) <= config.gjk_support_epsilon {
-            return ccd_distance_contact(&simplex, idx_a, idx_b, friction, margin, gap);
+            separated = true;
+            break;
         }
         simplex.push(point);
         if ccd_simplex_step(&mut simplex, &mut direction) {
             enclosed = true;
             break;
         }
+    }
+    if !enclosed && separated {
+        simplex = ccd_distance_gjk(shape_a, shape_b, simplex, config);
     }
     if !enclosed || simplex.len != 4 {
         return ccd_distance_contact(&simplex, idx_a, idx_b, friction, margin, gap);
