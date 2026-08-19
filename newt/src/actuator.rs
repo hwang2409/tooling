@@ -551,6 +551,60 @@ impl Actuator {
         }
     }
 
+    /// Return `∂torque/∂ctrl` at `(len, vel)` for the current actuator state.
+    ///
+    /// The result is zero when activation dynamics own the input signal, or
+    /// when a control or force clamp is active at the current point. Clamps
+    /// are piecewise smooth, so the endpoint convention uses the zero side.
+    #[inline]
+    pub fn control_derivative(&self, len: f32, vel: f32) -> f32 {
+        let du = match (self.ctrl_limited, self.ctrl_range) {
+            (true, Some((lo, hi))) if self.ctrl <= lo || self.ctrl >= hi => 0.0,
+            _ => 1.0,
+        };
+        if du == 0.0 {
+            return 0.0;
+        }
+        let raw = match self.flavor {
+            ActuatorFlavor::Position { kp, .. } => kp * du,
+            ActuatorFlavor::Velocity { kv } => kv * du,
+            ActuatorFlavor::Motor { gear } => gear * du,
+            ActuatorFlavor::General {
+                gain_type,
+                gain_prm,
+                bias_type: _,
+                bias_prm: _,
+                gear,
+            } => {
+                if !matches!(self.dyn_type, DynType::None) {
+                    0.0
+                } else {
+                    let len_tr = len * gear;
+                    let vel_tr = vel * gear;
+                    let gain = match gain_type {
+                        GainType::Fixed => gain_prm[0],
+                        GainType::Affine => {
+                            gain_prm[0] + gain_prm[1] * len_tr + gain_prm[2] * vel_tr
+                        }
+                        GainType::Muscle => unreachable!("muscle gain uses ActuatorFlavor::Muscle"),
+                    };
+                    gain * gear * du
+                }
+            }
+            ActuatorFlavor::Muscle { .. } => 0.0,
+        };
+        if !self.force_limited {
+            return raw;
+        }
+        let torque = self.torque(len, vel);
+        if let Some((lo, hi)) = self.force_range {
+            if torque <= lo || torque >= hi {
+                return 0.0;
+            }
+        }
+        raw
+    }
+
     /// Return the positive velocity coefficient in the actuator force law.
     ///
     /// This is `-∂τ/∂vel` before the force clamp. It is the derivative that
@@ -601,6 +655,83 @@ impl Actuator {
                     * gear
             }
         }
+    }
+
+    /// Return `∂torque/∂vel` for explicit dynamics.
+    ///
+    /// Unlike [`Self::velocity_damping`], this derivative includes the active
+    /// force clamp. A saturated actuator has zero local velocity derivative.
+    #[inline]
+    pub fn velocity_derivative(&self, len: f32, vel: f32) -> f32 {
+        if self.force_limited {
+            if let Some((lo, hi)) = self.force_range {
+                let torque = self.torque(len, vel);
+                if torque <= lo || torque >= hi {
+                    return 0.0;
+                }
+            }
+        }
+        -self.velocity_damping(len, vel)
+    }
+
+    /// Return `∂torque/∂len` for explicit dynamics.
+    #[inline]
+    pub fn position_derivative(&self, len: f32, vel: f32) -> f32 {
+        let raw = match self.flavor {
+            ActuatorFlavor::Position { kp, .. } => -kp,
+            ActuatorFlavor::Velocity { .. } | ActuatorFlavor::Motor { .. } => 0.0,
+            ActuatorFlavor::General {
+                gain_type,
+                gain_prm,
+                bias_type,
+                bias_prm,
+                gear,
+            } => {
+                let signal = match self.dyn_type {
+                    DynType::None => self.clamped_ctrl(),
+                    DynType::Filter | DynType::Muscle => self.act,
+                };
+                let gain_length = match gain_type {
+                    GainType::Fixed => 0.0,
+                    GainType::Affine => gain_prm[1],
+                    GainType::Muscle => unreachable!("muscle gain uses ActuatorFlavor::Muscle"),
+                };
+                let bias_length = match bias_type {
+                    BiasType::None => 0.0,
+                    BiasType::Affine => bias_prm[1],
+                    BiasType::Muscle => unreachable!("muscle bias uses ActuatorFlavor::Muscle"),
+                };
+                (gain_length * signal + bias_length) * gear * gear
+            }
+            ActuatorFlavor::Muscle {
+                gain_prm,
+                bias_prm,
+                length_range,
+                acc0,
+                gear,
+            } => {
+                gear * gear
+                    * muscle_position_derivative(
+                        len * gear,
+                        vel * gear,
+                        length_range,
+                        acc0,
+                        gain_prm,
+                        bias_prm,
+                        self.act,
+                    )
+            }
+        };
+        if !self.force_limited {
+            return raw;
+        }
+        if let Some((lo, hi)) = self.force_range {
+            let torque = self.torque(len, vel);
+            if torque <= lo || torque >= hi {
+                return 0.0;
+            }
+        }
+        raw
     }
 
     /// Advance activation state by one step using forward Euler on
@@ -730,6 +861,81 @@ fn muscle_velocity_damping(
         0.0
     };
     force * fl * dfv / (l0 * prm[6]).max(MJ_MINVAL) * act
+}
+
+/// Return the derivative of muscle force with respect to transmission length.
+#[inline]
+fn muscle_position_derivative(
+    len: f32,
+    vel: f32,
+    length_range: [f32; 2],
+    acc0: f32,
+    gain_prm: [f32; 9],
+    bias_prm: [f32; 9],
+    act: f32,
+) -> f32 {
+    let force = if gain_prm[2] < 0.0 {
+        gain_prm[3] / acc0.max(MJ_MINVAL)
+    } else {
+        gain_prm[2]
+    };
+    let l0 = (length_range[1] - length_range[0]) / (gain_prm[1] - gain_prm[0]).max(MJ_MINVAL);
+    let l = gain_prm[0] + (len - length_range[0]) / l0.max(MJ_MINVAL);
+    let dl_dlen = 1.0 / l0.max(MJ_MINVAL);
+    let dfl = muscle_gain_length_derivative(l, gain_prm[4], gain_prm[5]);
+    let v = vel / (l0 * gain_prm[6]).max(MJ_MINVAL);
+    let y = gain_prm[8] - 1.0;
+    let fv = if v <= -1.0 {
+        0.0
+    } else if v <= 0.0 {
+        (v + 1.0) * (v + 1.0)
+    } else if v <= y {
+        let y_safe = if y.abs() > MJ_MINVAL { y } else { MJ_MINVAL };
+        gain_prm[8] - (y - v) * (y - v) / y_safe
+    } else {
+        gain_prm[8]
+    };
+    let dgain = -force * dfl * fv * dl_dlen;
+
+    let bias_force = if bias_prm[2] < 0.0 {
+        bias_prm[3] / acc0.max(MJ_MINVAL)
+    } else {
+        bias_prm[2]
+    };
+    let bias_l0 = (length_range[1] - length_range[0]) / (bias_prm[1] - bias_prm[0]).max(MJ_MINVAL);
+    let bias_l = bias_prm[0] + (len - length_range[0]) / bias_l0.max(MJ_MINVAL);
+    let bias_dl_dlen = 1.0 / bias_l0.max(MJ_MINVAL);
+    let dbias_dl = if bias_l <= 1.0 {
+        0.0
+    } else {
+        let b = 0.5 * (1.0 + bias_prm[5]);
+        let dbias = if bias_l <= b {
+            let x = (bias_l - 1.0) / (b - 1.0).max(MJ_MINVAL);
+            -bias_force * bias_prm[7] * x / (b - 1.0).max(MJ_MINVAL)
+        } else {
+            -bias_force * bias_prm[7] / (b - 1.0).max(MJ_MINVAL)
+        };
+        dbias * bias_dl_dlen
+    };
+    dgain * act + dbias_dl
+}
+
+#[inline]
+fn muscle_gain_length_derivative(length: f32, lmin: f32, lmax: f32) -> f32 {
+    if !(lmin <= length && length <= lmax) {
+        return 0.0;
+    }
+    let a = 0.5 * (lmin + 1.0);
+    let b = 0.5 * (1.0 + lmax);
+    if length <= a {
+        (length - lmin) / (a - lmin).max(MJ_MINVAL).powi(2)
+    } else if length <= 1.0 {
+        (1.0 - length) / (1.0 - a).max(MJ_MINVAL).powi(2)
+    } else if length <= b {
+        -(length - 1.0) / (b - 1.0).max(MJ_MINVAL).powi(2)
+    } else {
+        -(lmax - length) / (lmax - b).max(MJ_MINVAL).powi(2)
+    }
 }
 
 /// MuJoCo's piecewise muscle activation derivative.

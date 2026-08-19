@@ -423,6 +423,14 @@ pub fn bias_forces(tree: &Tree, gravity: Vec3) -> Vec<f32> {
     inverse_dynamics(tree, &qddot, gravity, &ext)
 }
 
+/// Dense derivatives of the tree's explicit forward dynamics.
+///
+/// The acceleration is evaluated by [`crate::tree::aba`] with the current
+/// tree state and external wrenches. Matrices use row-major storage:
+#[path = "derivatives.rs"]
+mod derivatives;
+
+pub use derivatives::{Derivatives, constrained_derivatives, derivatives};
 // ---------------------------------------------------------------------------
 // CRB — composite rigid body mass matrix
 // ---------------------------------------------------------------------------
