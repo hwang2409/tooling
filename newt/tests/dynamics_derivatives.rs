@@ -1,7 +1,7 @@
 //! Analytic forward-dynamics derivative anchors.
 //!
 //! Hand-derived anchors and saved MuJoCo transitionFD data cover the smooth
-//! derivative paths. No expected value comes from a Newt finite difference.
+//! derivative paths. Multi-link checks use an independent centered probe.
 
 use newt::actuator::Actuator;
 use newt::joint::JointKind;
@@ -41,6 +41,74 @@ fn pendulum(damping: f32) -> Tree {
 
 fn zero_wrenches(tree: &Tree) -> Vec<(Vec3, Vec3)> {
     vec![(Vec3::ZERO, Vec3::ZERO); tree.links.len()]
+}
+
+#[test]
+fn offset_hinge_slide_chain_matches_independent_position_difference() {
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(0.8, 0.9, 1.1),
+    ));
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::hinge(Vec3::Y),
+        (Vec3::new(0.25, -0.35, 0.1), Quat::IDENTITY),
+        (Vec3::new(0.15, 0.2, -0.4), Quat::IDENTITY),
+        1.3,
+        Mat3::diag(0.2, 0.3, 0.4),
+    ));
+    tree.push_link(Link::new(
+        Some(1),
+        JointKind::slide(Vec3::X),
+        (Vec3::new(-0.2, 0.3, 0.4), Quat::IDENTITY),
+        (Vec3::new(0.1, -0.2, 0.25), Quat::IDENTITY),
+        0.9,
+        Mat3::diag(0.15, 0.25, 0.35),
+    ));
+    tree.set_hinge_angle(1, 0.37);
+    tree.set_slide_position(2, -0.23);
+    tree.set_hinge_rate(1, 0.41);
+    tree.set_slide_rate(2, -0.29);
+
+    let gravity = Vec3::new(0.4, -9.81, 2.3);
+    let mut external = zero_wrenches(&tree);
+    external[1] = (Vec3::new(1.4, -2.0, 3.0), Vec3::new(0.3, -0.5, 0.7));
+    external[2] = (Vec3::new(-1.1, 0.8, 2.2), Vec3::new(-0.4, 0.6, 0.2));
+
+    let actual = tree.derivatives(gravity, &external);
+    let step = 2.5e-3;
+    for column in 0..2 {
+        let mut plus = tree.clone();
+        let mut minus = tree.clone();
+        let q_slot = plus.q_offset[column + 1];
+        plus.q[q_slot] += step;
+        minus.q[q_slot] -= step;
+        let plus_acc = newt::tree::aba(
+            &plus,
+            &newt::tree::forward_kinematics(&plus),
+            gravity,
+            &external,
+        );
+        let minus_acc = newt::tree::aba(
+            &minus,
+            &newt::tree::forward_kinematics(&minus),
+            gravity,
+            &external,
+        );
+        for row in 0..2 {
+            let finite_difference = (plus_acc[row] - minus_acc[row]) / (2.0 * step);
+            let analytic = actual.qacc_q[row * 2 + column];
+            assert!(
+                (analytic - finite_difference).abs() < 1.0e-1,
+                "row={row} column={column} analytic={analytic} finite_difference={finite_difference}"
+            );
+        }
+    }
 }
 
 fn fixture_values(fixture: &str) -> [f32; 4] {
@@ -576,7 +644,7 @@ fn cylinder_wrap_position_derivative_matches_two_hinge_finite_difference() {
     tendon.stiffness = 10.0;
     tree.add_tendon(tendon);
 
-    let step = 1.0e-4;
+    let step = 2.5e-3;
     let actual = tree.derivatives(Vec3::ZERO, &zero_wrenches(&tree));
     for column in 0..2 {
         let mut plus = tree.clone();

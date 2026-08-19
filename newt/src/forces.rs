@@ -3,15 +3,14 @@ use crate::math::Vec3;
 use crate::spatial::SpatialForce;
 use crate::tree::{ExternalWrenches, Tree, joint_limit_scalar_force};
 
-pub(crate) struct JointForceAssembly {
-    pub(crate) scalar: Vec<f32>,
-    pub(crate) ball: Vec<Vec3>,
-    pub(crate) free: SpatialForce,
-}
-
-pub(crate) fn assemble_joint_forces(tree: &Tree, tendon_qfrc: &[f32]) -> JointForceAssembly {
-    let mut scalar = vec![0.0; tree.links.len()];
-    let mut ball = vec![Vec3::ZERO; tree.links.len()];
+pub(crate) fn assemble_joint_forces(
+    tree: &Tree,
+    tendon_qfrc: &[f32],
+    scalar: &mut [f32],
+    ball: &mut [Vec3],
+) -> SpatialForce {
+    scalar.fill(0.0);
+    ball.fill(Vec3::ZERO);
     let mut free = SpatialForce::ZERO;
 
     for (link_idx, link) in tree.links.iter().enumerate() {
@@ -82,7 +81,7 @@ pub(crate) fn assemble_joint_forces(tree: &Tree, tendon_qfrc: &[f32]) -> JointFo
         }
     }
 
-    JointForceAssembly { scalar, ball, free }
+    free
 }
 
 pub(crate) fn external_wrench_world(

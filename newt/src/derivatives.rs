@@ -71,54 +71,14 @@ pub fn derivatives(
 }
 
 /// Differentiate the position path in each generalized tangent coordinate.
-/// Rigid-only trees use the forward-mode ABA path. Spatial-tendon trees use
-/// the production ABA at symmetric tangent probes, keeping tendon assembly
-/// on the primal path.
+/// The forward-mode ABA path also differentiates spatial tendon geometry.
 fn analytic_qacc_q(tree: &Tree, gravity: Vec3, external_wrenches: &ExternalWrenches) -> Vec<f32> {
     let nv = tree.nv();
-    let has_spatial_tendon = tree
-        .tendons
-        .iter()
-        .any(|tendon| matches!(tendon.kind, crate::tendon::TendonKind::Spatial { .. }));
-    if !has_spatial_tendon {
-        let mut out = vec![0.0; nv * nv];
-        for column in 0..nv {
-            let derivative = analytic_qacc_column(tree, gravity, external_wrenches, column);
-            for row in 0..nv {
-                out[row * nv + column] = derivative[row];
-            }
-        }
-        return out;
-    }
-    let has_spatial_wrap = tree.tendons.iter().any(|tendon| {
-        let crate::tendon::TendonKind::Spatial { branches } = &tendon.kind else {
-            return false;
-        };
-        branches
-            .iter()
-            .any(|branch| branch.segments.iter().any(|segment| segment.wrap.is_some()))
-    });
-    let step = if has_spatial_wrap { 1.0e-4 } else { 1.0e-2 };
     let mut out = vec![0.0; nv * nv];
     for column in 0..nv {
-        let mut plus = tree.clone();
-        let mut minus = tree.clone();
-        perturb_position_tangent(&mut plus, column, step);
-        perturb_position_tangent(&mut minus, column, -step);
-        let plus_acc = crate::tree::aba(
-            &plus,
-            &forward_kinematics(&plus),
-            gravity,
-            external_wrenches,
-        );
-        let minus_acc = crate::tree::aba(
-            &minus,
-            &forward_kinematics(&minus),
-            gravity,
-            external_wrenches,
-        );
+        let derivative = analytic_qacc_column(tree, gravity, external_wrenches, column);
         for row in 0..nv {
-            out[row * nv + column] = (plus_acc[row] - minus_acc[row]) / (2.0 * step);
+            out[row * nv + column] = derivative[row];
         }
     }
     out
@@ -209,7 +169,8 @@ struct DForce {
 #[derive(Clone, Copy)]
 struct DXform {
     value: Xform,
-    derivative: Xform,
+    d_rotation: Mat3,
+    d_translation: Vec3,
 }
 
 #[derive(Clone, Copy)]
@@ -253,16 +214,46 @@ fn df_sub(a: DForce, b: DForce) -> DForce {
 }
 
 fn dxf_motion(x: DXform, m: DMotion) -> DMotion {
+    // Xform::motion is bilinear in (R, t) and the motion. Keep both
+    // product-rule terms from the transform tangent: dt × (Rω) and
+    // t × (dRω).
+    let angular = x.value.rot_a_to_b * m.value.angular;
+    let transformed_linear = x.value.rot_a_to_b * m.value.linear;
+    let derivative_angular =
+        x.d_rotation * m.value.angular + x.value.rot_a_to_b * m.derivative.angular;
+    let derivative_linear = x.d_rotation * m.value.linear
+        + x.value.rot_a_to_b * m.derivative.linear
+        + x.d_translation.cross(angular)
+        + x.value.translation_a_in_b.cross(derivative_angular);
     DMotion {
-        value: x.value.motion(m.value),
-        derivative: x.derivative.motion(m.value) + x.value.motion(m.derivative),
+        value: SpatialMotion::new(
+            angular,
+            transformed_linear + x.value.translation_a_in_b.cross(angular),
+        ),
+        derivative: SpatialMotion::new(derivative_angular, derivative_linear),
     }
 }
 
 fn dxf_transpose_force(x: DXform, f: DForce) -> DForce {
+    // Xform::transpose_force is also bilinear. Differentiate the pulled
+    // torque after differentiating the translated force.
+    let pulled_linear = x.value.rot_a_to_b.transpose() * f.value.linear;
+    let pulled_torque_argument = f.value.torque - x.value.translation_a_in_b.cross(f.value.linear);
+    let derivative_linear = x.d_rotation.transpose() * f.value.linear
+        + x.value.rot_a_to_b.transpose() * f.derivative.linear;
+    let derivative_torque_argument = f.derivative.torque
+        - x.d_translation.cross(f.value.linear)
+        - x.value.translation_a_in_b.cross(f.derivative.linear);
     DForce {
-        value: x.value.transpose_force(f.value),
-        derivative: x.derivative.transpose_force(f.value) + x.value.transpose_force(f.derivative),
+        value: SpatialForce::new(
+            x.value.rot_a_to_b.transpose() * pulled_torque_argument,
+            pulled_linear,
+        ),
+        derivative: SpatialForce::new(
+            x.d_rotation.transpose() * pulled_torque_argument
+                + x.value.rot_a_to_b.transpose() * derivative_torque_argument,
+            derivative_linear,
+        ),
     }
 }
 
@@ -402,11 +393,13 @@ fn d_xup(tree: &Tree, link_idx: usize, column: usize) -> DXform {
     match link.joint {
         JointKind::Free => DXform {
             value: Xform::IDENTITY,
-            derivative: Xform::new(Mat3::ZERO, Vec3::ZERO),
+            d_rotation: Mat3::ZERO,
+            d_translation: Vec3::ZERO,
         },
         JointKind::Fixed => DXform {
             value: xup_for_link(link, 0.0),
-            derivative: Xform::new(Mat3::ZERO, Vec3::ZERO),
+            d_rotation: Mat3::ZERO,
+            d_translation: Vec3::ZERO,
         },
         JointKind::Hinge { axis, .. } => {
             let value = xup_for_link_hinge(link, axis, tree.q[qoff]);
@@ -423,7 +416,8 @@ fn d_xup(tree: &Tree, link_idx: usize, column: usize) -> DXform {
             };
             DXform {
                 value,
-                derivative: Xform::new(derivative_rotation, derivative_translation),
+                d_rotation: derivative_rotation,
+                d_translation: derivative_translation,
             }
         }
         JointKind::Slide { axis, .. } => {
@@ -431,7 +425,8 @@ fn d_xup(tree: &Tree, link_idx: usize, column: usize) -> DXform {
             let derivative_translation = if column == voff { -axis } else { Vec3::ZERO };
             DXform {
                 value,
-                derivative: Xform::new(Mat3::ZERO, derivative_translation),
+                d_rotation: Mat3::ZERO,
+                d_translation: derivative_translation,
             }
         }
         JointKind::Ball { .. } => {
@@ -455,7 +450,8 @@ fn d_xup(tree: &Tree, link_idx: usize, column: usize) -> DXform {
             let derivative_translation = -(derivative_rotation * link.joint_offset_in_parent.0);
             DXform {
                 value,
-                derivative: Xform::new(derivative_rotation, derivative_translation),
+                d_rotation: derivative_rotation,
+                d_translation: derivative_translation,
             }
         }
     }
@@ -560,7 +556,8 @@ fn analytic_qacc_column(
     let mut xup = vec![
         DXform {
             value: Xform::IDENTITY,
-            derivative: Xform::new(Mat3::ZERO, Vec3::ZERO)
+            d_rotation: Mat3::ZERO,
+            d_translation: Vec3::ZERO,
         };
         n
     ];
@@ -596,7 +593,14 @@ fn analytic_qacc_column(
     ];
     let mut tau = vec![(0.0, 0.0); n];
     let (tendon_qfrc, tendon_qfrc_derivative) = tendon_force_derivative(tree, column);
-    let joint_forces = crate::forces::assemble_joint_forces(tree, &tendon_qfrc);
+    let mut joint_force_scalar = vec![0.0; n];
+    let mut joint_force_ball = vec![Vec3::ZERO; n];
+    let free_joint_force = crate::forces::assemble_joint_forces(
+        tree,
+        &tendon_qfrc,
+        &mut joint_force_scalar,
+        &mut joint_force_ball,
+    );
 
     for i in 0..n {
         let link = &tree.links[i];
@@ -743,7 +747,7 @@ fn analytic_qacc_column(
                 let dq = if column == tree.v_offset[i] { 1.0 } else { 0.0 };
                 let tau_derivative =
                     tendon_qfrc_derivative[tree.v_offset[i]] + (qacc + actuator_derivative) * dq;
-                let u_value = joint_forces.scalar[i];
+                let u_value = joint_force_scalar[i];
                 let p_u_value = u_value - s_p;
                 let p_u_derivative = tau_derivative - ds_p;
                 let qdd_value = p_u_value / d_value;
@@ -831,7 +835,7 @@ fn analytic_qacc_column(
                     spatial_dot_ms(s3[i][2], p_stage.derivative),
                 );
                 let off = tree.v_offset[i];
-                let tau_value = joint_forces.ball[i];
+                let tau_value = joint_force_ball[i];
                 let tau_derivative = Vec3::new(
                     tendon_qfrc_derivative[off],
                     tendon_qfrc_derivative[off + 1],
@@ -876,7 +880,7 @@ fn analytic_qacc_column(
     let mut qacc_derivative = vec![0.0; nv];
     match tree.links[0].joint {
         JointKind::Free => {
-            let tau_value = joint_forces.free;
+            let tau_value = free_joint_force;
             let rhs = df_sub(
                 DForce {
                     value: tau_value,

@@ -894,6 +894,10 @@ pub(crate) struct AbaWorkspace {
     /// tendon-actuator). Length = tree.nv(). Reused across ABA calls to
     /// avoid an allocation per call.
     tendon_qfrc: Vec<f32>,
+    /// Scalar joint-force scratch, reused across ABA calls.
+    joint_force_scalar: Vec<f32>,
+    /// Ball-joint force scratch, reused across ABA calls.
+    joint_force_ball: Vec<Vec3>,
 }
 
 impl AbaWorkspace {
@@ -922,6 +926,8 @@ impl AbaWorkspace {
             qddot_ball: vec![Vec3::ZERO; n],
             a: vec![SpatialMotion::ZERO; n],
             tendon_qfrc: vec![0.0; nv],
+            joint_force_scalar: vec![0.0; n],
+            joint_force_ball: vec![Vec3::ZERO; n],
         }
     }
 
@@ -1151,7 +1157,12 @@ fn aba_with_velocity_implicit_workspace(
             crate::tendon::accumulate_tendon_passive(tree, poses, &mut tendon_qfrc);
         crate::tendon::accumulate_tendon_actuator_qfrc(tree, &mut tendon_state, &mut tendon_qfrc);
     }
-    let joint_forces = crate::forces::assemble_joint_forces(tree, &tendon_qfrc);
+    let free_joint_force = crate::forces::assemble_joint_forces(
+        tree,
+        &tendon_qfrc,
+        &mut w.joint_force_scalar,
+        &mut w.joint_force_ball,
+    );
 
     // --- Pass 2: leaves→root, accumulate IA and pA. ---
     // Initialize each link's IA = spatial inertia and pA = velocity-product bias.
@@ -1202,7 +1213,7 @@ fn aba_with_velocity_implicit_workspace(
                 let parent = link.parent.expect("hinge must have parent");
                 let qdot_i = tree.qdot[tree.v_offset[i]];
                 let q_i = tree.q[tree.q_offset[i]];
-                let tau_scalar = joint_forces.scalar[i];
+                let tau_scalar = w.joint_force_scalar[i];
                 let damping_mass =
                     implicit_mass_damping(tree, i, q_i, qdot_i, damping, velocity_implicit);
                 single_dof_pass2(w, tree, i, parent, armature, damping_mass, tau_scalar);
@@ -1239,7 +1250,7 @@ fn aba_with_velocity_implicit_workspace(
                     .inverse()
                     .expect("ball articulated-inertia block is singular");
                 // Ball joint torque: qfrc_applied - damping * omega (isotropic).
-                let tau3 = joint_forces.ball[i];
+                let tau3 = w.joint_force_ball[i];
 
                 // p_stage = pA + IA c
                 let ia_c = w.ia[i].times_motion(w.c[i]);
@@ -1302,7 +1313,7 @@ fn aba_with_velocity_implicit_workspace(
             // coordinates conjugate to the 6 slot layout (ω_body, v_body).
             // The solver path sets `disable_penalty_limits`, which gates this
             // channel on. Penalty callers keep the old free-root behavior.
-            let tau_free = joint_forces.free;
+            let tau_free = free_joint_force;
             let rhs = SpatialForce::new(
                 tau_free.torque - w.pa[0].torque,
                 tau_free.linear - w.pa[0].linear,

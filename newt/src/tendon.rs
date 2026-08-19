@@ -802,6 +802,12 @@ fn straight_segment_jacobian_derivative(
     }
 }
 
+fn add_segment_jacobian(total: &mut [f32], segment: &[f32], divisor: f32) {
+    for (total, segment) in total.iter_mut().zip(segment) {
+        *total += *segment / divisor;
+    }
+}
+
 #[derive(Clone, Copy)]
 struct DifferentialScalar {
     value: f32,
@@ -1062,6 +1068,7 @@ fn sphere_segment_jacobian_derivative(
     divisor: f32,
     jacobian: &mut [f32],
 ) {
+    let mut segment_jacobian = vec![0.0; jacobian.len()];
     let center = wrap_center_world(poses, wrap.link, wrap.center_local);
     let center_site = differential_wrap_point(tree, poses, dposes, wrap.link, center);
     let a_point = differential_site_vector(a);
@@ -1073,7 +1080,8 @@ fn sphere_segment_jacobian_derivative(
     let a_distance_squared = differential_vec3_dot(a_from_center, a_from_center);
     let b_distance_squared = differential_vec3_dot(b_from_center, b_from_center);
     if a_distance_squared.value <= radius_squared || b_distance_squared.value <= radius_squared {
-        straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+        straight_segment_jacobian_derivative(a, b, 1.0, &mut segment_jacobian);
+        add_segment_jacobian(jacobian, &segment_jacobian, divisor);
         return;
     }
     let ab = differential_vec3_sub(b_point, a_point);
@@ -1092,13 +1100,15 @@ fn sphere_segment_jacobian_derivative(
     let perpendicular = differential_vec3_sub(closest_point, center_point);
     let inside_segment = (0.0..=1.0).contains(&closest.value);
     if !inside_segment || perpendicular.value.length_squared() >= radius_squared {
-        straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+        straight_segment_jacobian_derivative(a, b, 1.0, &mut segment_jacobian);
+        add_segment_jacobian(jacobian, &segment_jacobian, divisor);
         return;
     }
     let plane_normal = differential_vec3_cross(a_from_center, b_from_center);
     if plane_normal.value.length() < SIDE_HINT_COLINEARITY_EPS {
         let Some(hint) = wrap.side_hint_world else {
-            straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+            straight_segment_jacobian_derivative(a, b, 1.0, &mut segment_jacobian);
+            add_segment_jacobian(jacobian, &segment_jacobian, divisor);
             return;
         };
         let ab_hat = ab.value / ab.value.length();
@@ -1106,7 +1116,8 @@ fn sphere_segment_jacobian_derivative(
         if hint_perpendicular.length_squared()
             < SIDE_HINT_COLINEARITY_EPS * SIDE_HINT_COLINEARITY_EPS
         {
-            straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+            straight_segment_jacobian_derivative(a, b, 1.0, &mut segment_jacobian);
+            add_segment_jacobian(jacobian, &segment_jacobian, divisor);
             return;
         }
         let unit_hint = differential_vec3(hint_perpendicular.normalize(), Vec3::ZERO);
@@ -1114,7 +1125,7 @@ fn sphere_segment_jacobian_derivative(
             sphere_tangent_points_with_hint(a_point, b_point, center_point, wrap.radius, unit_hint);
         let force_a = differential_vec3_normalize(differential_vec3_sub(point_a, a_point));
         let force_b = differential_vec3_normalize(differential_vec3_sub(point_b, b_point));
-        differential_wrap_endpoint_jacobian(a, b, force_a, force_b, jacobian);
+        differential_wrap_endpoint_jacobian(a, b, force_a, force_b, &mut segment_jacobian);
         differential_wrap_body_jacobian(
             tree,
             poses,
@@ -1125,11 +1136,9 @@ fn sphere_segment_jacobian_derivative(
             point_b.value,
             force_a,
             force_b,
-            jacobian,
+            &mut segment_jacobian,
         );
-        for value in jacobian.iter_mut() {
-            *value /= divisor;
-        }
+        add_segment_jacobian(jacobian, &segment_jacobian, divisor);
         return;
     }
     let distance_a = differential_vec3_length(a_from_center);
@@ -1155,7 +1164,8 @@ fn sphere_segment_jacobian_derivative(
         differential_vec3_scale(x_a, differential_vec3_dot(b_from_center, x_a)),
     );
     if cb_perpendicular.value.length() == 0.0 {
-        straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+        straight_segment_jacobian_derivative(a, b, 1.0, &mut segment_jacobian);
+        add_segment_jacobian(jacobian, &segment_jacobian, divisor);
         return;
     }
     let y_a = differential_vec3_normalize(cb_perpendicular);
@@ -1180,7 +1190,8 @@ fn sphere_segment_jacobian_derivative(
         differential_vec3_scale(x_b, differential_vec3_dot(a_from_center, x_b)),
     );
     if ca_perpendicular.value.length() == 0.0 {
-        straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+        straight_segment_jacobian_derivative(a, b, 1.0, &mut segment_jacobian);
+        add_segment_jacobian(jacobian, &segment_jacobian, divisor);
         return;
     }
     let y_b = differential_vec3_normalize(ca_perpendicular);
@@ -1202,7 +1213,7 @@ fn sphere_segment_jacobian_derivative(
     );
     let force_a = differential_vec3_normalize(differential_vec3_sub(point_a, a_point));
     let force_b = differential_vec3_normalize(differential_vec3_sub(point_b, b_point));
-    differential_wrap_endpoint_jacobian(a, b, force_a, force_b, jacobian);
+    differential_wrap_endpoint_jacobian(a, b, force_a, force_b, &mut segment_jacobian);
     differential_wrap_body_jacobian(
         tree,
         poses,
@@ -1213,11 +1224,9 @@ fn sphere_segment_jacobian_derivative(
         point_b.value,
         force_a,
         force_b,
-        jacobian,
+        &mut segment_jacobian,
     );
-    for value in jacobian.iter_mut() {
-        *value /= divisor;
-    }
+    add_segment_jacobian(jacobian, &segment_jacobian, divisor);
 }
 
 fn sphere_tangent_points_with_hint(
@@ -1482,6 +1491,7 @@ fn cylinder_segment_jacobian_derivative(
     divisor: f32,
     jacobian: &mut [f32],
 ) {
+    let mut segment_jacobian = vec![0.0; jacobian.len()];
     let center = wrap_center_world(poses, wrap.link, wrap.center_local);
     let center_site = differential_wrap_point(tree, poses, dposes, wrap.link, center);
     let center_point = differential_site_vector(&center_site);
@@ -1549,14 +1559,16 @@ fn cylinder_segment_jacobian_derivative(
     let Some((tangent_a, tangent_b, arc)) =
         differential_circle_wrap_points(end0, end1, side, wrap.radius)
     else {
-        straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+        straight_segment_jacobian_derivative(a, b, 1.0, &mut segment_jacobian);
+        add_segment_jacobian(jacobian, &segment_jacobian, divisor);
         return;
     };
     let radial_a = differential_vec2_length(differential_vec2_sub(end0, tangent_a));
     let radial_b = differential_vec2_length(differential_vec2_sub(end1, tangent_b));
     let total = differential_scalar_add(differential_scalar_add(radial_a, arc), radial_b);
     if total.value == 0.0 {
-        straight_segment_jacobian_derivative(a, b, divisor, jacobian);
+        straight_segment_jacobian_derivative(a, b, 1.0, &mut segment_jacobian);
+        add_segment_jacobian(jacobian, &segment_jacobian, divisor);
         return;
     }
     let za = differential_vec3_dot(a_relative, axis);
@@ -1607,7 +1619,7 @@ fn cylinder_segment_jacobian_derivative(
     );
     let force_a = differential_vec3_normalize(differential_vec3_sub(point_a, a_point));
     let force_b = differential_vec3_normalize(differential_vec3_sub(point_b, b_point));
-    differential_wrap_endpoint_jacobian(a, b, force_a, force_b, jacobian);
+    differential_wrap_endpoint_jacobian(a, b, force_a, force_b, &mut segment_jacobian);
     differential_wrap_body_jacobian(
         tree,
         poses,
@@ -1618,11 +1630,9 @@ fn cylinder_segment_jacobian_derivative(
         point_b.value,
         force_a,
         force_b,
-        jacobian,
+        &mut segment_jacobian,
     );
-    for value in jacobian.iter_mut() {
-        *value /= divisor;
-    }
+    add_segment_jacobian(jacobian, &segment_jacobian, divisor);
 }
 
 fn column_value(columns: &[(u32, Vec3)], slot: usize) -> Vec3 {
