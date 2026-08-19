@@ -282,7 +282,7 @@ fn stack_world(mode: SolverMode, integrator: Integrator) -> World {
 
 fn integrator_world(integrator: Integrator) -> World {
     let mut world = World::new();
-    world.dt = 0.005;
+    world.dt = 0.01;
     world.gravity = Vec3::new(0.0, 0.0, -9.81);
     world.solver = solver();
     world.integrator = integrator;
@@ -303,7 +303,7 @@ fn integrator_world(integrator: Integrator) -> World {
         0.8,
         Mat3::diag(0.04, 0.04, 0.01),
     ));
-    tree.add_actuator(Actuator::velocity(hinge, 18.0, 5.0));
+    tree.add_actuator(Actuator::velocity(hinge, 160.0, 100.0));
     let tree_id = world.add_tree(tree);
     let capsule = world.add_geom(Geom::capsule_on_link(
         tree_id,
@@ -320,21 +320,36 @@ fn integrator_world(integrator: Integrator) -> World {
     world
 }
 
+fn integrator_target(step: usize) -> f32 {
+    1.4 * newt::math::sin(step as f32 * 0.15)
+}
+
+fn drive_integrators(left: &mut World, right: &mut World, step: usize) {
+    let target = integrator_target(step);
+    left.trees[0].set_actuator_target(0, target);
+    right.trees[0].set_actuator_target(0, target);
+    left.step();
+    right.step();
+}
+
 fn assert_integrator_trajectories_differ() {
     let mut euler = integrator_world(Integrator::Euler);
     let mut implicit = integrator_world(Integrator::ImplicitFast);
+    let mut max_position_delta: f32 = 0.0;
     for step in 0..600 {
-        let target = 1.4 * newt::math::sin(step as f32 * 0.013);
-        euler.trees[0].set_actuator_target(0, target);
-        implicit.trees[0].set_actuator_target(0, target);
-        euler.step();
-        implicit.step();
+        drive_integrators(&mut euler, &mut implicit, step);
+        max_position_delta =
+            max_position_delta.max((euler.trees[0].q[0] - implicit.trees[0].q[0]).abs());
     }
     let position_delta = (euler.trees[0].q[0] - implicit.trees[0].q[0]).abs();
     let velocity_delta = (euler.trees[0].qdot[0] - implicit.trees[0].qdot[0]).abs();
     assert!(
         position_delta + velocity_delta > 1.0e-6,
         "Euler and ImplicitFast trajectories must differ"
+    );
+    assert!(
+        max_position_delta > 0.4,
+        "integrator trajectories must separate visibly: {max_position_delta} rad"
     );
 }
 
@@ -501,9 +516,13 @@ fn run_compare(args: &Args, integrators: bool) -> Result<(), Box<dyn std::error:
     let (width, height) = args.size;
     let mut simulated = 0;
     showcase_support::write_video(&args.out, args.frames, |step| {
-        for _ in simulated..step {
-            left.step();
-            right.step();
+        for current in simulated..step {
+            if integrators {
+                drive_integrators(&mut left, &mut right, current);
+            } else {
+                left.step();
+                right.step();
+            }
         }
         simulated = step;
         let hud = if integrators {

@@ -3,7 +3,7 @@
 //!
 //! Run:
 //! ```text
-//! cargo run --release --example tumble -- --frames 200 --out /tmp/tumble.ppm
+//! cargo run --release --example tumble -- --frames 200 --wireframe --out /tmp/tumble.ppm
 //! ```
 //!
 //! Deliberately minimal: no lighting, no rasterizer — just per-body world→view
@@ -25,7 +25,8 @@ use std::path::PathBuf;
 
 fn parse_args() -> (usize, PathBuf, (usize, usize), bool) {
     let mut frames = 200usize;
-    let mut out = PathBuf::from("newt-tumble.mp4");
+    let default_out = PathBuf::from("newt-tumble.mp4");
+    let mut out = default_out.clone();
     let mut size = (640usize, 360usize);
     let mut wireframe = false;
     let mut args = std::env::args().skip(1);
@@ -41,6 +42,9 @@ fn parse_args() -> (usize, PathBuf, (usize, usize), bool) {
             "--wireframe" => wireframe = true,
             _ => panic!("unknown arg: {a}"),
         }
+    }
+    if wireframe && out == default_out {
+        out.set_extension("ppm");
     }
     (frames, out, size, wireframe)
 }

@@ -1,8 +1,9 @@
 //! v1-tier-5 demo: a four-bar-style linkage built from two grounded
 //! hinges, a free coupler bar constrained by two `connect` equalities,
 //! and a `joint` coupling equality that slaves the follower hinge to
-//! `2 · crank`. One servo drives the crank; the whole assembly moves
-//! through the connect + coupling constraints.
+//! `-1 · crank`. One servo drives the crank; coupling drives the follower.
+//! The coupler bar stays at static reference anchors because tree-link
+//! connect anchors are not supported yet.
 //!
 //! Uses ALL four v1-tier-5 equality features:
 //! - `Connect` (×2, world-space anchor coincidence)
@@ -10,7 +11,7 @@
 //!
 //! Run:
 //! ```text
-//! cargo run --release --example linkage -- --frames 800 --out /tmp/linkage.ppm
+//! cargo run --release --example linkage -- --frames 800 --wireframe --out /tmp/linkage.ppm
 //! ```
 //!
 //! Wireframe PPM via chimy2, same rendering plumbing as the other
@@ -49,7 +50,8 @@ const FOLLOWER_PIVOT_X: f32 = 0.4;
 
 fn parse_args() -> (usize, PathBuf, (usize, usize), bool) {
     let mut frames = 800usize;
-    let mut out = PathBuf::from("newt-linkage.mp4");
+    let default_out = PathBuf::from("newt-linkage.mp4");
+    let mut out = default_out.clone();
     let mut size = (640usize, 360usize);
     let mut wireframe = false;
     let mut args = std::env::args().skip(1);
@@ -65,6 +67,9 @@ fn parse_args() -> (usize, PathBuf, (usize, usize), bool) {
             "--wireframe" => wireframe = true,
             _ => panic!("unknown arg: {a}"),
         }
+    }
+    if wireframe && out == default_out {
+        out.set_extension("ppm");
     }
     (frames, out, size, wireframe)
 }
@@ -129,8 +134,9 @@ fn build_world() -> (World, usize, usize) {
     let tree_idx = w.add_tree(tree);
 
     // Free coupler bar. World-space rest pose: horizontal at the level
-    // of the crank tips (z = 0.5 + CRANK_LEN when q = 0), spanning
-    // from crank tip to follower tip.
+    // of the crank tips (z = 0.5 + CRANK_LEN when q = 0). The Connect
+    // rows use these static rest points because tree-link anchors are not
+    // supported by the engine.
     let bar_z = 0.5 + CRANK_LEN;
     let bar_center = Vec3::new(0.5 * (CRANK_PIVOT_X + FOLLOWER_PIVOT_X), 0.0, bar_z);
     // Bar inertia — slender box.
@@ -155,13 +161,11 @@ fn build_world() -> (World, usize, usize) {
         solref,
         solimp,
     });
-    // NOTE: The two anchors above are STATIC world points — the crank
-    // and follower tips MOVE with the hinges, so the anchors as
-    // written won't actually track the hinge tips. This demo simplifies
-    // by putting both connect anchors at the world-space rest position
-    // of the tips; the joint coupling then correlates the two hinges
-    // 2:1 so the tips stay in geometric agreement with the coupler
-    // through the coupling constraint alone. A more general
+    // NOTE: The two anchors above are STATIC world points. The crank
+    // and follower tips move with the hinges, so these rows do not track
+    // the tips. The joint coupling demonstrates the supported hinge
+    // relationship while the bar demonstrates static-reference Connect
+    // rows. A more general
     // implementation would attach the connect equalities to the tree
     // link's body (v1 tier 6 will lift `Equality::Connect` to accept a
     // tree link + local anchor, matching MuJoCo's `equality/connect`
@@ -170,8 +174,7 @@ fn build_world() -> (World, usize, usize) {
         tree: tree_idx,
         link_a: follower,
         link_b: crank,
-        // follower = -1 · crank  (opposite sign so the two hinges
-        // sweep the coupler bar side-to-side in phase).
+        // follower = -1 · crank (the supported coupling relationship).
         polycoef: [0.0, -1.0, 0.0],
         solref,
         solimp,

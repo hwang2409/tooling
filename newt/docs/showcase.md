@@ -6,8 +6,10 @@ follow camera.
 
 video is the default output. each run advances the deterministic simulation
 by 10 fixed simulation steps per video frame and writes 60 fps. with the
-showcase timestep of 0.005 seconds, this is 3x simulation speed. a 5000-step
-biped walk covers 25 seconds of simulation in an 8.33 second video.
+usual showcase timestep of 0.005 seconds, this is 3x simulation speed. the
+integrator comparison uses a tuned 0.01-second timestep to make stability
+differences visible. a 5000-step biped walk covers 25 seconds of simulation
+in an 8.33 second video.
 rendering does not change the simulation state.
 
 all commands run from `newt/`.
@@ -44,8 +46,8 @@ connect anchors stay at static reference points because tree-link connect
 anchors are not supported by the engine yet. the contacts scene shows capsule,
 cylinder, and ellipsoid geoms. the sensor scene
 renders live joint, velocity, and accelerometer values in its hud. the solver
-and integrator scenes run the same stack side by side with pgs/newton and
-euler/implicitfast.
+scene compares pgs and newton on the stack model. the integrator scene compares
+euler and implicitfast on the same damped velocity-servo tree.
 
 convex mesh ccd is not available on `origin/main` yet. the dedicated video is
 deferred until the convex ccd routes land; the existing `pile` demo covers
