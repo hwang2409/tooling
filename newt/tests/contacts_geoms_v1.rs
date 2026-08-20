@@ -8,7 +8,7 @@
 //! ellipsoid-plane, etc.
 
 use newt::body::Body;
-use newt::contact::{is_pair_supported, narrow_phase};
+use newt::contact::{Contact, is_pair_supported, narrow_phase};
 use newt::geom::{ConvexMesh, Geom, GeomPose, GeomShape, geom_world_pose};
 use newt::json::{self, Value};
 use newt::math::{FRAC_PI_2, FRAC_PI_4, Mat3, Quat, Vec3, cos, sin};
@@ -37,6 +37,25 @@ fn close_scalar(actual: f32, expected: f32, tolerance: f32, label: &str) {
         (actual - expected).abs() <= tolerance,
         "{label}: {actual} != {expected}"
     );
+}
+
+fn assert_contact_bit_equal(actual: &Contact, expected: &Contact, label: &str) {
+    let bits = |contact: &Contact| {
+        (
+            contact.geom_a,
+            contact.geom_b,
+            contact.position_world.x.to_bits(),
+            contact.position_world.y.to_bits(),
+            contact.position_world.z.to_bits(),
+            contact.normal_world.x.to_bits(),
+            contact.normal_world.y.to_bits(),
+            contact.normal_world.z.to_bits(),
+            contact.penetration.to_bits(),
+            contact.friction.to_bits(),
+            contact.gap.to_bits(),
+        )
+    };
+    assert_eq!(bits(actual), bits(expected), "{label}");
 }
 
 fn route_object<'a>(value: &'a Value, key: &str) -> &'a Value {
@@ -329,14 +348,7 @@ fn mesh_mesh_witness_is_invariant_to_vertex_order_and_argument_order() {
             "vertex order {order:?} changed contact count"
         );
         let contact = actual.as_slice()[0];
-        close_vec(contact.position_world, expected.position_world, 1.0e-6);
-        close_vec(contact.normal_world, expected.normal_world, 1.0e-6);
-        close_scalar(
-            contact.penetration,
-            expected.penetration,
-            1.0e-6,
-            "vertex-order penetration",
-        );
+        assert_contact_bit_equal(&contact, &expected, &format!("vertex order {order:?}"));
 
         let swapped = narrow_phase(1, &permuted_geom_b, &pose_b, 0, &geom_a, &pose_a, &meshes);
         assert_eq!(
@@ -344,17 +356,19 @@ fn mesh_mesh_witness_is_invariant_to_vertex_order_and_argument_order() {
             "vertex order {order:?} changed swapped count"
         );
         let swapped_contact = swapped.as_slice()[0];
-        close_vec(
-            swapped_contact.position_world,
-            expected.position_world,
-            1.0e-6,
-        );
-        close_vec(swapped_contact.normal_world, -expected.normal_world, 1.0e-6);
-        close_scalar(
-            swapped_contact.penetration,
-            expected.penetration,
-            1.0e-6,
-            "swapped penetration",
+        let expected_swapped = Contact {
+            geom_a: expected.geom_b,
+            geom_b: expected.geom_a,
+            position_world: expected.position_world,
+            normal_world: -expected.normal_world,
+            penetration: expected.penetration,
+            friction: expected.friction,
+            gap: expected.gap,
+        };
+        assert_contact_bit_equal(
+            &swapped_contact,
+            &expected_swapped,
+            &format!("swapped vertex order {order:?}"),
         );
     }
 }
@@ -389,13 +403,10 @@ fn plane_mesh_contacts_are_invariant_to_vertex_order() {
         let actual = narrow_phase(0, &plane, &plane_pose, 1, &mesh_geom, &mesh_pose, &meshes);
         assert_eq!(actual.len, reference.len, "vertex order {order:?} count");
         for (expected, contact) in reference.as_slice().iter().zip(actual.as_slice()) {
-            close_vec(contact.position_world, expected.position_world, 1.0e-6);
-            close_vec(contact.normal_world, expected.normal_world, 1.0e-6);
-            close_scalar(
-                contact.penetration,
-                expected.penetration,
-                1.0e-6,
-                "plane-mesh vertex-order penetration",
+            assert_contact_bit_equal(
+                contact,
+                expected,
+                &format!("plane-mesh vertex order {order:?}"),
             );
         }
     }
@@ -668,9 +679,7 @@ fn tiny_high_valence_face_centroid_is_stable_under_permutations() {
         ("tiny reversed", reversed_contact.as_slice()[0]),
         ("tiny mixed", mixed_contact.as_slice()[0]),
     ] {
-        close_vec(actual.position_world, expected.position_world, 1.0e-12);
-        close_vec(actual.normal_world, expected.normal_world, 1.0e-6);
-        close_scalar(actual.penetration, expected.penetration, 1.0e-12, label);
+        assert_contact_bit_equal(&actual, &expected, label);
     }
 }
 
@@ -704,9 +713,7 @@ fn high_valence_face_centroid_is_stable_when_vertices_reverse() {
         assert_eq!(reversed.len, 1, "{name} reversed contact count");
         let expected = forward.as_slice()[0];
         let actual = reversed.as_slice()[0];
-        close_vec(actual.position_world, expected.position_world, 1.0e-6);
-        close_vec(actual.normal_world, expected.normal_world, 1.0e-6);
-        close_scalar(actual.penetration, expected.penetration, 1.0e-6, name);
+        assert_contact_bit_equal(&actual, &expected, name);
     }
 }
 
