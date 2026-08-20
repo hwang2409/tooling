@@ -7,9 +7,15 @@
 
 use crate::geom::{ConvexMesh, Geom, GeomPose, GeomShape, HeightField};
 use crate::math::{Vec3, abs};
+use std::collections::HashSet;
 
 const FATNESS: f32 = 0.1;
 const FAT_EPSILON: f32 = 1.0e-4;
+
+#[inline]
+pub fn should_collide(a_group: u32, a_mask: u32, b_group: u32, b_mask: u32) -> bool {
+    (a_group & b_mask) != 0 && (b_group & a_mask) != 0
+}
 
 /// An axis-aligned bounding box.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -132,6 +138,14 @@ struct Node {
     height: i32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Proxy {
+    node: usize,
+    group: u32,
+    mask: u32,
+    tree_id: Option<usize>,
+}
+
 impl Node {
     fn leaf(proxy: usize, aabb: Aabb) -> Self {
         Self {
@@ -169,7 +183,7 @@ impl Node {
 pub struct DynamicAabbTree {
     nodes: Vec<Node>,
     free_nodes: Vec<usize>,
-    proxy_nodes: Vec<Option<usize>>,
+    proxies: Vec<Option<Proxy>>,
     root: Option<usize>,
     pair_stack: Vec<(usize, usize)>,
     pairs: Vec<(usize, usize)>,
@@ -187,7 +201,7 @@ impl DynamicAabbTree {
         Self {
             nodes: Vec::new(),
             free_nodes: Vec::new(),
-            proxy_nodes: Vec::new(),
+            proxies: Vec::new(),
             root: None,
             pair_stack: Vec::new(),
             pairs: Vec::new(),
@@ -196,10 +210,7 @@ impl DynamicAabbTree {
     }
 
     pub fn len(&self) -> usize {
-        self.proxy_nodes
-            .iter()
-            .filter(|node| node.is_some())
-            .count()
+        self.proxies.iter().filter(|node| node.is_some()).count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -221,30 +232,51 @@ impl DynamicAabbTree {
     }
 
     pub fn contains_proxy(&self, proxy: usize) -> bool {
-        self.proxy_nodes.get(proxy).is_some_and(Option::is_some)
+        self.proxies.get(proxy).is_some_and(Option::is_some)
     }
 
     pub fn proxy_aabb(&self, proxy: usize) -> Option<Aabb> {
-        self.proxy_nodes
+        self.proxies
             .get(proxy)
             .and_then(|node| *node)
-            .map(|node| self.nodes[node].aabb)
+            .map(|proxy| self.nodes[proxy.node].aabb)
     }
 
     pub fn insert(&mut self, proxy: usize, bounds: Aabb) {
+        self.insert_with_filter(proxy, bounds, u32::MAX, u32::MAX);
+    }
+
+    pub fn insert_with_filter(&mut self, proxy: usize, bounds: Aabb, group: u32, mask: u32) {
+        self.insert_with_filter_and_tree(proxy, bounds, group, mask, None);
+    }
+
+    pub fn insert_with_filter_and_tree(
+        &mut self,
+        proxy: usize,
+        bounds: Aabb,
+        group: u32,
+        mask: u32,
+        tree_id: Option<usize>,
+    ) {
         assert!(!self.contains_proxy(proxy), "proxy is already in the tree");
         let leaf = self.allocate_node(Node::leaf(proxy, bounds.fatten()));
-        if self.proxy_nodes.len() <= proxy {
-            self.proxy_nodes.resize(proxy + 1, None);
+        if self.proxies.len() <= proxy {
+            self.proxies.resize(proxy + 1, None);
         }
-        self.proxy_nodes[proxy] = Some(leaf);
+        self.proxies[proxy] = Some(Proxy {
+            node: leaf,
+            group,
+            mask,
+            tree_id,
+        });
         self.insert_leaf(leaf);
     }
 
     pub fn remove(&mut self, proxy: usize) -> bool {
-        let Some(leaf) = self.proxy_nodes.get_mut(proxy).and_then(Option::take) else {
+        let Some(proxy) = self.proxies.get_mut(proxy).and_then(Option::take) else {
             return false;
         };
+        let leaf = proxy.node;
         self.remove_leaf(leaf);
         self.release_node(leaf);
         true
@@ -252,21 +284,106 @@ impl DynamicAabbTree {
 
     /// Update a proxy. Returns true only when the leaf was reinserted.
     pub fn update(&mut self, proxy: usize, bounds: Aabb) -> bool {
-        let Some(leaf) = self.proxy_nodes.get(proxy).and_then(|node| *node) else {
+        let Some(proxy_state) = self.proxies.get(proxy).and_then(|proxy| *proxy) else {
             self.insert(proxy, bounds);
             return true;
         };
+        let leaf = proxy_state.node;
         if self.nodes[leaf].aabb.contains(bounds) {
             return false;
         }
         let removed = self.remove(proxy);
         debug_assert!(removed);
-        self.insert(proxy, bounds);
+        self.insert_with_filter_and_tree(
+            proxy,
+            bounds,
+            proxy_state.group,
+            proxy_state.mask,
+            proxy_state.tree_id,
+        );
         true
+    }
+
+    /// Update a proxy and its cached collision filter.
+    pub fn update_with_filter(
+        &mut self,
+        proxy: usize,
+        bounds: Aabb,
+        group: u32,
+        mask: u32,
+    ) -> bool {
+        let tree_id = self
+            .proxies
+            .get(proxy)
+            .and_then(|proxy| proxy.and_then(|proxy| proxy.tree_id));
+        self.update_with_filter_and_tree(proxy, bounds, group, mask, tree_id)
+    }
+
+    pub fn update_with_filter_and_tree(
+        &mut self,
+        proxy: usize,
+        bounds: Aabb,
+        group: u32,
+        mask: u32,
+        tree_id: Option<usize>,
+    ) -> bool {
+        let Some(proxy_state) = self.proxies.get(proxy).and_then(|proxy| *proxy) else {
+            self.insert_with_filter_and_tree(proxy, bounds, group, mask, tree_id);
+            return true;
+        };
+        let leaf = proxy_state.node;
+        if self.nodes[leaf].aabb.contains(bounds) {
+            self.proxies[proxy] = Some(Proxy {
+                node: leaf,
+                group,
+                mask,
+                tree_id,
+            });
+            return false;
+        }
+        let removed = self.remove(proxy);
+        debug_assert!(removed);
+        self.insert_with_filter_and_tree(proxy, bounds, group, mask, tree_id);
+        true
+    }
+
+    /// Update a live proxy's cached collision filter without changing its AABB.
+    pub fn set_proxy_filter(&mut self, proxy: usize, group: u32, mask: u32) -> bool {
+        let Some(proxy_state) = self.proxies.get_mut(proxy).and_then(Option::as_mut) else {
+            return false;
+        };
+        proxy_state.group = group;
+        proxy_state.mask = mask;
+        true
+    }
+
+    pub fn proxy_filter(&self, proxy: usize) -> Option<(u32, u32)> {
+        self.proxies
+            .get(proxy)
+            .and_then(|proxy| *proxy)
+            .map(|proxy| (proxy.group, proxy.mask))
+    }
+
+    pub fn proxy_tree_id(&self, proxy: usize) -> Option<usize> {
+        self.proxies
+            .get(proxy)
+            .and_then(|proxy| *proxy)
+            .and_then(|proxy| proxy.tree_id)
     }
 
     /// Return all overlapping fat-bound proxy pairs in lexicographic order.
     pub fn compute_pairs(&mut self) -> &[(usize, usize)] {
+        self.compute_pairs_inner(None)
+    }
+
+    pub fn compute_pairs_with_disabled_self_collision(
+        &mut self,
+        disabled: &HashSet<usize>,
+    ) -> &[(usize, usize)] {
+        self.compute_pairs_inner(Some(disabled))
+    }
+
+    fn compute_pairs_inner(&mut self, disabled: Option<&HashSet<usize>>) -> &[(usize, usize)] {
         self.pairs.clear();
         self.pair_stack.clear();
         let Some(root) = self.root else {
@@ -303,7 +420,20 @@ impl DynamicAabbTree {
                     } else {
                         (proxy_b, proxy_a)
                     };
-                    self.pairs.push(pair);
+                    let filter_a = self.proxies[pair.0].unwrap();
+                    let filter_b = self.proxies[pair.1].unwrap();
+                    if should_collide(filter_a.group, filter_a.mask, filter_b.group, filter_b.mask)
+                        && !disabled.is_some_and(|disabled| {
+                            match (filter_a.tree_id, filter_b.tree_id) {
+                                (Some(tree_a), Some(tree_b)) => {
+                                    tree_a == tree_b && disabled.contains(&tree_a)
+                                }
+                                _ => false,
+                            }
+                        })
+                    {
+                        self.pairs.push(pair);
+                    }
                 }
                 (true, false) => self.push_children_against(a, b),
                 (false, true) => self.push_children_against(b, a),

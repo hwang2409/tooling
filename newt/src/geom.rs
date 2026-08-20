@@ -397,6 +397,12 @@ pub struct Geom {
     /// Impedance profile for the constraint solver. See [`SolImp`]. Consulted
     /// by PGS and Newton free-body rows. Default `SolImp::DEFAULT`.
     pub solimp: SolImp,
+    /// Collision groups this geom belongs to. Defaults to all groups.
+    pub collision_group: u32,
+    /// Collision groups this geom wants to contact. Defaults to all groups.
+    pub collision_mask: u32,
+    /// Opaque consumer-owned handle.
+    pub user_data: u64,
 }
 
 /// Combine two geoms' torsional friction coefficients. Rule: `min`, same
@@ -461,6 +467,9 @@ impl Geom {
             torsional_friction: 0.0,
             rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
+            collision_group: u32::MAX,
+            collision_mask: u32::MAX,
+            user_data: 0,
         }
     }
 
@@ -486,6 +495,9 @@ impl Geom {
             torsional_friction: 0.0,
             rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
+            collision_group: u32::MAX,
+            collision_mask: u32::MAX,
+            user_data: 0,
         }
     }
 
@@ -506,6 +518,9 @@ impl Geom {
             torsional_friction: 0.0,
             rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
+            collision_group: u32::MAX,
+            collision_mask: u32::MAX,
+            user_data: 0,
         }
     }
 
@@ -532,6 +547,9 @@ impl Geom {
             torsional_friction: 0.0,
             rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
+            collision_group: u32::MAX,
+            collision_mask: u32::MAX,
+            user_data: 0,
         }
     }
 
@@ -558,6 +576,9 @@ impl Geom {
             torsional_friction: 0.0,
             rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
+            collision_group: u32::MAX,
+            collision_mask: u32::MAX,
+            user_data: 0,
         }
     }
 
@@ -584,6 +605,9 @@ impl Geom {
             torsional_friction: 0.0,
             rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
+            collision_group: u32::MAX,
+            collision_mask: u32::MAX,
+            user_data: 0,
         }
     }
 
@@ -613,6 +637,9 @@ impl Geom {
             torsional_friction: 0.0,
             rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
+            collision_group: u32::MAX,
+            collision_mask: u32::MAX,
+            user_data: 0,
         }
     }
 
@@ -644,6 +671,9 @@ impl Geom {
             torsional_friction: 0.0,
             rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
+            collision_group: u32::MAX,
+            collision_mask: u32::MAX,
+            user_data: 0,
         }
     }
 
@@ -673,6 +703,9 @@ impl Geom {
             torsional_friction: 0.0,
             rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
+            collision_group: u32::MAX,
+            collision_mask: u32::MAX,
+            user_data: 0,
         }
     }
 
@@ -698,6 +731,9 @@ impl Geom {
             torsional_friction: 0.0,
             rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
+            collision_group: u32::MAX,
+            collision_mask: u32::MAX,
+            user_data: 0,
         }
     }
 
@@ -724,6 +760,9 @@ impl Geom {
             torsional_friction: 0.0,
             rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
+            collision_group: u32::MAX,
+            collision_mask: u32::MAX,
+            user_data: 0,
         }
     }
 
@@ -750,6 +789,9 @@ impl Geom {
             torsional_friction: 0.0,
             rolling_friction: 0.0,
             solimp: SolImp::DEFAULT,
+            collision_group: u32::MAX,
+            collision_mask: u32::MAX,
+            user_data: 0,
         }
     }
 
@@ -768,6 +810,19 @@ impl Geom {
     /// Set the contact force-free zone width (m). See the module docs.
     pub fn with_gap(mut self, gap: f32) -> Self {
         self.gap = gap;
+        self
+    }
+
+    /// Set the collision group and contact mask (builder-style).
+    pub fn with_collision_filter(mut self, group: u32, mask: u32) -> Self {
+        self.collision_group = group;
+        self.collision_mask = mask;
+        self
+    }
+
+    /// Set the opaque consumer-owned handle (builder-style).
+    pub fn with_user_data(mut self, user_data: u64) -> Self {
+        self.user_data = user_data;
         self
     }
 }

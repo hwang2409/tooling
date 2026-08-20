@@ -858,9 +858,6 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
     // ---- Trees ----
     let mut trees_by_name: HashMap<String, usize> = HashMap::new();
     let mut links_by_name: Vec<HashMap<String, usize>> = Vec::new();
-    // Track (tree_idx, is_self_collide, link_geom_owned: bool) — used for
-    // self-collision filtering when generating contact pairs.
-    let mut tree_self_collide: Vec<bool> = Vec::new();
     if let Some(v) = optional(root_fields, "trees") {
         let arr = get_array(v, "trees")?;
         for (i, tree_v) in arr.iter().enumerate() {
@@ -873,9 +870,11 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
                 );
             }
             let idx = world.add_tree(tree);
+            if !self_collide {
+                world.disabled_self_collision.insert(idx);
+            }
             trees_by_name.insert(name, idx);
             links_by_name.push(link_names);
-            tree_self_collide.push(self_collide);
         }
     }
 
@@ -1033,22 +1032,12 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
 
     // ---- Contact pair filtering ----
     if let Some(v) = optional(root_fields, "contact_pairs") {
-        world.pair_list = Some(parse_contact_pairs(
-            v,
-            "contact_pairs",
-            &world,
-            &geoms_by_name,
-            &tree_self_collide,
-        )?);
-    } else if tree_self_collide.iter().any(|&s| !s) {
-        // Auto pair list minus geom pairs on the same non-self-colliding
-        // tree. Even if every tree is self_collide=true, we can leave
-        // `pair_list = None` (world uses auto pairs) — the auto list already
-        // drops same-link and same-body pairs.
-        world.pair_list = Some(auto_pairs_with_self_collision_filter(
-            &world,
-            &tree_self_collide,
-        ));
+        let pairs = parse_contact_pairs(v, "contact_pairs", &geoms_by_name)?;
+        if let Some(explicit) = pairs.explicit {
+            world.pair_list = Some(explicit);
+        } else {
+            world.set_auto_pair_exclusions(pairs.disabled);
+        }
     }
 
     // ---- Equalities ----
@@ -1511,6 +1500,9 @@ fn parse_geom(
         torsional_friction,
         rolling_friction,
         solimp,
+        collision_group: u32::MAX,
+        collision_mask: u32::MAX,
+        user_data: 0,
     };
     Ok((geom, name))
 }
@@ -3199,13 +3191,16 @@ fn parse_optional_solimp(
     Ok(s)
 }
 
+struct ContactPairConfig {
+    explicit: Option<Vec<(usize, usize)>>,
+    disabled: Vec<(usize, usize)>,
+}
+
 fn parse_contact_pairs(
     v: &Value,
     path: &str,
-    world: &World,
     geoms_by_name: &HashMap<String, usize>,
-    tree_self_collide: &[bool],
-) -> Result<Vec<(usize, usize)>, ModelError> {
+) -> Result<ContactPairConfig, ModelError> {
     let fields = get_object(v, path)?;
     reject_unknown(fields, &["explicit", "disable"], path)?;
     let has_explicit = optional(fields, "explicit").is_some();
@@ -3224,11 +3219,12 @@ fn parse_contact_pairs(
             let (a, b) = parse_pair(pv, &p, geoms_by_name)?;
             out.push(if a < b { (a, b) } else { (b, a) });
         }
-        return Ok(out);
+        return Ok(ContactPairConfig {
+            explicit: Some(out),
+            disabled: Vec::new(),
+        });
     }
-    // No explicit list. Start with the world's auto-pairs then subtract
-    // disable + apply self-collision.
-    let mut auto = auto_pairs_with_self_collision_filter(world, tree_self_collide);
+    let mut disabled = Vec::new();
     if let Some(v) = optional(fields, "disable") {
         let arr = get_array(v, &format!("{path}.disable"))?;
         let mut disable: Vec<(usize, usize)> = Vec::new();
@@ -3237,9 +3233,12 @@ fn parse_contact_pairs(
             let (a, b) = parse_pair(pv, &p, geoms_by_name)?;
             disable.push(if a < b { (a, b) } else { (b, a) });
         }
-        auto.retain(|pair| !disable.contains(pair));
+        disabled.extend(disable);
     }
-    Ok(auto)
+    Ok(ContactPairConfig {
+        explicit: None,
+        disabled,
+    })
 }
 
 fn parse_pair(
@@ -3263,36 +3262,6 @@ fn parse_pair(
         return fail(path, "contact pair endpoints must be distinct geoms");
     }
     Ok((a, b))
-}
-
-/// Enumerate all valid contact pairs, dropping pairs where both geoms live
-/// on the same tree AND that tree opts out of self-collision. Same
-/// `(min, max)` sorted order as `World::auto_pairs`.
-fn auto_pairs_with_self_collision_filter(
-    world: &World,
-    tree_self_collide: &[bool],
-) -> Vec<(usize, usize)> {
-    use crate::geom::GeomAttach;
-    let mut out = Vec::new();
-    let n = world.geoms.len();
-    for a in 0..n {
-        for b in (a + 1)..n {
-            let att_a = world.geoms[a].attachment();
-            let att_b = world.geoms[b].attachment();
-            if att_a == att_b {
-                continue;
-            }
-            // Same-tree opt-out: if both geoms attach to the same tree AND
-            // that tree has self_collide=false, drop the pair.
-            if let (GeomAttach::Link(ta, _), GeomAttach::Link(tb, _)) = (att_a, att_b) {
-                if ta == tb && !tree_self_collide.get(ta).copied().unwrap_or(true) {
-                    continue;
-                }
-            }
-            out.push((a, b));
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
