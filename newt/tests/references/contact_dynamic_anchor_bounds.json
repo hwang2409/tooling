@@ -9,46 +9,66 @@
       "id": "mesh-mesh-tumble",
       "early": {
         "observed_max": {
-          "position": 0.018640879541635513,
-          "orientation": 0.0032404225785285234,
+          "position": 0.01864086091518402,
+          "orientation": 0.0032404304947704077,
           "contact_count": 0
         },
-        "position": 0.018740879371762276,
-        "orientation": 0.0033404226414859295,
-        "contact_count": 0
+        "position": 0.018740860745310783,
+        "orientation": 0.0033404305577278137,
+        "contact_count": 0,
+        "acceptance_ceiling": {
+          "position": 0.15,
+          "orientation": 0.12,
+          "contact_count": 0
+        }
       },
       "full": {
         "observed_max": {
           "position": 0.12806618213653564,
-          "orientation": 0.0035700753796845675,
+          "orientation": 0.0035701103042811155,
           "contact_count": 0
         },
         "position": 0.12816618382930756,
-        "orientation": 0.0036700754426419735,
-        "contact_count": 0
+        "orientation": 0.0036701103672385216,
+        "contact_count": 0,
+        "acceptance_ceiling": {
+          "position": 0.15,
+          "orientation": 0.12,
+          "contact_count": 0
+        }
       }
     },
     {
       "id": "mesh-mesh-rotated-drop",
       "early": {
         "observed_max": {
-          "position": 0.01886032521724701,
-          "orientation": 0.018947714939713478,
+          "position": 0.018860312178730965,
+          "orientation": 0.018947722390294075,
           "contact_count": 0
         },
-        "position": 0.01896032504737377,
-        "orientation": 0.01904771476984024,
-        "contact_count": 0
+        "position": 0.018960312008857727,
+        "orientation": 0.019047722220420837,
+        "contact_count": 0,
+        "acceptance_ceiling": {
+          "position": 0.15,
+          "orientation": 0.12,
+          "contact_count": 0
+        }
       },
       "full": {
         "observed_max": {
           "position": 0.12913423776626587,
-          "orientation": 0.10184609144926071,
+          "orientation": 0.1018461138010025,
           "contact_count": 0
         },
         "position": 0.12923423945903778,
-        "orientation": 0.10194609314203262,
-        "contact_count": 0
+        "orientation": 0.10194611549377441,
+        "contact_count": 0,
+        "acceptance_ceiling": {
+          "position": 0.15,
+          "orientation": 0.12,
+          "contact_count": 0
+        }
       }
     }
   ]

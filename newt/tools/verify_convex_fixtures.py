@@ -542,6 +542,24 @@ def assert_bounds_cover(measured: dict, reviewed: dict) -> None:
                 )
 
 
+def assert_acceptance_ceiling(measured: dict, reviewed: dict) -> None:
+    reviewed_cases = {case["id"]: case for case in reviewed["cases"]}
+    for measured_case in measured["cases"]:
+        reviewed_case = reviewed_cases.get(measured_case["id"])
+        assert reviewed_case is not None, measured_case["id"]
+        for window in ("early", "full"):
+            observed = measured_case[window]["observed_max"]
+            ceiling = reviewed_case[window]["acceptance_ceiling"]
+            for field in ("position", "orientation", "contact_count"):
+                assert observed[field] <= ceiling[field], (
+                    measured_case["id"],
+                    window,
+                    field,
+                    observed[field],
+                    ceiling[field],
+                )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -576,35 +594,25 @@ def main() -> int:
         (args.references / "contact_dynamic_anchors.json").read_text(encoding="utf-8")
     )
     assert len(expected_dynamic["cases"]) >= 2, "dynamic evidence needs two independent anchors"
-    with tempfile.TemporaryDirectory(prefix="newt-convex-fixtures-") as temp:
-        temp_references = Path(temp)
-        # MuJoCo loads the checked-in XML paths. The temporary directory only
-        # holds canonical comparison data, so this also tests XML provenance.
-        generated_routes = capture_routes(mujoco, args.references)
-        generated_dynamic = {
-            "mujoco": mujoco.__version__,
-            "capture_provenance": {
-                "script": "tools/capture_convex_dynamic_anchors.py",
-                "date": datetime.date.today().isoformat(),
-                "method": "mj_step from each source_xml; snapshots at every step 0 through 100",
-            },
-            "windows": {name: step for name, step in WINDOWS},
-            "cases": [capture_case(mujoco, args.references, case) for case in CASES],
-        }
-        (temp_references / "contact_route_probes.json").write_text(
-            json.dumps(generated_routes, indent=2) + "\n", encoding="utf-8"
-        )
-        (temp_references / "contact_dynamic_anchors.json").write_text(
-            json.dumps(generated_dynamic, indent=2) + "\n", encoding="utf-8"
-        )
-        if not args.ci:
-            assert without_date(generated_routes) == without_date(expected_routes)
-            assert without_date(generated_dynamic) == without_date(expected_dynamic)
-        else:
-            maxima = {field: 0.0 for field in CI_ORACLE_TOLERANCE}
-            compare_route_oracle(expected_routes, generated_routes, maxima)
-            compare_dynamic_oracle(expected_dynamic, generated_dynamic, maxima)
-            print(f"CI MuJoCo capture drift maxima: {maxima}")
+    generated_routes = capture_routes(mujoco, args.references)
+    generated_dynamic = {
+        "mujoco": mujoco.__version__,
+        "capture_provenance": {
+            "script": "tools/capture_convex_dynamic_anchors.py",
+            "date": datetime.date.today().isoformat(),
+            "method": "mj_step from each source_xml; snapshots at every step 0 through 100",
+        },
+        "windows": {name: step for name, step in WINDOWS},
+        "cases": [capture_case(mujoco, args.references, case) for case in CASES],
+    }
+    if not args.ci:
+        assert without_date(generated_routes) == without_date(expected_routes)
+        assert without_date(generated_dynamic) == without_date(expected_dynamic)
+    else:
+        maxima = {field: 0.0 for field in CI_ORACLE_TOLERANCE}
+        compare_route_oracle(expected_routes, generated_routes, maxima)
+        compare_dynamic_oracle(expected_dynamic, generated_dynamic, maxima)
+        print(f"CI MuJoCo capture drift maxima: {maxima}")
     bounds_path = args.references / "contact_dynamic_anchor_bounds.json"
     bounds = json.loads(
         bounds_path.read_text(encoding="utf-8")
@@ -622,6 +630,15 @@ def main() -> int:
         bounds["review_tolerance"],
         WINDOWS,
     )
+    assert_acceptance_ceiling(measured_dynamic, bounds)
+    for measured_case in measured_dynamic["cases"]:
+        reviewed_case = next(
+            case for case in bounds["cases"] if case["id"] == measured_case["id"]
+        )
+        for window in ("early", "full"):
+            measured_case[window]["acceptance_ceiling"] = reviewed_case[window][
+                "acceptance_ceiling"
+            ]
     if args.update_bounds:
         bounds_path.write_text(json.dumps(measured_dynamic, indent=2) + "\n", encoding="utf-8")
     elif args.ci:

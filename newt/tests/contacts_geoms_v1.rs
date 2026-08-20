@@ -360,6 +360,48 @@ fn mesh_mesh_witness_is_invariant_to_vertex_order_and_argument_order() {
 }
 
 #[test]
+fn plane_mesh_contacts_are_invariant_to_vertex_order() {
+    let identity = [0, 1, 2, 3, 4, 5, 6, 7];
+    let permutations = [identity, [7, 6, 5, 4, 3, 2, 1, 0], [1, 0, 3, 2, 5, 4, 7, 6]];
+    let plane = Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5);
+    let plane_pose = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let mesh_geom = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let mesh_pose = GeomPose {
+        position: Vec3::new(0.0, 0.0, -0.1),
+        orientation: Quat::IDENTITY,
+    };
+    let reference_mesh = cube_mesh(identity);
+    let reference = narrow_phase(
+        0,
+        &plane,
+        &plane_pose,
+        1,
+        &mesh_geom,
+        &mesh_pose,
+        std::slice::from_ref(&reference_mesh),
+    );
+    assert_eq!(reference.len, 2);
+    for order in permutations {
+        let meshes = [cube_mesh(order)];
+        let actual = narrow_phase(0, &plane, &plane_pose, 1, &mesh_geom, &mesh_pose, &meshes);
+        assert_eq!(actual.len, reference.len, "vertex order {order:?} count");
+        for (expected, contact) in reference.as_slice().iter().zip(actual.as_slice()) {
+            close_vec(contact.position_world, expected.position_world, 1.0e-6);
+            close_vec(contact.normal_world, expected.normal_world, 1.0e-6);
+            close_scalar(
+                contact.penetration,
+                expected.penetration,
+                1.0e-6,
+                "plane-mesh vertex-order penetration",
+            );
+        }
+    }
+}
+
+#[test]
 fn coincident_mesh_mesh_swapped_order_flips_normal() {
     let mesh = cube_mesh([0, 1, 2, 3, 4, 5, 6, 7]);
     let meshes = [mesh];
@@ -529,6 +571,61 @@ fn mesh_exact_alignment_preserves_contacts_at_feature_dimensions() {
             }
         }
     }
+}
+
+#[test]
+fn convex_ccd_overlap_is_stable_across_scales() {
+    for scale in [1.0e-6, 1.0e-5, 1.0e3] {
+        let mut mesh = triangular_prism_mesh();
+        for vertex in &mut mesh.vertices {
+            *vertex *= scale;
+        }
+        let meshes = [mesh];
+        let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.02 * scale);
+        let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+        let pose_a = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let pose_b = GeomPose {
+            position: Vec3::new(0.001 * scale, 0.0, 0.75 * scale),
+            orientation: Quat::IDENTITY,
+        };
+        let contacts = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &meshes);
+        assert_eq!(contacts.len, 1, "scale {scale} contact count");
+        let contact = contacts.as_slice()[0];
+        assert!(contact.normal_world.z.abs() > 0.9, "scale {scale} normal");
+        assert!(
+            (0.24 * scale..=0.30 * scale).contains(&contact.penetration),
+            "scale {scale} penetration {}",
+            contact.penetration
+        );
+    }
+}
+
+#[test]
+fn high_valence_ccd_overlap_survives_epa_support_cap() {
+    let ring_vertices = 256;
+    let scale = 1.0e3;
+    let vertex_count = ring_vertices * 2;
+    let identity: Vec<usize> = (0..vertex_count).collect();
+    let mesh = regular_prism_mesh_with_order(ring_vertices, scale, &identity);
+    let meshes = [mesh];
+    let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.02 * scale);
+    let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(1.0, 0.0, 0.75 * scale),
+        orientation: Quat::IDENTITY,
+    };
+    let contacts = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &meshes);
+    assert_eq!(contacts.len, 1);
+    let contact = contacts.as_slice()[0];
+    assert!(contact.normal_world.z.abs() > 0.99);
+    assert!((0.24 * scale..=0.30 * scale).contains(&contact.penetration));
 }
 
 #[test]
@@ -2020,6 +2117,19 @@ fn dynamic_enabled_convex_anchors_are_fixture_backed() {
                     window.1
                 );
                 assert_eq!(route_number(observed, "contact_count") as usize, window.2);
+                let ceiling = route_object(window_fixture, "acceptance_ceiling");
+                assert!(
+                    window.0 <= route_number(ceiling, "position"),
+                    "{case_id}/{window_name} position acceptance ceiling"
+                );
+                assert!(
+                    window.1 <= route_number(ceiling, "orientation"),
+                    "{case_id}/{window_name} orientation acceptance ceiling"
+                );
+                assert!(
+                    window.2 <= route_number(ceiling, "contact_count") as usize,
+                    "{case_id}/{window_name} contact acceptance ceiling"
+                );
                 let expected_position_bound = observed_position + DYNAMIC_REVIEW_TOLERANCE;
                 let expected_orientation_bound = observed_orientation + DYNAMIC_REVIEW_TOLERANCE;
                 assert_eq!(

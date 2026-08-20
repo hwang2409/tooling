@@ -1441,30 +1441,58 @@ pub fn mesh_plane(
 ) -> ContactBuf {
     let (n_world, p0) = plane_world(plane_geom, plane_pose);
     let tangent = plane_pose.rotate(Vec3::Y);
+    let (mut min_vertex, mut max_vertex) = (mesh.vertices[0], mesh.vertices[0]);
+    for &vertex in mesh.vertices.iter().skip(1) {
+        min_vertex.x = min_vertex.x.min(vertex.x);
+        min_vertex.y = min_vertex.y.min(vertex.y);
+        min_vertex.z = min_vertex.z.min(vertex.z);
+        max_vertex.x = max_vertex.x.max(vertex.x);
+        max_vertex.y = max_vertex.y.max(vertex.y);
+        max_vertex.z = max_vertex.z.max(vertex.z);
+    }
+    let tie_epsilon = (max_vertex - min_vertex).length() * 1.0e-6;
+    let max_penetration = mesh
+        .vertices
+        .iter()
+        .map(|&vertex| {
+            let world = mesh_pose.point_to_world(vertex);
+            margin - (world - p0).dot(n_world)
+        })
+        .fold(f32::NEG_INFINITY, f32::max);
     let mut primary: Option<(f32, f32, Vec3)> = None;
     let mut secondary: Option<(f32, f32, Vec3)> = None;
     for &v_local in &mesh.vertices {
         let world = mesh_pose.point_to_world(v_local);
         let signed = (world - p0).dot(n_world);
         let pen = margin - signed;
-        if pen < 0.0 {
+        if pen < 0.0 || max_penetration - pen > tie_epsilon {
             continue;
         }
         let tangent_value = world.dot(tangent);
         if primary.is_none_or(|candidate| {
-            pen > candidate.0 || (pen == candidate.0 && tangent_value > candidate.1 + 1.0e-6)
+            tangent_value > candidate.1
+                || (tangent_value == candidate.1 && lexicographically_precedes(world, candidate.2))
         }) {
-            if let Some(previous) = primary {
-                secondary = Some(previous);
-            }
             primary = Some((pen, tangent_value, world));
-        } else if primary.is_some_and(|candidate| {
-            (world - candidate.2).length_squared() > 1.0e-20
+        }
+    }
+    if let Some(primary) = primary {
+        for &v_local in &mesh.vertices {
+            let world = mesh_pose.point_to_world(v_local);
+            let signed = (world - p0).dot(n_world);
+            let pen = margin - signed;
+            if pen < 0.0 {
+                continue;
+            }
+            let tangent_value = world.dot(tangent);
+            if !same_vec3(world, primary.2)
                 && secondary.is_none_or(|prior| {
-                    pen > prior.0 || (pen == prior.0 && tangent_value < prior.1 - 1.0e-6)
+                    tangent_value < prior.1
+                        || (tangent_value == prior.1 && lexicographically_precedes(world, prior.2))
                 })
-        }) {
-            secondary = Some((pen, tangent_value, world));
+            {
+                secondary = Some((pen, tangent_value, world));
+            }
         }
     }
     let mut out = ContactBuf::new();
@@ -2460,7 +2488,7 @@ fn support_vertices_transformed(
 }
 
 fn ccd_support(a: CcdShape<'_>, b: CcdShape<'_>, direction: Vec3) -> CcdVertex {
-    let direction = if direction.length_squared() > 1.0e-20 {
+    let direction = if direction.length_squared() > CCD_DEGENERATE_SQUARED {
         direction
     } else {
         Vec3::X
@@ -2474,6 +2502,17 @@ fn ccd_support(a: CcdShape<'_>, b: CcdShape<'_>, direction: Vec3) -> CcdVertex {
         tie_a,
         tie_b,
     }
+}
+
+fn ccd_support_normalized(
+    shape_a: CcdShape<'_>,
+    shape_b: CcdShape<'_>,
+    direction: Vec3,
+    pair_extent: f32,
+) -> CcdVertex {
+    let mut support = ccd_support(shape_a, shape_b, direction);
+    support.minkowski = support.minkowski / pair_extent;
+    support
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2501,6 +2540,10 @@ const CCD_MESH_CONFIG: CcdSolverConfig = CcdSolverConfig {
     epa_support_epsilon: 1.0e-7,
     max_epa_iterations: 128,
 };
+
+const CCD_DEGENERATE_EPSILON: f32 = 1.0e-12;
+const CCD_DEGENERATE_SQUARED: f32 = CCD_DEGENERATE_EPSILON * CCD_DEGENERATE_EPSILON;
+const CCD_DISTANCE_FLOOR: f32 = CCD_DEGENERATE_SQUARED;
 
 const CCD_HFIELD_CONFIG: CcdSolverConfig = CcdSolverConfig {
     gjk_support_epsilon: 1.0e-7,
@@ -2539,7 +2582,7 @@ fn ccd_simplex_step(simplex: &mut CcdSimplex, direction: &mut Vec3) -> bool {
             let ab = b.minkowski - a.minkowski;
             if ab.dot(ao) > 0.0 {
                 *direction = triple_product(ab, ao, ab);
-                if direction.length_squared() <= 1.0e-20 {
+                if direction.length_squared() <= CCD_DEGENERATE_SQUARED {
                     *direction = Vec3::Z;
                 }
             } else {
@@ -2553,16 +2596,16 @@ fn ccd_simplex_step(simplex: &mut CcdSimplex, direction: &mut Vec3) -> bool {
             let ab = b.minkowski - a.minkowski;
             let ac = c.minkowski - a.minkowski;
             let abc = ab.cross(ac);
-            if abc.length_squared() <= 1.0e-20 {
+            if abc.length_squared() <= CCD_DEGENERATE_SQUARED {
                 simplex.set(&[a, b]);
                 let edge_length_squared = ab.length_squared();
-                let t = if edge_length_squared > 1.0e-20 {
+                let t = if edge_length_squared > CCD_DEGENERATE_SQUARED {
                     clamp01(-a.minkowski.dot(ab) / edge_length_squared)
                 } else {
                     0.0
                 };
                 let closest = a.minkowski + ab * t;
-                if closest.length_squared() > 1.0e-20 {
+                if closest.length_squared() > CCD_DEGENERATE_SQUARED {
                     *direction = -closest;
                     return false;
                 }
@@ -2574,7 +2617,7 @@ fn ccd_simplex_step(simplex: &mut CcdSimplex, direction: &mut Vec3) -> bool {
                     Vec3::Z
                 };
                 *direction = ab.cross(axis);
-                if direction.length_squared() <= 1.0e-20 {
+                if direction.length_squared() <= CCD_DEGENERATE_SQUARED {
                     *direction = ao;
                 }
                 return false;
@@ -2630,7 +2673,7 @@ fn ccd_simplex_step(simplex: &mut CcdSimplex, direction: &mut Vec3) -> bool {
         }
         _ => unreachable!(),
     }
-    if direction.length_squared() <= 1.0e-20 {
+    if direction.length_squared() <= CCD_DEGENERATE_SQUARED {
         *direction = Vec3::X;
     }
     false
@@ -2653,7 +2696,7 @@ fn ccd_centered_witness(
     point_b: Vec3,
     direction: Vec3,
 ) -> (Vec3, Vec3) {
-    let direction = if direction.length_squared() > 1.0e-20 {
+    let direction = if direction.length_squared() > CCD_DEGENERATE_SQUARED {
         direction
     } else {
         Vec3::X
@@ -2718,7 +2761,7 @@ fn ccd_feature_support(
             vertex.shape_b
         }
     };
-    let direction = if direction.length_squared() > 1.0e-20 {
+    let direction = if direction.length_squared() > CCD_DEGENERATE_SQUARED {
         direction.normalize()
     } else {
         return (false, None);
@@ -2754,7 +2797,7 @@ fn ccd_closest_witness(simplex: &CcdSimplex) -> Option<(Vec3, Vec3)> {
             let b = simplex.points[1];
             let edge = b.minkowski - a.minkowski;
             let denominator = edge.length_squared();
-            let t = if denominator > 1.0e-20 {
+            let t = if denominator > CCD_DEGENERATE_SQUARED {
                 clamp01(-a.minkowski.dot(edge) / denominator)
             } else {
                 0.0
@@ -2801,7 +2844,7 @@ fn ccd_origin_inside_tetrahedron(simplex: &CcdSimplex) -> bool {
     let ac = c - a;
     let ad = d - a;
     let denominator = ab.cross(ac).dot(ad);
-    if denominator.abs() <= 1.0e-20 {
+    if denominator.abs() <= CCD_DEGENERATE_SQUARED {
         return false;
     }
     let ao = -a;
@@ -2846,7 +2889,7 @@ fn ccd_distance_candidate(simplex: &CcdSimplex, mask: u8) -> Option<CcdDistanceC
             let b = simplex.points[indices[1]].minkowski;
             let edge = b - a;
             let denominator = edge.length_squared();
-            let t = if denominator > 1.0e-20 {
+            let t = if denominator > CCD_DEGENERATE_SQUARED {
                 clamp01(-a.dot(edge) / denominator)
             } else {
                 0.0
@@ -2857,7 +2900,7 @@ fn ccd_distance_candidate(simplex: &CcdSimplex, mask: u8) -> Option<CcdDistanceC
             let a = simplex.points[indices[0]].minkowski;
             let b = simplex.points[indices[1]].minkowski;
             let c = simplex.points[indices[2]].minkowski;
-            if (b - a).cross(c - a).length_squared() <= 1.0e-20 {
+            if (b - a).cross(c - a).length_squared() <= CCD_DEGENERATE_SQUARED {
                 return None;
             }
             let point = closest_point_on_triangle(Vec3::ZERO, a, b, c);
@@ -2982,7 +3025,7 @@ fn ccd_distance_contact(
         raw_point_b,
         raw_point_b - raw_point_a,
     );
-    let normal_world = if raw_distance > 1.0e-20 {
+    let normal_world = if raw_distance > 0.0 {
         separation / raw_distance
     } else {
         Vec3::X
@@ -3003,6 +3046,7 @@ fn ccd_distance_gjk(
     shape_b: CcdShape<'_>,
     mut simplex: CcdSimplex,
     config: CcdSolverConfig,
+    pair_extent: f32,
 ) -> CcdSimplex {
     let mut best_simplex = simplex;
     let mut best_distance_squared = f32::INFINITY;
@@ -3015,7 +3059,7 @@ fn ccd_distance_gjk(
         debug_assert!(
             distance_squared
                 <= previous_distance_squared
-                    + config.distance_tolerance * previous_distance_squared.max(1.0),
+                    + config.distance_tolerance * previous_distance_squared.max(CCD_DISTANCE_FLOOR),
             "distance simplex reduction increased the distance"
         );
         previous_distance_squared = distance_squared;
@@ -3023,20 +3067,19 @@ fn ccd_distance_gjk(
             best_distance_squared = distance_squared;
             best_simplex = simplex;
         }
-        if distance_squared <= 1.0e-20 {
+        if distance_squared <= CCD_DISTANCE_FLOOR {
             return best_simplex;
         }
         let direction = -closest;
-        let point = ccd_support(shape_a, shape_b, direction);
+        let point = ccd_support_normalized(shape_a, shape_b, direction, pair_extent);
         let support_dot = point.minkowski.dot(direction);
         let support_progress = support_dot - closest.dot(direction);
         if support_progress <= config.gjk_support_epsilon {
             return best_simplex;
         }
-        if simplex.points[..simplex.len]
-            .iter()
-            .any(|candidate| (candidate.minkowski - point.minkowski).length_squared() <= 1.0e-20)
-        {
+        if simplex.points[..simplex.len].iter().any(|candidate| {
+            (candidate.minkowski - point.minkowski).length_squared() <= CCD_DISTANCE_FLOOR
+        }) {
             return best_simplex;
         }
         simplex.push(point);
@@ -3046,7 +3089,8 @@ fn ccd_distance_gjk(
         let next_distance_squared = next_closest.length_squared();
         debug_assert!(
             next_distance_squared
-                <= distance_squared + config.distance_tolerance * distance_squared.max(1.0),
+                <= distance_squared
+                    + config.distance_tolerance * distance_squared.max(CCD_DISTANCE_FLOOR),
             "distance GJK increased the distance"
         );
         if next_distance_squared < best_distance_squared {
@@ -3054,7 +3098,7 @@ fn ccd_distance_gjk(
             best_simplex = simplex;
         }
         let improvement = distance_squared - next_distance_squared;
-        if improvement <= config.distance_tolerance * distance_squared.max(1.0) {
+        if improvement <= config.distance_tolerance * distance_squared.max(CCD_DISTANCE_FLOOR) {
             return best_simplex;
         }
     }
@@ -3128,7 +3172,7 @@ fn ccd_face(vertices: &[CcdVertex; 128], indices: [usize; 3]) -> Option<CcdFace>
     let b = vertices[indices[1]].minkowski;
     let c = vertices[indices[2]].minkowski;
     let raw = (b - a).cross(c - a);
-    if raw.length_squared() <= 1.0e-20 {
+    if raw.length_squared() <= CCD_DEGENERATE_SQUARED {
         return None;
     }
     let mut normal = raw.normalize();
@@ -3186,20 +3230,48 @@ fn ccd_mesh_face_normal(pose: &GeomPose, mesh: &ConvexMesh, face: [u32; 3]) -> O
     let b = pose.point_to_world(mesh.vertices[face[1] as usize]);
     let c = pose.point_to_world(mesh.vertices[face[2] as usize]);
     let normal = (b - a).cross(c - a);
-    (normal.length_squared() > 1.0e-20).then(|| normal.normalize())
+    (normal.length_squared() > 0.0).then(|| normal.normalize())
 }
 
-fn ccd_fallback_face_axis(shape_a: CcdShape<'_>, shape_b: CcdShape<'_>) -> Option<(Vec3, f32)> {
+/// Choose the shallowest deterministic support axis when EPA cannot converge.
+/// The retained polytope, source mesh faces, center axis, and world axes cover
+/// both generated hulls without emitting an unverified EPA face.
+#[allow(clippy::too_many_arguments)]
+fn ccd_epa_fallback_contact(
+    shape_a: CcdShape<'_>,
+    shape_b: CcdShape<'_>,
+    faces: &[CcdFace],
+    pair_extent: f32,
+    idx_a: usize,
+    idx_b: usize,
+    friction: f32,
+    margin: f32,
+    gap: f32,
+) -> Option<Contact> {
     let mut best: Option<(Vec3, f32)> = None;
     let mut consider = |axis: Vec3| {
+        if axis.length_squared() <= CCD_DEGENERATE_SQUARED {
+            return;
+        }
+        let axis = axis.normalize();
         for axis in [axis, -axis] {
-            let support = ccd_support(shape_a, shape_b, axis);
+            let support = ccd_support_normalized(shape_a, shape_b, axis, pair_extent);
             let distance = support.minkowski.dot(axis);
-            if distance > 0.0 && best.is_none_or(|(_, current)| distance < current) {
-                best = Some((axis, distance));
+            if distance <= 0.0
+                || best.is_some_and(|(current_axis, current_distance)| {
+                    distance > current_distance
+                        || (distance == current_distance
+                            && !lexicographically_precedes(axis, current_axis))
+                })
+            {
+                continue;
             }
+            best = Some((axis, distance));
         }
     };
+    for face in faces {
+        consider(face.normal);
+    }
     match shape_a {
         CcdShape::Mesh { pose, mesh } => {
             for &face in &mesh.faces {
@@ -3220,29 +3292,17 @@ fn ccd_fallback_face_axis(shape_a: CcdShape<'_>, shape_b: CcdShape<'_>) -> Optio
         }
         CcdShape::Vertices(_) => {}
     }
-    best
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ccd_fallback_face_contact(
-    shape_a: CcdShape<'_>,
-    shape_b: CcdShape<'_>,
-    idx_a: usize,
-    idx_b: usize,
-    friction: f32,
-    margin: f32,
-    gap: f32,
-) -> Option<Contact> {
-    let (axis, distance) = ccd_fallback_face_axis(shape_a, shape_b)?;
-    let penetration = distance + margin;
-    if penetration <= 0.0 {
-        return None;
+    consider(shape_b.center() - shape_a.center());
+    for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+        consider(axis);
     }
+    let (axis, distance) = best?;
     let support = ccd_support(shape_a, shape_b, axis);
-    Some(Contact {
+    let penetration = distance * pair_extent + margin;
+    (penetration > 0.0).then(|| Contact {
         geom_a: idx_a,
         geom_b: idx_b,
-        position_world: support.shape_b + axis * (distance * 0.5),
+        position_world: support.shape_b + axis * (distance * pair_extent * 0.5),
         normal_world: -axis,
         penetration,
         friction,
@@ -3263,16 +3323,25 @@ fn ccd_convex_contact(
     margin: f32,
     gap: f32,
 ) -> Option<Contact> {
+    let pair_extent = shape_a.extent().max(shape_b.extent());
+    if pair_extent <= 0.0 {
+        return None;
+    }
     let mut direction = shape_b.center() - shape_a.center();
-    if direction.length_squared() <= 1.0e-20 {
+    if direction.length_squared() == 0.0 {
         direction = Vec3::X;
     }
-    let mut simplex = CcdSimplex::new(ccd_support(shape_a, shape_b, direction));
+    let mut simplex = CcdSimplex::new(ccd_support_normalized(
+        shape_a,
+        shape_b,
+        direction,
+        pair_extent,
+    ));
     direction = -simplex.points[0].minkowski;
     let mut enclosed = false;
     let mut separated = false;
     for _ in 0..32 {
-        let point = ccd_support(shape_a, shape_b, direction);
+        let point = ccd_support_normalized(shape_a, shape_b, direction, pair_extent);
         if point.minkowski.dot(direction) <= config.gjk_support_epsilon {
             separated = true;
             break;
@@ -3284,7 +3353,7 @@ fn ccd_convex_contact(
         }
     }
     if !enclosed && separated {
-        simplex = ccd_distance_gjk(shape_a, shape_b, simplex, config);
+        simplex = ccd_distance_gjk(shape_a, shape_b, simplex, config, pair_extent);
     }
     if !enclosed || simplex.len != 4 {
         return ccd_distance_contact(
@@ -3306,7 +3375,7 @@ fn ccd_convex_contact(
         normal: Vec3::Z,
         distance: f32::INFINITY,
     }; 512];
-    let epa_support_epsilon = config.epa_support_epsilon * shape_a.extent().max(shape_b.extent());
+    let epa_support_epsilon = config.epa_support_epsilon;
     let mut face_len = 0;
     for indices in [[0, 1, 2], [0, 3, 1], [0, 2, 3], [1, 3, 2]] {
         if let Some(face) = ccd_face(&vertices, indices) {
@@ -3320,34 +3389,11 @@ fn ccd_convex_contact(
         );
     }
     let mut best_face = faces[0];
-    let low_valence_mesh_pair = matches!(
-        (shape_a, shape_b),
-        (
-            CcdShape::Mesh { mesh: mesh_a, .. },
-            CcdShape::Mesh { mesh: mesh_b, .. }
-        ) if mesh_a.vertices.len() <= 4 && mesh_b.vertices.len() <= 4
-    );
-    let face_distance_epsilon = shape_a.extent().max(shape_b.extent()).max(1.0) * 1.0e-6;
+    let face_distance_epsilon = 1.0e-4;
+    let mut converged = false;
     for _ in 0..config.max_epa_iterations {
-        let has_positive_face = low_valence_mesh_pair
-            && faces[..face_len]
-                .iter()
-                .any(|face| face.distance > face_distance_epsilon);
-        let mut best_index = faces[..face_len]
-            .iter()
-            .position(|face| {
-                !low_valence_mesh_pair
-                    || !has_positive_face
-                    || face.distance > face_distance_epsilon
-            })
-            .unwrap_or(0);
+        let mut best_index = 0;
         for index in 0..face_len {
-            if low_valence_mesh_pair
-                && has_positive_face
-                && faces[index].distance <= face_distance_epsilon
-            {
-                continue;
-            }
             if ccd_face_precedes(
                 &vertices,
                 faces[index],
@@ -3358,12 +3404,18 @@ fn ccd_convex_contact(
             }
         }
         best_face = faces[best_index];
-        let support = ccd_support(shape_a, shape_b, best_face.normal);
+        let support = ccd_support_normalized(shape_a, shape_b, best_face.normal, pair_extent);
         let support_distance = support.minkowski.dot(best_face.normal);
         if support_distance - best_face.distance <= epa_support_epsilon {
+            converged = true;
             break;
         }
         if vertex_len == vertices.len() {
+            break;
+        }
+        if vertices[..vertex_len].iter().any(|vertex| {
+            (vertex.minkowski - support.minkowski).length_squared() <= CCD_DEGENERATE_SQUARED
+        }) {
             break;
         }
         vertices[vertex_len] = support;
@@ -3378,7 +3430,7 @@ fn ccd_convex_contact(
         let mut edges = [[0usize; 2]; 1024];
         let mut edge_len = 0;
         for face in faces[..face_len].iter().copied() {
-            if face.normal.dot(support.minkowski) > face.distance + 1.0e-6 {
+            if face.normal.dot(support.minkowski) > face.distance + face_distance_epsilon {
                 for edge in [
                     [face.indices[0], face.indices[1]],
                     [face.indices[1], face.indices[2]],
@@ -3417,16 +3469,18 @@ fn ccd_convex_contact(
         }
     }
 
-    if low_valence_mesh_pair
-        && (vertex_len == vertices.len()
-            || (best_face.distance > face_distance_epsilon
-                && best_face.distance < shape_a.extent().max(shape_b.extent()) * 1.0e-3))
-    {
-        if let Some(contact) =
-            ccd_fallback_face_contact(shape_a, shape_b, idx_a, idx_b, friction, margin, gap)
-        {
-            return Some(contact);
-        }
+    if !converged {
+        return ccd_epa_fallback_contact(
+            shape_a,
+            shape_b,
+            &faces[..face_len],
+            pair_extent,
+            idx_a,
+            idx_b,
+            friction,
+            margin,
+            gap,
+        );
     }
 
     let nearest = best_face.normal * best_face.distance;
@@ -3453,7 +3507,7 @@ fn ccd_convex_contact(
         [bary.0, bary.1, bary.2],
         best_face.normal,
     );
-    let penetration = best_face.distance + margin;
+    let penetration = best_face.distance * pair_extent + margin;
     if penetration <= 0.0 {
         return None;
     }

@@ -278,12 +278,10 @@ The box-mesh and mesh-mesh probes remain in `contact_route_probes.json` as
 open and shipped findings. Route bounds are reviewed in
 `contact_route_probe_bounds.json`. The shipped mesh-mesh dynamic anchors use
 the executable XML sources and capture every step from 0 through 100. The
-tumble anchor bounds are `0.01874111 / 0.00334043 / 0` for the early window
-and `0.1281665 / 0.00367010 / 0` for the full window. The rotated-drop anchor
-bounds are `0.01874084 / 0.00311405 / 0` for the early window and
-`0.1281642 / 0.00350464 / 0` for the full window. Each position and
+bounds fixture stores per-case early and full-window maxima. Each position and
 orientation bound is the measured per-step replay maximum plus the reviewed
-`1e-4` tolerance. Local `tools/verify_convex_fixtures.py` reruns both pinned
+`1e-4` tolerance. It also stores independent acceptance ceilings for each
+window. Local `tools/verify_convex_fixtures.py` reruns both pinned
 MuJoCo captures, checks byte identity, replays Newt over every captured step,
 computes both window maxima, and rejects bounds that do not equal those
 generated values. This committed-fixture verifier is part of the local
