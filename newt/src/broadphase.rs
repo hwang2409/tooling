@@ -77,7 +77,7 @@ impl Aabb {
             && self.max.z >= other.min.z
     }
 
-    fn contains(self, other: Self) -> bool {
+    pub(crate) fn contains(self, other: Self) -> bool {
         self.min.x <= other.min.x
             && self.min.y <= other.min.y
             && self.min.z <= other.min.z
@@ -187,7 +187,6 @@ pub struct DynamicAabbTree {
     root: Option<usize>,
     pair_stack: Vec<(usize, usize)>,
     pairs: Vec<(usize, usize)>,
-    query_stack: Vec<usize>,
 }
 
 impl Default for DynamicAabbTree {
@@ -205,7 +204,6 @@ impl DynamicAabbTree {
             root: None,
             pair_stack: Vec::new(),
             pairs: Vec::new(),
-            query_stack: Vec::new(),
         }
     }
 
@@ -457,55 +455,51 @@ impl DynamicAabbTree {
     }
 
     /// Visit AABB hits. Return false when the callback requested early exit.
-    pub fn query_aabb<F>(&mut self, bounds: Aabb, mut callback: F) -> bool
+    pub fn query_aabb<F>(&self, bounds: Aabb, mut callback: F) -> bool
     where
         F: FnMut(usize) -> bool,
     {
-        self.query_stack.clear();
-        if let Some(root) = self.root {
-            self.query_stack.push(root);
-        }
-        while let Some(node) = self.query_stack.pop() {
-            let current = self.nodes[node];
-            if !current.aabb.overlaps(bounds) {
-                continue;
-            }
-            if current.is_leaf() {
-                if !callback(current.proxy.unwrap()) {
-                    return false;
-                }
-            } else {
-                self.query_stack.push(current.child2.unwrap());
-                self.query_stack.push(current.child1.unwrap());
-            }
-        }
-        true
+        self.query_aabb_node(self.root, bounds, &mut callback)
     }
 
     /// Visit ray hits. Return false when the callback requested early exit.
-    pub fn query_ray<F>(&mut self, ray: Ray, mut callback: F) -> bool
+    pub fn query_ray<F>(&self, ray: Ray, mut callback: F) -> bool
     where
         F: FnMut(usize) -> bool,
     {
-        self.query_stack.clear();
-        if let Some(root) = self.root {
-            self.query_stack.push(root);
+        self.query_ray_node(self.root, ray, &mut callback)
+    }
+
+    fn query_aabb_node<F>(&self, node: Option<usize>, bounds: Aabb, callback: &mut F) -> bool
+    where
+        F: FnMut(usize) -> bool,
+    {
+        let Some(node) = node else { return true };
+        let current = self.nodes[node];
+        if !current.aabb.overlaps(bounds) {
+            return true;
         }
-        while let Some(node) = self.query_stack.pop() {
-            let current = self.nodes[node];
-            if !current.aabb.ray_hits(ray) {
-                continue;
-            }
-            if current.is_leaf() {
-                if !callback(current.proxy.unwrap()) {
-                    return false;
-                }
-            } else {
-                self.query_stack.push(current.child2.unwrap());
-                self.query_stack.push(current.child1.unwrap());
-            }
+        if current.is_leaf() {
+            return callback(current.proxy.unwrap());
         }
-        true
+        self.query_aabb_node(current.child1, bounds, callback)
+            && self.query_aabb_node(current.child2, bounds, callback)
+    }
+
+    fn query_ray_node<F>(&self, node: Option<usize>, ray: Ray, callback: &mut F) -> bool
+    where
+        F: FnMut(usize) -> bool,
+    {
+        let Some(node) = node else { return true };
+        let current = self.nodes[node];
+        if !current.aabb.ray_hits(ray) {
+            return true;
+        }
+        if current.is_leaf() {
+            return callback(current.proxy.unwrap());
+        }
+        self.query_ray_node(current.child1, ray, callback)
+            && self.query_ray_node(current.child2, ray, callback)
     }
 
     fn push_children_against(&mut self, leaf: usize, branch: usize) {

@@ -12,15 +12,22 @@ pub(super) fn shape<'a>(
     meshes: &'a [ConvexMesh],
 ) -> Option<CcdShape<'a>> {
     match *shape {
+        GeomShape::Sphere { radius } => Some(CcdShape::Sphere { pose, radius }),
+        GeomShape::Box { half_extents } => Some(CcdShape::Box { pose, half_extents }),
+        GeomShape::Capsule {
+            radius,
+            half_height,
+        } => Some(CcdShape::Capsule {
+            pose,
+            radius,
+            half_height,
+        }),
         GeomShape::Mesh { mesh_id } => Some(CcdShape::Mesh {
             pose,
             mesh: &meshes[mesh_id],
         }),
         GeomShape::Plane
         | GeomShape::Hfield { .. }
-        | GeomShape::Sphere { .. }
-        | GeomShape::Box { .. }
-        | GeomShape::Capsule { .. }
         | GeomShape::Cylinder { .. }
         | GeomShape::Ellipsoid { .. } => None,
     }
@@ -38,6 +45,19 @@ pub(super) struct CcdVertex {
 #[derive(Clone, Copy)]
 pub(super) enum CcdShape<'a> {
     Vertices(&'a [Vec3]),
+    Sphere {
+        pose: &'a GeomPose,
+        radius: f32,
+    },
+    Box {
+        pose: &'a GeomPose,
+        half_extents: Vec3,
+    },
+    Capsule {
+        pose: &'a GeomPose,
+        radius: f32,
+        half_height: f32,
+    },
     Mesh {
         pose: &'a GeomPose,
         mesh: &'a ConvexMesh,
@@ -54,25 +74,26 @@ impl CcdShape<'_> {
                     .fold(Vec3::ZERO, |sum, point| sum + point)
                     / vertices.len() as f32
             }
+            Self::Sphere { pose, .. } | Self::Box { pose, .. } | Self::Capsule { pose, .. } => {
+                pose.position
+            }
             Self::Mesh { pose, .. } => pose.position,
         }
     }
 
     fn extent(self) -> f32 {
         let vertices = match self {
-            Self::Vertices(vertices) => vertices,
+            Self::Vertices(vertices) => return vertices_extent(vertices),
+            Self::Sphere { radius, .. } => return radius * 2.0,
+            Self::Box { half_extents, .. } => return (half_extents * 2.0).length(),
+            Self::Capsule {
+                radius,
+                half_height,
+                ..
+            } => return 2.0 * (half_height + radius),
             Self::Mesh { mesh, .. } => &mesh.vertices,
         };
-        let (mut min, mut max) = (vertices[0], vertices[0]);
-        for &vertex in vertices.iter().skip(1) {
-            min.x = min.x.min(vertex.x);
-            min.y = min.y.min(vertex.y);
-            min.z = min.z.min(vertex.z);
-            max.x = max.x.max(vertex.x);
-            max.y = max.y.max(vertex.y);
-            max.z = max.z.max(vertex.z);
-        }
-        (max - min).length()
+        vertices_extent(vertices)
     }
 
     pub(super) fn support(self, direction: Vec3) -> Vec3 {
@@ -87,6 +108,43 @@ impl CcdShape<'_> {
         };
         match self {
             Self::Vertices(vertices) => (support_vertices_legacy(vertices, direction), false),
+            Self::Sphere { pose, radius } => {
+                (pose.position + direction.normalize() * radius, false)
+            }
+            Self::Box { pose, half_extents } => {
+                let local = pose.orientation.inverse_rotate(direction);
+                let point = Vec3::new(
+                    if local.x >= 0.0 {
+                        half_extents.x
+                    } else {
+                        -half_extents.x
+                    },
+                    if local.y >= 0.0 {
+                        half_extents.y
+                    } else {
+                        -half_extents.y
+                    },
+                    if local.z >= 0.0 {
+                        half_extents.z
+                    } else {
+                        -half_extents.z
+                    },
+                );
+                (pose.point_to_world(point), false)
+            }
+            Self::Capsule {
+                pose,
+                radius,
+                half_height,
+            } => {
+                let axis = pose.rotate(Vec3::Z);
+                let endpoint = if direction.dot(axis) >= 0.0 {
+                    pose.position + axis * half_height
+                } else {
+                    pose.position - axis * half_height
+                };
+                (endpoint + direction.normalize() * radius, false)
+            }
             Self::Mesh { pose, mesh } => {
                 support_vertices_transformed(&mesh.vertices, pose, direction)
             }
@@ -96,6 +154,7 @@ impl CcdShape<'_> {
     fn centered_support(self, direction: Vec3) -> Option<Vec3> {
         match self {
             Self::Vertices(_) => None,
+            Self::Sphere { .. } | Self::Box { .. } | Self::Capsule { .. } => None,
             Self::Mesh { pose, mesh } => {
                 let local_direction = pose.orientation.inverse_rotate(direction);
                 support_feature_centroid(&mesh.vertices, local_direction)
@@ -103,6 +162,19 @@ impl CcdShape<'_> {
             }
         }
     }
+}
+
+fn vertices_extent(vertices: &[Vec3]) -> f32 {
+    let (mut min, mut max) = (vertices[0], vertices[0]);
+    for &vertex in vertices.iter().skip(1) {
+        min.x = min.x.min(vertex.x);
+        min.y = min.y.min(vertex.y);
+        min.z = min.z.min(vertex.z);
+        max.x = max.x.max(vertex.x);
+        max.y = max.y.max(vertex.y);
+        max.z = max.z.max(vertex.z);
+    }
+    (max - min).length()
 }
 
 fn support_vertices(vertices: &[Vec3], direction: Vec3) -> (Vec3, bool) {
@@ -1052,7 +1124,10 @@ fn ccd_epa_fallback_contact(
                 }
             }
         }
-        CcdShape::Vertices(_) => {}
+        CcdShape::Vertices(_)
+        | CcdShape::Sphere { .. }
+        | CcdShape::Box { .. }
+        | CcdShape::Capsule { .. } => {}
     }
     match shape_b {
         CcdShape::Mesh { pose, mesh } => {
@@ -1062,7 +1137,10 @@ fn ccd_epa_fallback_contact(
                 }
             }
         }
-        CcdShape::Vertices(_) => {}
+        CcdShape::Vertices(_)
+        | CcdShape::Sphere { .. }
+        | CcdShape::Box { .. }
+        | CcdShape::Capsule { .. } => {}
     }
     consider(shape_b.center() - shape_a.center());
     for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
@@ -1809,6 +1887,61 @@ pub(super) fn ccd_convex_contact(
         friction,
         gap,
     })
+}
+
+/// Sweep two finite convex shapes along a linear translation of shape A.
+///
+/// The GJK/EPA contact routine remains the single narrow-phase source. A
+/// fixed coarse pass brackets the first overlap, then binary search refines
+/// the time of impact. The fixed iteration counts keep the result stable.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn ccd_sweep_convex(
+    shape_a: &GeomShape,
+    from_pose: &GeomPose,
+    to_pose: &GeomPose,
+    shape_b: &GeomShape,
+    pose_b: &GeomPose,
+    meshes: &[ConvexMesh],
+) -> Option<(f32, Contact)> {
+    let mut pose = *from_pose;
+    let shape_b = shape(shape_b, pose_b, meshes)?;
+    let shape_a_from = shape(shape_a, &pose, meshes)?;
+    if let Some(contact) =
+        ccd_convex_contact(shape_a_from, shape_b, CCD_MESH_CONFIG, 0, 0, 0.0, 0.0, 0.0)
+    {
+        return Some((0.0, contact));
+    }
+
+    let delta = to_pose.position - from_pose.position;
+    let mut low = 0.0;
+    let mut high = None;
+    for step in 1..=128 {
+        let t = step as f32 / 128.0;
+        pose.position = from_pose.position + delta * t;
+        let shape_a = shape(shape_a, &pose, meshes)?;
+        if let Some(contact) =
+            ccd_convex_contact(shape_a, shape_b, CCD_MESH_CONFIG, 0, 0, 0.0, 0.0, 0.0)
+        {
+            high = Some((t, contact));
+            break;
+        }
+        low = t;
+    }
+    let (mut high, mut contact) = high?;
+    for _ in 0..24 {
+        let mid = (low + high) * 0.5;
+        pose.position = from_pose.position + delta * mid;
+        let shape_a = shape(shape_a, &pose, meshes)?;
+        if let Some(candidate) =
+            ccd_convex_contact(shape_a, shape_b, CCD_MESH_CONFIG, 0, 0, 0.0, 0.0, 0.0)
+        {
+            high = mid;
+            contact = candidate;
+        } else {
+            low = mid;
+        }
+    }
+    Some((high, contact))
 }
 
 #[allow(clippy::too_many_arguments)]
