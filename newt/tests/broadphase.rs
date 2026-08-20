@@ -1,7 +1,7 @@
 use newt::body::Body;
 use newt::broadphase::{Aabb, DynamicAabbTree, Ray};
 use newt::geom::Geom;
-use newt::math::Vec3;
+use newt::math::{Quat, Vec3};
 use newt::world::{BroadPhaseMode, World};
 
 fn bounds(x: f32, y: f32, z: f32) -> Aabb {
@@ -121,6 +121,26 @@ fn tree_pair_order_is_insertion_order_independent() {
     assert_eq!(forward.compute_pairs(), reverse.compute_pairs());
 }
 
+#[test]
+fn ordered_insertions_keep_tree_depth_logarithmic() {
+    let count = 128;
+    let mut tree = DynamicAabbTree::new();
+    for index in 0..count {
+        tree.insert(index, bounds(index as f32 * 3.0, 0.0, 0.0));
+    }
+    let mut log2 = 0;
+    let mut power = 1;
+    while power < count {
+        power *= 2;
+        log2 += 1;
+    }
+    assert!(
+        tree.max_depth() <= 2 * log2 + 1,
+        "depth = {}",
+        tree.max_depth()
+    );
+}
+
 fn contact_scene(mode: BroadPhaseMode) -> World {
     let mut world = World::new();
     world.gravity = Vec3::new(0.0, 0.0, -9.81);
@@ -160,6 +180,110 @@ fn dynamic_tree_matches_naive_multi_body_contact_baseline() {
     let expected = contact_counts(contact_scene(BroadPhaseMode::Naive), 120);
     let actual = contact_counts(contact_scene(BroadPhaseMode::DynamicAabbTree), 120);
     assert_eq!(actual, expected);
+}
+
+fn margin_scene(mode: BroadPhaseMode, margin_a: f32, margin_b: f32) -> World {
+    let mut world = World::new();
+    world.gravity = Vec3::ZERO;
+    world.broadphase_mode = mode;
+    let body_a = world.add_body(Body::solid_sphere(1.0, 0.5, Vec3::ZERO, Quat::IDENTITY));
+    let body_b = world.add_body(Body::solid_sphere(
+        1.0,
+        0.5,
+        Vec3::new(1.05, 0.0, 0.0),
+        Quat::IDENTITY,
+    ));
+    world.add_geom(Geom::sphere(body_a, 0.5, Vec3::ZERO, 0.5).with_margin(margin_a));
+    world.add_geom(Geom::sphere(body_b, 0.5, Vec3::ZERO, 0.5).with_margin(margin_b));
+    world
+}
+
+#[test]
+fn tree_margin_candidates_match_naive_manifolds() {
+    for (margin_a, margin_b) in [(0.1, 0.0), (0.08, 0.04)] {
+        let mut tree = margin_scene(BroadPhaseMode::DynamicAabbTree, margin_a, margin_b);
+        let naive = margin_scene(BroadPhaseMode::Naive, margin_a, margin_b);
+        assert_eq!(tree.broadphase_pair_count(), 1);
+        assert_eq!(tree.detect_contacts(), naive.detect_contacts());
+    }
+}
+
+fn fast_crossing_scene(mode: BroadPhaseMode) -> World {
+    let mut world = World::new();
+    world.dt = 0.05;
+    world.gravity = Vec3::ZERO;
+    world.broadphase_mode = mode;
+    let body_a = world.add_body(Body::solid_sphere(
+        1.0,
+        0.2,
+        Vec3::new(-0.6, 0.0, 0.0),
+        Quat::IDENTITY,
+    ));
+    let body_b = world.add_body(Body::solid_sphere(
+        1.0,
+        0.2,
+        Vec3::new(0.6, 0.0, 0.0),
+        Quat::IDENTITY,
+    ));
+    world.bodies[body_a].linear_velocity = Vec3::new(20.0, 0.0, 0.0);
+    world.bodies[body_b].linear_velocity = Vec3::new(-20.0, 0.0, 0.0);
+    world.add_geom(Geom::sphere(body_a, 0.2, Vec3::ZERO, 0.0));
+    world.add_geom(Geom::sphere(body_b, 0.2, Vec3::ZERO, 0.0));
+    world
+}
+
+#[test]
+fn swept_bounds_cover_fast_crossing_rk4_contacts() {
+    let mut tree = fast_crossing_scene(BroadPhaseMode::DynamicAabbTree);
+    let mut naive = fast_crossing_scene(BroadPhaseMode::Naive);
+    assert_eq!(tree.detect_contacts(), Vec::new());
+    assert_eq!(tree.broadphase_pair_count(), 1);
+    tree.step();
+    naive.step();
+    assert_eq!(tree.bodies, naive.bodies);
+}
+
+#[test]
+fn swept_bounds_cover_rotating_corner_crossing() {
+    let mut tree = World::new();
+    tree.dt = 0.05;
+    tree.gravity = Vec3::ZERO;
+    tree.broadphase_mode = BroadPhaseMode::DynamicAabbTree;
+    let box_body = tree.add_body(Body::solid_box(
+        1.0,
+        Vec3::new(0.7, 0.05, 0.05),
+        Vec3::ZERO,
+        Quat::IDENTITY,
+    ));
+    let fixture_body = tree.add_body(Body::solid_sphere(
+        1.0,
+        0.05,
+        Vec3::new(0.5, 0.5, 0.0),
+        Quat::IDENTITY,
+    ));
+    tree.bodies[box_body].angular_velocity_body = Vec3::new(0.0, 0.0, 20.0);
+    tree.add_geom(Geom::r#box(
+        box_body,
+        Vec3::new(0.7, 0.05, 0.05),
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        0.0,
+    ));
+    tree.add_geom(Geom::r#box(
+        fixture_body,
+        Vec3::splat(0.05),
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        0.0,
+    ));
+    let mut naive = tree.clone();
+    naive.broadphase_mode = BroadPhaseMode::Naive;
+    assert_eq!(tree.detect_contacts(), Vec::new());
+    assert_eq!(naive.detect_contacts(), Vec::new());
+    assert_eq!(tree.broadphase_pair_count(), 1);
+    tree.step();
+    naive.step();
+    assert_eq!(tree.bodies, naive.bodies);
 }
 
 #[test]

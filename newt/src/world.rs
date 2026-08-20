@@ -54,6 +54,7 @@ use crate::solver::{
 use crate::tree::{
     AbaWorkspace, Tree, euler_step_with_workspace as tree_euler_step_with_workspace,
     forward_kinematics as tree_forward_kinematics,
+    forward_kinematics_into as tree_forward_kinematics_into,
     rk4_step_with_workspace as tree_rk4_step_with_workspace,
 };
 
@@ -175,11 +176,24 @@ pub struct World {
     #[doc(hidden)]
     broadphase_pairs: Vec<(usize, usize)>,
     #[doc(hidden)]
+    broadphase_tree_poses: Vec<Vec<(Vec3, Quat)>>,
+    #[doc(hidden)]
     broadphase_reinsert_count: std::cell::Cell<u64>,
     #[doc(hidden)]
     last_broadphase_mode: BroadPhaseMode,
     #[cfg(feature = "instrumentation")]
     step_timings: StepTimings,
+}
+
+struct BroadphaseInputs<'a> {
+    bodies: &'a [Body],
+    trees: &'a [Tree],
+    geoms: &'a [Geom],
+    meshes: &'a [ConvexMesh],
+    hfields: &'a [HeightField],
+    tree_poses: &'a mut Vec<Vec<(Vec3, Quat)>>,
+    dt: f32,
+    swept: bool,
 }
 
 /// State and contacts consumed by the most recent solver phase.
@@ -305,6 +319,7 @@ impl World {
             tree_aba_workspaces: Vec::new(),
             broadphase: DynamicAabbTree::new(),
             broadphase_pairs: Vec::new(),
+            broadphase_tree_poses: Vec::new(),
             broadphase_reinsert_count: std::cell::Cell::new(0),
             last_broadphase_mode: BroadPhaseMode::DynamicAabbTree,
             #[cfg(feature = "instrumentation")]
@@ -360,7 +375,10 @@ impl World {
     /// Return the current broad-phase candidate count.
     #[doc(hidden)]
     pub fn broadphase_pair_count(&mut self) -> usize {
-        self.active_pairs().len()
+        let pairs = self.active_pairs();
+        let count = pairs.len();
+        self.restore_broadphase_pairs(pairs);
+        count
     }
 
     /// Capture the current state through the same solver assembly used at the
@@ -376,6 +394,7 @@ impl World {
         let contacts = self.detect_contacts_for_step(&pairs);
         let solution = self.solver_phase_solution(&contacts);
         self.record_solver_phase(state, solution.as_ref(), &contacts);
+        self.restore_broadphase_pairs(pairs);
     }
 
     /// Add a sensor to the world's sensor bank. Validates the sensor's
@@ -766,7 +785,13 @@ impl World {
             return self.auto_pairs();
         }
         self.update_broadphase();
-        self.broadphase_pairs.clone()
+        std::mem::take(&mut self.broadphase_pairs)
+    }
+
+    fn restore_broadphase_pairs(&mut self, pairs: Vec<(usize, usize)>) {
+        if self.pair_list.is_none() && self.broadphase_mode == BroadPhaseMode::DynamicAabbTree {
+            self.broadphase_pairs = pairs;
+        }
     }
 
     fn update_broadphase(&mut self) {
@@ -775,14 +800,17 @@ impl World {
             self.broadphase_pairs.clear();
             self.last_broadphase_mode = self.broadphase_mode;
         }
-        let reinserts = Self::populate_broadphase_tree(
-            &mut self.broadphase,
-            &self.bodies,
-            &self.trees,
-            &self.geoms,
-            &self.meshes,
-            &self.hfields,
-        );
+        let inputs = BroadphaseInputs {
+            bodies: &self.bodies,
+            trees: &self.trees,
+            geoms: &self.geoms,
+            meshes: &self.meshes,
+            hfields: &self.hfields,
+            tree_poses: &mut self.broadphase_tree_poses,
+            dt: self.dt,
+            swept: true,
+        };
+        let reinserts = Self::populate_broadphase_tree(&mut self.broadphase, inputs);
         if reinserts > 0 {
             self.broadphase_reinsert_count
                 .set(self.broadphase_reinsert_count.get() + reinserts);
@@ -798,14 +826,18 @@ impl World {
 
     fn temporary_broadphase_pairs(&self) -> Vec<(usize, usize)> {
         let mut tree = DynamicAabbTree::new();
-        Self::populate_broadphase_tree(
-            &mut tree,
-            &self.bodies,
-            &self.trees,
-            &self.geoms,
-            &self.meshes,
-            &self.hfields,
-        );
+        let mut tree_poses = Vec::new();
+        let inputs = BroadphaseInputs {
+            bodies: &self.bodies,
+            trees: &self.trees,
+            geoms: &self.geoms,
+            meshes: &self.meshes,
+            hfields: &self.hfields,
+            tree_poses: &mut tree_poses,
+            dt: self.dt,
+            swept: false,
+        };
+        Self::populate_broadphase_tree(&mut tree, inputs);
         tree.compute_pairs()
             .iter()
             .copied()
@@ -813,33 +845,89 @@ impl World {
             .collect()
     }
 
-    fn populate_broadphase_tree(
-        tree: &mut DynamicAabbTree,
-        bodies: &[Body],
-        trees: &[Tree],
-        geoms: &[Geom],
-        meshes: &[ConvexMesh],
-        hfields: &[HeightField],
-    ) -> u64 {
-        let tree_poses: Vec<Vec<(Vec3, Quat)>> =
-            trees.iter().map(tree_forward_kinematics).collect();
+    fn populate_broadphase_tree(tree: &mut DynamicAabbTree, inputs: BroadphaseInputs<'_>) -> u64 {
+        inputs.tree_poses.resize_with(inputs.trees.len(), Vec::new);
+        for (scratch, tree) in inputs.tree_poses.iter_mut().zip(inputs.trees) {
+            tree_forward_kinematics_into(tree, scratch);
+        }
         let mut reinserts = 0;
-        for (geom_index, geom) in geoms.iter().enumerate() {
+        for (geom_index, geom) in inputs.geoms.iter().enumerate() {
             let pose = match geom.attachment() {
                 GeomAttach::Static => geom_world_pose(geom, Vec3::ZERO, Quat::IDENTITY),
-                GeomAttach::Body(body) => {
-                    geom_world_pose(geom, bodies[body].position, bodies[body].orientation)
-                }
+                GeomAttach::Body(body) => geom_world_pose(
+                    geom,
+                    inputs.bodies[body].position,
+                    inputs.bodies[body].orientation,
+                ),
                 GeomAttach::Link(tree_index, link) => {
-                    let (position, orientation) = tree_poses[tree_index][link];
+                    let (position, orientation) = inputs.tree_poses[tree_index][link];
                     geom_world_pose(geom, position, orientation)
                 }
             };
-            if tree.update(geom_index, geom_aabb(geom, &pose, meshes, hfields)) {
+            let bound = if inputs.swept {
+                Self::swept_geom_bound(geom, &pose, &inputs)
+            } else {
+                geom_aabb(geom, &pose, inputs.meshes, inputs.hfields)
+            };
+            if tree.update(geom_index, bound.expanded(geom.margin)) {
                 reinserts += 1;
             }
         }
         reinserts
+    }
+
+    fn swept_geom_bound(
+        geom: &Geom,
+        start_pose: &GeomPose,
+        inputs: &BroadphaseInputs<'_>,
+    ) -> crate::broadphase::Aabb {
+        let end_pose = match geom.attachment() {
+            GeomAttach::Static => *start_pose,
+            GeomAttach::Body(body) => {
+                let state = &inputs.bodies[body];
+                geom_world_pose(
+                    geom,
+                    state.position + state.linear_velocity * inputs.dt,
+                    state
+                        .orientation
+                        .integrate_body_angular_velocity(state.angular_velocity_body, inputs.dt),
+                )
+            }
+            GeomAttach::Link(tree_index, link) => {
+                let tree = &inputs.trees[tree_index];
+                let (velocity, angular_velocity) =
+                    link_world_velocity(tree, link, &inputs.tree_poses[tree_index]);
+                let (position, orientation) = inputs.tree_poses[tree_index][link];
+                geom_world_pose(
+                    geom,
+                    position + velocity * inputs.dt,
+                    orientation.integrate_body_angular_velocity(
+                        orientation.inverse_rotate(angular_velocity),
+                        inputs.dt,
+                    ),
+                )
+            }
+        };
+        let start_bound = geom_aabb(geom, start_pose, inputs.meshes, inputs.hfields);
+        let end_bound = geom_aabb(geom, &end_pose, inputs.meshes, inputs.hfields);
+        let angular_speed = match geom.attachment() {
+            GeomAttach::Body(body) => inputs.bodies[body].angular_velocity_world().length(),
+            GeomAttach::Link(tree_index, link) => link_world_velocity(
+                &inputs.trees[tree_index],
+                link,
+                &inputs.tree_poses[tree_index],
+            )
+            .1
+            .length(),
+            GeomAttach::Static => 0.0,
+        };
+        let extent = (start_bound.max - start_bound.min) * 0.5;
+        let rotation_sweep = if angular_speed > 0.0 && extent.length().is_finite() {
+            (geom.local_offset.length() + extent.length()) * angular_speed * inputs.dt
+        } else {
+            0.0
+        };
+        start_bound.union(end_bound).expanded(rotation_sweep)
     }
 
     /// Read-only accessor: current world-frame COM position + orientation of
@@ -952,6 +1040,8 @@ impl World {
         // or geom-count change panics if any ACTIVE pair falls in the
         // deferred bucket. Prevents a stack.json-style silent no-op.
         self.assert_pairs_supported();
+        let uses_broadphase_buffer =
+            self.pair_list.is_none() && self.broadphase_mode == BroadPhaseMode::DynamicAabbTree;
         let pairs = self.active_pairs();
         let contacts = matches!(self.solver.mode, SolverMode::Pgs | SolverMode::Newton)
             .then(|| self.detect_contacts_for_step(&pairs));
@@ -1001,6 +1091,9 @@ impl World {
             } else {
                 self.evaluate_sensors(&pairs);
             }
+        }
+        if uses_broadphase_buffer {
+            self.broadphase_pairs = pairs;
         }
         #[cfg(feature = "instrumentation")]
         {

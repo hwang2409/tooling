@@ -32,6 +32,11 @@ impl Aabb {
         Self::new(center - extents, center + extents)
     }
 
+    pub fn expanded(self, margin: f32) -> Self {
+        let margin = Vec3::splat(margin);
+        Self::new(self.min - margin, self.max + margin)
+    }
+
     fn fatten(self) -> Self {
         let extent = self.max - self.min;
         let margin = Vec3::new(
@@ -199,6 +204,20 @@ impl DynamicAabbTree {
 
     pub fn is_empty(&self) -> bool {
         self.root.is_none()
+    }
+
+    #[doc(hidden)]
+    pub fn max_depth(&self) -> usize {
+        fn depth(nodes: &[Node], node: Option<usize>) -> usize {
+            let Some(index) = node else { return 0 };
+            let current = nodes[index];
+            if current.is_leaf() {
+                1
+            } else {
+                1 + depth(nodes, current.child1).max(depth(nodes, current.child2))
+            }
+        }
+        depth(&self.nodes, self.root)
     }
 
     pub fn contains_proxy(&self, proxy: usize) -> bool {
@@ -472,16 +491,92 @@ impl DynamicAabbTree {
 
     fn fix_upward(&mut self, mut node: Option<usize>) {
         while let Some(index) = node {
-            let current = self.nodes[index];
-            if !current.is_leaf() {
-                let child1 = current.child1.unwrap();
-                let child2 = current.child2.unwrap();
-                self.nodes[index].aabb = self.nodes[child1].aabb.union(self.nodes[child2].aabb);
-                self.nodes[index].height =
+            let balanced = self.balance(index);
+            let child1 = self.nodes[balanced].child1;
+            let child2 = self.nodes[balanced].child2;
+            if let (Some(child1), Some(child2)) = (child1, child2) {
+                self.nodes[balanced].aabb = self.nodes[child1].aabb.union(self.nodes[child2].aabb);
+                self.nodes[balanced].height =
                     1 + self.nodes[child1].height.max(self.nodes[child2].height);
             }
-            node = current.parent;
+            node = self.nodes[balanced].parent;
         }
+    }
+
+    // Rotations use child1 on equal heights. This left-first tie break makes
+    // insertion order and all later tree shapes deterministic.
+    fn balance(&mut self, index: usize) -> usize {
+        let node = self.nodes[index];
+        if node.is_leaf() || node.height < 2 {
+            return index;
+        }
+        let left = node.child1.unwrap();
+        let right = node.child2.unwrap();
+        let balance = self.nodes[right].height - self.nodes[left].height;
+        if balance > 1 {
+            let right_left = self.nodes[right].child1.unwrap();
+            let right_right = self.nodes[right].child2.unwrap();
+            self.nodes[right].parent = node.parent;
+            self.nodes[right].child1 = Some(index);
+            self.nodes[index].parent = Some(right);
+            self.replace_child(node.parent, index, right);
+            if self.nodes[right_left].height >= self.nodes[right_right].height {
+                self.nodes[right].child2 = Some(right_left);
+                self.nodes[index].child2 = Some(right_right);
+                self.nodes[right_left].parent = Some(right);
+                self.nodes[right_right].parent = Some(index);
+            } else {
+                self.nodes[right].child2 = Some(right_right);
+                self.nodes[index].child2 = Some(right_left);
+                self.nodes[right_right].parent = Some(right);
+                self.nodes[right_left].parent = Some(index);
+            }
+            self.recompute(index);
+            self.recompute(right);
+            return right;
+        }
+        if balance < -1 {
+            let left_left = self.nodes[left].child1.unwrap();
+            let left_right = self.nodes[left].child2.unwrap();
+            self.nodes[left].parent = node.parent;
+            self.nodes[left].child2 = Some(index);
+            self.nodes[index].parent = Some(left);
+            self.replace_child(node.parent, index, left);
+            if self.nodes[left_left].height >= self.nodes[left_right].height {
+                self.nodes[left].child1 = Some(left_left);
+                self.nodes[index].child1 = Some(left_right);
+                self.nodes[left_left].parent = Some(left);
+                self.nodes[left_right].parent = Some(index);
+            } else {
+                self.nodes[left].child1 = Some(left_right);
+                self.nodes[index].child1 = Some(left_left);
+                self.nodes[left_right].parent = Some(left);
+                self.nodes[left_left].parent = Some(index);
+            }
+            self.recompute(index);
+            self.recompute(left);
+            return left;
+        }
+        index
+    }
+
+    fn replace_child(&mut self, parent: Option<usize>, old: usize, new: usize) {
+        if let Some(parent) = parent {
+            if self.nodes[parent].child1 == Some(old) {
+                self.nodes[parent].child1 = Some(new);
+            } else {
+                self.nodes[parent].child2 = Some(new);
+            }
+        } else {
+            self.root = Some(new);
+        }
+    }
+
+    fn recompute(&mut self, index: usize) {
+        let child1 = self.nodes[index].child1.unwrap();
+        let child2 = self.nodes[index].child2.unwrap();
+        self.nodes[index].aabb = self.nodes[child1].aabb.union(self.nodes[child2].aabb);
+        self.nodes[index].height = 1 + self.nodes[child1].height.max(self.nodes[child2].height);
     }
 }
 

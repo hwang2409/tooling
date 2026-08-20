@@ -2,15 +2,20 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use newt::body::Body;
+use newt::geom::Geom;
+use newt::math::{Quat, Vec3};
 use newt::mjcf::load_mjcf_path;
 use newt::solver::SolverMode;
-use newt::world::Integrator;
+use newt::world::{BroadPhaseMode, Integrator, World};
 
 struct CountingAllocator;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static ALLOCATION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 // SAFETY: each operation forwards its valid arguments to the system allocator.
 unsafe impl GlobalAlloc for CountingAllocator {
@@ -45,6 +50,7 @@ fn allocation_count() -> usize {
 
 #[test]
 fn optimized_euler_muscle_step_allocations_are_stable() {
+    let _lock = ALLOCATION_TEST_LOCK.lock().unwrap();
     const STEPS: usize = 16;
     // Each step allocates: tendon (2), external-force (2), and acceleration
     // result buffers. Previous state (tier-3 first optimization pass) held at
@@ -74,4 +80,36 @@ fn optimized_euler_muscle_step_allocations_are_stable() {
             .all(|&count| count == EXPECTED_ALLOCATIONS)
     );
     assert_eq!(allocations[0], EXPECTED_ALLOCATIONS);
+}
+
+#[test]
+fn warmed_broadphase_updates_do_not_allocate() {
+    let _lock = ALLOCATION_TEST_LOCK.lock().unwrap();
+    let mut world = World::new();
+    world.gravity = Vec3::ZERO;
+    world.broadphase_mode = BroadPhaseMode::DynamicAabbTree;
+    for index in 0..500 {
+        let body = world.add_body(Body::solid_sphere(
+            1.0,
+            0.1,
+            Vec3::new(index as f32 * 2.0, 0.0, 0.0),
+            Quat::IDENTITY,
+        ));
+        world.add_geom(Geom::sphere(body, 0.1, Vec3::ZERO, 0.0));
+    }
+
+    for _ in 0..4 {
+        world.broadphase_pair_count();
+    }
+    reset_allocations();
+    for _ in 0..100 {
+        assert_eq!(world.broadphase_pair_count(), 0);
+    }
+    assert_eq!(allocation_count(), 0);
+
+    reset_allocations();
+    for _ in 0..100 {
+        assert_eq!(world.broadphase_pair_count(), 0);
+    }
+    assert_eq!(allocation_count(), 0);
 }
