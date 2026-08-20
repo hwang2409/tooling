@@ -4,6 +4,7 @@ use newt::math::{Quat, Vec3};
 use newt::mjcf::load_mjcf_str;
 use newt::model::load_str;
 use newt::world::World;
+use std::fmt::Write as _;
 use std::panic::{self, AssertUnwindSafe};
 
 fn pair_world(a_group: u32, a_mask: u32, b_group: u32, b_mask: u32) -> World {
@@ -234,26 +235,47 @@ fn loaded_mjcf_filters_apply_after_runtime_mutation() {
 
 #[test]
 fn disabled_tree_self_collision_is_compact_and_runtime_toggleable() {
-    let json = r#"{
-        "version":"1",
-        "trees":[{"name":"tree","self_collide":false,"links":[
-            {"name":"root","joint":{"kind":"fixed"},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}},
-            {"name":"child","parent":"root","joint":{"kind":"fixed"},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}}
-        ]}],
-        "geoms":[
-            {"name":"root_geom","shape":{"kind":"sphere","radius":0.5},"attach":{"kind":"link","tree":"tree","link":"root"}},
-            {"name":"child_geom","shape":{"kind":"sphere","radius":0.5},"attach":{"kind":"link","tree":"tree","link":"child"}}
-        ]
-    }"#;
-    let mut json_world = load_str(json).unwrap().world;
+    let link_count = 128;
+    let mut links = String::new();
+    let mut geoms = String::new();
+    for index in 0..link_count {
+        if index != 0 {
+            links.push(',');
+            geoms.push(',');
+        }
+        if index == 0 {
+            write!(
+                links,
+                r#"{{"name":"link{index}","joint":{{"kind":"fixed"}},"mass":1,"inertia":{{"kind":"diag","values":[1,1,1]}}}}"#
+            )
+            .unwrap();
+        } else {
+            write!(
+                links,
+                r#"{{"name":"link{index}","parent":"link{}","joint":{{"kind":"fixed"}},"mass":1,"inertia":{{"kind":"diag","values":[1,1,1]}}}}"#,
+                index - 1
+            )
+            .unwrap();
+        }
+        write!(
+            geoms,
+            r#"{{"name":"geom{index}","shape":{{"kind":"sphere","radius":0.5}},"attach":{{"kind":"link","tree":"tree","link":"link{index}"}}}}"#
+        )
+        .unwrap();
+    }
+    let json = format!(
+        r#"{{"version":"1","trees":[{{"name":"tree","self_collide":false,"links":[{links}]}}],"geoms":[{geoms}]}}"#
+    );
+    let mut json_world = load_str(&json).unwrap().world;
+    // NEWT-44 R2#1: keep this large enough to catch quadratic exclusion materialization.
     assert_eq!(json_world.auto_pair_exclusion_count(), 0);
     assert_eq!(json_world.broadphase_pair_count(), 0);
-    json_world.step();
     json_world.set_tree_self_collision(0, true).unwrap();
-    json_world.step();
-    assert_eq!(json_world.broadphase_pair_count(), 1);
+    assert_eq!(
+        json_world.broadphase_pair_count(),
+        link_count * (link_count - 1) / 2
+    );
     json_world.set_tree_self_collision(0, false).unwrap();
-    json_world.step();
     assert_eq!(json_world.broadphase_pair_count(), 0);
     json_world.pair_list = Some(vec![(0, 1)]);
     assert_eq!(json_world.detect_contacts().len(), 1);
