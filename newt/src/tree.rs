@@ -751,6 +751,13 @@ impl Default for Tree {
 /// The returned vector is indexed by link index.
 pub fn forward_kinematics(tree: &Tree) -> Vec<(Vec3, Quat)> {
     let mut out: Vec<(Vec3, Quat)> = Vec::with_capacity(tree.links.len());
+    forward_kinematics_into(tree, &mut out);
+    out
+}
+
+pub(crate) fn forward_kinematics_into(tree: &Tree, out: &mut Vec<(Vec3, Quat)>) {
+    out.clear();
+    out.reserve(tree.links.len().saturating_sub(out.capacity()));
     for (i, link) in tree.links.iter().enumerate() {
         let pose = match link.joint {
             JointKind::Free => {
@@ -835,7 +842,6 @@ pub fn forward_kinematics(tree: &Tree) -> Vec<(Vec3, Quat)> {
         };
         out.push(pose);
     }
-    out
 }
 
 // ---------------------------------------------------------------------------
