@@ -78,6 +78,7 @@ pub mod actuator;
 #[doc(hidden)]
 pub mod benchmark;
 pub mod body;
+pub mod broadphase;
 pub mod contact;
 pub mod dynamics;
 pub mod equality;

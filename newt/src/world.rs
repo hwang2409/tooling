@@ -36,6 +36,7 @@
 //!   [`crate::math`] appear in the compute path.
 
 use crate::body::Body;
+use crate::broadphase::{DynamicAabbTree, geom_aabb};
 use crate::contact::{
     Contact, is_pair_supported, narrow_phase_solver_with_hfields, narrow_phase_with_hfields,
 };
@@ -86,6 +87,16 @@ impl Integrator {
     pub const Implicit: Self = Self::ImplicitFast;
 }
 
+/// Broad-phase pair generation strategy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BroadPhaseMode {
+    /// Dynamic AABB tree with fat bounds.
+    #[default]
+    DynamicAabbTree,
+    /// Quadratic fallback kept for comparison and diagnostics.
+    Naive,
+}
+
 /// Simulation world.
 #[derive(Clone, Debug)]
 pub struct World {
@@ -113,9 +124,11 @@ pub struct World {
     pub hfields: Vec<HeightField>,
     /// Optional explicit pair list `(geom_a, geom_b)` with `a < b`. When
     /// `None`, contact detection enumerates every unordered geom pair whose
-    /// two geoms don't share a body/link and aren't both static; the
-    /// resulting order is `(min, max)` lexicographic.
+    /// two geoms don't share a body/link and aren't both static. The dynamic
+    /// tree returns the candidate subset in `(min, max)` lexicographic order.
     pub pair_list: Option<Vec<(usize, usize)>>,
+    /// Broad-phase strategy used when `pair_list` is `None`.
+    pub broadphase_mode: BroadPhaseMode,
     /// Constraint solver configuration. Default is
     /// [`SolverConfig::DEFAULT`] — `SolverMode::Penalty`, the legacy force
     /// path. Set to `SolverMode::Pgs` or `SolverMode::Newton` to switch on a
@@ -157,6 +170,14 @@ pub struct World {
     last_solver_phase: Option<SolverPhaseDiagnostics>,
     #[doc(hidden)]
     tree_aba_workspaces: Vec<AbaWorkspace>,
+    #[doc(hidden)]
+    broadphase: DynamicAabbTree,
+    #[doc(hidden)]
+    broadphase_pairs: Vec<(usize, usize)>,
+    #[doc(hidden)]
+    broadphase_reinsert_count: std::cell::Cell<u64>,
+    #[doc(hidden)]
+    last_broadphase_mode: BroadPhaseMode,
     #[cfg(feature = "instrumentation")]
     step_timings: StepTimings,
 }
@@ -236,6 +257,7 @@ impl PartialEq for World {
             && self.meshes == other.meshes
             && self.hfields == other.hfields
             && self.pair_list == other.pair_list
+            && self.broadphase_mode == other.broadphase_mode
             && self.solver == other.solver
             && self.equalities == other.equalities
             && self.sensors == other.sensors
@@ -271,6 +293,7 @@ impl World {
             meshes: Vec::new(),
             hfields: Vec::new(),
             pair_list: None,
+            broadphase_mode: BroadPhaseMode::DynamicAabbTree,
             solver: SolverConfig::DEFAULT,
             equalities: Vec::new(),
             sensors: SensorBank::new(),
@@ -280,6 +303,10 @@ impl World {
             solver_phase_capture: false,
             last_solver_phase: None,
             tree_aba_workspaces: Vec::new(),
+            broadphase: DynamicAabbTree::new(),
+            broadphase_pairs: Vec::new(),
+            broadphase_reinsert_count: std::cell::Cell::new(0),
+            last_broadphase_mode: BroadPhaseMode::DynamicAabbTree,
             #[cfg(feature = "instrumentation")]
             step_timings: StepTimings::default(),
         }
@@ -318,6 +345,24 @@ impl World {
         self.contact_detection_count.set(0);
     }
 
+    /// Return the number of dynamic-tree leaf reinserts since world creation.
+    #[doc(hidden)]
+    pub fn broadphase_reinsert_count(&self) -> u64 {
+        self.broadphase_reinsert_count.get()
+    }
+
+    /// Reset the dynamic-tree reinsert counter used by broad-phase tests.
+    #[doc(hidden)]
+    pub fn reset_broadphase_reinsert_count(&self) {
+        self.broadphase_reinsert_count.set(0);
+    }
+
+    /// Return the current broad-phase candidate count.
+    #[doc(hidden)]
+    pub fn broadphase_pair_count(&mut self) -> usize {
+        self.active_pairs().len()
+    }
+
     /// Capture the current state through the same solver assembly used at the
     /// start of [`World::step`], without integrating. This supports an initial
     /// step-zero diagnostic record.
@@ -326,10 +371,7 @@ impl World {
             .validate()
             .unwrap_or_else(|message| panic!("{message}"));
         self.assert_pairs_supported();
-        let pairs = match &self.pair_list {
-            Some(p) => p.clone(),
-            None => self.auto_pairs(),
-        };
+        let pairs = self.active_pairs();
         let state = self.solver_phase_state();
         let contacts = self.detect_contacts_for_step(&pairs);
         let solution = self.solver_phase_solution(&contacts);
@@ -654,7 +696,7 @@ impl World {
     /// cylinder/ellipsoid/mesh combinations.
     pub fn validate_supported_pairs(&self) -> Vec<UnsupportedPair> {
         let pairs = match &self.pair_list {
-            Some(p) => p.clone(),
+            Some(pairs) => pairs.clone(),
             None => self.auto_pairs(),
         };
         let mut out = Vec::new();
@@ -714,6 +756,90 @@ impl World {
             }
         }
         out
+    }
+
+    fn active_pairs(&mut self) -> Vec<(usize, usize)> {
+        if let Some(pairs) = &self.pair_list {
+            return pairs.clone();
+        }
+        if self.broadphase_mode == BroadPhaseMode::Naive {
+            return self.auto_pairs();
+        }
+        self.update_broadphase();
+        self.broadphase_pairs.clone()
+    }
+
+    fn update_broadphase(&mut self) {
+        if self.last_broadphase_mode != self.broadphase_mode {
+            self.broadphase = DynamicAabbTree::new();
+            self.broadphase_pairs.clear();
+            self.last_broadphase_mode = self.broadphase_mode;
+        }
+        let reinserts = Self::populate_broadphase_tree(
+            &mut self.broadphase,
+            &self.bodies,
+            &self.trees,
+            &self.geoms,
+            &self.meshes,
+            &self.hfields,
+        );
+        if reinserts > 0 {
+            self.broadphase_reinsert_count
+                .set(self.broadphase_reinsert_count.get() + reinserts);
+        }
+        self.broadphase_pairs.clear();
+        let tree_pairs = self.broadphase.compute_pairs();
+        for &(a, b) in tree_pairs {
+            if self.geoms[a].attachment() != self.geoms[b].attachment() {
+                self.broadphase_pairs.push((a, b));
+            }
+        }
+    }
+
+    fn temporary_broadphase_pairs(&self) -> Vec<(usize, usize)> {
+        let mut tree = DynamicAabbTree::new();
+        Self::populate_broadphase_tree(
+            &mut tree,
+            &self.bodies,
+            &self.trees,
+            &self.geoms,
+            &self.meshes,
+            &self.hfields,
+        );
+        tree.compute_pairs()
+            .iter()
+            .copied()
+            .filter(|&(a, b)| self.geoms[a].attachment() != self.geoms[b].attachment())
+            .collect()
+    }
+
+    fn populate_broadphase_tree(
+        tree: &mut DynamicAabbTree,
+        bodies: &[Body],
+        trees: &[Tree],
+        geoms: &[Geom],
+        meshes: &[ConvexMesh],
+        hfields: &[HeightField],
+    ) -> u64 {
+        let tree_poses: Vec<Vec<(Vec3, Quat)>> =
+            trees.iter().map(tree_forward_kinematics).collect();
+        let mut reinserts = 0;
+        for (geom_index, geom) in geoms.iter().enumerate() {
+            let pose = match geom.attachment() {
+                GeomAttach::Static => geom_world_pose(geom, Vec3::ZERO, Quat::IDENTITY),
+                GeomAttach::Body(body) => {
+                    geom_world_pose(geom, bodies[body].position, bodies[body].orientation)
+                }
+                GeomAttach::Link(tree_index, link) => {
+                    let (position, orientation) = tree_poses[tree_index][link];
+                    geom_world_pose(geom, position, orientation)
+                }
+            };
+            if tree.update(geom_index, geom_aabb(geom, &pose, meshes, hfields)) {
+                reinserts += 1;
+            }
+        }
+        reinserts
     }
 
     /// Read-only accessor: current world-frame COM position + orientation of
@@ -826,10 +952,7 @@ impl World {
         // or geom-count change panics if any ACTIVE pair falls in the
         // deferred bucket. Prevents a stack.json-style silent no-op.
         self.assert_pairs_supported();
-        let pairs = match &self.pair_list {
-            Some(p) => p.clone(),
-            None => self.auto_pairs(),
-        };
+        let pairs = self.active_pairs();
         let contacts = matches!(self.solver.mode, SolverMode::Pgs | SolverMode::Newton)
             .then(|| self.detect_contacts_for_step(&pairs));
         #[cfg(feature = "instrumentation")]
@@ -1397,8 +1520,9 @@ impl World {
     /// Useful for tests that need to inspect current contact geometry.
     pub fn detect_contacts(&self) -> Vec<Contact> {
         let pairs = match &self.pair_list {
-            Some(p) => p.clone(),
-            None => self.auto_pairs(),
+            Some(pairs) => pairs.clone(),
+            None if self.broadphase_mode == BroadPhaseMode::Naive => self.auto_pairs(),
+            None => self.temporary_broadphase_pairs(),
         };
         self.detect_contacts_with_manifold(&pairs, ContactManifold::Legacy)
     }

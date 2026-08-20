@@ -4,10 +4,13 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use newt::benchmark::nearest_rank_percentile;
+use newt::body::Body;
+use newt::geom::Geom;
+use newt::math::{Quat, Vec3};
 use newt::mjcf::load_mjcf_path;
 use newt::model::load_from_path;
 use newt::solver::{ConeKind, SolverMode};
-use newt::world::Integrator;
+use newt::world::{BroadPhaseMode, Integrator, World};
 
 #[path = "../examples/biped_walk_support.rs"]
 mod biped_walk_support;
@@ -145,6 +148,7 @@ impl Stats {
 
 fn main() {
     let options = parse_options();
+    benchmark_broadphase_500();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut results = Vec::new();
 
@@ -202,6 +206,60 @@ fn main() {
             print_profile(scene, config, &result.profile);
         }
     }
+}
+
+fn benchmark_broadphase_500() {
+    const STEPS: usize = 20;
+    for mode in [BroadPhaseMode::Naive, BroadPhaseMode::DynamicAabbTree] {
+        let mut world = broadphase_scene(mode);
+        for _ in 0..3 {
+            world.step();
+        }
+        let start = Instant::now();
+        let mut pairs = 0usize;
+        for _ in 0..STEPS {
+            world.step();
+            pairs += world.broadphase_pair_count();
+        }
+        let elapsed_ns = start.elapsed().as_nanos();
+        println!(
+            "{{\"scene\":\"500_spheres\",\"broadphase\":\"{}\",\"pairs_per_step\":{},\"wall_ns_per_step\":{}}}",
+            match mode {
+                BroadPhaseMode::Naive => "naive",
+                BroadPhaseMode::DynamicAabbTree => "dynamic_aabb_tree",
+            },
+            pairs / STEPS,
+            elapsed_ns / STEPS as u128,
+        );
+    }
+}
+
+fn broadphase_scene(mode: BroadPhaseMode) -> World {
+    let mut world = World::new();
+    world.broadphase_mode = mode;
+    world.gravity = Vec3::ZERO;
+    world.integrator = Integrator::Euler;
+    let mut state = 0x39_u32;
+    for _ in 0..500 {
+        let position = Vec3::new(
+            next_bench_random(&mut state) * 10.0,
+            next_bench_random(&mut state) * 10.0,
+            next_bench_random(&mut state) * 10.0,
+        );
+        let body_index = world.add_body(Body::solid_sphere(1.0, 0.1, position, Quat::IDENTITY));
+        world.bodies[body_index].linear_velocity = Vec3::new(
+            next_bench_random(&mut state) * 0.01,
+            next_bench_random(&mut state) * 0.01,
+            next_bench_random(&mut state) * 0.01,
+        );
+        world.add_geom(Geom::sphere(body_index, 0.1, Vec3::ZERO, 0.0));
+    }
+    world
+}
+
+fn next_bench_random(state: &mut u32) -> f32 {
+    *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    *state as f32 / u32::MAX as f32 - 0.5
 }
 
 struct ResultRow {
