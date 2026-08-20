@@ -1,0 +1,15 @@
+[package]
+name = "sandbox"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Native newt physics viewer powered by chimy2"
+
+[dependencies]
+chimy2 = { path = "../chimy2" }
+newt = { path = "../newt" }
+
+[[bin]]
+name = "sandbox"
+path = "src/main.rs"

@@ -5,19 +5,50 @@ use std::num::NonZeroU32;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+pub use winit::event::MouseButton as PresentMouseButton;
+pub use winit::keyboard::KeyCode as PresentKeyCode;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameTiming {
+    pub draw: std::time::Duration,
+    pub present: std::time::Duration,
+    pub total: std::time::Duration,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct InputState {
     pressed: HashSet<KeyCode>,
+    mouse_buttons: HashSet<MouseButton>,
+    mouse_delta: (f32, f32),
+    scroll_delta: f32,
+    last_cursor: Option<(f32, f32)>,
 }
 
 impl InputState {
     pub fn is_down(&self, key: KeyCode) -> bool {
         self.pressed.contains(&key)
+    }
+
+    pub fn is_mouse_down(&self, button: PresentMouseButton) -> bool {
+        self.mouse_buttons.contains(&button)
+    }
+
+    pub const fn mouse_delta(&self) -> (f32, f32) {
+        self.mouse_delta
+    }
+
+    pub const fn scroll_delta(&self) -> f32 {
+        self.scroll_delta
+    }
+
+    fn clear_frame_deltas(&mut self) {
+        self.mouse_delta = (0.0, 0.0);
+        self.scroll_delta = 0.0;
     }
 }
 
@@ -99,8 +130,10 @@ struct App<F> {
     started: Instant,
     frames: usize,
     max_frames: Option<usize>,
+    max_seconds: Option<f32>,
     error: Option<String>,
     input: InputState,
+    observer: Option<Box<dyn FnMut(FrameTiming)>>,
 }
 
 impl<F> App<F>
@@ -119,6 +152,11 @@ where
     fn frame_budget_exhausted(&self) -> bool {
         self.max_frames
             .is_some_and(|max_frames| self.frames >= max_frames)
+    }
+
+    fn time_budget_exhausted(&self) -> bool {
+        self.max_seconds
+            .is_some_and(|max_seconds| self.started.elapsed().as_secs_f32() >= max_seconds)
     }
 
     fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
@@ -146,6 +184,9 @@ where
         match &event {
             WindowEvent::Focused(false) => {
                 self.input.pressed.clear();
+                self.input.mouse_buttons.clear();
+                self.input.last_cursor = None;
+                self.input.clear_frame_deltas();
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -165,6 +206,27 @@ where
                 } else {
                     self.input.pressed.remove(key);
                 }
+            }
+            WindowEvent::MouseInput { button, state, .. } => {
+                if *state == ElementState::Pressed {
+                    self.input.mouse_buttons.insert(*button);
+                } else {
+                    self.input.mouse_buttons.remove(button);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let cursor = (position.x as f32, position.y as f32);
+                if let Some(previous) = self.input.last_cursor {
+                    self.input.mouse_delta.0 += cursor.0 - previous.0;
+                    self.input.mouse_delta.1 += cursor.1 - previous.1;
+                }
+                self.input.last_cursor = Some(cursor);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.input.scroll_delta += match delta {
+                    MouseScrollDelta::LineDelta(_, y) => *y * 24.0,
+                    MouseScrollDelta::PixelDelta(value) => value.y as f32,
+                };
             }
             _ => {}
         }
@@ -186,19 +248,34 @@ where
                 {
                     return;
                 }
+                if self.time_budget_exhausted() {
+                    event_loop.exit();
+                    return;
+                }
+                let frame_started = Instant::now();
                 (self.draw)(
                     &mut self.framebuffer,
                     self.started.elapsed().as_secs_f32(),
                     &self.input,
                 );
+                let draw = frame_started.elapsed();
+                let present_started = Instant::now();
                 if let Some(backend) = self.backend.as_mut() {
                     if let Err(error) = backend.present(&self.framebuffer.color) {
                         self.fail(event_loop, error);
                         return;
                     }
                 }
+                if let Some(observer) = self.observer.as_mut() {
+                    observer(FrameTiming {
+                        draw,
+                        present: present_started.elapsed(),
+                        total: frame_started.elapsed(),
+                    });
+                }
+                self.input.clear_frame_deltas();
                 self.frames += 1;
-                if self.frame_budget_exhausted() {
+                if self.frame_budget_exhausted() || self.time_budget_exhausted() {
                     event_loop.exit();
                 }
             }
@@ -260,8 +337,12 @@ where
         self.dispatch_window_event(&mut control, Some(window), event);
     }
 
-    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.frame_budget_exhausted() {
+            return;
+        }
+        if self.time_budget_exhausted() {
+            event_loop.exit();
             return;
         }
         if let Some(window) = self.window {
@@ -291,11 +372,17 @@ where
     }
 }
 
+struct RunOptions {
+    max_frames: Option<usize>,
+    max_seconds: Option<f32>,
+    observer: Option<Box<dyn FnMut(FrameTiming)>>,
+}
+
 fn run_with_runner<F, R>(
     title: &str,
     width: u32,
     height: u32,
-    max_frames: Option<usize>,
+    options: RunOptions,
     draw: F,
     runner: &mut R,
 ) -> Result<(), Box<dyn Error>>
@@ -303,7 +390,7 @@ where
     F: FnMut(&mut Framebuffer, f32, &InputState),
     R: EventRunner<F>,
 {
-    if max_frames == Some(0) {
+    if options.max_frames == Some(0) {
         return Ok(());
     }
     let mut app = App {
@@ -316,9 +403,11 @@ where
         draw,
         started: Instant::now(),
         frames: 0,
-        max_frames,
+        max_frames: options.max_frames,
+        max_seconds: options.max_seconds,
         error: None,
         input: InputState::default(),
+        observer: options.observer,
     };
     runner.run(&mut app)?;
     app.error.map_or(Ok(()), |error| Err(error.into()))
@@ -341,7 +430,11 @@ where
         title,
         width,
         height,
-        max_frames,
+        RunOptions {
+            max_frames,
+            max_seconds: None,
+            observer: None,
+        },
         move |framebuffer, elapsed, _| draw(framebuffer, elapsed),
         &mut runner,
     )
@@ -359,7 +452,46 @@ where
     F: FnMut(&mut Framebuffer, f32, &InputState),
 {
     let mut runner = WinitEventRunner;
-    run_with_runner(title, width, height, max_frames, draw, &mut runner)
+    run_with_runner(
+        title,
+        width,
+        height,
+        RunOptions {
+            max_frames,
+            max_seconds: None,
+            observer: None,
+        },
+        draw,
+        &mut runner,
+    )
+}
+
+/// Run a windowed framebuffer demo and report draw/present timings.
+pub fn run_with_input_timed<F, O>(
+    title: &str,
+    width: u32,
+    height: u32,
+    max_seconds: f32,
+    draw: F,
+    observe: O,
+) -> Result<(), Box<dyn Error>>
+where
+    F: FnMut(&mut Framebuffer, f32, &InputState),
+    O: FnMut(FrameTiming) + 'static,
+{
+    let mut runner = WinitEventRunner;
+    run_with_runner(
+        title,
+        width,
+        height,
+        RunOptions {
+            max_frames: None,
+            max_seconds: Some(max_seconds),
+            observer: Some(Box::new(observe)),
+        },
+        draw,
+        &mut runner,
+    )
 }
 
 #[cfg(test)]
@@ -406,7 +538,11 @@ mod tests {
             "",
             2,
             2,
-            Some(1),
+            RunOptions {
+                max_frames: Some(1),
+                max_seconds: None,
+                observer: None,
+            },
             |_: &mut Framebuffer, _: f32, _: &InputState| {},
             &mut runner,
         );
@@ -457,8 +593,10 @@ mod tests {
             started: Instant::now(),
             frames: 0,
             max_frames: Some(3),
+            max_seconds: None,
             error: None,
             input: InputState::default(),
+            observer: None,
         };
 
         let mut runner = HeadlessEventRunner { exited: false };
@@ -479,6 +617,39 @@ mod tests {
     }
 
     #[test]
+    fn expired_time_budget_exits_before_redraw() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let draw_count = Rc::new(Cell::new(0usize));
+        let counter = draw_count.clone();
+        let mut app = App {
+            title: String::new(),
+            logical_width: 2,
+            logical_height: 2,
+            window: None,
+            backend: Some(Box::new(CountingBackend)),
+            framebuffer: Framebuffer::new(2, 2),
+            draw: move |_: &mut Framebuffer, _: f32, _: &InputState| {
+                counter.set(counter.get() + 1);
+            },
+            started: Instant::now(),
+            frames: 0,
+            max_frames: None,
+            max_seconds: Some(0.0),
+            error: None,
+            input: InputState::default(),
+            observer: None,
+        };
+
+        let mut runner = HeadlessEventRunner { exited: false };
+        app.dispatch_window_event(&mut runner, None, WindowEvent::RedrawRequested);
+
+        assert_eq!(draw_count.get(), 0);
+        assert!(runner.exited);
+    }
+
+    #[test]
     fn focus_loss_clears_pressed_keys_headlessly() {
         let mut app = App {
             title: String::new(),
@@ -491,8 +662,10 @@ mod tests {
             started: Instant::now(),
             frames: 0,
             max_frames: None,
+            max_seconds: None,
             error: None,
             input: InputState::default(),
+            observer: None,
         };
         app.input.pressed.insert(KeyCode::KeyW);
         assert!(app.input.is_down(KeyCode::KeyW));
