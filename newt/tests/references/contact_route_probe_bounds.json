@@ -30,6 +30,11 @@
       "id": "P6",
       "observed_max": {"position": 0.0000001757250, "normal": 0.00003508902, "penetration": 0.00000009685755},
       "bounds": {"count_delta": 0, "position": 0.000001, "normal": 0.00004, "penetration": 0.000001}
+    },
+    {
+      "id": "P7",
+      "observed_max": {"position": 0.00000002980232, "normal": 0.00000005960465, "penetration": 0.0000001192093},
+      "bounds": {"count_delta": 0, "position": 0.005, "normal": 0.000001, "penetration": 0.0001}
     }
   ]
 }

@@ -286,27 +286,24 @@ impl HeightField {
 ///
 /// The engine does not check any of the above. [`ConvexMesh::validate`]
 /// performs the cheap structural checks the [`crate::model`] loader runs:
-/// non-empty, at least four vertices, at least four faces, every face index
-/// in range, every vertex finite. Convexity itself is expensive to check
-/// (O(V·F)) and is punted to the mesh author — mirroring MuJoCo, which also
-/// trusts `mesh` assets to be convex.
+/// non-empty, at least 4 vertices, at least four faces, every face index in range,
+/// every vertex finite. Convexity itself is expensive to check (O(V·F)) and
+/// is punted to the mesh author — mirroring MuJoCo, which also trusts `mesh`
+/// assets to be convex.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConvexMesh {
     /// Mesh-local vertex positions.
     pub vertices: Vec<Vec3>,
     /// Triangular face list — each entry is three indices into `vertices`,
-    /// in CCW order when viewed from outside the polyhedron. The engine only
-    /// consumes triangle CENTROIDS + NORMALS during narrow-phase (never the
-    /// winding for topological queries), so a mis-wound face degrades
-    /// contact accuracy on that face but does not corrupt other faces.
+    /// in CCW order when viewed from outside the polyhedron. Mesh-mesh
+    /// manifolds use this winding to recover outward face normals.
     pub faces: Vec<[u32; 3]>,
 }
 
 impl ConvexMesh {
-    /// Cheap structural checks. `Err(msg)` on empty vertices, fewer than 4
-    /// vertices (a mesh must at least span a tetrahedron to enclose any
-    /// volume), fewer than 4 faces, out-of-range face index, or a non-finite
-    /// vertex coordinate.
+    /// Cheap structural checks. `Err(msg)` on fewer than 4 vertices,
+    /// fewer than 4 faces, an out-of-range face index, or a non-finite vertex
+    /// coordinate.
     pub fn validate(&self) -> Result<(), String> {
         if self.vertices.len() < 4 {
             return Err(format!(

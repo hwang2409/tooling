@@ -928,13 +928,25 @@ fn muscle_gain_length_derivative(length: f32, lmin: f32, lmax: f32) -> f32 {
     let a = 0.5 * (lmin + 1.0);
     let b = 0.5 * (1.0 + lmax);
     if length <= a {
-        (length - lmin) / (a - lmin).max(MJ_MINVAL).powi(2)
+        (length - lmin) / {
+            let denominator = (a - lmin).max(MJ_MINVAL);
+            denominator * denominator
+        }
     } else if length <= 1.0 {
-        (1.0 - length) / (1.0 - a).max(MJ_MINVAL).powi(2)
+        (1.0 - length) / {
+            let denominator = (1.0 - a).max(MJ_MINVAL);
+            denominator * denominator
+        }
     } else if length <= b {
-        -(length - 1.0) / (b - 1.0).max(MJ_MINVAL).powi(2)
+        -(length - 1.0) / {
+            let denominator = (b - 1.0).max(MJ_MINVAL);
+            denominator * denominator
+        }
     } else {
-        -(lmax - length) / (lmax - b).max(MJ_MINVAL).powi(2)
+        -(lmax - length) / {
+            let denominator = (lmax - b).max(MJ_MINVAL);
+            denominator * denominator
+        }
     }
 }
 

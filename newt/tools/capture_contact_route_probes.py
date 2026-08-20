@@ -85,6 +85,17 @@ PROBES = (
             ("near_touch", "mesh_a_near_touch", "mesh_b_near_touch"),
         ),
     },
+    {
+        "id": "P7",
+        "pair": "mesh-mesh-manifold",
+        "route": "mjc_Convex",
+        "source_xml": "contact_route_mesh_mesh_manifold.xml",
+        "cases": (
+            ("face_face", "mesh_a_face_face", "mesh_b_face_face"),
+            ("edge_face", "mesh_a_edge_face", "mesh_b_edge_face"),
+            ("vertex_face", "mesh_a_vertex_face", "mesh_b_vertex_face"),
+        ),
+    },
 )
 
 

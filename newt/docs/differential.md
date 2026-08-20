@@ -22,6 +22,18 @@ to report, not to hide. Bounds are set from measurement plus ~2×
 headroom; open findings get their own section below and are called
 out at the top of the PR body.
 
+### NEWT-37 mesh-mesh multiCCD
+
+Mesh-mesh CCD now recovers MuJoCo 3.11.0 face, edge, and vertex features after
+GJK plus EPA. Face-face pairs emit up to four midpoint contacts. Edge-face and
+vertex-face pairs emit the native two-contact patterns. The fixture-backed
+P7 route probe stores the MuJoCo XML and captured contact rows in
+`tests/references/contact_route_mesh_mesh_manifold.xml` and
+`tests/references/contact_route_probes.json`.
+
+This change does not alter the existing penalty or differential goldens. The
+new stack regression checks bounded PGS behavior directly for three mesh cubes.
+
 ## How the harness works
 
 - **Reference** — `tools/capture_mujoco.py` loads each scenario's
