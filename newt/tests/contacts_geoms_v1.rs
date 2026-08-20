@@ -11,7 +11,7 @@ use newt::body::Body;
 use newt::contact::{is_pair_supported, narrow_phase};
 use newt::geom::{ConvexMesh, Geom, GeomPose, GeomShape, geom_world_pose};
 use newt::json::{self, Value};
-use newt::math::{FRAC_PI_2, FRAC_PI_4, Mat3, Quat, Vec3};
+use newt::math::{FRAC_PI_2, FRAC_PI_4, Mat3, Quat, Vec3, cos, sin};
 use newt::world::World;
 use newt::xml;
 use std::fmt::Write as _;
@@ -253,6 +253,23 @@ fn triangular_prism_mesh() -> ConvexMesh {
     }
 }
 
+fn regular_prism_mesh(ring_vertices: usize, reversed: bool) -> ConvexMesh {
+    let mut vertices = Vec::with_capacity(ring_vertices * 2);
+    for z in [-0.5, 0.5] {
+        for index in 0..ring_vertices {
+            let angle = 2.0 * std::f32::consts::PI * index as f32 / ring_vertices as f32;
+            vertices.push(Vec3::new(cos(angle), sin(angle), z));
+        }
+    }
+    if reversed {
+        vertices.reverse();
+    }
+    ConvexMesh {
+        vertices,
+        faces: Vec::new(),
+    }
+}
+
 #[test]
 fn mesh_mesh_witness_is_invariant_to_vertex_order_and_argument_order() {
     let identity = [0, 1, 2, 3, 4, 5, 6, 7];
@@ -432,6 +449,102 @@ fn triangular_prism_support_features_are_continuous() {
                 "{name} offset {offset}: {actual:?} != {expected:?}"
             );
         }
+    }
+}
+
+#[test]
+fn mesh_exact_alignment_preserves_contacts_at_feature_dimensions() {
+    for scale in [1.0e-3, 1.0, 1.0e3] {
+        let mut mesh = triangular_prism_mesh();
+        for vertex in &mut mesh.vertices {
+            *vertex *= scale;
+        }
+        let meshes = [mesh];
+        let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+        let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+        let pose_a = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        for (name, axis) in [
+            ("triangular face", Vec3::Z),
+            ("edge", Vec3::X),
+            ("quad face", Vec3::Y),
+        ] {
+            let base_position = axis * (0.25 * scale);
+            let exact_pose = GeomPose {
+                position: base_position,
+                orientation: Quat::IDENTITY,
+            };
+            let exact = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &exact_pose, &meshes);
+            assert_eq!(exact.len, 1, "{name} scale {scale} exact contact count");
+            let exact = exact.as_slice()[0];
+            assert!(exact.penetration > 0.0, "{name} scale {scale} exact depth");
+            assert!(
+                exact.normal_world.length() > 0.99,
+                "{name} scale {scale} exact normal"
+            );
+            for offset in [-1.0e-7, 1.0e-7] {
+                let near_pose = GeomPose {
+                    position: base_position + Vec3::new(offset, 0.0, 0.0),
+                    orientation: Quat::IDENTITY,
+                };
+                let near = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &near_pose, &meshes);
+                assert_eq!(near.len, 1, "{name} scale {scale} offset {offset} count");
+                let near = near.as_slice()[0];
+                let tolerance = 1.0e-4 * scale.max(1.0);
+                let normal_tolerance = 2.0e-4;
+                close_vec(near.position_world, exact.position_world, tolerance);
+                assert!(
+                    (near.normal_world - exact.normal_world).length() <= normal_tolerance,
+                    "{name} scale {scale} offset {offset} normal {:?} != {:?}",
+                    near.normal_world,
+                    exact.normal_world
+                );
+                close_scalar(
+                    near.penetration,
+                    exact.penetration,
+                    tolerance,
+                    "exact-alignment depth",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn high_valence_face_centroid_is_stable_when_vertices_reverse() {
+    let meshes = [
+        regular_prism_mesh(256, false),
+        regular_prism_mesh(256, true),
+    ];
+    let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.02);
+    let geom_b = Geom::mesh(1, 1, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    for (name, position) in [
+        ("margin", Vec3::new(0.0, 0.0, 1.0000001)),
+        ("overlap", Vec3::new(0.0, 0.0, 0.9)),
+    ] {
+        let pose_b = GeomPose {
+            position,
+            orientation: Quat::IDENTITY,
+        };
+        let forward = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &meshes);
+        let swapped_meshes = [
+            regular_prism_mesh(256, true),
+            regular_prism_mesh(256, false),
+        ];
+        let reversed = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &swapped_meshes);
+        assert_eq!(forward.len, 1, "{name} forward contact count");
+        assert_eq!(reversed.len, 1, "{name} reversed contact count");
+        let expected = forward.as_slice()[0];
+        let actual = reversed.as_slice()[0];
+        close_vec(actual.position_world, expected.position_world, 1.0e-6);
+        close_vec(actual.normal_world, expected.normal_world, 1.0e-6);
+        close_scalar(actual.penetration, expected.penetration, 1.0e-6, name);
     }
 }
 
