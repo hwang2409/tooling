@@ -36,7 +36,7 @@
 //!   [`crate::math`] appear in the compute path.
 
 use crate::body::Body;
-use crate::broadphase::{DynamicAabbTree, geom_aabb};
+use crate::broadphase::{DynamicAabbTree, geom_aabb, should_collide};
 use crate::contact::{
     Contact, is_pair_supported, narrow_phase_solver_with_hfields, narrow_phase_with_hfields,
 };
@@ -125,8 +125,10 @@ pub struct World {
     pub hfields: Vec<HeightField>,
     /// Optional explicit pair list `(geom_a, geom_b)` with `a < b`. When
     /// `None`, contact detection enumerates every unordered geom pair whose
-    /// two geoms don't share a body/link and aren't both static. The dynamic
-    /// tree returns the candidate subset in `(min, max)` lexicographic order.
+    /// two geoms don't share a body/link and aren't both static. Automatic
+    /// pairs pass through each geom's collision group/mask filter. Explicit
+    /// pairs bypass that filter. The dynamic tree returns candidates in
+    /// `(min, max)` lexicographic order.
     pub pair_list: Option<Vec<(usize, usize)>>,
     /// Broad-phase strategy used when `pair_list` is `None`.
     pub broadphase_mode: BroadPhaseMode,
@@ -759,6 +761,33 @@ impl World {
         idx
     }
 
+    /// Update a geom's collision group and contact mask.
+    pub fn set_geom_filter(&mut self, geom_id: usize, group: u32, mask: u32) -> Result<(), String> {
+        let geom = self
+            .geoms
+            .get_mut(geom_id)
+            .ok_or_else(|| format!("geom index {geom_id} is out of range"))?;
+        geom.collision_group = group;
+        geom.collision_mask = mask;
+        self.broadphase.set_proxy_filter(geom_id, group, mask);
+        Ok(())
+    }
+
+    /// Return a geom's opaque consumer-owned handle.
+    pub fn geom_user_data(&self, geom_id: usize) -> Option<u64> {
+        self.geoms.get(geom_id).map(|geom| geom.user_data)
+    }
+
+    /// Update a geom's opaque consumer-owned handle.
+    pub fn set_geom_user_data(&mut self, geom_id: usize, user_data: u64) -> Result<(), String> {
+        let geom = self
+            .geoms
+            .get_mut(geom_id)
+            .ok_or_else(|| format!("geom index {geom_id} is out of range"))?;
+        geom.user_data = user_data;
+        Ok(())
+    }
+
     /// Enumerate all valid contact pairs in canonical `(min, max)` order.
     /// Used when `pair_list` is `None`. Pairs are dropped when both geoms
     /// share the same attachment (same body or same tree link, including
@@ -775,7 +804,14 @@ impl World {
                     // meaningful pair.
                     continue;
                 }
-                out.push((a, b));
+                if should_collide(
+                    self.geoms[a].collision_group,
+                    self.geoms[a].collision_mask,
+                    self.geoms[b].collision_group,
+                    self.geoms[b].collision_mask,
+                ) {
+                    out.push((a, b));
+                }
             }
         }
         out
@@ -887,7 +923,12 @@ impl World {
             } else {
                 geom_aabb(geom, &pose, inputs.meshes, inputs.hfields)
             };
-            if tree.update(geom_index, bound.expanded(geom.margin)) {
+            if tree.update_with_filter(
+                geom_index,
+                bound.expanded(geom.margin),
+                geom.collision_group,
+                geom.collision_mask,
+            ) {
                 reinserts += 1;
             }
         }

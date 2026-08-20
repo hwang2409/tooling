@@ -202,6 +202,15 @@ fn parse_int(src: &str, path: &str, attr: &str) -> Result<i32, MjcfError> {
     })
 }
 
+fn parse_u32(src: &str, path: &str, attr: &str) -> Result<u32, MjcfError> {
+    src.trim().parse().map_err(|_| {
+        MjcfError::new(
+            path,
+            format!("attribute \"{attr}\": expected a non-negative u32, got {src:?}"),
+        )
+    })
+}
+
 fn parse_bool(src: &str, path: &str, attr: &str) -> Result<bool, MjcfError> {
     match src.trim() {
         "true" | "True" | "1" => Ok(true),
@@ -1913,7 +1922,7 @@ impl Loader {
             match k.as_str() {
                 "name" | "type" | "hfield" | "pos" | "quat" | "euler" | "axisangle" | "size"
                 | "fromto" | "friction" | "solref" | "solimp" | "condim" | "margin" | "gap"
-                | "class" | "mass" => {}
+                | "class" | "mass" | "contype" | "conaffinity" => {}
                 other => {
                     return fail(
                         path,
@@ -1998,6 +2007,14 @@ impl Loader {
         };
         let margin = optional_nonneg_float(e, "margin", path, &dc, "geom")?.unwrap_or(0.0);
         let gap = optional_nonneg_float(e, "gap", path, &dc, "geom")?.unwrap_or(0.0);
+        let collision_group = attr_with_default(e, "geom", "contype", &dc)
+            .map(|value| parse_u32(value, path, "contype"))
+            .transpose()?
+            .unwrap_or(1);
+        let collision_mask = attr_with_default(e, "geom", "conaffinity", &dc)
+            .map(|value| parse_u32(value, path, "conaffinity"))
+            .transpose()?
+            .unwrap_or(1);
 
         // For static planes, mimic the JSON loader's `static_plane`
         // construction: local_orientation aligns local +Z to the world
@@ -2022,6 +2039,9 @@ impl Loader {
             torsional_friction,
             rolling_friction,
             solimp,
+            collision_group,
+            collision_mask,
+            user_data: 0,
         })
     }
 
@@ -4205,6 +4225,14 @@ fn auto_pairs_with_self_collision_filter(
             if att_a == att_b {
                 continue;
             }
+            if !crate::broadphase::should_collide(
+                world.geoms[a].collision_group,
+                world.geoms[a].collision_mask,
+                world.geoms[b].collision_group,
+                world.geoms[b].collision_mask,
+            ) {
+                continue;
+            }
             if let (GeomAttach::Link(ta, _), GeomAttach::Link(tb, _)) = (att_a, att_b) {
                 if ta == tb && !tree_self_collide.get(ta).copied().unwrap_or(true) {
                     continue;
@@ -4224,6 +4252,14 @@ fn default_auto_pairs(world: &World) -> Vec<(usize, usize)> {
     for a in 0..n {
         for b in (a + 1)..n {
             if world.geoms[a].attachment() == world.geoms[b].attachment() {
+                continue;
+            }
+            if !crate::broadphase::should_collide(
+                world.geoms[a].collision_group,
+                world.geoms[a].collision_mask,
+                world.geoms[b].collision_group,
+                world.geoms[b].collision_mask,
+            ) {
                 continue;
             }
             out.push((a, b));

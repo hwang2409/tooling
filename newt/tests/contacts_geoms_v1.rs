@@ -1220,6 +1220,9 @@ fn box_box_sat_uses_face_normal_when_it_wins_min_overlap() {
         torsional_friction: 0.0,
         rolling_friction: 0.0,
         solimp: newt::solver::SolImp::DEFAULT,
+        collision_group: u32::MAX,
+        collision_mask: u32::MAX,
+        user_data: 0,
     };
     let buf = narrow_phase(0, &ga, &pose_a, 1, &gb, &pose_b, &[]);
     assert!(

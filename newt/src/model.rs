@@ -1511,6 +1511,9 @@ fn parse_geom(
         torsional_friction,
         rolling_friction,
         solimp,
+        collision_group: u32::MAX,
+        collision_mask: u32::MAX,
+        user_data: 0,
     };
     Ok((geom, name))
 }
