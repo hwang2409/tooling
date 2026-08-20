@@ -9,22 +9,22 @@
       "id": "mesh-mesh-tumble",
       "early": {
         "observed_max": {
-          "position": 0.018641119822859764,
-          "orientation": 0.003240427700802684,
+          "position": 0.018640896305441856,
+          "orientation": 0.0032404332887381315,
           "contact_count": 0
         },
-        "position": 0.018741119652986526,
-        "orientation": 0.00334042776376009,
+        "position": 0.01874089613556862,
+        "orientation": 0.0033404333516955376,
         "contact_count": 0
       },
       "full": {
         "observed_max": {
-          "position": 0.1280665248632431,
-          "orientation": 0.0035701002925634384,
+          "position": 0.12806624174118042,
+          "orientation": 0.003570129396393895,
           "contact_count": 0
         },
-        "position": 0.12816652655601501,
-        "orientation": 0.0036701003555208445,
+        "position": 0.12816624343395233,
+        "orientation": 0.003670129459351301,
         "contact_count": 0
       }
     },
@@ -33,20 +33,20 @@
       "early": {
         "observed_max": {
           "position": 0.018640846014022827,
-          "orientation": 0.0030140553135424852,
+          "orientation": 0.0030140585731714964,
           "contact_count": 0
         },
         "position": 0.01874084584414959,
-        "orientation": 0.0031140553764998913,
+        "orientation": 0.0031140586361289024,
         "contact_count": 0
       },
       "full": {
         "observed_max": {
-          "position": 0.12806424498558044,
+          "position": 0.12806567549705505,
           "orientation": 0.0034046443179249763,
           "contact_count": 0
         },
-        "position": 0.12816424667835236,
+        "position": 0.12816567718982697,
         "orientation": 0.0035046443808823824,
         "contact_count": 0
       }

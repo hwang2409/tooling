@@ -230,6 +230,29 @@ fn cube_mesh(order: [usize; 8]) -> ConvexMesh {
     }
 }
 
+fn triangular_prism_mesh() -> ConvexMesh {
+    ConvexMesh {
+        vertices: vec![
+            Vec3::new(-0.5, -0.5, -0.5),
+            Vec3::new(0.5, -0.5, -0.5),
+            Vec3::new(0.0, 0.5, -0.5),
+            Vec3::new(-0.5, -0.5, 0.5),
+            Vec3::new(0.5, -0.5, 0.5),
+            Vec3::new(0.0, 0.5, 0.5),
+        ],
+        faces: vec![
+            [0, 1, 2],
+            [3, 5, 4],
+            [0, 3, 4],
+            [0, 4, 1],
+            [1, 4, 5],
+            [1, 5, 2],
+            [2, 5, 3],
+            [2, 3, 0],
+        ],
+    }
+}
+
 #[test]
 fn mesh_mesh_witness_is_invariant_to_vertex_order_and_argument_order() {
     let identity = [0, 1, 2, 3, 4, 5, 6, 7];
@@ -373,6 +396,43 @@ fn near_parallel_mesh_face_witness_is_continuous() {
         1.0e-4,
         "near-parallel penetration",
     );
+}
+
+#[test]
+fn triangular_prism_support_features_are_continuous() {
+    let mut mesh = triangular_prism_mesh();
+    for vertex in &mut mesh.vertices {
+        *vertex *= 3.0;
+    }
+    let meshes = [mesh];
+    let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.01);
+    let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    for (name, axis) in [("triangular face", Vec3::Z), ("edge", Vec3::Y)] {
+        let baseline_pose = GeomPose {
+            position: axis,
+            orientation: Quat::IDENTITY,
+        };
+        let baseline = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &baseline_pose, &meshes);
+        assert_eq!(baseline.len, 1, "{name} baseline contact count");
+        let expected = baseline.as_slice()[0].position_world;
+        for offset in [-1.0e-7, 1.0e-7] {
+            let near_pose = GeomPose {
+                position: axis + Vec3::new(offset, 0.0, 0.0),
+                orientation: Quat::IDENTITY,
+            };
+            let near = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &near_pose, &meshes);
+            assert_eq!(near.len, 1, "{name} offset {offset} contact count");
+            let actual = near.as_slice()[0].position_world;
+            assert!(
+                (actual - expected).length() <= 1.0e-4,
+                "{name} offset {offset}: {actual:?} != {expected:?}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

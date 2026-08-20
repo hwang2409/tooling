@@ -2283,21 +2283,25 @@ impl CcdShape<'_> {
 }
 
 fn support_vertices(vertices: &[Vec3], direction: Vec3) -> Vec3 {
-    // Preserve the original tight tolerance for simplex-sized meshes. Larger
-    // mesh supports need a small axis-aligned allowance so f32 rounding does
-    // not drop one vertex from a planar support feature.
-    const SUPPORT_TIE_EPSILON: f32 = 1.0e-12;
-    const AXIS_SUPPORT_TIE_EPSILON: f32 = 1.2e-7;
+    // Normalize the direction so the tolerance stays in length units, then
+    // scale it by the mesh extent for consistent behavior across mesh sizes.
+    const SUPPORT_TIE_FRACTION: f32 = 1.0e-7;
     let direction_length = direction.length();
-    let axis_aligned = direction_length > 0.0
-        && (direction.x.abs() >= 0.999_999 * direction_length
-            || direction.y.abs() >= 0.999_999 * direction_length
-            || direction.z.abs() >= 0.999_999 * direction_length);
-    let tie_epsilon = if axis_aligned && vertices.len() > 4 {
-        AXIS_SUPPORT_TIE_EPSILON
-    } else {
-        SUPPORT_TIE_EPSILON
-    };
+    if direction_length <= 1.0e-20 {
+        return vertices[0];
+    }
+    let direction = direction / direction_length;
+    let (mut min, mut max) = (vertices[0], vertices[0]);
+    for &vertex in vertices.iter().skip(1) {
+        min.x = min.x.min(vertex.x);
+        min.y = min.y.min(vertex.y);
+        min.z = min.z.min(vertex.z);
+        max.x = max.x.max(vertex.x);
+        max.y = max.y.max(vertex.y);
+        max.z = max.z.max(vertex.z);
+    }
+    let extent = (max - min).length();
+    let tie_epsilon = extent * SUPPORT_TIE_FRACTION;
     let best = vertices
         .iter()
         .map(|point| point.dot(direction))
@@ -2314,8 +2318,8 @@ fn support_vertices(vertices: &[Vec3], direction: Vec3) -> Vec3 {
             tied_count += 1;
         }
     }
-    // Centroid planar support features instead of snapping to one corner.
-    if vertices.len() > 4 && tied_count >= 4 {
+    // Center every tied edge or face instead of snapping to one vertex.
+    if tied_count >= 2 {
         centroid / tied_count as f32
     } else {
         selected
