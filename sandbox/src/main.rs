@@ -1,9 +1,11 @@
 use chimy2::camera::OrbitController;
+use chimy2::demo::write_ppm;
 use chimy2::fb::Framebuffer;
 use chimy2::math::{Mat4, Vec3, Vec4};
 use chimy2::pipeline::Pipeline;
 use chimy2::present::{
-    InputState, PresentKeyCode as KeyCode, PresentMouseButton as MouseButton, run_with_input,
+    FrameTiming, InputState, PresentKeyCode as KeyCode, PresentMouseButton as MouseButton,
+    run_with_input, run_with_input_timed,
 };
 use chimy2::shaders::{FlatColorShader, FlatColorUniforms};
 use newt::geom::{Geom, GeomAttach, GeomShape, geom_world_pose};
@@ -11,10 +13,19 @@ use newt::math::{Quat as NewtQuat, Vec3 as NewtVec3};
 use newt::mjcf::load_mjcf_path;
 use newt::model::{Scene as NewtScene, load_from_path};
 use newt::world::World;
+use std::cell::RefCell;
 use std::f32::consts::{FRAC_PI_2, PI};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::rc::Rc;
+use std::time::Instant;
 
 const WIDTH: u32 = 960;
 const HEIGHT: u32 = 640;
+const RECORD_WIDTH: u32 = 640;
+const RECORD_HEIGHT: u32 = 400;
+const VIDEO_FPS: f32 = 60.0;
 const SCENE_COUNT: usize = 5;
 
 const PALETTE: [u32; 8] = [
@@ -49,6 +60,68 @@ struct Viewer {
     last_elapsed: f32,
     previous_input: InputState,
     steps: u64,
+    metrics: Option<Rc<RefCell<Metrics>>>,
+}
+
+#[derive(Default)]
+struct Metrics {
+    sim_ms: Vec<f64>,
+    render_ms: Vec<f64>,
+    present_ms: Vec<f64>,
+    frame_ms: Vec<f64>,
+}
+
+impl Metrics {
+    fn record_draw(&mut self, sim: std::time::Duration, render: std::time::Duration) {
+        self.sim_ms.push(sim.as_secs_f64() * 1000.0);
+        self.render_ms.push(render.as_secs_f64() * 1000.0);
+    }
+
+    fn record_present(&mut self, timing: FrameTiming) {
+        self.present_ms.push(timing.present.as_secs_f64() * 1000.0);
+        self.frame_ms.push(timing.total.as_secs_f64() * 1000.0);
+    }
+
+    fn report(&self, seconds: f32) {
+        println!(
+            "measurement: {} frames over {:.1}s",
+            self.frame_ms.len(),
+            seconds
+        );
+        report_metric("frame", &self.frame_ms);
+        report_metric("sim", &self.sim_ms);
+        report_metric("render", &self.render_ms);
+        report_metric("present", &self.present_ms);
+        if let Some(avg) = average(&self.frame_ms) {
+            println!("effective fps: {:.2}", 1000.0 / avg);
+        }
+    }
+}
+
+fn average(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn percentile(values: &[f64], percentile: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let index = ((sorted.len() as f64 * percentile).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted.len() - 1);
+    Some(sorted[index])
+}
+
+fn report_metric(name: &str, values: &[f64]) {
+    let Some(avg) = average(values) else {
+        println!("{name} ms: no samples");
+        return;
+    };
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let p99 = percentile(values, 0.99).unwrap_or(avg);
+    println!("{name} ms: min={min:.3} avg={avg:.3} p99={p99:.3}");
 }
 
 fn map_vector(value: NewtVec3) -> Vec3 {
@@ -369,7 +442,7 @@ fn edge(current: &InputState, previous: &InputState, key: KeyCode) -> bool {
 }
 
 impl Viewer {
-    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(metrics: Option<Rc<RefCell<Metrics>>>) -> Result<Self, Box<dyn std::error::Error>> {
         let scene = load_scene(0)?;
         let uniforms = scene
             .shapes
@@ -389,6 +462,7 @@ impl Viewer {
             last_elapsed: 0.0,
             previous_input: InputState::default(),
             steps: 0,
+            metrics,
         })
     }
 
@@ -455,6 +529,11 @@ impl Viewer {
 
         let frame_delta = (elapsed - self.last_elapsed).clamp(0.0, 0.1);
         self.last_elapsed = elapsed;
+        self.advance_simulation(frame_delta);
+        self.previous_input = input.clone();
+    }
+
+    fn advance_simulation(&mut self, frame_delta: f32) {
         if !self.paused {
             self.accumulator += frame_delta * self.speed;
             while self.accumulator >= self.scene.world.dt {
@@ -463,11 +542,9 @@ impl Viewer {
                 self.steps += 1;
             }
         }
-        self.previous_input = input.clone();
     }
 
-    fn draw(&mut self, framebuffer: &mut Framebuffer, elapsed: f32, input: &InputState) {
-        self.update(elapsed, input);
+    fn render_frame(&mut self, framebuffer: &mut Framebuffer) {
         framebuffer.clear(0xff101820);
         let camera = self.orbit.camera(
             0.85,
@@ -489,10 +566,166 @@ impl Viewer {
             }
         });
     }
+
+    fn draw(&mut self, framebuffer: &mut Framebuffer, elapsed: f32, input: &InputState) {
+        let sim_started = self.metrics.as_ref().map(|_| Instant::now());
+        self.update(elapsed, input);
+        let render_started = self.metrics.as_ref().map(|_| Instant::now());
+        self.render_frame(framebuffer);
+        if let (Some(sim_started), Some(render_started), Some(metrics)) =
+            (sim_started, render_started, &self.metrics)
+        {
+            metrics
+                .borrow_mut()
+                .record_draw(sim_started.elapsed(), render_started.elapsed());
+        }
+    }
+
+    fn record_frame(&mut self, frame: usize, framebuffer: &mut Framebuffer) {
+        match frame {
+            180 => self.paused = true,
+            300 => self.paused = false,
+            360 => self.speed = 0.5,
+            540 => self.speed = 2.0,
+            600 => self.select_scene(1),
+            720 => self.paused = true,
+            780 => self.paused = false,
+            900 => self.select_scene(2),
+            1050 => self.select_scene(3),
+            1140 => self.select_scene(4),
+            _ => {}
+        }
+        let phase = frame as f32 / VIDEO_FPS;
+        self.orbit.step(0.012, (phase * 0.7).sin() * 0.004, 0.0);
+        self.advance_simulation(1.0 / VIDEO_FPS);
+        self.render_frame(framebuffer);
+    }
+}
+
+struct VideoWriter {
+    output: PathBuf,
+    frame_dir: PathBuf,
+    next_frame: usize,
+}
+
+impl VideoWriter {
+    fn new(root: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        fs::create_dir_all(root)?;
+        let frame_dir = root.join(format!("frames-{}", std::process::id()));
+        fs::create_dir_all(&frame_dir)?;
+        Ok(Self {
+            output: root.join("newt-sandbox-demo.mp4"),
+            frame_dir,
+            next_frame: 0,
+        })
+    }
+
+    fn push(&mut self, framebuffer: &Framebuffer) -> Result<(), Box<dyn std::error::Error>> {
+        let path = self
+            .frame_dir
+            .join(format!("frame_{:05}.ppm", self.next_frame));
+        write_ppm(path, framebuffer)?;
+        self.next_frame += 1;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let input = self.frame_dir.join("frame_%05d.ppm");
+        let result = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-framerate",
+                "60",
+                "-i",
+                input.to_str().unwrap_or_default(),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                self.output.to_str().unwrap_or_default(),
+            ])
+            .output();
+        let cleanup = fs::remove_dir_all(&self.frame_dir);
+        match (result, cleanup) {
+            (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err("ffmpeg is required for video output".into())
+            }
+            (Err(error), _) => Err(error.into()),
+            (Ok(output), _) if !output.status.success() => {
+                Err(format!("ffmpeg failed: {}", String::from_utf8_lossy(&output.stderr)).into())
+            }
+            (Ok(_), Err(error)) => Err(error.into()),
+            (Ok(_), Ok(())) => Ok(self.output.clone()),
+        }
+    }
+}
+
+impl Drop for VideoWriter {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.frame_dir);
+    }
+}
+
+fn record_demo(root: &Path, seconds: f32) -> Result<(), Box<dyn std::error::Error>> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err("recording duration must be finite and positive".into());
+    }
+    let frames = (seconds * VIDEO_FPS).ceil() as usize;
+    let mut viewer = Viewer::new(None)?;
+    let mut writer = VideoWriter::new(root)?;
+    let mut framebuffer = Framebuffer::new(RECORD_WIDTH as usize, RECORD_HEIGHT as usize);
+    for frame in 0..frames {
+        viewer.record_frame(frame, &mut framebuffer);
+        writer.push(&framebuffer)?;
+    }
+    let output = writer.finish()?;
+    println!(
+        "wrote {} ({} frames at {} fps)",
+        output.display(),
+        frames,
+        VIDEO_FPS
+    );
+    Ok(())
+}
+
+fn measure_viewer(seconds: f32) -> Result<(), Box<dyn std::error::Error>> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err("measurement duration must be finite and positive".into());
+    }
+    let metrics = Rc::new(RefCell::new(Metrics::default()));
+    let viewer_metrics = metrics.clone();
+    let mut viewer = Viewer::new(Some(viewer_metrics))?;
+    let observer_metrics = metrics.clone();
+    run_with_input_timed(
+        "newt sandbox viewer measurement",
+        WIDTH,
+        HEIGHT,
+        seconds,
+        move |framebuffer, elapsed, input| viewer.draw(framebuffer, elapsed, input),
+        move |timing| observer_metrics.borrow_mut().record_present(timing),
+    )?;
+    metrics.borrow().report(seconds);
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut viewer = Viewer::new()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.as_slice() {
+        [flag, root, seconds] if flag == "--record" => {
+            return record_demo(Path::new(root), seconds.parse()?);
+        }
+        [flag, seconds] if flag == "--measure" => {
+            return measure_viewer(seconds.parse()?);
+        }
+        [] => {}
+        _ => return Err("usage: sandbox [--record DIR SECONDS | --measure SECONDS]".into()),
+    }
+    let mut viewer = Viewer::new(None)?;
     run_with_input(
         "newt sandbox viewer",
         WIDTH,
