@@ -2,7 +2,7 @@
   "mujoco": "3.11.0",
   "capture_provenance": {
     "script": "tools/capture_contact_route_probes.py",
-    "date": "2026-08-17",
+    "date": "2026-08-20",
     "method": "mj_forward default contacts from each source_xml"
   },
   "probes": [
@@ -2079,6 +2079,433 @@
             1,
             2,
             3
+          ]
+        ]
+      }
+    },
+    {
+      "id": "P7",
+      "pair": "mesh-mesh-manifold",
+      "mujoco_route": "mjc_Convex",
+      "source_xml": "contact_route_mesh_mesh_manifold.xml",
+      "poses": [
+        {
+          "id": "face_face",
+          "geom_a": "mesh_a_face_face",
+          "geom_b": "mesh_b_face_face",
+          "pose_a": {
+            "position": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "orientation_wxyz": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "pose_b": {
+            "position": [
+              0.02,
+              0.01,
+              0.96
+            ],
+            "orientation_wxyz": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "body_pose_a": {
+            "position": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "orientation_wxyz": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "body_pose_b": {
+            "position": [
+              0.02,
+              0.01,
+              0.96
+            ],
+            "orientation_wxyz": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "contacts": [
+            {
+              "geom": [
+                0,
+                1
+              ],
+              "position": [
+                -0.48,
+                0.5,
+                0.48
+              ],
+              "frame_normal": [
+                0.0,
+                0.0,
+                1.0
+              ],
+              "penetration": 0.040000000000000036
+            },
+            {
+              "geom": [
+                0,
+                1
+              ],
+              "position": [
+                -0.48,
+                -0.49,
+                0.48
+              ],
+              "frame_normal": [
+                0.0,
+                0.0,
+                1.0
+              ],
+              "penetration": 0.040000000000000036
+            },
+            {
+              "geom": [
+                0,
+                1
+              ],
+              "position": [
+                0.5,
+                -0.49,
+                0.48
+              ],
+              "frame_normal": [
+                0.0,
+                0.0,
+                1.0
+              ],
+              "penetration": 0.040000000000000036
+            },
+            {
+              "geom": [
+                0,
+                1
+              ],
+              "position": [
+                0.5,
+                0.5,
+                0.48
+              ],
+              "frame_normal": [
+                0.0,
+                0.0,
+                1.0
+              ],
+              "penetration": 0.040000000000000036
+            }
+          ]
+        },
+        {
+          "id": "edge_face",
+          "geom_a": "mesh_a_edge_face",
+          "geom_b": "mesh_b_edge_face",
+          "pose_a": {
+            "position": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "orientation_wxyz": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "pose_b": {
+            "position": [
+              0.65,
+              0.0,
+              0.0
+            ],
+            "orientation_wxyz": [
+              0.9999765121745486,
+              0.0,
+              0.0,
+              0.006853838284111027
+            ]
+          },
+          "body_pose_a": {
+            "position": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "orientation_wxyz": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "body_pose_b": {
+            "position": [
+              0.65,
+              0.0,
+              0.0
+            ],
+            "orientation_wxyz": [
+              0.9999765121745486,
+              0.0,
+              0.0,
+              0.006853838284111027
+            ]
+          },
+          "contacts": [
+            {
+              "geom": [
+                2,
+                3
+              ],
+              "position": [
+                0.32159664889843553,
+                0.49309934759842144,
+                -0.5
+              ],
+              "frame_normal": [
+                1.0,
+                0.0,
+                0.0
+              ],
+              "penetration": 0.35680670220312893
+            },
+            {
+              "geom": [
+                2,
+                3
+              ],
+              "position": [
+                0.32159664889843553,
+                0.49309934759842144,
+                0.5
+              ],
+              "frame_normal": [
+                1.0,
+                0.0,
+                0.0
+              ],
+              "penetration": 0.35680670220312893
+            }
+          ]
+        },
+        {
+          "id": "vertex_face",
+          "geom_a": "mesh_a_vertex_face",
+          "geom_b": "mesh_b_vertex_face",
+          "pose_a": {
+            "position": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "orientation_wxyz": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "pose_b": {
+            "position": [
+              0.65,
+              0.0,
+              0.3
+            ],
+            "orientation_wxyz": [
+              0.9999765121745486,
+              0.0,
+              0.006853838284111027,
+              0.0
+            ]
+          },
+          "body_pose_a": {
+            "position": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "orientation_wxyz": [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "body_pose_b": {
+            "position": [
+              0.65,
+              0.0,
+              0.3
+            ],
+            "orientation_wxyz": [
+              0.9999765121745486,
+              0.0,
+              0.006853838284111027,
+              0.0
+            ]
+          },
+          "contacts": [
+            {
+              "geom": [
+                4,
+                5
+              ],
+              "position": [
+                0.32159664889843553,
+                0.5,
+                -0.19309934759842146
+              ],
+              "frame_normal": [
+                1.0,
+                0.0,
+                0.0
+              ],
+              "penetration": 0.35680670220312893
+            },
+            {
+              "geom": [
+                4,
+                5
+              ],
+              "position": [
+                0.32159664889843553,
+                -0.5,
+                -0.19309934759842146
+              ],
+              "frame_normal": [
+                1.0,
+                0.0,
+                0.0
+              ],
+              "penetration": 0.35680670220312893
+            }
+          ]
+        }
+      ],
+      "mesh": {
+        "vertices": [
+          [
+            -0.5,
+            -0.5,
+            -0.5
+          ],
+          [
+            0.5,
+            -0.5,
+            -0.5
+          ],
+          [
+            -0.5,
+            0.5,
+            -0.5
+          ],
+          [
+            0.5,
+            0.5,
+            -0.5
+          ],
+          [
+            -0.5,
+            -0.5,
+            0.5
+          ],
+          [
+            0.5,
+            -0.5,
+            0.5
+          ],
+          [
+            -0.5,
+            0.5,
+            0.5
+          ],
+          [
+            0.5,
+            0.5,
+            0.5
+          ]
+        ],
+        "faces": [
+          [
+            0,
+            3,
+            1
+          ],
+          [
+            0,
+            2,
+            3
+          ],
+          [
+            4,
+            5,
+            7
+          ],
+          [
+            4,
+            7,
+            6
+          ],
+          [
+            0,
+            1,
+            5
+          ],
+          [
+            0,
+            5,
+            4
+          ],
+          [
+            2,
+            6,
+            7
+          ],
+          [
+            2,
+            7,
+            3
+          ],
+          [
+            0,
+            4,
+            6
+          ],
+          [
+            0,
+            6,
+            2
+          ],
+          [
+            1,
+            3,
+            7
+          ],
+          [
+            1,
+            7,
+            5
           ]
         ]
       }

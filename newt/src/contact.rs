@@ -2594,8 +2594,7 @@ fn try_narrow_phase(
     if ccd::route_pair(&geom_a.shape, &geom_b.shape) {
         let shape_a = ccd::shape(&geom_a.shape, pose_a, meshes)?;
         let shape_b = ccd::shape(&geom_b.shape, pose_b, meshes)?;
-        let mut out = ContactBuf::new();
-        if let Some(contact) = ccd::ccd_convex_contact(
+        let out = ccd::ccd_convex_contacts(
             shape_a,
             shape_b,
             ccd::CCD_MESH_CONFIG,
@@ -2604,9 +2603,7 @@ fn try_narrow_phase(
             friction,
             margin,
             gap,
-        ) {
-            out.push(contact);
-        }
+        );
         return Some(out);
     }
     Some(match (geom_a.shape, geom_b.shape) {
@@ -3573,5 +3570,98 @@ mod tests {
         assert!(approx(sep.dot(a1 - a0), 0.0, 1e-4));
         assert!(approx(sep.dot(b1 - b0), 0.0, 1e-4));
         assert!(approx(sep.length(), 0.7, 1e-5));
+    }
+
+    fn cube_mesh() -> ConvexMesh {
+        ConvexMesh {
+            vertices: vec![
+                Vec3::new(-0.5, -0.5, -0.5),
+                Vec3::new(0.5, -0.5, -0.5),
+                Vec3::new(-0.5, 0.5, -0.5),
+                Vec3::new(0.5, 0.5, -0.5),
+                Vec3::new(-0.5, -0.5, 0.5),
+                Vec3::new(0.5, -0.5, 0.5),
+                Vec3::new(-0.5, 0.5, 0.5),
+                Vec3::new(0.5, 0.5, 0.5),
+            ],
+            faces: vec![
+                [0, 3, 1],
+                [0, 2, 3],
+                [4, 5, 7],
+                [4, 7, 6],
+                [0, 1, 5],
+                [0, 5, 4],
+                [2, 6, 7],
+                [2, 7, 3],
+                [0, 4, 6],
+                [0, 6, 2],
+                [1, 3, 7],
+                [1, 7, 5],
+            ],
+        }
+    }
+
+    #[test]
+    fn mesh_mesh_face_face_manifold_has_four_midpoint_contacts() {
+        let mesh = cube_mesh();
+        let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+        let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+        let pose_a = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let pose_b = GeomPose {
+            position: Vec3::new(0.02, 0.01, 0.96),
+            orientation: Quat::IDENTITY,
+        };
+        let contacts = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &[mesh]);
+        assert_eq!(contacts.len, 4);
+        for contact in contacts.as_slice() {
+            assert!(approx_vec(contact.normal_world, -Vec3::Z, 1.0e-5));
+            assert!(approx(contact.penetration, 0.04, 1.0e-5));
+            assert!(approx(contact.position_world.z, 0.48, 1.0e-5));
+        }
+    }
+
+    #[test]
+    fn mesh_mesh_edge_face_and_vertex_face_keep_native_feature_counts() {
+        let mesh = cube_mesh();
+        let geom = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+        let poses = [
+            (
+                Vec3::new(0.65, 0.0, 0.0),
+                Quat::from_axis_angle(Vec3::Z, crate::math::FRAC_PI_4),
+            ),
+            (
+                Vec3::new(0.65, 0.0, 0.3),
+                Quat::from_axis_angle(Vec3::Y, crate::math::FRAC_PI_4),
+            ),
+        ];
+        let pose_a = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let mut counts = [0; 2];
+        for (index, (position, orientation)) in poses.into_iter().enumerate() {
+            let pose_b = GeomPose {
+                position,
+                orientation,
+            };
+            let contacts = narrow_phase(
+                0,
+                &geom,
+                &pose_a,
+                1,
+                &geom,
+                &pose_b,
+                std::slice::from_ref(&mesh),
+            );
+            counts[index] = contacts.len;
+            for contact in contacts.as_slice() {
+                assert!(contact.normal_world.length() > 0.99);
+                assert!(contact.penetration > 0.0);
+            }
+        }
+        assert_eq!(counts, [2, 1]);
     }
 }

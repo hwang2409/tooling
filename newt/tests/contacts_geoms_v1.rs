@@ -12,6 +12,7 @@ use newt::contact::{Contact, is_pair_supported, narrow_phase};
 use newt::geom::{ConvexMesh, Geom, GeomPose, GeomShape, geom_world_pose};
 use newt::json::{self, Value};
 use newt::math::{FRAC_PI_2, FRAC_PI_4, Mat3, Quat, Vec3, cos, sin};
+use newt::solver::{ConeKind, SolverConfig, SolverMode};
 use newt::world::World;
 use newt::xml;
 use std::fmt::Write as _;
@@ -425,19 +426,19 @@ fn coincident_mesh_mesh_swapped_order_flips_normal() {
 
     let forward = narrow_phase(0, &geom_a, &pose, 1, &geom_b, &pose, &meshes);
     let swapped = narrow_phase(1, &geom_b, &pose, 0, &geom_a, &pose, &meshes);
-    assert_eq!(forward.len, 1);
-    assert_eq!(swapped.len, 1);
-    let forward = forward.as_slice()[0];
-    let swapped = swapped.as_slice()[0];
-    assert!(forward.normal_world.length_squared() > 0.99);
-    close_vec(swapped.position_world, forward.position_world, 1.0e-6);
-    close_vec(swapped.normal_world, -forward.normal_world, 1.0e-6);
-    close_scalar(
-        swapped.penetration,
-        forward.penetration,
-        1.0e-6,
-        "coincident depth",
-    );
+    assert_eq!(forward.len, 4);
+    assert_eq!(swapped.len, 4);
+    for (forward, swapped) in forward.as_slice().iter().zip(swapped.as_slice()) {
+        assert!(forward.normal_world.length_squared() > 0.99);
+        close_vec(swapped.position_world, forward.position_world, 1.0e-6);
+        close_vec(swapped.normal_world, -forward.normal_world, 1.0e-6);
+        close_scalar(
+            swapped.penetration,
+            forward.penetration,
+            1.0e-6,
+            "coincident depth",
+        );
+    }
 }
 
 #[test]
@@ -544,41 +545,49 @@ fn mesh_exact_alignment_preserves_contacts_at_feature_dimensions() {
                 orientation: Quat::IDENTITY,
             };
             let exact = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &exact_pose, &meshes);
-            assert_eq!(exact.len, 1, "{name} scale {scale} exact contact count");
-            let exact = exact.as_slice()[0];
-            assert!(exact.penetration > 0.0, "{name} scale {scale} exact depth");
-            assert!(
-                exact.normal_world.length() > 0.99,
-                "{name} scale {scale} exact normal"
-            );
+            assert!(exact.len > 0, "{name} scale {scale} exact contact count");
+            for contact in exact.as_slice() {
+                assert!(
+                    contact.penetration > 0.0,
+                    "{name} scale {scale} exact depth"
+                );
+                assert!(
+                    contact.normal_world.length() > 0.99,
+                    "{name} scale {scale} exact normal"
+                );
+            }
             for offset in [-1.0e-7, 1.0e-7] {
                 let near_pose = GeomPose {
                     position: base_position + transverse * offset,
                     orientation: Quat::IDENTITY,
                 };
                 let near = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &near_pose, &meshes);
-                assert_eq!(near.len, 1, "{name} scale {scale} offset {offset} count");
-                let near = near.as_slice()[0];
+                assert_eq!(
+                    near.len, exact.len,
+                    "{name} scale {scale} offset {offset} count"
+                );
                 let tolerance = 1.0e-4 * scale.max(1.0);
                 let normal_tolerance = 2.0e-4;
-                assert!(
-                    (near.position_world - exact.position_world).length() <= tolerance,
-                    "{name} scale {scale} offset {offset} position {:?} != {:?}",
-                    near.position_world,
-                    exact.position_world
-                );
-                assert!(
-                    (near.normal_world - exact.normal_world).length() <= normal_tolerance,
-                    "{name} scale {scale} offset {offset} normal {:?} != {:?}",
-                    near.normal_world,
-                    exact.normal_world
-                );
-                close_scalar(
-                    near.penetration,
-                    exact.penetration,
-                    tolerance,
-                    "exact-alignment depth",
-                );
+                for (near, exact) in near.as_slice().iter().zip(exact.as_slice()) {
+                    assert!(
+                        (near.position_world - exact.position_world).length() <= tolerance,
+                        "{name} scale {scale} offset {offset} position {:?} != {:?}",
+                        near.position_world,
+                        exact.position_world
+                    );
+                    assert!(
+                        (near.normal_world - exact.normal_world).length() <= normal_tolerance,
+                        "{name} scale {scale} offset {offset} normal {:?} != {:?}",
+                        near.normal_world,
+                        exact.normal_world
+                    );
+                    close_scalar(
+                        near.penetration,
+                        exact.penetration,
+                        tolerance,
+                        "exact-alignment depth",
+                    );
+                }
             }
         }
     }
@@ -848,6 +857,105 @@ fn tetrahedron_mesh_rests_on_a_face() {
     assert!(
         z > expected - 5.0e-3 && z < expected + 5.0e-3,
         "tetra mesh rest z {z} vs expected {expected}"
+    );
+}
+
+fn stack_cube_mesh() -> ConvexMesh {
+    ConvexMesh {
+        vertices: vec![
+            Vec3::new(-0.5, -0.5, -0.5),
+            Vec3::new(0.5, -0.5, -0.5),
+            Vec3::new(-0.5, 0.5, -0.5),
+            Vec3::new(0.5, 0.5, -0.5),
+            Vec3::new(-0.5, -0.5, 0.5),
+            Vec3::new(0.5, -0.5, 0.5),
+            Vec3::new(-0.5, 0.5, 0.5),
+            Vec3::new(0.5, 0.5, 0.5),
+        ],
+        faces: vec![
+            [0, 3, 1],
+            [0, 2, 3],
+            [4, 5, 7],
+            [4, 7, 6],
+            [0, 1, 5],
+            [0, 5, 4],
+            [2, 6, 7],
+            [2, 7, 3],
+            [0, 4, 6],
+            [0, 6, 2],
+            [1, 3, 7],
+            [1, 7, 5],
+        ],
+    }
+}
+
+#[test]
+fn mesh_mesh_stack_keeps_face_manifold_under_pgs() {
+    let mesh = stack_cube_mesh();
+    let mut world = World::new();
+    world.dt = 0.005;
+    world.gravity = Vec3::new(0.0, 0.0, -9.81);
+    world.solver = SolverConfig {
+        mode: SolverMode::Pgs,
+        iterations: 30,
+        cone: ConeKind::Pyramidal,
+    };
+    world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 1.0));
+    let mesh_id = world.add_mesh(mesh);
+    for position in [
+        Vec3::new(0.0, 0.0, 0.5),
+        Vec3::new(0.02, 0.0, 1.46),
+        Vec3::new(0.0, 0.02, 2.42),
+    ] {
+        let body_id = world.add_body(Body::solid_box(
+            1.0,
+            Vec3::splat(0.5),
+            position,
+            Quat::IDENTITY,
+        ));
+        world.add_geom(Geom::mesh(
+            body_id,
+            mesh_id,
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            0.6,
+        ));
+    }
+    let lower_pose = GeomPose {
+        position: world.bodies[0].position,
+        orientation: Quat::IDENTITY,
+    };
+    let upper_pose = GeomPose {
+        position: world.bodies[1].position,
+        orientation: Quat::IDENTITY,
+    };
+    let lower_geom = &world.geoms[1];
+    let upper_geom = &world.geoms[2];
+    assert_eq!(
+        narrow_phase(
+            1,
+            lower_geom,
+            &lower_pose,
+            2,
+            upper_geom,
+            &upper_pose,
+            &world.meshes
+        )
+        .len,
+        4,
+        "flat mesh faces must expose the four torque-balancing contacts"
+    );
+    for _ in 0..2000 {
+        world.step();
+    }
+    for (index, body) in world.bodies.iter().enumerate() {
+        assert!(body.position.z > 0.2, "mesh {index} fell through the plane");
+        assert!(body.position.z < 3.0, "mesh {index} escaped the stack");
+        assert!(body.position.x.is_finite() && body.position.y.is_finite());
+    }
+    assert!(
+        world.bodies[1].position.x.abs() < 1.0 && world.bodies[1].position.y.abs() < 1.0,
+        "mesh stack developed excessive lateral drift"
     );
 }
 
@@ -1379,7 +1487,7 @@ fn analytic_convex_route_probes_are_fixture_backed() {
                     vec![route_mesh(probe)],
                 ),
                 "box-mesh" => continue,
-                "mesh-mesh" => (
+                "mesh-mesh" | "mesh-mesh-manifold" => (
                     Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
                     Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
                     vec![route_mesh(probe)],
