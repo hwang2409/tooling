@@ -5,19 +5,43 @@ use std::num::NonZeroU32;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+pub use winit::event::MouseButton as PresentMouseButton;
+pub use winit::keyboard::KeyCode as PresentKeyCode;
+
 #[derive(Clone, Debug, Default)]
 pub struct InputState {
     pressed: HashSet<KeyCode>,
+    mouse_buttons: HashSet<MouseButton>,
+    mouse_delta: (f32, f32),
+    scroll_delta: f32,
+    last_cursor: Option<(f32, f32)>,
 }
 
 impl InputState {
     pub fn is_down(&self, key: KeyCode) -> bool {
         self.pressed.contains(&key)
+    }
+
+    pub fn is_mouse_down(&self, button: PresentMouseButton) -> bool {
+        self.mouse_buttons.contains(&button)
+    }
+
+    pub const fn mouse_delta(&self) -> (f32, f32) {
+        self.mouse_delta
+    }
+
+    pub const fn scroll_delta(&self) -> f32 {
+        self.scroll_delta
+    }
+
+    fn clear_frame_deltas(&mut self) {
+        self.mouse_delta = (0.0, 0.0);
+        self.scroll_delta = 0.0;
     }
 }
 
@@ -146,6 +170,9 @@ where
         match &event {
             WindowEvent::Focused(false) => {
                 self.input.pressed.clear();
+                self.input.mouse_buttons.clear();
+                self.input.last_cursor = None;
+                self.input.clear_frame_deltas();
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -165,6 +192,27 @@ where
                 } else {
                     self.input.pressed.remove(key);
                 }
+            }
+            WindowEvent::MouseInput { button, state, .. } => {
+                if *state == ElementState::Pressed {
+                    self.input.mouse_buttons.insert(*button);
+                } else {
+                    self.input.mouse_buttons.remove(button);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let cursor = (position.x as f32, position.y as f32);
+                if let Some(previous) = self.input.last_cursor {
+                    self.input.mouse_delta.0 += cursor.0 - previous.0;
+                    self.input.mouse_delta.1 += cursor.1 - previous.1;
+                }
+                self.input.last_cursor = Some(cursor);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.input.scroll_delta += match delta {
+                    MouseScrollDelta::LineDelta(_, y) => *y * 24.0,
+                    MouseScrollDelta::PixelDelta(value) => value.y as f32,
+                };
             }
             _ => {}
         }
@@ -197,6 +245,7 @@ where
                         return;
                     }
                 }
+                self.input.clear_frame_deltas();
                 self.frames += 1;
                 if self.frame_budget_exhausted() {
                     event_loop.exit();
