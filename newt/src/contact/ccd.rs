@@ -1,4 +1,5 @@
 use super::*;
+use crate::geom::MAX_CONVEX_MESH_VERTICES;
 
 pub(super) fn route_pair(a: &GeomShape, b: &GeomShape) -> bool {
     matches!((a, b), (GeomShape::Mesh { .. }, GeomShape::Mesh { .. }))
@@ -1080,8 +1081,8 @@ fn ccd_epa_fallback_contact(
     })
 }
 
-const MULTI_FEATURE_CAP: usize = 16;
-const MULTI_CLIP_CAP: usize = 16;
+const MULTI_FEATURE_CAP: usize = MAX_CONVEX_MESH_VERTICES;
+const MULTI_CLIP_CAP: usize = MULTI_FEATURE_CAP * 2;
 const MULTI_FACE_TOL: f32 = 0.996;
 const MULTI_EDGE_TOL: f32 = 0.0888;
 
@@ -1089,14 +1090,14 @@ fn mesh_support_ids(
     shape: CcdShape<'_>,
     direction: Vec3,
     ids: &mut [usize; MULTI_FEATURE_CAP],
-) -> usize {
+) -> Option<usize> {
     let CcdShape::Mesh { pose, mesh } = shape else {
-        return 0;
+        return Some(0);
     };
     let local_direction = pose.orientation.inverse_rotate(direction);
     let direction_length = local_direction.length();
     if direction_length <= CCD_DEGENERATE_EPSILON {
-        return 0;
+        return Some(0);
     }
     let direction = local_direction / direction_length;
     let best = mesh
@@ -1108,12 +1109,15 @@ fn mesh_support_ids(
     let tolerance = extent * 1.0e-7;
     let mut len = 0;
     for (index, point) in mesh.vertices.iter().enumerate() {
-        if (point.dot(direction) - best).abs() <= tolerance && len < ids.len() {
+        if (point.dot(direction) - best).abs() <= tolerance {
+            if len == ids.len() {
+                return None;
+            }
             ids[len] = index;
             len += 1;
         }
     }
-    len
+    Some(len)
 }
 
 fn mesh_face_contains(face: [u32; 3], ids: &[usize; MULTI_FEATURE_CAP], id_len: usize) -> bool {
@@ -1126,7 +1130,7 @@ fn mesh_feature_faces(
     ids: &[usize; MULTI_FEATURE_CAP],
     id_len: usize,
     faces: &mut [usize; MULTI_FEATURE_CAP],
-) -> usize {
+) -> Option<usize> {
     let mut len = 0;
     for (index, &face) in mesh.faces.iter().enumerate() {
         let matches = if id_len >= 3 {
@@ -1137,12 +1141,15 @@ fn mesh_feature_faces(
                 .count()
                 == id_len
         };
-        if matches && len < faces.len() {
+        if matches {
+            if len == faces.len() {
+                return None;
+            }
             faces[len] = index;
             len += 1;
         }
     }
-    len
+    Some(len)
 }
 
 fn mesh_face_world(
@@ -1151,33 +1158,19 @@ fn mesh_face_world(
     face_index: usize,
 ) -> Option<([Vec3; 3], Vec3)> {
     let face = mesh.faces[face_index];
-    let mut points = [
+    let points = [
         pose.point_to_world(mesh.vertices[face[0] as usize]),
         pose.point_to_world(mesh.vertices[face[1] as usize]),
         pose.point_to_world(mesh.vertices[face[2] as usize]),
     ];
-    let raw = (points[1] - points[0]).cross(points[2] - points[0]);
-    if raw.length_squared() <= CCD_DEGENERATE_SQUARED {
+    let local_a = mesh.vertices[face[0] as usize];
+    let local_b = mesh.vertices[face[1] as usize];
+    let local_c = mesh.vertices[face[2] as usize];
+    let local_normal = (local_b - local_a).cross(local_c - local_a);
+    if local_normal.length_squared() <= CCD_DEGENERATE_SQUARED {
         return None;
     }
-    let mesh_center = mesh
-        .vertices
-        .iter()
-        .copied()
-        .fold(Vec3::ZERO, |sum, point| sum + point)
-        / mesh.vertices.len() as f32;
-    let face_center = (mesh.vertices[face[0] as usize]
-        + mesh.vertices[face[1] as usize]
-        + mesh.vertices[face[2] as usize])
-        / 3.0;
-    let local_normal = raw.normalize();
-    let outward = if local_normal.dot(face_center - mesh_center) >= 0.0 {
-        local_normal
-    } else {
-        points.swap(1, 2);
-        -local_normal
-    };
-    Some((points, pose.rotate(outward).normalize()))
+    Some((points, pose.rotate(local_normal.normalize()).normalize()))
 }
 
 fn mesh_feature_normal(
@@ -1188,7 +1181,7 @@ fn mesh_feature_normal(
     expected: Vec3,
 ) -> Option<Vec3> {
     let mut faces = [0usize; MULTI_FEATURE_CAP];
-    let face_len = mesh_feature_faces(mesh, ids, id_len, &mut faces);
+    let face_len = mesh_feature_faces(mesh, ids, id_len, &mut faces)?;
     let mut best = None;
     for &face_index in &faces[..face_len] {
         let Some((_, normal)) = mesh_face_world(pose, mesh, face_index) else {
@@ -1207,8 +1200,8 @@ fn mesh_feature_polygon(
     ids: &[usize; MULTI_FEATURE_CAP],
     id_len: usize,
     normal: Vec3,
-) -> ([Vec3; MULTI_FEATURE_CAP], usize) {
-    let mut polygon = [Vec3::ZERO; MULTI_FEATURE_CAP];
+) -> Option<([Vec3; MULTI_CLIP_CAP], usize)> {
+    let mut polygon = [Vec3::ZERO; MULTI_CLIP_CAP];
     let mut len = 0;
     for &id in &ids[..id_len] {
         let point = pose.point_to_world(mesh.vertices[id]);
@@ -1216,12 +1209,15 @@ fn mesh_feature_polygon(
             .iter()
             .any(|prior| (*prior - point).length_squared() <= CCD_DEGENERATE_SQUARED)
         {
+            if len == polygon.len() {
+                return None;
+            }
             polygon[len] = point;
             len += 1;
         }
     }
     if len < 3 {
-        return (polygon, len);
+        return Some((polygon, len));
     }
     let center = polygon[..len]
         .iter()
@@ -1248,7 +1244,7 @@ fn mesh_feature_polygon(
             position -= 1;
         }
     }
-    (polygon, len)
+    Some((polygon, len))
 }
 
 fn polygon_start_precedes(a: Vec3, b: Vec3) -> bool {
@@ -1300,14 +1296,16 @@ fn mesh_feature_edges(
         return 0;
     }
     let mut face_indices = [0usize; MULTI_FEATURE_CAP];
-    let face_len = mesh_feature_faces(mesh, ids, id_len, &mut face_indices);
+    let Some(face_len) = mesh_feature_faces(mesh, ids, id_len, &mut face_indices) else {
+        return 0;
+    };
     let mut len = 0;
     for &face_index in &face_indices[..face_len] {
         let face = mesh.faces[face_index];
         for &other in &face {
             let other = other as usize;
             if other == ids[0] || len == edges.len() {
-                continue;
+                return 0;
             }
             let edge = [ids[0], other];
             let points = [
@@ -1334,7 +1332,8 @@ fn polygon_clip(
     reference: &[Vec3; MULTI_CLIP_CAP],
     reference_len: usize,
     normal: Vec3,
-) -> ([Vec3; MULTI_CLIP_CAP], usize) {
+) -> Option<([Vec3; MULTI_CLIP_CAP], usize)> {
+    // Overflow returns None so the caller keeps the single EPA contact.
     let mut polygon = *subject;
     let mut polygon_len = subject_len;
     let mut clipped = [Vec3::ZERO; MULTI_CLIP_CAP];
@@ -1352,13 +1351,19 @@ fn polygon_clip(
             let end_inside = end_distance >= -1.0e-6;
             if start_inside != end_inside {
                 let denominator = start_distance - end_distance;
-                if denominator.abs() > CCD_DEGENERATE_EPSILON && clipped_len < clipped.len() {
+                if denominator.abs() > CCD_DEGENERATE_EPSILON {
+                    if clipped_len == clipped.len() {
+                        return None;
+                    }
                     let t = start_distance / denominator;
                     clipped[clipped_len] = start + (end - start) * t;
                     clipped_len += 1;
                 }
             }
-            if end_inside && clipped_len < clipped.len() {
+            if end_inside {
+                if clipped_len == clipped.len() {
+                    return None;
+                }
                 clipped[clipped_len] = end;
                 clipped_len += 1;
             }
@@ -1370,16 +1375,15 @@ fn polygon_clip(
             break;
         }
     }
-    (polygon, polygon_len)
+    Some((polygon, polygon_len))
 }
 
 fn quad_area(points: &[Vec3; MULTI_CLIP_CAP], indices: [usize; 4]) -> f32 {
-    let cross = |a: Vec3, b: Vec3| a.cross(b);
     let a = points[indices[0]];
     let b = points[indices[1]];
     let c = points[indices[2]];
     let d = points[indices[3]];
-    (cross(d - a, b - a) + cross(c - b, a - c)).length() * 0.5
+    ((b - a).cross(c - a).length() + (c - a).cross(d - a).length()) * 0.5
 }
 
 fn quad_indices(points: &[Vec3; MULTI_CLIP_CAP], len: usize) -> [usize; 4] {
@@ -1405,7 +1409,12 @@ fn quad_indices(points: &[Vec3; MULTI_CLIP_CAP], len: usize) -> [usize; 4] {
 fn ordered_indices(points: &[Vec3; MULTI_CLIP_CAP], indices: [usize; 4], len: usize) -> [usize; 4] {
     let mut first = 0;
     for index in 1..len {
-        if polygon_start_precedes(points[indices[index]], points[indices[first]]) {
+        let precedes = if len == 2 {
+            lexicographically_precedes(points[indices[index]], points[indices[first]])
+        } else {
+            polygon_start_precedes(points[indices[index]], points[indices[first]])
+        };
+        if precedes {
             first = index;
         }
     }
@@ -1425,20 +1434,19 @@ fn append_multi_contacts(
     reference_len: usize,
     reference_normal: Vec3,
     projection_normal: Vec3,
-    contact_normal: Vec3,
     subject_is_a: bool,
     base: Contact,
     margin: f32,
-) {
+) -> Option<()> {
     let (polygon, polygon_len) = polygon_clip(
         subject,
         subject_len,
         reference,
         reference_len,
         reference_normal,
-    );
+    )?;
     if polygon_len == 0 {
-        return;
+        return Some(());
     }
     let selected = if polygon_len > 4 {
         let indices = quad_indices(&polygon, polygon_len);
@@ -1458,11 +1466,14 @@ fn append_multi_contacts(
             (subject_point - projection_normal * signed, subject_point)
         };
         let separation = point_a - point_b;
-        let separation_length = separation.length();
+        let penetration = margin - separation.dot(base.normal_world);
+        if penetration <= 0.0 {
+            continue;
+        }
         let contact = Contact {
             position_world: (point_a + point_b) * 0.5,
-            penetration: margin + separation_length,
-            normal_world: contact_normal,
+            penetration,
+            normal_world: base.normal_world,
             ..base
         };
         if contact.penetration > 0.0
@@ -1474,6 +1485,7 @@ fn append_multi_contacts(
             out.push(contact);
         }
     }
+    Some(())
 }
 
 fn mesh_multicontact(
@@ -1501,8 +1513,8 @@ fn mesh_multicontact(
     };
     let mut ids_a = [0usize; MULTI_FEATURE_CAP];
     let mut ids_b = [0usize; MULTI_FEATURE_CAP];
-    let len_a = mesh_support_ids(shape_a, -base.normal_world, &mut ids_a);
-    let len_b = mesh_support_ids(shape_b, base.normal_world, &mut ids_b);
+    let len_a = mesh_support_ids(shape_a, -base.normal_world, &mut ids_a)?;
+    let len_b = mesh_support_ids(shape_b, base.normal_world, &mut ids_b)?;
     if len_a == 0 || len_b == 0 {
         return None;
     }
@@ -1511,9 +1523,9 @@ fn mesh_multicontact(
     let mut out = ContactBuf::new();
     if len_a >= 3 && len_b >= 3 && normal_a.dot(normal_b) < -MULTI_FACE_TOL {
         let (polygon_a, polygon_a_len) =
-            mesh_feature_polygon(pose_a, mesh_a, &ids_a, len_a, normal_a);
+            mesh_feature_polygon(pose_a, mesh_a, &ids_a, len_a, normal_a)?;
         let (polygon_b, polygon_b_len) =
-            mesh_feature_polygon(pose_b, mesh_b, &ids_b, len_b, normal_b);
+            mesh_feature_polygon(pose_b, mesh_b, &ids_b, len_b, normal_b)?;
         append_multi_contacts(
             &mut out,
             &polygon_b,
@@ -1522,16 +1534,15 @@ fn mesh_multicontact(
             polygon_a_len,
             normal_a,
             normal_a,
-            -normal_a,
             false,
             base,
             margin,
-        );
+        )?;
     } else if len_a < 3 && len_b >= 3 {
         let mut edges = [[Vec3::ZERO; 2]; MULTI_FEATURE_CAP];
         let edge_len = mesh_feature_edges(pose_a, mesh_a, &ids_a, len_a, &mut edges);
         let (polygon_b, polygon_b_len) =
-            mesh_feature_polygon(pose_b, mesh_b, &ids_b, len_b, normal_b);
+            mesh_feature_polygon(pose_b, mesh_b, &ids_b, len_b, normal_b)?;
         for edge in &edges[..edge_len] {
             let direction = (edge[1] - edge[0]).normalize();
             if direction.dot(normal_b).abs() < MULTI_EDGE_TOL {
@@ -1546,11 +1557,10 @@ fn mesh_multicontact(
                     polygon_b_len,
                     normal_b,
                     base.normal_world,
-                    -normal_a,
                     true,
                     base,
                     margin,
-                );
+                )?;
                 break;
             }
         }
@@ -1558,7 +1568,7 @@ fn mesh_multicontact(
         let mut edges = [[Vec3::ZERO; 2]; MULTI_FEATURE_CAP];
         let edge_len = mesh_feature_edges(pose_b, mesh_b, &ids_b, len_b, &mut edges);
         let (polygon_a, polygon_a_len) =
-            mesh_feature_polygon(pose_a, mesh_a, &ids_a, len_a, normal_a);
+            mesh_feature_polygon(pose_a, mesh_a, &ids_a, len_a, normal_a)?;
         for edge in &edges[..edge_len] {
             let direction = (edge[1] - edge[0]).normalize();
             if direction.dot(normal_a).abs() < MULTI_EDGE_TOL {
@@ -1573,11 +1583,10 @@ fn mesh_multicontact(
                     polygon_a_len,
                     normal_a,
                     base.normal_world,
-                    -normal_a,
                     false,
                     base,
                     margin,
-                );
+                )?;
                 break;
             }
         }
@@ -1839,4 +1848,24 @@ fn barycentric_triangle_origin(a: Vec3, b: Vec3, c: Vec3, point: Vec3) -> (f32, 
     let v = (d11 * d20 - d01 * d21) / denom;
     let w = (d00 * d21 - d01 * d20) / denom;
     (1.0 - v - w, v, w)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quad_reducer_selects_maximum_area_subset() {
+        let mut points = [Vec3::ZERO; MULTI_CLIP_CAP];
+        points[0] = Vec3::new(-1.0, -1.0, 0.0);
+        points[1] = Vec3::new(0.0, 0.0, 0.0);
+        points[2] = Vec3::new(1.0, -1.0, 0.0);
+        points[3] = Vec3::new(1.0, 1.0, 0.0);
+        points[4] = Vec3::new(-1.0, 1.0, 0.0);
+
+        let selected = quad_indices(&points, 5);
+
+        assert_eq!(selected, [0, 2, 3, 4]);
+        assert!(quad_area(&points, selected) > 0.0);
+    }
 }

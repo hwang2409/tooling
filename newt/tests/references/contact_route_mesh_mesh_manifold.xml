@@ -1,4 +1,5 @@
 <mujoco model="contact_route_mesh_mesh_manifold">
+  <compiler angle="radian"/>
   <option gravity="0 0 0"/>
   <asset>
     <mesh name="cube"

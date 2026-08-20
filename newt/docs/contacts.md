@@ -261,7 +261,7 @@ reads the MuJoCo rows and asserts the reviewed bounds:
 | P4 plane-mesh | `4.1e-8 / 0 / 5.96e-8` | `1e-6 / 1e-6 / 1e-6` | equal |
 | P5 box-mesh | `2.5e-7 / 1.0 / 6.0e-8` | `1e-6 / 1.01 / 1e-6` | deferred |
 | P6 mesh-mesh | `1.8e-7 / 3.51e-5 / 9.7e-8` | `1e-6 / 4e-5 / 1e-6` | equal |
-| P7 mesh-mesh-manifold | `4.46e-3 / 0 / 6.12e-5` | `5e-3 / 1e-6 / 1e-4` | 4 / 2 / 2 contacts |
+| P7 mesh-mesh-manifold | `2.98e-8 / 5.96e-8 / 1.19e-7` | `5e-3 / 1e-6 / 1e-4` | 4 / 2 / 2 contacts |
 
 No-contact poses require zero contacts in both engines. Mesh-mesh multiCCD is
 limited to the four-contact output cap used by MuJoCo's native convex path.

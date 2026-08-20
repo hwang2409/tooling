@@ -1543,6 +1543,32 @@ fn analytic_convex_route_probes_are_fixture_backed() {
     }
 }
 
+#[test]
+fn mesh_mesh_edge_face_recovery_preserves_diagonal_epa_normal() {
+    let mesh = stack_cube_mesh();
+    let meshes = [mesh];
+    let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(0.65, 0.65, 0.0),
+        orientation: Quat::from_axis_angle(Vec3::Z, FRAC_PI_4),
+    };
+    let contacts = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &meshes);
+    assert!(contacts.len > 1, "edge-face recovery must emit a manifold");
+    let expected_normal = contacts.contacts[0].normal_world;
+    assert!(
+        expected_normal.x.abs() > 0.5 && expected_normal.y.abs() > 0.5,
+        "test pair must produce a diagonal EPA normal: {expected_normal:?}"
+    );
+    for contact in contacts.as_slice() {
+        close_vec(contact.normal_world, expected_normal, 1.0e-6);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Margin / gap
 // ---------------------------------------------------------------------------

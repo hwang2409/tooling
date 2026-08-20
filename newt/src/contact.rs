@@ -3662,6 +3662,6 @@ mod tests {
                 assert!(contact.penetration > 0.0);
             }
         }
-        assert_eq!(counts, [2, 1]);
+        assert_eq!(counts, [2, 2]);
     }
 }
