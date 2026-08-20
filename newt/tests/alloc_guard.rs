@@ -6,13 +6,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use newt::body::Body;
-use newt::geom::Geom;
+use newt::broadphase::Ray;
+use newt::geom::{ConvexMesh, Geom};
 use newt::joint::JointKind;
 use newt::math::{Mat3, Quat, Vec3};
 use newt::mjcf::load_mjcf_path;
 use newt::solver::SolverMode;
 use newt::tree::{Link, Tree};
-use newt::world::{BroadPhaseMode, Integrator, World};
+use newt::world::{BroadPhaseMode, Integrator, ShapeDesc, World};
 
 struct CountingAllocator;
 
@@ -137,6 +138,94 @@ fn warmed_broadphase_updates_do_not_allocate() {
     reset_allocations();
     for _ in 0..100 {
         assert_eq!(world.broadphase_pair_count(), 0);
+    }
+    assert_eq!(allocation_count(), 0);
+}
+
+#[test]
+fn warmed_scene_queries_do_not_allocate_for_links_or_meshes() {
+    let _lock = ALLOCATION_TEST_LOCK.lock().unwrap();
+    let mut world = World::new();
+    world.gravity = Vec3::ZERO;
+
+    let body = world.add_body(Body::solid_sphere(
+        1.0,
+        0.25,
+        Vec3::new(2.0, 0.0, 0.0),
+        Quat::IDENTITY,
+    ));
+    world.add_geom(Geom::sphere(body, 0.25, Vec3::ZERO, 0.0));
+
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::new(4.0, 0.0, 0.0), Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    let tree_id = world.add_tree(tree);
+    world.add_geom(Geom::sphere_on_link(tree_id, 0, 0.25, Vec3::ZERO, 0.0));
+
+    let mesh_id = world.add_mesh(ConvexMesh {
+        vertices: vec![
+            Vec3::new(-0.25, -0.25, -0.25),
+            Vec3::new(0.25, -0.25, -0.25),
+            Vec3::new(0.0, 0.25, -0.25),
+            Vec3::new(0.0, 0.0, 0.25),
+        ],
+        faces: vec![[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]],
+    });
+    let mesh_body = world.add_body(Body::solid_sphere(
+        1.0,
+        0.25,
+        Vec3::new(6.0, 0.0, 0.0),
+        Quat::IDENTITY,
+    ));
+    world.add_geom(Geom::mesh(
+        mesh_body,
+        mesh_id,
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        0.0,
+    ));
+
+    let ray = Ray {
+        origin: Vec3::ZERO,
+        direction: Vec3::X,
+    };
+    for _ in 0..4 {
+        let _ = world.raycast(ray, 20.0, u32::MAX);
+        let _ = world.shape_cast(
+            ShapeDesc::Sphere { radius: 0.1 },
+            newt::world::Pose {
+                position: Vec3::ZERO,
+                orientation: Quat::IDENTITY,
+            },
+            newt::world::Pose {
+                position: Vec3::new(8.0, 0.0, 0.0),
+                orientation: Quat::IDENTITY,
+            },
+            u32::MAX,
+        );
+    }
+
+    reset_allocations();
+    for _ in 0..100 {
+        let _ = world.raycast(ray, 20.0, u32::MAX);
+        let _ = world.shape_cast(
+            ShapeDesc::Sphere { radius: 0.1 },
+            newt::world::Pose {
+                position: Vec3::ZERO,
+                orientation: Quat::IDENTITY,
+            },
+            newt::world::Pose {
+                position: Vec3::new(8.0, 0.0, 0.0),
+                orientation: Quat::IDENTITY,
+            },
+            u32::MAX,
+        );
     }
     assert_eq!(allocation_count(), 0);
 }

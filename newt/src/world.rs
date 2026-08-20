@@ -56,9 +56,10 @@ use crate::solver::{
 use crate::tree::{
     AbaWorkspace, Tree, euler_step_with_workspace as tree_euler_step_with_workspace,
     forward_kinematics as tree_forward_kinematics,
-    forward_kinematics_into as tree_forward_kinematics_into,
+    forward_kinematics_into as tree_forward_kinematics_into, link_pose_nonalloc,
     rk4_step_with_workspace as tree_rk4_step_with_workspace,
 };
+use std::cell::RefCell;
 use std::collections::HashSet;
 
 #[cfg(feature = "instrumentation")]
@@ -189,6 +190,12 @@ pub struct World {
     broadphase_tree_poses: Vec<Vec<(Vec3, Quat)>>,
     #[doc(hidden)]
     broadphase_tree_velocities: Vec<Vec<(Vec3, Vec3)>>,
+    #[doc(hidden)]
+    query_broadphase: RefCell<DynamicAabbTree>,
+    #[doc(hidden)]
+    query_tree_poses: RefCell<Vec<Vec<(Vec3, Quat)>>>,
+    #[doc(hidden)]
+    query_tree_velocities: RefCell<Vec<Vec<(Vec3, Vec3)>>>,
     #[doc(hidden)]
     broadphase_reinsert_count: std::cell::Cell<u64>,
     #[doc(hidden)]
@@ -344,6 +351,9 @@ impl World {
             broadphase_pairs: Vec::new(),
             broadphase_tree_poses: Vec::new(),
             broadphase_tree_velocities: Vec::new(),
+            query_broadphase: RefCell::new(DynamicAabbTree::new()),
+            query_tree_poses: RefCell::new(Vec::new()),
+            query_tree_velocities: RefCell::new(Vec::new()),
             broadphase_reinsert_count: std::cell::Cell::new(0),
             last_broadphase_mode: BroadPhaseMode::DynamicAabbTree,
             #[cfg(feature = "instrumentation")]
@@ -666,9 +676,14 @@ impl World {
                 return true;
             }
             let pose = self.geom_pose(geom);
-            let Some((t, point_world, normal_world)) =
-                crate::scene_query::ray_hit(geom, &pose, ray, max_dist, &self.meshes)
-            else {
+            let Some((t, point_world, normal_world)) = crate::scene_query::ray_hit(
+                geom,
+                &pose,
+                ray,
+                max_dist,
+                &self.meshes,
+                &self.hfields,
+            ) else {
                 return true;
             };
             let candidate = RayHit {
@@ -701,7 +716,7 @@ impl World {
             }
             let pose = self.geom_pose(geom);
             if let Some((t, point_world, normal_world)) =
-                crate::scene_query::ray_hit(geom, &pose, ray, max_dist, &self.meshes)
+                crate::scene_query::ray_hit(geom, &pose, ray, max_dist, &self.meshes, &self.hfields)
             {
                 hits.push(RayHit {
                     geom_id,
@@ -729,9 +744,7 @@ impl World {
         if layer_mask == 0 {
             return None;
         }
-        let bounds = shape
-            .aabb(&from_pose, &self.meshes)
-            .union(shape.aabb(&to_pose, &self.meshes));
+        let bounds = shape.sweep_aabb(&from_pose, &to_pose, &self.meshes);
         let mut best = None;
         self.query_aabb_candidates(bounds, |geom_id| {
             let geom = &self.geoms[geom_id];
@@ -1062,24 +1075,10 @@ impl World {
                 geom_world_pose(geom, state.position, state.orientation)
             }
             GeomAttach::Link(tree, link) => {
-                let (position, orientation) = tree_forward_kinematics(&self.trees[tree])[link];
+                let (position, orientation) = link_pose_nonalloc(&self.trees[tree], link);
                 geom_world_pose(geom, position, orientation)
             }
         }
-    }
-
-    fn query_tree_current(&self) -> bool {
-        if self.broadphase.len() != self.geoms.len() {
-            return false;
-        }
-        self.geoms.iter().enumerate().all(|(geom_id, geom)| {
-            let Some(proxy_bounds) = self.broadphase.proxy_aabb(geom_id) else {
-                return false;
-            };
-            let pose = self.geom_pose(geom);
-            let bounds = geom_aabb(geom, &pose, &self.meshes, &self.hfields).expanded(geom.margin);
-            proxy_bounds.contains(bounds)
-        })
     }
 
     fn refresh_broadphase_for_query(&mut self) {
@@ -1101,13 +1100,9 @@ impl World {
     where
         F: FnMut(usize) -> bool,
     {
-        if self.query_tree_current() {
-            self.broadphase.query_aabb(bounds, callback);
-            return;
-        }
-        let mut tree = DynamicAabbTree::new();
-        let mut tree_poses = Vec::new();
-        let mut tree_velocities = Vec::new();
+        let mut tree = self.query_broadphase.borrow_mut();
+        let mut tree_poses = self.query_tree_poses.borrow_mut();
+        let mut tree_velocities = self.query_tree_velocities.borrow_mut();
         let inputs = BroadphaseInputs {
             bodies: &self.bodies,
             trees: &self.trees,
@@ -1127,13 +1122,9 @@ impl World {
     where
         F: FnMut(usize) -> bool,
     {
-        if self.query_tree_current() {
-            self.broadphase.query_ray(ray, callback);
-            return;
-        }
-        let mut tree = DynamicAabbTree::new();
-        let mut tree_poses = Vec::new();
-        let mut tree_velocities = Vec::new();
+        let mut tree = self.query_broadphase.borrow_mut();
+        let mut tree_poses = self.query_tree_poses.borrow_mut();
+        let mut tree_velocities = self.query_tree_velocities.borrow_mut();
         let inputs = BroadphaseInputs {
             bodies: &self.bodies,
             trees: &self.trees,

@@ -844,6 +844,72 @@ pub(crate) fn forward_kinematics_into(tree: &Tree, out: &mut Vec<(Vec3, Quat)>) 
     }
 }
 
+/// Compute one link pose without allocating a pose vector.
+pub(crate) fn link_pose_nonalloc(tree: &Tree, target: usize) -> (Vec3, Quat) {
+    fn pose_at(tree: &Tree, index: usize) -> (Vec3, Quat) {
+        let link = &tree.links[index];
+        let parent = link
+            .parent
+            .map(|parent| pose_at(tree, parent))
+            .unwrap_or((Vec3::ZERO, Quat::IDENTITY));
+        let (parent_pos, parent_ori) = parent;
+        match link.joint {
+            JointKind::Free => {
+                let off = tree.q_offset[index];
+                (
+                    Vec3::new(tree.q[off], tree.q[off + 1], tree.q[off + 2]),
+                    Quat::new(
+                        tree.q[off + 3],
+                        tree.q[off + 4],
+                        tree.q[off + 5],
+                        tree.q[off + 6],
+                    ),
+                )
+            }
+            JointKind::Fixed => {
+                let (offset_p, offset_o) = link.joint_offset_in_parent;
+                let (offset_c_p, offset_c_o) = link.joint_offset_in_child;
+                let joint_pos = parent_pos + parent_ori.rotate(offset_p);
+                let joint_ori = parent_ori * offset_o;
+                let child_ori = joint_ori * offset_c_o.conjugate();
+                (joint_pos - child_ori.rotate(offset_c_p), child_ori)
+            }
+            JointKind::Hinge { axis, .. } => {
+                let q_angle = tree.q[tree.q_offset[index]];
+                let (offset_p, _) = link.joint_offset_in_parent;
+                let (offset_c_p, _) = link.joint_offset_in_child;
+                let joint_pos = parent_pos + parent_ori.rotate(offset_p);
+                let child_ori = parent_ori * Quat::from_axis_angle(axis, q_angle);
+                (joint_pos - child_ori.rotate(offset_c_p), child_ori)
+            }
+            JointKind::Slide { axis, .. } => {
+                let q_slide = tree.q[tree.q_offset[index]];
+                let (offset_p, _) = link.joint_offset_in_parent;
+                let (offset_c_p, _) = link.joint_offset_in_child;
+                let joint_pos = parent_pos + parent_ori.rotate(offset_p);
+                let child_pos = joint_pos + parent_ori.rotate(axis * q_slide);
+                (child_pos - parent_ori.rotate(offset_c_p), parent_ori)
+            }
+            JointKind::Ball { .. } => {
+                let off = tree.q_offset[index];
+                let q_ball = Quat::new(
+                    tree.q[off],
+                    tree.q[off + 1],
+                    tree.q[off + 2],
+                    tree.q[off + 3],
+                );
+                let (offset_p, _) = link.joint_offset_in_parent;
+                let (offset_c_p, _) = link.joint_offset_in_child;
+                let joint_pos = parent_pos + parent_ori.rotate(offset_p);
+                let child_ori = parent_ori * q_ball;
+                (joint_pos - child_ori.rotate(offset_c_p), child_ori)
+            }
+        }
+    }
+
+    pose_at(tree, target)
+}
+
 // ---------------------------------------------------------------------------
 // ABA — Featherstone's Articulated Body Algorithm
 // ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 use super::*;
+use crate::math::Quat;
 
 const MULTI_FEATURE_CAP: usize = 16;
 
@@ -1889,59 +1890,134 @@ pub(super) fn ccd_convex_contact(
     })
 }
 
-/// Sweep two finite convex shapes along a linear translation of shape A.
+/// Sweep two finite convex shapes with conservative advancement.
 ///
-/// The GJK/EPA contact routine remains the single narrow-phase source. A
-/// fixed coarse pass brackets the first overlap, then binary search refines
-/// the time of impact. The fixed iteration counts keep the result stable.
+/// GJK supplies a separating distance at each pose. The advancement bound is
+/// deliberately conservative for both translation and the shortest quaternion
+/// interpolation, so a narrow overlap window cannot be skipped.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn ccd_sweep_convex(
-    shape_a: &GeomShape,
+    shape_a_desc: &GeomShape,
     from_pose: &GeomPose,
     to_pose: &GeomPose,
     shape_b: &GeomShape,
     pose_b: &GeomPose,
     meshes: &[ConvexMesh],
 ) -> Option<(f32, Contact)> {
-    let mut pose = *from_pose;
     let shape_b = shape(shape_b, pose_b, meshes)?;
-    let shape_a_from = shape(shape_a, &pose, meshes)?;
-    if let Some(contact) =
-        ccd_convex_contact(shape_a_from, shape_b, CCD_MESH_CONFIG, 0, 0, 0.0, 0.0, 0.0)
-    {
-        return Some((0.0, contact));
-    }
+    let shape_a_from = shape(shape_a_desc, from_pose, meshes)?;
+    let extent = shape_a_from.extent();
+    let translation_speed = (to_pose.position - from_pose.position).length();
+    let rotation_speed = 4.0 * quat_distance(from_pose.orientation, to_pose.orientation) * extent;
+    let max_speed = translation_speed + rotation_speed;
+    const DISTANCE_TOLERANCE: f32 = 1.0e-5;
+    const MIN_ADVANCE: f32 = 1.0e-6;
+    const MAX_STEPS: usize = 256;
 
-    let delta = to_pose.position - from_pose.position;
-    let mut low = 0.0;
-    let mut high = None;
-    for step in 1..=128 {
-        let t = step as f32 / 128.0;
-        pose.position = from_pose.position + delta * t;
-        let shape_a = shape(shape_a, &pose, meshes)?;
-        if let Some(contact) =
-            ccd_convex_contact(shape_a, shape_b, CCD_MESH_CONFIG, 0, 0, 0.0, 0.0, 0.0)
-        {
-            high = Some((t, contact));
-            break;
+    let mut t = 0.0;
+    for _ in 0..MAX_STEPS {
+        let pose = interpolated_pose(from_pose, to_pose, t);
+        let shape_a = shape(shape_a_desc, &pose, meshes)?;
+        let pair_extent = shape_a.extent().max(shape_b.extent());
+        if pair_extent <= 0.0 {
+            return None;
         }
-        low = t;
-    }
-    let (mut high, mut contact) = high?;
-    for _ in 0..24 {
-        let mid = (low + high) * 0.5;
-        pose.position = from_pose.position + delta * mid;
-        let shape_a = shape(shape_a, &pose, meshes)?;
-        if let Some(candidate) =
-            ccd_convex_contact(shape_a, shape_b, CCD_MESH_CONFIG, 0, 0, 0.0, 0.0, 0.0)
-        {
-            high = mid;
-            contact = candidate;
-        } else {
-            low = mid;
+        let mut direction = shape_b.center() - shape_a.center();
+        if direction.length_squared() == 0.0 {
+            direction = Vec3::X;
         }
+        let simplex = CcdSimplex::new(ccd_support_normalized(
+            shape_a,
+            shape_b,
+            direction,
+            pair_extent,
+        ));
+        let simplex = ccd_distance_gjk(shape_a, shape_b, simplex, CCD_MESH_CONFIG, pair_extent);
+        let (point_a, point_b) = ccd_closest_witness(&simplex)?;
+        let distance = (point_a - point_b).length();
+        if distance <= DISTANCE_TOLERANCE || max_speed <= MIN_ADVANCE {
+            let mut contact = ccd_distance_contact(
+                shape_a,
+                shape_b,
+                &simplex,
+                0,
+                0,
+                0.0,
+                DISTANCE_TOLERANCE,
+                0.0,
+            )?;
+            contact.normal_world = sweep_normal(shape_a, shape_b, point_a, point_b, distance);
+            return Some((t, contact));
+        }
+        let advance = distance / max_speed;
+        if advance < MIN_ADVANCE {
+            let mut contact = ccd_distance_contact(
+                shape_a,
+                shape_b,
+                &simplex,
+                0,
+                0,
+                0.0,
+                DISTANCE_TOLERANCE,
+                0.0,
+            )?;
+            contact.normal_world = sweep_normal(shape_a, shape_b, point_a, point_b, distance);
+            return Some((t, contact));
+        }
+        let next_t = t + advance;
+        if next_t >= 1.0 {
+            let end_pose = interpolated_pose(from_pose, to_pose, 1.0);
+            let shape_a = shape(shape_a_desc, &end_pose, meshes)?;
+            return ccd_convex_contact(shape_a, shape_b, CCD_MESH_CONFIG, 0, 0, 0.0, 0.0, 0.0)
+                .map(|contact| (1.0, contact));
+        }
+        t = next_t;
     }
-    Some((high, contact))
+    None
+}
+
+fn sweep_normal(
+    shape_a: CcdShape<'_>,
+    shape_b: CcdShape<'_>,
+    point_a: Vec3,
+    point_b: Vec3,
+    distance: f32,
+) -> Vec3 {
+    if distance > 1.0e-5 {
+        return (point_a - point_b) / distance;
+    }
+    let center_delta = shape_a.center() - shape_b.center();
+    if center_delta.length_squared() > 0.0 {
+        center_delta.normalize()
+    } else {
+        Vec3::X
+    }
+}
+
+fn quat_distance(a: Quat, b: Quat) -> f32 {
+    let dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    let sign = if dot < 0.0 { -1.0 } else { 1.0 };
+    let dx = a.x - sign * b.x;
+    let dy = a.y - sign * b.y;
+    let dz = a.z - sign * b.z;
+    let dw = a.w - sign * b.w;
+    (dx * dx + dy * dy + dz * dz + dw * dw).sqrt()
+}
+
+fn interpolated_pose(from: &GeomPose, to: &GeomPose, t: f32) -> GeomPose {
+    let mut to_orientation = to.orientation;
+    if from.orientation.x * to_orientation.x
+        + from.orientation.y * to_orientation.y
+        + from.orientation.z * to_orientation.z
+        + from.orientation.w * to_orientation.w
+        < 0.0
+    {
+        to_orientation = to_orientation * -1.0;
+    }
+    GeomPose {
+        position: from.position + (to.position - from.position) * t,
+        orientation: (from.orientation * (1.0 - t) + to_orientation * t).renormalize(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
