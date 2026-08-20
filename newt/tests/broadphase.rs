@@ -59,6 +59,16 @@ fn tree_pair_insert_remove_update_and_queries() {
 }
 
 #[test]
+fn bounds_update_preserves_proxy_filter() {
+    let mut tree = DynamicAabbTree::new();
+    tree.insert_with_filter(1, bounds(0.0, 0.0, 0.0), 0x01, 0x01);
+
+    assert_eq!(tree.proxy_filter(1), Some((0x01, 0x01)));
+    assert!(tree.update(1, bounds(5.0, 0.0, 0.0)));
+    assert_eq!(tree.proxy_filter(1), Some((0x01, 0x01)));
+}
+
+#[test]
 fn tree_query_miss_and_early_exit() {
     let mut tree = DynamicAabbTree::new();
     tree.insert(0, bounds(0.0, 0.0, 0.0));

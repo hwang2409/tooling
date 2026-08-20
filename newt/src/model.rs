@@ -1033,22 +1033,20 @@ fn build_scene(root: &Value) -> Result<Scene, ModelError> {
 
     // ---- Contact pair filtering ----
     if let Some(v) = optional(root_fields, "contact_pairs") {
-        world.pair_list = Some(parse_contact_pairs(
+        let pairs = parse_contact_pairs(
             v,
             "contact_pairs",
             &world,
             &geoms_by_name,
             &tree_self_collide,
-        )?);
+        )?;
+        if let Some(explicit) = pairs.explicit {
+            world.pair_list = Some(explicit);
+        } else {
+            world.set_auto_pair_exclusions(pairs.disabled);
+        }
     } else if tree_self_collide.iter().any(|&s| !s) {
-        // Auto pair list minus geom pairs on the same non-self-colliding
-        // tree. Even if every tree is self_collide=true, we can leave
-        // `pair_list = None` (world uses auto pairs) — the auto list already
-        // drops same-link and same-body pairs.
-        world.pair_list = Some(auto_pairs_with_self_collision_filter(
-            &world,
-            &tree_self_collide,
-        ));
+        world.set_auto_pair_exclusions(self_collision_exclusions(&world, &tree_self_collide));
     }
 
     // ---- Equalities ----
@@ -3202,13 +3200,18 @@ fn parse_optional_solimp(
     Ok(s)
 }
 
+struct ContactPairConfig {
+    explicit: Option<Vec<(usize, usize)>>,
+    disabled: Vec<(usize, usize)>,
+}
+
 fn parse_contact_pairs(
     v: &Value,
     path: &str,
     world: &World,
     geoms_by_name: &HashMap<String, usize>,
     tree_self_collide: &[bool],
-) -> Result<Vec<(usize, usize)>, ModelError> {
+) -> Result<ContactPairConfig, ModelError> {
     let fields = get_object(v, path)?;
     reject_unknown(fields, &["explicit", "disable"], path)?;
     let has_explicit = optional(fields, "explicit").is_some();
@@ -3227,11 +3230,12 @@ fn parse_contact_pairs(
             let (a, b) = parse_pair(pv, &p, geoms_by_name)?;
             out.push(if a < b { (a, b) } else { (b, a) });
         }
-        return Ok(out);
+        return Ok(ContactPairConfig {
+            explicit: Some(out),
+            disabled: Vec::new(),
+        });
     }
-    // No explicit list. Start with the world's auto-pairs then subtract
-    // disable + apply self-collision.
-    let mut auto = auto_pairs_with_self_collision_filter(world, tree_self_collide);
+    let mut disabled = self_collision_exclusions(world, tree_self_collide);
     if let Some(v) = optional(fields, "disable") {
         let arr = get_array(v, &format!("{path}.disable"))?;
         let mut disable: Vec<(usize, usize)> = Vec::new();
@@ -3240,9 +3244,12 @@ fn parse_contact_pairs(
             let (a, b) = parse_pair(pv, &p, geoms_by_name)?;
             disable.push(if a < b { (a, b) } else { (b, a) });
         }
-        auto.retain(|pair| !disable.contains(pair));
+        disabled.extend(disable);
     }
-    Ok(auto)
+    Ok(ContactPairConfig {
+        explicit: None,
+        disabled,
+    })
 }
 
 fn parse_pair(
@@ -3268,13 +3275,8 @@ fn parse_pair(
     Ok((a, b))
 }
 
-/// Enumerate all valid contact pairs, dropping pairs where both geoms live
-/// on the same tree AND that tree opts out of self-collision. Same
-/// `(min, max)` sorted order as `World::auto_pairs`.
-fn auto_pairs_with_self_collision_filter(
-    world: &World,
-    tree_self_collide: &[bool],
-) -> Vec<(usize, usize)> {
+/// Enumerate automatic pairs excluded by a tree's self-collision setting.
+fn self_collision_exclusions(world: &World, tree_self_collide: &[bool]) -> Vec<(usize, usize)> {
     use crate::geom::GeomAttach;
     let mut out = Vec::new();
     let n = world.geoms.len();
@@ -3285,14 +3287,11 @@ fn auto_pairs_with_self_collision_filter(
             if att_a == att_b {
                 continue;
             }
-            // Same-tree opt-out: if both geoms attach to the same tree AND
-            // that tree has self_collide=false, drop the pair.
             if let (GeomAttach::Link(ta, _), GeomAttach::Link(tb, _)) = (att_a, att_b) {
                 if ta == tb && !tree_self_collide.get(ta).copied().unwrap_or(true) {
-                    continue;
+                    out.push((a, b));
                 }
             }
-            out.push((a, b));
         }
     }
     out

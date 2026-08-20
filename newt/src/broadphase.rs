@@ -270,7 +270,18 @@ impl DynamicAabbTree {
 
     /// Update a proxy. Returns true only when the leaf was reinserted.
     pub fn update(&mut self, proxy: usize, bounds: Aabb) -> bool {
-        self.update_with_filter(proxy, bounds, u32::MAX, u32::MAX)
+        let Some(proxy_state) = self.proxies.get(proxy).and_then(|proxy| *proxy) else {
+            self.insert(proxy, bounds);
+            return true;
+        };
+        let leaf = proxy_state.node;
+        if self.nodes[leaf].aabb.contains(bounds) {
+            return false;
+        }
+        let removed = self.remove(proxy);
+        debug_assert!(removed);
+        self.insert_with_filter(proxy, bounds, proxy_state.group, proxy_state.mask);
+        true
     }
 
     /// Update a proxy and its cached collision filter.
@@ -308,6 +319,13 @@ impl DynamicAabbTree {
         proxy_state.group = group;
         proxy_state.mask = mask;
         true
+    }
+
+    pub fn proxy_filter(&self, proxy: usize) -> Option<(u32, u32)> {
+        self.proxies
+            .get(proxy)
+            .and_then(|proxy| *proxy)
+            .map(|proxy| (proxy.group, proxy.mask))
     }
 
     /// Return all overlapping fat-bound proxy pairs in lexicographic order.

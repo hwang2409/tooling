@@ -3,6 +3,7 @@ use newt::geom::Geom;
 use newt::math::{Quat, Vec3};
 use newt::mjcf::load_mjcf_str;
 use newt::world::World;
+use std::panic::{self, AssertUnwindSafe};
 
 fn pair_world(a_group: u32, a_mask: u32, b_group: u32, b_mask: u32) -> World {
     let mut world = World::new();
@@ -124,9 +125,12 @@ fn body_snapshot(world: &World) -> Vec<u32> {
 
 #[test]
 fn filtering_preserves_determinism() {
-    let mut filtered = pair_world(u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-    let mut manual = pair_world(u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-    manual.pair_list = Some(vec![(0, 1)]);
+    let mut filtered = triplet_world();
+    let mut manual = triplet_world();
+    manual.pair_list = Some(vec![(0, 1), (1, 2)]);
+
+    assert_eq!(filtered.broadphase_pair_count(), 2);
+    assert_eq!(manual.pair_list.as_deref(), Some(&[(0, 1), (1, 2)][..]));
 
     for _ in 0..100 {
         filtered.step();
@@ -134,6 +138,45 @@ fn filtering_preserves_determinism() {
     }
 
     assert_eq!(body_snapshot(&filtered), body_snapshot(&manual));
+}
+
+fn triplet_world() -> World {
+    let mut world = World::new();
+    world.gravity = Vec3::ZERO;
+    for (x, group, mask) in [(0.0, 0x01, 0x02), (0.5, 0x02, 0x05), (0.8, 0x04, 0x02)] {
+        let body = world.add_body(Body::solid_sphere(
+            1.0,
+            0.5,
+            Vec3::new(x, 0.0, 0.0),
+            Quat::IDENTITY,
+        ));
+        world.add_geom(Geom::sphere(body, 0.5, Vec3::ZERO, 0.5).with_collision_filter(group, mask));
+    }
+    world
+}
+
+#[test]
+fn filter_mutation_rechecks_newly_active_unsupported_pairs() {
+    let mut world = World::new();
+    world.gravity = Vec3::ZERO;
+    let box_body = world.add_body(Body::solid_sphere(1.0, 0.5, Vec3::ZERO, Quat::IDENTITY));
+    let sphere_body = world.add_body(Body::solid_sphere(
+        1.0,
+        0.5,
+        Vec3::new(0.5, 0.0, 0.0),
+        Quat::IDENTITY,
+    ));
+    world.add_geom(
+        Geom::r#box(box_body, Vec3::splat(0.5), Vec3::ZERO, Quat::IDENTITY, 0.5)
+            .with_collision_filter(0x01, 0x01),
+    );
+    world.add_geom(
+        Geom::sphere(sphere_body, 0.5, Vec3::ZERO, 0.5).with_collision_filter(0x02, 0x02),
+    );
+
+    world.step();
+    world.set_geom_filter(1, 0x01, 0x01).unwrap();
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| world.step())).is_err());
 }
 
 #[test]
@@ -157,4 +200,33 @@ fn mjcf_contype_and_conaffinity_filter_pairs() {
 
     assert_eq!(world.broadphase_pair_count(), 0);
     assert!(world.detect_contacts().is_empty());
+}
+
+#[test]
+fn loaded_mjcf_filters_apply_after_runtime_mutation() {
+    let scene = load_mjcf_str(
+        r#"
+        <mujoco>
+          <worldbody>
+            <body name="a">
+              <freejoint/>
+              <geom name="a_geom" type="sphere" size="0.5" mass="1"/>
+            </body>
+            <body name="b" pos="0.75 0 0">
+              <freejoint/>
+              <geom name="b_geom" type="sphere" size="0.5" mass="1"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        "#,
+    )
+    .unwrap();
+    let mut world = scene.world;
+
+    assert_eq!(world.pair_list, None);
+    assert_eq!(world.broadphase_pair_count(), 1);
+    world.set_geom_filter(0, 0x01, 0x00).unwrap();
+    assert_eq!(world.broadphase_pair_count(), 0);
+    world.set_geom_filter(0, 0x01, 0x01).unwrap();
+    assert_eq!(world.broadphase_pair_count(), 1);
 }

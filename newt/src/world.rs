@@ -130,6 +130,9 @@ pub struct World {
     /// pairs bypass that filter. The dynamic tree returns candidates in
     /// `(min, max)` lexicographic order.
     pub pair_list: Option<Vec<(usize, usize)>>,
+    /// Pairs excluded from automatic broad-phase enumeration by a scene loader.
+    /// These exclusions do not affect explicit `pair_list` entries.
+    pub(crate) auto_pair_exclusions: Vec<(usize, usize)>,
     /// Broad-phase strategy used when `pair_list` is `None`.
     pub broadphase_mode: BroadPhaseMode,
     /// Constraint solver configuration. Default is
@@ -262,7 +265,7 @@ impl std::fmt::Display for KeyframeError {
 impl std::error::Error for KeyframeError {}
 
 // Manual PartialEq: the pair-check cache is not part of logical world state.
-// Two worlds with identical bodies/trees/geoms/meshes/pair_list are equal
+// Two worlds with identical bodies/trees/geoms/meshes/pair configuration are equal
 // regardless of whether either has run the pair check.
 impl PartialEq for World {
     fn eq(&self, other: &Self) -> bool {
@@ -276,6 +279,7 @@ impl PartialEq for World {
             && self.meshes == other.meshes
             && self.hfields == other.hfields
             && self.pair_list == other.pair_list
+            && self.auto_pair_exclusions == other.auto_pair_exclusions
             && self.broadphase_mode == other.broadphase_mode
             && self.solver == other.solver
             && self.equalities == other.equalities
@@ -312,6 +316,7 @@ impl World {
             meshes: Vec::new(),
             hfields: Vec::new(),
             pair_list: None,
+            auto_pair_exclusions: Vec::new(),
             broadphase_mode: BroadPhaseMode::DynamicAabbTree,
             solver: SolverConfig::DEFAULT,
             equalities: Vec::new(),
@@ -770,7 +775,15 @@ impl World {
         geom.collision_group = group;
         geom.collision_mask = mask;
         self.broadphase.set_proxy_filter(geom_id, group, mask);
+        self.checked_pairs.set(0);
         Ok(())
+    }
+
+    pub(crate) fn set_auto_pair_exclusions(&mut self, mut exclusions: Vec<(usize, usize)>) {
+        exclusions.sort_unstable();
+        exclusions.dedup();
+        self.auto_pair_exclusions = exclusions;
+        self.checked_pairs.set(0);
     }
 
     /// Return a geom's opaque consumer-owned handle.
@@ -802,6 +815,9 @@ impl World {
                 if att_a == att_b {
                     // Same body, same tree link, or two statics — no
                     // meaningful pair.
+                    continue;
+                }
+                if self.auto_pair_exclusions.binary_search(&(a, b)).is_ok() {
                     continue;
                 }
                 if should_collide(
@@ -859,7 +875,9 @@ impl World {
         self.broadphase_pairs.clear();
         let tree_pairs = self.broadphase.compute_pairs();
         for &(a, b) in tree_pairs {
-            if self.geoms[a].attachment() != self.geoms[b].attachment() {
+            if self.geoms[a].attachment() != self.geoms[b].attachment()
+                && self.auto_pair_exclusions.binary_search(&(a, b)).is_err()
+            {
                 self.broadphase_pairs.push((a, b));
             }
         }
@@ -884,7 +902,10 @@ impl World {
         tree.compute_pairs()
             .iter()
             .copied()
-            .filter(|&(a, b)| self.geoms[a].attachment() != self.geoms[b].attachment())
+            .filter(|&(a, b)| {
+                self.geoms[a].attachment() != self.geoms[b].attachment()
+                    && self.auto_pair_exclusions.binary_search(&(a, b)).is_err()
+            })
             .collect()
     }
 

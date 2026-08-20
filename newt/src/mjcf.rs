@@ -509,6 +509,7 @@ struct Loader {
     /// tree_self_collide=false for auto pair filtering (equivalent to the
     /// JSON loader's default).
     tree_self_collide: Vec<bool>,
+    auto_pair_exclusions: Vec<(usize, usize)>,
 }
 
 impl Loader {
@@ -531,6 +532,7 @@ impl Loader {
             coordinate_local: true,
             defaults: DefaultsTable::default(),
             tree_self_collide: Vec::new(),
+            auto_pair_exclusions: Vec::new(),
         }
     }
 
@@ -630,20 +632,10 @@ impl Loader {
                 self.walk_keyframe(child, &subpath)?;
             }
         }
-        // Apply the JSON loader's auto pair-list filter for the same-tree /
-        // self-collision case BEFORE running the pair-support check so an
-        // unsupported same-tree pair (e.g. box-vs-capsule inside a robot
-        // that opts out of self-collision) does not spuriously trip the
-        // narrow-phase validator.
-        if self.world.pair_list.is_none()
-            && !self.tree_self_collide.is_empty()
-            && self.tree_self_collide.iter().any(|&s| !s)
-        {
-            self.world.pair_list = Some(auto_pairs_with_self_collision_filter(
-                &self.world,
-                &self.tree_self_collide,
-            ));
-        }
+        let mut auto_pair_exclusions =
+            self_collision_exclusions(&self.world, &self.tree_self_collide);
+        auto_pair_exclusions.extend(self.auto_pair_exclusions.iter().copied());
+        self.world.set_auto_pair_exclusions(auto_pair_exclusions);
         // After parsing everything, run the pair-support check the JSON
         // loader also runs so a bad geom-pair combo surfaces at load time
         // with a path rather than a runtime panic.
@@ -4076,18 +4068,19 @@ impl Loader {
             self.world.pair_list = Some(pairs);
         }
         if has_exclude {
-            // Body-level exclusion via geom subtraction from the auto list.
-            let mut auto = default_auto_pairs(&self.world);
+            // Body-level exclusion via geom pairs removed from auto detection.
             for (b1, b2) in excludes {
                 let g_a: Vec<usize> = self.geoms_for_body(&b1)?;
                 let g_b: Vec<usize> = self.geoms_for_body(&b2)?;
-                auto.retain(|(x, y)| {
-                    let touches_a = g_a.contains(x) || g_a.contains(y);
-                    let touches_b = g_b.contains(x) || g_b.contains(y);
-                    !(touches_a && touches_b)
-                });
+                for x in &g_a {
+                    for y in &g_b {
+                        if x != y {
+                            self.auto_pair_exclusions
+                                .push(if x < y { (*x, *y) } else { (*y, *x) });
+                        }
+                    }
+                }
             }
-            self.world.pair_list = Some(auto);
         }
         Ok(())
     }
@@ -4209,12 +4202,8 @@ fn quat_align_z_to(n: Vec3) -> Quat {
     Quat::new(axis.x, axis.y, axis.z, w).renormalize()
 }
 
-/// Mirror the JSON loader's auto-pair filter (drop same-attachment pairs
-/// and same-tree pairs where the tree opts out of self-collision).
-fn auto_pairs_with_self_collision_filter(
-    world: &World,
-    tree_self_collide: &[bool],
-) -> Vec<(usize, usize)> {
+/// Enumerate automatic pairs excluded by a tree's self-collision setting.
+fn self_collision_exclusions(world: &World, tree_self_collide: &[bool]) -> Vec<(usize, usize)> {
     use crate::geom::GeomAttach;
     let mut out = Vec::new();
     let n = world.geoms.len();
@@ -4225,44 +4214,11 @@ fn auto_pairs_with_self_collision_filter(
             if att_a == att_b {
                 continue;
             }
-            if !crate::broadphase::should_collide(
-                world.geoms[a].collision_group,
-                world.geoms[a].collision_mask,
-                world.geoms[b].collision_group,
-                world.geoms[b].collision_mask,
-            ) {
-                continue;
-            }
             if let (GeomAttach::Link(ta, _), GeomAttach::Link(tb, _)) = (att_a, att_b) {
                 if ta == tb && !tree_self_collide.get(ta).copied().unwrap_or(true) {
-                    continue;
+                    out.push((a, b));
                 }
             }
-            out.push((a, b));
-        }
-    }
-    out
-}
-
-/// The default auto-pair enumeration MJCF's <exclude> subtracts from —
-/// mirrors `World::auto_pairs` (which is private).
-fn default_auto_pairs(world: &World) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let n = world.geoms.len();
-    for a in 0..n {
-        for b in (a + 1)..n {
-            if world.geoms[a].attachment() == world.geoms[b].attachment() {
-                continue;
-            }
-            if !crate::broadphase::should_collide(
-                world.geoms[a].collision_group,
-                world.geoms[a].collision_mask,
-                world.geoms[b].collision_group,
-                world.geoms[b].collision_mask,
-            ) {
-                continue;
-            }
-            out.push((a, b));
         }
     }
     out
