@@ -304,6 +304,69 @@ fn regular_prism_mesh_with_order(ring_vertices: usize, scale: f32, order: &[usiz
     }
 }
 
+fn high_vertex_prism_mesh() -> ConvexMesh {
+    let ring_vertices = 16;
+    let mut vertices = Vec::with_capacity(ring_vertices * 2);
+    for z in [-0.5, 0.5] {
+        for index in 0..ring_vertices {
+            let angle = 2.0 * std::f32::consts::PI * index as f32 / ring_vertices as f32;
+            vertices.push(Vec3::new(cos(angle), sin(angle), z));
+        }
+    }
+    let mut faces = Vec::with_capacity(ring_vertices * 4 - 4);
+    for index in 1..ring_vertices - 1 {
+        faces.push([0, (index + 1) as u32, index as u32]);
+        faces.push([
+            ring_vertices as u32,
+            (ring_vertices + index) as u32,
+            (ring_vertices + index + 1) as u32,
+        ]);
+    }
+    for index in 0..ring_vertices {
+        let next = (index + 1) % ring_vertices;
+        faces.push([index as u32, next as u32, (ring_vertices + next) as u32]);
+        faces.push([
+            index as u32,
+            (ring_vertices + next) as u32,
+            (ring_vertices + index) as u32,
+        ]);
+    }
+    ConvexMesh { vertices, faces }
+}
+
+#[test]
+fn registered_high_vertex_mesh_has_deterministic_contact() {
+    let mesh = high_vertex_prism_mesh();
+    assert_eq!(mesh.vertices.len(), 32);
+    let mut world = World::new();
+    let mesh_a = world.add_mesh(mesh.clone());
+    let mesh_b = world.add_mesh(mesh);
+    assert_eq!((mesh_a, mesh_b), (0, 1));
+    assert_eq!(world.meshes[mesh_a].vertices.len(), 32);
+
+    let geom_a = Geom::mesh(0, mesh_a, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let geom_b = Geom::mesh(1, mesh_b, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(0.02, 0.01, 0.96),
+        orientation: Quat::IDENTITY,
+    };
+    let first = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &world.meshes);
+    let second = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &world.meshes);
+    assert_eq!(first.len, 4);
+    assert_eq!(second.len, first.len);
+    for (actual, expected) in second.as_slice().iter().zip(first.as_slice()) {
+        assert_contact_bit_equal(
+            actual,
+            expected,
+            "high-vertex mesh contact is not deterministic",
+        );
+    }
+}
+
 #[test]
 fn mesh_mesh_witness_is_invariant_to_vertex_order_and_argument_order() {
     let identity = [0, 1, 2, 3, 4, 5, 6, 7];

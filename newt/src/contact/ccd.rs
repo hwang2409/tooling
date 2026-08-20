@@ -1,5 +1,6 @@
 use super::*;
-use crate::geom::MAX_CONVEX_MESH_VERTICES;
+
+const MULTI_FEATURE_CAP: usize = 16;
 
 pub(super) fn route_pair(a: &GeomShape, b: &GeomShape) -> bool {
     matches!((a, b), (GeomShape::Mesh { .. }, GeomShape::Mesh { .. }))
@@ -1081,7 +1082,6 @@ fn ccd_epa_fallback_contact(
     })
 }
 
-const MULTI_FEATURE_CAP: usize = MAX_CONVEX_MESH_VERTICES;
 const MULTI_CLIP_CAP: usize = MULTI_FEATURE_CAP * 2;
 const MULTI_FACE_TOL: f32 = 0.996;
 const MULTI_EDGE_TOL: f32 = 0.0888;

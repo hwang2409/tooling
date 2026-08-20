@@ -269,9 +269,6 @@ impl HeightField {
     }
 }
 
-/// The largest mesh supported by the allocation-free mesh manifold path.
-pub const MAX_CONVEX_MESH_VERTICES: usize = 16;
-
 /// Convex triangular mesh, stored once in [`crate::world::World::meshes`]
 /// and referenced from geoms by index. Vertices are in the mesh's own local
 /// frame; the geom's `local_offset` + `local_orientation` place that frame
@@ -289,7 +286,7 @@ pub const MAX_CONVEX_MESH_VERTICES: usize = 16;
 ///
 /// The engine does not check any of the above. [`ConvexMesh::validate`]
 /// performs the cheap structural checks the [`crate::model`] loader runs:
-/// non-empty, 4–16 vertices, at least four faces, every face index in range,
+/// non-empty, at least 4 vertices, at least four faces, every face index in range,
 /// every vertex finite. Convexity itself is expensive to check (O(V·F)) and
 /// is punted to the mesh author — mirroring MuJoCo, which also trusts `mesh`
 /// assets to be convex.
@@ -304,19 +301,13 @@ pub struct ConvexMesh {
 }
 
 impl ConvexMesh {
-    /// Cheap structural checks. `Err(msg)` on a vertex count outside 4–16,
+    /// Cheap structural checks. `Err(msg)` on fewer than 4 vertices,
     /// fewer than 4 faces, an out-of-range face index, or a non-finite vertex
     /// coordinate.
     pub fn validate(&self) -> Result<(), String> {
         if self.vertices.len() < 4 {
             return Err(format!(
                 "convex mesh needs ≥ 4 vertices to enclose volume, got {}",
-                self.vertices.len()
-            ));
-        }
-        if self.vertices.len() > MAX_CONVEX_MESH_VERTICES {
-            return Err(format!(
-                "convex mesh supports at most {MAX_CONVEX_MESH_VERTICES} vertices, got {}",
                 self.vertices.len()
             ));
         }
