@@ -57,6 +57,7 @@ use crate::tree::{
     forward_kinematics_into as tree_forward_kinematics_into,
     rk4_step_with_workspace as tree_rk4_step_with_workspace,
 };
+use std::collections::HashSet;
 
 #[cfg(feature = "instrumentation")]
 use std::time::Instant;
@@ -133,6 +134,8 @@ pub struct World {
     /// Pairs excluded from automatic broad-phase enumeration by a scene loader.
     /// These exclusions do not affect explicit `pair_list` entries.
     pub(crate) auto_pair_exclusions: Vec<(usize, usize)>,
+    /// Trees whose links do not collide with other links in the same tree.
+    pub(crate) disabled_self_collision: HashSet<usize>,
     /// Broad-phase strategy used when `pair_list` is `None`.
     pub broadphase_mode: BroadPhaseMode,
     /// Constraint solver configuration. Default is
@@ -280,6 +283,7 @@ impl PartialEq for World {
             && self.hfields == other.hfields
             && self.pair_list == other.pair_list
             && self.auto_pair_exclusions == other.auto_pair_exclusions
+            && self.disabled_self_collision == other.disabled_self_collision
             && self.broadphase_mode == other.broadphase_mode
             && self.solver == other.solver
             && self.equalities == other.equalities
@@ -317,6 +321,7 @@ impl World {
             hfields: Vec::new(),
             pair_list: None,
             auto_pair_exclusions: Vec::new(),
+            disabled_self_collision: HashSet::new(),
             broadphase_mode: BroadPhaseMode::DynamicAabbTree,
             solver: SolverConfig::DEFAULT,
             equalities: Vec::new(),
@@ -779,6 +784,26 @@ impl World {
         Ok(())
     }
 
+    /// Enable or disable collisions between links in one tree.
+    pub fn set_tree_self_collision(&mut self, tree_id: usize, enabled: bool) -> Result<(), String> {
+        if tree_id >= self.trees.len() {
+            return Err(format!("tree index {tree_id} is out of range"));
+        }
+        if enabled {
+            self.disabled_self_collision.remove(&tree_id);
+        } else {
+            self.disabled_self_collision.insert(tree_id);
+        }
+        self.checked_pairs.set(0);
+        Ok(())
+    }
+
+    /// Return the number of explicit automatic pair exclusions.
+    #[doc(hidden)]
+    pub fn auto_pair_exclusion_count(&self) -> usize {
+        self.auto_pair_exclusions.len()
+    }
+
     pub(crate) fn set_auto_pair_exclusions(&mut self, mut exclusions: Vec<(usize, usize)>) {
         exclusions.sort_unstable();
         exclusions.dedup();
@@ -825,12 +850,34 @@ impl World {
                     self.geoms[a].collision_mask,
                     self.geoms[b].collision_group,
                     self.geoms[b].collision_mask,
-                ) {
+                ) && !self.disabled_self_collision_pair(a, b)
+                {
                     out.push((a, b));
                 }
             }
         }
         out
+    }
+
+    fn disabled_self_collision_pair(&self, a: usize, b: usize) -> bool {
+        Self::disabled_self_collision_for_attachments(
+            self.geoms[a].attachment(),
+            self.geoms[b].attachment(),
+            &self.disabled_self_collision,
+        )
+    }
+
+    fn disabled_self_collision_for_attachments(
+        a: GeomAttach,
+        b: GeomAttach,
+        disabled: &HashSet<usize>,
+    ) -> bool {
+        match (a, b) {
+            (GeomAttach::Link(tree_a, _), GeomAttach::Link(tree_b, _)) => {
+                tree_a == tree_b && disabled.contains(&tree_a)
+            }
+            _ => false,
+        }
     }
 
     fn active_pairs(&mut self) -> Vec<(usize, usize)> {
@@ -873,7 +920,9 @@ impl World {
                 .set(self.broadphase_reinsert_count.get() + reinserts);
         }
         self.broadphase_pairs.clear();
-        let tree_pairs = self.broadphase.compute_pairs();
+        let tree_pairs = self
+            .broadphase
+            .compute_pairs_with_disabled_self_collision(&self.disabled_self_collision);
         for &(a, b) in tree_pairs {
             if self.geoms[a].attachment() != self.geoms[b].attachment()
                 && self.auto_pair_exclusions.binary_search(&(a, b)).is_err()
@@ -899,7 +948,7 @@ impl World {
             swept: false,
         };
         Self::populate_broadphase_tree(&mut tree, inputs);
-        tree.compute_pairs()
+        tree.compute_pairs_with_disabled_self_collision(&self.disabled_self_collision)
             .iter()
             .copied()
             .filter(|&(a, b)| {
@@ -944,11 +993,16 @@ impl World {
             } else {
                 geom_aabb(geom, &pose, inputs.meshes, inputs.hfields)
             };
-            if tree.update_with_filter(
+            let tree_id = match geom.attachment() {
+                GeomAttach::Link(tree_id, _) => Some(tree_id),
+                GeomAttach::Static | GeomAttach::Body(_) => None,
+            };
+            if tree.update_with_filter_and_tree(
                 geom_index,
                 bound.expanded(geom.margin),
                 geom.collision_group,
                 geom.collision_mask,
+                tree_id,
             ) {
                 reinserts += 1;
             }

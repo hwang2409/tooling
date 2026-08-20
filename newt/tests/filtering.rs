@@ -2,6 +2,7 @@ use newt::body::Body;
 use newt::geom::Geom;
 use newt::math::{Quat, Vec3};
 use newt::mjcf::load_mjcf_str;
+use newt::model::load_str;
 use newt::world::World;
 use std::panic::{self, AssertUnwindSafe};
 
@@ -229,4 +230,51 @@ fn loaded_mjcf_filters_apply_after_runtime_mutation() {
     assert_eq!(world.broadphase_pair_count(), 0);
     world.set_geom_filter(0, 0x01, 0x01).unwrap();
     assert_eq!(world.broadphase_pair_count(), 1);
+}
+
+#[test]
+fn disabled_tree_self_collision_is_compact_and_runtime_toggleable() {
+    let json = r#"{
+        "version":"1",
+        "trees":[{"name":"tree","self_collide":false,"links":[
+            {"name":"root","joint":{"kind":"fixed"},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}},
+            {"name":"child","parent":"root","joint":{"kind":"fixed"},"mass":1,"inertia":{"kind":"diag","values":[1,1,1]}}
+        ]}],
+        "geoms":[
+            {"name":"root_geom","shape":{"kind":"sphere","radius":0.5},"attach":{"kind":"link","tree":"tree","link":"root"}},
+            {"name":"child_geom","shape":{"kind":"sphere","radius":0.5},"attach":{"kind":"link","tree":"tree","link":"child"}}
+        ]
+    }"#;
+    let mut json_world = load_str(json).unwrap().world;
+    assert_eq!(json_world.auto_pair_exclusion_count(), 0);
+    assert_eq!(json_world.broadphase_pair_count(), 0);
+    json_world.step();
+    json_world.set_tree_self_collision(0, true).unwrap();
+    json_world.step();
+    assert_eq!(json_world.broadphase_pair_count(), 1);
+    json_world.set_tree_self_collision(0, false).unwrap();
+    json_world.step();
+    assert_eq!(json_world.broadphase_pair_count(), 0);
+    json_world.pair_list = Some(vec![(0, 1)]);
+    assert_eq!(json_world.detect_contacts().len(), 1);
+
+    let mjcf = r#"
+        <mujoco>
+          <worldbody>
+            <body name="root">
+              <inertial mass="1" diaginertia="1 1 1"/>
+              <geom name="root_geom" type="sphere" size="0.5"/>
+              <body name="child">
+                <inertial mass="1" diaginertia="1 1 1"/>
+                <geom name="child_geom" type="sphere" size="0.5"/>
+              </body>
+            </body>
+          </worldbody>
+        </mujoco>
+    "#;
+    let mut mjcf_world = load_mjcf_str(mjcf).unwrap().world;
+    assert_eq!(mjcf_world.auto_pair_exclusion_count(), 0);
+    assert_eq!(mjcf_world.broadphase_pair_count(), 0);
+    mjcf_world.set_tree_self_collision(0, true).unwrap();
+    assert_eq!(mjcf_world.broadphase_pair_count(), 1);
 }

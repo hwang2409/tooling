@@ -7,6 +7,7 @@
 
 use crate::geom::{ConvexMesh, Geom, GeomPose, GeomShape, HeightField};
 use crate::math::{Vec3, abs};
+use std::collections::HashSet;
 
 const FATNESS: f32 = 0.1;
 const FAT_EPSILON: f32 = 1.0e-4;
@@ -142,6 +143,7 @@ struct Proxy {
     node: usize,
     group: u32,
     mask: u32,
+    tree_id: Option<usize>,
 }
 
 impl Node {
@@ -245,6 +247,17 @@ impl DynamicAabbTree {
     }
 
     pub fn insert_with_filter(&mut self, proxy: usize, bounds: Aabb, group: u32, mask: u32) {
+        self.insert_with_filter_and_tree(proxy, bounds, group, mask, None);
+    }
+
+    pub fn insert_with_filter_and_tree(
+        &mut self,
+        proxy: usize,
+        bounds: Aabb,
+        group: u32,
+        mask: u32,
+        tree_id: Option<usize>,
+    ) {
         assert!(!self.contains_proxy(proxy), "proxy is already in the tree");
         let leaf = self.allocate_node(Node::leaf(proxy, bounds.fatten()));
         if self.proxies.len() <= proxy {
@@ -254,6 +267,7 @@ impl DynamicAabbTree {
             node: leaf,
             group,
             mask,
+            tree_id,
         });
         self.insert_leaf(leaf);
     }
@@ -280,7 +294,13 @@ impl DynamicAabbTree {
         }
         let removed = self.remove(proxy);
         debug_assert!(removed);
-        self.insert_with_filter(proxy, bounds, proxy_state.group, proxy_state.mask);
+        self.insert_with_filter_and_tree(
+            proxy,
+            bounds,
+            proxy_state.group,
+            proxy_state.mask,
+            proxy_state.tree_id,
+        );
         true
     }
 
@@ -292,8 +312,23 @@ impl DynamicAabbTree {
         group: u32,
         mask: u32,
     ) -> bool {
+        let tree_id = self
+            .proxies
+            .get(proxy)
+            .and_then(|proxy| proxy.and_then(|proxy| proxy.tree_id));
+        self.update_with_filter_and_tree(proxy, bounds, group, mask, tree_id)
+    }
+
+    pub fn update_with_filter_and_tree(
+        &mut self,
+        proxy: usize,
+        bounds: Aabb,
+        group: u32,
+        mask: u32,
+        tree_id: Option<usize>,
+    ) -> bool {
         let Some(proxy_state) = self.proxies.get(proxy).and_then(|proxy| *proxy) else {
-            self.insert_with_filter(proxy, bounds, group, mask);
+            self.insert_with_filter_and_tree(proxy, bounds, group, mask, tree_id);
             return true;
         };
         let leaf = proxy_state.node;
@@ -302,12 +337,13 @@ impl DynamicAabbTree {
                 node: leaf,
                 group,
                 mask,
+                tree_id,
             });
             return false;
         }
         let removed = self.remove(proxy);
         debug_assert!(removed);
-        self.insert_with_filter(proxy, bounds, group, mask);
+        self.insert_with_filter_and_tree(proxy, bounds, group, mask, tree_id);
         true
     }
 
@@ -328,8 +364,26 @@ impl DynamicAabbTree {
             .map(|proxy| (proxy.group, proxy.mask))
     }
 
+    pub fn proxy_tree_id(&self, proxy: usize) -> Option<usize> {
+        self.proxies
+            .get(proxy)
+            .and_then(|proxy| *proxy)
+            .and_then(|proxy| proxy.tree_id)
+    }
+
     /// Return all overlapping fat-bound proxy pairs in lexicographic order.
     pub fn compute_pairs(&mut self) -> &[(usize, usize)] {
+        self.compute_pairs_inner(None)
+    }
+
+    pub fn compute_pairs_with_disabled_self_collision(
+        &mut self,
+        disabled: &HashSet<usize>,
+    ) -> &[(usize, usize)] {
+        self.compute_pairs_inner(Some(disabled))
+    }
+
+    fn compute_pairs_inner(&mut self, disabled: Option<&HashSet<usize>>) -> &[(usize, usize)] {
         self.pairs.clear();
         self.pair_stack.clear();
         let Some(root) = self.root else {
@@ -369,6 +423,14 @@ impl DynamicAabbTree {
                     let filter_a = self.proxies[pair.0].unwrap();
                     let filter_b = self.proxies[pair.1].unwrap();
                     if should_collide(filter_a.group, filter_a.mask, filter_b.group, filter_b.mask)
+                        && !disabled.is_some_and(|disabled| {
+                            match (filter_a.tree_id, filter_b.tree_id) {
+                                (Some(tree_a), Some(tree_b)) => {
+                                    tree_a == tree_b && disabled.contains(&tree_a)
+                                }
+                                _ => false,
+                            }
+                        })
                     {
                         self.pairs.push(pair);
                     }

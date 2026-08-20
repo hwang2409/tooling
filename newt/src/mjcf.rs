@@ -504,11 +504,6 @@ struct Loader {
     #[allow(dead_code)]
     coordinate_local: bool,
     defaults: DefaultsTable,
-    /// Track per-tree self-collide (defaults to false, matches JSON loader).
-    /// MJCF does not have a per-tree self-collide flag; we always emit
-    /// tree_self_collide=false for auto pair filtering (equivalent to the
-    /// JSON loader's default).
-    tree_self_collide: Vec<bool>,
     auto_pair_exclusions: Vec<(usize, usize)>,
 }
 
@@ -531,7 +526,6 @@ impl Loader {
             angle_scale: 1.0,
             coordinate_local: true,
             defaults: DefaultsTable::default(),
-            tree_self_collide: Vec::new(),
             auto_pair_exclusions: Vec::new(),
         }
     }
@@ -632,10 +626,8 @@ impl Loader {
                 self.walk_keyframe(child, &subpath)?;
             }
         }
-        let mut auto_pair_exclusions =
-            self_collision_exclusions(&self.world, &self.tree_self_collide);
-        auto_pair_exclusions.extend(self.auto_pair_exclusions.iter().copied());
-        self.world.set_auto_pair_exclusions(auto_pair_exclusions);
+        self.world
+            .set_auto_pair_exclusions(std::mem::take(&mut self.auto_pair_exclusions));
         // After parsing everything, run the pair-support check the JSON
         // loader also runs so a bad geom-pair combo surfaces at load time
         // with a path rather than a runtime panic.
@@ -1053,10 +1045,10 @@ impl Loader {
         link_names.insert(root_link_name.clone(), 0);
 
         let tree_idx = self.world.add_tree(tree);
+        self.world.disabled_self_collision.insert(tree_idx);
         self.trees_by_name.insert(tree_name.clone(), tree_idx);
         // Placeholder; we'll set the real link_names table after the walk.
         self.links_by_name.push(HashMap::new());
-        self.tree_self_collide.push(false);
 
         // Register root body name.
         self.tree_bodies_by_name
@@ -4200,28 +4192,6 @@ fn quat_align_z_to(n: Vec3) -> Quat {
     let axis = z.cross(n);
     let w = 1.0 + dot;
     Quat::new(axis.x, axis.y, axis.z, w).renormalize()
-}
-
-/// Enumerate automatic pairs excluded by a tree's self-collision setting.
-fn self_collision_exclusions(world: &World, tree_self_collide: &[bool]) -> Vec<(usize, usize)> {
-    use crate::geom::GeomAttach;
-    let mut out = Vec::new();
-    let n = world.geoms.len();
-    for a in 0..n {
-        for b in (a + 1)..n {
-            let att_a = world.geoms[a].attachment();
-            let att_b = world.geoms[b].attachment();
-            if att_a == att_b {
-                continue;
-            }
-            if let (GeomAttach::Link(ta, _), GeomAttach::Link(tb, _)) = (att_a, att_b) {
-                if ta == tb && !tree_self_collide.get(ta).copied().unwrap_or(true) {
-                    out.push((a, b));
-                }
-            }
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
