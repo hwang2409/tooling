@@ -1304,8 +1304,8 @@ fn mesh_feature_edges(
         let face = mesh.faces[face_index];
         for &other in &face {
             let other = other as usize;
-            if other == ids[0] || len == edges.len() {
-                return 0;
+            if other == ids[0] {
+                continue;
             }
             let edge = [ids[0], other];
             let points = [
@@ -1318,6 +1318,9 @@ fn mesh_feature_edges(
                     || (prior[0] - points[1]).length_squared() <= CCD_DEGENERATE_SQUARED
                         && (prior[1] - points[0]).length_squared() <= CCD_DEGENERATE_SQUARED
             }) {
+                if len == edges.len() {
+                    return 0;
+                }
                 edges[len] = points;
                 len += 1;
             }

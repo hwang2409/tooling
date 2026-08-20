@@ -250,6 +250,28 @@ fn cube_mesh(order: [usize; 8]) -> ConvexMesh {
     }
 }
 
+fn corner_mesh() -> ConvexMesh {
+    // The lower apex is the unique -Z support vertex. Its four incident
+    // edges stay nearly tangent to the opposing cube face.
+    ConvexMesh {
+        vertices: vec![
+            Vec3::new(0.0, 0.0, -0.5),
+            Vec3::new(-0.5, -0.5, -0.499),
+            Vec3::new(0.5, -0.5, -0.499),
+            Vec3::new(0.5, 0.5, -0.499),
+            Vec3::new(-0.5, 0.5, -0.499),
+        ],
+        faces: vec![
+            [0, 1, 2],
+            [0, 2, 3],
+            [0, 3, 4],
+            [0, 4, 1],
+            [1, 4, 3],
+            [1, 3, 2],
+        ],
+    }
+}
+
 fn triangular_prism_mesh() -> ConvexMesh {
     ConvexMesh {
         vertices: vec![
@@ -305,7 +327,10 @@ fn regular_prism_mesh_with_order(ring_vertices: usize, scale: f32, order: &[usiz
 }
 
 fn high_vertex_prism_mesh() -> ConvexMesh {
-    let ring_vertices = 16;
+    high_vertex_prism_mesh_with_ring(16)
+}
+
+fn high_vertex_prism_mesh_with_ring(ring_vertices: usize) -> ConvexMesh {
     let mut vertices = Vec::with_capacity(ring_vertices * 2);
     for z in [-0.5, 0.5] {
         for index in 0..ring_vertices {
@@ -364,6 +389,63 @@ fn registered_high_vertex_mesh_has_deterministic_contact() {
             expected,
             "high-vertex mesh contact is not deterministic",
         );
+    }
+}
+
+#[test]
+fn high_vertex_mesh_overflow_falls_back_to_one_epa_contact() {
+    let mesh = high_vertex_prism_mesh_with_ring(17);
+    assert_eq!(mesh.vertices.len(), 34);
+    let mut world = World::new();
+    let mesh_a = world.add_mesh(mesh.clone());
+    let mesh_b = world.add_mesh(mesh);
+
+    let geom_a = Geom::mesh(0, mesh_a, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let geom_b = Geom::mesh(1, mesh_b, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(0.02, 0.01, 0.96),
+        orientation: Quat::IDENTITY,
+    };
+    let first = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &world.meshes);
+    let second = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &world.meshes);
+    assert_eq!(
+        first.len, 1,
+        "support-face overflow must keep the EPA contact"
+    );
+    assert_eq!(second.len, first.len);
+    assert_contact_bit_equal(
+        &second.contacts[0],
+        &first.contacts[0],
+        "support-face overflow contact is not deterministic",
+    );
+    close_vec(first.contacts[0].normal_world, -Vec3::Z, 1.0e-6);
+}
+
+#[test]
+fn mesh_mesh_single_vertex_recovery_keeps_base_normal() {
+    let meshes = [corner_mesh(), cube_mesh([0, 1, 2, 3, 4, 5, 6, 7])];
+    let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let geom_b = Geom::mesh(1, 1, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::new(0.0, 0.0, 0.96),
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let contacts = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &meshes);
+    assert!(
+        contacts.len >= 2,
+        "a single corner against a face must recover a manifold; got {}",
+        contacts.len
+    );
+    for contact in contacts.as_slice() {
+        close_vec(contact.normal_world, Vec3::Z, 1.0e-6);
     }
 }
 
