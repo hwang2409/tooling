@@ -10,21 +10,21 @@
       "early": {
         "observed_max": {
           "position": 0.018640879541635513,
-          "orientation": 0.0032404158264398575,
+          "orientation": 0.0032404225785285234,
           "contact_count": 0
         },
         "position": 0.018740879371762276,
-        "orientation": 0.0033404158893972635,
+        "orientation": 0.0033404226414859295,
         "contact_count": 0
       },
       "full": {
         "observed_max": {
           "position": 0.12806618213653564,
-          "orientation": 0.0035700672306120396,
+          "orientation": 0.0035700753796845675,
           "contact_count": 0
         },
         "position": 0.12816618382930756,
-        "orientation": 0.0036700672935694456,
+        "orientation": 0.0036700754426419735,
         "contact_count": 0
       }
     },
@@ -32,23 +32,23 @@
       "id": "mesh-mesh-rotated-drop",
       "early": {
         "observed_max": {
-          "position": 0.026015695184469223,
-          "orientation": 0.01086485106498003,
-          "contact_count": 1
+          "position": 0.01886032521724701,
+          "orientation": 0.018947714939713478,
+          "contact_count": 0
         },
-        "position": 0.026115695014595985,
-        "orientation": 0.010964850895106792,
-        "contact_count": 1
+        "position": 0.01896032504737377,
+        "orientation": 0.01904771476984024,
+        "contact_count": 0
       },
       "full": {
         "observed_max": {
-          "position": 0.14904622733592987,
-          "orientation": 0.06500313431024551,
-          "contact_count": 1
+          "position": 0.12913423776626587,
+          "orientation": 0.10184609144926071,
+          "contact_count": 0
         },
-        "position": 0.14914622902870178,
-        "orientation": 0.06510313600301743,
-        "contact_count": 1
+        "position": 0.12923423945903778,
+        "orientation": 0.10194609314203262,
+        "contact_count": 0
       }
     }
   ]

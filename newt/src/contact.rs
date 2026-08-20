@@ -2410,33 +2410,15 @@ fn support_vertices_legacy(vertices: &[Vec3], direction: Vec3) -> Vec3 {
 }
 
 fn lexicographically_precedes(a: Vec3, b: Vec3) -> bool {
-    const EPSILON: f32 = 1.0e-6;
-    if (a.x - b.x).abs() > EPSILON {
-        return a.x < b.x;
+    match a.x.total_cmp(&b.x) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => match a.y.total_cmp(&b.y) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => a.z.total_cmp(&b.z).is_lt(),
+        },
     }
-    if (a.y - b.y).abs() > EPSILON {
-        return a.y < b.y;
-    }
-    if (a.z - b.z).abs() > EPSILON {
-        return a.z < b.z;
-    }
-    if a.x != b.x {
-        return a.x < b.x;
-    }
-    if a.y != b.y {
-        return a.y < b.y;
-    }
-    a.z < b.z
-}
-
-fn lexicographically_precedes_exact(a: Vec3, b: Vec3) -> bool {
-    if a.x != b.x {
-        return a.x < b.x;
-    }
-    if a.y != b.y {
-        return a.y < b.y;
-    }
-    a.z < b.z
 }
 
 fn same_vec3(a: Vec3, b: Vec3) -> bool {
@@ -2452,7 +2434,7 @@ fn ccd_vertex_precedes(a: CcdVertex, b: CcdVertex) -> bool {
         if same_vec3(left, right) {
             continue;
         }
-        return lexicographically_precedes_exact(left, right);
+        return lexicographically_precedes(left, right);
     }
     false
 }
@@ -2690,12 +2672,22 @@ fn ccd_polytope_witness(
     normal: Vec3,
 ) -> (Vec3, Vec3) {
     let (mut point_a, mut point_b) = ccd_weighted_witness(feature, &weights);
-    let (matches_a, centered_a) = if feature.iter().any(|point| point.tie_a) {
+    // EPA can derive a final feature from a direction not used for support.
+    // High-valence meshes need the geometric tie check in that case.
+    let center_untagged_a = matches!(
+        shape_a,
+        CcdShape::Mesh { mesh, .. } if mesh.vertices.len() > 4
+    );
+    let center_untagged_b = matches!(
+        shape_b,
+        CcdShape::Mesh { mesh, .. } if mesh.vertices.len() > 4
+    );
+    let (matches_a, centered_a) = if center_untagged_a || feature.iter().any(|point| point.tie_a) {
         ccd_feature_support(shape_a, feature, normal, true)
     } else {
         (true, None)
     };
-    let (matches_b, centered_b) = if feature.iter().any(|point| point.tie_b) {
+    let (matches_b, centered_b) = if center_untagged_b || feature.iter().any(|point| point.tie_b) {
         ccd_feature_support(shape_b, feature, -normal, false)
     } else {
         (true, None)
@@ -2737,7 +2729,7 @@ fn ccd_feature_support(
         .map(|vertex| point(vertex).dot(direction))
         .fold(f32::NEG_INFINITY, f32::max);
     let support_best = support.dot(direction);
-    let tolerance = shape.extent() * 1.0e-6;
+    let tolerance = shape.extent() * 1.0e-7;
     if (feature_best - support_best).abs() > tolerance {
         (false, None)
     } else {
@@ -2983,18 +2975,13 @@ fn ccd_distance_contact(
     if penetration <= 0.0 {
         return None;
     }
-    let witness_tolerance = shape_a.extent().max(shape_b.extent()) * 1.0e-6;
-    let (point_a, point_b) = if raw_distance <= witness_tolerance {
-        ccd_centered_witness(
-            shape_a,
-            shape_b,
-            raw_point_a,
-            raw_point_b,
-            raw_point_b - raw_point_a,
-        )
-    } else {
-        (raw_point_a, raw_point_b)
-    };
+    let (point_a, point_b) = ccd_centered_witness(
+        shape_a,
+        shape_b,
+        raw_point_a,
+        raw_point_b,
+        raw_point_b - raw_point_a,
+    );
     let normal_world = if raw_distance > 1.0e-20 {
         separation / raw_distance
     } else {
@@ -3159,6 +3146,41 @@ fn ccd_face(vertices: &[CcdVertex; 128], indices: [usize; 3]) -> Option<CcdFace>
     })
 }
 
+fn ccd_face_precedes(
+    vertices: &[CcdVertex; 128],
+    candidate: CcdFace,
+    current: CcdFace,
+    tie_epsilon: f32,
+) -> bool {
+    if candidate.distance + tie_epsilon < current.distance {
+        return true;
+    }
+    if current.distance + tie_epsilon < candidate.distance {
+        return false;
+    }
+    let mut candidate_key = [
+        vertices[candidate.indices[0]],
+        vertices[candidate.indices[1]],
+        vertices[candidate.indices[2]],
+    ];
+    let mut current_key = [
+        vertices[current.indices[0]],
+        vertices[current.indices[1]],
+        vertices[current.indices[2]],
+    ];
+    sort_ccd_vertices(&mut candidate_key);
+    sort_ccd_vertices(&mut current_key);
+    for (candidate_vertex, current_vertex) in candidate_key.into_iter().zip(current_key) {
+        if ccd_vertex_precedes(candidate_vertex, current_vertex) {
+            return true;
+        }
+        if ccd_vertex_precedes(current_vertex, candidate_vertex) {
+            return false;
+        }
+    }
+    false
+}
+
 fn ccd_mesh_face_normal(pose: &GeomPose, mesh: &ConvexMesh, face: [u32; 3]) -> Option<Vec3> {
     let a = pose.point_to_world(mesh.vertices[face[0] as usize]);
     let b = pose.point_to_world(mesh.vertices[face[1] as usize]);
@@ -3305,7 +3327,7 @@ fn ccd_convex_contact(
             CcdShape::Mesh { mesh: mesh_b, .. }
         ) if mesh_a.vertices.len() <= 4 && mesh_b.vertices.len() <= 4
     );
-    let face_distance_epsilon = shape_a.extent().max(shape_b.extent()) * 1.0e-6;
+    let face_distance_epsilon = shape_a.extent().max(shape_b.extent()).max(1.0) * 1.0e-6;
     for _ in 0..config.max_epa_iterations {
         let has_positive_face = low_valence_mesh_pair
             && faces[..face_len]
@@ -3319,14 +3341,19 @@ fn ccd_convex_contact(
                     || face.distance > face_distance_epsilon
             })
             .unwrap_or(0);
-        for index in 1..face_len {
+        for index in 0..face_len {
             if low_valence_mesh_pair
                 && has_positive_face
                 && faces[index].distance <= face_distance_epsilon
             {
                 continue;
             }
-            if faces[index].distance < faces[best_index].distance {
+            if ccd_face_precedes(
+                &vertices,
+                faces[index],
+                faces[best_index],
+                face_distance_epsilon,
+            ) {
                 best_index = index;
             }
         }
@@ -3430,12 +3457,7 @@ fn ccd_convex_contact(
     if penetration <= 0.0 {
         return None;
     }
-    let contact_delta = point_b - point_a;
-    let normal_world = if contact_delta.length_squared() > 1.0e-20 {
-        contact_delta.normalize()
-    } else {
-        -best_face.normal
-    };
+    let normal_world = -best_face.normal;
     let position_world = (point_a + point_b) * 0.5;
     Some(Contact {
         geom_a: idx_a,
