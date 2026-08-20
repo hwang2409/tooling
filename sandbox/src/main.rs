@@ -58,8 +58,7 @@ struct Viewer {
     speed: f32,
     accumulator: f32,
     last_elapsed: f32,
-    previous_input: InputState,
-    steps: u64,
+    previous_input: [bool; EDGE_KEYS.len()],
     metrics: Option<Rc<RefCell<Metrics>>>,
 }
 
@@ -69,6 +68,7 @@ struct Metrics {
     render_ms: Vec<f64>,
     present_ms: Vec<f64>,
     frame_ms: Vec<f64>,
+    last_present: Option<Instant>,
 }
 
 impl Metrics {
@@ -78,8 +78,12 @@ impl Metrics {
     }
 
     fn record_present(&mut self, timing: FrameTiming) {
+        let now = Instant::now();
         self.present_ms.push(timing.present.as_secs_f64() * 1000.0);
-        self.frame_ms.push(timing.total.as_secs_f64() * 1000.0);
+        if let Some(previous) = self.last_present.replace(now) {
+            self.frame_ms
+                .push(now.duration_since(previous).as_secs_f64() * 1000.0);
+        }
     }
 
     fn report(&self, seconds: f32) {
@@ -307,7 +311,7 @@ fn plane_mesh() -> (Vec<Vec4>, Vec<[usize; 3]>) {
 }
 
 fn hfield_mesh(hfield: &newt::geom::HeightField) -> (Vec<Vec4>, Vec<[usize; 3]>) {
-    let mut vertices = Vec::with_capacity(hfield.nrow * hfield.ncol);
+    let mut vertices = Vec::with_capacity(hfield.nrow * hfield.ncol + 4);
     for row in 0..hfield.nrow {
         let y = -hfield.size[1] + 2.0 * hfield.size[1] * row as f32 / (hfield.nrow - 1) as f32;
         for col in 0..hfield.ncol {
@@ -315,7 +319,11 @@ fn hfield_mesh(hfield: &newt::geom::HeightField) -> (Vec<Vec4>, Vec<[usize; 3]>)
             vertices.push(NewtVec3::new(x, y, hfield.height(row, col)));
         }
     }
-    let mut triangles = Vec::with_capacity((hfield.nrow - 1) * (hfield.ncol - 1) * 2);
+    let mut triangles = Vec::with_capacity(
+        (hfield.nrow - 1) * (hfield.ncol - 1) * 2
+            + 2 * (2 * (hfield.nrow - 1) + 2 * (hfield.ncol - 1))
+            + 2,
+    );
     for row in 0..hfield.nrow - 1 {
         for col in 0..hfield.ncol - 1 {
             let a = row * hfield.ncol + col;
@@ -325,6 +333,42 @@ fn hfield_mesh(hfield: &newt::geom::HeightField) -> (Vec<Vec4>, Vec<[usize; 3]>)
             triangles.push([a, b, c]);
             triangles.push([a, c, d]);
         }
+    }
+
+    let base = vertices.len();
+    vertices.extend([
+        NewtVec3::new(-hfield.size[0], -hfield.size[1], -hfield.size[3]),
+        NewtVec3::new(hfield.size[0], -hfield.size[1], -hfield.size[3]),
+        NewtVec3::new(hfield.size[0], hfield.size[1], -hfield.size[3]),
+        NewtVec3::new(-hfield.size[0], hfield.size[1], -hfield.size[3]),
+    ]);
+    triangles.push([base, base + 2, base + 1]);
+    triangles.push([base, base + 3, base + 2]);
+
+    for col in 0..(hfield.ncol - 1) {
+        let a = col;
+        let b = col + 1;
+        triangles.push([a, base, base + 1]);
+        triangles.push([a, base + 1, b]);
+    }
+    for row in 0..(hfield.nrow - 1) {
+        let a = row * hfield.ncol + hfield.ncol - 1;
+        let b = (row + 1) * hfield.ncol + hfield.ncol - 1;
+        triangles.push([a, base + 2, base + 1]);
+        triangles.push([a, b, base + 2]);
+    }
+    let top_row = (hfield.nrow - 1) * hfield.ncol;
+    for col in 0..(hfield.ncol - 1) {
+        let a = top_row + col;
+        let b = a + 1;
+        triangles.push([a, b, base + 2]);
+        triangles.push([a, base + 2, base + 3]);
+    }
+    for row in 0..(hfield.nrow - 1) {
+        let a = row * hfield.ncol;
+        let b = (row + 1) * hfield.ncol;
+        triangles.push([a, b, base + 3]);
+        triangles.push([a, base + 3, base]);
     }
     mesh(vertices, triangles)
 }
@@ -437,8 +481,28 @@ fn load_scene(index: usize) -> Result<SceneData, Box<dyn std::error::Error>> {
     })
 }
 
-fn edge(current: &InputState, previous: &InputState, key: KeyCode) -> bool {
-    current.is_down(key) && !previous.is_down(key)
+const EDGE_KEYS: [KeyCode; 13] = [
+    KeyCode::Space,
+    KeyCode::KeyR,
+    KeyCode::BracketLeft,
+    KeyCode::Minus,
+    KeyCode::BracketRight,
+    KeyCode::Equal,
+    KeyCode::KeyN,
+    KeyCode::KeyP,
+    KeyCode::Digit1,
+    KeyCode::Digit2,
+    KeyCode::Digit3,
+    KeyCode::Digit4,
+    KeyCode::Digit5,
+];
+
+fn edge(current: &InputState, previous: &[bool; EDGE_KEYS.len()], key: KeyCode) -> bool {
+    let index = EDGE_KEYS
+        .iter()
+        .position(|candidate| *candidate == key)
+        .expect("edge key must be listed in EDGE_KEYS");
+    current.is_down(key) && !previous[index]
 }
 
 impl Viewer {
@@ -460,8 +524,7 @@ impl Viewer {
             speed: 1.0,
             accumulator: 0.0,
             last_elapsed: 0.0,
-            previous_input: InputState::default(),
-            steps: 0,
+            previous_input: [false; EDGE_KEYS.len()],
             metrics,
         })
     }
@@ -478,7 +541,6 @@ impl Viewer {
                     .collect();
                 self.scene = scene;
                 self.accumulator = 0.0;
-                self.steps = 0;
             }
             Err(error) => eprintln!("cannot load scene {index}: {error}"),
         }
@@ -491,7 +553,6 @@ impl Viewer {
         if edge(input, &self.previous_input, KeyCode::KeyR) {
             self.scene.world = self.scene.initial_world.clone();
             self.accumulator = 0.0;
-            self.steps = 0;
         }
         if edge(input, &self.previous_input, KeyCode::BracketLeft)
             || edge(input, &self.previous_input, KeyCode::Minus)
@@ -530,7 +591,7 @@ impl Viewer {
         let frame_delta = (elapsed - self.last_elapsed).clamp(0.0, 0.1);
         self.last_elapsed = elapsed;
         self.advance_simulation(frame_delta);
-        self.previous_input = input.clone();
+        self.previous_input = std::array::from_fn(|index| input.is_down(EDGE_KEYS[index]));
     }
 
     fn advance_simulation(&mut self, frame_delta: f32) {
@@ -539,7 +600,6 @@ impl Viewer {
             while self.accumulator >= self.scene.world.dt {
                 self.scene.world.step();
                 self.accumulator -= self.scene.world.dt;
-                self.steps += 1;
             }
         }
     }
@@ -570,14 +630,15 @@ impl Viewer {
     fn draw(&mut self, framebuffer: &mut Framebuffer, elapsed: f32, input: &InputState) {
         let sim_started = self.metrics.as_ref().map(|_| Instant::now());
         self.update(elapsed, input);
+        let simulation = sim_started.map(|started| started.elapsed());
         let render_started = self.metrics.as_ref().map(|_| Instant::now());
         self.render_frame(framebuffer);
-        if let (Some(sim_started), Some(render_started), Some(metrics)) =
-            (sim_started, render_started, &self.metrics)
+        if let (Some(simulation), Some(render_started), Some(metrics)) =
+            (simulation, render_started, &self.metrics)
         {
             metrics
                 .borrow_mut()
-                .record_draw(sim_started.elapsed(), render_started.elapsed());
+                .record_draw(simulation, render_started.elapsed());
         }
     }
 
@@ -748,5 +809,21 @@ mod tests {
             assert!(scene.shapes.iter().all(|shape| !shape.vertices.is_empty()));
             assert!(scene.distance.is_finite() && scene.distance > 0.0);
         }
+    }
+
+    #[test]
+    fn hfield_render_geometry_includes_collision_base_and_sides() {
+        let hfield = newt::geom::HeightField {
+            nrow: 2,
+            ncol: 2,
+            size: [2.0, 3.0, 4.0, 5.0],
+            data: vec![0.0; 4],
+        };
+
+        let (vertices, triangles) = hfield_mesh(&hfield);
+
+        assert_eq!(vertices.len(), 8);
+        assert_eq!(triangles.len(), 12);
+        assert!(vertices[4..].iter().all(|vertex| vertex.z == -5.0));
     }
 }

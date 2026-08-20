@@ -245,8 +245,11 @@ where
                     || self.framebuffer.width == 0
                     || self.framebuffer.height == 0
                     || self.frame_budget_exhausted()
-                    || self.time_budget_exhausted()
                 {
+                    return;
+                }
+                if self.time_budget_exhausted() {
+                    event_loop.exit();
                     return;
                 }
                 let frame_started = Instant::now();
@@ -334,8 +337,12 @@ where
         self.dispatch_window_event(&mut control, Some(window), event);
     }
 
-    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
-        if self.frame_budget_exhausted() || self.time_budget_exhausted() {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.frame_budget_exhausted() {
+            return;
+        }
+        if self.time_budget_exhausted() {
+            event_loop.exit();
             return;
         }
         if let Some(window) = self.window {
@@ -607,6 +614,39 @@ mod tests {
             "event loop should exit once the budget is met"
         );
         assert_eq!(app.frames, 3);
+    }
+
+    #[test]
+    fn expired_time_budget_exits_before_redraw() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let draw_count = Rc::new(Cell::new(0usize));
+        let counter = draw_count.clone();
+        let mut app = App {
+            title: String::new(),
+            logical_width: 2,
+            logical_height: 2,
+            window: None,
+            backend: Some(Box::new(CountingBackend)),
+            framebuffer: Framebuffer::new(2, 2),
+            draw: move |_: &mut Framebuffer, _: f32, _: &InputState| {
+                counter.set(counter.get() + 1);
+            },
+            started: Instant::now(),
+            frames: 0,
+            max_frames: None,
+            max_seconds: Some(0.0),
+            error: None,
+            input: InputState::default(),
+            observer: None,
+        };
+
+        let mut runner = HeadlessEventRunner { exited: false };
+        app.dispatch_window_event(&mut runner, None, WindowEvent::RedrawRequested);
+
+        assert_eq!(draw_count.get(), 0);
+        assert!(runner.exited);
     }
 
     #[test]
