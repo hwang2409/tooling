@@ -8,11 +8,14 @@
 //! ellipsoid-plane, etc.
 
 use newt::body::Body;
-use newt::contact::{is_pair_supported, narrow_phase};
+use newt::contact::{Contact, is_pair_supported, narrow_phase};
 use newt::geom::{ConvexMesh, Geom, GeomPose, GeomShape, geom_world_pose};
 use newt::json::{self, Value};
-use newt::math::{FRAC_PI_2, FRAC_PI_4, Mat3, Quat, Vec3};
+use newt::math::{FRAC_PI_2, FRAC_PI_4, Mat3, Quat, Vec3, cos, sin};
 use newt::world::World;
+use newt::xml;
+use std::fmt::Write as _;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -34,6 +37,25 @@ fn close_scalar(actual: f32, expected: f32, tolerance: f32, label: &str) {
         (actual - expected).abs() <= tolerance,
         "{label}: {actual} != {expected}"
     );
+}
+
+fn assert_contact_bit_equal(actual: &Contact, expected: &Contact, label: &str) {
+    let bits = |contact: &Contact| {
+        (
+            contact.geom_a,
+            contact.geom_b,
+            contact.position_world.x.to_bits(),
+            contact.position_world.y.to_bits(),
+            contact.position_world.z.to_bits(),
+            contact.normal_world.x.to_bits(),
+            contact.normal_world.y.to_bits(),
+            contact.normal_world.z.to_bits(),
+            contact.penetration.to_bits(),
+            contact.friction.to_bits(),
+            contact.gap.to_bits(),
+        )
+    };
+    assert_eq!(bits(actual), bits(expected), "{label}");
 }
 
 fn route_object<'a>(value: &'a Value, key: &str) -> &'a Value {
@@ -81,6 +103,28 @@ fn route_array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
         panic!("route fixture field {key} must be an array");
     };
     values
+}
+
+fn assert_mjcf_source_contains(path: &std::path::Path, required_names: &[&str]) {
+    let source = std::fs::read_to_string(path).expect("fixture XML must be readable");
+    let root = xml::parse(&source).expect("fixture XML must parse");
+    assert_eq!(root.name, "mujoco", "fixture XML must be MJCF");
+    fn collect_names(node: &newt::xml::Element, names: &mut Vec<String>) {
+        if let Some(name) = node.attr("name") {
+            names.push(name.to_owned());
+        }
+        for child in node.child_elements() {
+            collect_names(child, names);
+        }
+    }
+    let mut names = Vec::new();
+    collect_names(&root, &mut names);
+    for required in required_names {
+        assert!(
+            names.iter().any(|name| name == required),
+            "{path:?}: missing named MJCF element {required}"
+        );
+    }
 }
 
 fn route_pose(value: &Value, key: &str) -> GeomPose {
@@ -158,6 +202,518 @@ fn unit_tetrahedron() -> ConvexMesh {
         ],
         // 4 outward-facing triangles.
         faces: vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
+    }
+}
+
+fn cube_mesh(order: [usize; 8]) -> ConvexMesh {
+    let base_vertices = [
+        Vec3::new(-0.5, -0.5, -0.5),
+        Vec3::new(0.5, -0.5, -0.5),
+        Vec3::new(-0.5, 0.5, -0.5),
+        Vec3::new(0.5, 0.5, -0.5),
+        Vec3::new(-0.5, -0.5, 0.5),
+        Vec3::new(0.5, -0.5, 0.5),
+        Vec3::new(-0.5, 0.5, 0.5),
+        Vec3::new(0.5, 0.5, 0.5),
+    ];
+    let mut inverse = [0usize; 8];
+    for (new_index, &old_index) in order.iter().enumerate() {
+        inverse[old_index] = new_index;
+    }
+    let base_faces = [
+        [0, 2, 3],
+        [0, 3, 1],
+        [4, 5, 7],
+        [4, 7, 6],
+        [0, 1, 5],
+        [0, 5, 4],
+        [2, 6, 7],
+        [2, 7, 3],
+        [0, 4, 6],
+        [0, 6, 2],
+        [1, 3, 7],
+        [1, 7, 5],
+    ];
+    ConvexMesh {
+        vertices: order.iter().map(|&index| base_vertices[index]).collect(),
+        faces: base_faces
+            .into_iter()
+            .map(|face| {
+                [
+                    inverse[face[0]] as u32,
+                    inverse[face[1]] as u32,
+                    inverse[face[2]] as u32,
+                ]
+            })
+            .collect(),
+    }
+}
+
+fn triangular_prism_mesh() -> ConvexMesh {
+    ConvexMesh {
+        vertices: vec![
+            Vec3::new(-0.5, -0.5, -0.5),
+            Vec3::new(0.5, -0.5, -0.5),
+            Vec3::new(0.0, 0.5, -0.5),
+            Vec3::new(-0.5, -0.5, 0.5),
+            Vec3::new(0.5, -0.5, 0.5),
+            Vec3::new(0.0, 0.5, 0.5),
+        ],
+        faces: vec![
+            [0, 1, 2],
+            [3, 5, 4],
+            [0, 3, 4],
+            [0, 4, 1],
+            [1, 4, 5],
+            [1, 5, 2],
+            [2, 5, 3],
+            [2, 3, 0],
+        ],
+    }
+}
+
+fn regular_prism_mesh(ring_vertices: usize, reversed: bool) -> ConvexMesh {
+    let mut vertices = Vec::with_capacity(ring_vertices * 2);
+    for z in [-0.5, 0.5] {
+        for index in 0..ring_vertices {
+            let angle = 2.0 * std::f32::consts::PI * index as f32 / ring_vertices as f32;
+            vertices.push(Vec3::new(cos(angle), sin(angle), z));
+        }
+    }
+    if reversed {
+        vertices.reverse();
+    }
+    ConvexMesh {
+        vertices,
+        faces: Vec::new(),
+    }
+}
+
+fn regular_prism_mesh_with_order(ring_vertices: usize, scale: f32, order: &[usize]) -> ConvexMesh {
+    let mut base_vertices = Vec::with_capacity(ring_vertices * 2);
+    for z in [-0.5, 0.5] {
+        for index in 0..ring_vertices {
+            let angle = 2.0 * std::f32::consts::PI * index as f32 / ring_vertices as f32;
+            base_vertices.push(Vec3::new(cos(angle), sin(angle), z) * scale);
+        }
+    }
+    ConvexMesh {
+        vertices: order.iter().map(|&index| base_vertices[index]).collect(),
+        faces: Vec::new(),
+    }
+}
+
+#[test]
+fn mesh_mesh_witness_is_invariant_to_vertex_order_and_argument_order() {
+    let identity = [0, 1, 2, 3, 4, 5, 6, 7];
+    let permutations = [
+        identity,
+        [7, 6, 5, 4, 3, 2, 1, 0],
+        [1, 0, 3, 2, 5, 4, 7, 6],
+        [2, 3, 0, 1, 6, 7, 4, 5],
+        [4, 5, 6, 7, 0, 1, 2, 3],
+        [3, 1, 7, 5, 2, 0, 6, 4],
+        [6, 2, 4, 0, 7, 3, 5, 1],
+        [5, 7, 1, 3, 4, 6, 0, 2],
+    ];
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(1.01, 0.0, 0.0),
+        orientation: Quat::IDENTITY,
+    };
+    let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.02);
+    let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let reference_mesh = cube_mesh(identity);
+    let reference = narrow_phase(
+        0,
+        &geom_a,
+        &pose_a,
+        1,
+        &geom_b,
+        &pose_b,
+        std::slice::from_ref(&reference_mesh),
+    );
+    assert_eq!(reference.len, 1);
+    let expected = reference.as_slice()[0];
+
+    for order in permutations {
+        let permuted_geom_b = Geom::mesh(1, 1, Vec3::ZERO, Quat::IDENTITY, 0.5);
+        let meshes = [reference_mesh.clone(), cube_mesh(order)];
+        let actual = narrow_phase(0, &geom_a, &pose_a, 1, &permuted_geom_b, &pose_b, &meshes);
+        assert_eq!(
+            actual.len, 1,
+            "vertex order {order:?} changed contact count"
+        );
+        let contact = actual.as_slice()[0];
+        assert_contact_bit_equal(&contact, &expected, &format!("vertex order {order:?}"));
+
+        let swapped = narrow_phase(1, &permuted_geom_b, &pose_b, 0, &geom_a, &pose_a, &meshes);
+        assert_eq!(
+            swapped.len, 1,
+            "vertex order {order:?} changed swapped count"
+        );
+        let swapped_contact = swapped.as_slice()[0];
+        let expected_swapped = Contact {
+            geom_a: expected.geom_b,
+            geom_b: expected.geom_a,
+            position_world: expected.position_world,
+            normal_world: -expected.normal_world,
+            penetration: expected.penetration,
+            friction: expected.friction,
+            gap: expected.gap,
+        };
+        assert_contact_bit_equal(
+            &swapped_contact,
+            &expected_swapped,
+            &format!("swapped vertex order {order:?}"),
+        );
+    }
+}
+
+#[test]
+fn plane_mesh_contacts_are_invariant_to_vertex_order() {
+    let identity = [0, 1, 2, 3, 4, 5, 6, 7];
+    let permutations = [identity, [7, 6, 5, 4, 3, 2, 1, 0], [1, 0, 3, 2, 5, 4, 7, 6]];
+    let plane = Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5);
+    let plane_pose = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let mesh_geom = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let mesh_pose = GeomPose {
+        position: Vec3::new(0.0, 0.0, -0.1),
+        orientation: Quat::IDENTITY,
+    };
+    let reference_mesh = cube_mesh(identity);
+    let reference = narrow_phase(
+        0,
+        &plane,
+        &plane_pose,
+        1,
+        &mesh_geom,
+        &mesh_pose,
+        std::slice::from_ref(&reference_mesh),
+    );
+    assert_eq!(reference.len, 2);
+    for order in permutations {
+        let meshes = [cube_mesh(order)];
+        let actual = narrow_phase(0, &plane, &plane_pose, 1, &mesh_geom, &mesh_pose, &meshes);
+        assert_eq!(actual.len, reference.len, "vertex order {order:?} count");
+        for (expected, contact) in reference.as_slice().iter().zip(actual.as_slice()) {
+            assert_contact_bit_equal(
+                contact,
+                expected,
+                &format!("plane-mesh vertex order {order:?}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn coincident_mesh_mesh_swapped_order_flips_normal() {
+    let mesh = cube_mesh([0, 1, 2, 3, 4, 5, 6, 7]);
+    let meshes = [mesh];
+    let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+
+    let forward = narrow_phase(0, &geom_a, &pose, 1, &geom_b, &pose, &meshes);
+    let swapped = narrow_phase(1, &geom_b, &pose, 0, &geom_a, &pose, &meshes);
+    assert_eq!(forward.len, 1);
+    assert_eq!(swapped.len, 1);
+    let forward = forward.as_slice()[0];
+    let swapped = swapped.as_slice()[0];
+    assert!(forward.normal_world.length_squared() > 0.99);
+    close_vec(swapped.position_world, forward.position_world, 1.0e-6);
+    close_vec(swapped.normal_world, -forward.normal_world, 1.0e-6);
+    close_scalar(
+        swapped.penetration,
+        forward.penetration,
+        1.0e-6,
+        "coincident depth",
+    );
+}
+
+#[test]
+fn near_parallel_mesh_face_witness_is_continuous() {
+    let mesh = cube_mesh([0, 1, 2, 3, 4, 5, 6, 7]);
+    let meshes = [mesh];
+    let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.01);
+    let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(0.0, 1.0, 0.0),
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b_near_parallel = GeomPose {
+        position: Vec3::new(1.0e-7, 1.0, 0.0),
+        orientation: Quat::IDENTITY,
+    };
+
+    let face = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &meshes);
+    let near_parallel = narrow_phase(
+        0,
+        &geom_a,
+        &pose_a,
+        1,
+        &geom_b,
+        &pose_b_near_parallel,
+        &meshes,
+    );
+    assert_eq!(face.len, 1);
+    assert_eq!(near_parallel.len, 1);
+    let face = face.as_slice()[0];
+    let near_parallel = near_parallel.as_slice()[0];
+    close_vec(near_parallel.position_world, face.position_world, 1.0e-4);
+    close_scalar(
+        near_parallel.penetration,
+        face.penetration,
+        1.0e-4,
+        "near-parallel penetration",
+    );
+}
+
+#[test]
+fn triangular_prism_support_features_are_continuous() {
+    let mut mesh = triangular_prism_mesh();
+    for vertex in &mut mesh.vertices {
+        *vertex *= 3.0;
+    }
+    let meshes = [mesh];
+    let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.01);
+    let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    for (name, axis) in [("triangular face", Vec3::Z), ("edge", Vec3::Y)] {
+        let baseline_pose = GeomPose {
+            position: axis,
+            orientation: Quat::IDENTITY,
+        };
+        let baseline = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &baseline_pose, &meshes);
+        assert_eq!(baseline.len, 1, "{name} baseline contact count");
+        let expected = baseline.as_slice()[0].position_world;
+        for offset in [-1.0e-7, 1.0e-7] {
+            let near_pose = GeomPose {
+                position: axis + Vec3::new(offset, 0.0, 0.0),
+                orientation: Quat::IDENTITY,
+            };
+            let near = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &near_pose, &meshes);
+            assert_eq!(near.len, 1, "{name} offset {offset} contact count");
+            let actual = near.as_slice()[0].position_world;
+            assert!(
+                (actual - expected).length() <= 1.0e-4,
+                "{name} offset {offset}: {actual:?} != {expected:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mesh_exact_alignment_preserves_contacts_at_feature_dimensions() {
+    for scale in [1.0e-3, 1.0, 1.0e3] {
+        let mut mesh = triangular_prism_mesh();
+        for vertex in &mut mesh.vertices {
+            *vertex *= scale;
+        }
+        let meshes = [mesh];
+        let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+        let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+        let pose_a = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        for (name, axis, transverse) in [
+            ("triangular face", Vec3::Z, Vec3::X),
+            ("edge", Vec3::X, Vec3::Y),
+            ("quad face", Vec3::Y, Vec3::X),
+        ] {
+            let base_position = axis * (0.25 * scale);
+            let exact_pose = GeomPose {
+                position: base_position,
+                orientation: Quat::IDENTITY,
+            };
+            let exact = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &exact_pose, &meshes);
+            assert_eq!(exact.len, 1, "{name} scale {scale} exact contact count");
+            let exact = exact.as_slice()[0];
+            assert!(exact.penetration > 0.0, "{name} scale {scale} exact depth");
+            assert!(
+                exact.normal_world.length() > 0.99,
+                "{name} scale {scale} exact normal"
+            );
+            for offset in [-1.0e-7, 1.0e-7] {
+                let near_pose = GeomPose {
+                    position: base_position + transverse * offset,
+                    orientation: Quat::IDENTITY,
+                };
+                let near = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &near_pose, &meshes);
+                assert_eq!(near.len, 1, "{name} scale {scale} offset {offset} count");
+                let near = near.as_slice()[0];
+                let tolerance = 1.0e-4 * scale.max(1.0);
+                let normal_tolerance = 2.0e-4;
+                assert!(
+                    (near.position_world - exact.position_world).length() <= tolerance,
+                    "{name} scale {scale} offset {offset} position {:?} != {:?}",
+                    near.position_world,
+                    exact.position_world
+                );
+                assert!(
+                    (near.normal_world - exact.normal_world).length() <= normal_tolerance,
+                    "{name} scale {scale} offset {offset} normal {:?} != {:?}",
+                    near.normal_world,
+                    exact.normal_world
+                );
+                close_scalar(
+                    near.penetration,
+                    exact.penetration,
+                    tolerance,
+                    "exact-alignment depth",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn convex_ccd_overlap_is_stable_across_scales() {
+    for scale in [1.0e-6, 1.0e-5, 1.0e3] {
+        let mut mesh = triangular_prism_mesh();
+        for vertex in &mut mesh.vertices {
+            *vertex *= scale;
+        }
+        let meshes = [mesh];
+        let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.02 * scale);
+        let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+        let pose_a = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let pose_b = GeomPose {
+            position: Vec3::new(0.001 * scale, 0.0, 0.75 * scale),
+            orientation: Quat::IDENTITY,
+        };
+        let contacts = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &meshes);
+        assert_eq!(contacts.len, 1, "scale {scale} contact count");
+        let contact = contacts.as_slice()[0];
+        assert!(contact.normal_world.z.abs() > 0.9, "scale {scale} normal");
+        assert!(
+            (0.24 * scale..=0.30 * scale).contains(&contact.penetration),
+            "scale {scale} penetration {}",
+            contact.penetration
+        );
+    }
+}
+
+#[test]
+fn high_valence_ccd_overlap_survives_epa_support_cap() {
+    let ring_vertices = 256;
+    let scale = 1.0e3;
+    let vertex_count = ring_vertices * 2;
+    let identity: Vec<usize> = (0..vertex_count).collect();
+    let mesh = regular_prism_mesh_with_order(ring_vertices, scale, &identity);
+    let meshes = [mesh];
+    let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.02 * scale);
+    let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(1.0, 0.0, 0.75 * scale),
+        orientation: Quat::IDENTITY,
+    };
+    let contacts = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &meshes);
+    assert_eq!(contacts.len, 1);
+    let contact = contacts.as_slice()[0];
+    assert!(contact.normal_world.z.abs() > 0.99);
+    assert!((0.24 * scale..=0.30 * scale).contains(&contact.penetration));
+}
+
+#[test]
+fn tiny_high_valence_face_centroid_is_stable_under_permutations() {
+    let ring_vertices = 256;
+    let vertex_count = ring_vertices * 2;
+    let scale = 1.0e-6;
+    let identity: Vec<usize> = (0..vertex_count).collect();
+    let reversed: Vec<usize> = identity.iter().copied().rev().collect();
+    let mut mixed = Vec::with_capacity(vertex_count);
+    for index in (0..vertex_count).step_by(2) {
+        mixed.push(index + 1);
+        mixed.push(index);
+    }
+    let meshes = [
+        regular_prism_mesh_with_order(ring_vertices, scale, &identity),
+        regular_prism_mesh_with_order(ring_vertices, scale, &reversed),
+        regular_prism_mesh_with_order(ring_vertices, scale, &mixed),
+    ];
+    let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.02 * scale);
+    let geom_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let geom_b_reversed = Geom::mesh(1, 1, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let geom_b_mixed = Geom::mesh(1, 2, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(0.0, 0.0, 1.0001 * scale),
+        orientation: Quat::IDENTITY,
+    };
+    let expected = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &meshes);
+    let reversed_contact = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b_reversed, &pose_b, &meshes);
+    let mixed_contact = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b_mixed, &pose_b, &meshes);
+    assert_eq!(expected.len, 1, "tiny baseline contact count");
+    assert_eq!(reversed_contact.len, 1, "tiny reversed contact count");
+    assert_eq!(mixed_contact.len, 1, "tiny mixed contact count");
+    let expected = expected.as_slice()[0];
+    for (label, actual) in [
+        ("tiny reversed", reversed_contact.as_slice()[0]),
+        ("tiny mixed", mixed_contact.as_slice()[0]),
+    ] {
+        assert_contact_bit_equal(&actual, &expected, label);
+    }
+}
+
+#[test]
+fn high_valence_face_centroid_is_stable_when_vertices_reverse() {
+    let meshes = [
+        regular_prism_mesh(256, false),
+        regular_prism_mesh(256, true),
+    ];
+    let geom_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.02);
+    let geom_b = Geom::mesh(1, 1, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    for (name, position) in [
+        ("margin", Vec3::new(0.0, 0.0, 1.0000001)),
+        ("overlap", Vec3::new(0.0, 0.0, 0.9)),
+    ] {
+        let pose_b = GeomPose {
+            position,
+            orientation: Quat::IDENTITY,
+        };
+        let forward = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &meshes);
+        let swapped_meshes = [
+            regular_prism_mesh(256, true),
+            regular_prism_mesh(256, false),
+        ];
+        let reversed = narrow_phase(0, &geom_a, &pose_a, 1, &geom_b, &pose_b, &swapped_meshes);
+        assert_eq!(forward.len, 1, "{name} forward contact count");
+        assert_eq!(reversed.len, 1, "{name} reversed contact count");
+        let expected = forward.as_slice()[0];
+        let actual = reversed.as_slice()[0];
+        assert_contact_bit_equal(&actual, &expected, name);
     }
 }
 
@@ -661,9 +1217,7 @@ fn sphere_touching_mesh_face_gives_correct_penetration() {
 #[test]
 fn analytic_convex_route_probes_are_stable_against_default_oracle_cases() {
     // These four fixed poses are the MuJoCo 3.11.0 route probes documented in
-    // docs/contacts.md. MuJoCo uses mjc_Convex for the first two pairs and
-    // mjc_PlaneConvex for the last two. Newt keeps its analytic colliders
-    // because the measured construction differences are documented there.
+    // docs/contacts.md. Newt uses the matching convex support constructions.
     let sphere = Geom::sphere(0, 0.2, Vec3::ZERO, 0.5);
     let sphere_pose = GeomPose {
         position: Vec3::new(0.6, 0.0, 0.0),
@@ -685,7 +1239,7 @@ fn analytic_convex_route_probes_are_stable_against_default_oracle_cases() {
     );
     assert_eq!(sphere_ellipsoid.len, 1);
     let contact = sphere_ellipsoid.contacts[0];
-    close_vec(contact.position_world, Vec3::new(0.5, 0.0, 0.0), 1.0e-6);
+    close_vec(contact.position_world, Vec3::new(0.45, 0.0, 0.0), 2.0e-3);
     close_vec(contact.normal_world, Vec3::X, 1.0e-6);
     close_scalar(contact.penetration, 0.1, 1.0e-6, "sphere-ellipsoid depth");
 
@@ -709,7 +1263,7 @@ fn analytic_convex_route_probes_are_stable_against_default_oracle_cases() {
     );
     assert_eq!(sphere_mesh.len, 1);
     let contact = sphere_mesh.contacts[0];
-    close_vec(contact.position_world, Vec3::new(0.2, 0.2, 0.0), 1.0e-6);
+    close_vec(contact.position_world, Vec3::new(0.2, 0.2, 0.05), 2.0e-3);
     close_vec(contact.normal_world, -Vec3::Z, 1.0e-6);
     close_scalar(contact.penetration, 0.1, 1.0e-6, "sphere-mesh depth");
 
@@ -732,7 +1286,7 @@ fn analytic_convex_route_probes_are_stable_against_default_oracle_cases() {
     );
     assert_eq!(plane_ellipsoid.len, 1);
     let contact = plane_ellipsoid.contacts[0];
-    close_vec(contact.position_world, Vec3::ZERO, 1.0e-6);
+    close_vec(contact.position_world, Vec3::new(0.0, 0.0, -0.05), 2.0e-3);
     close_vec(contact.normal_world, -Vec3::Z, 1.0e-6);
     close_scalar(contact.penetration, 0.1, 1.0e-6, "plane-ellipsoid depth");
 
@@ -748,12 +1302,12 @@ fn analytic_convex_route_probes_are_stable_against_default_oracle_cases() {
         },
         &[unit_tetrahedron()],
     );
-    assert_eq!(plane_mesh.len, 3);
+    assert_eq!(plane_mesh.len, 2);
     for contact in plane_mesh.as_slice() {
         close_vec(contact.normal_world, -Vec3::Z, 1.0e-6);
         close_scalar(
             contact.position_world.z,
-            0.0,
+            -0.05,
             1.0e-6,
             "plane-mesh position z",
         );
@@ -765,6 +1319,8 @@ fn analytic_convex_route_probes_are_stable_against_default_oracle_cases() {
 fn analytic_convex_route_probes_are_fixture_backed() {
     let document = json::parse(include_str!("references/contact_route_probes.json"))
         .expect("route probe fixture must parse");
+    let bounds_document = json::parse(include_str!("references/contact_route_probe_bounds.json"))
+        .expect("route probe bounds fixture must parse");
     for probe in route_array(&document, "probes") {
         let source_xml = route_string(probe, "source_xml");
         let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -774,7 +1330,24 @@ fn analytic_convex_route_probes_are_fixture_backed() {
             source_path.is_file(),
             "{source_xml}: source XML from fixture is missing"
         );
-        let bounds = route_object(probe, "bounds");
+        let required_names: Vec<&str> = route_array(probe, "poses")
+            .iter()
+            .flat_map(|pose| [route_string(pose, "geom_a"), route_string(pose, "geom_b")])
+            .collect();
+        assert_mjcf_source_contains(&source_path, &required_names);
+        let probe_id = route_string(probe, "id");
+        let bounds_probe = route_array(&bounds_document, "probes")
+            .iter()
+            .find(|candidate| route_string(candidate, "id") == probe_id)
+            .unwrap_or_else(|| panic!("missing reviewed bounds for {probe_id}"));
+        let observed = route_object(bounds_probe, "observed_max");
+        let bounds = route_object(bounds_probe, "bounds");
+        for field in ["position", "normal", "penetration"] {
+            assert!(
+                route_number(observed, field) <= route_number(bounds, field),
+                "{probe_id}: observed {field} exceeds reviewed bound"
+            );
+        }
         let position_bound = route_number(bounds, "position");
         let normal_bound = route_number(bounds, "normal");
         let penetration_bound = route_number(bounds, "penetration");
@@ -802,6 +1375,12 @@ fn analytic_convex_route_probes_are_fixture_backed() {
                 ),
                 "plane-mesh" => (
                     Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5),
+                    Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+                    vec![route_mesh(probe)],
+                ),
+                "box-mesh" => continue,
+                "mesh-mesh" => (
+                    Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
                     Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
                     vec![route_mesh(probe)],
                 ),
@@ -881,6 +1460,219 @@ fn margin_fires_contact_before_geoms_touch() {
         "margin activation gave pen {} (expected 0.03)",
         c.penetration
     );
+    let swapped = narrow_phase(1, &plane, &plane_pose, 0, &sphere, &sphere_pose, &[]);
+    assert_eq!(swapped.len, 1);
+    let swapped_contact = swapped.as_slice()[0];
+    close_scalar(
+        swapped_contact.penetration,
+        c.penetration,
+        1.0e-5,
+        "swapped margin depth",
+    );
+    close_vec(swapped_contact.position_world, c.position_world, 1.0e-5);
+    close_vec(swapped_contact.normal_world, -c.normal_world, 1.0e-5);
+}
+
+#[test]
+fn mesh_mesh_margin_uses_gjk_distance_witness() {
+    let mesh = unit_tetrahedron();
+    let mesh_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.02);
+    let mesh_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(1.01, 0.0, 0.0),
+        orientation: Quat::IDENTITY,
+    };
+
+    let contacts = narrow_phase(0, &mesh_a, &pose_a, 1, &mesh_b, &pose_b, &[mesh]);
+    assert_eq!(contacts.len, 1, "mesh margin gap should emit one contact");
+    assert!(
+        approx(contacts.as_slice()[0].penetration, 0.01, 1.0e-5),
+        "mesh margin gap penetration was {}",
+        contacts.as_slice()[0].penetration
+    );
+    assert!(contacts.as_slice()[0].normal_world.x < -0.99);
+
+    let swapped = narrow_phase(
+        1,
+        &mesh_b,
+        &pose_b,
+        0,
+        &mesh_a,
+        &pose_a,
+        &[unit_tetrahedron()],
+    );
+    assert_eq!(
+        swapped.len, 1,
+        "swapped mesh margin gap should emit one contact"
+    );
+    assert!(approx(
+        swapped.as_slice()[0].penetration,
+        contacts.as_slice()[0].penetration,
+        1.0e-5
+    ));
+    assert_eq!(swapped.as_slice()[0].geom_a, 1);
+    assert_eq!(swapped.as_slice()[0].geom_b, 0);
+    close_vec(
+        swapped.as_slice()[0].position_world,
+        contacts.as_slice()[0].position_world,
+        1.0e-5,
+    );
+    close_vec(
+        swapped.as_slice()[0].normal_world,
+        -contacts.as_slice()[0].normal_world,
+        1.0e-5,
+    );
+}
+
+#[test]
+fn rotated_mesh_mesh_margin_uses_converged_distance_witness() {
+    let mesh = unit_tetrahedron();
+    let mesh_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.02);
+    let mesh_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(0.0, 1.01, 0.0),
+        orientation: Quat::from_axis_angle(Vec3::X, 15.0_f32.to_radians()),
+    };
+    let meshes = [mesh];
+
+    let contacts = narrow_phase(0, &mesh_a, &pose_a, 1, &mesh_b, &pose_b, &meshes);
+    assert_eq!(
+        contacts.len, 1,
+        "rotated mesh margin gap should emit one contact"
+    );
+    let contact = contacts.as_slice()[0];
+    assert!(approx(contact.penetration, 0.010340718, 1.0e-5));
+    close_vec(
+        contact.normal_world,
+        Vec3::new(0.0, -0.9659258, -0.258_819),
+        1.0e-5,
+    );
+
+    let swapped = narrow_phase(1, &mesh_b, &pose_b, 0, &mesh_a, &pose_a, &meshes);
+    assert_eq!(
+        swapped.len, 1,
+        "swapped rotated mesh margin gap should emit one contact"
+    );
+    let swapped_contact = swapped.as_slice()[0];
+    assert!(approx(
+        swapped_contact.penetration,
+        contact.penetration,
+        1.0e-5
+    ));
+    assert_eq!(swapped_contact.geom_a, 1);
+    assert_eq!(swapped_contact.geom_b, 0);
+    close_vec(
+        swapped_contact.position_world,
+        contact.position_world,
+        1.0e-5,
+    );
+    close_vec(swapped_contact.normal_world, -contact.normal_world, 1.0e-5);
+}
+
+#[test]
+fn rotated_y_mesh_mesh_margin_matches_distance_oracle() {
+    let mesh = unit_tetrahedron();
+    let mesh_a = Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5).with_margin(0.02);
+    let mesh_b = Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(0.0, -0.01, 1.01),
+        orientation: Quat::from_axis_angle(Vec3::Y, 23.0_f32.to_radians()),
+    };
+    let meshes = [mesh];
+
+    let contacts = narrow_phase(0, &mesh_a, &pose_a, 1, &mesh_b, &pose_b, &meshes);
+    assert_eq!(contacts.len, 1);
+    let contact = contacts.as_slice()[0];
+    close_scalar(
+        contact.penetration,
+        0.010_794_782,
+        2.0e-5,
+        "rotated-y distance oracle depth",
+    );
+    close_vec(
+        contact.normal_world,
+        Vec3::new(-0.390_725_3, -0.005456817, -0.920_491_16),
+        6.0e-3,
+    );
+    close_vec(
+        contact.position_world,
+        Vec3::new(0.001807937, -0.000000005, 1.004_232_5),
+        2.0e-5,
+    );
+
+    let swapped = narrow_phase(1, &mesh_b, &pose_b, 0, &mesh_a, &pose_a, &meshes);
+    assert_eq!(swapped.len, 1);
+    let swapped_contact = swapped.as_slice()[0];
+    assert_eq!(swapped_contact.geom_a, 1);
+    assert_eq!(swapped_contact.geom_b, 0);
+    close_scalar(
+        swapped_contact.penetration,
+        contact.penetration,
+        2.0e-5,
+        "swapped rotated-y depth",
+    );
+    close_vec(
+        swapped_contact.position_world,
+        contact.position_world,
+        2.0e-5,
+    );
+    close_vec(swapped_contact.normal_world, -contact.normal_world, 2.0e-5);
+}
+
+#[test]
+fn plane_convex_exact_margin_equality_emits_contact() {
+    let plane = Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5);
+    let plane_pose = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let ellipsoid = Geom::ellipsoid(1, Vec3::new(0.5, 0.3, 0.2), Vec3::ZERO, Quat::IDENTITY, 0.5);
+    let ellipsoid_contacts = narrow_phase(
+        0,
+        &plane,
+        &plane_pose,
+        1,
+        &ellipsoid,
+        &GeomPose {
+            position: Vec3::new(0.0, 0.0, 0.2),
+            orientation: Quat::IDENTITY,
+        },
+        &[],
+    );
+    assert_eq!(ellipsoid_contacts.len, 1);
+    assert!(ellipsoid_contacts.contacts[0].penetration <= 1.0e-6);
+
+    let mesh_contacts = narrow_phase(
+        0,
+        &plane,
+        &plane_pose,
+        1,
+        &Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        &GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        },
+        &[unit_tetrahedron()],
+    );
+    assert!(mesh_contacts.len > 0);
+    assert!(
+        mesh_contacts
+            .as_slice()
+            .iter()
+            .all(|contact| contact.penetration <= 1.0e-6)
+    );
 }
 
 #[test]
@@ -947,33 +1739,111 @@ fn is_pair_supported_covers_new_and_reject_lists() {
         GeomShape::Sphere { radius: 1.0 },
         GeomShape::Mesh { mesh_id: 0 },
     ));
-    // Deferred.
+    // Box-mesh remains deferred because its rotated EPA witness normal is not
+    // within the shipped route error tier.
     assert!(!is_pair_supported(
-        GeomShape::Cylinder {
-            radius: 1.0,
-            half_height: 1.0
-        },
-        GeomShape::Cylinder {
-            radius: 1.0,
-            half_height: 1.0
-        },
-    ));
-    assert!(!is_pair_supported(
-        GeomShape::Ellipsoid {
-            semi_axes: Vec3::splat(1.0)
-        },
         GeomShape::Box {
-            half_extents: Vec3::splat(1.0)
+            half_extents: Vec3::splat(0.5)
         },
+        GeomShape::Mesh { mesh_id: 0 },
     ));
-    assert!(!is_pair_supported(
+    // Mesh-mesh has a verified convex distance witness route.
+    assert!(is_pair_supported(
         GeomShape::Mesh { mesh_id: 0 },
         GeomShape::Mesh { mesh_id: 1 },
     ));
+    // Deferred tail routes stay rejected until they have oracle evidence.
+    for (a, b) in [
+        (
+            GeomShape::Capsule {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+            GeomShape::Ellipsoid {
+                semi_axes: Vec3::splat(1.0),
+            },
+        ),
+        (
+            GeomShape::Capsule {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+            GeomShape::Cylinder {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+        ),
+        (
+            GeomShape::Capsule {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+            GeomShape::Mesh { mesh_id: 0 },
+        ),
+        (
+            GeomShape::Ellipsoid {
+                semi_axes: Vec3::splat(1.0),
+            },
+            GeomShape::Ellipsoid {
+                semi_axes: Vec3::splat(1.0),
+            },
+        ),
+        (
+            GeomShape::Ellipsoid {
+                semi_axes: Vec3::splat(1.0),
+            },
+            GeomShape::Cylinder {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+        ),
+        (
+            GeomShape::Ellipsoid {
+                semi_axes: Vec3::splat(1.0),
+            },
+            GeomShape::Box {
+                half_extents: Vec3::splat(1.0),
+            },
+        ),
+        (
+            GeomShape::Ellipsoid {
+                semi_axes: Vec3::splat(1.0),
+            },
+            GeomShape::Mesh { mesh_id: 0 },
+        ),
+        (
+            GeomShape::Cylinder {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+            GeomShape::Cylinder {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+        ),
+        (
+            GeomShape::Cylinder {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+            GeomShape::Box {
+                half_extents: Vec3::splat(1.0),
+            },
+        ),
+        (
+            GeomShape::Cylinder {
+                radius: 1.0,
+                half_height: 1.0,
+            },
+            GeomShape::Mesh { mesh_id: 0 },
+        ),
+    ] {
+        assert!(!is_pair_supported(a, b));
+    }
 }
 
 #[test]
-fn world_validate_supported_pairs_flags_deferred_cylinder_cylinder() {
+fn world_validate_supported_pairs_rejects_deferred_ccd_pairs() {
     let mut world = World::new();
     world.gravity = Vec3::ZERO;
     let b1 = Body::solid_box(1.0, Vec3::splat(0.1), Vec3::ZERO, Quat::IDENTITY);
@@ -1005,9 +1875,292 @@ fn world_validate_supported_pairs_flags_deferred_cylinder_cylinder() {
     assert!(
         unsupported
             .iter()
-            .any(|u| u.geom_a == g1.min(g2) && u.geom_b == g1.max(g2)),
-        "expected cylinder-cylinder pair to be flagged, got {unsupported:?}"
+            .any(|u| u.geom_a == g1.min(g2) && u.geom_b == g1.max(g2))
     );
+}
+
+#[test]
+fn enabled_convex_ccd_routes_emit_one_contact() {
+    let pose_a = GeomPose {
+        position: Vec3::ZERO,
+        orientation: Quat::IDENTITY,
+    };
+    let pose_b = GeomPose {
+        position: Vec3::new(0.1, 0.1, 0.1),
+        orientation: Quat::from_axis_angle(Vec3::Z, 0.3),
+    };
+    let mesh = unit_tetrahedron();
+    let cases = [(
+        Geom::mesh(0, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+        Geom::mesh(1, 0, Vec3::ZERO, Quat::IDENTITY, 0.5),
+    )];
+    for (index, (geom_a, geom_b)) in cases.into_iter().enumerate() {
+        let actual = narrow_phase(
+            0,
+            &geom_a,
+            &pose_a,
+            1,
+            &geom_b,
+            &pose_b,
+            std::slice::from_ref(&mesh),
+        );
+        assert_eq!(actual.len, 1, "ccd route {index} did not emit one contact");
+    }
+}
+
+fn build_dynamic_anchor_world(rotated: bool) -> World {
+    let mut world = World::new();
+    world.dt = 0.005;
+    world.gravity = Vec3::ZERO;
+    let mesh_id = world.add_mesh(unit_tetrahedron());
+    let mut static_mesh = Geom::mesh(0, mesh_id, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    static_mesh.body = None;
+    world.add_geom(static_mesh);
+    let (position, orientation, angular_velocity_body) = if rotated {
+        (
+            Vec3::new(0.25, 0.1, 0.25),
+            Quat::from_axis_angle(Vec3::Z, 0.4_f32.to_radians()),
+            Vec3::new(-0.6, 0.9, 0.5),
+        )
+    } else {
+        (
+            Vec3::new(0.2, 0.2, 0.2),
+            Quat::IDENTITY,
+            Vec3::new(1.0, 0.7, -0.4),
+        )
+    };
+    let body = Body::principal_axis(1.0, 0.166667, 0.166667, 0.166667, position, orientation);
+    let body_id = world.add_body(body);
+    world.bodies[body_id].angular_velocity_body = angular_velocity_body;
+    world.add_geom(Geom::mesh(
+        body_id,
+        mesh_id,
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        0.5,
+    ));
+    world
+}
+
+type DynamicReplaySample = (usize, Vec3, Quat, usize);
+const DYNAMIC_REVIEW_TOLERANCE: f32 = 1.0e-4;
+
+fn write_dynamic_replay(path: &Path, cases: &[(String, Vec<DynamicReplaySample>)]) {
+    let mut document = String::from("{\"cases\":[");
+    for (case_index, (case_id, samples)) in cases.iter().enumerate() {
+        if case_index != 0 {
+            document.push(',');
+        }
+        write!(document, "{{\"id\":\"{case_id}\",\"samples\":[").unwrap();
+        for (sample_index, (step, position, orientation, contacts)) in samples.iter().enumerate() {
+            if sample_index != 0 {
+                document.push(',');
+            }
+            write!(
+                document,
+                "{{\"step\":{step},\"position\":[{:?},{:?},{:?}],\"orientation_wxyz\":[{:?},{:?},{:?},{:?}],\"contacts\":{contacts}}}",
+                position.x,
+                position.y,
+                position.z,
+                orientation.w,
+                orientation.x,
+                orientation.y,
+                orientation.z,
+            )
+            .unwrap();
+        }
+        document.push_str("]}");
+    }
+    document.push_str("]}\n");
+    std::fs::write(path, document).expect("dynamic replay output must be writable");
+}
+
+#[test]
+fn dynamic_enabled_convex_anchors_are_fixture_backed() {
+    let document = json::parse(include_str!("references/contact_dynamic_anchors.json"))
+        .expect("dynamic anchor fixture must parse");
+    let bounds_document = json::parse(include_str!(
+        "references/contact_dynamic_anchor_bounds.json"
+    ))
+    .expect("dynamic anchor bounds fixture must parse");
+    let review_tolerance = route_object(&bounds_document, "review_tolerance");
+    assert_eq!(
+        route_number(review_tolerance, "position").to_bits(),
+        DYNAMIC_REVIEW_TOLERANCE.to_bits()
+    );
+    assert_eq!(
+        route_number(review_tolerance, "orientation").to_bits(),
+        DYNAMIC_REVIEW_TOLERANCE.to_bits()
+    );
+    let cases = route_array(&document, "cases");
+    assert!(
+        cases.len() >= 2,
+        "dynamic evidence needs two independent anchors"
+    );
+    let replay_only = std::env::var_os("NEWT_DYNAMIC_REPLAY_ONLY").is_some();
+    let mut replay_cases = Vec::with_capacity(cases.len());
+    for case in cases {
+        let source_xml = route_string(case, "source_xml");
+        let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/references")
+            .join(source_xml);
+        assert!(source_path.is_file(), "{source_xml}: source XML is missing");
+        let case_id = route_string(case, "id");
+        let rotated = case_id == "mesh-mesh-rotated-drop";
+        let required_names = if rotated {
+            ["mesh_static", "mesh_rotated_body", "mesh_rotated"]
+        } else {
+            ["mesh_static", "mesh_body", "mesh_tumble"]
+        };
+        assert_mjcf_source_contains(&source_path, &required_names);
+        let bounds_case = route_array(&bounds_document, "cases")
+            .iter()
+            .find(|candidate| route_string(candidate, "id") == case_id)
+            .unwrap_or_else(|| panic!("missing bounds for dynamic case {case_id}"));
+        let mut world = build_dynamic_anchor_world(rotated);
+        let samples = route_array(case, "samples");
+        assert_eq!(
+            samples.len(),
+            101,
+            "{case_id}: full dynamic window is incomplete"
+        );
+        let mut simulated_step = 0;
+        let mut replay_samples = Vec::with_capacity(samples.len());
+        let mut window_max = [(0.0_f32, 0.0_f32, 0_usize); 2];
+        for (expected_step, sample) in samples.iter().enumerate() {
+            let target_step = route_number(sample, "step") as usize;
+            assert_eq!(
+                target_step, expected_step,
+                "{case_id}: sample steps must be contiguous"
+            );
+            while simulated_step < target_step {
+                world.step();
+                simulated_step += 1;
+            }
+            let current_step = target_step;
+            let expected_position = route_numbers(sample, "position");
+            let expected_orientation = route_numbers(sample, "orientation_wxyz");
+            let expected_position = Vec3::new(
+                expected_position[0],
+                expected_position[1],
+                expected_position[2],
+            );
+            let expected_orientation = Quat::new(
+                expected_orientation[1],
+                expected_orientation[2],
+                expected_orientation[3],
+                expected_orientation[0],
+            );
+            let bounds = if replay_only {
+                None
+            } else {
+                Some(route_object(
+                    bounds_case,
+                    if current_step <= 20 { "early" } else { "full" },
+                ))
+            };
+            let position_error = (world.bodies[0].position - expected_position).length();
+            let orientation_error = ((world.bodies[0].orientation.x - expected_orientation.x)
+                .powi(2)
+                + (world.bodies[0].orientation.y - expected_orientation.y).powi(2)
+                + (world.bodies[0].orientation.z - expected_orientation.z).powi(2)
+                + (world.bodies[0].orientation.w - expected_orientation.w).powi(2))
+            .sqrt();
+            let expected_contacts = route_number(sample, "contacts") as usize;
+            let actual_contacts = world.detect_contacts().len();
+            let contact_error = actual_contacts.abs_diff(expected_contacts);
+            let full = &mut window_max[1];
+            full.0 = full.0.max(position_error);
+            full.1 = full.1.max(orientation_error);
+            full.2 = full.2.max(contact_error);
+            if current_step <= 20 {
+                let early = &mut window_max[0];
+                early.0 = early.0.max(position_error);
+                early.1 = early.1.max(orientation_error);
+                early.2 = early.2.max(contact_error);
+            }
+            replay_samples.push((
+                current_step,
+                world.bodies[0].position,
+                world.bodies[0].orientation,
+                actual_contacts,
+            ));
+            if replay_only {
+                continue;
+            }
+            let bounds = bounds.expect("dynamic bounds must be available during verification");
+            let position_bound = route_number(bounds, "position") as f32;
+            let orientation_bound = route_number(bounds, "orientation") as f32;
+            let contact_bound = route_number(bounds, "contact_count") as usize;
+            assert!(
+                position_error <= position_bound,
+                "{source_xml}/step-{current_step}: position bound"
+            );
+            assert!(
+                orientation_error <= orientation_bound,
+                "{source_xml}/step-{current_step}: orientation bound"
+            );
+            assert!(
+                contact_error <= contact_bound,
+                "{source_xml}/step-{current_step}: contact count bound"
+            );
+        }
+        if !replay_only {
+            for (window_name, window) in [("early", &window_max[0]), ("full", &window_max[1])] {
+                let window_fixture = route_object(bounds_case, window_name);
+                let observed = route_object(window_fixture, "observed_max");
+                let observed_position = route_number(observed, "position");
+                let observed_orientation = route_number(observed, "orientation");
+                assert!(
+                    (observed_position - window.0).abs() <= 1.0e-6,
+                    "{case_id}/{window_name} position: stored={} computed={}",
+                    observed_position,
+                    window.0
+                );
+                assert!(
+                    (observed_orientation - window.1).abs() <= 1.0e-6,
+                    "{case_id}/{window_name} orientation: stored={} computed={}",
+                    observed_orientation,
+                    window.1
+                );
+                assert_eq!(route_number(observed, "contact_count") as usize, window.2);
+                let ceiling = route_object(window_fixture, "acceptance_ceiling");
+                assert!(
+                    window.0 <= route_number(ceiling, "position"),
+                    "{case_id}/{window_name} position acceptance ceiling"
+                );
+                assert!(
+                    window.1 <= route_number(ceiling, "orientation"),
+                    "{case_id}/{window_name} orientation acceptance ceiling"
+                );
+                assert!(
+                    window.2 <= route_number(ceiling, "contact_count") as usize,
+                    "{case_id}/{window_name} contact acceptance ceiling"
+                );
+                let expected_position_bound = observed_position + DYNAMIC_REVIEW_TOLERANCE;
+                let expected_orientation_bound = observed_orientation + DYNAMIC_REVIEW_TOLERANCE;
+                assert_eq!(
+                    route_number(window_fixture, "position").to_bits(),
+                    expected_position_bound.to_bits(),
+                    "{case_id}/{window_name} position bound is not max + tolerance"
+                );
+                assert_eq!(
+                    route_number(window_fixture, "orientation").to_bits(),
+                    expected_orientation_bound.to_bits(),
+                    "{case_id}/{window_name} orientation bound is not max + tolerance"
+                );
+                assert_eq!(
+                    route_number(window_fixture, "contact_count") as usize,
+                    window.2,
+                    "{case_id}/{window_name} contact bound is not the measured maximum"
+                );
+            }
+        }
+        replay_cases.push((case_id.to_string(), replay_samples));
+    }
+    if let Some(path) = std::env::var_os("NEWT_DYNAMIC_REPLAY_OUTPUT") {
+        write_dynamic_replay(Path::new(&path), &replay_cases);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,10 +2222,9 @@ fn build_mixed_scene() -> World {
     let b_b_upper = Body::solid_box(m, hb, Vec3::new(0.02, -0.7, 0.7), Quat::IDENTITY);
     let ibu = world.add_body(b_b_upper);
     world.add_geom(Geom::r#box(ibu, hb, Vec3::ZERO, Quat::IDENTITY, 0.6));
-    // Restrict pair list to supported combinations only — the four dynamic
+    // Restrict pair list to the intended pile interactions. The four dynamic
     // geoms all touch the ground plane (index 0); the two boxes also touch
-    // each other. Cylinder-vs-ellipsoid etc. are deferred and would trip
-    // the engine-level unsupported-pair panic if auto_pairs enumerated them.
+    // each other. Remaining box-sphere and box-capsule gaps stay excluded.
     let plane = 0;
     let cyl_g = 1;
     let ell_g = 2;
@@ -1121,8 +2273,8 @@ fn snapshot(world: &World) -> Vec<u8> {
 #[test]
 #[should_panic(expected = "not supported by newt's narrow phase")]
 fn world_step_panics_on_auto_generated_unsupported_pair() {
-    // Programmatic scene with two cylinders on separate bodies — auto_pairs
-    // enumerates the cylinder-cylinder pair, which is deferred. The first
+    // Programmatic scene with a box and sphere on separate bodies — auto_pairs
+    // enumerates the box-sphere pair, which is deferred. The first
     // `step()` after construction must panic; this replaces the tier-2
     // stack.json silent-no-op class of bug.
     let mut world = World::new();
@@ -1139,22 +2291,14 @@ fn world_step_panics_on_auto_generated_unsupported_pair() {
         Vec3::new(0.5, 0.0, 0.5),
         Quat::IDENTITY,
     ));
-    world.add_geom(Geom::cylinder(
+    world.add_geom(Geom::r#box(
         ba,
-        0.2,
-        0.2,
+        Vec3::splat(0.2),
         Vec3::ZERO,
         Quat::IDENTITY,
         0.5,
     ));
-    world.add_geom(Geom::cylinder(
-        bb,
-        0.2,
-        0.2,
-        Vec3::ZERO,
-        Quat::IDENTITY,
-        0.5,
-    ));
+    world.add_geom(Geom::sphere(bb, 0.2, Vec3::ZERO, 0.5));
     world.step();
 }
 
@@ -1173,7 +2317,7 @@ fn pile_scene_all_supported_steps_without_panic() {
 #[test]
 fn model_loader_rejects_explicit_unsupported_contact_pair() {
     // The JSON loader must surface an unsupported explicit pair at load
-    // time with a JSON-path error. Scene: two cylinder bodies with an
+    // time with a JSON-path error. Scene: a box and sphere with an
     // explicit `contact_pairs` entry between them.
     let json = r#"{
         "version": "1",
@@ -1182,9 +2326,9 @@ fn model_loader_rejects_explicit_unsupported_contact_pair() {
             {"name":"b","mass":1,"inertia":{"kind":"diag","values":[0.01,0.01,0.01]}}
         ],
         "geoms": [
-            {"name":"ga","shape":{"kind":"cylinder","radius":0.2,"half_height":0.2},
+            {"name":"ga","shape":{"kind":"box","half_extents":[0.2,0.2,0.2]},
              "attach":{"kind":"body","body":"a"}},
-            {"name":"gb","shape":{"kind":"cylinder","radius":0.2,"half_height":0.2},
+            {"name":"gb","shape":{"kind":"sphere","radius":0.2},
              "attach":{"kind":"body","body":"b"}}
         ],
         "contact_pairs": {"explicit":[{"a":"ga","b":"gb"}]}
@@ -1194,7 +2338,8 @@ fn model_loader_rejects_explicit_unsupported_contact_pair() {
     let msg = err.to_string();
     let lower = msg.to_lowercase();
     assert!(
-        lower.contains("cylinder")
+        lower.contains("box")
+            && lower.contains("sphere")
             && (lower.contains("not supported") || lower.contains("unsupported")),
         "loader error should mention cylinder + unsupported: {msg}"
     );
