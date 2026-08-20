@@ -7,9 +7,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use newt::body::Body;
 use newt::geom::Geom;
-use newt::math::{Quat, Vec3};
+use newt::joint::JointKind;
+use newt::math::{Mat3, Quat, Vec3};
 use newt::mjcf::load_mjcf_path;
 use newt::solver::SolverMode;
+use newt::tree::{Link, Tree};
 use newt::world::{BroadPhaseMode, Integrator, World};
 
 struct CountingAllocator;
@@ -88,7 +90,8 @@ fn warmed_broadphase_updates_do_not_allocate() {
     let mut world = World::new();
     world.gravity = Vec3::ZERO;
     world.broadphase_mode = BroadPhaseMode::DynamicAabbTree;
-    for index in 0..500 {
+    const COUNT: usize = 8;
+    for index in 0..COUNT {
         let body = world.add_body(Body::solid_sphere(
             1.0,
             0.1,
@@ -96,6 +99,30 @@ fn warmed_broadphase_updates_do_not_allocate() {
             Quat::IDENTITY,
         ));
         world.add_geom(Geom::sphere(body, 0.1, Vec3::ZERO, 0.0));
+    }
+
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::new(1000.0, 0.0, 0.0), Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    for index in 1..COUNT {
+        tree.push_link(Link::new(
+            Some(index - 1),
+            JointKind::hinge(Vec3::Z),
+            (Vec3::new(2.0, 0.0, 0.0), Quat::IDENTITY),
+            (Vec3::ZERO, Quat::IDENTITY),
+            1.0,
+            Mat3::diag(1.0, 1.0, 1.0),
+        ));
+    }
+    let tree_index = world.add_tree(tree);
+    for link in 0..COUNT {
+        world.add_geom(Geom::sphere_on_link(tree_index, link, 0.1, Vec3::ZERO, 0.0));
     }
 
     for _ in 0..4 {

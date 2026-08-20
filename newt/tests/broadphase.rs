@@ -1,7 +1,9 @@
 use newt::body::Body;
 use newt::broadphase::{Aabb, DynamicAabbTree, Ray};
-use newt::geom::Geom;
-use newt::math::{Quat, Vec3};
+use newt::geom::{ConvexMesh, Geom};
+use newt::joint::JointKind;
+use newt::math::{Mat3, Quat, Vec3};
+use newt::tree::{Link, Tree};
 use newt::world::{BroadPhaseMode, World};
 
 fn bounds(x: f32, y: f32, z: f32) -> Aabb {
@@ -182,30 +184,162 @@ fn dynamic_tree_matches_naive_multi_body_contact_baseline() {
     assert_eq!(actual, expected);
 }
 
-fn margin_scene(mode: BroadPhaseMode, margin_a: f32, margin_b: f32) -> World {
+fn margin_scene(mode: BroadPhaseMode, margin_a: f32, margin_b: f32, separation: f32) -> World {
     let mut world = World::new();
     world.gravity = Vec3::ZERO;
     world.broadphase_mode = mode;
-    let body_a = world.add_body(Body::solid_sphere(1.0, 0.5, Vec3::ZERO, Quat::IDENTITY));
+    let body_a = world.add_body(Body::solid_sphere(1.0, 0.01, Vec3::ZERO, Quat::IDENTITY));
     let body_b = world.add_body(Body::solid_sphere(
         1.0,
-        0.5,
-        Vec3::new(1.05, 0.0, 0.0),
+        0.01,
+        Vec3::new(separation, 0.0, 0.0),
         Quat::IDENTITY,
     ));
-    world.add_geom(Geom::sphere(body_a, 0.5, Vec3::ZERO, 0.5).with_margin(margin_a));
-    world.add_geom(Geom::sphere(body_b, 0.5, Vec3::ZERO, 0.5).with_margin(margin_b));
+    world.add_geom(Geom::sphere(body_a, 0.01, Vec3::ZERO, 0.5).with_margin(margin_a));
+    world.add_geom(Geom::sphere(body_b, 0.01, Vec3::ZERO, 0.5).with_margin(margin_b));
     world
 }
 
 #[test]
 fn tree_margin_candidates_match_naive_manifolds() {
-    for (margin_a, margin_b) in [(0.1, 0.0), (0.08, 0.04)] {
-        let mut tree = margin_scene(BroadPhaseMode::DynamicAabbTree, margin_a, margin_b);
-        let naive = margin_scene(BroadPhaseMode::Naive, margin_a, margin_b);
+    for (margin_a, margin_b, separation) in [(0.3, 0.3, 0.4), (0.0, 0.3, 0.15), (0.1, 0.3, 0.35)] {
+        let mut tree = margin_scene(
+            BroadPhaseMode::DynamicAabbTree,
+            margin_a,
+            margin_b,
+            separation,
+        );
+        let naive = margin_scene(BroadPhaseMode::Naive, margin_a, margin_b, separation);
+        // Without margin inflation, the fat bounds end 0.376 m apart in the
+        // first case, so this assertion fails and isolates the fix.
         assert_eq!(tree.broadphase_pair_count(), 1);
         assert_eq!(tree.detect_contacts(), naive.detect_contacts());
     }
+}
+
+fn off_pivot_mesh() -> ConvexMesh {
+    let mut vertices = Vec::with_capacity(8);
+    for z in [-0.5, 0.5] {
+        for y in [9.5, 10.5] {
+            for x in [-0.5, 0.5] {
+                vertices.push(Vec3::new(x, y, z));
+            }
+        }
+    }
+    ConvexMesh {
+        vertices,
+        faces: vec![
+            [0, 2, 3],
+            [0, 3, 1],
+            [4, 5, 7],
+            [4, 7, 6],
+            [0, 1, 5],
+            [0, 5, 4],
+            [2, 6, 7],
+            [2, 7, 3],
+            [0, 4, 6],
+            [0, 6, 2],
+            [1, 3, 7],
+            [1, 7, 5],
+        ],
+    }
+}
+
+fn off_pivot_free_scene(mode: BroadPhaseMode) -> World {
+    let mut world = World::new();
+    world.dt = 0.1;
+    world.gravity = Vec3::ZERO;
+    world.broadphase_mode = mode;
+    let mesh_id = world.add_mesh(off_pivot_mesh());
+    let rotating = world.add_body(Body::solid_sphere(1.0, 0.5, Vec3::ZERO, Quat::IDENTITY));
+    let fixture = world.add_body(Body::solid_sphere(
+        1.0,
+        0.5,
+        Vec3::new(-10.0, 0.9, 0.0),
+        Quat::IDENTITY,
+    ));
+    world.bodies[rotating].angular_velocity_body =
+        Vec3::new(0.0, 0.0, std::f32::consts::PI / world.dt);
+    world.add_geom(Geom::mesh(
+        rotating,
+        mesh_id,
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        0.5,
+    ));
+    world.add_geom(Geom::sphere(fixture, 0.5, Vec3::ZERO, 0.5));
+    world
+}
+
+fn off_pivot_link_scene(mode: BroadPhaseMode) -> World {
+    let mut world = World::new();
+    world.dt = 0.1;
+    world.gravity = Vec3::ZERO;
+    world.broadphase_mode = mode;
+    let mesh_id = world.add_mesh(off_pivot_mesh());
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    tree.push_link(Link::new(
+        Some(0),
+        JointKind::hinge(Vec3::Z),
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    tree.set_hinge_rate(1, std::f32::consts::PI / world.dt);
+    let tree_id = world.add_tree(tree);
+    let fixture = world.add_body(Body::solid_sphere(
+        1.0,
+        0.5,
+        Vec3::new(-10.0, 0.9, 0.0),
+        Quat::IDENTITY,
+    ));
+    let mut mesh_geom = Geom::mesh(0, mesh_id, Vec3::ZERO, Quat::IDENTITY, 0.5);
+    mesh_geom.body = None;
+    mesh_geom.link = Some((tree_id, 1));
+    world.add_geom(mesh_geom);
+    world.add_geom(Geom::sphere(fixture, 0.5, Vec3::ZERO, 0.5));
+    world
+}
+
+#[test]
+fn swept_bounds_cover_off_pivot_free_mesh_contacts() {
+    let mut tree = off_pivot_free_scene(BroadPhaseMode::DynamicAabbTree);
+    let mut naive = off_pivot_free_scene(BroadPhaseMode::Naive);
+    assert_eq!(tree.broadphase_pair_count(), 1);
+    assert_eq!(naive.broadphase_pair_count(), 1);
+
+    let mid_step = Quat::from_axis_angle(Vec3::Z, std::f32::consts::FRAC_PI_2);
+    tree.bodies[0].orientation = mid_step;
+    naive.bodies[0].orientation = mid_step;
+    let tree_contacts = tree.detect_contacts();
+    let naive_contacts = naive.detect_contacts();
+    assert!(!tree_contacts.is_empty());
+    assert_eq!(tree_contacts.len(), naive_contacts.len());
+}
+
+#[test]
+fn swept_bounds_cover_off_pivot_articulated_mesh_contacts() {
+    let mut tree = off_pivot_link_scene(BroadPhaseMode::DynamicAabbTree);
+    let mut naive = off_pivot_link_scene(BroadPhaseMode::Naive);
+    assert_eq!(tree.broadphase_pair_count(), 1);
+    assert_eq!(naive.broadphase_pair_count(), 1);
+
+    let mid_step = std::f32::consts::FRAC_PI_2;
+    tree.trees[0].set_hinge_angle(1, mid_step);
+    naive.trees[0].set_hinge_angle(1, mid_step);
+    let tree_contacts = tree.detect_contacts();
+    let naive_contacts = naive.detect_contacts();
+    assert!(!tree_contacts.is_empty());
+    assert_eq!(tree_contacts.len(), naive_contacts.len());
 }
 
 fn fast_crossing_scene(mode: BroadPhaseMode) -> World {

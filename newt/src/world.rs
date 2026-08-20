@@ -178,6 +178,8 @@ pub struct World {
     #[doc(hidden)]
     broadphase_tree_poses: Vec<Vec<(Vec3, Quat)>>,
     #[doc(hidden)]
+    broadphase_tree_velocities: Vec<Vec<(Vec3, Vec3)>>,
+    #[doc(hidden)]
     broadphase_reinsert_count: std::cell::Cell<u64>,
     #[doc(hidden)]
     last_broadphase_mode: BroadPhaseMode,
@@ -192,6 +194,7 @@ struct BroadphaseInputs<'a> {
     meshes: &'a [ConvexMesh],
     hfields: &'a [HeightField],
     tree_poses: &'a mut Vec<Vec<(Vec3, Quat)>>,
+    tree_velocities: &'a mut Vec<Vec<(Vec3, Vec3)>>,
     dt: f32,
     swept: bool,
 }
@@ -320,6 +323,7 @@ impl World {
             broadphase: DynamicAabbTree::new(),
             broadphase_pairs: Vec::new(),
             broadphase_tree_poses: Vec::new(),
+            broadphase_tree_velocities: Vec::new(),
             broadphase_reinsert_count: std::cell::Cell::new(0),
             last_broadphase_mode: BroadPhaseMode::DynamicAabbTree,
             #[cfg(feature = "instrumentation")]
@@ -807,6 +811,7 @@ impl World {
             meshes: &self.meshes,
             hfields: &self.hfields,
             tree_poses: &mut self.broadphase_tree_poses,
+            tree_velocities: &mut self.broadphase_tree_velocities,
             dt: self.dt,
             swept: true,
         };
@@ -827,6 +832,7 @@ impl World {
     fn temporary_broadphase_pairs(&self) -> Vec<(usize, usize)> {
         let mut tree = DynamicAabbTree::new();
         let mut tree_poses = Vec::new();
+        let mut tree_velocities = Vec::new();
         let inputs = BroadphaseInputs {
             bodies: &self.bodies,
             trees: &self.trees,
@@ -834,6 +840,7 @@ impl World {
             meshes: &self.meshes,
             hfields: &self.hfields,
             tree_poses: &mut tree_poses,
+            tree_velocities: &mut tree_velocities,
             dt: self.dt,
             swept: false,
         };
@@ -847,8 +854,19 @@ impl World {
 
     fn populate_broadphase_tree(tree: &mut DynamicAabbTree, inputs: BroadphaseInputs<'_>) -> u64 {
         inputs.tree_poses.resize_with(inputs.trees.len(), Vec::new);
-        for (scratch, tree) in inputs.tree_poses.iter_mut().zip(inputs.trees) {
-            tree_forward_kinematics_into(tree, scratch);
+        inputs
+            .tree_velocities
+            .resize_with(inputs.trees.len(), Vec::new);
+        for tree_index in 0..inputs.trees.len() {
+            tree_forward_kinematics_into(
+                &inputs.trees[tree_index],
+                &mut inputs.tree_poses[tree_index],
+            );
+            link_world_velocities_into(
+                &inputs.trees[tree_index],
+                &inputs.tree_poses[tree_index],
+                &mut inputs.tree_velocities[tree_index],
+            );
         }
         let mut reinserts = 0;
         for (geom_index, geom) in inputs.geoms.iter().enumerate() {
@@ -894,9 +912,7 @@ impl World {
                 )
             }
             GeomAttach::Link(tree_index, link) => {
-                let tree = &inputs.trees[tree_index];
-                let (velocity, angular_velocity) =
-                    link_world_velocity(tree, link, &inputs.tree_poses[tree_index]);
+                let (velocity, angular_velocity) = inputs.tree_velocities[tree_index][link];
                 let (position, orientation) = inputs.tree_poses[tree_index][link];
                 geom_world_pose(
                     geom,
@@ -910,20 +926,22 @@ impl World {
         };
         let start_bound = geom_aabb(geom, start_pose, inputs.meshes, inputs.hfields);
         let end_bound = geom_aabb(geom, &end_pose, inputs.meshes, inputs.hfields);
-        let angular_speed = match geom.attachment() {
-            GeomAttach::Body(body) => inputs.bodies[body].angular_velocity_world().length(),
-            GeomAttach::Link(tree_index, link) => link_world_velocity(
-                &inputs.trees[tree_index],
-                link,
-                &inputs.tree_poses[tree_index],
-            )
-            .1
-            .length(),
-            GeomAttach::Static => 0.0,
+        let (angular_speed, pivot_position) = match geom.attachment() {
+            GeomAttach::Body(body) => (
+                inputs.bodies[body].angular_velocity_world().length(),
+                inputs.bodies[body].position,
+            ),
+            GeomAttach::Link(tree_index, link) => (
+                inputs.tree_velocities[tree_index][link].1.length(),
+                inputs.tree_poses[tree_index][link].0,
+            ),
+            GeomAttach::Static => (0.0, start_pose.position),
         };
-        let extent = (start_bound.max - start_bound.min) * 0.5;
-        let rotation_sweep = if angular_speed > 0.0 && extent.length().is_finite() {
-            (geom.local_offset.length() + extent.length()) * angular_speed * inputs.dt
+        let bound_center = (start_bound.min + start_bound.max) * 0.5;
+        let bound_radius = ((start_bound.max - start_bound.min) * 0.5).length();
+        let pivot_radius = (bound_center - pivot_position).length() + bound_radius;
+        let rotation_sweep = if angular_speed > 0.0 && pivot_radius.is_finite() {
+            pivot_radius * angular_speed * inputs.dt
         } else {
             0.0
         };
@@ -2288,90 +2306,93 @@ fn point_velocity_generic(
     }
 }
 
+fn link_world_velocities_into(
+    tree: &Tree,
+    link_poses: &[(Vec3, Quat)],
+    out: &mut Vec<(Vec3, Vec3)>,
+) {
+    use crate::joint::JointKind;
+
+    out.clear();
+    out.resize(tree.links.len(), (Vec3::ZERO, Vec3::ZERO));
+    for i in 0..tree.links.len() {
+        let Some(parent) = tree.links[i].parent else {
+            if tree.links[i].mocap {
+                out[i] = (tree.mocap_linear_velocity, tree.mocap_angular_velocity);
+            } else if tree.links[i].joint == JointKind::Free {
+                let (_, orientation) = link_poses[i];
+                let offset = tree.v_offset[i];
+                let angular_body = Vec3::new(
+                    tree.qdot[offset],
+                    tree.qdot[offset + 1],
+                    tree.qdot[offset + 2],
+                );
+                let linear_body = Vec3::new(
+                    tree.qdot[offset + 3],
+                    tree.qdot[offset + 4],
+                    tree.qdot[offset + 5],
+                );
+                out[i] = (
+                    orientation.rotate(linear_body),
+                    orientation.rotate(angular_body),
+                );
+            }
+            continue;
+        };
+
+        let (parent_velocity, parent_angular_velocity) = out[parent];
+        let (child_pos, _) = link_poses[i];
+        let (parent_pos, parent_orientation) = link_poses[parent];
+        out[i] = match tree.links[i].joint {
+            JointKind::Hinge { axis, .. } => {
+                let axis_world = parent_orientation.rotate(axis);
+                let qdot = tree.hinge_rate(i);
+                let angular = parent_angular_velocity + axis_world * qdot;
+                let joint_world =
+                    parent_pos + parent_orientation.rotate(tree.links[i].joint_offset_in_parent.0);
+                let parent_at_child =
+                    parent_velocity + parent_angular_velocity.cross(child_pos - parent_pos);
+                (
+                    parent_at_child + (axis_world * qdot).cross(child_pos - joint_world),
+                    angular,
+                )
+            }
+            JointKind::Slide { axis, .. } => {
+                let axis_world = parent_orientation.rotate(axis);
+                let qdot = tree.slide_rate(i);
+                let parent_at_child =
+                    parent_velocity + parent_angular_velocity.cross(child_pos - parent_pos);
+                (parent_at_child + axis_world * qdot, parent_angular_velocity)
+            }
+            JointKind::Ball { .. } => {
+                let (_, child_orientation) = link_poses[i];
+                let child_angular = child_orientation.rotate(tree.ball_omega(i));
+                let joint_world =
+                    parent_pos + parent_orientation.rotate(tree.links[i].joint_offset_in_parent.0);
+                let parent_at_child =
+                    parent_velocity + parent_angular_velocity.cross(child_pos - parent_pos);
+                (
+                    parent_at_child + child_angular.cross(child_pos - joint_world),
+                    parent_angular_velocity + child_angular,
+                )
+            }
+            JointKind::Fixed => (
+                parent_velocity + parent_angular_velocity.cross(child_pos - parent_pos),
+                parent_angular_velocity,
+            ),
+            JointKind::Free => (Vec3::ZERO, Vec3::ZERO),
+        };
+    }
+}
+
 /// World-frame (linear-at-COM, angular) velocity of a link in the given
 /// tree. Computed by walking the tree's spatial-velocity recursion from
 /// the root — same layout as ABA pass 1 but keeping only what the contact
 /// code needs.
 fn link_world_velocity(tree: &Tree, target: usize, link_poses: &[(Vec3, Quat)]) -> (Vec3, Vec3) {
-    use crate::joint::JointKind;
-    let n = tree.links.len();
-    // Ancestor chain root → target.
-    let mut chain = vec![target];
-    let mut cur = target;
-    while let Some(p) = tree.links[cur].parent {
-        chain.push(p);
-        cur = p;
-    }
-    chain.reverse();
-    let mut v_world = vec![Vec3::ZERO; n];
-    let mut w_world = vec![Vec3::ZERO; n];
-    // Seed root.
-    let root = chain[0];
-    if tree.links[root].mocap {
-        w_world[root] = tree.mocap_angular_velocity;
-        v_world[root] = tree.mocap_linear_velocity;
-    } else if tree.links[root].joint == JointKind::Free {
-        let (_pos, ori) = link_poses[root];
-        let wb = Vec3::new(tree.qdot[0], tree.qdot[1], tree.qdot[2]);
-        let vb = Vec3::new(tree.qdot[3], tree.qdot[4], tree.qdot[5]);
-        w_world[root] = ori.rotate(wb);
-        v_world[root] = ori.rotate(vb);
-    }
-    // Walk down the chain.
-    for &i in chain.iter().skip(1) {
-        let parent = tree.links[i].parent.unwrap();
-        let (child_pos, _child_ori) = link_poses[i];
-        let (parent_pos, parent_ori) = link_poses[parent];
-        match tree.links[i].joint {
-            JointKind::Hinge { axis, .. } => {
-                let axis_world = parent_ori.rotate(axis);
-                let qdot_i = tree.hinge_rate(i);
-                w_world[i] = w_world[parent] + axis_world * qdot_i;
-                let joint_world =
-                    parent_pos + parent_ori.rotate(tree.links[i].joint_offset_in_parent.0);
-                let v_parent_at_child_com =
-                    v_world[parent] + w_world[parent].cross(child_pos - parent_pos);
-                v_world[i] =
-                    v_parent_at_child_com + (axis_world * qdot_i).cross(child_pos - joint_world);
-            }
-            JointKind::Slide { axis, .. } => {
-                // Slide never rotates; child ω = parent ω. Child COM adds
-                // the joint's linear velocity (axis * qdot) to the parent's
-                // point velocity at the child COM.
-                let axis_world = parent_ori.rotate(axis);
-                let qdot_i = tree.slide_rate(i);
-                w_world[i] = w_world[parent];
-                let v_parent_at_child_com =
-                    v_world[parent] + w_world[parent].cross(child_pos - parent_pos);
-                v_world[i] = v_parent_at_child_com + axis_world * qdot_i;
-            }
-            JointKind::Ball { .. } => {
-                // Body-frame ω on the child; rotate into world by the child
-                // orientation (equivalent to parent_ori * q_ball, but we
-                // already computed it in link_poses).
-                let (_, child_ori) = link_poses[i];
-                let omega_body = tree.ball_omega(i);
-                let omega_child_world = child_ori.rotate(omega_body);
-                w_world[i] = w_world[parent] + omega_child_world;
-                // The ball's joint anchor coincides with parent's anchor —
-                // the ball doesn't translate; only rotates.
-                let joint_world =
-                    parent_pos + parent_ori.rotate(tree.links[i].joint_offset_in_parent.0);
-                let v_parent_at_child_com =
-                    v_world[parent] + w_world[parent].cross(child_pos - parent_pos);
-                v_world[i] =
-                    v_parent_at_child_com + omega_child_world.cross(child_pos - joint_world);
-            }
-            JointKind::Fixed => {
-                w_world[i] = w_world[parent];
-                v_world[i] = v_world[parent] + w_world[parent].cross(child_pos - parent_pos);
-            }
-            JointKind::Free => {
-                // A non-root free joint isn't allowed in v0.
-            }
-        }
-    }
-    (v_world[target], w_world[target])
+    let mut velocities = Vec::new();
+    link_world_velocities_into(tree, link_poses, &mut velocities);
+    velocities[target]
 }
 
 /// Apply one contact's wrench to the appropriate body/bodies. Static geoms
