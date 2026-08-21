@@ -2104,6 +2104,9 @@ fn build_tree_solver_rows(tree: &Tree, tree_idx: usize, equalities: &[Equality])
     // (ascending link index, low-side before high-side never triggers on
     // the same link so no tie to break).
     for (li, link) in tree.links.iter().enumerate() {
+        if link.is_broken() {
+            continue;
+        }
         let (range, limit_cfg, is_single_dof) = match link.joint {
             JointKind::Hinge { range, limit, .. } | JointKind::Slide { range, limit, .. } => {
                 (range, Some(limit), true)
@@ -2277,8 +2280,28 @@ pub fn solve_tree_limits(
     dt: f32,
     iterations: u32,
 ) -> Vec<f32> {
+    let mut joint_impulses = vec![0.0f32; tree.links.len()];
+    solve_tree_limits_with_impulses(
+        tree,
+        tree_idx,
+        equalities,
+        dt,
+        iterations,
+        &mut joint_impulses,
+    )
+}
+
+pub(crate) fn solve_tree_limits_with_impulses(
+    tree: &Tree,
+    tree_idx: usize,
+    equalities: &[Equality],
+    dt: f32,
+    iterations: u32,
+    joint_impulses: &mut [f32],
+) -> Vec<f32> {
     let nv = tree.nv();
     let mut qfrc = vec![0.0f32; nv];
+    joint_impulses.fill(0.0);
     if nv == 0 || dt <= 0.0 {
         return qfrc;
     }
@@ -2388,6 +2411,9 @@ pub fn solve_tree_limits(
         }
     }
 
+    for (row, &impulse) in rows.iter().zip(&f) {
+        accumulate_tree_row_impulse(tree, row, impulse, joint_impulses);
+    }
     qfrc
 }
 
@@ -2402,8 +2428,28 @@ pub fn solve_tree_limits_newton(
     dt: f32,
     iterations: u32,
 ) -> Vec<f32> {
+    let mut joint_impulses = vec![0.0f32; tree.links.len()];
+    solve_tree_limits_newton_with_impulses(
+        tree,
+        tree_idx,
+        equalities,
+        dt,
+        iterations,
+        &mut joint_impulses,
+    )
+}
+
+pub(crate) fn solve_tree_limits_newton_with_impulses(
+    tree: &Tree,
+    tree_idx: usize,
+    equalities: &[Equality],
+    dt: f32,
+    iterations: u32,
+    joint_impulses: &mut [f32],
+) -> Vec<f32> {
     let nv = tree.nv();
     let mut qfrc = vec![0.0f32; nv];
+    joint_impulses.fill(0.0);
     if nv == 0 || dt <= 0.0 {
         return qfrc;
     }
@@ -2473,7 +2519,31 @@ pub fn solve_tree_limits_newton(
             qfrc[slot as usize] += coeff * f_dt;
         }
     }
+    for (row, &impulse) in rows.iter().zip(&result.solution) {
+        accumulate_tree_row_impulse(tree, row, impulse, joint_impulses);
+    }
     qfrc
+}
+
+fn accumulate_tree_row_impulse(
+    tree: &Tree,
+    row: &TreeRow,
+    impulse: f32,
+    joint_impulses: &mut [f32],
+) {
+    // A row owns each joint whose contiguous velocity span it touches.
+    // Scan the sparse row so ownership stays allocation-free.
+    for (joint_id, link) in tree.links.iter().enumerate() {
+        let start = tree.v_offset[joint_id] as u32;
+        let end = start + link.joint.nv() as u32;
+        if row
+            .sparse_coeffs
+            .iter()
+            .any(|&(slot, coefficient)| coefficient != 0.0 && slot >= start && slot < end)
+        {
+            joint_impulses[joint_id] += impulse.abs();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2495,6 +2565,8 @@ pub struct TreeContactSolution {
     pub body_wrenches: Vec<(Vec3, Vec3)>,
     /// Joint-space generalized forces, indexed by tree and then `nv` slot.
     pub tree_qfrc: Vec<Vec<f32>>,
+    /// Final absolute row impulses accumulated per tree link.
+    pub tree_joint_impulses: Vec<Vec<f32>>,
     /// Per-link world-frame wrenches equivalent to the solved contact
     /// impulses. This feeds post-step acceleration and force sensors.
     pub tree_wrenches: Vec<crate::tree::ExternalWrenches>,
@@ -2573,6 +2645,7 @@ pub fn solve_tree_contacts(
         row_to_contact: Vec::new(),
         body_wrenches: vec![(Vec3::ZERO, Vec3::ZERO); bodies.len()],
         tree_qfrc: trees.iter().map(|tree| vec![0.0; tree.nv()]).collect(),
+        tree_joint_impulses: Vec::new(),
         tree_wrenches: trees
             .iter()
             .map(|tree| vec![(Vec3::ZERO, Vec3::ZERO); tree.links.len()])
@@ -2584,6 +2657,10 @@ pub fn solve_tree_contacts(
     if contacts.is_empty() || dt <= 0.0 || trees.is_empty() {
         return solution;
     }
+    solution.tree_joint_impulses = trees
+        .iter()
+        .map(|tree| vec![0.0; tree.links.len()])
+        .collect();
     if use_newton && cone == ConeKind::Elliptic {
         panic!("{NEWTON_ELLIPTIC_ERROR}");
     }
@@ -2937,6 +3014,7 @@ pub fn solve_tree_contacts(
         solution.contact_normal_forces[block.contact_index] = normal_impulse / dt;
     }
     for (row_index, row) in rows.iter().enumerate() {
+        let impulse = impulses[row_index];
         let force = impulses[row_index] / dt;
         for component in &row.components {
             if let Some(body) = component.body {
@@ -2945,6 +3023,7 @@ pub fn solve_tree_contacts(
                 output.1 += body.angular * force;
             }
             if let Some(tree) = &component.tree {
+                solution.tree_joint_impulses[tree.index][tree.link] += impulse.abs();
                 if !tree_is_mocap(tree.index, trees) {
                     for (slot, coefficient) in tree.coefficients.iter().enumerate() {
                         solution.tree_qfrc[tree.index][slot] += coefficient * force;

@@ -104,3 +104,4 @@ pub mod xml;
 pub use ragdoll::{
     BodyId, BoneSpec, JointId, RagdollBuildError, RagdollBuilder, RagdollHandles, RagdollJointSpec,
 };
+pub use world::WorldJointId;
