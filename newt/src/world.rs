@@ -59,6 +59,7 @@ use crate::tree::{
     forward_kinematics_into as tree_forward_kinematics_into,
     rk4_step_with_workspace as tree_rk4_step_with_workspace,
 };
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
 #[cfg(feature = "instrumentation")]
@@ -172,9 +173,9 @@ pub struct World {
     /// `shape` in place bypasses detection. Callers that do so should
     /// call [`Self::invalidate_pair_check`].
     #[doc(hidden)]
-    checked_pairs: std::cell::Cell<u64>,
+    checked_pairs: Cell<u64>,
     #[doc(hidden)]
-    contact_detection_count: std::cell::Cell<u64>,
+    contact_detection_count: Cell<u64>,
     #[doc(hidden)]
     solver_phase_capture: bool,
     #[doc(hidden)]
@@ -182,15 +183,17 @@ pub struct World {
     #[doc(hidden)]
     tree_aba_workspaces: Vec<AbaWorkspace>,
     #[doc(hidden)]
-    broadphase: DynamicAabbTree,
+    broadphase: RefCell<DynamicAabbTree>,
     #[doc(hidden)]
     broadphase_pairs: Vec<(usize, usize)>,
     #[doc(hidden)]
-    broadphase_tree_poses: Vec<Vec<(Vec3, Quat)>>,
+    broadphase_tree_poses: RefCell<Vec<Vec<(Vec3, Quat)>>>,
     #[doc(hidden)]
-    broadphase_tree_velocities: Vec<Vec<(Vec3, Vec3)>>,
+    broadphase_tree_velocities: RefCell<Vec<Vec<(Vec3, Vec3)>>>,
     #[doc(hidden)]
-    broadphase_reinsert_count: std::cell::Cell<u64>,
+    query_state_fingerprint: Cell<u64>,
+    #[doc(hidden)]
+    broadphase_reinsert_count: Cell<u64>,
     #[doc(hidden)]
     last_broadphase_mode: BroadPhaseMode,
     #[cfg(feature = "instrumentation")]
@@ -335,16 +338,17 @@ impl World {
             equalities: Vec::new(),
             sensors: SensorBank::new(),
             keyframes: Vec::new(),
-            checked_pairs: std::cell::Cell::new(0),
-            contact_detection_count: std::cell::Cell::new(0),
+            checked_pairs: Cell::new(0),
+            contact_detection_count: Cell::new(0),
             solver_phase_capture: false,
             last_solver_phase: None,
             tree_aba_workspaces: Vec::new(),
-            broadphase: DynamicAabbTree::new(),
+            broadphase: RefCell::new(DynamicAabbTree::new()),
             broadphase_pairs: Vec::new(),
-            broadphase_tree_poses: Vec::new(),
-            broadphase_tree_velocities: Vec::new(),
-            broadphase_reinsert_count: std::cell::Cell::new(0),
+            broadphase_tree_poses: RefCell::new(Vec::new()),
+            broadphase_tree_velocities: RefCell::new(Vec::new()),
+            query_state_fingerprint: Cell::new(0),
+            broadphase_reinsert_count: Cell::new(0),
             last_broadphase_mode: BroadPhaseMode::DynamicAabbTree,
             #[cfg(feature = "instrumentation")]
             step_timings: StepTimings::default(),
@@ -498,6 +502,7 @@ impl World {
                 actuator += 1;
             }
         }
+        self.refresh_broadphase_for_query();
         Ok(())
     }
 
@@ -554,6 +559,7 @@ impl World {
                 }
             }
         }
+        self.refresh_broadphase_for_query();
         assert_eq!(cursor, qpos.len(), "MuJoCo qpos has trailing values");
     }
 
@@ -605,6 +611,7 @@ impl World {
                 }
             }
         }
+        self.refresh_broadphase_for_query();
         assert_eq!(cursor, qvel.len(), "MuJoCo qvel has trailing values");
     }
 
@@ -964,7 +971,9 @@ impl World {
             .ok_or_else(|| format!("geom index {geom_id} is out of range"))?;
         geom.collision_group = group;
         geom.collision_mask = mask;
-        self.broadphase.set_proxy_filter(geom_id, group, mask);
+        self.broadphase
+            .get_mut()
+            .set_proxy_filter(geom_id, group, mask);
         self.checked_pairs.set(0);
         Ok(())
     }
@@ -1073,39 +1082,77 @@ impl World {
                 geom_world_pose(geom, state.position, state.orientation)
             }
             GeomAttach::Link(tree, link) => {
-                let (position, orientation) = self.broadphase_tree_poses[tree][link];
+                let (position, orientation) = self.broadphase_tree_poses.borrow()[tree][link];
                 geom_world_pose(geom, position, orientation)
             }
         }
     }
 
-    fn refresh_broadphase_for_query(&mut self) {
+    fn pose_state_fingerprint(&self) -> u64 {
+        let mut fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
+        for (tree_id, tree) in self.trees.iter().enumerate() {
+            fingerprint = fingerprint
+                .wrapping_mul(1_099_511_628_211)
+                .wrapping_add(tree_id as u64 + 1);
+            fingerprint = fingerprint
+                .wrapping_mul(1_099_511_628_211)
+                .wrapping_add(tree.query_generation);
+        }
+        fingerprint
+    }
+
+    fn refresh_broadphase_for_query(&self) {
+        let mut broadphase = self.broadphase.borrow_mut();
+        let mut tree_poses = self.broadphase_tree_poses.borrow_mut();
+        let mut tree_velocities = self.broadphase_tree_velocities.borrow_mut();
         let inputs = BroadphaseInputs {
             bodies: &self.bodies,
             trees: &self.trees,
             geoms: &self.geoms,
             meshes: &self.meshes,
             hfields: &self.hfields,
-            tree_poses: &mut self.broadphase_tree_poses,
-            tree_velocities: &mut self.broadphase_tree_velocities,
+            tree_poses: &mut tree_poses,
+            tree_velocities: &mut tree_velocities,
             dt: self.dt,
             swept: true,
         };
-        Self::populate_broadphase_tree(&mut self.broadphase, inputs);
+        Self::populate_broadphase_tree(&mut broadphase, inputs);
+        self.query_state_fingerprint
+            .set(self.pose_state_fingerprint());
+    }
+
+    fn ensure_query_proxies_current(&self) {
+        if self.query_state_fingerprint.get() != self.pose_state_fingerprint() {
+            self.refresh_broadphase_for_query();
+        }
     }
 
     fn query_aabb_candidates<F>(&self, bounds: Aabb, callback: F)
     where
         F: FnMut(usize) -> bool,
     {
-        self.broadphase.query_aabb(bounds, callback);
+        self.ensure_query_proxies_current();
+        self.broadphase.borrow().query_aabb(bounds, callback);
     }
 
     fn query_ray_candidates<F>(&self, ray: Ray, callback: F)
     where
         F: FnMut(usize) -> bool,
     {
-        self.broadphase.query_ray(ray, callback);
+        self.ensure_query_proxies_current();
+        self.broadphase.borrow().query_ray(ray, callback);
+    }
+
+    /// Visit raw AABB candidates for ordering regression tests.
+    #[doc(hidden)]
+    pub fn raw_query_aabb_candidates<F>(&self, bounds: Aabb, mut callback: F)
+    where
+        F: FnMut(GeomId),
+    {
+        self.query_aabb_candidates(bounds, |geom_id| {
+            callback(geom_id);
+            true
+        });
     }
 
     fn active_pairs(&mut self) -> Vec<(usize, usize)> {
@@ -1127,22 +1174,24 @@ impl World {
 
     fn update_broadphase(&mut self) {
         if self.last_broadphase_mode != self.broadphase_mode {
-            self.broadphase = DynamicAabbTree::new();
+            *self.broadphase.get_mut() = DynamicAabbTree::new();
             self.broadphase_pairs.clear();
             self.last_broadphase_mode = self.broadphase_mode;
         }
+        let broadphase_tree_poses = self.broadphase_tree_poses.get_mut();
+        let broadphase_tree_velocities = self.broadphase_tree_velocities.get_mut();
         let inputs = BroadphaseInputs {
             bodies: &self.bodies,
             trees: &self.trees,
             geoms: &self.geoms,
             meshes: &self.meshes,
             hfields: &self.hfields,
-            tree_poses: &mut self.broadphase_tree_poses,
-            tree_velocities: &mut self.broadphase_tree_velocities,
+            tree_poses: broadphase_tree_poses,
+            tree_velocities: broadphase_tree_velocities,
             dt: self.dt,
             swept: true,
         };
-        let reinserts = Self::populate_broadphase_tree(&mut self.broadphase, inputs);
+        let reinserts = Self::populate_broadphase_tree(self.broadphase.get_mut(), inputs);
         if reinserts > 0 {
             self.broadphase_reinsert_count
                 .set(self.broadphase_reinsert_count.get() + reinserts);
@@ -1150,6 +1199,7 @@ impl World {
         self.broadphase_pairs.clear();
         let tree_pairs = self
             .broadphase
+            .get_mut()
             .compute_pairs_with_disabled_self_collision(&self.disabled_self_collision);
         for &(a, b) in tree_pairs {
             if self.geoms[a].attachment() != self.geoms[b].attachment()

@@ -1,7 +1,9 @@
 use newt::body::Body;
 use newt::broadphase::{Aabb, Ray};
 use newt::geom::{ConvexMesh, Geom, GeomPose, HeightField};
-use newt::math::{Quat, Vec3};
+use newt::joint::JointKind;
+use newt::math::{Mat3, Quat, Vec3};
+use newt::tree::{Link, Tree};
 use newt::world::{RayHit, ShapeDesc, World};
 
 fn pose(x: f32, y: f32, z: f32) -> GeomPose {
@@ -91,7 +93,7 @@ fn body_pose_mutation_refreshes_query_proxy() {
     let body = world.add_body(Body::solid_sphere(
         1.0,
         0.5,
-        Vec3::new(10.0, 0.0, 0.0),
+        Vec3::new(2.0, 0.0, 0.0),
         Quat::IDENTITY,
     ));
     world.add_geom(Geom::sphere(body, 0.5, Vec3::ZERO, 0.0));
@@ -99,15 +101,124 @@ fn body_pose_mutation_refreshes_query_proxy() {
         origin: Vec3::ZERO,
         direction: Vec3::X,
     };
-    assert_eq!(world.raycast(ray, 5.0, u32::MAX), None);
+    assert!(world.raycast(ray, 5.0, u32::MAX).is_some());
 
-    world.set_body_pose(body, Vec3::new(2.0, 0.0, 0.0), Quat::IDENTITY);
+    world.set_body_pose(body, Vec3::new(10.0, 0.0, 0.0), Quat::IDENTITY);
 
     let hit = world
-        .raycast(ray, 5.0, u32::MAX)
+        .raycast(
+            Ray {
+                origin: Vec3::new(9.0, 0.0, 0.0),
+                direction: Vec3::X,
+            },
+            5.0,
+            u32::MAX,
+        )
         .expect("moved body should hit");
     assert_eq!(hit.geom_id, 0);
-    assert!((hit.t - 1.5).abs() < 1.0e-5);
+    assert!((hit.t - 0.5).abs() < 1.0e-5);
+}
+
+fn free_tree_query_world() -> (World, usize) {
+    let mut world = World::new();
+    world.gravity = Vec3::ZERO;
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Free,
+        (Vec3::new(2.0, 0.0, 0.0), Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(1.0, 1.0, 1.0),
+    ));
+    let tree_id = world.add_tree(tree);
+    let mut geom = Geom::sphere(0, 0.5, Vec3::ZERO, 0.0);
+    geom.body = None;
+    geom.link = Some((tree_id, 0));
+    world.add_geom(geom);
+    (world, tree_id)
+}
+
+fn ray_hit_at_five(world: &World) -> RayHit {
+    world
+        .raycast(
+            Ray {
+                origin: Vec3::new(9.0, 0.0, 0.0),
+                direction: Vec3::X,
+            },
+            5.0,
+            u32::MAX,
+        )
+        .expect("moved tree geometry should hit")
+}
+
+#[test]
+fn keyframe_application_refreshes_query_proxy() {
+    let (mut world, _) = free_tree_query_world();
+    world
+        .add_keyframe(
+            "moved",
+            vec![10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            vec![0.0; 6],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+    assert_eq!(
+        world.raycast(
+            Ray {
+                origin: Vec3::new(9.0, 0.0, 0.0),
+                direction: Vec3::X
+            },
+            5.0,
+            u32::MAX
+        ),
+        None
+    );
+
+    world.reset_to_keyframe("moved").unwrap();
+
+    assert_eq!(ray_hit_at_five(&world).geom_id, 0);
+}
+
+#[test]
+fn qpos_application_refreshes_query_proxy() {
+    let (mut world, _) = free_tree_query_world();
+    assert_eq!(
+        world.raycast(
+            Ray {
+                origin: Vec3::new(9.0, 0.0, 0.0),
+                direction: Vec3::X
+            },
+            5.0,
+            u32::MAX
+        ),
+        None
+    );
+
+    world.apply_mujoco_qpos(&[10.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]);
+
+    assert_eq!(ray_hit_at_five(&world).geom_id, 0);
+}
+
+#[test]
+fn direct_tree_pose_mutation_refreshes_query_proxy() {
+    let (mut world, tree_id) = free_tree_query_world();
+    assert_eq!(
+        world.raycast(
+            Ray {
+                origin: Vec3::new(9.0, 0.0, 0.0),
+                direction: Vec3::X
+            },
+            5.0,
+            u32::MAX
+        ),
+        None
+    );
+
+    world.trees[tree_id].set_free_root_pose(Vec3::new(10.0, 0.0, 0.0), Quat::IDENTITY);
+
+    assert_eq!(ray_hit_at_five(&world).geom_id, 0);
 }
 
 #[test]
@@ -125,6 +236,20 @@ fn overlap_queries_filter_and_sort_geom_ids() {
             Geom::sphere(body, 0.25, Vec3::ZERO, 0.0).with_collision_filter(group, u32::MAX),
         );
     }
+    let mut raw_sphere = Vec::new();
+    world.raw_query_aabb_candidates(
+        Aabb::from_center_extents(Vec3::ZERO, Vec3::splat(2.0)),
+        |geom_id| raw_sphere.push(geom_id),
+    );
+    assert_eq!(raw_sphere, vec![2, 3, 0, 1]);
+    assert_ne!(raw_sphere, vec![0, 1, 2, 3]);
+    let mut raw_box = Vec::new();
+    world.raw_query_aabb_candidates(
+        Aabb::new(Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 1.0)),
+        |geom_id| raw_box.push(geom_id),
+    );
+    assert_eq!(raw_box, vec![3, 0]);
+    assert_ne!(raw_box, vec![0, 3]);
     assert_eq!(
         world.overlap_sphere(Vec3::ZERO, 2.0, u32::MAX),
         vec![0, 1, 2, 3]
