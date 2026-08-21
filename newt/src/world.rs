@@ -662,6 +662,8 @@ impl World {
     /// `layer_mask` selects geom collision groups. A zero mask always misses;
     /// `u32::MAX` selects every group. The ray direction should be normalized
     /// when `max_dist` is expressed in world distance units.
+    ///
+    /// See [`crate::scene_query`] for the query consistency contract.
     pub fn raycast(&self, ray: Ray, max_dist: f32, layer_mask: u32) -> Option<RayHit> {
         if layer_mask == 0 {
             return None;
@@ -701,6 +703,8 @@ impl World {
     }
 
     /// Return every geom hit by `ray`, sorted by ascending ray distance.
+    ///
+    /// See [`crate::scene_query`] for the query consistency contract.
     pub fn raycast_all(&self, ray: Ray, max_dist: f32, layer_mask: u32) -> Vec<RayHit> {
         let mut hits = Vec::with_capacity(self.geoms.len());
         if layer_mask == 0 {
@@ -731,6 +735,8 @@ impl World {
 
     /// Return the nearest geom hit while sweeping `shape` from `from_pose` to
     /// `to_pose` along a linear path.
+    ///
+    /// See [`crate::scene_query`] for the query consistency contract.
     pub fn shape_cast(
         &self,
         shape: ShapeDesc,
@@ -777,6 +783,8 @@ impl World {
     }
 
     /// Return geom ids whose current world AABBs overlap a sphere.
+    ///
+    /// See [`crate::scene_query`] for the query consistency contract.
     pub fn overlap_sphere(&self, center: Vec3, radius: f32, layer_mask: u32) -> Vec<GeomId> {
         let mut overlaps = Vec::with_capacity(self.geoms.len());
         if layer_mask == 0 || radius < 0.0 {
@@ -805,6 +813,8 @@ impl World {
     }
 
     /// Return geom ids whose current world AABBs overlap `bounds`.
+    ///
+    /// See [`crate::scene_query`] for the query consistency contract.
     pub fn overlap_box(&self, bounds: Aabb, layer_mask: u32) -> Vec<GeomId> {
         let mut overlaps = Vec::with_capacity(self.geoms.len());
         if layer_mask == 0 {

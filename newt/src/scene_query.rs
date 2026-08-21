@@ -1,4 +1,21 @@
 //! Read-only scene queries built on the dynamic AABB tree.
+//!
+//! # Query consistency
+//!
+//! These queries are consistent with public method-based mutations of world
+//! state, such as [`crate::world::World::set_body_pose`],
+//! [`crate::world::World::apply_mujoco_qpos`],
+//! [`crate::world::World::apply_mujoco_qvel`],
+//! [`crate::world::World::reset_to_keyframe`],
+//! [`crate::world::World::set_mocap_pose`], and
+//! [`crate::world::World::add_geom`], plus the guarded [`crate::tree::Tree`]
+//! pose and velocity setters. Direct writes to the public
+//! [`crate::world::World::bodies`], [`crate::world::World::trees`],
+//! [`crate::world::World::geoms`], [`crate::world::World::meshes`], or
+//! [`crate::world::World::hfields`] fields bypass query-proxy refresh, so a
+//! query after such a write may miss the mutated geometry. Prefer the
+//! method-based writers. Tracked follow-up: NEWT-60 (make pose- and
+//! geometry-bearing state private).
 
 use crate::broadphase::{Aabb, Ray, geom_aabb};
 use crate::contact;
