@@ -81,6 +81,17 @@ pub struct SolRef {
     pub dampratio: f32,
 }
 
+/// Direction-dependent sliding friction in a geom's local tangent frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AnisotropicFriction {
+    /// Preferred slip direction in the geom's local frame.
+    pub axis_local: Vec3,
+    /// Friction coefficient along the projected preferred direction.
+    pub along_axis_mu: f32,
+    /// Friction coefficient across the projected preferred direction.
+    pub across_axis_mu: f32,
+}
+
 impl SolRef {
     /// MuJoCo-style default: timeconst 0.02 s, critical damping. Chosen so a
     /// unit mass under 1g settles in a few timesteps of dt=5 ms without
@@ -356,6 +367,8 @@ pub struct Geom {
     pub local_orientation: Quat,
     /// Coulomb friction coefficient.
     pub friction: f32,
+    /// Optional direction-dependent sliding friction.
+    pub friction_anisotropy: Option<AnisotropicFriction>,
     /// Contact stiffness parameters. See [`SolRef`] and [`solref_to_kc`].
     pub solref: SolRef,
     /// MuJoCo-style contact-activation margin (m). A pair fires a contact
@@ -460,6 +473,7 @@ impl Geom {
             local_offset: point,
             local_orientation: orientation,
             friction,
+            friction_anisotropy: None,
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
@@ -488,6 +502,7 @@ impl Geom {
             local_offset: position,
             local_orientation: orientation,
             friction,
+            friction_anisotropy: None,
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
@@ -511,6 +526,7 @@ impl Geom {
             local_offset,
             local_orientation: Quat::IDENTITY,
             friction,
+            friction_anisotropy: None,
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
@@ -540,6 +556,7 @@ impl Geom {
             local_offset,
             local_orientation: Quat::IDENTITY,
             friction,
+            friction_anisotropy: None,
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
@@ -569,6 +586,7 @@ impl Geom {
             local_offset,
             local_orientation,
             friction,
+            friction_anisotropy: None,
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
@@ -598,6 +616,7 @@ impl Geom {
             local_offset,
             local_orientation,
             friction,
+            friction_anisotropy: None,
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
@@ -630,6 +649,7 @@ impl Geom {
             local_offset,
             local_orientation,
             friction,
+            friction_anisotropy: None,
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
@@ -664,6 +684,7 @@ impl Geom {
             local_offset,
             local_orientation,
             friction,
+            friction_anisotropy: None,
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
@@ -696,6 +717,7 @@ impl Geom {
             local_offset,
             local_orientation,
             friction,
+            friction_anisotropy: None,
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
@@ -724,6 +746,7 @@ impl Geom {
             local_offset,
             local_orientation,
             friction,
+            friction_anisotropy: None,
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
@@ -753,6 +776,7 @@ impl Geom {
             local_offset,
             local_orientation,
             friction,
+            friction_anisotropy: None,
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
@@ -782,6 +806,7 @@ impl Geom {
             local_offset,
             local_orientation,
             friction,
+            friction_anisotropy: None,
             solref: SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,
@@ -810,6 +835,12 @@ impl Geom {
     /// Set the contact force-free zone width (m). See the module docs.
     pub fn with_gap(mut self, gap: f32) -> Self {
         self.gap = gap;
+        self
+    }
+
+    /// Set direction-dependent sliding friction.
+    pub fn with_friction_anisotropy(mut self, friction_anisotropy: AnisotropicFriction) -> Self {
+        self.friction_anisotropy = Some(friction_anisotropy);
         self
     }
 

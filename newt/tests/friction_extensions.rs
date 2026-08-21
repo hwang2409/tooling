@@ -1,0 +1,142 @@
+use newt::body::Body;
+use newt::geom::{AnisotropicFriction, Geom};
+use newt::math::{Quat, Vec3};
+use newt::solver::{ConeKind, SolverConfig, SolverMode};
+use newt::world::World;
+
+fn solver_world(gravity: Vec3) -> World {
+    let mut world = World::new();
+    world.gravity = gravity;
+    world.solver = SolverConfig {
+        mode: SolverMode::Pgs,
+        iterations: 30,
+        cone: ConeKind::Pyramidal,
+    };
+    world
+}
+
+fn sliding_box(gravity: Vec3, orientation: Quat) -> World {
+    let mut world = solver_world(gravity);
+    let body = world.add_body(Body::solid_box(
+        1.0,
+        Vec3::splat(0.2),
+        Vec3::new(0.0, 0.0, 0.21),
+        orientation,
+    ));
+    world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 1.0));
+    let mut geom = Geom::r#box(body, Vec3::splat(0.2), Vec3::ZERO, Quat::IDENTITY, 1.0);
+    geom.friction_anisotropy = Some(AnisotropicFriction {
+        axis_local: Vec3::X,
+        along_axis_mu: 0.05,
+        across_axis_mu: 1.0,
+    });
+    world.add_geom(geom);
+    world
+}
+
+#[test]
+fn friction_isotropic_defaults_unchanged() {
+    let mut implicit = sliding_box(Vec3::new(2.0, 0.0, -9.81), Quat::IDENTITY);
+    let mut explicit_none = sliding_box(Vec3::new(2.0, 0.0, -9.81), Quat::IDENTITY);
+    implicit.geoms[1].friction_anisotropy = None;
+    explicit_none.geoms[0].friction_anisotropy = None;
+    explicit_none.geoms[1].friction_anisotropy = None;
+    explicit_none.bodies[0].rolling_friction = None;
+    for _ in 0..100 {
+        implicit.step();
+        explicit_none.step();
+    }
+    assert_eq!(
+        implicit.bodies[0].position.x.to_bits(),
+        explicit_none.bodies[0].position.x.to_bits()
+    );
+    assert_eq!(
+        implicit.bodies[0].linear_velocity.x.to_bits(),
+        explicit_none.bodies[0].linear_velocity.x.to_bits()
+    );
+}
+
+#[test]
+fn friction_anisotropic_along_slippier() {
+    let along = sliding_box(Vec3::new(2.0, 0.0, -9.81), Quat::IDENTITY);
+    let across = sliding_box(Vec3::new(0.0, 2.0, -9.81), Quat::IDENTITY);
+    let mut along = along;
+    let mut across = across;
+    for _ in 0..200 {
+        along.step();
+        across.step();
+    }
+    assert!(
+        along.bodies[0].position.x > across.bodies[0].position.y + 0.02,
+        "along displacement should exceed across displacement: {} vs {}",
+        along.bodies[0].position.x,
+        across.bodies[0].position.y
+    );
+}
+
+#[test]
+fn friction_anisotropic_world_frame_rotation() {
+    let rotation = Quat::from_axis_angle(Vec3::Z, newt::math::PI * 0.5);
+    let mut world = sliding_box(Vec3::new(0.0, 2.0, -9.81), rotation);
+    for _ in 0..200 {
+        world.step();
+    }
+    assert!(
+        world.bodies[0].position.y > 0.02,
+        "rotated local axis should slip along world y: {}",
+        world.bodies[0].position.y
+    );
+}
+
+fn spinning_ball(rolling_friction: Option<f32>, height: f32) -> World {
+    let mut world = solver_world(Vec3::new(0.0, 0.0, -9.81));
+    let radius = 0.2;
+    let body = world.add_body(Body::solid_sphere(
+        1.0,
+        radius,
+        Vec3::new(0.0, 0.0, height),
+        Quat::IDENTITY,
+    ));
+    world.bodies[body].rolling_friction = rolling_friction;
+    world.bodies[body].angular_velocity_body = Vec3::new(0.0, 0.1, 0.0);
+    world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 1.0));
+    world.add_geom(Geom::sphere(body, radius, Vec3::ZERO, 1.0));
+    world
+}
+
+#[test]
+fn friction_rolling_slows_spinning_ball() {
+    let mut world = spinning_ball(Some(0.5), 0.2);
+    let mut previous = world.bodies[0].angular_velocity_world().length();
+    for _ in 0..200 {
+        world.step();
+        let current = world.bodies[0].angular_velocity_world().length();
+        assert!(current <= previous + 1.0e-5, "rolling speed increased");
+        previous = current;
+    }
+    assert!(previous < 0.1);
+}
+
+#[test]
+fn friction_rolling_zero_normal_no_effect() {
+    let mut world = spinning_ball(Some(0.5), 1.0);
+    let initial = world.bodies[0].angular_velocity_body;
+    for _ in 0..20 {
+        world.step();
+    }
+    assert_eq!(world.bodies[0].angular_velocity_body, initial);
+}
+
+#[test]
+fn friction_rolling_clamp_no_reverse() {
+    let mut world = spinning_ball(Some(10.0), 0.1);
+    for _ in 0..200 {
+        world.step();
+    }
+    let omega = world.bodies[0].angular_velocity_world();
+    assert!(omega.y >= -1.0e-5);
+    assert!(
+        omega.length() < 1.0e-5,
+        "angular velocity was not clamped: {omega:?}"
+    );
+}
