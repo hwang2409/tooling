@@ -110,8 +110,10 @@ pub struct World {
     /// Integration scheme. Defaults to [`Integrator::Rk4`] for trajectory
     /// compatibility with all pre-v3 scenes.
     pub integrator: Integrator,
-    /// Uniform gravity vector applied to every body's COM.
+    /// Uniform gravity vector applied to each body's COM after its scale.
     pub gravity: Vec3,
+    /// Global force-free penetration width for contact stabilization.
+    pub penetration_slop: f32,
     /// Global magnetic field in world coordinates for magnetometer sensors.
     pub magnetic_field: Vec3,
     /// Free bodies. Index-stable. Tier-1 style (no joints).
@@ -286,6 +288,7 @@ impl PartialEq for World {
         self.dt == other.dt
             && self.integrator == other.integrator
             && self.gravity == other.gravity
+            && self.penetration_slop == other.penetration_slop
             && self.magnetic_field == other.magnetic_field
             && self.bodies == other.bodies
             && self.trees == other.trees
@@ -324,6 +327,7 @@ impl World {
             dt: 0.005,
             integrator: Integrator::default(),
             gravity: Vec3::new(0.0, 0.0, -9.81),
+            penetration_slop: 0.0,
             magnetic_field: Vec3::new(0.0, -0.5, 0.0),
             bodies: Vec::new(),
             trees: Vec::new(),
@@ -1655,6 +1659,7 @@ impl World {
                         &self.bodies,
                         &self.geoms,
                         contacts,
+                        self.penetration_slop,
                     ));
                 }
                 let forces = tree_contacts
@@ -1764,9 +1769,15 @@ impl World {
 
             self.bodies[i] = Body {
                 position: state.position + dp * self.dt,
-                linear_velocity: state.linear_velocity + dv * self.dt,
+                linear_velocity: clamp_velocity(
+                    state.linear_velocity + dv * self.dt,
+                    state.max_linear_velocity,
+                ),
                 orientation: (state.orientation + dq * self.dt).renormalize(),
-                angular_velocity_body: state.angular_velocity_body + dw * self.dt,
+                angular_velocity_body: clamp_velocity(
+                    state.angular_velocity_body + dw * self.dt,
+                    state.max_angular_velocity,
+                ),
                 ..state
             };
         }
@@ -1798,8 +1809,9 @@ impl World {
             body.orientation = body
                 .orientation
                 .integrate_body_angular_velocity(angular_velocity_body, dt);
-            body.linear_velocity = linear_velocity;
-            body.angular_velocity_body = angular_velocity_body;
+            body.linear_velocity = clamp_velocity(linear_velocity, body.max_linear_velocity);
+            body.angular_velocity_body =
+                clamp_velocity(angular_velocity_body, body.max_angular_velocity);
         }
     }
 
@@ -1830,6 +1842,7 @@ impl World {
         // Snapshot scalars before we start borrowing the vector fields.
         let dt = self.dt;
         let gravity = self.gravity;
+        let penetration_slop = self.penetration_slop;
         let solver_mode = self.solver.mode;
         let solver_iterations = self.solver.iterations;
         for ti in 0..n_trees {
@@ -1913,6 +1926,7 @@ impl World {
                                 &self.meshes,
                                 &self.hfields,
                                 &tree_pairs,
+                                penetration_slop,
                             )
                         }
                     },
@@ -1953,6 +1967,7 @@ impl World {
         }
         let dt = self.dt;
         let gravity = self.gravity;
+        let penetration_slop = self.penetration_slop;
         let solver_mode = self.solver.mode;
         let solver_iterations = self.solver.iterations;
         for ti in 0..self.trees.len() {
@@ -2019,6 +2034,7 @@ impl World {
                                 &self.meshes,
                                 &self.hfields,
                                 &tree_pairs,
+                                penetration_slop,
                             )
                         }
                     },
@@ -2067,6 +2083,7 @@ impl World {
             &self.hfields,
             pairs,
             manifold,
+            self.penetration_slop,
         )
     }
 
@@ -2272,6 +2289,7 @@ impl World {
             &self.hfields,
             pairs,
             ContactManifold::Legacy,
+            self.penetration_slop,
         );
         let mut out = vec![(Vec3::ZERO, Vec3::ZERO); state.len()];
         for contact in &contacts {
@@ -2359,6 +2377,7 @@ impl World {
             &self.hfields,
             pairs,
             ContactManifold::Legacy,
+            self.penetration_slop,
         );
         let poses: Vec<Vec<(Vec3, Quat)>> =
             self.trees.iter().map(tree_forward_kinematics).collect();
@@ -2416,6 +2435,7 @@ fn collect_contacts(
     hfields: &[HeightField],
     pairs: &[(usize, usize)],
     manifold: ContactManifold,
+    penetration_slop: f32,
 ) -> Vec<Contact> {
     let mut out = Vec::new();
     let poses: Vec<GeomPose> = geoms
@@ -2442,13 +2462,14 @@ fn collect_contacts(
                 a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes, hfields,
             ),
         };
-        out.extend_from_slice(buf.as_slice());
+        append_contacts(&mut out, buf.as_slice(), penetration_slop);
     }
     out
 }
 
 /// Contact enumeration that considers both free bodies AND trees. Used by
 /// [`World::detect_contacts`] as a diagnostic surface.
+#[allow(clippy::too_many_arguments)]
 fn collect_contacts_full(
     bodies: &[Body],
     trees: &[Tree],
@@ -2457,6 +2478,7 @@ fn collect_contacts_full(
     hfields: &[HeightField],
     pairs: &[(usize, usize)],
     manifold: ContactManifold,
+    penetration_slop: f32,
 ) -> Vec<Contact> {
     let mut out = Vec::new();
     // Cache each tree's link poses so we don't redo forward kinematics per
@@ -2484,11 +2506,22 @@ fn collect_contacts_full(
                 a, &geoms[a], &poses[a], b, &geoms[b], &poses[b], meshes, hfields,
             ),
         };
-        for c in buf.as_slice() {
-            out.push(*c);
-        }
+        append_contacts(&mut out, buf.as_slice(), penetration_slop);
     }
     out
+}
+
+fn append_contacts(out: &mut Vec<Contact>, contacts: &[Contact], penetration_slop: f32) {
+    if penetration_slop <= 0.0 {
+        out.extend_from_slice(contacts);
+        return;
+    }
+    for mut contact in contacts.iter().copied() {
+        if contact.gap < penetration_slop {
+            contact.gap = penetration_slop;
+        }
+        out.push(contact);
+    }
 }
 
 /// Compute per-link external wrenches for one tree in penalty mode.
@@ -2503,6 +2536,7 @@ fn tree_wrenches_from_contacts(
     bodies: &[Body],
     geoms: &[Geom],
     contacts: &[Contact],
+    penetration_slop: f32,
 ) -> Vec<(Vec3, Vec3)> {
     let mut out = vec![(Vec3::ZERO, Vec3::ZERO); tree.links.len()];
     if contacts.is_empty() {
@@ -2525,11 +2559,13 @@ fn tree_wrenches_from_contacts(
             bodies,
             geoms,
             contact,
+            penetration_slop,
         );
     }
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tree_wrenches_from_pairs(
     tree: &Tree,
     tree_idx: usize,
@@ -2538,6 +2574,7 @@ fn tree_wrenches_from_pairs(
     meshes: &[ConvexMesh],
     hfields: &[HeightField],
     pairs: &[(usize, usize)],
+    penetration_slop: f32,
 ) -> Vec<(Vec3, Vec3)> {
     let n_links = tree.links.len();
     let mut out = vec![(Vec3::ZERO, Vec3::ZERO); n_links];
@@ -2577,6 +2614,7 @@ fn tree_wrenches_from_pairs(
                 bodies,
                 geoms,
                 contact,
+                penetration_slop,
             );
         }
     }
@@ -2588,6 +2626,7 @@ fn tree_wrenches_from_pairs(
 /// "other side" of the contact contributes only its point velocity for the
 /// relative-normal-velocity term; equal-opposite reaction on the other side
 /// is discarded (v0 simplification — see `step_trees`).
+#[allow(clippy::too_many_arguments)]
 fn apply_tree_contact_wrench(
     ext: &mut [(Vec3, Vec3)],
     tree: &Tree,
@@ -2596,6 +2635,7 @@ fn apply_tree_contact_wrench(
     bodies: &[Body],
     geoms: &[Geom],
     contact: &Contact,
+    penetration_slop: f32,
 ) {
     let ga = &geoms[contact.geom_a];
     let gb = &geoms[contact.geom_b];
@@ -2649,10 +2689,13 @@ fn apply_tree_contact_wrench(
     );
     let v_rel = v_a - v_b;
     let v_n = v_rel.dot(normal);
-    // Gap subtract: force only applies once the shifted penetration exceeds
-    // the gap; sensing-only contacts (pen ≤ gap) fire in the contact list
-    // but contribute zero wrench.
-    let pen_eff = contact.penetration - contact.gap;
+    // Effective gap subtract: force only applies once the shifted penetration
+    // exceeds the larger of the contact and world gaps.
+    let pen_eff = if penetration_slop > contact.gap {
+        contact.penetration - penetration_slop
+    } else {
+        contact.penetration - contact.gap
+    };
     if pen_eff <= 0.0 {
         return;
     }
@@ -3086,7 +3129,12 @@ struct Deriv {
 /// `Vec3::ZERO / mass = ZERO`, `gravity + ZERO = gravity`, and
 /// `Vec3::ZERO − X = −X` per component in IEEE arithmetic.
 fn evaluate(state: Body, gravity: Vec3, ext_force_world: Vec3, ext_torque_world: Vec3) -> Deriv {
-    let dlin = gravity + ext_force_world / state.mass;
+    let body_gravity = if state.gravity_scale == 1.0 {
+        gravity
+    } else {
+        gravity * state.gravity_scale
+    };
+    let dlin = body_gravity + ext_force_world / state.mass;
 
     let iw = state.inertia_body * state.angular_velocity_body;
     let gyroscopic = -state.angular_velocity_body.cross(iw);
@@ -3128,6 +3176,21 @@ fn advance_all(origin: &[Body], deriv: &[Deriv], dt: f32) -> Vec<Body> {
         });
     }
     out
+}
+
+fn clamp_velocity(velocity: Vec3, cap: Option<f32>) -> Vec3 {
+    let Some(cap) = cap else {
+        return velocity;
+    };
+    if cap <= 0.0 {
+        return Vec3::ZERO;
+    }
+    let speed = velocity.length();
+    if speed > cap {
+        velocity.normalize() * cap
+    } else {
+        velocity
+    }
 }
 
 // ---------------------------------------------------------------------------
