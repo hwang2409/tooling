@@ -50,9 +50,7 @@ use crate::joint::JointKind;
 use crate::math::{Quat, Vec3};
 pub use crate::scene_query::{RayHit, ShapeDesc, ShapeHit};
 use crate::sensor::{Sensor, SensorBank, SensorError, SensorInputs};
-use crate::solver::{
-    ConstraintRowDiagnostic, SolverConfig, SolverMode, TreeContactSolution, solve_free_bodies,
-};
+use crate::solver::{ConstraintRowDiagnostic, SolverConfig, SolverMode, TreeContactSolution};
 use crate::tree::{
     AbaWorkspace, Tree, euler_step_with_workspace as tree_euler_step_with_workspace,
     forward_kinematics as tree_forward_kinematics,
@@ -60,7 +58,7 @@ use crate::tree::{
     rk4_step_with_workspace as tree_rk4_step_with_workspace,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(feature = "instrumentation")]
 use std::time::Instant;
@@ -148,6 +146,9 @@ pub struct World {
     /// path. Set to `SolverMode::Pgs` or `SolverMode::Newton` to switch on a
     /// MuJoCo soft-constraint solver.
     pub solver: SolverConfig,
+    /// Enable feature-id contact warm starts for the PGS solver.
+    /// Disabled by default to preserve legacy trajectories byte-for-byte.
+    pub contact_persistence: bool,
     /// Equality constraints (v1 tier 5). Only active when
     /// `solver.mode == Pgs`. Free-body equalities (connect / weld /
     /// distance) contribute rows to the free-body PGS solve; tree
@@ -198,12 +199,32 @@ pub struct World {
     broadphase_reinsert_count: Cell<u64>,
     #[doc(hidden)]
     last_broadphase_mode: BroadPhaseMode,
+    contact_persistence_cache: HashMap<ContactPersistenceKey, ContactPersistenceEntry>,
+    contact_persistence_slots: Vec<ContactPersistenceKey>,
+    contact_persistence_step: u64,
+    contact_persistence_hits: u64,
+    last_contact_solver_iterations: u32,
+    last_contact_initial_impulses: Vec<Vec3>,
     #[cfg(feature = "instrumentation")]
     step_timings: StepTimings,
 }
 
 /// Stable geom index returned by scene queries.
 pub type GeomId = usize;
+
+type ContactPersistenceKey = (GeomId, GeomId, u16, u16);
+
+#[derive(Clone, Copy, Debug)]
+struct ContactPersistenceEntry {
+    impulse: Vec3,
+    last_seen: u64,
+}
+
+struct SolverWrenchResult {
+    wrenches: Vec<(Vec3, Vec3)>,
+    free_contacts: Vec<Contact>,
+    impulses: Option<Vec<Vec3>>,
+}
 
 /// World-space pose used by shape casts.
 pub type Pose = GeomPose;
@@ -300,6 +321,7 @@ impl PartialEq for World {
             && self.disabled_self_collision == other.disabled_self_collision
             && self.broadphase_mode == other.broadphase_mode
             && self.solver == other.solver
+            && self.contact_persistence == other.contact_persistence
             && self.equalities == other.equalities
             && self.sensors == other.sensors
             && self.keyframes == other.keyframes
@@ -339,6 +361,7 @@ impl World {
             disabled_self_collision: HashSet::new(),
             broadphase_mode: BroadPhaseMode::DynamicAabbTree,
             solver: SolverConfig::DEFAULT,
+            contact_persistence: false,
             equalities: Vec::new(),
             sensors: SensorBank::new(),
             keyframes: Vec::new(),
@@ -354,8 +377,123 @@ impl World {
             query_state_fingerprint: Cell::new(0),
             broadphase_reinsert_count: Cell::new(0),
             last_broadphase_mode: BroadPhaseMode::DynamicAabbTree,
+            contact_persistence_cache: HashMap::with_capacity(256),
+            contact_persistence_slots: Vec::with_capacity(256),
+            contact_persistence_step: 0,
+            contact_persistence_hits: 0,
+            last_contact_solver_iterations: 0,
+            last_contact_initial_impulses: Vec::new(),
             #[cfg(feature = "instrumentation")]
             step_timings: StepTimings::default(),
+        }
+    }
+
+    /// Enable or disable feature-id contact persistence. Disabling clears the
+    /// cache on the next step and keeps the legacy solver path unchanged.
+    pub fn set_contact_persistence(&mut self, enabled: bool) {
+        self.contact_persistence = enabled;
+        if !enabled {
+            self.clear_contact_persistence();
+        }
+    }
+
+    /// Number of cached feature-pair impulses.
+    pub fn contact_persistence_cache_len(&self) -> usize {
+        self.contact_persistence_cache.len()
+    }
+
+    /// Number of cache hits during the most recent step.
+    pub fn contact_persistence_hits(&self) -> u64 {
+        self.contact_persistence_hits
+    }
+
+    /// Number of PGS sweeps performed during the most recent body solve.
+    pub fn contact_solver_iterations(&self) -> u32 {
+        self.last_contact_solver_iterations
+    }
+
+    /// Contact impulses applied before the most recent PGS sweep.
+    pub fn contact_persistence_initial_impulses(&self) -> &[Vec3] {
+        &self.last_contact_initial_impulses
+    }
+
+    fn clear_contact_persistence(&mut self) {
+        self.contact_persistence_cache.clear();
+        self.contact_persistence_slots.clear();
+        self.contact_persistence_hits = 0;
+    }
+
+    fn prepare_contact_persistence(&mut self, contacts: &[Contact]) -> Option<Vec<Vec3>> {
+        if !self.contact_persistence {
+            self.contact_persistence_hits = 0;
+            return None;
+        }
+        if self.solver.mode != SolverMode::Pgs {
+            self.clear_contact_persistence();
+            return None;
+        }
+        self.contact_persistence_step = self.contact_persistence_step.wrapping_add(1);
+        self.contact_persistence_hits = 0;
+        let mut initial = vec![Vec3::ZERO; contacts.len()];
+        for (index, contact) in contacts.iter().enumerate() {
+            let key = (
+                contact.geom_a,
+                contact.geom_b,
+                contact.feature_id.0,
+                contact.feature_id.1,
+            );
+            if let Some(entry) = self.contact_persistence_cache.get_mut(&key) {
+                entry.last_seen = self.contact_persistence_step;
+                initial[index] = entry.impulse;
+                self.contact_persistence_hits += 1;
+            }
+        }
+        self.evict_stale_contact_persistence();
+        Some(initial)
+    }
+
+    fn store_contact_persistence(&mut self, contacts: &[Contact], impulses: &[Vec3]) {
+        if !self.contact_persistence || self.solver.mode != SolverMode::Pgs {
+            return;
+        }
+        for (contact, &impulse) in contacts.iter().zip(impulses) {
+            let key = (
+                contact.geom_a,
+                contact.geom_b,
+                contact.feature_id.0,
+                contact.feature_id.1,
+            );
+            if let Some(entry) = self.contact_persistence_cache.get_mut(&key) {
+                entry.impulse = impulse;
+                entry.last_seen = self.contact_persistence_step;
+            } else {
+                self.contact_persistence_slots.push(key);
+                self.contact_persistence_cache.insert(
+                    key,
+                    ContactPersistenceEntry {
+                        impulse,
+                        last_seen: self.contact_persistence_step,
+                    },
+                );
+            }
+        }
+    }
+
+    fn evict_stale_contact_persistence(&mut self) {
+        let step = self.contact_persistence_step;
+        let mut slot = 0;
+        while slot < self.contact_persistence_slots.len() {
+            let key = self.contact_persistence_slots[slot];
+            let stale = self
+                .contact_persistence_cache
+                .get(&key)
+                .is_none_or(|entry| step.saturating_sub(entry.last_seen) > 3);
+            if !stale {
+                slot += 1;
+                continue;
+            }
+            self.contact_persistence_cache.remove(&key);
+            self.contact_persistence_slots.swap_remove(slot);
         }
     }
 
@@ -420,11 +558,16 @@ impl World {
         self.solver
             .validate()
             .unwrap_or_else(|message| panic!("{message}"));
+        if self.solver.mode != SolverMode::Pgs || !self.contact_persistence {
+            self.clear_contact_persistence();
+        }
+        self.last_contact_solver_iterations = 0;
+        self.last_contact_initial_impulses.clear();
         self.assert_pairs_supported();
         let pairs = self.active_pairs();
         let state = self.solver_phase_state();
         let contacts = self.detect_contacts_for_step(&pairs);
-        let solution = self.solver_phase_solution(&contacts);
+        let solution = self.solver_phase_solution(&contacts, None);
         self.record_solver_phase(state, solution.as_ref(), &contacts);
         self.restore_broadphase_pairs(pairs);
     }
@@ -1472,6 +1615,9 @@ impl World {
         let pairs = self.active_pairs();
         let contacts = matches!(self.solver.mode, SolverMode::Pgs | SolverMode::Newton)
             .then(|| self.detect_contacts_for_step(&pairs));
+        let warm_starts = contacts
+            .as_deref()
+            .and_then(|contacts| self.prepare_contact_persistence(contacts));
         #[cfg(feature = "instrumentation")]
         let collision_ns = collision_start.elapsed().as_nanos();
         #[cfg(feature = "instrumentation")]
@@ -1479,7 +1625,10 @@ impl World {
         let solver_phase_state = self.solver_phase_capture.then(|| self.solver_phase_state());
         let tree_contact_solution = contacts
             .as_deref()
-            .and_then(|contacts| self.solver_phase_solution(contacts));
+            .and_then(|contacts| self.solver_phase_solution(contacts, warm_starts.as_deref()));
+        if let Some(solution) = tree_contact_solution.as_ref() {
+            self.store_contact_persistence(&solution.contacts, &solution.contact_impulses);
+        }
         if let Some(state) = solver_phase_state {
             let phase_contacts = contacts.as_deref().map_or_else(
                 || self.detect_contacts_for_step(&pairs),
@@ -1493,16 +1642,31 @@ impl World {
         let integration_start = Instant::now();
         match self.integrator {
             Integrator::Rk4 => {
-                self.step_bodies(&pairs, contacts.as_deref(), tree_contact_solution.as_ref());
+                self.step_bodies(
+                    &pairs,
+                    contacts.as_deref(),
+                    warm_starts.as_deref(),
+                    tree_contact_solution.as_ref(),
+                );
                 self.step_trees(&pairs, tree_contact_solution.as_ref());
             }
             Integrator::Euler => {
                 self.step_trees_euler(&pairs, false, tree_contact_solution.as_ref());
-                self.step_bodies_euler(&pairs, contacts.as_deref(), tree_contact_solution.as_ref());
+                self.step_bodies_euler(
+                    &pairs,
+                    contacts.as_deref(),
+                    warm_starts.as_deref(),
+                    tree_contact_solution.as_ref(),
+                );
             }
             Integrator::ImplicitFast => {
                 self.step_trees_euler(&pairs, true, tree_contact_solution.as_ref());
-                self.step_bodies_euler(&pairs, contacts.as_deref(), tree_contact_solution.as_ref());
+                self.step_bodies_euler(
+                    &pairs,
+                    contacts.as_deref(),
+                    warm_starts.as_deref(),
+                    tree_contact_solution.as_ref(),
+                );
             }
         }
         #[cfg(feature = "instrumentation")]
@@ -1639,9 +1803,11 @@ impl World {
             .collect();
         let tree_contact_solution = match self.solver.mode {
             SolverMode::Penalty => None,
-            SolverMode::Pgs => Some(self.solve_tree_contact_sensor_solution(&tree_contacts, false)),
+            SolverMode::Pgs => {
+                Some(self.solve_tree_contact_sensor_solution(&tree_contacts, false, None))
+            }
             SolverMode::Newton => {
-                Some(self.solve_tree_contact_sensor_solution(&tree_contacts, true))
+                Some(self.solve_tree_contact_sensor_solution(&tree_contacts, true, None))
             }
         };
         let (tree_wrenches, tree_contact_forces) =
@@ -1705,6 +1871,7 @@ impl World {
         &mut self,
         pairs: &[(usize, usize)],
         contacts: Option<&[Contact]>,
+        warm_starts: Option<&[Vec3]>,
         tree_contact_solution: Option<&TreeContactSolution>,
     ) {
         let s0 = self.bodies.clone();
@@ -1717,11 +1884,18 @@ impl World {
         //   for the rationale + tradeoffs.
         let solver_zoh: Option<Vec<(Vec3, Vec3)>> = match self.solver.mode {
             SolverMode::Penalty => None,
-            SolverMode::Pgs | SolverMode::Newton => Some(self.compute_solver_wrenches(
-                &s0,
-                contacts.expect("constraint contacts captured before body step"),
-                tree_contact_solution,
-            )),
+            SolverMode::Pgs | SolverMode::Newton => {
+                let result = self.compute_solver_wrenches(
+                    &s0,
+                    contacts.expect("constraint contacts captured before body step"),
+                    warm_starts,
+                    tree_contact_solution,
+                );
+                if let Some(impulses) = result.impulses.as_deref() {
+                    self.store_contact_persistence(&result.free_contacts, impulses);
+                }
+                Some(result.wrenches)
+            }
         };
         let sample_wrenches = |state: &[Body]| -> Vec<(Vec3, Vec3)> {
             match &solver_zoh {
@@ -1790,15 +1964,24 @@ impl World {
         &mut self,
         pairs: &[(usize, usize)],
         contacts: Option<&[Contact]>,
+        warm_starts: Option<&[Vec3]>,
         tree_contact_solution: Option<&TreeContactSolution>,
     ) {
+        let state = self.bodies.clone();
         let ext = match self.solver.mode {
-            SolverMode::Penalty => self.compute_penalty_wrenches(&self.bodies, pairs),
-            SolverMode::Pgs | SolverMode::Newton => self.compute_solver_wrenches(
-                &self.bodies,
-                contacts.expect("constraint contacts captured before body step"),
-                tree_contact_solution,
-            ),
+            SolverMode::Penalty => self.compute_penalty_wrenches(&state, pairs),
+            SolverMode::Pgs | SolverMode::Newton => {
+                let result = self.compute_solver_wrenches(
+                    &state,
+                    contacts.expect("constraint contacts captured before body step"),
+                    warm_starts,
+                    tree_contact_solution,
+                );
+                if let Some(impulses) = result.impulses.as_deref() {
+                    self.store_contact_persistence(&result.free_contacts, impulses);
+                }
+                result.wrenches
+            }
         };
         let accel = evaluate_all(&self.bodies, self.gravity, &ext);
         let dt = self.dt;
@@ -2094,35 +2277,50 @@ impl World {
     /// constant across all four RK4 sub-stages. Tree-involved contact rows
     /// are added by the shared world solve before this result is returned.
     fn compute_solver_wrenches(
-        &self,
+        &mut self,
         state: &[Body],
         contacts: &[Contact],
+        warm_starts: Option<&[Vec3]>,
         tree_contact_solution: Option<&TreeContactSolution>,
-    ) -> Vec<(Vec3, Vec3)> {
+    ) -> SolverWrenchResult {
         // Filter pairs to free-body-only ones (both sides Body or
         // Static). `solve_free_bodies` returns per-body zero wrenches
         // when there are no contacts AND no free-body equalities, so
         // the outer fast path is redundant.
-        let free_contacts: Vec<Contact> = contacts
-            .iter()
-            .copied()
-            .filter(|contact| {
-                let att_a = self.geoms[contact.geom_a].attachment();
-                let att_b = self.geoms[contact.geom_b].attachment();
-                !matches!(att_a, GeomAttach::Link(_, _)) && !matches!(att_b, GeomAttach::Link(_, _))
-            })
-            .collect();
+        let mut free_contacts = Vec::new();
+        let mut free_warm_starts = Vec::new();
+        for (index, contact) in contacts.iter().copied().enumerate() {
+            let att_a = self.geoms[contact.geom_a].attachment();
+            let att_b = self.geoms[contact.geom_b].attachment();
+            if !matches!(att_a, GeomAttach::Link(_, _)) && !matches!(att_b, GeomAttach::Link(_, _))
+            {
+                free_contacts.push(contact);
+                if let Some(warm_starts) = warm_starts {
+                    free_warm_starts.push(warm_starts[index]);
+                }
+            }
+        }
+        let mut solved_impulses = None;
+        let mut initial_impulses = Vec::new();
+        let mut solver_iterations = self.solver.iterations;
         let mut wrenches = match self.solver.mode {
-            SolverMode::Pgs => solve_free_bodies(
-                state,
-                &self.geoms,
-                &free_contacts,
-                &self.equalities,
-                self.gravity,
-                self.dt,
-                self.solver.cone,
-                self.solver.iterations,
-            ),
+            SolverMode::Pgs => {
+                let result = crate::solver::solve_free_bodies_instrumented(
+                    state,
+                    &self.geoms,
+                    &free_contacts,
+                    &self.equalities,
+                    self.gravity,
+                    self.dt,
+                    self.solver.cone,
+                    self.solver.iterations,
+                    warm_starts.map(|_| free_warm_starts.as_slice()),
+                );
+                solver_iterations = result.iterations;
+                initial_impulses = result.initial_contact_impulses.clone();
+                solved_impulses = Some(result.contact_impulses);
+                result.wrenches
+            }
             SolverMode::Newton => crate::solver::solve_free_bodies_newton(
                 state,
                 &self.geoms,
@@ -2144,7 +2342,13 @@ impl World {
                 wrench.1 += solved.1;
             }
         }
-        wrenches
+        self.last_contact_solver_iterations = solver_iterations;
+        self.last_contact_initial_impulses = initial_impulses.clone();
+        SolverWrenchResult {
+            wrenches,
+            free_contacts,
+            impulses: solved_impulses,
+        }
     }
 
     /// Assemble the full solver contact set for rows that touch a tree.
@@ -2153,29 +2357,42 @@ impl World {
     fn compute_tree_contact_solution(
         &self,
         contacts: &[Contact],
+        warm_starts: Option<&[Vec3]>,
         use_newton: bool,
     ) -> Option<TreeContactSolution> {
-        let tree_contacts: Vec<Contact> = contacts
-            .iter()
-            .copied()
-            .filter(|contact| {
-                matches!(
-                    self.geoms[contact.geom_a].attachment(),
-                    GeomAttach::Link(_, _)
-                ) || matches!(
-                    self.geoms[contact.geom_b].attachment(),
-                    GeomAttach::Link(_, _)
-                )
-            })
-            .collect();
-        Some(self.solve_tree_contact_sensor_solution(&tree_contacts, use_newton))
+        let mut tree_contacts = Vec::new();
+        let mut tree_warm_starts = Vec::new();
+        for (index, contact) in contacts.iter().copied().enumerate() {
+            let touches_tree = matches!(
+                self.geoms[contact.geom_a].attachment(),
+                GeomAttach::Link(_, _)
+            ) || matches!(
+                self.geoms[contact.geom_b].attachment(),
+                GeomAttach::Link(_, _)
+            );
+            if touches_tree {
+                tree_contacts.push(contact);
+                if let Some(warm_starts) = warm_starts {
+                    tree_warm_starts.push(warm_starts[index]);
+                }
+            }
+        }
+        Some(self.solve_tree_contact_sensor_solution(
+            &tree_contacts,
+            use_newton,
+            warm_starts.map(|_| tree_warm_starts.as_slice()),
+        ))
     }
 
-    fn solver_phase_solution(&self, contacts: &[Contact]) -> Option<TreeContactSolution> {
+    fn solver_phase_solution(
+        &self,
+        contacts: &[Contact],
+        warm_starts: Option<&[Vec3]>,
+    ) -> Option<TreeContactSolution> {
         match self.solver.mode {
             SolverMode::Penalty => None,
-            SolverMode::Pgs => self.compute_tree_contact_solution(contacts, false),
-            SolverMode::Newton => self.compute_tree_contact_solution(contacts, true),
+            SolverMode::Pgs => self.compute_tree_contact_solution(contacts, warm_starts, false),
+            SolverMode::Newton => self.compute_tree_contact_solution(contacts, None, true),
         }
     }
 
@@ -2252,24 +2469,40 @@ impl World {
         &self,
         tree_contacts: &[Contact],
         use_newton: bool,
+        warm_starts: Option<&[Vec3]>,
     ) -> TreeContactSolution {
         let tree_implicit = match self.integrator {
             Integrator::Rk4 => None,
             Integrator::Euler => Some(false),
             Integrator::ImplicitFast => Some(true),
         };
-        crate::solver::solve_tree_contacts(
-            &self.bodies,
-            &self.trees,
-            &self.geoms,
-            tree_contacts,
-            self.gravity,
-            self.dt,
-            self.solver.cone,
-            self.solver.iterations,
-            use_newton,
-            tree_implicit,
-        )
+        match warm_starts {
+            Some(initial) if !use_newton => crate::solver::solve_tree_contacts_warm_start(
+                &self.bodies,
+                &self.trees,
+                &self.geoms,
+                tree_contacts,
+                self.gravity,
+                self.dt,
+                self.solver.cone,
+                self.solver.iterations,
+                use_newton,
+                tree_implicit,
+                initial,
+            ),
+            _ => crate::solver::solve_tree_contacts(
+                &self.bodies,
+                &self.trees,
+                &self.geoms,
+                tree_contacts,
+                self.gravity,
+                self.dt,
+                self.solver.cone,
+                self.solver.iterations,
+                use_newton,
+                tree_implicit,
+            ),
+        }
     }
 
     /// Compute per-body external wrench arrays for a given body-state vector.

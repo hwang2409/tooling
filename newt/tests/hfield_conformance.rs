@@ -87,6 +87,7 @@ fn contact(value: &Value) -> Contact {
         penetration: number(object(value, "penetration"), "penetration"),
         friction: 0.5,
         gap: 0.0,
+        feature_id: (0, 0),
     }
 }
 

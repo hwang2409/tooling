@@ -904,7 +904,63 @@ fn ccd_distance_contact(
         penetration,
         friction,
         gap,
+        feature_id: (
+            ccd_shape_feature_id(shape_a, point_a),
+            ccd_shape_feature_id(shape_b, point_b),
+        ),
     })
+}
+
+fn ccd_shape_feature_id(shape: CcdShape<'_>, point_world: Vec3) -> u16 {
+    match shape {
+        CcdShape::Sphere { .. } => 0,
+        CcdShape::Box { pose, .. } => {
+            let local = pose.orientation.inverse_rotate(point_world - pose.position);
+            u16::from(local.x >= 0.0)
+                | (u16::from(local.y >= 0.0) << 1)
+                | (u16::from(local.z >= 0.0) << 2)
+        }
+        CcdShape::Capsule {
+            pose, half_height, ..
+        } => {
+            let local = pose.orientation.inverse_rotate(point_world - pose.position);
+            if local.z <= -half_height {
+                0
+            } else if local.z >= half_height {
+                1
+            } else {
+                2
+            }
+        }
+        CcdShape::Mesh { pose, mesh } => {
+            let local = pose.orientation.inverse_rotate(point_world - pose.position);
+            let vertex = mesh
+                .vertices
+                .iter()
+                .enumerate()
+                .min_by(|(_, left), (_, right)| {
+                    (**left - local)
+                        .length_squared()
+                        .total_cmp(&(**right - local).length_squared())
+                })
+                .map(|(index, _)| index)
+                .unwrap_or(usize::MAX);
+            mesh.faces
+                .iter()
+                .position(|face| face.iter().any(|&index| index as usize == vertex))
+                .unwrap_or(vertex)
+                .min(u16::MAX as usize) as u16
+        }
+        CcdShape::Vertices(vertices) => vertices
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| {
+                (**left - point_world)
+                    .length_squared()
+                    .total_cmp(&(**right - point_world).length_squared())
+            })
+            .map_or(u16::MAX, |(index, _)| index.min(u16::MAX as usize) as u16),
+    }
 }
 
 fn ccd_distance_gjk(
@@ -1179,6 +1235,10 @@ fn ccd_epa_fallback_contact(
         penetration,
         friction,
         gap,
+        feature_id: (
+            ccd_shape_feature_id(shape_a, support.shape_a),
+            ccd_shape_feature_id(shape_b, support.shape_b),
+        ),
     })
 }
 
@@ -1908,6 +1968,10 @@ pub(super) fn ccd_convex_contact(
         penetration,
         friction,
         gap,
+        feature_id: (
+            ccd_shape_feature_id(shape_a, point_a),
+            ccd_shape_feature_id(shape_b, point_b),
+        ),
     })
 }
 
@@ -2020,6 +2084,7 @@ fn ccd_near_miss_contact(point_a: Vec3, point_b: Vec3, distance: f32) -> Contact
         penetration: 0.0,
         friction: 0.0,
         gap: 0.0,
+        feature_id: (0, 0),
     }
 }
 

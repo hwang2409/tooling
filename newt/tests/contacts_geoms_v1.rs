@@ -510,6 +510,7 @@ fn mesh_mesh_witness_is_invariant_to_vertex_order_and_argument_order() {
             penetration: expected.penetration,
             friction: expected.friction,
             gap: expected.gap,
+            feature_id: expected.feature_id,
         };
         assert_contact_bit_equal(
             &swapped_contact,

@@ -255,6 +255,7 @@ fn contact_force_writeback_keeps_input_indices_when_a_gap_skips_a_row() {
             penetration: 0.0,
             friction: 0.8,
             gap: 0.05,
+            feature_id: (0, 0),
         },
         Contact {
             geom_a: 1,
@@ -264,6 +265,7 @@ fn contact_force_writeback_keeps_input_indices_when_a_gap_skips_a_row() {
             penetration: 0.02,
             friction: 0.8,
             gap: 0.0,
+            feature_id: (0, 0),
         },
     ];
     let (_, forces) = solve_free_bodies_newton_diag(
