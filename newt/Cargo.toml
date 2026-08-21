@@ -23,3 +23,7 @@ winit = "0.30"
 [[bench]]
 name = "newt_perf"
 harness = false
+
+[[bin]]
+name = "libm-gate"
+path = "tools/libm_gate/src/main.rs"
