@@ -3199,7 +3199,7 @@ pub fn solve_tree_contacts(
                 hessian[index * n_rows + index] += pivot;
             }
         }
-        crate::newton::NewtonSystem {
+        let mut impulses = crate::newton::NewtonSystem {
             hessian,
             linear: rows.iter().map(|row| row.bias).collect(),
             projections,
@@ -3208,7 +3208,30 @@ pub fn solve_tree_contacts(
         }
         .solve()
         .unwrap_or_else(|error| panic!("Newton tree contact solve failed: {error}"))
-        .solution
+        .solution;
+        for block in &blocks {
+            let normal = block.start_row;
+            let normal_count = if cone == ConeKind::Pyramidal && block.condim == 3 {
+                4
+            } else {
+                1
+            };
+            let normal_impulse = (0..normal_count)
+                .map(|offset| impulses[normal + offset].max(0.0))
+                .sum::<f32>();
+            for rolling in block.rolling_rows.iter().flatten() {
+                world_newton_clamp_rolling(
+                    &rows,
+                    &response,
+                    rolling.row_index,
+                    rolling.coefficient * normal_impulse,
+                    bodies,
+                    trees,
+                    &mut impulses,
+                );
+            }
+        }
+        impulses
     } else {
         let mut impulses = vec![0.0f32; n_rows];
         for _ in 0..iterations {
@@ -3847,6 +3870,41 @@ fn world_pgs_rolling(
         (-cap, zero.min(cap))
     };
     impulses[index] = unconstrained.max(lower).min(upper);
+}
+
+fn world_newton_clamp_rolling(
+    rows: &[WorldContactRow],
+    response: &[f32],
+    index: usize,
+    cap: f32,
+    bodies: &[Body],
+    trees: &[Tree],
+    impulses: &mut [f32],
+) {
+    if cap <= 0.0 {
+        return;
+    }
+    let n_rows = rows.len();
+    let current = world_current_velocity(&rows[index], bodies, trees);
+    if current == 0.0 {
+        return;
+    }
+    let a_ii = response[index * n_rows + index];
+    if a_ii <= 0.0 {
+        return;
+    }
+    let coupled_without_row = current
+        + (0..n_rows)
+            .filter(|&column| column != index)
+            .map(|column| response[index * n_rows + column] * impulses[column])
+            .sum::<f32>();
+    let zero = -coupled_without_row / a_ii;
+    let (lower, upper) = if current > 0.0 {
+        (zero.max(-cap), cap)
+    } else {
+        (-cap, zero.min(cap))
+    };
+    impulses[index] = impulses[index].max(lower).min(upper);
 }
 
 #[allow(clippy::too_many_arguments)]

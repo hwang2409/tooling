@@ -148,6 +148,10 @@ fn friction_rolling_slows_spinning_ball() {
 fn friction_rolling_zero_normal_no_effect() {
     let mut with_normal = spinning_ball(Some(0.5), 0.2);
     let mut without_normal = spinning_ball(Some(0.5), 1.0);
+    for world in [&mut with_normal, &mut without_normal] {
+        world.geoms[0].friction = 0.0;
+        world.geoms[1].friction = 0.0;
+    }
     let initial = with_normal.bodies[0].angular_velocity_world().length();
     for _ in 0..20 {
         with_normal.step();
