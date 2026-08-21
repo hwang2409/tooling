@@ -91,6 +91,7 @@ pub mod math;
 pub mod mjcf;
 pub mod model;
 pub mod newton;
+pub mod ragdoll;
 pub mod scene_query;
 pub mod sensor;
 pub mod solver;
@@ -99,3 +100,7 @@ pub mod tendon;
 pub mod tree;
 pub mod world;
 pub mod xml;
+
+pub use ragdoll::{
+    BodyId, BoneSpec, JointId, RagdollBuildError, RagdollBuilder, RagdollHandles, RagdollJointSpec,
+};
