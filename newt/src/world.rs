@@ -1369,6 +1369,7 @@ impl World {
                         &self.bodies,
                         &self.geoms,
                         contacts,
+                        self.penetration_slop,
                     ));
                 }
                 let forces = tree_contacts
@@ -1551,6 +1552,7 @@ impl World {
         // Snapshot scalars before we start borrowing the vector fields.
         let dt = self.dt;
         let gravity = self.gravity;
+        let penetration_slop = self.penetration_slop;
         let solver_mode = self.solver.mode;
         let solver_iterations = self.solver.iterations;
         for ti in 0..n_trees {
@@ -1634,6 +1636,7 @@ impl World {
                                 &self.meshes,
                                 &self.hfields,
                                 &tree_pairs,
+                                penetration_slop,
                             )
                         }
                     },
@@ -1674,6 +1677,7 @@ impl World {
         }
         let dt = self.dt;
         let gravity = self.gravity;
+        let penetration_slop = self.penetration_slop;
         let solver_mode = self.solver.mode;
         let solver_iterations = self.solver.iterations;
         for ti in 0..self.trees.len() {
@@ -1740,6 +1744,7 @@ impl World {
                                 &self.meshes,
                                 &self.hfields,
                                 &tree_pairs,
+                                penetration_slop,
                             )
                         }
                     },
@@ -2234,6 +2239,7 @@ fn tree_wrenches_from_contacts(
     bodies: &[Body],
     geoms: &[Geom],
     contacts: &[Contact],
+    penetration_slop: f32,
 ) -> Vec<(Vec3, Vec3)> {
     let mut out = vec![(Vec3::ZERO, Vec3::ZERO); tree.links.len()];
     if contacts.is_empty() {
@@ -2256,11 +2262,13 @@ fn tree_wrenches_from_contacts(
             bodies,
             geoms,
             contact,
+            penetration_slop,
         );
     }
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tree_wrenches_from_pairs(
     tree: &Tree,
     tree_idx: usize,
@@ -2269,6 +2277,7 @@ fn tree_wrenches_from_pairs(
     meshes: &[ConvexMesh],
     hfields: &[HeightField],
     pairs: &[(usize, usize)],
+    penetration_slop: f32,
 ) -> Vec<(Vec3, Vec3)> {
     let n_links = tree.links.len();
     let mut out = vec![(Vec3::ZERO, Vec3::ZERO); n_links];
@@ -2308,6 +2317,7 @@ fn tree_wrenches_from_pairs(
                 bodies,
                 geoms,
                 contact,
+                penetration_slop,
             );
         }
     }
@@ -2319,6 +2329,7 @@ fn tree_wrenches_from_pairs(
 /// "other side" of the contact contributes only its point velocity for the
 /// relative-normal-velocity term; equal-opposite reaction on the other side
 /// is discarded (v0 simplification — see `step_trees`).
+#[allow(clippy::too_many_arguments)]
 fn apply_tree_contact_wrench(
     ext: &mut [(Vec3, Vec3)],
     tree: &Tree,
@@ -2327,6 +2338,7 @@ fn apply_tree_contact_wrench(
     bodies: &[Body],
     geoms: &[Geom],
     contact: &Contact,
+    penetration_slop: f32,
 ) {
     let ga = &geoms[contact.geom_a];
     let gb = &geoms[contact.geom_b];
@@ -2380,10 +2392,13 @@ fn apply_tree_contact_wrench(
     );
     let v_rel = v_a - v_b;
     let v_n = v_rel.dot(normal);
-    // Gap subtract: force only applies once the shifted penetration exceeds
-    // the gap; sensing-only contacts (pen ≤ gap) fire in the contact list
-    // but contribute zero wrench.
-    let pen_eff = contact.penetration - contact.gap;
+    // Effective gap subtract: force only applies once the shifted penetration
+    // exceeds the larger of the contact and world gaps.
+    let pen_eff = if penetration_slop > contact.gap {
+        contact.penetration - penetration_slop
+    } else {
+        contact.penetration - contact.gap
+    };
     if pen_eff <= 0.0 {
         return;
     }

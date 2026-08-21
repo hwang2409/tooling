@@ -2773,8 +2773,14 @@ pub fn solve_tree_contacts(
             let diagonal = response[row_index * n_rows + row_index];
             rows[row_index].diag = diagonal + rows[row_index].reg;
             let velocity = world_current_velocity(&rows[row_index], bodies, trees);
-            let free_velocity =
-                world_free_velocity(&rows[row_index], &tree_free_velocity, trees, gravity, dt);
+            let free_velocity = world_free_velocity(
+                &rows[row_index],
+                &tree_free_velocity,
+                bodies,
+                trees,
+                gravity,
+                dt,
+            );
             let position = if (cone == ConeKind::Pyramidal && block.condim == 3) || row_offset == 0
             {
                 -block.penetration
@@ -3134,6 +3140,7 @@ fn world_current_velocity(row: &WorldContactRow, bodies: &[Body], trees: &[Tree]
 fn world_free_velocity(
     row: &WorldContactRow,
     tree_free_velocity: &[Vec<f32>],
+    bodies: &[Body],
     trees: &[Tree],
     gravity: Vec3,
     dt: f32,
@@ -3141,9 +3148,14 @@ fn world_free_velocity(
     row.components
         .iter()
         .map(|component| {
-            let body_velocity = component
-                .body
-                .map_or(0.0, |body| body.linear.dot(gravity * dt));
+            let body_velocity = component.body.map_or(0.0, |body| {
+                let body_gravity = if bodies[body.index].gravity_scale == 1.0 {
+                    gravity
+                } else {
+                    gravity * bodies[body.index].gravity_scale
+                };
+                body.linear.dot(body_gravity * dt)
+            });
             let tree_velocity = component.tree.as_ref().map_or(0.0, |tree| {
                 if tree_is_mocap(tree.index, trees) {
                     0.0

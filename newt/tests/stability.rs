@@ -1,8 +1,35 @@
 use newt::body::Body;
 use newt::geom::Geom;
-use newt::math::{Quat, Vec3};
+use newt::joint::JointKind;
+use newt::math::{Mat3, Quat, Vec3};
 use newt::solver::SolverMode;
+use newt::tree::{Link, Tree};
 use newt::world::World;
+
+fn tree_body_world(gravity: Vec3, gravity_scale: f32, joint: JointKind) -> (World, usize) {
+    let mut world = World::new();
+    world.gravity = gravity;
+    world.solver.mode = SolverMode::Pgs;
+
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        joint,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        Mat3::diag(0.1, 0.1, 0.1),
+    ));
+    let tree_id = world.add_tree(tree);
+
+    let mut body = Body::solid_sphere(1.0, 0.5, Vec3::new(0.0, 0.0, 0.99), Quat::IDENTITY);
+    body.gravity_scale = gravity_scale;
+    let body_id = world.add_body(body);
+    world.add_geom(Geom::sphere_on_link(tree_id, 0, 0.5, Vec3::ZERO, 0.0));
+    world.add_geom(Geom::sphere(body_id, 0.5, Vec3::ZERO, 0.0));
+    world.pair_list = Some(vec![(0, 1)]);
+    (world, body_id)
+}
 
 #[test]
 fn stability_max_linear_velocity() {
@@ -130,4 +157,39 @@ fn stability_penetration_slop() {
     world.bodies[upper].position.z = 0.96;
     world.step();
     assert!(world.bodies[upper].linear_velocity.length() > 0.0);
+}
+
+#[test]
+fn stability_gravity_scale_body_on_tree() {
+    let mut scaled_world = tree_body_world(Vec3::new(0.0, 0.0, -9.81), 0.0, JointKind::Fixed);
+    let scaled_body = scaled_world.1;
+    let mut zero_gravity_world = tree_body_world(Vec3::ZERO, 0.0, JointKind::Fixed);
+    let zero_gravity_body = zero_gravity_world.1;
+
+    for _ in 0..20 {
+        scaled_world.0.step();
+        zero_gravity_world.0.step();
+    }
+
+    let scaled_state = &scaled_world.0.bodies[scaled_body];
+    let zero_gravity_state = &zero_gravity_world.0.bodies[zero_gravity_body];
+    assert!((scaled_state.position.z - zero_gravity_state.position.z).abs() < 1.0e-6);
+    assert!((scaled_state.linear_velocity.z - zero_gravity_state.linear_velocity.z).abs() < 1.0e-6);
+}
+
+#[test]
+fn stability_penetration_slop_body_on_tree() {
+    let mut world = tree_body_world(Vec3::ZERO, 1.0, JointKind::Free).0;
+    world.solver.mode = SolverMode::Penalty;
+    world.penetration_slop = 0.02;
+
+    let tree_id = 0;
+    world.step();
+
+    assert!(
+        world.trees[tree_id]
+            .qdot
+            .iter()
+            .all(|velocity| *velocity == 0.0)
+    );
 }
