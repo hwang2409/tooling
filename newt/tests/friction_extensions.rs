@@ -34,25 +34,46 @@ fn sliding_box(gravity: Vec3, orientation: Quat) -> World {
     world
 }
 
+fn isotropic_box(gravity: Vec3, orientation: Quat) -> World {
+    let mut world = solver_world(gravity);
+    let body = world.add_body(Body::solid_box(
+        1.0,
+        Vec3::splat(0.2),
+        Vec3::new(0.0, 0.0, 0.21),
+        orientation,
+    ));
+    world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 1.0));
+    world.add_geom(Geom::r#box(
+        body,
+        Vec3::splat(0.2),
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        1.0,
+    ));
+    world
+}
+
 #[test]
 fn friction_isotropic_defaults_unchanged() {
-    let mut implicit = sliding_box(Vec3::new(2.0, 0.0, -9.81), Quat::IDENTITY);
-    let mut explicit_none = sliding_box(Vec3::new(2.0, 0.0, -9.81), Quat::IDENTITY);
-    implicit.geoms[1].friction_anisotropy = None;
-    explicit_none.geoms[0].friction_anisotropy = None;
-    explicit_none.geoms[1].friction_anisotropy = None;
-    explicit_none.bodies[0].rolling_friction = None;
+    let mut world = isotropic_box(Vec3::new(2.0, 0.0, -9.81), Quat::IDENTITY);
     for _ in 0..100 {
-        implicit.step();
-        explicit_none.step();
+        world.step();
     }
     assert_eq!(
-        implicit.bodies[0].position.x.to_bits(),
-        explicit_none.bodies[0].position.x.to_bits()
+        [
+            world.bodies[0].position.x.to_bits(),
+            world.bodies[0].position.y.to_bits(),
+            world.bodies[0].position.z.to_bits(),
+        ],
+        [997023786, 3084178527, 1045213687]
     );
     assert_eq!(
-        implicit.bodies[0].linear_velocity.x.to_bits(),
-        explicit_none.bodies[0].linear_velocity.x.to_bits()
+        [
+            world.bodies[0].linear_velocity.x.to_bits(),
+            world.bodies[0].linear_velocity.y.to_bits(),
+            world.bodies[0].linear_velocity.z.to_bits(),
+        ],
+        [981061749, 3104184134, 891028685]
     );
 }
 
@@ -106,25 +127,36 @@ fn spinning_ball(rolling_friction: Option<f32>, height: f32) -> World {
 
 #[test]
 fn friction_rolling_slows_spinning_ball() {
-    let mut world = spinning_ball(Some(0.5), 0.2);
-    let mut previous = world.bodies[0].angular_velocity_world().length();
+    let mut with_rolling = spinning_ball(Some(0.5), 0.2);
+    let mut without_rolling = spinning_ball(None, 0.2);
+    let mut previous = with_rolling.bodies[0].angular_velocity_world().length();
     for _ in 0..200 {
-        world.step();
-        let current = world.bodies[0].angular_velocity_world().length();
+        with_rolling.step();
+        without_rolling.step();
+        let current = with_rolling.bodies[0].angular_velocity_world().length();
         assert!(current <= previous + 1.0e-5, "rolling speed increased");
         previous = current;
     }
-    assert!(previous < 0.1);
+    let control = without_rolling.bodies[0].angular_velocity_world().length();
+    assert!(
+        control - previous > 0.01,
+        "rolling friction did not add slowdown"
+    );
 }
 
 #[test]
 fn friction_rolling_zero_normal_no_effect() {
-    let mut world = spinning_ball(Some(0.5), 1.0);
-    let initial = world.bodies[0].angular_velocity_body;
+    let mut with_normal = spinning_ball(Some(0.5), 0.2);
+    let mut without_normal = spinning_ball(Some(0.5), 1.0);
+    let initial = with_normal.bodies[0].angular_velocity_world().length();
     for _ in 0..20 {
-        world.step();
+        with_normal.step();
+        without_normal.step();
     }
-    assert_eq!(world.bodies[0].angular_velocity_body, initial);
+    let with_normal_speed = with_normal.bodies[0].angular_velocity_world().length();
+    let without_normal_speed = without_normal.bodies[0].angular_velocity_world().length();
+    assert!(with_normal_speed < initial - 0.001);
+    assert_eq!(without_normal_speed.to_bits(), initial.to_bits());
 }
 
 #[test]

@@ -2347,6 +2347,7 @@ impl World {
             apply_one_mocap_wrench(MocapWrenchInput {
                 out,
                 bodies,
+                dt: self.dt,
                 tree: &self.trees[mocap_tree],
                 tree_idx: mocap_tree,
                 link_poses: &poses[mocap_tree],
@@ -2396,6 +2397,7 @@ impl World {
             apply_one_mocap_wrench(MocapWrenchInput {
                 out,
                 bodies,
+                dt: self.dt,
                 tree: &self.trees[mocap_tree],
                 tree_idx: mocap_tree,
                 link_poses: &poses[mocap_tree],
@@ -2949,6 +2951,7 @@ fn apply_contact_wrench(
 struct MocapWrenchInput<'a> {
     out: &'a mut [(Vec3, Vec3)],
     bodies: &'a [Body],
+    dt: f32,
     tree: &'a Tree,
     tree_idx: usize,
     link_poses: &'a [(Vec3, Quat)],
@@ -2961,6 +2964,7 @@ fn apply_one_mocap_wrench(input: MocapWrenchInput<'_>) {
     let MocapWrenchInput {
         out,
         bodies,
+        dt,
         tree,
         tree_idx,
         link_poses,
@@ -3000,16 +3004,31 @@ fn apply_one_mocap_wrench(input: MocapWrenchInput<'_>) {
     if normal_force <= 0.0 {
         return;
     }
-    let (t1, t2) = tangent_basis(normal);
+    let pose_a = geom_pose_for_contact(ga, tree_idx, link_poses, bodies);
+    let pose_b = geom_pose_for_contact(gb, tree_idx, link_poses, bodies);
+    let (t1, t2, mu_t1, mu_t2) = contact_friction_axes(
+        ga,
+        gb,
+        pose_a,
+        pose_b,
+        normal,
+        tangent_basis(normal).0,
+        contact.friction,
+    );
     let tangent_velocity = v_rel - normal * v_n;
-    let cap = contact.friction * normal_force;
     let force_on_a = normal * normal_force
-        + t1 * clamp_symmetric(-damping * tangent_velocity.dot(t1), cap)
-        + t2 * clamp_symmetric(-damping * tangent_velocity.dot(t2), cap);
+        + t1 * clamp_symmetric(-damping * tangent_velocity.dot(t1), mu_t1 * normal_force)
+        + t2 * clamp_symmetric(-damping * tangent_velocity.dot(t2), mu_t2 * normal_force);
     let force_on_body = if body_is_a { force_on_a } else { -force_on_a };
     let moment_arm = if body_is_a { r_a } else { r_b };
     out[body_idx].0 += force_on_body;
     out[body_idx].1 += moment_arm.cross(force_on_body);
+    out[body_idx].1 += rolling_drag_torque(
+        &bodies[body_idx],
+        bodies[body_idx].rolling_friction,
+        normal_force,
+        dt,
+    );
 }
 
 /// World-frame linear velocity of the contact point on a geom's parent body.

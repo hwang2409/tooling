@@ -2756,6 +2756,13 @@ struct WorldContactBlock {
     mu_slide_2: f32,
     mu_torsion: f32,
     mu_roll: f32,
+    rolling_rows: [Option<WorldRollingRow>; 2],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorldRollingRow {
+    row_index: usize,
+    coefficient: f32,
 }
 
 /// Solve all active contacts that touch a tree in one joint-space system.
@@ -2925,6 +2932,46 @@ pub fn solve_tree_contacts(
                 bias: 0.0,
             });
         }
+        let mut rolling_rows = [None; 2];
+        for (slot, attachment) in [ga.attachment(), gb.attachment()].into_iter().enumerate() {
+            let GeomAttach::Body(body_index) = attachment else {
+                continue;
+            };
+            let body = &bodies[body_index];
+            let Some(coefficient) = body.rolling_friction else {
+                continue;
+            };
+            if coefficient <= 0.0 {
+                continue;
+            }
+            let direction = body.angular_velocity_world().normalize();
+            if direction == Vec3::ZERO {
+                continue;
+            }
+            let row_index = rows.len();
+            rows.push(WorldContactRow {
+                components: vec![
+                    world_jacobian_for_side(
+                        attachment,
+                        1.0,
+                        contact.position_world,
+                        direction,
+                        true,
+                        bodies,
+                        trees,
+                        &poses,
+                    )
+                    .expect("body attachment must produce a rolling jacobian"),
+                ],
+                reg: 0.0,
+                diag: 0.0,
+                bias: 0.0,
+            });
+            rolling_rows[slot] = Some(WorldRollingRow {
+                row_index,
+                coefficient,
+            });
+        }
         blocks.push(WorldContactBlock {
             contact_index,
             start_row,
@@ -2943,6 +2990,7 @@ pub fn solve_tree_contacts(
                 ga.rolling_friction,
                 gb.rolling_friction,
             ),
+            rolling_rows,
         });
     }
     if rows.is_empty() {
@@ -2955,6 +3003,13 @@ pub fn solve_tree_contacts(
         solution
             .row_to_contact
             .extend(std::iter::repeat_n(block.contact_index, row_count));
+        solution.row_to_contact.extend(
+            block
+                .rolling_rows
+                .iter()
+                .flatten()
+                .map(|_| block.contact_index),
+        );
     }
     let mut response = vec![0.0f32; n_rows * n_rows];
     for column in 0..n_rows {
@@ -3034,6 +3089,42 @@ pub fn solve_tree_contacts(
                 reference_accel: reference,
             });
         }
+        for rolling in block.rolling_rows.iter().flatten() {
+            let row = &mut rows[rolling.row_index];
+            let impedance_value = impedance_at_position(0.0, 0.0, block.solimp);
+            let diag_approx = tree_contact_diag_approx(
+                row,
+                bodies,
+                trees,
+                &inv_i_world,
+                &tree_diag_factors,
+                block.mu_slide,
+                false,
+            );
+            row.reg = contact_regularization_from_diag(
+                diag_approx,
+                impedance_value,
+                block.mu_slide,
+                false,
+            );
+            let diagonal = response[rolling.row_index * n_rows + rolling.row_index];
+            row.diag = diagonal + row.reg;
+            let velocity = world_current_velocity(row, bodies, trees);
+            let reference =
+                reference_accel(0.0, velocity, safe_solref(block.solref, dt), block.solimp);
+            row.bias = -reference * dt;
+            let (damping, stiffness, impedance) =
+                reference_coefficients(0.0, safe_solref(block.solref, dt), block.solimp);
+            solution.row_diagnostics.push(ConstraintRowDiagnostic {
+                position: 0.0,
+                velocity,
+                stiffness,
+                damping,
+                impedance,
+                regularization: row.reg,
+                reference_accel: reference,
+            });
+        }
     }
 
     let impulses = if use_newton {
@@ -3075,6 +3166,19 @@ pub fn solve_tree_contacts(
                         mu: block.mu_roll,
                     });
                 }
+            }
+            let normal_count = if cone == ConeKind::Pyramidal && block.condim == 3 {
+                4
+            } else {
+                1
+            };
+            for rolling in block.rolling_rows.iter().flatten() {
+                projections.push(crate::newton::Projection::ScalarConeSumBound {
+                    index: rolling.row_index,
+                    normal_start: normal,
+                    normal_count,
+                    mu: rolling.coefficient,
+                });
             }
         }
         if crate::dynamics::cholesky(&hessian, n_rows).is_none()
@@ -3149,6 +3253,22 @@ pub fn solve_tree_contacts(
                             &mut impulses,
                         );
                     }
+                }
+                let normal_impulse = if cone == ConeKind::Pyramidal && block.condim == 3 {
+                    (0..4).map(|offset| impulses[normal + offset]).sum()
+                } else {
+                    impulses[normal]
+                };
+                for rolling in block.rolling_rows.iter().flatten() {
+                    world_pgs_rolling(
+                        &rows,
+                        &response,
+                        rolling.row_index,
+                        rolling.coefficient * normal_impulse,
+                        bodies,
+                        trees,
+                        &mut impulses,
+                    );
                 }
             }
         }
@@ -3271,7 +3391,15 @@ pub(crate) fn contact_friction_axes(
     fallback_t1: Vec3,
     isotropic_mu: f32,
 ) -> (Vec3, Vec3, f32, f32) {
-    let Some(anisotropy) = geom_a.friction_anisotropy.or(geom_b.friction_anisotropy) else {
+    let Some(axis_local) = geom_a
+        .friction_anisotropy
+        .map(|anisotropy| anisotropy.axis_local)
+        .or_else(|| {
+            geom_b
+                .friction_anisotropy
+                .map(|anisotropy| anisotropy.axis_local)
+        })
+    else {
         return (
             fallback_t1,
             normal.cross(fallback_t1),
@@ -3280,9 +3408,9 @@ pub(crate) fn contact_friction_axes(
         );
     };
     let axis_world = if geom_a.friction_anisotropy.is_some() {
-        pose_a.rotate(anisotropy.axis_local)
+        pose_a.rotate(axis_local)
     } else {
-        pose_b.rotate(anisotropy.axis_local)
+        pose_b.rotate(axis_local)
     };
     let tangent = axis_world - normal * axis_world.dot(normal);
     let t1 = if tangent.length_squared() > 1.0e-12 {
@@ -3291,21 +3419,44 @@ pub(crate) fn contact_friction_axes(
         fallback_t1
     };
     let t2 = normal.cross(t1);
-    let (mu1, mu2) = match (geom_a.friction_anisotropy, geom_b.friction_anisotropy) {
-        (Some(a), Some(b)) => (
-            a.along_axis_mu.min(b.along_axis_mu),
-            a.across_axis_mu.min(b.across_axis_mu),
-        ),
-        (Some(a), None) => (
-            a.along_axis_mu.min(geom_b.friction),
-            a.across_axis_mu.min(geom_b.friction),
-        ),
-        (None, Some(b)) => (
-            b.along_axis_mu.min(geom_a.friction),
-            b.across_axis_mu.min(geom_a.friction),
-        ),
-        (None, None) => (isotropic_mu, isotropic_mu),
+    let mu_for_direction = |geom: &Geom, pose: GeomPose, direction: Vec3| {
+        let Some(anisotropy) = geom.friction_anisotropy else {
+            return geom.friction;
+        };
+        let axis = pose.rotate(anisotropy.axis_local);
+        let tangent = axis - normal * axis.dot(normal);
+        let axis = if tangent.length_squared() > 1.0e-12 {
+            tangent.normalize()
+        } else {
+            t1
+        };
+        let along = direction.dot(axis);
+        let across = direction.dot(normal.cross(axis));
+        let along_mu = anisotropy.along_axis_mu.max(0.0);
+        let across_mu = anisotropy.across_axis_mu.max(0.0);
+        let along_term = if along_mu > 0.0 {
+            (along / along_mu) * (along / along_mu)
+        } else if along == 0.0 {
+            0.0
+        } else {
+            return 0.0;
+        };
+        let across_term = if across_mu > 0.0 {
+            (across / across_mu) * (across / across_mu)
+        } else if across == 0.0 {
+            0.0
+        } else {
+            return 0.0;
+        };
+        let denominator = (along_term + across_term).sqrt();
+        if denominator > 0.0 {
+            1.0 / denominator
+        } else {
+            0.0
+        }
     };
+    let mu1 = mu_for_direction(geom_a, pose_a, t1).min(mu_for_direction(geom_b, pose_b, t1));
+    let mu2 = mu_for_direction(geom_a, pose_a, t2).min(mu_for_direction(geom_b, pose_b, t2));
     (t1, t2, mu1.max(0.0), mu2.max(0.0))
 }
 
@@ -3663,6 +3814,39 @@ fn world_pgs_scalar(
     let residual =
         world_pgs_residual(rows, response, index, impulses) + rows[index].reg * impulses[index];
     impulses[index] = project_pyramidal(impulses[index] - residual / rows[index].diag, cap);
+}
+
+fn world_pgs_rolling(
+    rows: &[WorldContactRow],
+    response: &[f32],
+    index: usize,
+    cap: f32,
+    bodies: &[Body],
+    trees: &[Tree],
+    impulses: &mut [f32],
+) {
+    if cap <= 0.0 {
+        return;
+    }
+    let n_rows = rows.len();
+    let current = world_current_velocity(&rows[index], bodies, trees)
+        + (0..n_rows)
+            .map(|column| response[index * n_rows + column] * impulses[column])
+            .sum::<f32>();
+    if current == 0.0 {
+        return;
+    }
+    let residual =
+        world_pgs_residual(rows, response, index, impulses) + rows[index].reg * impulses[index];
+    let unconstrained = impulses[index] - residual / rows[index].diag;
+    let a_ii = rows[index].diag - rows[index].reg;
+    let zero = -current / a_ii;
+    let (lower, upper) = if current > 0.0 {
+        (zero.max(-cap), cap)
+    } else {
+        (-cap, zero.min(cap))
+    };
+    impulses[index] = unconstrained.max(lower).min(upper);
 }
 
 #[allow(clippy::too_many_arguments)]
