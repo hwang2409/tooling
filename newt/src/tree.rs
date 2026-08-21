@@ -232,6 +232,8 @@ pub struct Tree {
     /// contact relative velocity and is not integrated.
     pub mocap_linear_velocity: Vec3,
     pub mocap_angular_velocity: Vec3,
+    /// Changes when a public state setter changes this tree's pose state.
+    pub(crate) query_generation: u64,
 }
 
 impl Tree {
@@ -250,6 +252,7 @@ impl Tree {
             tendons: Vec::new(),
             mocap_linear_velocity: Vec3::ZERO,
             mocap_angular_velocity: Vec3::ZERO,
+            query_generation: 0,
         }
     }
 
@@ -451,6 +454,7 @@ impl Tree {
         assert!(matches!(self.links[i].joint, JointKind::Hinge { .. }));
         let off = self.q_offset[i];
         self.q[off] = angle;
+        self.query_generation = self.query_generation.wrapping_add(1);
     }
 
     /// Overwrite the hinge rate for link `i`.
@@ -458,6 +462,7 @@ impl Tree {
         assert!(matches!(self.links[i].joint, JointKind::Hinge { .. }));
         let off = self.v_offset[i];
         self.qdot[off] = rate;
+        self.query_generation = self.query_generation.wrapping_add(1);
     }
 
     /// Read the hinge angle at link `i`.
@@ -478,6 +483,7 @@ impl Tree {
         assert!(matches!(self.links[i].joint, JointKind::Slide { .. }));
         let off = self.q_offset[i];
         self.q[off] = position;
+        self.query_generation = self.query_generation.wrapping_add(1);
     }
 
     /// Overwrite the slide rate for link `i`.
@@ -485,6 +491,7 @@ impl Tree {
         assert!(matches!(self.links[i].joint, JointKind::Slide { .. }));
         let off = self.v_offset[i];
         self.qdot[off] = rate;
+        self.query_generation = self.query_generation.wrapping_add(1);
     }
 
     /// Read the slide displacement at link `i`.
@@ -521,6 +528,7 @@ impl Tree {
         self.q[off + 1] = q.y;
         self.q[off + 2] = q.z;
         self.q[off + 3] = q.w;
+        self.query_generation = self.query_generation.wrapping_add(1);
     }
 
     /// Read the ball joint's body-frame angular velocity at link `i`.
@@ -537,6 +545,7 @@ impl Tree {
         self.qdot[off] = omega.x;
         self.qdot[off + 1] = omega.y;
         self.qdot[off + 2] = omega.z;
+        self.query_generation = self.query_generation.wrapping_add(1);
     }
 
     /// Set the free-root pose (position + orientation) for link 0. Panics if
@@ -550,6 +559,7 @@ impl Tree {
         self.q[4] = orientation.y;
         self.q[5] = orientation.z;
         self.q[6] = orientation.w;
+        self.query_generation = self.query_generation.wrapping_add(1);
     }
 
     /// Set the free-root spatial velocity for link 0 (body-frame,
@@ -562,6 +572,7 @@ impl Tree {
         self.qdot[3] = twist_body.linear.x;
         self.qdot[4] = twist_body.linear.y;
         self.qdot[5] = twist_body.linear.z;
+        self.query_generation = self.query_generation.wrapping_add(1);
     }
 
     /// World pose of a link. Position is COM in world; orientation is body →
@@ -611,6 +622,7 @@ impl Tree {
             }
             _ => unreachable!(),
         }
+        self.query_generation = self.query_generation.wrapping_add(1);
     }
 
     /// Set the world-frame velocity used by contacts against a mocap root.
@@ -618,6 +630,7 @@ impl Tree {
         assert!(self.links.first().is_some_and(|link| link.mocap));
         self.mocap_linear_velocity = linear;
         self.mocap_angular_velocity = angular;
+        self.query_generation = self.query_generation.wrapping_add(1);
     }
 
     /// Dense joint-space mass matrix `M(q)` (row-major, `nv × nv`). See

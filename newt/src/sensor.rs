@@ -83,8 +83,9 @@
 //! is unchanged.
 
 use crate::body::Body;
+use crate::broadphase::Ray;
 use crate::contact::Contact;
-use crate::geom::{Geom, GeomAttach, GeomShape, geom_world_pose};
+use crate::geom::{Geom, GeomAttach, geom_world_pose};
 use crate::joint::JointKind;
 use crate::math::{Quat, Vec3};
 use crate::spatial::{SpatialMotion, Xform};
@@ -775,210 +776,19 @@ fn rangefinder_reading(
                 geom_world_pose(geom, position, orientation)
             }
         };
-        let local_origin = pose.orientation.inverse_rotate(origin - pose.position);
-        let local_direction = pose.orientation.inverse_rotate(direction);
-        if let Some(distance) = ray_shape_hit(geom.shape, local_origin, local_direction, meshes) {
+        let local_ray = Ray {
+            origin: pose.orientation.inverse_rotate(origin - pose.position),
+            direction: pose.orientation.inverse_rotate(direction),
+        };
+        if let Some((distance, _, _)) =
+            crate::scene_query::ray_vs_geom(local_ray, geom.shape, meshes, f32::MAX)
+        {
             if distance >= 0.0 && distance < nearest {
                 nearest = distance;
             }
         }
     }
     if nearest == f32::MAX { -1.0 } else { nearest }
-}
-
-fn ray_shape_hit(
-    shape: GeomShape,
-    origin: Vec3,
-    direction: Vec3,
-    meshes: &[crate::geom::ConvexMesh],
-) -> Option<f32> {
-    match shape {
-        GeomShape::Plane => {
-            if direction.z.abs() < 1.0e-8 {
-                None
-            } else {
-                positive_hit(-origin.z / direction.z)
-            }
-        }
-        GeomShape::Sphere { radius } => ray_sphere(origin, direction, Vec3::ZERO, radius),
-        GeomShape::Box { half_extents } => ray_box(origin, direction, half_extents),
-        GeomShape::Capsule {
-            radius,
-            half_height,
-        } => {
-            let mut hit = ray_cylinder(origin, direction, radius, half_height);
-            for center in [
-                Vec3::new(0.0, 0.0, -half_height),
-                Vec3::new(0.0, 0.0, half_height),
-            ] {
-                hit = min_hit(hit, ray_sphere(origin, direction, center, radius));
-            }
-            hit
-        }
-        GeomShape::Cylinder {
-            radius,
-            half_height,
-        } => ray_cylinder(origin, direction, radius, half_height),
-        GeomShape::Ellipsoid { semi_axes } => ray_ellipsoid(origin, direction, semi_axes),
-        GeomShape::Mesh { mesh_id } => ray_mesh(origin, direction, &meshes[mesh_id]),
-        GeomShape::Hfield { .. } => None,
-    }
-}
-
-fn positive_hit(value: f32) -> Option<f32> {
-    if value >= 0.0 { Some(value) } else { None }
-}
-
-fn min_hit(a: Option<f32>, b: Option<f32>) -> Option<f32> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some(if x <= y { x } else { y }),
-        (Some(x), None) => Some(x),
-        (None, Some(y)) => Some(y),
-        (None, None) => None,
-    }
-}
-
-fn ray_sphere(origin: Vec3, direction: Vec3, center: Vec3, radius: f32) -> Option<f32> {
-    let offset = origin - center;
-    let a = direction.dot(direction);
-    if a <= 0.0 {
-        return None;
-    }
-    let half_b = offset.dot(direction);
-    let c = offset.dot(offset) - radius * radius;
-    let discriminant = half_b * half_b - a * c;
-    if discriminant < 0.0 {
-        return None;
-    }
-    let root = discriminant.sqrt();
-    let first = (-half_b - root) / a;
-    if first >= 0.0 {
-        Some(first)
-    } else {
-        positive_hit((-half_b + root) / a)
-    }
-}
-
-fn ray_box(origin: Vec3, direction: Vec3, half: Vec3) -> Option<f32> {
-    let mut near = 0.0;
-    let mut far = f32::MAX;
-    for (o, d, h) in [
-        (origin.x, direction.x, half.x),
-        (origin.y, direction.y, half.y),
-        (origin.z, direction.z, half.z),
-    ] {
-        if d.abs() < 1.0e-8 {
-            if o < -h || o > h {
-                return None;
-            }
-        } else {
-            let mut a = (-h - o) / d;
-            let mut b = (h - o) / d;
-            if a > b {
-                core::mem::swap(&mut a, &mut b);
-            }
-            if a > near {
-                near = a;
-            }
-            if b < far {
-                far = b;
-            }
-            if near > far {
-                return None;
-            }
-        }
-    }
-    if near >= 0.0 {
-        Some(near)
-    } else {
-        positive_hit(far)
-    }
-}
-
-fn ray_cylinder(origin: Vec3, direction: Vec3, radius: f32, half_height: f32) -> Option<f32> {
-    let mut best = None;
-    let a = direction.x * direction.x + direction.y * direction.y;
-    if a > 1.0e-8 {
-        let half_b = origin.x * direction.x + origin.y * direction.y;
-        let c = origin.x * origin.x + origin.y * origin.y - radius * radius;
-        let disc = half_b * half_b - a * c;
-        if disc >= 0.0 {
-            let root = disc.sqrt();
-            for t in [(-half_b - root) / a, (-half_b + root) / a] {
-                if t >= 0.0 {
-                    let z = origin.z + direction.z * t;
-                    if z >= -half_height && z <= half_height {
-                        best = min_hit(best, Some(t));
-                    }
-                }
-            }
-        }
-    }
-    if direction.z.abs() > 1.0e-8 {
-        for z in [-half_height, half_height] {
-            let t = (z - origin.z) / direction.z;
-            if t >= 0.0 {
-                let x = origin.x + direction.x * t;
-                let y = origin.y + direction.y * t;
-                if x * x + y * y <= radius * radius {
-                    best = min_hit(best, Some(t));
-                }
-            }
-        }
-    }
-    best
-}
-
-fn ray_ellipsoid(origin: Vec3, direction: Vec3, axes: Vec3) -> Option<f32> {
-    let ox = origin.x / axes.x;
-    let oy = origin.y / axes.y;
-    let oz = origin.z / axes.z;
-    let dx = direction.x / axes.x;
-    let dy = direction.y / axes.y;
-    let dz = direction.z / axes.z;
-    let a = dx * dx + dy * dy + dz * dz;
-    let half_b = ox * dx + oy * dy + oz * dz;
-    let c = ox * ox + oy * oy + oz * oz - 1.0;
-    let disc = half_b * half_b - a * c;
-    if disc < 0.0 || a <= 0.0 {
-        return None;
-    }
-    let root = disc.sqrt();
-    let first = (-half_b - root) / a;
-    if first >= 0.0 {
-        Some(first)
-    } else {
-        positive_hit((-half_b + root) / a)
-    }
-}
-
-fn ray_mesh(origin: Vec3, direction: Vec3, mesh: &crate::geom::ConvexMesh) -> Option<f32> {
-    let mut nearest = None;
-    for face in &mesh.faces {
-        let a = mesh.vertices[face[0] as usize];
-        let b = mesh.vertices[face[1] as usize];
-        let c = mesh.vertices[face[2] as usize];
-        let normal = (b - a).cross(c - a);
-        let denom = normal.dot(direction);
-        if denom.abs() < 1.0e-8 {
-            continue;
-        }
-        let t = normal.dot(a - origin) / denom;
-        if t < 0.0 {
-            continue;
-        }
-        let point = origin + direction * t;
-        let e0 = b - a;
-        let e1 = c - b;
-        let e2 = a - c;
-        if normal.dot((point - a).cross(e0)) >= -1.0e-6
-            && normal.dot((point - b).cross(e1)) >= -1.0e-6
-            && normal.dot((point - c).cross(e2)) >= -1.0e-6
-        {
-            nearest = min_hit(nearest, Some(t));
-        }
-    }
-    nearest
 }
 
 fn site_world_pose(

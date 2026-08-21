@@ -2481,6 +2481,18 @@ pub fn narrow_phase_solver_with_hfields(
     )
 }
 
+/// Sweep a finite convex query shape through a finite convex geom.
+pub(crate) fn sweep_convex(
+    shape_a: &GeomShape,
+    from_pose: &GeomPose,
+    to_pose: &GeomPose,
+    shape_b: &GeomShape,
+    pose_b: &GeomPose,
+    meshes: &[ConvexMesh],
+) -> Option<(f32, Contact)> {
+    ccd::ccd_sweep_convex(shape_a, from_pose, to_pose, shape_b, pose_b, meshes)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NarrowPhaseMode {
     /// Legacy dispatch used by the penalty pipeline (box-box uses

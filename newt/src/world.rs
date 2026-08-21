@@ -36,6 +36,7 @@
 //!   [`crate::math`] appear in the compute path.
 
 use crate::body::Body;
+pub use crate::broadphase::{Aabb, Ray};
 use crate::broadphase::{DynamicAabbTree, geom_aabb, should_collide};
 use crate::contact::{
     Contact, is_pair_supported, narrow_phase_solver_with_hfields, narrow_phase_with_hfields,
@@ -47,6 +48,7 @@ use crate::geom::{
 };
 use crate::joint::JointKind;
 use crate::math::{Quat, Vec3};
+pub use crate::scene_query::{RayHit, ShapeDesc, ShapeHit};
 use crate::sensor::{Sensor, SensorBank, SensorError, SensorInputs};
 use crate::solver::{
     ConstraintRowDiagnostic, SolverConfig, SolverMode, TreeContactSolution, solve_free_bodies,
@@ -57,6 +59,7 @@ use crate::tree::{
     forward_kinematics_into as tree_forward_kinematics_into,
     rk4_step_with_workspace as tree_rk4_step_with_workspace,
 };
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
 #[cfg(feature = "instrumentation")]
@@ -170,9 +173,9 @@ pub struct World {
     /// `shape` in place bypasses detection. Callers that do so should
     /// call [`Self::invalidate_pair_check`].
     #[doc(hidden)]
-    checked_pairs: std::cell::Cell<u64>,
+    checked_pairs: Cell<u64>,
     #[doc(hidden)]
-    contact_detection_count: std::cell::Cell<u64>,
+    contact_detection_count: Cell<u64>,
     #[doc(hidden)]
     solver_phase_capture: bool,
     #[doc(hidden)]
@@ -180,20 +183,28 @@ pub struct World {
     #[doc(hidden)]
     tree_aba_workspaces: Vec<AbaWorkspace>,
     #[doc(hidden)]
-    broadphase: DynamicAabbTree,
+    broadphase: RefCell<DynamicAabbTree>,
     #[doc(hidden)]
     broadphase_pairs: Vec<(usize, usize)>,
     #[doc(hidden)]
-    broadphase_tree_poses: Vec<Vec<(Vec3, Quat)>>,
+    broadphase_tree_poses: RefCell<Vec<Vec<(Vec3, Quat)>>>,
     #[doc(hidden)]
-    broadphase_tree_velocities: Vec<Vec<(Vec3, Vec3)>>,
+    broadphase_tree_velocities: RefCell<Vec<Vec<(Vec3, Vec3)>>>,
     #[doc(hidden)]
-    broadphase_reinsert_count: std::cell::Cell<u64>,
+    query_state_fingerprint: Cell<u64>,
+    #[doc(hidden)]
+    broadphase_reinsert_count: Cell<u64>,
     #[doc(hidden)]
     last_broadphase_mode: BroadPhaseMode,
     #[cfg(feature = "instrumentation")]
     step_timings: StepTimings,
 }
+
+/// Stable geom index returned by scene queries.
+pub type GeomId = usize;
+
+/// World-space pose used by shape casts.
+pub type Pose = GeomPose;
 
 struct BroadphaseInputs<'a> {
     bodies: &'a [Body],
@@ -327,16 +338,17 @@ impl World {
             equalities: Vec::new(),
             sensors: SensorBank::new(),
             keyframes: Vec::new(),
-            checked_pairs: std::cell::Cell::new(0),
-            contact_detection_count: std::cell::Cell::new(0),
+            checked_pairs: Cell::new(0),
+            contact_detection_count: Cell::new(0),
             solver_phase_capture: false,
             last_solver_phase: None,
             tree_aba_workspaces: Vec::new(),
-            broadphase: DynamicAabbTree::new(),
+            broadphase: RefCell::new(DynamicAabbTree::new()),
             broadphase_pairs: Vec::new(),
-            broadphase_tree_poses: Vec::new(),
-            broadphase_tree_velocities: Vec::new(),
-            broadphase_reinsert_count: std::cell::Cell::new(0),
+            broadphase_tree_poses: RefCell::new(Vec::new()),
+            broadphase_tree_velocities: RefCell::new(Vec::new()),
+            query_state_fingerprint: Cell::new(0),
+            broadphase_reinsert_count: Cell::new(0),
             last_broadphase_mode: BroadPhaseMode::DynamicAabbTree,
             #[cfg(feature = "instrumentation")]
             step_timings: StepTimings::default(),
@@ -490,6 +502,7 @@ impl World {
                 actuator += 1;
             }
         }
+        self.refresh_broadphase_for_query();
         Ok(())
     }
 
@@ -546,6 +559,7 @@ impl World {
                 }
             }
         }
+        self.refresh_broadphase_for_query();
         assert_eq!(cursor, qpos.len(), "MuJoCo qpos has trailing values");
     }
 
@@ -597,6 +611,7 @@ impl World {
                 }
             }
         }
+        self.refresh_broadphase_for_query();
         assert_eq!(cursor, qvel.len(), "MuJoCo qvel has trailing values");
     }
 
@@ -640,6 +655,184 @@ impl World {
     /// `None` when `idx` is out of range.
     pub fn sensor(&self, idx: usize) -> Option<&[f32]> {
         self.sensors.slice(idx)
+    }
+
+    /// Return the nearest geom hit by `ray` within `max_dist`.
+    ///
+    /// `layer_mask` selects geom collision groups. A zero mask always misses;
+    /// `u32::MAX` selects every group. The ray direction should be normalized
+    /// when `max_dist` is expressed in world distance units.
+    ///
+    /// See [`crate::scene_query`] for the query consistency contract.
+    pub fn raycast(&self, ray: Ray, max_dist: f32, layer_mask: u32) -> Option<RayHit> {
+        if layer_mask == 0 {
+            return None;
+        }
+        let mut best = None;
+        self.query_ray_candidates(ray, |geom_id| {
+            let geom = &self.geoms[geom_id];
+            if layer_mask & geom.collision_group == 0 {
+                return true;
+            }
+            let pose = self.geom_pose(geom);
+            let Some((t, point_world, normal_world)) = crate::scene_query::ray_hit(
+                geom,
+                &pose,
+                ray,
+                max_dist,
+                &self.meshes,
+                &self.hfields,
+            ) else {
+                return true;
+            };
+            let candidate = RayHit {
+                geom_id,
+                body_id: body_id(geom),
+                t,
+                point_world,
+                normal_world,
+            };
+            if best.is_none_or(|current: RayHit| {
+                t < current.t || (t == current.t && geom_id < current.geom_id)
+            }) {
+                best = Some(candidate);
+            }
+            true
+        });
+        best
+    }
+
+    /// Return every geom hit by `ray`, sorted by ascending ray distance.
+    ///
+    /// See [`crate::scene_query`] for the query consistency contract.
+    pub fn raycast_all(&self, ray: Ray, max_dist: f32, layer_mask: u32) -> Vec<RayHit> {
+        let mut hits = Vec::with_capacity(self.geoms.len());
+        if layer_mask == 0 {
+            return hits;
+        }
+        self.query_ray_candidates(ray, |geom_id| {
+            let geom = &self.geoms[geom_id];
+            if layer_mask & geom.collision_group == 0 {
+                return true;
+            }
+            let pose = self.geom_pose(geom);
+            if let Some((t, point_world, normal_world)) =
+                crate::scene_query::ray_hit(geom, &pose, ray, max_dist, &self.meshes, &self.hfields)
+            {
+                hits.push(RayHit {
+                    geom_id,
+                    body_id: body_id(geom),
+                    t,
+                    point_world,
+                    normal_world,
+                });
+            }
+            true
+        });
+        hits.sort_by(|a, b| a.t.total_cmp(&b.t).then(a.geom_id.cmp(&b.geom_id)));
+        hits
+    }
+
+    /// Return the nearest geom hit while sweeping `shape` from `from_pose` to
+    /// `to_pose` along a linear path.
+    ///
+    /// See [`crate::scene_query`] for the query consistency contract.
+    pub fn shape_cast(
+        &self,
+        shape: ShapeDesc,
+        from_pose: Pose,
+        to_pose: Pose,
+        layer_mask: u32,
+    ) -> Option<ShapeHit> {
+        if layer_mask == 0 {
+            return None;
+        }
+        let bounds = shape.sweep_aabb(&from_pose, &to_pose, &self.meshes);
+        let mut best = None;
+        self.query_aabb_candidates(bounds, |geom_id| {
+            let geom = &self.geoms[geom_id];
+            if layer_mask & geom.collision_group == 0 {
+                return true;
+            }
+            let target_pose = self.geom_pose(geom);
+            let Some((t, point_world, normal_world)) = crate::scene_query::shape_cast(
+                shape,
+                from_pose,
+                to_pose,
+                geom,
+                &target_pose,
+                &self.meshes,
+            ) else {
+                return true;
+            };
+            let candidate = ShapeHit {
+                geom_id,
+                body_id: body_id(geom),
+                t,
+                point_world,
+                normal_world,
+            };
+            if best.is_none_or(|current: ShapeHit| {
+                t < current.t || (t == current.t && geom_id < current.geom_id)
+            }) {
+                best = Some(candidate);
+            }
+            true
+        });
+        best
+    }
+
+    /// Return geom ids whose current world AABBs overlap a sphere.
+    ///
+    /// See [`crate::scene_query`] for the query consistency contract.
+    pub fn overlap_sphere(&self, center: Vec3, radius: f32, layer_mask: u32) -> Vec<GeomId> {
+        let mut overlaps = Vec::with_capacity(self.geoms.len());
+        if layer_mask == 0 || radius < 0.0 {
+            return overlaps;
+        }
+        let bounds = Aabb::from_center_extents(center, Vec3::splat(radius));
+        self.query_aabb_candidates(bounds, |geom_id| {
+            let geom = &self.geoms[geom_id];
+            if layer_mask & geom.collision_group == 0 {
+                return true;
+            }
+            let pose = self.geom_pose(geom);
+            let geom_bounds = geom_aabb(geom, &pose, &self.meshes, &self.hfields);
+            let closest = Vec3::new(
+                center.x.clamp(geom_bounds.min.x, geom_bounds.max.x),
+                center.y.clamp(geom_bounds.min.y, geom_bounds.max.y),
+                center.z.clamp(geom_bounds.min.z, geom_bounds.max.z),
+            );
+            if (closest - center).length_squared() <= radius * radius {
+                overlaps.push(geom_id);
+            }
+            true
+        });
+        overlaps.sort_unstable();
+        overlaps
+    }
+
+    /// Return geom ids whose current world AABBs overlap `bounds`.
+    ///
+    /// See [`crate::scene_query`] for the query consistency contract.
+    pub fn overlap_box(&self, bounds: Aabb, layer_mask: u32) -> Vec<GeomId> {
+        let mut overlaps = Vec::with_capacity(self.geoms.len());
+        if layer_mask == 0 {
+            return overlaps;
+        }
+        self.query_aabb_candidates(bounds, |geom_id| {
+            let geom = &self.geoms[geom_id];
+            if layer_mask & geom.collision_group == 0 {
+                return true;
+            }
+            let pose = self.geom_pose(geom);
+            if geom_aabb(geom, &pose, &self.meshes, &self.hfields).overlaps(bounds) {
+                overlaps.push(geom_id);
+            }
+            true
+        });
+        overlaps.sort_unstable();
+        overlaps
     }
 
     /// Invalidate the pair-support cache, forcing the next [`Self::step`]
@@ -755,6 +948,14 @@ impl World {
         idx
     }
 
+    /// Set a free body's pose and refresh its scene-query proxy.
+    pub fn set_body_pose(&mut self, body_idx: usize, position: Vec3, orientation: Quat) {
+        let body = &mut self.bodies[body_idx];
+        body.position = position;
+        body.orientation = orientation;
+        self.refresh_broadphase_for_query();
+    }
+
     /// Adds a tree and returns its stable index.
     pub fn add_tree(&mut self, tree: Tree) -> usize {
         let idx = self.trees.len();
@@ -768,6 +969,7 @@ impl World {
     pub fn add_geom(&mut self, geom: Geom) -> usize {
         let idx = self.geoms.len();
         self.geoms.push(geom);
+        self.refresh_broadphase_for_query();
         idx
     }
 
@@ -779,7 +981,9 @@ impl World {
             .ok_or_else(|| format!("geom index {geom_id} is out of range"))?;
         geom.collision_group = group;
         geom.collision_mask = mask;
-        self.broadphase.set_proxy_filter(geom_id, group, mask);
+        self.broadphase
+            .get_mut()
+            .set_proxy_filter(geom_id, group, mask);
         self.checked_pairs.set(0);
         Ok(())
     }
@@ -880,6 +1084,87 @@ impl World {
         }
     }
 
+    fn geom_pose(&self, geom: &Geom) -> GeomPose {
+        match geom.attachment() {
+            GeomAttach::Static => geom_world_pose(geom, Vec3::ZERO, Quat::IDENTITY),
+            GeomAttach::Body(body) => {
+                let state = &self.bodies[body];
+                geom_world_pose(geom, state.position, state.orientation)
+            }
+            GeomAttach::Link(tree, link) => {
+                let (position, orientation) = self.broadphase_tree_poses.borrow()[tree][link];
+                geom_world_pose(geom, position, orientation)
+            }
+        }
+    }
+
+    fn pose_state_fingerprint(&self) -> u64 {
+        let mut fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
+        for (tree_id, tree) in self.trees.iter().enumerate() {
+            fingerprint = fingerprint
+                .wrapping_mul(1_099_511_628_211)
+                .wrapping_add(tree_id as u64 + 1);
+            fingerprint = fingerprint
+                .wrapping_mul(1_099_511_628_211)
+                .wrapping_add(tree.query_generation);
+        }
+        fingerprint
+    }
+
+    fn refresh_broadphase_for_query(&self) {
+        let mut broadphase = self.broadphase.borrow_mut();
+        let mut tree_poses = self.broadphase_tree_poses.borrow_mut();
+        let mut tree_velocities = self.broadphase_tree_velocities.borrow_mut();
+        let inputs = BroadphaseInputs {
+            bodies: &self.bodies,
+            trees: &self.trees,
+            geoms: &self.geoms,
+            meshes: &self.meshes,
+            hfields: &self.hfields,
+            tree_poses: &mut tree_poses,
+            tree_velocities: &mut tree_velocities,
+            dt: self.dt,
+            swept: true,
+        };
+        Self::populate_broadphase_tree(&mut broadphase, inputs);
+        self.query_state_fingerprint
+            .set(self.pose_state_fingerprint());
+    }
+
+    fn ensure_query_proxies_current(&self) {
+        if self.query_state_fingerprint.get() != self.pose_state_fingerprint() {
+            self.refresh_broadphase_for_query();
+        }
+    }
+
+    fn query_aabb_candidates<F>(&self, bounds: Aabb, callback: F)
+    where
+        F: FnMut(usize) -> bool,
+    {
+        self.ensure_query_proxies_current();
+        self.broadphase.borrow().query_aabb(bounds, callback);
+    }
+
+    fn query_ray_candidates<F>(&self, ray: Ray, callback: F)
+    where
+        F: FnMut(usize) -> bool,
+    {
+        self.ensure_query_proxies_current();
+        self.broadphase.borrow().query_ray(ray, callback);
+    }
+
+    /// Visit raw AABB candidates for ordering regression tests.
+    #[doc(hidden)]
+    pub fn raw_query_aabb_candidates<F>(&self, bounds: Aabb, mut callback: F)
+    where
+        F: FnMut(GeomId),
+    {
+        self.query_aabb_candidates(bounds, |geom_id| {
+            callback(geom_id);
+            true
+        });
+    }
+
     fn active_pairs(&mut self) -> Vec<(usize, usize)> {
         if let Some(pairs) = &self.pair_list {
             return pairs.clone();
@@ -899,22 +1184,24 @@ impl World {
 
     fn update_broadphase(&mut self) {
         if self.last_broadphase_mode != self.broadphase_mode {
-            self.broadphase = DynamicAabbTree::new();
+            *self.broadphase.get_mut() = DynamicAabbTree::new();
             self.broadphase_pairs.clear();
             self.last_broadphase_mode = self.broadphase_mode;
         }
+        let broadphase_tree_poses = self.broadphase_tree_poses.get_mut();
+        let broadphase_tree_velocities = self.broadphase_tree_velocities.get_mut();
         let inputs = BroadphaseInputs {
             bodies: &self.bodies,
             trees: &self.trees,
             geoms: &self.geoms,
             meshes: &self.meshes,
             hfields: &self.hfields,
-            tree_poses: &mut self.broadphase_tree_poses,
-            tree_velocities: &mut self.broadphase_tree_velocities,
+            tree_poses: broadphase_tree_poses,
+            tree_velocities: broadphase_tree_velocities,
             dt: self.dt,
             swept: true,
         };
-        let reinserts = Self::populate_broadphase_tree(&mut self.broadphase, inputs);
+        let reinserts = Self::populate_broadphase_tree(self.broadphase.get_mut(), inputs);
         if reinserts > 0 {
             self.broadphase_reinsert_count
                 .set(self.broadphase_reinsert_count.get() + reinserts);
@@ -922,6 +1209,7 @@ impl World {
         self.broadphase_pairs.clear();
         let tree_pairs = self
             .broadphase
+            .get_mut()
             .compute_pairs_with_disabled_self_collision(&self.disabled_self_collision);
         for &(a, b) in tree_pairs {
             if self.geoms[a].attachment() != self.geoms[b].attachment()
@@ -1115,6 +1403,7 @@ impl World {
     /// Set a mocap root pose by tree index.
     pub fn set_mocap_pose(&mut self, tree_idx: usize, position: Vec3, orientation: Quat) {
         self.trees[tree_idx].set_mocap_pose(position, orientation);
+        self.refresh_broadphase_for_query();
     }
 
     /// Joint-space mass matrix `M(q)` for the tree at index `tree_idx`.
@@ -1226,6 +1515,7 @@ impl World {
                 self.evaluate_sensors(&pairs);
             }
         }
+        self.refresh_broadphase_for_query();
         if uses_broadphase_buffer {
             self.broadphase_pairs = pairs;
         }
@@ -2100,6 +2390,13 @@ impl World {
 // ---------------------------------------------------------------------------
 // contact assembly and force application
 // ---------------------------------------------------------------------------
+
+fn body_id(geom: &Geom) -> Option<usize> {
+    match geom.attachment() {
+        GeomAttach::Body(body) => Some(body),
+        GeomAttach::Static | GeomAttach::Link(_, _) => None,
+    }
+}
 
 /// Which narrow-phase dispatch to use when enumerating contacts. Penalty
 /// keeps the legacy vertex-vs-face primary for box-box pairs. The solver

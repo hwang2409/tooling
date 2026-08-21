@@ -1,4 +1,5 @@
 use super::*;
+use crate::math::Quat;
 
 const MULTI_FEATURE_CAP: usize = 16;
 
@@ -12,15 +13,22 @@ pub(super) fn shape<'a>(
     meshes: &'a [ConvexMesh],
 ) -> Option<CcdShape<'a>> {
     match *shape {
+        GeomShape::Sphere { radius } => Some(CcdShape::Sphere { pose, radius }),
+        GeomShape::Box { half_extents } => Some(CcdShape::Box { pose, half_extents }),
+        GeomShape::Capsule {
+            radius,
+            half_height,
+        } => Some(CcdShape::Capsule {
+            pose,
+            radius,
+            half_height,
+        }),
         GeomShape::Mesh { mesh_id } => Some(CcdShape::Mesh {
             pose,
             mesh: &meshes[mesh_id],
         }),
         GeomShape::Plane
         | GeomShape::Hfield { .. }
-        | GeomShape::Sphere { .. }
-        | GeomShape::Box { .. }
-        | GeomShape::Capsule { .. }
         | GeomShape::Cylinder { .. }
         | GeomShape::Ellipsoid { .. } => None,
     }
@@ -38,6 +46,19 @@ pub(super) struct CcdVertex {
 #[derive(Clone, Copy)]
 pub(super) enum CcdShape<'a> {
     Vertices(&'a [Vec3]),
+    Sphere {
+        pose: &'a GeomPose,
+        radius: f32,
+    },
+    Box {
+        pose: &'a GeomPose,
+        half_extents: Vec3,
+    },
+    Capsule {
+        pose: &'a GeomPose,
+        radius: f32,
+        half_height: f32,
+    },
     Mesh {
         pose: &'a GeomPose,
         mesh: &'a ConvexMesh,
@@ -54,25 +75,47 @@ impl CcdShape<'_> {
                     .fold(Vec3::ZERO, |sum, point| sum + point)
                     / vertices.len() as f32
             }
+            Self::Sphere { pose, .. } | Self::Box { pose, .. } | Self::Capsule { pose, .. } => {
+                pose.position
+            }
             Self::Mesh { pose, .. } => pose.position,
         }
     }
 
     fn extent(self) -> f32 {
         let vertices = match self {
-            Self::Vertices(vertices) => vertices,
+            Self::Vertices(vertices) => return vertices_extent(vertices),
+            Self::Sphere { radius, .. } => return radius * 2.0,
+            Self::Box { half_extents, .. } => return (half_extents * 2.0).length(),
+            Self::Capsule {
+                radius,
+                half_height,
+                ..
+            } => return 2.0 * (half_height + radius),
             Self::Mesh { mesh, .. } => &mesh.vertices,
         };
-        let (mut min, mut max) = (vertices[0], vertices[0]);
-        for &vertex in vertices.iter().skip(1) {
-            min.x = min.x.min(vertex.x);
-            min.y = min.y.min(vertex.y);
-            min.z = min.z.min(vertex.z);
-            max.x = max.x.max(vertex.x);
-            max.y = max.y.max(vertex.y);
-            max.z = max.z.max(vertex.z);
+        vertices_extent(vertices)
+    }
+
+    fn pivot_radius(self) -> f32 {
+        match self {
+            Self::Vertices(vertices) => vertices
+                .iter()
+                .map(|vertex| vertex.length())
+                .fold(0.0, f32::max),
+            Self::Sphere { radius, .. } => radius.abs(),
+            Self::Box { half_extents, .. } => half_extents.length(),
+            Self::Capsule {
+                radius,
+                half_height,
+                ..
+            } => radius.abs() + half_height.abs(),
+            Self::Mesh { mesh, .. } => mesh
+                .vertices
+                .iter()
+                .map(|vertex| vertex.length())
+                .fold(0.0, f32::max),
         }
-        (max - min).length()
     }
 
     pub(super) fn support(self, direction: Vec3) -> Vec3 {
@@ -87,6 +130,43 @@ impl CcdShape<'_> {
         };
         match self {
             Self::Vertices(vertices) => (support_vertices_legacy(vertices, direction), false),
+            Self::Sphere { pose, radius } => {
+                (pose.position + direction.normalize() * radius, false)
+            }
+            Self::Box { pose, half_extents } => {
+                let local = pose.orientation.inverse_rotate(direction);
+                let point = Vec3::new(
+                    if local.x >= 0.0 {
+                        half_extents.x
+                    } else {
+                        -half_extents.x
+                    },
+                    if local.y >= 0.0 {
+                        half_extents.y
+                    } else {
+                        -half_extents.y
+                    },
+                    if local.z >= 0.0 {
+                        half_extents.z
+                    } else {
+                        -half_extents.z
+                    },
+                );
+                (pose.point_to_world(point), false)
+            }
+            Self::Capsule {
+                pose,
+                radius,
+                half_height,
+            } => {
+                let axis = pose.rotate(Vec3::Z);
+                let endpoint = if direction.dot(axis) >= 0.0 {
+                    pose.position + axis * half_height
+                } else {
+                    pose.position - axis * half_height
+                };
+                (endpoint + direction.normalize() * radius, false)
+            }
             Self::Mesh { pose, mesh } => {
                 support_vertices_transformed(&mesh.vertices, pose, direction)
             }
@@ -96,6 +176,7 @@ impl CcdShape<'_> {
     fn centered_support(self, direction: Vec3) -> Option<Vec3> {
         match self {
             Self::Vertices(_) => None,
+            Self::Sphere { .. } | Self::Box { .. } | Self::Capsule { .. } => None,
             Self::Mesh { pose, mesh } => {
                 let local_direction = pose.orientation.inverse_rotate(direction);
                 support_feature_centroid(&mesh.vertices, local_direction)
@@ -103,6 +184,19 @@ impl CcdShape<'_> {
             }
         }
     }
+}
+
+fn vertices_extent(vertices: &[Vec3]) -> f32 {
+    let (mut min, mut max) = (vertices[0], vertices[0]);
+    for &vertex in vertices.iter().skip(1) {
+        min.x = min.x.min(vertex.x);
+        min.y = min.y.min(vertex.y);
+        min.z = min.z.min(vertex.z);
+        max.x = max.x.max(vertex.x);
+        max.y = max.y.max(vertex.y);
+        max.z = max.z.max(vertex.z);
+    }
+    (max - min).length()
 }
 
 fn support_vertices(vertices: &[Vec3], direction: Vec3) -> (Vec3, bool) {
@@ -1052,7 +1146,10 @@ fn ccd_epa_fallback_contact(
                 }
             }
         }
-        CcdShape::Vertices(_) => {}
+        CcdShape::Vertices(_)
+        | CcdShape::Sphere { .. }
+        | CcdShape::Box { .. }
+        | CcdShape::Capsule { .. } => {}
     }
     match shape_b {
         CcdShape::Mesh { pose, mesh } => {
@@ -1062,7 +1159,10 @@ fn ccd_epa_fallback_contact(
                 }
             }
         }
-        CcdShape::Vertices(_) => {}
+        CcdShape::Vertices(_)
+        | CcdShape::Sphere { .. }
+        | CcdShape::Box { .. }
+        | CcdShape::Capsule { .. } => {}
     }
     consider(shape_b.center() - shape_a.center());
     for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
@@ -1811,6 +1911,162 @@ pub(super) fn ccd_convex_contact(
     })
 }
 
+/// Sweep two finite convex shapes with conservative advancement.
+///
+/// GJK supplies a separating distance at each pose. The advancement bound is
+/// deliberately conservative for both translation and the shortest quaternion
+/// interpolation, so a narrow overlap window cannot be skipped.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn ccd_sweep_convex(
+    shape_a_desc: &GeomShape,
+    from_pose: &GeomPose,
+    to_pose: &GeomPose,
+    shape_b: &GeomShape,
+    pose_b: &GeomPose,
+    meshes: &[ConvexMesh],
+) -> Option<(f32, Contact)> {
+    let shape_b = shape(shape_b, pose_b, meshes)?;
+    let shape_a_from = shape(shape_a_desc, from_pose, meshes)?;
+    let translation_speed = (to_pose.position - from_pose.position).length();
+    let rotation_speed = 4.0
+        * quat_distance(from_pose.orientation, to_pose.orientation)
+        * shape_a_from.pivot_radius();
+    let max_speed = translation_speed + rotation_speed;
+    const DISTANCE_TOLERANCE: f32 = 1.0e-5;
+    const MIN_ADVANCE: f32 = 1.0e-6;
+    const MAX_STEPS: usize = 256;
+
+    let mut t = 0.0;
+    let mut closest_sample: Option<(f32, f32, Vec3, Vec3)> = None;
+    for _ in 0..MAX_STEPS {
+        let pose = interpolated_pose(from_pose, to_pose, t);
+        let shape_a = shape(shape_a_desc, &pose, meshes)?;
+        let pair_extent = shape_a.extent().max(shape_b.extent());
+        if pair_extent <= 0.0 {
+            return None;
+        }
+        let mut direction = shape_b.center() - shape_a.center();
+        if direction.length_squared() == 0.0 {
+            direction = Vec3::X;
+        }
+        let simplex = CcdSimplex::new(ccd_support_normalized(
+            shape_a,
+            shape_b,
+            direction,
+            pair_extent,
+        ));
+        let simplex = ccd_distance_gjk(shape_a, shape_b, simplex, CCD_MESH_CONFIG, pair_extent);
+        let (point_a, point_b) = ccd_closest_witness(&simplex)?;
+        let distance = (point_a - point_b).length();
+        if closest_sample.is_none_or(|sample| distance < sample.1) {
+            closest_sample = Some((t, distance, point_a, point_b));
+        }
+        if distance <= DISTANCE_TOLERANCE || max_speed <= MIN_ADVANCE {
+            let mut contact = ccd_distance_contact(
+                shape_a,
+                shape_b,
+                &simplex,
+                0,
+                0,
+                0.0,
+                DISTANCE_TOLERANCE,
+                0.0,
+            )?;
+            contact.normal_world = sweep_normal(shape_a, shape_b, point_a, point_b, distance);
+            return Some((t, contact));
+        }
+        let advance = distance / max_speed;
+        if advance < MIN_ADVANCE {
+            let mut contact = ccd_distance_contact(
+                shape_a,
+                shape_b,
+                &simplex,
+                0,
+                0,
+                0.0,
+                DISTANCE_TOLERANCE,
+                0.0,
+            )
+            .unwrap_or_else(|| ccd_near_miss_contact(point_a, point_b, distance));
+            contact.normal_world = sweep_normal(shape_a, shape_b, point_a, point_b, distance);
+            return Some((t, contact));
+        }
+        let next_t = t + advance;
+        if next_t >= 1.0 {
+            let end_pose = interpolated_pose(from_pose, to_pose, 1.0);
+            let shape_a = shape(shape_a_desc, &end_pose, meshes)?;
+            return ccd_convex_contact(shape_a, shape_b, CCD_MESH_CONFIG, 0, 0, 0.0, 0.0, 0.0)
+                .map(|contact| (1.0, contact));
+        }
+        t = next_t;
+    }
+    let (t, distance, point_a, point_b) = closest_sample?;
+    // A capped advancement is a conservative near-miss at the closest sample.
+    // Returning it keeps a valid crossing observable instead of silently losing
+    // the query when a narrow rotational window needs more than MAX_STEPS.
+    Some((t, ccd_near_miss_contact(point_a, point_b, distance)))
+}
+
+fn ccd_near_miss_contact(point_a: Vec3, point_b: Vec3, distance: f32) -> Contact {
+    Contact {
+        geom_a: 0,
+        geom_b: 0,
+        position_world: (point_a + point_b) * 0.5,
+        normal_world: if distance > 1.0e-5 {
+            (point_a - point_b) / distance
+        } else {
+            Vec3::X
+        },
+        penetration: 0.0,
+        friction: 0.0,
+        gap: 0.0,
+    }
+}
+
+fn sweep_normal(
+    shape_a: CcdShape<'_>,
+    shape_b: CcdShape<'_>,
+    point_a: Vec3,
+    point_b: Vec3,
+    distance: f32,
+) -> Vec3 {
+    if distance > 1.0e-5 {
+        return (point_a - point_b) / distance;
+    }
+    let center_delta = shape_a.center() - shape_b.center();
+    if center_delta.length_squared() > 0.0 {
+        center_delta.normalize()
+    } else {
+        Vec3::X
+    }
+}
+
+fn quat_distance(a: Quat, b: Quat) -> f32 {
+    let dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    let sign = if dot < 0.0 { -1.0 } else { 1.0 };
+    let dx = a.x - sign * b.x;
+    let dy = a.y - sign * b.y;
+    let dz = a.z - sign * b.z;
+    let dw = a.w - sign * b.w;
+    (dx * dx + dy * dy + dz * dz + dw * dw).sqrt()
+}
+
+fn interpolated_pose(from: &GeomPose, to: &GeomPose, t: f32) -> GeomPose {
+    let mut to_orientation = to.orientation;
+    if from.orientation.x * to_orientation.x
+        + from.orientation.y * to_orientation.y
+        + from.orientation.z * to_orientation.z
+        + from.orientation.w * to_orientation.w
+        < 0.0
+    {
+        to_orientation = to_orientation * -1.0;
+    }
+    GeomPose {
+        position: from.position + (to.position - from.position) * t,
+        orientation: (from.orientation * (1.0 - t) + to_orientation * t).renormalize(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn ccd_convex_contacts(
     shape_a: CcdShape<'_>,
@@ -1857,6 +2113,22 @@ fn barycentric_triangle_origin(a: Vec3, b: Vec3, c: Vec3, point: Vec3) -> (f32, 
 mod tests {
     use super::*;
 
+    fn off_pivot_cube_mesh() -> ConvexMesh {
+        ConvexMesh {
+            vertices: vec![
+                Vec3::new(-0.5, 9.5, -0.5),
+                Vec3::new(0.5, 9.5, -0.5),
+                Vec3::new(-0.5, 10.5, -0.5),
+                Vec3::new(0.5, 10.5, -0.5),
+                Vec3::new(-0.5, 9.5, 0.5),
+                Vec3::new(0.5, 9.5, 0.5),
+                Vec3::new(-0.5, 10.5, 0.5),
+                Vec3::new(0.5, 10.5, 0.5),
+            ],
+            faces: vec![],
+        }
+    }
+
     #[test]
     fn quad_reducer_selects_maximum_area_subset() {
         let mut points = [Vec3::ZERO; MULTI_CLIP_CAP];
@@ -1870,5 +2142,59 @@ mod tests {
 
         assert_eq!(selected, [0, 2, 3, 4]);
         assert!(quad_area(&points, selected) > 0.0);
+    }
+
+    #[test]
+    fn off_pivot_rotational_crossing_uses_pivot_speed() {
+        let meshes = [off_pivot_cube_mesh()];
+        let from = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let to = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::from_axis_angle(Vec3::Z, std::f32::consts::FRAC_PI_2),
+        };
+        let target = GeomPose {
+            position: Vec3::new(-7.071_068, 7.071_068, 0.0),
+            orientation: Quat::IDENTITY,
+        };
+        let result = ccd_sweep_convex(
+            &GeomShape::Mesh { mesh_id: 0 },
+            &from,
+            &to,
+            &GeomShape::Sphere { radius: 0.001 },
+            &target,
+            &meshes,
+        );
+        let (toi, _) = result.expect("off-pivot rotation should cross the target");
+        assert!((0.4..0.55).contains(&toi));
+    }
+
+    #[test]
+    fn capped_off_pivot_rotational_crossing_returns_contact() {
+        let meshes = [off_pivot_cube_mesh()];
+        let from = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let to = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::from_axis_angle(Vec3::Z, std::f32::consts::FRAC_PI_2),
+        };
+        let target = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let result = ccd_sweep_convex(
+            &GeomShape::Mesh { mesh_id: 0 },
+            &from,
+            &to,
+            &GeomShape::Sphere { radius: 84.9 },
+            &target,
+            &meshes,
+        );
+        let (_, contact) = result.expect("capped rotational crossing should remain observable");
+        assert_eq!(contact.penetration, 0.0);
     }
 }
