@@ -709,7 +709,17 @@ fn solve_free_bodies_diag_mode(
     // dv_free_lin = gravity * dt (per body), dw_free_body = 0 (approx).
     // Matches the "solve once per step with ZOH" scope note in the module
     // docs.
-    let dv_lin_free_per_body: Vec<Vec3> = (0..n_bodies).map(|_| gravity * dt).collect();
+    let dv_lin_free_per_body: Vec<Vec3> = bodies
+        .iter()
+        .map(|body| {
+            let body_gravity = if body.gravity_scale == 1.0 {
+                gravity
+            } else {
+                gravity * body.gravity_scale
+            };
+            body_gravity * dt
+        })
+        .collect();
     let dw_body_free_per_body: Vec<Vec3> = vec![Vec3::ZERO; n_bodies];
 
     // ---- Contact blocks ---------------------------------------------------

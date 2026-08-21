@@ -35,6 +35,13 @@ pub struct Body {
     pub orientation: Quat,
     /// Body-frame angular velocity.
     pub angular_velocity_body: Vec3,
+
+    /// Optional world-frame linear speed cap applied after integration.
+    pub max_linear_velocity: Option<f32>,
+    /// Optional body-frame angular speed cap applied after integration.
+    pub max_angular_velocity: Option<f32>,
+    /// Multiplier for this body's share of world gravity.
+    pub gravity_scale: f32,
 }
 
 impl Body {
@@ -53,6 +60,9 @@ impl Body {
             linear_velocity: Vec3::ZERO,
             orientation,
             angular_velocity_body: Vec3::ZERO,
+            max_linear_velocity: None,
+            max_angular_velocity: None,
+            gravity_scale: 1.0,
         }
     }
 
