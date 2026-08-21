@@ -341,40 +341,85 @@ mod tests {
 
     #[test]
     fn label_hides_no_call_after_it() {
-        assert_eq!(methods("'outer: loop { x.sin(); break 'outer; }").len(), 1);
+        assert_eq!(
+            methods("'outer: loop {\n    x.sin();\n    break 'outer;\n}"),
+            vec![Match {
+                line: 2,
+                column: 6,
+                method: "sin"
+            }]
+        );
     }
 
     #[test]
     fn lifetime_hides_no_call_after_it() {
-        assert_eq!(methods("fn f<'a>(x: &'a str) { x.sin(); }").len(), 1);
+        assert_eq!(
+            methods("fn f<'a>(x: &str) { x.sin(); let _ = &'a str; }"),
+            vec![Match {
+                line: 1,
+                column: 22,
+                method: "sin"
+            }]
+        );
     }
 
     #[test]
     fn char_literal_still_hides_call() {
-        assert_eq!(methods("let c = '.'; foo.sin();").len(), 1);
-        assert_eq!(methods("let c = '\\''; foo.sin();").len(), 1);
-        assert_eq!(methods("let c = b'.'; foo.sin();").len(), 1);
-        assert_eq!(methods("let c = b'\\''; foo.sin();").len(), 1);
+        assert_eq!(
+            methods("let c = '.';\n'outer: loop { x.sin(); break 'outer; }"),
+            vec![Match {
+                line: 2,
+                column: 17,
+                method: "sin"
+            }]
+        );
     }
 
     #[test]
     fn raw_string_zero_hash_boundary() {
-        assert_eq!(methods("let s = r\"inside .sin() \"#.sin();").len(), 1);
+        assert_eq!(
+            methods("let s = r\"inside .sin() \"#.sin();"),
+            vec![Match {
+                line: 1,
+                column: 27,
+                method: "sin"
+            }]
+        );
     }
 
     #[test]
     fn raw_string_two_hash_boundary() {
+        let source = r###"let s = r##"header let filler = 1; "#.sin()
+let more = 2;
+x.sin()
+"##;
+foo.sin();
+"###;
         assert_eq!(
-            methods("let s = r##\"inside \"#.sin() .cos() \"##; foo.sin();").len(),
-            1
+            methods(source),
+            vec![Match {
+                line: 5,
+                column: 4,
+                method: "sin"
+            }]
         );
     }
 
     #[test]
     fn raw_string_five_hash_boundary() {
+        let source = r######"let s = r#####"header let filler = 1; "####.sin()
+let more = 2;
+x.sin()
+"#####;
+foo.sin();
+"######;
         assert_eq!(
-            methods("let s = r#####\"inside \"####.sin() .cos() \"#####; foo.sin();").len(),
-            1
+            methods(source),
+            vec![Match {
+                line: 5,
+                column: 4,
+                method: "sin"
+            }]
         );
     }
 
