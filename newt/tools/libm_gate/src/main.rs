@@ -156,7 +156,7 @@ fn mask_comments_and_literals(source: &str) -> String {
         } else if bytes[index] == b'r' && is_raw_string_prefix(bytes, index + 1) {
             raw_string_end(bytes, index + 1)
         } else if bytes[index] == b'b' && matches!(bytes.get(index + 1), Some(b'"' | b'\'')) {
-            let Some(end) = quoted_literal_end(bytes, index + 1) else {
+            let Some(end) = literal_end(bytes, index + 1) else {
                 index += 1;
                 continue;
             };
@@ -164,7 +164,7 @@ fn mask_comments_and_literals(source: &str) -> String {
         } else if bytes[index] == b'"' {
             quoted_literal_end(bytes, index)
         } else if bytes[index] == b'\'' {
-            let Some(end) = quoted_literal_end(bytes, index) else {
+            let Some(end) = char_literal_end(bytes, index) else {
                 index += 1;
                 continue;
             };
@@ -222,6 +222,36 @@ fn quoted_literal_end(bytes: &[u8], quote: usize) -> Option<usize> {
         }
     }
     None
+}
+
+fn literal_end(bytes: &[u8], quote: usize) -> Option<usize> {
+    if bytes[quote] == b'\'' {
+        char_literal_end(bytes, quote)
+    } else {
+        quoted_literal_end(bytes, quote)
+    }
+}
+
+fn char_literal_end(bytes: &[u8], quote: usize) -> Option<usize> {
+    let next = quote + 1;
+    if bytes.get(next) == Some(&b'\\') {
+        return quoted_literal_end(bytes, quote);
+    }
+
+    let first = *bytes.get(next)?;
+    let width = utf8_char_width(first)?;
+    let close = next + width;
+    (bytes.get(close) == Some(&b'\'')).then_some(close + 1)
+}
+
+fn utf8_char_width(first: u8) -> Option<usize> {
+    match first {
+        0x00..=0x7f => Some(1),
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
+    }
 }
 
 fn raw_string_end(bytes: &[u8], prefix_end: usize) -> Option<usize> {
@@ -307,6 +337,45 @@ mod tests {
     #[test]
     fn raw_string_with_hashes_hides_call() {
         assert!(methods("let s = r##\"\".sin()\"##;").is_empty());
+    }
+
+    #[test]
+    fn label_hides_no_call_after_it() {
+        assert_eq!(methods("'outer: loop { x.sin(); break 'outer; }").len(), 1);
+    }
+
+    #[test]
+    fn lifetime_hides_no_call_after_it() {
+        assert_eq!(methods("fn f<'a>(x: &'a str) { x.sin(); }").len(), 1);
+    }
+
+    #[test]
+    fn char_literal_still_hides_call() {
+        assert_eq!(methods("let c = '.'; foo.sin();").len(), 1);
+        assert_eq!(methods("let c = '\\''; foo.sin();").len(), 1);
+        assert_eq!(methods("let c = b'.'; foo.sin();").len(), 1);
+        assert_eq!(methods("let c = b'\\''; foo.sin();").len(), 1);
+    }
+
+    #[test]
+    fn raw_string_zero_hash_boundary() {
+        assert_eq!(methods("let s = r\"inside .sin() \"#.sin();").len(), 1);
+    }
+
+    #[test]
+    fn raw_string_two_hash_boundary() {
+        assert_eq!(
+            methods("let s = r##\"inside \"#.sin() .cos() \"##; foo.sin();").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn raw_string_five_hash_boundary() {
+        assert_eq!(
+            methods("let s = r#####\"inside \"####.sin() .cos() \"#####; foo.sin();").len(),
+            1
+        );
     }
 
     #[test]
