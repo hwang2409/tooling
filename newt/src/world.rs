@@ -47,7 +47,7 @@ use crate::geom::{
     geom_world_pose, solref_to_kc,
 };
 use crate::joint::JointKind;
-use crate::math::{Quat, Vec3};
+use crate::math::{PI, Quat, Vec3};
 pub use crate::scene_query::{RayHit, ShapeDesc, ShapeHit};
 use crate::sensor::{Sensor, SensorBank, SensorError, SensorInputs};
 use crate::solver::{
@@ -102,6 +102,71 @@ pub enum BroadPhaseMode {
     Naive,
 }
 
+/// A world-space plane represented by `normal · point + distance = 0`.
+///
+/// The normal is expected to point toward the dry side. [`Self::new`] stores
+/// a normalized plane; struct literals should use a unit normal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Plane {
+    pub normal: Vec3,
+    pub distance: f32,
+}
+
+impl Plane {
+    /// Create a plane from a normal and its signed distance from the origin.
+    pub fn new(normal: Vec3, distance: f32) -> Self {
+        let length = normal.length();
+        if length == 0.0 {
+            return Self { normal, distance };
+        }
+        Self {
+            normal: normal / length,
+            distance: distance / length,
+        }
+    }
+
+    /// Create a plane passing through `point` with outward `normal`.
+    pub fn from_point_normal(point: Vec3, normal: Vec3) -> Self {
+        let normal = normal.normalize();
+        Self::new(normal, -normal.dot(point))
+    }
+}
+
+/// Falloff applied to a radial force field.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RadialFalloff {
+    /// Keep the configured magnitude at every distance.
+    Constant,
+    /// Scale by the inverse squared distance from the field center.
+    InverseSquare,
+    /// Reach zero at `max_range` and decrease linearly before then.
+    Linear { max_range: f32 },
+}
+
+/// A force generator applied to free bodies during force accumulation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ForceField {
+    /// A mass-weighted force. Positive magnitude follows `direction`.
+    Uniform { direction: Vec3, magnitude: f32 },
+    /// A mass-weighted radial force. Positive magnitude points away from the
+    /// center; a negative magnitude points toward it.
+    Radial {
+        center: Vec3,
+        magnitude: f32,
+        falloff: RadialFalloff,
+    },
+    /// Archimedes force against a plane. Solid volume comes from attached
+    /// geoms; unsupported shapes use their world AABB volume.
+    Buoyancy {
+        plane: Plane,
+        fluid_density: f32,
+        gravity: Vec3,
+    },
+}
+
+/// Stable handle returned by [`World::add_force_field`].
+pub type ForceFieldId = usize;
+
 /// Simulation world.
 #[derive(Clone, Debug)]
 pub struct World {
@@ -112,6 +177,9 @@ pub struct World {
     pub integrator: Integrator,
     /// Uniform gravity vector applied to each body's COM after its scale.
     pub gravity: Vec3,
+    /// Optional force fields, kept in registration order. Empty by default so
+    /// scenes without fields keep the original force path.
+    force_fields: Vec<Option<ForceField>>,
     /// Global force-free penetration width for contact stabilization.
     pub penetration_slop: f32,
     /// Global magnetic field in world coordinates for magnetometer sensors.
@@ -220,6 +288,16 @@ struct BroadphaseInputs<'a> {
     swept: bool,
 }
 
+struct WorldFieldForce<'a> {
+    world: &'a World,
+}
+
+impl crate::solver::FreeBodyFieldForce for WorldFieldForce<'_> {
+    fn force(&self, body_index: usize, body: &Body) -> Vec3 {
+        self.world.force_field_force(body_index, body)
+    }
+}
+
 /// State and contacts consumed by the most recent solver phase.
 ///
 /// This is a diagnostic surface. It records the state before integration, not
@@ -288,6 +366,7 @@ impl PartialEq for World {
         self.dt == other.dt
             && self.integrator == other.integrator
             && self.gravity == other.gravity
+            && self.force_fields == other.force_fields
             && self.penetration_slop == other.penetration_slop
             && self.magnetic_field == other.magnetic_field
             && self.bodies == other.bodies
@@ -327,6 +406,7 @@ impl World {
             dt: 0.005,
             integrator: Integrator::default(),
             gravity: Vec3::new(0.0, 0.0, -9.81),
+            force_fields: Vec::new(),
             penetration_slop: 0.0,
             magnetic_field: Vec3::new(0.0, -0.5, 0.0),
             bodies: Vec::new(),
@@ -950,6 +1030,26 @@ impl World {
         let idx = self.bodies.len();
         self.bodies.push(body);
         idx
+    }
+
+    /// Register a force field and return its stable handle.
+    pub fn add_force_field(&mut self, field: ForceField) -> ForceFieldId {
+        let id = self.force_fields.len();
+        self.force_fields.push(Some(field));
+        id
+    }
+
+    /// Remove a force field. Returns `true` when `id` was active.
+    pub fn remove_force_field(&mut self, id: ForceFieldId) -> bool {
+        self.force_fields
+            .get_mut(id)
+            .and_then(Option::take)
+            .is_some()
+    }
+
+    /// Inspect an active force field by its stable handle.
+    pub fn force_field(&self, id: ForceFieldId) -> Option<&ForceField> {
+        self.force_fields.get(id).and_then(Option::as_ref)
     }
 
     /// Set a free body's pose and refresh its scene-query proxy.
@@ -1599,26 +1699,58 @@ impl World {
                         .collect();
                     (w, f)
                 }
-                SolverMode::Pgs => crate::solver::solve_free_bodies_diag(
-                    &self.bodies,
-                    &self.geoms,
-                    &free_body_contacts,
-                    &self.equalities,
-                    self.gravity,
-                    self.dt,
-                    self.solver.cone,
-                    self.solver.iterations,
-                ),
-                SolverMode::Newton => crate::solver::solve_free_bodies_newton_diag(
-                    &self.bodies,
-                    &self.geoms,
-                    &free_body_contacts,
-                    &self.equalities,
-                    self.gravity,
-                    self.dt,
-                    self.solver.cone,
-                    self.solver.iterations,
-                ),
+                SolverMode::Pgs if self.force_fields.is_empty() => {
+                    crate::solver::solve_free_bodies_diag(
+                        &self.bodies,
+                        &self.geoms,
+                        &free_body_contacts,
+                        &self.equalities,
+                        self.gravity,
+                        self.dt,
+                        self.solver.cone,
+                        self.solver.iterations,
+                    )
+                }
+                SolverMode::Pgs => {
+                    let field_force = WorldFieldForce { world: self };
+                    crate::solver::solve_free_bodies_diag_with_field(
+                        &self.bodies,
+                        &self.geoms,
+                        &free_body_contacts,
+                        &self.equalities,
+                        self.gravity,
+                        self.dt,
+                        self.solver.cone,
+                        self.solver.iterations,
+                        &field_force,
+                    )
+                }
+                SolverMode::Newton if self.force_fields.is_empty() => {
+                    crate::solver::solve_free_bodies_newton_diag(
+                        &self.bodies,
+                        &self.geoms,
+                        &free_body_contacts,
+                        &self.equalities,
+                        self.gravity,
+                        self.dt,
+                        self.solver.cone,
+                        self.solver.iterations,
+                    )
+                }
+                SolverMode::Newton => {
+                    let field_force = WorldFieldForce { world: self };
+                    crate::solver::solve_free_bodies_newton_diag_with_field(
+                        &self.bodies,
+                        &self.geoms,
+                        &free_body_contacts,
+                        &self.equalities,
+                        self.gravity,
+                        self.dt,
+                        self.solver.cone,
+                        self.solver.iterations,
+                        &field_force,
+                    )
+                }
             };
 
         // Keep one original-indexed tree contact list. The solver solution
@@ -2113,7 +2245,7 @@ impl World {
             })
             .collect();
         let mut wrenches = match self.solver.mode {
-            SolverMode::Pgs => solve_free_bodies(
+            SolverMode::Pgs if self.force_fields.is_empty() => solve_free_bodies(
                 state,
                 &self.geoms,
                 &free_contacts,
@@ -2123,16 +2255,48 @@ impl World {
                 self.solver.cone,
                 self.solver.iterations,
             ),
-            SolverMode::Newton => crate::solver::solve_free_bodies_newton(
-                state,
-                &self.geoms,
-                &free_contacts,
-                &self.equalities,
-                self.gravity,
-                self.dt,
-                self.solver.cone,
-                self.solver.iterations,
-            ),
+            SolverMode::Pgs => {
+                let field_force = WorldFieldForce { world: self };
+                crate::solver::solve_free_bodies_diag_with_field(
+                    state,
+                    &self.geoms,
+                    &free_contacts,
+                    &self.equalities,
+                    self.gravity,
+                    self.dt,
+                    self.solver.cone,
+                    self.solver.iterations,
+                    &field_force,
+                )
+                .0
+            }
+            SolverMode::Newton if self.force_fields.is_empty() => {
+                crate::solver::solve_free_bodies_newton(
+                    state,
+                    &self.geoms,
+                    &free_contacts,
+                    &self.equalities,
+                    self.gravity,
+                    self.dt,
+                    self.solver.cone,
+                    self.solver.iterations,
+                )
+            }
+            SolverMode::Newton => {
+                let field_force = WorldFieldForce { world: self };
+                crate::solver::solve_free_bodies_newton_diag_with_field(
+                    state,
+                    &self.geoms,
+                    &free_contacts,
+                    &self.equalities,
+                    self.gravity,
+                    self.dt,
+                    self.solver.cone,
+                    self.solver.iterations,
+                    &field_force,
+                )
+                .0
+            }
             SolverMode::Penalty => unreachable!("penalty does not call compute_solver_wrenches"),
         };
         // Mocap contacts are kinematic rows in the shared tree solve. Their
@@ -2258,18 +2422,35 @@ impl World {
             Integrator::Euler => Some(false),
             Integrator::ImplicitFast => Some(true),
         };
-        crate::solver::solve_tree_contacts(
-            &self.bodies,
-            &self.trees,
-            &self.geoms,
-            tree_contacts,
-            self.gravity,
-            self.dt,
-            self.solver.cone,
-            self.solver.iterations,
-            use_newton,
-            tree_implicit,
-        )
+        if self.force_fields.is_empty() {
+            crate::solver::solve_tree_contacts(
+                &self.bodies,
+                &self.trees,
+                &self.geoms,
+                tree_contacts,
+                self.gravity,
+                self.dt,
+                self.solver.cone,
+                self.solver.iterations,
+                use_newton,
+                tree_implicit,
+            )
+        } else {
+            let field_force = WorldFieldForce { world: self };
+            crate::solver::solve_tree_contacts_with_field(
+                &self.bodies,
+                &self.trees,
+                &self.geoms,
+                tree_contacts,
+                self.gravity,
+                self.dt,
+                self.solver.cone,
+                self.solver.iterations,
+                use_newton,
+                tree_implicit,
+                &field_force,
+            )
+        }
     }
 
     /// Compute per-body external wrench arrays for a given body-state vector.
@@ -2296,6 +2477,7 @@ impl World {
             apply_contact_wrench(&mut out, state, &self.geoms, contact);
         }
         self.apply_mocap_wrenches_from_pairs(&mut out, state, pairs);
+        self.apply_force_fields(state, &mut out);
         out
     }
 
@@ -2303,6 +2485,7 @@ impl World {
         let n = state.len();
         let mut out = vec![(Vec3::ZERO, Vec3::ZERO); n];
         if self.geoms.is_empty() {
+            self.apply_force_fields(state, &mut out);
             return out;
         }
         for c in contacts {
@@ -2314,7 +2497,122 @@ impl World {
             apply_contact_wrench(&mut out, state, &self.geoms, c);
         }
         self.apply_mocap_wrenches_from_contacts(&mut out, state, contacts);
+        self.apply_force_fields(state, &mut out);
         out
+    }
+
+    fn apply_force_fields(&self, state: &[Body], out: &mut [(Vec3, Vec3)]) {
+        if self.force_fields.is_empty() {
+            return;
+        }
+        for (body_idx, body) in state.iter().enumerate() {
+            out[body_idx].0 += self.force_field_force(body_idx, body);
+        }
+    }
+
+    fn force_field_force(&self, body_idx: usize, body: &Body) -> Vec3 {
+        let mut force = Vec3::ZERO;
+        for field in self.force_fields.iter().flatten() {
+            force += match *field {
+                ForceField::Uniform {
+                    direction,
+                    magnitude,
+                } => direction.normalize() * (magnitude * body.mass),
+                ForceField::Radial {
+                    center,
+                    magnitude,
+                    falloff,
+                } => {
+                    let to_body = body.position - center;
+                    let distance_squared = to_body.length_squared();
+                    let scale = match falloff {
+                        RadialFalloff::Constant => 1.0,
+                        RadialFalloff::InverseSquare => 1.0 / distance_squared.max(1.0e-6),
+                        RadialFalloff::Linear { max_range } if max_range > 0.0 => {
+                            (1.0 - to_body.length() / max_range).max(0.0)
+                        }
+                        RadialFalloff::Linear { .. } => 0.0,
+                    };
+                    to_body.normalize() * (magnitude * scale * body.mass)
+                }
+                ForceField::Buoyancy {
+                    plane,
+                    fluid_density,
+                    gravity,
+                } => self.buoyancy_force(body_idx, body, plane, fluid_density, gravity),
+            };
+        }
+        force
+    }
+
+    fn buoyancy_force(
+        &self,
+        body_idx: usize,
+        body: &Body,
+        plane: Plane,
+        fluid_density: f32,
+        gravity: Vec3,
+    ) -> Vec3 {
+        let normal_length = plane.normal.length();
+        if normal_length == 0.0 {
+            return Vec3::ZERO;
+        }
+        let distance = |point: Vec3| (plane.normal.dot(point) + plane.distance) / normal_length;
+        let signed_distance = distance(body.position);
+        let mut submerged_volume = 0.0;
+        for geom in &self.geoms {
+            if !matches!(geom.attachment(), GeomAttach::Body(index) if index == body_idx) {
+                continue;
+            }
+            let pose = geom_world_pose(geom, body.position, body.orientation);
+            let Some((volume, radius)) = self.geom_volume_radius(geom, &pose) else {
+                continue;
+            };
+            if radius == 0.0 || volume == 0.0 {
+                continue;
+            }
+            let submerged_fraction = if signed_distance > radius {
+                0.0
+            } else if signed_distance < -radius {
+                1.0
+            } else {
+                (radius - signed_distance) / (2.0 * radius)
+            };
+            submerged_volume += volume * submerged_fraction;
+        }
+        -gravity * (fluid_density * submerged_volume)
+    }
+
+    fn geom_volume_radius(&self, geom: &Geom, pose: &GeomPose) -> Option<(f32, f32)> {
+        match geom.shape {
+            GeomShape::Plane => None,
+            GeomShape::Sphere { radius } => {
+                Some(((4.0 / 3.0) * PI * radius * radius * radius, radius))
+            }
+            GeomShape::Box { half_extents } => Some((
+                8.0 * half_extents.x * half_extents.y * half_extents.z,
+                half_extents.length(),
+            )),
+            GeomShape::Capsule {
+                radius,
+                half_height,
+            } => Some((
+                PI * radius * radius * (2.0 * half_height)
+                    + (4.0 / 3.0) * PI * radius * radius * radius,
+                half_height + radius,
+            )),
+            GeomShape::Cylinder { .. }
+            | GeomShape::Ellipsoid { .. }
+            | GeomShape::Mesh { .. }
+            | GeomShape::Hfield { .. } => {
+                let aabb = geom_aabb(geom, pose, &self.meshes, &self.hfields);
+                let half_extents = (aabb.max - aabb.min) * 0.5;
+                Some((
+                    8.0 * half_extents.x * half_extents.y * half_extents.z,
+                    half_extents.length(),
+                ))
+            }
+        }
     }
 
     fn apply_mocap_wrenches_from_contacts(

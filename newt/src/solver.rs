@@ -490,6 +490,10 @@ struct BodyDelta {
     dw_ang_body: Vec3,
 }
 
+pub(crate) trait FreeBodyFieldForce {
+    fn force(&self, body_index: usize, body: &Body) -> Vec3;
+}
+
 /// PGS solve for the free-body pool.
 ///
 /// Inputs:
@@ -503,12 +507,12 @@ struct BodyDelta {
 ///   apply to bodies in this pool. `JointCoupling` equalities are filtered
 ///   out here (they run in [`solve_tree_limits`] instead).
 /// - `gravity`, `dt` — for computing `qdot_free` (Euler forward with
-///   gravity + gyroscopic acceleration over one dt).
+///   gravity, field acceleration, and gyroscopic acceleration over one dt).
 /// - `cone`, `iterations` — world solver config.
 ///
 /// Returns per-body `(force_world, torque_world_at_com)` to be held constant
 /// (ZOH) across the RK4 stages. Bodies not touched by any constraint receive
-/// `(ZERO, ZERO)`.
+/// `(ZERO, ZERO)` unless a field force callback supplies a force.
 ///
 /// # Row ordering (deterministic total order)
 ///
@@ -578,7 +582,36 @@ pub fn solve_free_bodies_diag(
     iterations: u32,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     solve_free_bodies_diag_mode(
-        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, false, None, None,
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, false, None, None, None,
+    )
+}
+
+/// Diagnostic PGS solve with an additional deterministic force callback.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_free_bodies_diag_with_field(
+    bodies: &[Body],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    equalities: &[Equality],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+    field_force: &dyn FreeBodyFieldForce,
+) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
+    solve_free_bodies_diag_mode(
+        bodies,
+        geoms,
+        contacts,
+        equalities,
+        gravity,
+        dt,
+        cone,
+        iterations,
+        false,
+        None,
+        None,
+        Some(field_force),
     )
 }
 
@@ -597,7 +630,36 @@ pub fn solve_free_bodies_newton_diag(
     iterations: u32,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     solve_free_bodies_diag_mode(
-        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, true, None, None,
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, true, None, None, None,
+    )
+}
+
+/// Diagnostic Newton solve with an additional deterministic force callback.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_free_bodies_newton_diag_with_field(
+    bodies: &[Body],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    equalities: &[Equality],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+    field_force: &dyn FreeBodyFieldForce,
+) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
+    solve_free_bodies_diag_mode(
+        bodies,
+        geoms,
+        contacts,
+        equalities,
+        gravity,
+        dt,
+        cone,
+        iterations,
+        true,
+        None,
+        None,
+        Some(field_force),
     )
 }
 
@@ -628,6 +690,7 @@ pub fn solve_free_bodies_newton_trace(
         iterations,
         true,
         Some(&mut trace),
+        None,
         None,
     );
     trace
@@ -669,6 +732,7 @@ pub fn diagnose_free_body_contact_rows(
         false,
         None,
         Some(&mut diagnostics),
+        None,
     );
     diagnostics
 }
@@ -686,12 +750,18 @@ fn solve_free_bodies_diag_mode(
     use_newton: bool,
     newton_cost_trace: Option<&mut Vec<f32>>,
     mut row_diagnostics: Option<&mut Vec<ConstraintRowDiagnostic>>,
+    field_force: Option<&dyn FreeBodyFieldForce>,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     if use_newton && cone == ConeKind::Elliptic {
         panic!("{NEWTON_ELLIPTIC_ERROR}");
     }
     let n_bodies = bodies.len();
     let mut wrenches = vec![(Vec3::ZERO, Vec3::ZERO); n_bodies];
+    if let Some(field_force) = field_force {
+        for (index, body) in bodies.iter().enumerate() {
+            wrenches[index].0 = field_force.force(index, body);
+        }
+    }
     let mut contact_normal_forces = vec![0.0f32; contacts.len()];
     let has_free_eq = equalities.iter().any(|e| e.is_free_body());
     if (contacts.is_empty() && !has_free_eq) || dt <= 0.0 {
@@ -702,22 +772,26 @@ fn solve_free_bodies_diag_mode(
     let mut per_contact: Vec<PerContact> = Vec::with_capacity(contacts.len());
     let mut per_equality: Vec<PerEquality> = Vec::new();
 
-    // Precompute free (Euler) velocity offset from gravity ONLY. Gyroscopic
+    // Precompute free (Euler) velocity offset from gravity and fields.
     // torque affects angular velocity but is small over dt=5ms in our
     // tests and complicates b assembly; we fold it into ZOH via
     // world.step's later stages. For qdot_free within a single step:
-    // dv_free_lin = gravity * dt (per body), dw_free_body = 0 (approx).
+    // dv_free_lin = (gravity + field_force / mass) * dt, dw_free_body = 0
+    // (approx).
     // Matches the "solve once per step with ZOH" scope note in the module
     // docs.
     let dv_lin_free_per_body: Vec<Vec3> = bodies
         .iter()
-        .map(|body| {
+        .enumerate()
+        .map(|(index, body)| {
             let body_gravity = if body.gravity_scale == 1.0 {
                 gravity
             } else {
                 gravity * body.gravity_scale
             };
-            body_gravity * dt
+            let field_acceleration =
+                field_force.map_or(Vec3::ZERO, |force| force.force(index, body) / body.mass);
+            (body_gravity + field_acceleration) * dt
         })
         .collect();
     let dw_body_free_per_body: Vec<Vec3> = vec![Vec3::ZERO; n_bodies];
@@ -2568,6 +2642,65 @@ pub fn solve_tree_contacts(
     use_newton: bool,
     tree_implicit: Option<bool>,
 ) -> TreeContactSolution {
+    solve_tree_contacts_mode(
+        bodies,
+        trees,
+        geoms,
+        contacts,
+        gravity,
+        dt,
+        cone,
+        iterations,
+        use_newton,
+        tree_implicit,
+        None,
+    )
+}
+
+/// Tree-contact solve with an additional deterministic force callback.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_tree_contacts_with_field(
+    bodies: &[Body],
+    trees: &[Tree],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+    use_newton: bool,
+    tree_implicit: Option<bool>,
+    field_force: &dyn FreeBodyFieldForce,
+) -> TreeContactSolution {
+    solve_tree_contacts_mode(
+        bodies,
+        trees,
+        geoms,
+        contacts,
+        gravity,
+        dt,
+        cone,
+        iterations,
+        use_newton,
+        tree_implicit,
+        Some(field_force),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_tree_contacts_mode(
+    bodies: &[Body],
+    trees: &[Tree],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+    use_newton: bool,
+    tree_implicit: Option<bool>,
+    field_force: Option<&dyn FreeBodyFieldForce>,
+) -> TreeContactSolution {
     let mut solution = TreeContactSolution {
         contacts: contacts.to_vec(),
         row_to_contact: Vec::new(),
@@ -2780,6 +2913,7 @@ pub fn solve_tree_contacts(
                 trees,
                 gravity,
                 dt,
+                field_force,
             );
             let position = if (cone == ConeKind::Pyramidal && block.condim == 3) || row_offset == 0
             {
@@ -3144,6 +3278,7 @@ fn world_free_velocity(
     trees: &[Tree],
     gravity: Vec3,
     dt: f32,
+    field_force: Option<&dyn FreeBodyFieldForce>,
 ) -> f32 {
     row.components
         .iter()
@@ -3154,7 +3289,11 @@ fn world_free_velocity(
                 } else {
                     gravity * bodies[body.index].gravity_scale
                 };
-                body.linear.dot(body_gravity * dt)
+                let body_field_force = field_force.map_or(Vec3::ZERO, |force| {
+                    force.force(body.index, &bodies[body.index])
+                });
+                body.linear
+                    .dot((body_gravity + body_field_force / bodies[body.index].mass) * dt)
             });
             let tree_velocity = component.tree.as_ref().map_or(0.0, |tree| {
                 if tree_is_mocap(tree.index, trees) {
@@ -3394,7 +3533,7 @@ fn world_pgs_pair(
     }
 }
 
-/// Contribution of the "free evolution" (gravity + gyroscopic) step to
+/// Contribution of the "free evolution" (gravity + field + gyroscopic) step to
 /// `J_i · qdot_free`. Uses only the free linear velocity delta because our
 /// scope drops gyroscopic within one step (see the qdot_free note in
 /// [`solve_free_bodies`]).
