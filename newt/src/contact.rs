@@ -103,6 +103,8 @@ pub struct Contact {
     /// gap makes the primitive fire contacts (useful for sensing) without
     /// applying force until they overlap more than `gap`. Zero by default.
     pub gap: f32,
+    /// Stable narrow-phase feature pair that produced this contact.
+    pub feature_id: (u16, u16),
 }
 
 /// Small stack-allocated buffer for per-pair contact output. Four is enough
@@ -139,6 +141,7 @@ impl ContactBuf {
             penetration: 0.0,
             friction: 0.0,
             gap: 0.0,
+            feature_id: (0, 0),
         };
         Self {
             contacts: [placeholder; 4],
@@ -295,6 +298,7 @@ pub fn sphere_plane(
             penetration: margin - raw_dist,
             friction,
             gap,
+            feature_id: (0, 0),
         });
     }
     out
@@ -356,6 +360,7 @@ pub fn box_plane(
             penetration: margin - raw_dist,
             friction,
             gap,
+            feature_id: (i as u16, 0),
         });
     }
     out
@@ -383,7 +388,7 @@ pub fn capsule_plane(
         capsule_pose.position - axis_world * half_height,
     ];
     let mut out = ContactBuf::new();
-    for &e in ends.iter() {
+    for (i, &e) in ends.iter().enumerate() {
         let signed = (e - p0).dot(n);
         let raw_dist = signed - radius;
         if raw_dist <= margin {
@@ -396,6 +401,7 @@ pub fn capsule_plane(
                 penetration: margin - raw_dist,
                 friction,
                 gap,
+                feature_id: (i as u16, 0),
             });
         }
     }
@@ -463,6 +469,7 @@ fn sphere_vs_sphere_at(
         penetration: pen,
         friction,
         gap,
+        feature_id: (0, 0),
     });
     out
 }
@@ -627,23 +634,30 @@ fn box_box_vertex_face(
         -fallback
     };
 
-    // Candidate contacts: (penetration, position_world, normal_world). Up to
-    // 16 (8 vertices from each side); the caller keeps 4 deepest.
-    let mut candidates: [(f32, Vec3, Vec3); 16] = [(0.0, Vec3::ZERO, Vec3::Z); 16];
+    // Candidate contacts: (penetration, position_world, normal_world,
+    // feature-pair). Up to 16 (8 vertices from each side); the caller keeps
+    // 4 deepest.
+    let mut candidates: [(f32, Vec3, Vec3, (u16, u16)); 16] =
+        [(0.0, Vec3::ZERO, Vec3::Z, (0, 0)); 16];
     let mut count = 0usize;
 
     // A's vertices in B — normal is B's out-normal along `dir_b` (from B into A).
     // Project onto B's surface (contact convention: `position_world` sits on
     // B). Moving `world_v` by `+pen` along the out-normal takes it from
     // inside B onto B's face.
-    for &(sx, sy, sz) in &CORNER_SIGNS {
+    for (vertex_id, &(sx, sy, sz)) in CORNER_SIGNS.iter().enumerate() {
         let local_a = Vec3::new(sx * half_a.x, sy * half_a.y, sz * half_a.z);
         let world_v = pose_a.point_to_world(local_a);
         let local_b = pose_b.orientation.inverse_rotate(world_v - pose_b.position);
         if let Some((pen, normal_local_b)) = face_along_direction(local_b, half_b, dir_b) {
             let normal_world = pose_b.rotate(normal_local_b);
             let position_on_b_surface = world_v + normal_world * pen;
-            candidates[count] = (pen, position_on_b_surface, normal_world);
+            candidates[count] = (
+                pen,
+                position_on_b_surface,
+                normal_world,
+                (vertex_id as u16, box_face_id(normal_local_b)),
+            );
             count += 1;
         }
     }
@@ -651,13 +665,18 @@ fn box_box_vertex_face(
     // flipped to satisfy the "from B into A" convention. Here `world_v` is
     // already a corner of B — it sits on B's surface — so it needs no
     // projection to obey the convention.
-    for &(sx, sy, sz) in &CORNER_SIGNS {
+    for (vertex_id, &(sx, sy, sz)) in CORNER_SIGNS.iter().enumerate() {
         let local_b = Vec3::new(sx * half_b.x, sy * half_b.y, sz * half_b.z);
         let world_v = pose_b.point_to_world(local_b);
         let local_a = pose_a.orientation.inverse_rotate(world_v - pose_a.position);
         if let Some((pen, normal_local_a)) = face_along_direction(local_a, half_a, dir_a) {
             let normal_world = -pose_a.rotate(normal_local_a);
-            candidates[count] = (pen, world_v, normal_world);
+            candidates[count] = (
+                pen,
+                world_v,
+                normal_world,
+                (box_face_id(normal_local_a), vertex_id as u16),
+            );
             count += 1;
         }
     }
@@ -674,7 +693,7 @@ fn box_box_vertex_face(
     let take = if count > 4 { 4 } else { count };
     let mut out = ContactBuf::new();
     for &i in &order[..take] {
-        let (pen_raw, pos, normal) = candidates[i];
+        let (pen_raw, pos, normal, feature_id) = candidates[i];
         // Shift by margin — pen_raw is the true overlap depth; the reported
         // penetration is `pen_raw + margin` per the module contract.
         out.push(Contact {
@@ -685,6 +704,7 @@ fn box_box_vertex_face(
             penetration: pen_raw + margin,
             friction,
             gap,
+            feature_id,
         });
     }
     out
@@ -896,6 +916,8 @@ fn box_box_edge_edge_contact(
     let eb0 = edge_b_midpoint - edge_b_dir * b_len;
     let eb1 = edge_b_midpoint + edge_b_dir * b_len;
     let (_pa, pb) = closest_points_on_segments(ea0, ea1, eb0, eb1);
+    let edge_a_id = box_edge_id(ai, edge_a_midpoint, center_a, ax, ha);
+    let edge_b_id = box_edge_id(bj, edge_b_midpoint, center_b, bx, hb);
     let mut out = ContactBuf::new();
     out.push(Contact {
         geom_a: idx_a,
@@ -905,8 +927,44 @@ fn box_box_edge_edge_contact(
         penetration: pen_shift,
         friction,
         gap,
+        feature_id: (edge_a_id, edge_b_id),
     });
     out
+}
+
+fn box_face_id(normal: Vec3) -> u16 {
+    let axis = if normal.x.abs() >= normal.y.abs() && normal.x.abs() >= normal.z.abs() {
+        0
+    } else if normal.y.abs() >= normal.z.abs() {
+        1
+    } else {
+        2
+    };
+    let signed_component = match axis {
+        0 => normal.x,
+        1 => normal.y,
+        _ => normal.z,
+    };
+    200 + (axis as u16) * 2 + u16::from(signed_component >= 0.0)
+}
+
+fn box_edge_id(
+    axis: usize,
+    midpoint: Vec3,
+    center: Vec3,
+    basis: &[Vec3; 3],
+    half: &[f32; 3],
+) -> u16 {
+    let local = [
+        (midpoint - center).dot(basis[0]) / half[0].max(f32::EPSILON),
+        (midpoint - center).dot(basis[1]) / half[1].max(f32::EPSILON),
+        (midpoint - center).dot(basis[2]) / half[2].max(f32::EPSILON),
+    ];
+    match axis {
+        0 => u16::from(local[1] >= 0.0) + 2 * u16::from(local[2] >= 0.0),
+        1 => 4 + u16::from(local[0] >= 0.0) + 2 * u16::from(local[2] >= 0.0),
+        _ => 8 + u16::from(local[0] >= 0.0) + 2 * u16::from(local[1] >= 0.0),
+    }
 }
 
 /// Emit up to 4 reference-face-clipped contacts for a face-normal SAT
@@ -986,6 +1044,8 @@ fn box_box_face_reference_contacts(
     }
     let inc_face_normal_axis = inc_basis[inc_axis_idx];
     let inc_face_center = inc_center + inc_face_normal_axis * (inc_sign * inc_half[inc_axis_idx]);
+    let ref_face_id = 200 + (ref_axis_idx as u16) * 2 + u16::from(ref_sign >= 0.0);
+    let inc_face_id = 200 + (inc_axis_idx as u16) * 2 + u16::from(inc_sign >= 0.0);
     let (iu_idx, iv_idx) = other_two_indices(inc_axis_idx);
     let inc_u = inc_basis[iu_idx];
     let inc_v = inc_basis[iv_idx];
@@ -1073,6 +1133,11 @@ fn box_box_face_reference_contacts(
             penetration: pen,
             friction,
             gap,
+            feature_id: if reference_is_a {
+                (ref_face_id, inc_face_id)
+            } else {
+                (inc_face_id, ref_face_id)
+            },
         });
     }
     out
@@ -1367,6 +1432,7 @@ pub fn cylinder_plane(
             penetration: pen,
             friction,
             gap,
+            feature_id: (0, 0),
         });
     }
     out
@@ -1416,6 +1482,7 @@ pub fn ellipsoid_plane(
             penetration: pen,
             friction,
             gap,
+            feature_id: (0, 0),
         });
     }
     out
@@ -1456,9 +1523,9 @@ pub fn mesh_plane(
             margin - (world - p0).dot(n_world)
         })
         .fold(f32::NEG_INFINITY, f32::max);
-    let mut primary: Option<(f32, f32, Vec3)> = None;
-    let mut secondary: Option<(f32, f32, Vec3)> = None;
-    for &v_local in &mesh.vertices {
+    let mut primary: Option<(f32, f32, Vec3, u16)> = None;
+    let mut secondary: Option<(f32, f32, Vec3, u16)> = None;
+    for (vertex_index, &v_local) in mesh.vertices.iter().enumerate() {
         let world = mesh_pose.point_to_world(v_local);
         let signed = (world - p0).dot(n_world);
         let pen = margin - signed;
@@ -1470,11 +1537,11 @@ pub fn mesh_plane(
             tangent_value > candidate.1
                 || (tangent_value == candidate.1 && lexicographically_precedes(world, candidate.2))
         }) {
-            primary = Some((pen, tangent_value, world));
+            primary = Some((pen, tangent_value, world, vertex_index as u16));
         }
     }
     if let Some(primary) = primary {
-        for &v_local in &mesh.vertices {
+        for (vertex_index, &v_local) in mesh.vertices.iter().enumerate() {
             let world = mesh_pose.point_to_world(v_local);
             let signed = (world - p0).dot(n_world);
             let pen = margin - signed;
@@ -1488,12 +1555,12 @@ pub fn mesh_plane(
                         || (tangent_value == prior.1 && lexicographically_precedes(world, prior.2))
                 })
             {
-                secondary = Some((pen, tangent_value, world));
+                secondary = Some((pen, tangent_value, world, vertex_index as u16));
             }
         }
     }
     let mut out = ContactBuf::new();
-    for (_, _, world) in [primary, secondary].into_iter().flatten() {
+    for (_, _, world, vertex_index) in [primary, secondary].into_iter().flatten() {
         let signed = (world - p0).dot(n_world);
         let pen = margin - signed;
         let contact_pt = world - n_world * (signed * 0.5);
@@ -1505,9 +1572,18 @@ pub fn mesh_plane(
             penetration: pen,
             friction,
             gap,
+            feature_id: (mesh_triangle_for_vertex(mesh, vertex_index), 0),
         });
     }
     out
+}
+
+fn mesh_triangle_for_vertex(mesh: &ConvexMesh, vertex_index: u16) -> u16 {
+    mesh.faces
+        .iter()
+        .position(|face| face.iter().any(|&index| index as u16 == vertex_index))
+        .unwrap_or(usize::from(vertex_index))
+        .min(u16::MAX as usize) as u16
 }
 
 /// Sphere vs cylinder (axis local Z). Closest point from sphere center to
@@ -1612,6 +1688,7 @@ pub fn sphere_cylinder(
         penetration: pen,
         friction,
         gap,
+        feature_id: (0, 0),
     });
     out
 }
@@ -1715,6 +1792,7 @@ pub fn sphere_ellipsoid(
         penetration: pen,
         friction,
         gap,
+        feature_id: (0, 0),
     });
     out
 }
@@ -1740,7 +1818,8 @@ pub fn sphere_mesh(
         .inverse_rotate(sphere_pose.position - mesh_pose.position);
     let mut best_dist2 = f32::INFINITY;
     let mut best_point_local = Vec3::ZERO;
-    for face in &mesh.faces {
+    let mut best_face_index = 0usize;
+    for (face_index, face) in mesh.faces.iter().enumerate() {
         let v0 = mesh.vertices[face[0] as usize];
         let v1 = mesh.vertices[face[1] as usize];
         let v2 = mesh.vertices[face[2] as usize];
@@ -1749,6 +1828,7 @@ pub fn sphere_mesh(
         if d2 < best_dist2 {
             best_dist2 = d2;
             best_point_local = q;
+            best_face_index = face_index;
         }
     }
     let dist = best_dist2.sqrt();
@@ -1775,6 +1855,7 @@ pub fn sphere_mesh(
         penetration: pen,
         friction,
         gap,
+        feature_id: (0, best_face_index.min(u16::MAX as usize) as u16),
     });
     out
 }
@@ -2005,6 +2086,7 @@ fn hfield_sphere_candidates(
                     penetration,
                     friction,
                     gap,
+                    feature_id: (0, 0),
                 });
             }
             for &contact in cell_contacts.as_slice() {
@@ -2142,6 +2224,7 @@ fn hfield_capsule_candidates(
                     penetration,
                     friction,
                     gap,
+                    feature_id: (0, 0),
                 });
             }
             for &contact in cell_contacts.as_slice() {
@@ -2241,7 +2324,7 @@ pub fn box_hfield(
     };
     for row in 0..hfield.nrow - 1 {
         for col in 0..hfield.ncol - 1 {
-            for prism in hfield_prisms(hfield, row, col) {
+            for (triangle, prism) in hfield_prisms(hfield, row, col).into_iter().enumerate() {
                 if let Some(mut contact) = ccd::box_prism_gjk_epa_contact(
                     &box_pose_local,
                     half_extents,
@@ -2252,6 +2335,8 @@ pub fn box_hfield(
                     margin,
                     gap,
                 ) {
+                    let cell = row * hfield.ncol.saturating_sub(1) + col;
+                    contact.feature_id.1 = (cell * 2 + triangle).min(u16::MAX as usize) as u16;
                     contact.position_world = hfield_pose.point_to_world(contact.position_world);
                     contact.normal_world = hfield_pose.rotate(contact.normal_world);
                     out.push_deepest_unique(contact);
@@ -2423,7 +2508,7 @@ pub fn narrow_phase_with_hfields(
     meshes: &[ConvexMesh],
     hfields: &[HeightField],
 ) -> ContactBuf {
-    dispatch_narrow_phase(
+    let mut contacts = dispatch_narrow_phase(
         idx_a,
         geom_a,
         pose_a,
@@ -2433,7 +2518,17 @@ pub fn narrow_phase_with_hfields(
         meshes,
         hfields,
         NarrowPhaseMode::LegacyPenalty,
-    )
+    );
+    assign_feature_ids(
+        &mut contacts,
+        geom_a,
+        pose_a,
+        geom_b,
+        pose_b,
+        meshes,
+        hfields,
+    );
+    contacts
 }
 
 /// Same shape-pair dispatch as [`narrow_phase`] but requests the
@@ -2468,7 +2563,7 @@ pub fn narrow_phase_solver_with_hfields(
     meshes: &[ConvexMesh],
     hfields: &[HeightField],
 ) -> ContactBuf {
-    dispatch_narrow_phase(
+    let mut contacts = dispatch_narrow_phase(
         idx_a,
         geom_a,
         pose_a,
@@ -2478,7 +2573,135 @@ pub fn narrow_phase_solver_with_hfields(
         meshes,
         hfields,
         NarrowPhaseMode::FullManifold,
-    )
+    );
+    assign_feature_ids(
+        &mut contacts,
+        geom_a,
+        pose_a,
+        geom_b,
+        pose_b,
+        meshes,
+        hfields,
+    );
+    contacts
+}
+
+fn assign_feature_ids(
+    contacts: &mut ContactBuf,
+    geom_a: &Geom,
+    pose_a: &GeomPose,
+    geom_b: &Geom,
+    pose_b: &GeomPose,
+    meshes: &[ConvexMesh],
+    hfields: &[HeightField],
+) {
+    let generated_features = matches!(geom_a.shape, GeomShape::Box { .. } | GeomShape::Mesh { .. })
+        || matches!(geom_b.shape, GeomShape::Box { .. } | GeomShape::Mesh { .. });
+    for contact in contacts.contacts.iter_mut().take(contacts.len) {
+        if generated_features {
+            continue;
+        }
+        contact.feature_id = (
+            feature_id_for_shape(&geom_a.shape, pose_a, contact, meshes, hfields),
+            feature_id_for_shape(&geom_b.shape, pose_b, contact, meshes, hfields),
+        );
+    }
+}
+
+fn feature_id_for_shape(
+    shape: &GeomShape,
+    pose: &GeomPose,
+    contact: &Contact,
+    meshes: &[ConvexMesh],
+    hfields: &[HeightField],
+) -> u16 {
+    let local = pose
+        .orientation
+        .inverse_rotate(contact.position_world - pose.position);
+    match *shape {
+        GeomShape::Plane | GeomShape::Sphere { .. } => 0,
+        GeomShape::Box { .. } => {
+            (if local.x >= 0.0 { 1 } else { 0 })
+                | (if local.y >= 0.0 { 2 } else { 0 })
+                | (if local.z >= 0.0 { 4 } else { 0 })
+        }
+        GeomShape::Capsule { half_height, .. } => {
+            if local.z <= -half_height {
+                0
+            } else if local.z >= half_height {
+                1
+            } else {
+                2
+            }
+        }
+        GeomShape::Cylinder { half_height, .. } => {
+            if local.z <= -half_height {
+                0
+            } else if local.z >= half_height {
+                1
+            } else {
+                2
+            }
+        }
+        GeomShape::Ellipsoid { .. } => 0,
+        GeomShape::Mesh { mesh_id } => match meshes.get(mesh_id) {
+            Some(mesh) if !mesh.faces.is_empty() => {
+                let mut best = 0usize;
+                let mut best_dist = f32::INFINITY;
+                for (index, face) in mesh.faces.iter().enumerate() {
+                    let center = (mesh.vertices[face[0] as usize]
+                        + mesh.vertices[face[1] as usize]
+                        + mesh.vertices[face[2] as usize])
+                        / 3.0;
+                    let distance = (center - local).length_squared();
+                    if distance < best_dist {
+                        best_dist = distance;
+                        best = index;
+                    }
+                }
+                if best >= u16::MAX as usize {
+                    u16::MAX
+                } else {
+                    best as u16
+                }
+            }
+            Some(mesh) => {
+                let mut best = 0usize;
+                let mut best_dist = f32::INFINITY;
+                for (index, &vertex) in mesh.vertices.iter().enumerate() {
+                    let distance = (vertex - local).length_squared();
+                    if distance < best_dist {
+                        best_dist = distance;
+                        best = index;
+                    }
+                }
+                if best >= u16::MAX as usize {
+                    u16::MAX
+                } else {
+                    best as u16
+                }
+            }
+            None => u16::MAX,
+        },
+        GeomShape::Hfield { hfield_id } => hfields
+            .get(hfield_id)
+            .map(|hfield| {
+                let width = (hfield.size[0] * 2.0).max(f32::EPSILON);
+                let height = (hfield.size[1] * 2.0).max(f32::EPSILON);
+                let col = ((local.x + hfield.size[0]) / width
+                    * (hfield.ncol.saturating_sub(1)) as f32)
+                    .floor()
+                    .max(0.0) as usize;
+                let row = ((local.y + hfield.size[1]) / height
+                    * (hfield.nrow.saturating_sub(1)) as f32)
+                    .floor()
+                    .max(0.0) as usize;
+                let cell = row.min(hfield.nrow.saturating_sub(2)) * hfield.ncol.saturating_sub(1)
+                    + col.min(hfield.ncol.saturating_sub(2));
+                (cell % u16::MAX as usize) as u16
+            })
+            .unwrap_or(u16::MAX),
+    }
 }
 
 /// Sweep a finite convex query shape through a finite convex geom.

@@ -521,6 +521,7 @@ fn tree_tree_two_contact_response_includes_the_opposite_tree() {
             penetration: 0.1,
             friction: 0.0,
             gap: 0.0,
+            feature_id: (0, 0),
         })
         .collect::<Vec<_>>();
     let solution = newt::solver::solve_tree_contacts(

@@ -94,9 +94,8 @@ const NEWTON_ELLIPTIC_ERROR: &str =
 pub struct SolverConfig {
     /// Which model to use. Default `Penalty` keeps the legacy force path.
     pub mode: SolverMode,
-    /// Fixed number of PGS sweeps per step. Higher = tighter convergence,
-    /// same runtime cost per iteration. Determinism outranks early-exit
-    /// convergence sensitivity here: we always run exactly this many.
+    /// Maximum number of PGS sweeps per step. The persistence path exits when
+    /// the largest impulse update falls below its convergence tolerance.
     pub iterations: u32,
     /// Cone parameterization. Newton currently accepts pyramidal cones only;
     /// elliptic Newton models are rejected during loading.
@@ -559,6 +558,72 @@ pub fn solve_free_bodies_newton(
     wrenches
 }
 
+/// Free-body solver output with the accumulated normal and tangent impulses
+/// for each input contact. The warm-start path uses these values next step.
+#[derive(Clone, Debug)]
+pub struct ContactSolveResult {
+    pub wrenches: Vec<(Vec3, Vec3)>,
+    pub contact_normal_forces: Vec<f32>,
+    pub contact_impulses: Vec<Vec3>,
+    pub initial_contact_impulses: Vec<Vec3>,
+    pub iterations: u32,
+}
+
+pub const PGS_CONVERGENCE_TOLERANCE: f32 = 1.0e-2;
+
+#[allow(clippy::too_many_arguments)]
+pub fn solve_free_bodies_instrumented(
+    bodies: &[Body],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    equalities: &[Equality],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+    initial_impulses: Option<&[Vec3]>,
+) -> ContactSolveResult {
+    solve_free_bodies_diag_mode(
+        bodies,
+        geoms,
+        contacts,
+        equalities,
+        gravity,
+        dt,
+        cone,
+        iterations,
+        false,
+        None,
+        None,
+        initial_impulses,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn solve_free_bodies_warm_start(
+    bodies: &[Body],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    equalities: &[Equality],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+    initial_impulses: &[Vec3],
+) -> ContactSolveResult {
+    solve_free_bodies_instrumented(
+        bodies,
+        geoms,
+        contacts,
+        equalities,
+        gravity,
+        dt,
+        cone,
+        iterations,
+        Some(initial_impulses),
+    )
+}
+
 /// Diagnostic variant of [`solve_free_bodies`]. Returns the same per-body
 /// wrenches PLUS a `Vec<f32>` with one entry per input contact: the
 /// per-contact normal force (impulse / dt) after the PGS sweep. Used by
@@ -577,9 +642,10 @@ pub fn solve_free_bodies_diag(
     cone: ConeKind,
     iterations: u32,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
-    solve_free_bodies_diag_mode(
-        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, false, None, None,
-    )
+    let result = solve_free_bodies_diag_mode(
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, false, None, None, None,
+    );
+    (result.wrenches, result.contact_normal_forces)
 }
 
 /// Diagnostic Newton variant. The normal-force output has the same shape as
@@ -596,9 +662,10 @@ pub fn solve_free_bodies_newton_diag(
     cone: ConeKind,
     iterations: u32,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
-    solve_free_bodies_diag_mode(
-        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, true, None, None,
-    )
+    let result = solve_free_bodies_diag_mode(
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, true, None, None, None,
+    );
+    (result.wrenches, result.contact_normal_forces)
 }
 
 /// Return the live Newton cost trace for one free-body constraint solve.
@@ -628,6 +695,7 @@ pub fn solve_free_bodies_newton_trace(
         iterations,
         true,
         Some(&mut trace),
+        None,
         None,
     );
     trace
@@ -669,6 +737,7 @@ pub fn diagnose_free_body_contact_rows(
         false,
         None,
         Some(&mut diagnostics),
+        None,
     );
     diagnostics
 }
@@ -686,16 +755,24 @@ fn solve_free_bodies_diag_mode(
     use_newton: bool,
     newton_cost_trace: Option<&mut Vec<f32>>,
     mut row_diagnostics: Option<&mut Vec<ConstraintRowDiagnostic>>,
-) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
+    initial_impulses: Option<&[Vec3]>,
+) -> ContactSolveResult {
     if use_newton && cone == ConeKind::Elliptic {
         panic!("{NEWTON_ELLIPTIC_ERROR}");
     }
     let n_bodies = bodies.len();
     let mut wrenches = vec![(Vec3::ZERO, Vec3::ZERO); n_bodies];
     let mut contact_normal_forces = vec![0.0f32; contacts.len()];
+    let mut contact_impulses = vec![Vec3::ZERO; contacts.len()];
     let has_free_eq = equalities.iter().any(|e| e.is_free_body());
     if (contacts.is_empty() && !has_free_eq) || dt <= 0.0 {
-        return (wrenches, contact_normal_forces);
+        return ContactSolveResult {
+            wrenches,
+            contact_normal_forces,
+            contact_impulses,
+            initial_contact_impulses: vec![Vec3::ZERO; contacts.len()],
+            iterations: 0,
+        };
     }
 
     let mut rows: Vec<ConstraintRow> = Vec::new();
@@ -833,7 +910,13 @@ fn solve_free_bodies_diag_mode(
 
     let n_rows = rows.len();
     if n_rows == 0 {
-        return (wrenches, contact_normal_forces);
+        return ContactSolveResult {
+            wrenches,
+            contact_normal_forces,
+            contact_impulses,
+            initial_contact_impulses: vec![Vec3::ZERO; contacts.len()],
+            iterations: 0,
+        };
     }
 
     // Cache I_world^-1 per body — used by row_body_diagonal /
@@ -959,6 +1042,9 @@ fn solve_free_bodies_diag_mode(
     // Newton and PGS consume the same H = J M⁻¹ Jᵀ + R and bias. This keeps
     // the solver switch a numerical method choice, not a second constraint
     // model.
+    let mut initial_contact_impulses = vec![Vec3::ZERO; contacts.len()];
+    let allow_early_exit = initial_impulses.is_some();
+    let mut performed_iterations = if use_newton { iterations } else { 0 };
     let impulses = if use_newton {
         let result = solve_free_body_newton_impulses(
             &rows,
@@ -977,7 +1063,56 @@ fn solve_free_bodies_diag_mode(
         let mut impulses = vec![0.0f32; n_rows];
         let mut body_delta = vec![BodyDelta::default(); n_bodies];
 
+        if let Some(initial) = initial_impulses {
+            for pc in &per_contact {
+                let Some(&seed) = initial.get(pc.contact_index) else {
+                    continue;
+                };
+                let start = pc.start_row as usize;
+                if cone == ConeKind::Pyramidal && pc.condim == 3 {
+                    let normal = seed.x.max(0.0) * 0.25;
+                    let tangent_1 = if pc.mu_slide > 0.0 {
+                        seed.y / (2.0 * pc.mu_slide)
+                    } else {
+                        0.0
+                    };
+                    let tangent_2 = if pc.mu_slide > 0.0 {
+                        seed.z / (2.0 * pc.mu_slide)
+                    } else {
+                        0.0
+                    };
+                    impulses[start] = (normal + tangent_1).max(0.0);
+                    impulses[start + 1] = (normal - tangent_1).max(0.0);
+                    impulses[start + 2] = (normal + tangent_2).max(0.0);
+                    impulses[start + 3] = (normal - tangent_2).max(0.0);
+                } else {
+                    impulses[start] = seed.x.max(0.0);
+                    if pc.condim >= 3 {
+                        impulses[start + 1] = seed.y;
+                        impulses[start + 2] = seed.z;
+                    }
+                }
+                for offset in 0..contact_block_n_rows(pc.condim, cone) {
+                    apply_impulse_delta(
+                        &rows[start + offset],
+                        impulses[start + offset],
+                        &mut body_delta,
+                        bodies,
+                        &inv_i_world,
+                    );
+                }
+            }
+        }
+
+        for pc in &per_contact {
+            let start = pc.start_row as usize;
+            initial_contact_impulses[pc.contact_index] =
+                contact_impulse_from_rows(&impulses, start, pc.condim, pc.mu_slide, cone);
+        }
+
         for _iter in 0..iterations {
+            performed_iterations += 1;
+            let mut max_delta = 0.0f32;
             // Contact blocks first. Row sweep order within a contact:
             //   normal → t1, t2 (sliding cone cap on impulses[n_row])
             //   → torsion (cone cap: mu_torsion · f_n)
@@ -987,16 +1122,16 @@ fn solve_free_bodies_diag_mode(
             for pc in &per_contact {
                 let n_row = pc.start_row as usize;
                 // NORMAL: half-line projection.
-                pgs_step_non_negative(
+                max_delta = max_delta.max(pgs_step_non_negative(
                     &rows,
                     n_row,
                     &mut impulses,
                     &mut body_delta,
                     bodies,
                     &inv_i_world,
-                );
+                ));
                 if cone == ConeKind::Pyramidal && pc.condim == 3 {
-                    pgs_step_pyramidal_pair(
+                    max_delta = max_delta.max(pgs_step_pyramidal_pair(
                         &rows,
                         pc.start_row as usize,
                         pc.h01_pair01,
@@ -1004,8 +1139,8 @@ fn solve_free_bodies_diag_mode(
                         &mut body_delta,
                         bodies,
                         &inv_i_world,
-                    );
-                    pgs_step_pyramidal_pair(
+                    ));
+                    max_delta = max_delta.max(pgs_step_pyramidal_pair(
                         &rows,
                         pc.start_row as usize + 2,
                         pc.h01_pair23,
@@ -1013,12 +1148,12 @@ fn solve_free_bodies_diag_mode(
                         &mut body_delta,
                         bodies,
                         &inv_i_world,
-                    );
+                    ));
                 } else if pc.condim >= 3 {
                     let cap_normal = impulses[n_row];
                     let t1 = pc.start_row as usize + 1;
                     let t2 = pc.start_row as usize + 2;
-                    pgs_step_pair_cone(
+                    max_delta = max_delta.max(pgs_step_pair_cone(
                         &rows,
                         t1,
                         t2,
@@ -1029,10 +1164,10 @@ fn solve_free_bodies_diag_mode(
                         &mut body_delta,
                         bodies,
                         &inv_i_world,
-                    );
+                    ));
                     if pc.condim >= 4 {
                         let torsion = pc.start_row as usize + 3;
-                        pgs_step_scalar_cap(
+                        max_delta = max_delta.max(pgs_step_scalar_cap(
                             &rows,
                             torsion,
                             pc.mu_torsion * cap_normal,
@@ -1040,12 +1175,12 @@ fn solve_free_bodies_diag_mode(
                             &mut body_delta,
                             bodies,
                             &inv_i_world,
-                        );
+                        ));
                     }
                     if pc.condim >= 6 {
                         let r1 = pc.start_row as usize + 4;
                         let r2 = pc.start_row as usize + 5;
-                        pgs_step_pair_cone(
+                        max_delta = max_delta.max(pgs_step_pair_cone(
                             &rows,
                             r1,
                             r2,
@@ -1056,7 +1191,7 @@ fn solve_free_bodies_diag_mode(
                             &mut body_delta,
                             bodies,
                             &inv_i_world,
-                        );
+                        ));
                     }
                 }
             }
@@ -1064,15 +1199,18 @@ fn solve_free_bodies_diag_mode(
             for pe in &per_equality {
                 for k in 0..pe.n_rows as usize {
                     let ri = pe.start_row as usize + k;
-                    pgs_step_bilateral(
+                    max_delta = max_delta.max(pgs_step_bilateral(
                         &rows,
                         ri,
                         &mut impulses,
                         &mut body_delta,
                         bodies,
                         &inv_i_world,
-                    );
+                    ));
                 }
+            }
+            if allow_early_exit && max_delta < PGS_CONVERGENCE_TOLERANCE {
+                break;
             }
         }
         impulses
@@ -1120,17 +1258,70 @@ fn solve_free_bodies_diag_mode(
     // the original contact index rather than the compact row-block index.
     for pc in &per_contact {
         let rows = contact_block_n_rows(pc.condim, cone);
-        let normal_impulse = if cone == ConeKind::Pyramidal && pc.condim == 3 {
-            (0..rows)
-                .map(|offset| impulses[pc.start_row as usize + offset])
-                .sum()
-        } else {
-            impulses[pc.start_row as usize]
-        };
+        let start = pc.start_row as usize;
+        let (normal_impulse, tangent_1, tangent_2) =
+            if cone == ConeKind::Pyramidal && pc.condim == 3 {
+                (
+                    (0..rows).map(|offset| impulses[start + offset]).sum(),
+                    pc.mu_slide * (impulses[start] - impulses[start + 1]),
+                    pc.mu_slide * (impulses[start + 2] - impulses[start + 3]),
+                )
+            } else {
+                (
+                    impulses[start],
+                    if pc.condim >= 3 {
+                        impulses[start + 1]
+                    } else {
+                        0.0
+                    },
+                    if pc.condim >= 3 {
+                        impulses[start + 2]
+                    } else {
+                        0.0
+                    },
+                )
+            };
         contact_normal_forces[pc.contact_index] = normal_impulse / dt;
+        contact_impulses[pc.contact_index] = Vec3::new(normal_impulse, tangent_1, tangent_2);
     }
 
-    (wrenches, contact_normal_forces)
+    ContactSolveResult {
+        wrenches,
+        contact_normal_forces,
+        contact_impulses,
+        initial_contact_impulses,
+        iterations: performed_iterations,
+    }
+}
+
+fn contact_impulse_from_rows(
+    impulses: &[f32],
+    start: usize,
+    condim: u8,
+    mu_slide: f32,
+    cone: ConeKind,
+) -> Vec3 {
+    if cone == ConeKind::Pyramidal && condim == 3 {
+        Vec3::new(
+            impulses[start..start + 4].iter().sum(),
+            mu_slide * (impulses[start] - impulses[start + 1]),
+            mu_slide * (impulses[start + 2] - impulses[start + 3]),
+        )
+    } else {
+        Vec3::new(
+            impulses[start],
+            if condim >= 3 {
+                impulses[start + 1]
+            } else {
+                0.0
+            },
+            if condim >= 3 {
+                impulses[start + 2]
+            } else {
+                0.0
+            },
+        )
+    }
 }
 
 /// Per-contact solver bookkeeping shared across all rows of one contact.
@@ -1279,7 +1470,7 @@ fn pgs_step_non_negative(
     body_delta: &mut [BodyDelta],
     bodies: &[Body],
     inv_i_world: &[crate::math::Mat3],
-) {
+) -> f32 {
     let residual = row_residual(&rows[ri], body_delta, bodies, inv_i_world)
         + rows[ri].reg * impulses[ri]
         + rows[ri].bias;
@@ -1289,6 +1480,7 @@ fn pgs_step_non_negative(
     delta = projected - impulses[ri];
     impulses[ri] = projected;
     apply_impulse_delta(&rows[ri], delta, body_delta, bodies, inv_i_world);
+    delta.abs()
 }
 
 /// Update one pair of opposing pyramidal facets as one 2D block.
@@ -1308,7 +1500,7 @@ fn pgs_step_pyramidal_pair(
     body_delta: &mut [BodyDelta],
     bodies: &[Body],
     inv_i_world: &[crate::math::Mat3],
-) {
+) -> f32 {
     let rj = ri + 1;
     let residual_i = row_residual(&rows[ri], body_delta, bodies, inv_i_world)
         + rows[ri].reg * impulses[ri]
@@ -1320,9 +1512,9 @@ fn pgs_step_pyramidal_pair(
     let h11 = rows[rj].diag;
     let det = h00 * h11 - h01 * h01;
     if det <= 0.0 {
-        pgs_step_non_negative(rows, ri, impulses, body_delta, bodies, inv_i_world);
-        pgs_step_non_negative(rows, rj, impulses, body_delta, bodies, inv_i_world);
-        return;
+        return pgs_step_non_negative(rows, ri, impulses, body_delta, bodies, inv_i_world).max(
+            pgs_step_non_negative(rows, rj, impulses, body_delta, bodies, inv_i_world),
+        );
     }
     let delta_i = (-residual_i * h11 + h01 * residual_j) / det;
     let delta_j = (h01 * residual_i - h00 * residual_j) / det;
@@ -1343,6 +1535,7 @@ fn pgs_step_pyramidal_pair(
     impulses[rj] = new_j;
     apply_impulse_delta(&rows[ri], applied_i, body_delta, bodies, inv_i_world);
     apply_impulse_delta(&rows[rj], applied_j, body_delta, bodies, inv_i_world);
+    applied_i.abs().max(applied_j.abs())
 }
 
 /// Scratch-buffer-reusing cross-response: fills `scratch` with the body-delta
@@ -1372,13 +1565,14 @@ fn pgs_step_bilateral(
     body_delta: &mut [BodyDelta],
     bodies: &[Body],
     inv_i_world: &[crate::math::Mat3],
-) {
+) -> f32 {
     let residual = row_residual(&rows[ri], body_delta, bodies, inv_i_world)
         + rows[ri].reg * impulses[ri]
         + rows[ri].bias;
     let delta = -residual / rows[ri].diag;
     impulses[ri] += delta;
     apply_impulse_delta(&rows[ri], delta, body_delta, bodies, inv_i_world);
+    delta.abs()
 }
 
 /// Scalar-cap PGS update: `|f| ≤ cap`. Used for torsional friction under
@@ -1393,7 +1587,7 @@ fn pgs_step_scalar_cap(
     body_delta: &mut [BodyDelta],
     bodies: &[Body],
     inv_i_world: &[crate::math::Mat3],
-) {
+) -> f32 {
     let residual = row_residual(&rows[ri], body_delta, bodies, inv_i_world)
         + rows[ri].reg * impulses[ri]
         + rows[ri].bias;
@@ -1403,6 +1597,7 @@ fn pgs_step_scalar_cap(
     delta = projected - impulses[ri];
     impulses[ri] = projected;
     apply_impulse_delta(&rows[ri], delta, body_delta, bodies, inv_i_world);
+    delta.abs()
 }
 
 /// Paired-row PGS update for a 2-DOF friction block (sliding tangents or
@@ -1421,12 +1616,13 @@ fn pgs_step_pair_cone(
     body_delta: &mut [BodyDelta],
     bodies: &[Body],
     inv_i_world: &[crate::math::Mat3],
-) {
+) -> f32 {
     match cone {
         ConeKind::Pyramidal => {
             let cap = mu * cap_normal;
-            pgs_step_scalar_cap(rows, ri1, cap, impulses, body_delta, bodies, inv_i_world);
-            pgs_step_scalar_cap(rows, ri2, cap, impulses, body_delta, bodies, inv_i_world);
+            pgs_step_scalar_cap(rows, ri1, cap, impulses, body_delta, bodies, inv_i_world).max(
+                pgs_step_scalar_cap(rows, ri2, cap, impulses, body_delta, bodies, inv_i_world),
+            )
         }
         ConeKind::Elliptic => {
             let residual1 = row_residual(&rows[ri1], body_delta, bodies, inv_i_world)
@@ -1444,6 +1640,7 @@ fn pgs_step_pair_cone(
             impulses[ri2] = proj2;
             apply_impulse_delta(&rows[ri1], delta1, body_delta, bodies, inv_i_world);
             apply_impulse_delta(&rows[ri2], delta2, body_delta, bodies, inv_i_world);
+            delta1.abs().max(delta2.abs())
         }
     }
 }
@@ -2500,6 +2697,10 @@ pub struct TreeContactSolution {
     pub tree_wrenches: Vec<crate::tree::ExternalWrenches>,
     /// Normal forces, indexed by the original input contact index.
     pub contact_normal_forces: Vec<f32>,
+    /// Accumulated normal and tangent impulses per input contact.
+    pub contact_impulses: Vec<Vec3>,
+    /// Number of PGS sweeps performed by this solve.
+    pub iterations: u32,
     /// Dense `J M⁻¹ Jᵀ` response for the compact active contact rows.
     /// Rows follow the order assembled from `contacts`.
     pub contact_response: Vec<f32>,
@@ -2568,6 +2769,64 @@ pub fn solve_tree_contacts(
     use_newton: bool,
     tree_implicit: Option<bool>,
 ) -> TreeContactSolution {
+    solve_tree_contacts_impl(
+        bodies,
+        trees,
+        geoms,
+        contacts,
+        gravity,
+        dt,
+        cone,
+        iterations,
+        use_newton,
+        tree_implicit,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn solve_tree_contacts_warm_start(
+    bodies: &[Body],
+    trees: &[Tree],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+    use_newton: bool,
+    tree_implicit: Option<bool>,
+    initial_impulses: &[Vec3],
+) -> TreeContactSolution {
+    solve_tree_contacts_impl(
+        bodies,
+        trees,
+        geoms,
+        contacts,
+        gravity,
+        dt,
+        cone,
+        iterations,
+        use_newton,
+        tree_implicit,
+        Some(initial_impulses),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_tree_contacts_impl(
+    bodies: &[Body],
+    trees: &[Tree],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+    use_newton: bool,
+    tree_implicit: Option<bool>,
+    initial_impulses: Option<&[Vec3]>,
+) -> TreeContactSolution {
     let mut solution = TreeContactSolution {
         contacts: contacts.to_vec(),
         row_to_contact: Vec::new(),
@@ -2578,6 +2837,8 @@ pub fn solve_tree_contacts(
             .map(|tree| vec![(Vec3::ZERO, Vec3::ZERO); tree.links.len()])
             .collect(),
         contact_normal_forces: vec![0.0; contacts.len()],
+        contact_impulses: vec![Vec3::ZERO; contacts.len()],
+        iterations: if use_newton { iterations } else { 0 },
         contact_response: Vec::new(),
         row_diagnostics: Vec::new(),
     };
@@ -2879,16 +3140,60 @@ pub fn solve_tree_contacts(
         .solution
     } else {
         let mut impulses = vec![0.0f32; n_rows];
-        for _ in 0..iterations {
+        if let Some(initial) = initial_impulses {
+            for block in &blocks {
+                let Some(&seed) = initial.get(block.contact_index) else {
+                    continue;
+                };
+                let start = block.start_row;
+                if cone == ConeKind::Pyramidal && block.condim == 3 {
+                    let normal = seed.x.max(0.0) * 0.25;
+                    let tangent_1 = if block.mu_slide > 0.0 {
+                        seed.y / (4.0 * block.mu_slide)
+                    } else {
+                        0.0
+                    };
+                    let tangent_2 = if block.mu_slide > 0.0 {
+                        seed.z / (4.0 * block.mu_slide)
+                    } else {
+                        0.0
+                    };
+                    impulses[start] = (normal + tangent_1).max(0.0);
+                    impulses[start + 1] = (normal - tangent_1).max(0.0);
+                    impulses[start + 2] = (normal + tangent_2).max(0.0);
+                    impulses[start + 3] = (normal - tangent_2).max(0.0);
+                } else {
+                    impulses[start] = seed.x.max(0.0);
+                    if block.condim >= 3 {
+                        impulses[start + 1] = seed.y;
+                        impulses[start + 2] = seed.z;
+                    }
+                }
+            }
+        }
+        let allow_early_exit = initial_impulses.is_some();
+        for iteration in 0..iterations {
+            solution.iterations = iteration + 1;
+            let mut max_delta = 0.0f32;
             for block in &blocks {
                 let normal = block.start_row;
-                world_pgs_non_negative(&rows, &response, normal, &mut impulses);
+                max_delta = max_delta.max(world_pgs_non_negative(
+                    &rows,
+                    &response,
+                    normal,
+                    &mut impulses,
+                ));
                 if cone == ConeKind::Pyramidal && block.condim == 3 {
                     for offset in 1..4 {
-                        world_pgs_non_negative(&rows, &response, normal + offset, &mut impulses);
+                        max_delta = max_delta.max(world_pgs_non_negative(
+                            &rows,
+                            &response,
+                            normal + offset,
+                            &mut impulses,
+                        ));
                     }
                 } else if block.condim >= 3 {
-                    world_pgs_pair(
+                    max_delta = max_delta.max(world_pgs_pair(
                         &rows,
                         &response,
                         normal + 1,
@@ -2897,18 +3202,18 @@ pub fn solve_tree_contacts(
                         impulses[normal],
                         cone,
                         &mut impulses,
-                    );
+                    ));
                     if block.condim >= 4 {
-                        world_pgs_scalar(
+                        max_delta = max_delta.max(world_pgs_scalar(
                             &rows,
                             &response,
                             normal + 3,
                             block.mu_torsion * impulses[normal],
                             &mut impulses,
-                        );
+                        ));
                     }
                     if block.condim >= 6 {
-                        world_pgs_pair(
+                        max_delta = max_delta.max(world_pgs_pair(
                             &rows,
                             &response,
                             normal + 4,
@@ -2917,9 +3222,12 @@ pub fn solve_tree_contacts(
                             impulses[normal],
                             cone,
                             &mut impulses,
-                        );
+                        ));
                     }
                 }
+            }
+            if allow_early_exit && max_delta < PGS_CONVERGENCE_TOLERANCE {
+                break;
             }
         }
         impulses
@@ -2927,14 +3235,34 @@ pub fn solve_tree_contacts(
 
     for block in &blocks {
         let row_count = contact_block_n_rows(block.condim, cone);
-        let normal_impulse = if cone == ConeKind::Pyramidal && block.condim == 3 {
-            (0..row_count)
-                .map(|offset| impulses[block.start_row + offset])
-                .sum()
+        let (normal_impulse, tangent_1, tangent_2) = if cone == ConeKind::Pyramidal
+            && block.condim == 3
+        {
+            (
+                (0..row_count)
+                    .map(|offset| impulses[block.start_row + offset])
+                    .sum(),
+                block.mu_slide * (impulses[block.start_row] - impulses[block.start_row + 1]),
+                block.mu_slide * (impulses[block.start_row + 2] - impulses[block.start_row + 3]),
+            )
         } else {
-            impulses[block.start_row]
+            (
+                impulses[block.start_row],
+                if block.condim >= 3 {
+                    impulses[block.start_row + 1]
+                } else {
+                    0.0
+                },
+                if block.condim >= 3 {
+                    impulses[block.start_row + 2]
+                } else {
+                    0.0
+                },
+            )
         };
         solution.contact_normal_forces[block.contact_index] = normal_impulse / dt;
+        solution.contact_impulses[block.contact_index] =
+            Vec3::new(normal_impulse, tangent_1, tangent_2);
     }
     for (row_index, row) in rows.iter().enumerate() {
         let force = impulses[row_index] / dt;
@@ -3341,11 +3669,13 @@ fn world_pgs_non_negative(
     response: &[f32],
     index: usize,
     impulses: &mut [f32],
-) {
+) -> f32 {
     let residual =
         world_pgs_residual(rows, response, index, impulses) + rows[index].reg * impulses[index];
-    let projected = (impulses[index] - residual / rows[index].diag).max(0.0);
+    let before = impulses[index];
+    let projected = (before - residual / rows[index].diag).max(0.0);
     impulses[index] = projected;
+    (projected - before).abs()
 }
 
 fn world_pgs_scalar(
@@ -3354,10 +3684,12 @@ fn world_pgs_scalar(
     index: usize,
     cap: f32,
     impulses: &mut [f32],
-) {
+) -> f32 {
     let residual =
         world_pgs_residual(rows, response, index, impulses) + rows[index].reg * impulses[index];
-    impulses[index] = project_pyramidal(impulses[index] - residual / rows[index].diag, cap);
+    let before = impulses[index];
+    impulses[index] = project_pyramidal(before - residual / rows[index].diag, cap);
+    (impulses[index] - before).abs()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3370,14 +3702,16 @@ fn world_pgs_pair(
     normal_impulse: f32,
     cone: ConeKind,
     impulses: &mut [f32],
-) {
+) -> f32 {
     match cone {
         ConeKind::Pyramidal => {
             let cap = mu * normal_impulse;
-            world_pgs_scalar(rows, response, index_1, cap, impulses);
-            world_pgs_scalar(rows, response, index_2, cap, impulses);
+            world_pgs_scalar(rows, response, index_1, cap, impulses)
+                .max(world_pgs_scalar(rows, response, index_2, cap, impulses))
         }
         ConeKind::Elliptic => {
+            let before_1 = impulses[index_1];
+            let before_2 = impulses[index_2];
             let residual_1 = world_pgs_residual(rows, response, index_1, impulses)
                 + rows[index_1].reg * impulses[index_1];
             let residual_2 = world_pgs_residual(rows, response, index_2, impulses)
@@ -3390,6 +3724,9 @@ fn world_pgs_pair(
             );
             impulses[index_1] = projected_1;
             impulses[index_2] = projected_2;
+            (projected_1 - before_1)
+                .abs()
+                .max((projected_2 - before_2).abs())
         }
     }
 }
