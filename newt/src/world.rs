@@ -56,7 +56,7 @@ use crate::solver::{
 use crate::tree::{
     AbaWorkspace, Tree, euler_step_with_workspace as tree_euler_step_with_workspace,
     forward_kinematics as tree_forward_kinematics,
-    forward_kinematics_into as tree_forward_kinematics_into, link_pose_nonalloc,
+    forward_kinematics_into as tree_forward_kinematics_into,
     rk4_step_with_workspace as tree_rk4_step_with_workspace,
 };
 use std::collections::HashSet;
@@ -931,6 +931,14 @@ impl World {
         idx
     }
 
+    /// Set a free body's pose and refresh its scene-query proxy.
+    pub fn set_body_pose(&mut self, body_idx: usize, position: Vec3, orientation: Quat) {
+        let body = &mut self.bodies[body_idx];
+        body.position = position;
+        body.orientation = orientation;
+        self.refresh_broadphase_for_query();
+    }
+
     /// Adds a tree and returns its stable index.
     pub fn add_tree(&mut self, tree: Tree) -> usize {
         let idx = self.trees.len();
@@ -1065,7 +1073,7 @@ impl World {
                 geom_world_pose(geom, state.position, state.orientation)
             }
             GeomAttach::Link(tree, link) => {
-                let (position, orientation) = link_pose_nonalloc(&self.trees[tree], link);
+                let (position, orientation) = self.broadphase_tree_poses[tree][link];
                 geom_world_pose(geom, position, orientation)
             }
         }
@@ -1335,6 +1343,7 @@ impl World {
     /// Set a mocap root pose by tree index.
     pub fn set_mocap_pose(&mut self, tree_idx: usize, position: Vec3, orientation: Quat) {
         self.trees[tree_idx].set_mocap_pose(position, orientation);
+        self.refresh_broadphase_for_query();
     }
 
     /// Joint-space mass matrix `M(q)` for the tree at index `tree_idx`.
@@ -1446,6 +1455,7 @@ impl World {
                 self.evaluate_sensors(&pairs);
             }
         }
+        self.refresh_broadphase_for_query();
         if uses_broadphase_buffer {
             self.broadphase_pairs = pairs;
         }

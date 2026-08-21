@@ -2113,6 +2113,22 @@ fn barycentric_triangle_origin(a: Vec3, b: Vec3, c: Vec3, point: Vec3) -> (f32, 
 mod tests {
     use super::*;
 
+    fn off_pivot_cube_mesh() -> ConvexMesh {
+        ConvexMesh {
+            vertices: vec![
+                Vec3::new(-0.5, 9.5, -0.5),
+                Vec3::new(0.5, 9.5, -0.5),
+                Vec3::new(-0.5, 10.5, -0.5),
+                Vec3::new(0.5, 10.5, -0.5),
+                Vec3::new(-0.5, 9.5, 0.5),
+                Vec3::new(0.5, 9.5, 0.5),
+                Vec3::new(-0.5, 10.5, 0.5),
+                Vec3::new(0.5, 10.5, 0.5),
+            ],
+            faces: vec![],
+        }
+    }
+
     #[test]
     fn quad_reducer_selects_maximum_area_subset() {
         let mut points = [Vec3::ZERO; MULTI_CLIP_CAP];
@@ -2126,5 +2142,59 @@ mod tests {
 
         assert_eq!(selected, [0, 2, 3, 4]);
         assert!(quad_area(&points, selected) > 0.0);
+    }
+
+    #[test]
+    fn off_pivot_rotational_crossing_uses_pivot_speed() {
+        let meshes = [off_pivot_cube_mesh()];
+        let from = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let to = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::from_axis_angle(Vec3::Z, std::f32::consts::FRAC_PI_2),
+        };
+        let target = GeomPose {
+            position: Vec3::new(-7.071_068, 7.071_068, 0.0),
+            orientation: Quat::IDENTITY,
+        };
+        let result = ccd_sweep_convex(
+            &GeomShape::Mesh { mesh_id: 0 },
+            &from,
+            &to,
+            &GeomShape::Sphere { radius: 0.001 },
+            &target,
+            &meshes,
+        );
+        let (toi, _) = result.expect("off-pivot rotation should cross the target");
+        assert!((0.4..0.55).contains(&toi));
+    }
+
+    #[test]
+    fn capped_off_pivot_rotational_crossing_returns_contact() {
+        let meshes = [off_pivot_cube_mesh()];
+        let from = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let to = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::from_axis_angle(Vec3::Z, std::f32::consts::FRAC_PI_2),
+        };
+        let target = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let result = ccd_sweep_convex(
+            &GeomShape::Mesh { mesh_id: 0 },
+            &from,
+            &to,
+            &GeomShape::Sphere { radius: 84.9 },
+            &target,
+            &meshes,
+        );
+        let (_, contact) = result.expect("capped rotational crossing should remain observable");
+        assert_eq!(contact.penetration, 0.0);
     }
 }

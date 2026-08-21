@@ -85,10 +85,36 @@ fn raycast_nearest_all_miss_max_dist_and_mask() {
 }
 
 #[test]
+fn body_pose_mutation_refreshes_query_proxy() {
+    let mut world = World::new();
+    world.gravity = Vec3::ZERO;
+    let body = world.add_body(Body::solid_sphere(
+        1.0,
+        0.5,
+        Vec3::new(10.0, 0.0, 0.0),
+        Quat::IDENTITY,
+    ));
+    world.add_geom(Geom::sphere(body, 0.5, Vec3::ZERO, 0.0));
+    let ray = Ray {
+        origin: Vec3::ZERO,
+        direction: Vec3::X,
+    };
+    assert_eq!(world.raycast(ray, 5.0, u32::MAX), None);
+
+    world.set_body_pose(body, Vec3::new(2.0, 0.0, 0.0), Quat::IDENTITY);
+
+    let hit = world
+        .raycast(ray, 5.0, u32::MAX)
+        .expect("moved body should hit");
+    assert_eq!(hit.geom_id, 0);
+    assert!((hit.t - 1.5).abs() < 1.0e-5);
+}
+
+#[test]
 fn overlap_queries_filter_and_sort_geom_ids() {
     let mut world = World::new();
     world.gravity = Vec3::ZERO;
-    for (x, group) in [(-1.5, 0x1), (-0.5, 0x2), (0.5, 0x4), (1.5, 0x8)] {
+    for (x, group) in [(0.5, 0x1), (1.5, 0x2), (-1.5, 0x4), (-0.5, 0x8)] {
         let body = world.add_body(Body::solid_sphere(
             1.0,
             0.25,
@@ -106,10 +132,10 @@ fn overlap_queries_filter_and_sort_geom_ids() {
     assert_eq!(world.overlap_sphere(Vec3::ZERO, 2.0, 0x6), vec![1, 2]);
     assert_eq!(
         world.overlap_box(
-            Aabb::new(Vec3::new(-2.0, -1.0, -1.0), Vec3::new(0.0, 1.0, 1.0)),
+            Aabb::new(Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 1.0)),
             u32::MAX
         ),
-        vec![0, 1]
+        vec![0, 3]
     );
     assert!(world.overlap_box(Aabb::UNBOUNDED, 0).is_empty());
 }

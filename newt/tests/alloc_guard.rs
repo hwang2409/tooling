@@ -1,9 +1,9 @@
 #![cfg(feature = "alloc-guard")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use newt::body::Body;
 use newt::broadphase::Ray;
@@ -17,13 +17,21 @@ use newt::world::{BroadPhaseMode, Integrator, ShapeDesc, World};
 
 struct CountingAllocator;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    static MEASURING: Cell<bool> = const { Cell::new(false) };
+}
 
 // SAFETY: each operation forwards its valid arguments to the system allocator.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        MEASURING.with(|measuring| {
+            if measuring.get() {
+                ALLOCATIONS.with(|count| count.set(count.get() + 1));
+            }
+        });
         // SAFETY: the caller provides a valid allocation layout.
         unsafe { System.alloc(layout) }
     }
@@ -34,7 +42,11 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        MEASURING.with(|measuring| {
+            if measuring.get() {
+                ALLOCATIONS.with(|count| count.set(count.get() + 1));
+            }
+        });
         // SAFETY: the pointer and layout came from this allocator.
         unsafe { System.realloc(pointer, layout, new_size) }
     }
@@ -44,11 +56,12 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL: CountingAllocator = CountingAllocator;
 
 fn reset_allocations() {
-    ALLOCATIONS.store(0, Ordering::Relaxed);
+    ALLOCATIONS.with(|count| count.set(0));
+    MEASURING.with(|measuring| measuring.set(true));
 }
 
 fn allocation_count() -> usize {
-    ALLOCATIONS.load(Ordering::Relaxed)
+    ALLOCATIONS.with(Cell::get)
 }
 
 #[test]
