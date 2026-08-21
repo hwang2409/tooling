@@ -59,7 +59,6 @@ use crate::tree::{
     forward_kinematics_into as tree_forward_kinematics_into, link_pose_nonalloc,
     rk4_step_with_workspace as tree_rk4_step_with_workspace,
 };
-use std::cell::RefCell;
 use std::collections::HashSet;
 
 #[cfg(feature = "instrumentation")]
@@ -190,12 +189,6 @@ pub struct World {
     broadphase_tree_poses: Vec<Vec<(Vec3, Quat)>>,
     #[doc(hidden)]
     broadphase_tree_velocities: Vec<Vec<(Vec3, Vec3)>>,
-    #[doc(hidden)]
-    query_broadphase: RefCell<DynamicAabbTree>,
-    #[doc(hidden)]
-    query_tree_poses: RefCell<Vec<Vec<(Vec3, Quat)>>>,
-    #[doc(hidden)]
-    query_tree_velocities: RefCell<Vec<Vec<(Vec3, Vec3)>>>,
     #[doc(hidden)]
     broadphase_reinsert_count: std::cell::Cell<u64>,
     #[doc(hidden)]
@@ -351,9 +344,6 @@ impl World {
             broadphase_pairs: Vec::new(),
             broadphase_tree_poses: Vec::new(),
             broadphase_tree_velocities: Vec::new(),
-            query_broadphase: RefCell::new(DynamicAabbTree::new()),
-            query_tree_poses: RefCell::new(Vec::new()),
-            query_tree_velocities: RefCell::new(Vec::new()),
             broadphase_reinsert_count: std::cell::Cell::new(0),
             last_broadphase_mode: BroadPhaseMode::DynamicAabbTree,
             #[cfg(feature = "instrumentation")]
@@ -1100,44 +1090,14 @@ impl World {
     where
         F: FnMut(usize) -> bool,
     {
-        let mut tree = self.query_broadphase.borrow_mut();
-        let mut tree_poses = self.query_tree_poses.borrow_mut();
-        let mut tree_velocities = self.query_tree_velocities.borrow_mut();
-        let inputs = BroadphaseInputs {
-            bodies: &self.bodies,
-            trees: &self.trees,
-            geoms: &self.geoms,
-            meshes: &self.meshes,
-            hfields: &self.hfields,
-            tree_poses: &mut tree_poses,
-            tree_velocities: &mut tree_velocities,
-            dt: self.dt,
-            swept: false,
-        };
-        Self::populate_broadphase_tree(&mut tree, inputs);
-        tree.query_aabb(bounds, callback);
+        self.broadphase.query_aabb(bounds, callback);
     }
 
     fn query_ray_candidates<F>(&self, ray: Ray, callback: F)
     where
         F: FnMut(usize) -> bool,
     {
-        let mut tree = self.query_broadphase.borrow_mut();
-        let mut tree_poses = self.query_tree_poses.borrow_mut();
-        let mut tree_velocities = self.query_tree_velocities.borrow_mut();
-        let inputs = BroadphaseInputs {
-            bodies: &self.bodies,
-            trees: &self.trees,
-            geoms: &self.geoms,
-            meshes: &self.meshes,
-            hfields: &self.hfields,
-            tree_poses: &mut tree_poses,
-            tree_velocities: &mut tree_velocities,
-            dt: self.dt,
-            swept: false,
-        };
-        Self::populate_broadphase_tree(&mut tree, inputs);
-        tree.query_ray(ray, callback);
+        self.broadphase.query_ray(ray, callback);
     }
 
     fn active_pairs(&mut self) -> Vec<(usize, usize)> {

@@ -195,6 +195,25 @@ fn warmed_scene_queries_do_not_allocate_for_links_or_meshes() {
         origin: Vec3::ZERO,
         direction: Vec3::X,
     };
+    reset_allocations();
+    let _ = world.raycast(ray, 20.0, u32::MAX);
+    assert_eq!(allocation_count(), 0);
+
+    reset_allocations();
+    let _ = world.shape_cast(
+        ShapeDesc::Sphere { radius: 0.1 },
+        newt::world::Pose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        },
+        newt::world::Pose {
+            position: Vec3::new(8.0, 0.0, 0.0),
+            orientation: Quat::IDENTITY,
+        },
+        u32::MAX,
+    );
+    assert_eq!(allocation_count(), 0);
+
     for _ in 0..4 {
         let _ = world.raycast(ray, 20.0, u32::MAX);
         let _ = world.shape_cast(

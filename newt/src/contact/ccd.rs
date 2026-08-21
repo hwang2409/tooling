@@ -97,6 +97,27 @@ impl CcdShape<'_> {
         vertices_extent(vertices)
     }
 
+    fn pivot_radius(self) -> f32 {
+        match self {
+            Self::Vertices(vertices) => vertices
+                .iter()
+                .map(|vertex| vertex.length())
+                .fold(0.0, f32::max),
+            Self::Sphere { radius, .. } => radius.abs(),
+            Self::Box { half_extents, .. } => half_extents.length(),
+            Self::Capsule {
+                radius,
+                half_height,
+                ..
+            } => radius.abs() + half_height.abs(),
+            Self::Mesh { mesh, .. } => mesh
+                .vertices
+                .iter()
+                .map(|vertex| vertex.length())
+                .fold(0.0, f32::max),
+        }
+    }
+
     pub(super) fn support(self, direction: Vec3) -> Vec3 {
         self.support_with_tie(direction).0
     }
@@ -1906,15 +1927,17 @@ pub(super) fn ccd_sweep_convex(
 ) -> Option<(f32, Contact)> {
     let shape_b = shape(shape_b, pose_b, meshes)?;
     let shape_a_from = shape(shape_a_desc, from_pose, meshes)?;
-    let extent = shape_a_from.extent();
     let translation_speed = (to_pose.position - from_pose.position).length();
-    let rotation_speed = 4.0 * quat_distance(from_pose.orientation, to_pose.orientation) * extent;
+    let rotation_speed = 4.0
+        * quat_distance(from_pose.orientation, to_pose.orientation)
+        * shape_a_from.pivot_radius();
     let max_speed = translation_speed + rotation_speed;
     const DISTANCE_TOLERANCE: f32 = 1.0e-5;
     const MIN_ADVANCE: f32 = 1.0e-6;
     const MAX_STEPS: usize = 256;
 
     let mut t = 0.0;
+    let mut closest_sample: Option<(f32, f32, Vec3, Vec3)> = None;
     for _ in 0..MAX_STEPS {
         let pose = interpolated_pose(from_pose, to_pose, t);
         let shape_a = shape(shape_a_desc, &pose, meshes)?;
@@ -1935,6 +1958,9 @@ pub(super) fn ccd_sweep_convex(
         let simplex = ccd_distance_gjk(shape_a, shape_b, simplex, CCD_MESH_CONFIG, pair_extent);
         let (point_a, point_b) = ccd_closest_witness(&simplex)?;
         let distance = (point_a - point_b).length();
+        if closest_sample.is_none_or(|sample| distance < sample.1) {
+            closest_sample = Some((t, distance, point_a, point_b));
+        }
         if distance <= DISTANCE_TOLERANCE || max_speed <= MIN_ADVANCE {
             let mut contact = ccd_distance_contact(
                 shape_a,
@@ -1960,7 +1986,8 @@ pub(super) fn ccd_sweep_convex(
                 0.0,
                 DISTANCE_TOLERANCE,
                 0.0,
-            )?;
+            )
+            .unwrap_or_else(|| ccd_near_miss_contact(point_a, point_b, distance));
             contact.normal_world = sweep_normal(shape_a, shape_b, point_a, point_b, distance);
             return Some((t, contact));
         }
@@ -1973,7 +2000,27 @@ pub(super) fn ccd_sweep_convex(
         }
         t = next_t;
     }
-    None
+    let (t, distance, point_a, point_b) = closest_sample?;
+    // A capped advancement is a conservative near-miss at the closest sample.
+    // Returning it keeps a valid crossing observable instead of silently losing
+    // the query when a narrow rotational window needs more than MAX_STEPS.
+    Some((t, ccd_near_miss_contact(point_a, point_b, distance)))
+}
+
+fn ccd_near_miss_contact(point_a: Vec3, point_b: Vec3, distance: f32) -> Contact {
+    Contact {
+        geom_a: 0,
+        geom_b: 0,
+        position_world: (point_a + point_b) * 0.5,
+        normal_world: if distance > 1.0e-5 {
+            (point_a - point_b) / distance
+        } else {
+            Vec3::X
+        },
+        penetration: 0.0,
+        friction: 0.0,
+        gap: 0.0,
+    }
 }
 
 fn sweep_normal(

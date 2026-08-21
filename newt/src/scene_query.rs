@@ -66,9 +66,29 @@ impl ShapeDesc {
     ) -> Aabb {
         let from = self.aabb(from_pose, meshes);
         let to = self.aabb(to_pose, meshes);
-        let radius = ((from.max - from.min) * 0.5).length();
+        let radius = self.pivot_radius(meshes);
         from.union(to)
             .expanded(4.0 * quat_distance(from_pose.orientation, to_pose.orientation) * radius)
+    }
+
+    fn pivot_radius(self, meshes: &[ConvexMesh]) -> f32 {
+        match self {
+            Self::Sphere { radius } => radius.abs(),
+            Self::Box { half_extents } => half_extents.length(),
+            Self::Capsule {
+                radius,
+                half_height,
+            } => radius.abs() + half_height.abs(),
+            Self::ConvexMesh { mesh_id } | Self::Mesh { mesh_id } => meshes
+                .get(mesh_id)
+                .map(|mesh| {
+                    mesh.vertices
+                        .iter()
+                        .map(|vertex| vertex.length())
+                        .fold(0.0, f32::max)
+                })
+                .unwrap_or(0.0),
+        }
     }
 }
 
@@ -231,7 +251,7 @@ fn ray_sphere(center: Vec3, radius: f32, ray: Ray, max_dist: f32) -> Option<(f32
 
 fn ray_box_local(half_extents: Vec3, ray: Ray, max_dist: f32) -> Option<(f32, Vec3, Vec3)> {
     let mut near = f32::NEG_INFINITY;
-    let mut far = max_dist;
+    let mut far = f32::INFINITY;
     let mut near_normal = Vec3::ZERO;
     let mut far_normal = Vec3::ZERO;
     let axes = [
@@ -468,4 +488,32 @@ fn ray_triangle(
         return None;
     }
     Some((t, edge1.cross(edge2).normalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotating_mesh_sweep_bound_uses_the_geom_pivot() {
+        let meshes = [ConvexMesh {
+            vertices: vec![
+                Vec3::new(4.9, -0.1, -0.1),
+                Vec3::new(5.1, -0.1, -0.1),
+                Vec3::new(5.0, 0.1, -0.1),
+                Vec3::new(5.0, 0.0, 0.1),
+            ],
+            faces: vec![[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]],
+        }];
+        let from_pose = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::IDENTITY,
+        };
+        let to_pose = GeomPose {
+            position: Vec3::ZERO,
+            orientation: Quat::from_axis_angle(Vec3::Z, core::f32::consts::PI),
+        };
+        let bounds = ShapeDesc::ConvexMesh { mesh_id: 0 }.sweep_aabb(&from_pose, &to_pose, &meshes);
+        assert!(bounds.max.y >= 5.0);
+    }
 }
