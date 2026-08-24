@@ -403,7 +403,7 @@ impl SensorBank {
     /// Slice of `data` for one sensor, or `None` if the index is bad.
     pub fn slice(&self, idx: usize) -> Option<&[f32]> {
         let off = *self.offsets.get(idx)?;
-        let dim = self.sensors[idx].kind.dim();
+        let dim = self.sensors.get(idx)?.kind.dim();
         self.data.get(off..off + dim)
     }
 }

@@ -35,7 +35,7 @@ use crate::tendon::{
     WrapCylinder, WrapSphere,
 };
 use crate::tree::{Link, Tree, forward_kinematics};
-use crate::world::{Integrator, World};
+use crate::world::{DetachError, DetachReport, Integrator, World, WorldJointId};
 
 // ---------------------------------------------------------------------------
 // public error type
@@ -143,6 +143,53 @@ pub struct Scene {
 }
 
 impl Scene {
+    /// Detach a subtree and atomically remap scene metadata with the world.
+    pub fn detach_subtree(&mut self, joint_id: WorldJointId) -> Result<DetachReport, DetachError> {
+        let mut world = self.world.clone_for_transaction();
+        let report = world.detach_subtree(joint_id)?;
+
+        let mut sites = self.sites.clone();
+        for site in &mut sites {
+            if let SiteAttach::Link { tree, link } = site.attach {
+                if tree == report.source_tree_id {
+                    let mapped = report.remap_link_location(tree, link)?;
+                    site.attach = SiteAttach::Link {
+                        tree: mapped.0,
+                        link: mapped.1,
+                    };
+                }
+            }
+        }
+
+        let mut links_by_name = vec![HashMap::new(); world.trees.len()];
+        for (tree, names) in self.links_by_name.iter().enumerate() {
+            for (name, &link) in names {
+                let mapped = report.remap_link_location(tree, link)?;
+                links_by_name[mapped.0].insert(name.clone(), mapped.1);
+            }
+        }
+
+        let mut actuators_by_name = self.actuators_by_name.clone();
+        for location in actuators_by_name.values_mut() {
+            if location.0 == report.source_tree_id {
+                *location = report.remap_actuator(location.0, location.1)?;
+            }
+        }
+        let mut tendons_by_name = self.tendons_by_name.clone();
+        for location in tendons_by_name.values_mut() {
+            if location.0 == report.source_tree_id {
+                *location = report.remap_tendon(location.0, location.1)?;
+            }
+        }
+
+        self.world = world;
+        self.sites = sites;
+        self.links_by_name = links_by_name;
+        self.actuators_by_name = actuators_by_name;
+        self.tendons_by_name = tendons_by_name;
+        Ok(report)
+    }
+
     /// World-frame pose of a named site: `(position, orientation)`. `None`
     /// when the name is unknown.
     pub fn site_pose(&self, name: &str) -> Option<(Vec3, Quat)> {
