@@ -2558,13 +2558,13 @@ impl World {
             return Vec3::ZERO;
         }
         let distance = |point: Vec3| (plane.normal.dot(point) + plane.distance) / normal_length;
-        let signed_distance = distance(body.position);
         let mut submerged_volume = 0.0;
         for geom in &self.geoms {
             if !matches!(geom.attachment(), GeomAttach::Body(index) if index == body_idx) {
                 continue;
             }
             let pose = geom_world_pose(geom, body.position, body.orientation);
+            let signed_distance = distance(pose.position);
             let Some((volume, radius)) = self.geom_volume_radius(geom, &pose) else {
                 continue;
             };

@@ -103,6 +103,26 @@ fn buoyant_box(fluid_density: f32) -> World {
     world
 }
 
+fn buoyant_offset_box(offset_z: f32) -> World {
+    let mut world = World::new();
+    world.integrator = Integrator::Euler;
+    world.dt = 0.01;
+    let body = world.add_body(free_body(Vec3::ZERO));
+    world.add_geom(Geom::r#box(
+        body,
+        Vec3::splat(0.5),
+        Vec3::new(0.0, 0.0, offset_z),
+        Quat::IDENTITY,
+        0.0,
+    ));
+    world.add_force_field(ForceField::Buoyancy {
+        plane: Plane::new(Vec3::Z, 0.0),
+        fluid_density: 2.0,
+        gravity: world.gravity,
+    });
+    world
+}
+
 #[test]
 fn force_field_buoyancy_floats_less_dense() {
     let mut world = buoyant_box(2.0);
@@ -123,6 +143,20 @@ fn force_field_buoyancy_sinks_more_dense() {
     let expected_accel = world.gravity * (1.0 - 0.5 / 1.0);
     let actual_accel = world.bodies[0].linear_velocity.z / world.dt;
     assert!((actual_accel - expected_accel.z).abs() < 1.0e-5);
+}
+
+#[test]
+fn force_field_buoyancy_uses_geom_offset_for_submersion() {
+    let mut dry = buoyant_offset_box(2.0);
+    dry.step();
+    let dry_accel = dry.bodies[0].linear_velocity.z / dry.dt;
+    assert!((dry_accel - dry.gravity.z).abs() < 1.0e-5);
+
+    let mut submerged = buoyant_offset_box(-2.0);
+    submerged.step();
+    let submerged_accel = submerged.bodies[0].linear_velocity.z / submerged.dt;
+    let expected_accel = submerged.gravity.z * (1.0 - 2.0 / 1.0);
+    assert!((submerged_accel - expected_accel).abs() < 1.0e-5);
 }
 
 #[test]
@@ -183,13 +217,12 @@ fn force_field_none_registered_byte_identical() {
     assert_eq!(actual, ORIGIN_GOLDEN);
 }
 
-#[test]
-fn force_field_free_body_pgs_contact_react() {
+fn free_body_contact_fixture(solver_mode: SolverMode) -> (World, usize, usize) {
     let mut world = World::new();
     world.gravity = Vec3::ZERO;
     world.integrator = Integrator::Euler;
     world.dt = 0.005;
-    world.solver.mode = SolverMode::Pgs;
+    world.solver.mode = solver_mode;
     world.solver.iterations = 40;
     world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.0));
     let body = world.add_body(Body::solid_sphere(
@@ -204,16 +237,27 @@ fn force_field_free_body_pgs_contact_react() {
         magnitude: 9.81,
     });
 
+    (world, body, field)
+}
+
+#[test]
+fn force_field_free_body_pgs_contact_react() {
+    let (mut world, body, field) = free_body_contact_fixture(SolverMode::Pgs);
     assert_downward_field_reacts(&mut world, body, field, 9.81);
 }
 
 #[test]
-fn force_field_tree_contact_pgs_react() {
+fn force_field_free_body_newton_contact_react() {
+    let (mut world, body, field) = free_body_contact_fixture(SolverMode::Newton);
+    assert_downward_field_reacts(&mut world, body, field, 9.81);
+}
+
+fn tree_contact_fixture(solver_mode: SolverMode) -> (World, usize, usize) {
     let mut world = World::new();
     world.gravity = Vec3::ZERO;
     world.integrator = Integrator::Euler;
     world.dt = 0.005;
-    world.solver.mode = SolverMode::Pgs;
+    world.solver.mode = solver_mode;
     world.solver.iterations = 40;
 
     let mut tree = Tree::new();
@@ -239,5 +283,17 @@ fn force_field_tree_contact_pgs_react() {
         magnitude: 9.81,
     });
 
+    (world, body, field)
+}
+
+#[test]
+fn force_field_tree_contact_pgs_react() {
+    let (mut world, body, field) = tree_contact_fixture(SolverMode::Pgs);
+    assert_downward_field_reacts(&mut world, body, field, 9.81);
+}
+
+#[test]
+fn force_field_tree_contact_newton_react() {
+    let (mut world, body, field) = tree_contact_fixture(SolverMode::Newton);
     assert_downward_field_reacts(&mut world, body, field, 9.81);
 }

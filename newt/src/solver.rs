@@ -756,11 +756,19 @@ fn solve_free_bodies_diag_mode(
         panic!("{NEWTON_ELLIPTIC_ERROR}");
     }
     let n_bodies = bodies.len();
+    let field_forces = field_force.map_or_else(
+        || vec![Vec3::ZERO; n_bodies],
+        |force| {
+            bodies
+                .iter()
+                .enumerate()
+                .map(|(index, body)| force.force(index, body))
+                .collect()
+        },
+    );
     let mut wrenches = vec![(Vec3::ZERO, Vec3::ZERO); n_bodies];
-    if let Some(field_force) = field_force {
-        for (index, body) in bodies.iter().enumerate() {
-            wrenches[index].0 = field_force.force(index, body);
-        }
+    for (wrench, force) in wrenches.iter_mut().zip(&field_forces) {
+        wrench.0 = *force;
     }
     let mut contact_normal_forces = vec![0.0f32; contacts.len()];
     let has_free_eq = equalities.iter().any(|e| e.is_free_body());
@@ -789,8 +797,7 @@ fn solve_free_bodies_diag_mode(
             } else {
                 gravity * body.gravity_scale
             };
-            let field_acceleration =
-                field_force.map_or(Vec3::ZERO, |force| force.force(index, body) / body.mass);
+            let field_acceleration = field_forces[index] / body.mass;
             (body_gravity + field_acceleration) * dt
         })
         .collect();
@@ -1292,6 +1299,24 @@ fn solve_free_body_newton_impulses(
                     mu: contact.mu_roll,
                 });
             }
+        }
+    }
+    if crate::dynamics::cholesky(&hessian, n_rows).is_none()
+        && per_contact.iter().any(|contact| {
+            cone == ConeKind::Pyramidal && contact.condim == 3 && contact.mu_slide == 0.0
+        })
+    {
+        // Zero-friction pyramid facets are identical rows. MuJoCo keeps
+        // their source Rpy at zero, so the resulting Hessian is positive
+        // semidefinite. Add a solver-only pivot for Cholesky without
+        // changing the assembled constraint regularizer.
+        let scale = hessian
+            .iter()
+            .copied()
+            .fold(0.0f32, |max_value, value| max_value.max(value.abs()));
+        let pivot = (scale * 1.0e-6).max(1.0e-7);
+        for index in 0..n_rows {
+            hessian[index * n_rows + index] += pivot;
         }
     }
     // Rows belonging to equalities have no projection and are bilateral.
@@ -2854,6 +2879,16 @@ fn solve_tree_contacts_mode(
         return solution;
     }
 
+    let field_forces = field_force.map_or_else(
+        || vec![Vec3::ZERO; bodies.len()],
+        |force| {
+            bodies
+                .iter()
+                .enumerate()
+                .map(|(index, body)| force.force(index, body))
+                .collect()
+        },
+    );
     let n_rows = rows.len();
     for block in &blocks {
         let row_count = contact_block_n_rows(block.condim, cone);
@@ -2913,7 +2948,7 @@ fn solve_tree_contacts_mode(
                 trees,
                 gravity,
                 dt,
-                field_force,
+                &field_forces,
             );
             let position = if (cone == ConeKind::Pyramidal && block.condim == 3) || row_offset == 0
             {
@@ -3278,7 +3313,7 @@ fn world_free_velocity(
     trees: &[Tree],
     gravity: Vec3,
     dt: f32,
-    field_force: Option<&dyn FreeBodyFieldForce>,
+    field_forces: &[Vec3],
 ) -> f32 {
     row.components
         .iter()
@@ -3289,9 +3324,7 @@ fn world_free_velocity(
                 } else {
                     gravity * bodies[body.index].gravity_scale
                 };
-                let body_field_force = field_force.map_or(Vec3::ZERO, |force| {
-                    force.force(body.index, &bodies[body.index])
-                });
+                let body_field_force = field_forces[body.index];
                 body.linear
                     .dot((body_gravity + body_field_force / bodies[body.index].mass) * dt)
             });
