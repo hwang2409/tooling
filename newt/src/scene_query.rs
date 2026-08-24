@@ -61,6 +61,7 @@ impl ShapeDesc {
             local_offset: Vec3::ZERO,
             local_orientation: Quat::IDENTITY,
             friction: 0.0,
+            friction_anisotropy: None,
             solref: crate::geom::SolRef::DEFAULT,
             margin: 0.0,
             gap: 0.0,

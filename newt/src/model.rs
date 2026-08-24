@@ -1144,7 +1144,14 @@ fn parse_body(v: &Value, path: &str) -> Result<Body, ModelError> {
     let fields = get_object(v, path)?;
     reject_unknown(
         fields,
-        &["name", "mass", "inertia", "pose", "velocity"],
+        &[
+            "name",
+            "mass",
+            "inertia",
+            "pose",
+            "velocity",
+            "rolling_friction",
+        ],
         path,
     )?;
     let mass = get_f32(required(fields, "mass", path)?, &format!("{path}.mass"))?;
@@ -1164,6 +1171,7 @@ fn parse_body(v: &Value, path: &str) -> Result<Body, ModelError> {
         None => (Vec3::ZERO, Quat::IDENTITY),
     };
     let mut body = Body::new(mass, inertia, pos, ori);
+    body.rolling_friction = parse_nonneg_float(fields, "rolling_friction", path)?;
     if let Some(v) = optional(fields, "velocity") {
         let vf = get_object(v, &format!("{path}.velocity"))?;
         reject_unknown(vf, &["linear", "angular_body"], &format!("{path}.velocity"))?;
@@ -1493,6 +1501,7 @@ fn parse_geom(
         local_offset,
         local_orientation,
         friction,
+        friction_anisotropy: None,
         solref,
         margin,
         gap,

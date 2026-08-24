@@ -1213,6 +1213,7 @@ fn box_box_sat_uses_face_normal_when_it_wins_min_overlap() {
         local_offset: Vec3::ZERO,
         local_orientation: Quat::IDENTITY,
         friction: 0.5,
+        friction_anisotropy: None,
         solref: newt::geom::SolRef::DEFAULT,
         margin: 0.0,
         gap: 0.0,

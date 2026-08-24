@@ -42,6 +42,8 @@ pub struct Body {
     pub max_angular_velocity: Option<f32>,
     /// Multiplier for this body's share of world gravity.
     pub gravity_scale: f32,
+    /// Optional contact rolling-friction coefficient.
+    pub rolling_friction: Option<f32>,
 }
 
 impl Body {
@@ -63,6 +65,7 @@ impl Body {
             max_linear_velocity: None,
             max_angular_velocity: None,
             gravity_scale: 1.0,
+            rolling_friction: None,
         }
     }
 
