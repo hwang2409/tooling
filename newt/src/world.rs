@@ -47,7 +47,7 @@ use crate::geom::{
     geom_world_pose, solref_to_kc,
 };
 use crate::joint::JointKind;
-use crate::math::{Quat, Vec3};
+use crate::math::{PI, Quat, Vec3, asin, atan2};
 pub use crate::scene_query::{RayHit, ShapeDesc, ShapeHit};
 use crate::sensor::{Sensor, SensorBank, SensorError, SensorInputs};
 use crate::solver::{
@@ -103,6 +103,78 @@ pub enum BroadPhaseMode {
     Naive,
 }
 
+/// A world-space plane represented by `normal · point + distance = 0`.
+///
+/// The normal is expected to point toward the dry side. [`Self::new`] stores
+/// a normalized plane; struct literals should use a unit normal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Plane {
+    pub normal: Vec3,
+    pub distance: f32,
+}
+
+impl Plane {
+    /// Create a plane from a normal and its signed distance from the origin.
+    pub fn new(normal: Vec3, distance: f32) -> Self {
+        let length = normal.length();
+        if length == 0.0 {
+            return Self { normal, distance };
+        }
+        Self {
+            normal: normal / length,
+            distance: distance / length,
+        }
+    }
+
+    /// Create a plane passing through `point` with outward `normal`.
+    pub fn from_point_normal(point: Vec3, normal: Vec3) -> Self {
+        let normal = normal.normalize();
+        Self::new(normal, -normal.dot(point))
+    }
+}
+
+/// Falloff applied to a radial force field.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RadialFalloff {
+    /// Keep the configured magnitude at every distance.
+    Constant,
+    /// Scale by the inverse squared distance from the field center.
+    InverseSquare,
+    /// Reach zero at `max_range` and decrease linearly before then.
+    Linear { max_range: f32 },
+}
+
+/// A force generator applied to free bodies during force accumulation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ForceField {
+    /// A mass-weighted force. Positive magnitude follows `direction`.
+    Uniform { direction: Vec3, magnitude: f32 },
+    /// A mass-weighted radial force. Positive magnitude points away from the
+    /// center; a negative magnitude points toward it.
+    Radial {
+        center: Vec3,
+        magnitude: f32,
+        falloff: RadialFalloff,
+    },
+    /// Archimedes force against a plane. Solid volume comes from attached
+    /// geoms; unsupported shapes use their world AABB volume.
+    Buoyancy {
+        plane: Plane,
+        fluid_density: f32,
+        gravity: Vec3,
+    },
+}
+
+/// Stable handle returned by [`World::add_force_field`].
+pub type ForceFieldId = usize;
+
+#[derive(Clone, Debug, Default)]
+struct BuoyancyScratch {
+    clipped_faces: Vec<Vec<Vec3>>,
+    cap_points: Vec<Vec3>,
+    unique_cap: Vec<Vec3>,
+}
+
 /// Simulation world.
 #[derive(Clone, Debug)]
 pub struct World {
@@ -113,6 +185,11 @@ pub struct World {
     pub integrator: Integrator,
     /// Uniform gravity vector applied to each body's COM after its scale.
     pub gravity: Vec3,
+    /// Optional force fields, kept in registration order. Empty by default so
+    /// scenes without fields keep the original force path.
+    force_fields: Vec<Option<ForceField>>,
+    #[cfg(test)]
+    field_force_evaluation_count: Cell<usize>,
     /// Global force-free penetration width for contact stabilization.
     pub penetration_slop: f32,
     /// Global magnetic field in world coordinates for magnetometer sensors.
@@ -130,6 +207,7 @@ pub struct World {
     pub meshes: Vec<ConvexMesh>,
     /// Heightfield assets, indexed by [`GeomShape::Hfield::hfield_id`].
     pub hfields: Vec<HeightField>,
+    buoyancy_scratch: RefCell<BuoyancyScratch>,
     /// Optional explicit pair list `(geom_a, geom_b)` with `a < b`. When
     /// `None`, contact detection enumerates every unordered geom pair whose
     /// two geoms don't share a body/link and aren't both static. Automatic
@@ -289,6 +367,7 @@ impl PartialEq for World {
         self.dt == other.dt
             && self.integrator == other.integrator
             && self.gravity == other.gravity
+            && self.force_fields == other.force_fields
             && self.penetration_slop == other.penetration_slop
             && self.magnetic_field == other.magnetic_field
             && self.bodies == other.bodies
@@ -328,6 +407,9 @@ impl World {
             dt: 0.005,
             integrator: Integrator::default(),
             gravity: Vec3::new(0.0, 0.0, -9.81),
+            force_fields: Vec::new(),
+            #[cfg(test)]
+            field_force_evaluation_count: Cell::new(0),
             penetration_slop: 0.0,
             magnetic_field: Vec3::new(0.0, -0.5, 0.0),
             bodies: Vec::new(),
@@ -335,6 +417,7 @@ impl World {
             geoms: Vec::new(),
             meshes: Vec::new(),
             hfields: Vec::new(),
+            buoyancy_scratch: RefCell::new(BuoyancyScratch::default()),
             pair_list: None,
             auto_pair_exclusions: Vec::new(),
             disabled_self_collision: HashSet::new(),
@@ -425,7 +508,8 @@ impl World {
         let pairs = self.active_pairs();
         let state = self.solver_phase_state();
         let contacts = self.detect_contacts_for_step(&pairs);
-        let solution = self.solver_phase_solution(&contacts);
+        let field_forces = self.compute_field_forces(&self.bodies);
+        let solution = self.solver_phase_solution(&contacts, &field_forces);
         self.record_solver_phase(state, solution.as_ref(), &contacts);
         self.restore_broadphase_pairs(pairs);
     }
@@ -953,6 +1037,26 @@ impl World {
         idx
     }
 
+    /// Register a force field and return its stable handle.
+    pub fn add_force_field(&mut self, field: ForceField) -> ForceFieldId {
+        let id = self.force_fields.len();
+        self.force_fields.push(Some(field));
+        id
+    }
+
+    /// Remove a force field. Returns `true` when `id` was active.
+    pub fn remove_force_field(&mut self, id: ForceFieldId) -> bool {
+        self.force_fields
+            .get_mut(id)
+            .and_then(Option::take)
+            .is_some()
+    }
+
+    /// Inspect an active force field by its stable handle.
+    pub fn force_field(&self, id: ForceFieldId) -> Option<&ForceField> {
+        self.force_fields.get(id).and_then(Option::as_ref)
+    }
+
     /// Set a free body's pose and refresh its scene-query proxy.
     pub fn set_body_pose(&mut self, body_idx: usize, position: Vec3, orientation: Quat) {
         let body = &mut self.bodies[body_idx];
@@ -1462,6 +1566,8 @@ impl World {
         self.solver
             .validate()
             .unwrap_or_else(|message| panic!("{message}"));
+        let field_forces = self.compute_field_forces(&self.bodies);
+        let field_torques = self.compute_field_torques(&self.bodies);
         #[cfg(feature = "instrumentation")]
         let collision_start = Instant::now();
         // Loud engine-level enforcement: the first step after any pair-list
@@ -1480,7 +1586,7 @@ impl World {
         let solver_phase_state = self.solver_phase_capture.then(|| self.solver_phase_state());
         let tree_contact_solution = contacts
             .as_deref()
-            .and_then(|contacts| self.solver_phase_solution(contacts));
+            .and_then(|contacts| self.solver_phase_solution(contacts, &field_forces));
         if let Some(state) = solver_phase_state {
             let phase_contacts = contacts.as_deref().map_or_else(
                 || self.detect_contacts_for_step(&pairs),
@@ -1494,16 +1600,34 @@ impl World {
         let integration_start = Instant::now();
         match self.integrator {
             Integrator::Rk4 => {
-                self.step_bodies(&pairs, contacts.as_deref(), tree_contact_solution.as_ref());
+                self.step_bodies(
+                    &pairs,
+                    contacts.as_deref(),
+                    tree_contact_solution.as_ref(),
+                    &field_forces,
+                    &field_torques,
+                );
                 self.step_trees(&pairs, tree_contact_solution.as_ref());
             }
             Integrator::Euler => {
                 self.step_trees_euler(&pairs, false, tree_contact_solution.as_ref());
-                self.step_bodies_euler(&pairs, contacts.as_deref(), tree_contact_solution.as_ref());
+                self.step_bodies_euler(
+                    &pairs,
+                    contacts.as_deref(),
+                    tree_contact_solution.as_ref(),
+                    &field_forces,
+                    &field_torques,
+                );
             }
             Integrator::ImplicitFast => {
                 self.step_trees_euler(&pairs, true, tree_contact_solution.as_ref());
-                self.step_bodies_euler(&pairs, contacts.as_deref(), tree_contact_solution.as_ref());
+                self.step_bodies_euler(
+                    &pairs,
+                    contacts.as_deref(),
+                    tree_contact_solution.as_ref(),
+                    &field_forces,
+                    &field_torques,
+                );
             }
         }
         #[cfg(feature = "instrumentation")]
@@ -1515,7 +1639,7 @@ impl World {
         // pre-v1-tier-6 golden path is bit-for-bit untouched.
         if !self.sensors.sensors.is_empty() {
             if let Some(contacts) = contacts.as_deref() {
-                self.evaluate_sensors_with_contacts(contacts);
+                self.evaluate_sensors_with_contacts(contacts, &field_forces, &field_torques);
             } else {
                 self.evaluate_sensors(&pairs);
             }
@@ -1544,10 +1668,17 @@ impl World {
     /// evaluation.
     pub fn evaluate_sensors(&mut self, pairs: &[(usize, usize)]) {
         let contacts = self.detect_contacts_for_step(pairs);
-        self.evaluate_sensors_with_contacts(&contacts);
+        let field_forces = self.compute_field_forces(&self.bodies);
+        let field_torques = self.compute_field_torques(&self.bodies);
+        self.evaluate_sensors_with_contacts(&contacts, &field_forces, &field_torques);
     }
 
-    fn evaluate_sensors_with_contacts(&mut self, contacts: &[Contact]) {
+    fn evaluate_sensors_with_contacts(
+        &mut self,
+        contacts: &[Contact],
+        field_forces: &[Vec3],
+        field_torques: &[Vec3],
+    ) {
         // Take the sensor bank out temporarily so `build_sensor_inputs`
         // can borrow the rest of `self` immutably without conflicting
         // with the &mut we need for the writeback. A scope guard restores
@@ -1567,7 +1698,9 @@ impl World {
             world: self,
             bank: bank_taken,
         };
-        let inputs = guard.world.build_sensor_inputs(contacts);
+        let inputs = guard
+            .world
+            .build_sensor_inputs(contacts, field_forces, field_torques);
         crate::sensor::evaluate(&mut guard.bank, &inputs);
         // Guard's Drop restores the bank into `self.sensors`.
     }
@@ -1576,7 +1709,12 @@ impl World {
     /// solver-mode-appropriate wrench source (penalty vs PGS) so an
     /// accelerometer or touch reading sees the SAME contact forces the
     /// integrator did.
-    fn build_sensor_inputs<'a>(&'a self, contacts: &'a [Contact]) -> SensorInputs<'a> {
+    fn build_sensor_inputs<'a>(
+        &'a self,
+        contacts: &'a [Contact],
+        field_forces: &[Vec3],
+        field_torques: &[Vec3],
+    ) -> SensorInputs<'a> {
         // Reuse the exact start-of-step contact set. Sensors must not trigger
         // a second collision pass or observe a different manifold.
         let free_body_contacts: Vec<Contact> = contacts
@@ -1593,14 +1731,27 @@ impl World {
         let (mut body_wrenches, free_body_contact_forces): (Vec<(Vec3, Vec3)>, Vec<f32>) =
             match self.solver.mode {
                 SolverMode::Penalty => {
-                    let w = self.compute_wrenches(&self.bodies, contacts);
+                    let w =
+                        self.compute_wrenches(&self.bodies, contacts, field_forces, field_torques);
                     let f: Vec<f32> = free_body_contacts
                         .iter()
                         .map(|c| penalty_normal_force(c, &self.bodies, &self.trees, &self.geoms))
                         .collect();
                     (w, f)
                 }
-                SolverMode::Pgs => crate::solver::solve_free_bodies_diag(
+                SolverMode::Pgs if self.force_fields.is_empty() => {
+                    crate::solver::solve_free_bodies_diag(
+                        &self.bodies,
+                        &self.geoms,
+                        &free_body_contacts,
+                        &self.equalities,
+                        self.gravity,
+                        self.dt,
+                        self.solver.cone,
+                        self.solver.iterations,
+                    )
+                }
+                SolverMode::Pgs => crate::solver::solve_free_bodies_diag_with_field(
                     &self.bodies,
                     &self.geoms,
                     &free_body_contacts,
@@ -1609,8 +1760,21 @@ impl World {
                     self.dt,
                     self.solver.cone,
                     self.solver.iterations,
+                    field_forces,
                 ),
-                SolverMode::Newton => crate::solver::solve_free_bodies_newton_diag(
+                SolverMode::Newton if self.force_fields.is_empty() => {
+                    crate::solver::solve_free_bodies_newton_diag(
+                        &self.bodies,
+                        &self.geoms,
+                        &free_body_contacts,
+                        &self.equalities,
+                        self.gravity,
+                        self.dt,
+                        self.solver.cone,
+                        self.solver.iterations,
+                    )
+                }
+                SolverMode::Newton => crate::solver::solve_free_bodies_newton_diag_with_field(
                     &self.bodies,
                     &self.geoms,
                     &free_body_contacts,
@@ -1619,8 +1783,10 @@ impl World {
                     self.dt,
                     self.solver.cone,
                     self.solver.iterations,
+                    field_forces,
                 ),
             };
+        self.apply_cached_field_torques(&mut body_wrenches, field_torques);
 
         // Keep one original-indexed tree contact list. The solver solution
         // uses this exact order, so touch sensors cannot drift when a gap
@@ -1640,9 +1806,11 @@ impl World {
             .collect();
         let tree_contact_solution = match self.solver.mode {
             SolverMode::Penalty => None,
-            SolverMode::Pgs => Some(self.solve_tree_contact_sensor_solution(&tree_contacts, false)),
+            SolverMode::Pgs => {
+                Some(self.solve_tree_contact_sensor_solution(&tree_contacts, false, field_forces))
+            }
             SolverMode::Newton => {
-                Some(self.solve_tree_contact_sensor_solution(&tree_contacts, true))
+                Some(self.solve_tree_contact_sensor_solution(&tree_contacts, true, field_forces))
             }
         };
         let (tree_wrenches, tree_contact_forces) =
@@ -1707,6 +1875,8 @@ impl World {
         pairs: &[(usize, usize)],
         contacts: Option<&[Contact]>,
         tree_contact_solution: Option<&TreeContactSolution>,
+        field_forces: &[Vec3],
+        field_torques: &[Vec3],
     ) {
         let s0 = self.bodies.clone();
 
@@ -1722,12 +1892,14 @@ impl World {
                 &s0,
                 contacts.expect("constraint contacts captured before body step"),
                 tree_contact_solution,
+                field_forces,
+                field_torques,
             )),
         };
         let sample_wrenches = |state: &[Body]| -> Vec<(Vec3, Vec3)> {
             match &solver_zoh {
                 Some(w) => w.clone(),
-                None => self.compute_penalty_wrenches(state, pairs),
+                None => self.compute_penalty_wrenches(state, pairs, field_forces, field_torques),
             }
         };
 
@@ -1792,13 +1964,19 @@ impl World {
         pairs: &[(usize, usize)],
         contacts: Option<&[Contact]>,
         tree_contact_solution: Option<&TreeContactSolution>,
+        field_forces: &[Vec3],
+        field_torques: &[Vec3],
     ) {
         let ext = match self.solver.mode {
-            SolverMode::Penalty => self.compute_penalty_wrenches(&self.bodies, pairs),
+            SolverMode::Penalty => {
+                self.compute_penalty_wrenches(&self.bodies, pairs, field_forces, field_torques)
+            }
             SolverMode::Pgs | SolverMode::Newton => self.compute_solver_wrenches(
                 &self.bodies,
                 contacts.expect("constraint contacts captured before body step"),
                 tree_contact_solution,
+                field_forces,
+                field_torques,
             ),
         };
         let accel = evaluate_all(&self.bodies, self.gravity, &ext);
@@ -2099,6 +2277,8 @@ impl World {
         state: &[Body],
         contacts: &[Contact],
         tree_contact_solution: Option<&TreeContactSolution>,
+        field_forces: &[Vec3],
+        field_torques: &[Vec3],
     ) -> Vec<(Vec3, Vec3)> {
         // Filter pairs to free-body-only ones (both sides Body or
         // Static). `solve_free_bodies` returns per-body zero wrenches
@@ -2114,7 +2294,7 @@ impl World {
             })
             .collect();
         let mut wrenches = match self.solver.mode {
-            SolverMode::Pgs => solve_free_bodies(
+            SolverMode::Pgs if self.force_fields.is_empty() => solve_free_bodies(
                 state,
                 &self.geoms,
                 &free_contacts,
@@ -2124,16 +2304,46 @@ impl World {
                 self.solver.cone,
                 self.solver.iterations,
             ),
-            SolverMode::Newton => crate::solver::solve_free_bodies_newton(
-                state,
-                &self.geoms,
-                &free_contacts,
-                &self.equalities,
-                self.gravity,
-                self.dt,
-                self.solver.cone,
-                self.solver.iterations,
-            ),
+            SolverMode::Pgs => {
+                crate::solver::solve_free_bodies_diag_with_field(
+                    state,
+                    &self.geoms,
+                    &free_contacts,
+                    &self.equalities,
+                    self.gravity,
+                    self.dt,
+                    self.solver.cone,
+                    self.solver.iterations,
+                    field_forces,
+                )
+                .0
+            }
+            SolverMode::Newton if self.force_fields.is_empty() => {
+                crate::solver::solve_free_bodies_newton(
+                    state,
+                    &self.geoms,
+                    &free_contacts,
+                    &self.equalities,
+                    self.gravity,
+                    self.dt,
+                    self.solver.cone,
+                    self.solver.iterations,
+                )
+            }
+            SolverMode::Newton => {
+                crate::solver::solve_free_bodies_newton_diag_with_field(
+                    state,
+                    &self.geoms,
+                    &free_contacts,
+                    &self.equalities,
+                    self.gravity,
+                    self.dt,
+                    self.solver.cone,
+                    self.solver.iterations,
+                    field_forces,
+                )
+                .0
+            }
             SolverMode::Penalty => unreachable!("penalty does not call compute_solver_wrenches"),
         };
         // Mocap contacts are kinematic rows in the shared tree solve. Their
@@ -2145,6 +2355,7 @@ impl World {
                 wrench.1 += solved.1;
             }
         }
+        self.apply_cached_field_torques(&mut wrenches, field_torques);
         wrenches
     }
 
@@ -2155,6 +2366,7 @@ impl World {
         &self,
         contacts: &[Contact],
         use_newton: bool,
+        field_forces: &[Vec3],
     ) -> Option<TreeContactSolution> {
         let tree_contacts: Vec<Contact> = contacts
             .iter()
@@ -2169,14 +2381,18 @@ impl World {
                 )
             })
             .collect();
-        Some(self.solve_tree_contact_sensor_solution(&tree_contacts, use_newton))
+        Some(self.solve_tree_contact_sensor_solution(&tree_contacts, use_newton, field_forces))
     }
 
-    fn solver_phase_solution(&self, contacts: &[Contact]) -> Option<TreeContactSolution> {
+    fn solver_phase_solution(
+        &self,
+        contacts: &[Contact],
+        field_forces: &[Vec3],
+    ) -> Option<TreeContactSolution> {
         match self.solver.mode {
             SolverMode::Penalty => None,
-            SolverMode::Pgs => self.compute_tree_contact_solution(contacts, false),
-            SolverMode::Newton => self.compute_tree_contact_solution(contacts, true),
+            SolverMode::Pgs => self.compute_tree_contact_solution(contacts, false, field_forces),
+            SolverMode::Newton => self.compute_tree_contact_solution(contacts, true, field_forces),
         }
     }
 
@@ -2253,24 +2469,41 @@ impl World {
         &self,
         tree_contacts: &[Contact],
         use_newton: bool,
+        field_forces: &[Vec3],
     ) -> TreeContactSolution {
         let tree_implicit = match self.integrator {
             Integrator::Rk4 => None,
             Integrator::Euler => Some(false),
             Integrator::ImplicitFast => Some(true),
         };
-        crate::solver::solve_tree_contacts(
-            &self.bodies,
-            &self.trees,
-            &self.geoms,
-            tree_contacts,
-            self.gravity,
-            self.dt,
-            self.solver.cone,
-            self.solver.iterations,
-            use_newton,
-            tree_implicit,
-        )
+        if self.force_fields.is_empty() {
+            crate::solver::solve_tree_contacts(
+                &self.bodies,
+                &self.trees,
+                &self.geoms,
+                tree_contacts,
+                self.gravity,
+                self.dt,
+                self.solver.cone,
+                self.solver.iterations,
+                use_newton,
+                tree_implicit,
+            )
+        } else {
+            crate::solver::solve_tree_contacts_with_field(
+                &self.bodies,
+                &self.trees,
+                &self.geoms,
+                tree_contacts,
+                self.gravity,
+                self.dt,
+                self.solver.cone,
+                self.solver.iterations,
+                use_newton,
+                tree_implicit,
+                field_forces,
+            )
+        }
     }
 
     /// Compute per-body external wrench arrays for a given body-state vector.
@@ -2282,6 +2515,8 @@ impl World {
         &self,
         state: &[Body],
         pairs: &[(usize, usize)],
+        field_forces: &[Vec3],
+        field_torques: &[Vec3],
     ) -> Vec<(Vec3, Vec3)> {
         let contacts = collect_contacts(
             state,
@@ -2297,13 +2532,23 @@ impl World {
             apply_contact_wrench(&mut out, state, &self.geoms, contact, self.dt);
         }
         self.apply_mocap_wrenches_from_pairs(&mut out, state, pairs);
+        self.apply_cached_field_forces(&mut out, field_forces);
+        self.apply_cached_field_torques(&mut out, field_torques);
         out
     }
 
-    fn compute_wrenches(&self, state: &[Body], contacts: &[Contact]) -> Vec<(Vec3, Vec3)> {
+    fn compute_wrenches(
+        &self,
+        state: &[Body],
+        contacts: &[Contact],
+        field_forces: &[Vec3],
+        field_torques: &[Vec3],
+    ) -> Vec<(Vec3, Vec3)> {
         let n = state.len();
         let mut out = vec![(Vec3::ZERO, Vec3::ZERO); n];
         if self.geoms.is_empty() {
+            self.apply_cached_field_forces(&mut out, field_forces);
+            self.apply_cached_field_torques(&mut out, field_torques);
             return out;
         }
         for c in contacts {
@@ -2315,7 +2560,204 @@ impl World {
             apply_contact_wrench(&mut out, state, &self.geoms, c, self.dt);
         }
         self.apply_mocap_wrenches_from_contacts(&mut out, state, contacts);
+        self.apply_cached_field_forces(&mut out, field_forces);
+        self.apply_cached_field_torques(&mut out, field_torques);
         out
+    }
+
+    fn compute_field_forces(&self, state: &[Body]) -> Vec<Vec3> {
+        if self.force_fields.is_empty() {
+            return Vec::new();
+        }
+        state
+            .iter()
+            .enumerate()
+            .map(|(body_idx, body)| self.force_field_force(body_idx, body))
+            .collect()
+    }
+
+    fn compute_field_torques(&self, state: &[Body]) -> Vec<Vec3> {
+        if !self
+            .force_fields
+            .iter()
+            .any(|field| matches!(field, Some(ForceField::Buoyancy { .. })))
+        {
+            return Vec::new();
+        }
+        state
+            .iter()
+            .enumerate()
+            .map(|(body_idx, body)| self.force_field_torque(body_idx, body))
+            .collect()
+    }
+
+    fn apply_cached_field_forces(&self, out: &mut [(Vec3, Vec3)], field_forces: &[Vec3]) {
+        for (wrench, force) in out.iter_mut().zip(field_forces) {
+            wrench.0 += *force;
+        }
+    }
+
+    fn apply_cached_field_torques(&self, out: &mut [(Vec3, Vec3)], field_torques: &[Vec3]) {
+        for (wrench, torque) in out.iter_mut().zip(field_torques) {
+            wrench.1 += *torque;
+        }
+    }
+
+    fn force_field_force(&self, body_idx: usize, body: &Body) -> Vec3 {
+        #[cfg(test)]
+        self.field_force_evaluation_count
+            .set(self.field_force_evaluation_count.get() + 1);
+        let mut force = Vec3::ZERO;
+        for field in self.force_fields.iter().flatten() {
+            force += match *field {
+                ForceField::Uniform {
+                    direction,
+                    magnitude,
+                } => direction.normalize() * (magnitude * body.mass),
+                ForceField::Radial {
+                    center,
+                    magnitude,
+                    falloff,
+                } => {
+                    let to_body = body.position - center;
+                    let distance_squared = to_body.length_squared();
+                    let scale = match falloff {
+                        RadialFalloff::Constant => 1.0,
+                        RadialFalloff::InverseSquare => 1.0 / distance_squared.max(1.0e-6),
+                        RadialFalloff::Linear { max_range } if max_range > 0.0 => {
+                            (1.0 - to_body.length() / max_range).max(0.0)
+                        }
+                        RadialFalloff::Linear { .. } => 0.0,
+                    };
+                    to_body.normalize() * (magnitude * scale * body.mass)
+                }
+                ForceField::Buoyancy {
+                    plane,
+                    fluid_density,
+                    gravity,
+                } => self.buoyancy_force(body_idx, body, plane, fluid_density, gravity),
+            };
+        }
+        force
+    }
+
+    fn force_field_torque(&self, body_idx: usize, body: &Body) -> Vec3 {
+        let mut torque = Vec3::ZERO;
+        for field in self.force_fields.iter().flatten() {
+            if let ForceField::Buoyancy {
+                plane,
+                fluid_density,
+                gravity,
+            } = *field
+            {
+                torque += self.buoyancy_torque(body_idx, body, plane, fluid_density, gravity);
+            }
+        }
+        torque
+    }
+
+    fn buoyancy_force(
+        &self,
+        body_idx: usize,
+        body: &Body,
+        plane: Plane,
+        fluid_density: f32,
+        gravity: Vec3,
+    ) -> Vec3 {
+        let normal_length = plane.normal.length();
+        if normal_length == 0.0 {
+            return Vec3::ZERO;
+        }
+        let mut submerged_volume = 0.0;
+        for geom in &self.geoms {
+            if !matches!(geom.attachment(), GeomAttach::Body(index) if index == body_idx) {
+                continue;
+            }
+            let pose = geom_world_pose(geom, body.position, body.orientation);
+            submerged_volume += self.geom_submerged_region(geom, &pose, plane).volume;
+        }
+        -gravity * (fluid_density * submerged_volume)
+    }
+
+    fn buoyancy_torque(
+        &self,
+        body_idx: usize,
+        body: &Body,
+        plane: Plane,
+        fluid_density: f32,
+        gravity: Vec3,
+    ) -> Vec3 {
+        let force_per_volume = -gravity * fluid_density;
+        let mut torque = Vec3::ZERO;
+        for geom in &self.geoms {
+            if !matches!(geom.attachment(), GeomAttach::Body(index) if index == body_idx) {
+                continue;
+            }
+            let pose = geom_world_pose(geom, body.position, body.orientation);
+            let region = self.geom_submerged_region(geom, &pose, plane);
+            let first_moment_about_com = region.first_moment - body.position * region.volume;
+            torque += first_moment_about_com.cross(force_per_volume);
+        }
+        torque
+    }
+
+    fn geom_submerged_region(&self, geom: &Geom, pose: &GeomPose, plane: Plane) -> SubmergedRegion {
+        let normal_length = plane.normal.length();
+        if normal_length == 0.0 {
+            return SubmergedRegion::ZERO;
+        }
+        let distance = |point: Vec3| (plane.normal.dot(point) + plane.distance) / normal_length;
+        match geom.shape {
+            GeomShape::Plane => SubmergedRegion::ZERO,
+            GeomShape::Sphere { radius } => {
+                spherical_submerged_region(pose.position, distance(pose.position), radius, plane)
+            }
+            GeomShape::Box { half_extents } => {
+                let vertices = box_vertices(half_extents).map(|vertex| pose.point_to_world(vertex));
+                self.clipped_convex_region(&vertices, &BOX_FACES, plane)
+            }
+            GeomShape::Capsule {
+                radius,
+                half_height,
+            } => capsule_submerged_region(pose, plane, radius, half_height),
+            GeomShape::Cylinder {
+                radius,
+                half_height,
+            } => cylinder_submerged_region(pose, plane, radius, half_height),
+            GeomShape::Ellipsoid { semi_axes } => {
+                ellipsoid_submerged_region(pose, plane, semi_axes)
+            }
+            GeomShape::Mesh { mesh_id } => {
+                let mesh = &self.meshes[mesh_id];
+                let vertices: Vec<Vec3> = mesh
+                    .vertices
+                    .iter()
+                    .map(|&vertex| pose.point_to_world(vertex))
+                    .collect();
+                let faces: Vec<[usize; 3]> = mesh
+                    .faces
+                    .iter()
+                    .map(|face| [face[0] as usize, face[1] as usize, face[2] as usize])
+                    .collect();
+                self.clipped_convex_region(&vertices, &faces, plane)
+            }
+            GeomShape::Hfield { .. } => {
+                let aabb = geom_aabb(geom, pose, &self.meshes, &self.hfields);
+                let vertices = box_vertices((aabb.max - aabb.min) * 0.5)
+                    .map(|vertex| aabb.min + vertex + (aabb.max - aabb.min) * 0.5);
+                self.clipped_convex_region(&vertices, &BOX_FACES, plane)
+            }
+        }
+    }
+
+    fn clipped_convex_region(
+        &self,
+        vertices: &[Vec3],
+        faces: &[[usize; 3]],
+        plane: Plane,
+    ) -> SubmergedRegion {
+        let mut scratch = self.buoyancy_scratch.borrow_mut();
+        clipped_convex_region(vertices, faces, plane, &mut scratch)
     }
 
     fn apply_mocap_wrenches_from_contacts(
@@ -3111,6 +3553,552 @@ pub fn tangent_basis(n: Vec3) -> (Vec3, Vec3) {
 }
 
 /// Human-readable shape name for panic messages.
+const BOX_FACES: [[usize; 3]; 12] = [
+    [0, 2, 1],
+    [0, 3, 2],
+    [4, 5, 6],
+    [4, 6, 7],
+    [1, 6, 5],
+    [1, 2, 6],
+    [2, 7, 6],
+    [2, 3, 7],
+    [0, 7, 3],
+    [0, 4, 7],
+    [0, 1, 5],
+    [0, 5, 4],
+];
+
+fn box_vertices(half_extents: Vec3) -> [Vec3; 8] {
+    let Vec3 { x, y, z } = half_extents;
+    [
+        Vec3::new(-x, -y, -z),
+        Vec3::new(x, -y, -z),
+        Vec3::new(x, y, -z),
+        Vec3::new(-x, y, -z),
+        Vec3::new(-x, -y, z),
+        Vec3::new(x, -y, z),
+        Vec3::new(x, y, z),
+        Vec3::new(-x, y, z),
+    ]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SubmergedRegion {
+    volume: f32,
+    first_moment: Vec3,
+}
+
+impl SubmergedRegion {
+    const ZERO: Self = Self {
+        volume: 0.0,
+        first_moment: Vec3::ZERO,
+    };
+
+    fn centered(center: Vec3, volume: f32) -> Self {
+        Self {
+            volume,
+            first_moment: center * volume,
+        }
+    }
+}
+
+fn spherical_submerged_volume(signed_distance: f32, radius: f32) -> f32 {
+    if radius <= 0.0 {
+        return 0.0;
+    }
+    if signed_distance >= radius {
+        return 0.0;
+    }
+    if signed_distance <= -radius {
+        return (4.0 / 3.0) * PI * radius * radius * radius;
+    }
+    let height = radius - signed_distance;
+    PI * height * height * (radius - height / 3.0)
+}
+
+fn spherical_submerged_region(
+    center: Vec3,
+    signed_distance: f32,
+    radius: f32,
+    plane: Plane,
+) -> SubmergedRegion {
+    let volume = spherical_submerged_volume(signed_distance, radius);
+    if volume == 0.0 {
+        return SubmergedRegion::ZERO;
+    }
+    if signed_distance <= -radius {
+        return SubmergedRegion::centered(center, volume);
+    }
+    let normal = plane.normal / plane.normal.length();
+    let cut = -signed_distance;
+    let moment_axis =
+        PI * (radius * radius * cut - cut * cut * cut / 3.0 + 2.0 * radius * radius * radius / 3.0);
+    SubmergedRegion {
+        volume,
+        first_moment: center * volume + normal * moment_axis,
+    }
+}
+
+fn clipped_convex_region(
+    vertices: &[Vec3],
+    faces: &[[usize; 3]],
+    plane: Plane,
+    scratch: &mut BuoyancyScratch,
+) -> SubmergedRegion {
+    let normal_length = plane.normal.length();
+    if normal_length == 0.0 || vertices.is_empty() {
+        return SubmergedRegion::ZERO;
+    }
+    let normal = plane.normal / normal_length;
+    let signed = |point: Vec3| normal.dot(point) + plane.distance / normal_length;
+    if vertices.iter().all(|&point| signed(point) > 0.0) {
+        return SubmergedRegion::ZERO;
+    }
+
+    scratch.cap_points.clear();
+    if scratch.clipped_faces.len() < faces.len() {
+        scratch.clipped_faces.resize_with(faces.len(), Vec::new);
+    }
+    let mut clipped_face_count = 0;
+    for &[a, b, c] in faces {
+        let input = [vertices[a], vertices[b], vertices[c]];
+        let output = &mut scratch.clipped_faces[clipped_face_count];
+        output.clear();
+        for index in 0..input.len() {
+            let current = input[index];
+            let next = input[(index + 1) % input.len()];
+            let current_distance = signed(current);
+            let next_distance = signed(next);
+            if current_distance <= 0.0 {
+                output.push(current);
+            }
+            if current_distance * next_distance < 0.0 {
+                let t = current_distance / (current_distance - next_distance);
+                let intersection = current + (next - current) * t;
+                output.push(intersection);
+                scratch.cap_points.push(intersection);
+            }
+            if current_distance.abs() <= 1.0e-6 {
+                scratch.cap_points.push(current);
+            }
+        }
+        if output.len() >= 3 {
+            clipped_face_count += 1;
+        }
+    }
+
+    let mut six_volume = 0.0;
+    let mut first_moment_times_six = Vec3::ZERO;
+    for face in scratch.clipped_faces.iter().take(clipped_face_count) {
+        for index in 1..face.len() - 1 {
+            let a = face[0];
+            let b = face[index];
+            let c = face[index + 1];
+            let signed_six = a.dot(b.cross(c));
+            six_volume += signed_six;
+            first_moment_times_six += (a + b + c) * (signed_six * 0.25);
+        }
+    }
+
+    scratch.unique_cap.clear();
+    for point in scratch.cap_points.iter().copied() {
+        if !scratch
+            .unique_cap
+            .iter()
+            .any(|other: &Vec3| (*other - point).length_squared() <= 1.0e-10)
+        {
+            scratch.unique_cap.push(point);
+        }
+    }
+    if scratch.unique_cap.len() >= 3 {
+        let center = scratch
+            .unique_cap
+            .iter()
+            .copied()
+            .fold(Vec3::ZERO, |sum, point| sum + point)
+            / scratch.unique_cap.len() as f32;
+        let reference = if normal.x.abs() < 0.9 {
+            Vec3::X
+        } else {
+            Vec3::Y
+        };
+        let tangent = normal.cross(reference).normalize();
+        let bitangent = normal.cross(tangent);
+        scratch.unique_cap.sort_by(|a, b| {
+            let angle_a = atan2((*a - center).dot(bitangent), (*a - center).dot(tangent));
+            let angle_b = atan2((*b - center).dot(bitangent), (*b - center).dot(tangent));
+            angle_a
+                .partial_cmp(&angle_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut area_normal = Vec3::ZERO;
+        for index in 0..scratch.unique_cap.len() {
+            area_normal += (scratch.unique_cap[index] - center)
+                .cross(scratch.unique_cap[(index + 1) % scratch.unique_cap.len()] - center);
+        }
+        if area_normal.dot(normal) < 0.0 {
+            scratch.unique_cap.reverse();
+        }
+        for index in 0..scratch.unique_cap.len() {
+            let a = center;
+            let b = scratch.unique_cap[index];
+            let c = scratch.unique_cap[(index + 1) % scratch.unique_cap.len()];
+            let signed_six = a.dot(b.cross(c));
+            six_volume += signed_six;
+            first_moment_times_six += (a + b + c) * (signed_six * 0.25);
+        }
+    }
+    let sign = if six_volume < 0.0 { -1.0 } else { 1.0 };
+    SubmergedRegion {
+        volume: six_volume.abs() / 6.0,
+        first_moment: first_moment_times_six * (sign / 6.0),
+    }
+}
+
+fn ellipsoid_submerged_region(pose: &GeomPose, plane: Plane, semi_axes: Vec3) -> SubmergedRegion {
+    if semi_axes.x <= 0.0 || semi_axes.y <= 0.0 || semi_axes.z <= 0.0 {
+        return SubmergedRegion::ZERO;
+    }
+    let normal = plane.normal / plane.normal.length();
+    let local_normal = pose.orientation.inverse_rotate(normal);
+    let transformed_normal = Vec3::new(
+        local_normal.x * semi_axes.x,
+        local_normal.y * semi_axes.y,
+        local_normal.z * semi_axes.z,
+    );
+    let scale = transformed_normal.length();
+    if scale == 0.0 {
+        return SubmergedRegion::ZERO;
+    }
+    let signed_distance =
+        (normal.dot(pose.position) + plane.distance / plane.normal.length()) / scale;
+    let unit_region = spherical_submerged_region(
+        Vec3::ZERO,
+        signed_distance,
+        1.0,
+        Plane::new(transformed_normal, 0.0),
+    );
+    let volume_scale = semi_axes.x * semi_axes.y * semi_axes.z;
+    let volume = unit_region.volume * volume_scale;
+    let local_first_moment = Vec3::new(
+        unit_region.first_moment.x * semi_axes.x,
+        unit_region.first_moment.y * semi_axes.y,
+        unit_region.first_moment.z * semi_axes.z,
+    ) * volume_scale;
+    SubmergedRegion {
+        volume,
+        first_moment: pose.position * volume + pose.rotate(local_first_moment),
+    }
+}
+
+fn disk_submerged_area(radius: f32, threshold: f32) -> f32 {
+    if radius <= 0.0 || threshold <= -radius {
+        return 0.0;
+    }
+    if threshold >= radius {
+        return PI * radius * radius;
+    }
+    let full_area = PI * radius * radius;
+    let cap_height = threshold + radius;
+    let area = if cap_height <= radius {
+        disk_cap_area(radius, cap_height)
+    } else {
+        full_area - disk_cap_area(radius, 2.0 * radius - cap_height)
+    };
+    area.clamp(0.0, full_area)
+}
+
+fn disk_cap_area(radius: f32, cap_height: f32) -> f32 {
+    if cap_height <= 0.0 {
+        return 0.0;
+    }
+    if cap_height >= 2.0 * radius {
+        return PI * radius * radius;
+    }
+    let x = cap_height / radius;
+    if x <= 0.01 {
+        let series = 4.0 / 3.0 - x / 5.0 - x * x / 56.0;
+        return radius * radius * x * (2.0 * x).sqrt() * series;
+    }
+    let root = (radius * radius - (cap_height - radius) * (cap_height - radius))
+        .max(0.0)
+        .sqrt();
+    radius * radius * asin((cap_height - radius) / radius) + PI * radius * radius * 0.5
+        - (radius - cap_height) * root
+}
+
+const PI_F64: f64 = core::f64::consts::PI;
+
+fn asin_f64(x: f64) -> f64 {
+    let x = x.clamp(-1.0, 1.0);
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let ax = x.abs();
+    let t = if ax <= 0.5 {
+        ax
+    } else {
+        ((1.0 - ax) * 0.5).sqrt()
+    };
+    let t2 = t * t;
+    let mut coefficient = 1.0;
+    let mut power = t;
+    let mut polynomial = t;
+    for index in 1..=20 {
+        let index = index as f64;
+        coefficient *=
+            (2.0 * index - 1.0) * (2.0 * index - 1.0) / (2.0 * index * (2.0 * index + 1.0));
+        power *= t2;
+        polynomial += coefficient * power;
+    }
+    if ax <= 0.5 {
+        sign * polynomial
+    } else {
+        sign * (PI_F64 * 0.5 - 2.0 * polynomial)
+    }
+}
+
+fn disk_submerged_area_primitive(radius: f64, threshold: f64) -> f64 {
+    if radius <= 0.0 || threshold <= -radius {
+        return 0.0;
+    }
+    if threshold >= radius {
+        return PI_F64 * radius * radius * threshold;
+    }
+    let root = (radius * radius - threshold * threshold).max(0.0).sqrt();
+    let ratio = threshold / radius;
+    radius * radius * (threshold * asin_f64(ratio) + root + PI_F64 * 0.5 * threshold)
+        - root * root * root / 3.0
+}
+
+fn clipped_axial_length(center_distance: f32, axis_component: f32, axial_half: f32) -> f32 {
+    if axis_component == 0.0 {
+        return if center_distance <= 0.0 {
+            2.0 * axial_half
+        } else {
+            0.0
+        };
+    }
+    let crossing = -center_distance / axis_component;
+    if axis_component > 0.0 {
+        (crossing + axial_half).clamp(0.0, 2.0 * axial_half)
+    } else {
+        (axial_half - crossing).clamp(0.0, 2.0 * axial_half)
+    }
+}
+
+fn cylinder_submerged_volume(pose: &GeomPose, plane: Plane, radius: f32, half_height: f32) -> f32 {
+    if radius <= 0.0 || half_height <= 0.0 {
+        return 0.0;
+    }
+    let normal_length = plane.normal.length();
+    if normal_length == 0.0 {
+        return 0.0;
+    }
+    let normal = plane.normal / normal_length;
+    let local_normal = pose.orientation.inverse_rotate(normal);
+    let transverse = (local_normal.x * local_normal.x + local_normal.y * local_normal.y).sqrt();
+    let center_distance = normal.dot(pose.position) + plane.distance / normal_length;
+    let full_volume = PI * radius * radius * 2.0 * half_height;
+    if transverse == 0.0 {
+        return (PI
+            * radius
+            * radius
+            * clipped_axial_length(center_distance, local_normal.z, half_height))
+        .clamp(0.0, full_volume);
+    }
+
+    let axial_min = -half_height as f64;
+    let axial_max = half_height as f64;
+    let center_distance = center_distance as f64;
+    let transverse = transverse as f64;
+    let axis_component = local_normal.z as f64;
+    if axis_component == 0.0 {
+        return (disk_submerged_area(radius, (-center_distance / transverse) as f32)
+            * (axial_max - axial_min) as f32)
+            .clamp(0.0, full_volume);
+    }
+    let q_min = -(center_distance + axis_component * axial_min) / transverse;
+    let q_max = -(center_distance + axis_component * axial_max) / transverse;
+    let primitive_min = disk_submerged_area_primitive(radius as f64, q_min);
+    let primitive_max = disk_submerged_area_primitive(radius as f64, q_max);
+    (((primitive_max - primitive_min) * transverse / axis_component).abs() as f32)
+        .clamp(0.0, full_volume)
+}
+
+fn cylinder_submerged_region(
+    pose: &GeomPose,
+    plane: Plane,
+    radius: f32,
+    half_height: f32,
+) -> SubmergedRegion {
+    let volume = cylinder_submerged_volume(pose, plane, radius, half_height);
+    if volume == 0.0 {
+        return SubmergedRegion::ZERO;
+    }
+    let normal = plane.normal / plane.normal.length();
+    let local_normal = pose.orientation.inverse_rotate(normal);
+    let transverse = (local_normal.x * local_normal.x + local_normal.y * local_normal.y).sqrt();
+    if transverse == 0.0 {
+        return SubmergedRegion::centered(pose.position, volume);
+    }
+    let transverse_axis = Vec3::new(
+        local_normal.x / transverse,
+        local_normal.y / transverse,
+        0.0,
+    );
+    let steps = 64;
+    let step = 2.0 * half_height / steps as f32;
+    let center_distance = normal.dot(pose.position) + plane.distance / plane.normal.length();
+    let mut local_first_moment = Vec3::ZERO;
+    for index in 0..steps {
+        let axial = -half_height + (index as f32 + 0.5) * step;
+        let threshold = -(center_distance + local_normal.z * axial) / transverse;
+        let area = disk_submerged_area(radius, threshold);
+        let transverse_first_moment = if threshold <= -radius || threshold >= radius {
+            0.0
+        } else {
+            -2.0 / 3.0
+                * (radius * radius - threshold * threshold).max(0.0).sqrt()
+                * (radius * radius - threshold * threshold).max(0.0)
+        };
+        local_first_moment +=
+            (Vec3::Z * axial * area + transverse_axis * transverse_first_moment) * step;
+    }
+    SubmergedRegion {
+        volume,
+        first_moment: pose.position * volume + pose.rotate(local_first_moment),
+    }
+}
+
+fn hemisphere_submerged_volume(
+    signed_center_distance: f32,
+    plane_normal_axis_component: f32,
+    radius: f32,
+    upper: bool,
+) -> f32 {
+    if radius <= 0.0 {
+        return 0.0;
+    }
+    let axis_component = if upper {
+        plane_normal_axis_component
+    } else {
+        -plane_normal_axis_component
+    };
+    let transverse = (1.0 - axis_component * axis_component).max(0.0).sqrt();
+    let threshold = -signed_center_distance / radius;
+    let half_sphere = 2.0 * PI * radius * radius * radius / 3.0;
+
+    if transverse == 0.0 {
+        if axis_component >= 0.0 {
+            return (spherical_submerged_volume(-threshold * radius, radius) - half_sphere)
+                .max(0.0);
+        }
+        if threshold >= 0.0 {
+            return half_sphere;
+        }
+        return spherical_submerged_volume(-threshold * radius, radius).min(half_sphere);
+    }
+
+    if axis_component >= 0.0 {
+        if threshold <= -transverse {
+            return 0.0;
+        }
+        if threshold >= 1.0 {
+            return half_sphere;
+        }
+        if threshold >= transverse {
+            return (half_sphere - spherical_submerged_volume(threshold * radius, radius)).max(0.0);
+        }
+    } else {
+        if threshold <= -1.0 {
+            return 0.0;
+        }
+        if threshold <= -transverse {
+            return spherical_submerged_volume(-threshold * radius, radius).min(half_sphere);
+        }
+        if threshold >= transverse {
+            return half_sphere;
+        }
+    }
+
+    let circle_radius = (1.0 - threshold * threshold).max(0.0).sqrt();
+    let intersection_height = (1.0 - (threshold / transverse) * (threshold / transverse))
+        .max(0.0)
+        .sqrt();
+    let beta = atan2(
+        intersection_height / circle_radius,
+        -threshold * axis_component / (circle_radius * transverse),
+    );
+    let intersection_x = threshold / transverse;
+    let small_tangent = Vec3::new(
+        axis_component * intersection_height / circle_radius,
+        -threshold * axis_component / (circle_radius * transverse),
+        -transverse * intersection_height / circle_radius,
+    );
+    let equator_tangent = Vec3::new(-intersection_height, intersection_x, 0.0);
+    let intersection = Vec3::new(intersection_x, intersection_height, 0.0);
+    let turn = atan2(
+        intersection.dot(small_tangent.cross(equator_tangent)),
+        small_tangent.dot(equator_tangent),
+    );
+    let spherical_area = 2.0 * PI + 2.0 * threshold * beta - 2.0 * turn;
+    let disk_threshold = threshold * axis_component / transverse;
+    let plane_disk_area = disk_submerged_area(circle_radius, disk_threshold);
+    radius * radius * radius * (spherical_area + threshold * plane_disk_area) / 3.0
+}
+
+fn capsule_submerged_volume(pose: &GeomPose, plane: Plane, radius: f32, half_height: f32) -> f32 {
+    if radius <= 0.0 || half_height < 0.0 {
+        return 0.0;
+    }
+    let normal_length = plane.normal.length();
+    if normal_length == 0.0 {
+        return 0.0;
+    }
+    let normal = plane.normal / normal_length;
+    let local_normal = pose.orientation.inverse_rotate(normal);
+    let center_distance = normal.dot(pose.position) + plane.distance / normal_length;
+    let cylinder = cylinder_submerged_volume(pose, plane, radius, half_height);
+    let lower_center_distance = center_distance - local_normal.z * half_height;
+    let upper_center_distance = center_distance + local_normal.z * half_height;
+    (cylinder
+        + hemisphere_submerged_volume(lower_center_distance, local_normal.z, radius, false)
+        + hemisphere_submerged_volume(upper_center_distance, local_normal.z, radius, true))
+    .clamp(
+        0.0,
+        PI * radius * radius * (2.0 * half_height + 4.0 * radius / 3.0),
+    )
+}
+
+fn capsule_submerged_region(
+    pose: &GeomPose,
+    plane: Plane,
+    radius: f32,
+    half_height: f32,
+) -> SubmergedRegion {
+    let volume = capsule_submerged_volume(pose, plane, radius, half_height);
+    let cylinder = cylinder_submerged_region(pose, plane, radius, half_height);
+    let normal = plane.normal / plane.normal.length();
+    let local_normal = pose.orientation.inverse_rotate(normal);
+    let lower_center_distance = normal.dot(pose.position) + plane.distance / plane.normal.length()
+        - local_normal.z * half_height;
+    let upper_center_distance = normal.dot(pose.position)
+        + plane.distance / plane.normal.length()
+        + local_normal.z * half_height;
+    let lower_volume =
+        hemisphere_submerged_volume(lower_center_distance, local_normal.z, radius, false);
+    let upper_volume =
+        hemisphere_submerged_volume(upper_center_distance, local_normal.z, radius, true);
+    let axis = pose.rotate(Vec3::Z);
+    let lower_center = pose.position - axis * half_height;
+    let upper_center = pose.position + axis * half_height;
+    let lower = SubmergedRegion::centered(lower_center, lower_volume);
+    let upper = SubmergedRegion::centered(upper_center, upper_volume);
+    SubmergedRegion {
+        volume,
+        first_moment: cylinder.first_moment + lower.first_moment + upper.first_moment,
+    }
+}
+
 fn shape_name(s: GeomShape) -> &'static str {
     match s {
         GeomShape::Plane => "plane",
@@ -3425,5 +4413,243 @@ mod tests {
         let diff = d_new.dangular_velocity_body - dang_ref;
         assert!(diff.length() < 1e-6, "wrench-free path diverged");
         assert_eq!(d_new.dlinear_velocity, Vec3::new(0.0, 0.0, -9.81));
+    }
+
+    #[test]
+    fn field_force_cache_evaluates_each_body_once_per_tree_contact_step() {
+        let mut world = World::new();
+        world.gravity = Vec3::ZERO;
+        world.integrator = Integrator::Euler;
+        world.dt = 0.005;
+        world.solver.mode = SolverMode::Pgs;
+        world.solver.iterations = 40;
+
+        let mut tree = Tree::new();
+        tree.push_link(crate::tree::Link::new(
+            None,
+            JointKind::Fixed,
+            (Vec3::ZERO, Quat::IDENTITY),
+            (Vec3::ZERO, Quat::IDENTITY),
+            1.0,
+            crate::math::Mat3::diag(0.1, 0.1, 0.1),
+        ));
+        let tree = world.add_tree(tree);
+        world.add_geom(Geom::sphere_on_link(tree, 0, 0.5, Vec3::ZERO, 0.0));
+        let body = world.add_body(Body::solid_sphere(
+            1.0,
+            0.5,
+            Vec3::new(0.0, 0.0, 0.49999),
+            Quat::IDENTITY,
+        ));
+        world.add_geom(Geom::sphere(body, 0.5, Vec3::ZERO, 0.0));
+        world.add_force_field(ForceField::Uniform {
+            direction: Vec3::new(0.0, 0.0, -1.0),
+            magnitude: 9.81,
+        });
+
+        world.step();
+
+        assert_eq!(world.field_force_evaluation_count.get(), world.bodies.len());
+    }
+
+    #[test]
+    fn analytic_cylinder_and_capsule_volume_handles_tangent_and_continuity() {
+        let plane = Plane::new(Vec3::Z, 0.0);
+        let tangent_cylinder = GeomPose {
+            position: Vec3::new(0.0, 0.0, 1.0),
+            orientation: Quat::IDENTITY,
+        };
+        let tangent_capsule = GeomPose {
+            position: Vec3::new(0.0, 0.0, 1.5),
+            orientation: Quat::IDENTITY,
+        };
+        assert_eq!(
+            cylinder_submerged_volume(&tangent_cylinder, plane, 0.5, 1.0),
+            0.0
+        );
+        assert_eq!(
+            capsule_submerged_volume(&tangent_capsule, plane, 0.5, 1.0),
+            0.0
+        );
+
+        let near_tangent_cylinder = GeomPose {
+            position: Vec3::new(0.0, 0.0, 1.0 - 2.0e-6),
+            orientation: Quat::IDENTITY,
+        };
+        let near_tangent_capsule = GeomPose {
+            position: Vec3::new(0.0, 0.0, 1.5 - 2.0e-6),
+            orientation: Quat::IDENTITY,
+        };
+        let near_tangent_cylinder =
+            cylinder_submerged_volume(&near_tangent_cylinder, plane, 0.5, 1.0);
+        let near_tangent_capsule = capsule_submerged_volume(&near_tangent_capsule, plane, 0.5, 1.0);
+        assert!(near_tangent_cylinder >= 0.0);
+        assert!(near_tangent_capsule >= 0.0);
+        assert!(near_tangent_cylinder < 3.0e-6);
+        assert!(near_tangent_capsule < 1.0e-8);
+    }
+
+    #[test]
+    fn analytic_cylinder_and_capsule_volume_matches_partial_and_full_values() {
+        let plane = Plane::new(Vec3::Z, 0.0);
+        let partial_pose = GeomPose {
+            position: Vec3::new(0.0, 0.0, 0.25),
+            orientation: Quat::IDENTITY,
+        };
+        let partial_cylinder = cylinder_submerged_volume(&partial_pose, plane, 0.5, 1.0);
+        let expected_cylinder = PI * 0.5 * 0.5 * 0.75;
+        assert!(partial_cylinder >= 0.0);
+        assert!((partial_cylinder - expected_cylinder).abs() < 1.0e-6);
+
+        let partial_capsule = capsule_submerged_volume(&partial_pose, plane, 0.5, 1.0);
+        let expected_capsule = expected_cylinder + (2.0 / 3.0) * PI * 0.5 * 0.5 * 0.5;
+        assert!(partial_capsule >= 0.0);
+        assert!((partial_capsule - expected_capsule).abs() < 1.0e-6);
+
+        let full_pose = GeomPose {
+            position: Vec3::new(0.0, 0.0, -2.0),
+            orientation: Quat::IDENTITY,
+        };
+        let full_cylinder = cylinder_submerged_volume(&full_pose, plane, 0.5, 1.0);
+        let expected_full_cylinder = PI * 0.5 * 0.5 * 2.0;
+        assert!(full_cylinder >= 0.0);
+        assert!((full_cylinder - expected_full_cylinder).abs() < 1.0e-6);
+
+        let full_capsule = capsule_submerged_volume(&full_pose, plane, 0.5, 1.0);
+        let expected_full_capsule = expected_full_cylinder + (4.0 / 3.0) * PI * 0.5 * 0.5 * 0.5;
+        assert!(full_capsule >= 0.0);
+        assert!((full_capsule - expected_full_capsule).abs() < 1.0e-6);
+
+        let tilted_plane = Plane::new(Vec3::new(0.6, 0.0, 0.8), 0.0);
+        let centered_cylinder = cylinder_submerged_volume(
+            &GeomPose {
+                position: Vec3::ZERO,
+                orientation: Quat::IDENTITY,
+            },
+            tilted_plane,
+            0.5,
+            1.0,
+        );
+        assert!(centered_cylinder >= 0.0);
+        assert!((centered_cylinder - expected_full_cylinder * 0.5).abs() < 1.0e-6);
+        let centered_capsule = capsule_submerged_volume(
+            &GeomPose {
+                position: Vec3::ZERO,
+                orientation: Quat::IDENTITY,
+            },
+            tilted_plane,
+            0.5,
+            1.0,
+        );
+        assert!(centered_capsule >= 0.0);
+        assert!((centered_capsule - expected_full_capsule * 0.5).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn analytic_volume_handles_near_parallel_cylinder_axes() {
+        let plane = Plane::new(Vec3::Z, 0.0);
+        let radius = 0.5;
+        let half_height = 1.0;
+        let full_cylinder = PI * radius * radius * 2.0 * half_height;
+        let full_capsule = full_cylinder + (4.0 / 3.0) * PI * radius * radius * radius;
+
+        for axis_component in [0.0_f32, 1.0e-8, 1.0e-7, 1.0e-4] {
+            let half_angle_sin = ((1.0_f32 - axis_component) * 0.5).sqrt();
+            let half_angle_cos = ((1.0_f32 + axis_component) * 0.5).sqrt();
+            let pose = |center_z: f32| GeomPose {
+                position: Vec3::new(0.0, 0.0, center_z),
+                orientation: Quat::new(0.0, half_angle_sin, 0.0, half_angle_cos),
+            };
+            let transverse = (1.0_f32 - axis_component * axis_component).sqrt();
+            let parallel_cylinder = |center_z: f32| {
+                disk_submerged_area(radius, -center_z / transverse) * 2.0 * half_height
+            };
+
+            for center_z in [0.5, 0.25, 0.0, -0.25, -0.5] {
+                let cylinder =
+                    cylinder_submerged_volume(&pose(center_z), plane, radius, half_height);
+                assert!(cylinder >= 0.0);
+                assert!(
+                    (cylinder - parallel_cylinder(center_z)).abs() < 2.0e-6,
+                    "axis={axis_component} center={center_z} cylinder={cylinder} parallel={}",
+                    parallel_cylinder(center_z)
+                );
+            }
+
+            let full_pose = pose(-2.0);
+            let cylinder = cylinder_submerged_volume(&full_pose, plane, radius, half_height);
+            assert!(cylinder >= 0.0);
+            assert!((cylinder - full_cylinder).abs() < 1.0e-6);
+            let capsule = capsule_submerged_volume(&full_pose, plane, radius, half_height);
+            assert!(capsule >= 0.0);
+            assert!((capsule - full_capsule).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn analytic_volume_keeps_tiny_near_parallel_intersections_positive() {
+        let plane = Plane::new(Vec3::Z, 0.0);
+        let radius = 0.5;
+        let half_height = 1.0;
+        let pose = |axis_component: f32| GeomPose {
+            position: Vec3::new(0.0, 0.0, radius),
+            orientation: Quat::new(
+                0.0,
+                ((1.0 - axis_component) * 0.5).sqrt(),
+                0.0,
+                ((1.0 + axis_component) * 0.5).sqrt(),
+            ),
+        };
+
+        let tiny = cylinder_submerged_volume(&pose(1.0e-6), plane, radius, half_height);
+        let smaller = cylinder_submerged_volume(&pose(5.0e-7), plane, radius, half_height);
+        assert!(tiny > 0.0, "tiny real intersection was discarded");
+        assert!(smaller > 0.0, "smaller real intersection was discarded");
+        assert!(smaller < tiny, "near-parallel volume is not continuous");
+    }
+
+    #[test]
+    fn analytic_volume_is_nonnegative_and_monotone_at_boundaries() {
+        let plane = Plane::new(Vec3::Z, 0.0);
+        let radius = 0.5;
+        let half_height = 1.0;
+        let pose = |center_z: f32| GeomPose {
+            position: Vec3::new(0.0, 0.0, center_z),
+            orientation: Quat::new(0.0, 2.0_f32.sqrt() * 0.5, 0.0, 2.0_f32.sqrt() * 0.5),
+        };
+        let mut previous_cylinder = 0.0;
+        let mut previous_capsule = 0.0;
+        for index in 0..=1_000_000 {
+            let center_z = 0.5 - index as f32 * 1.0e-6;
+            let current_cylinder =
+                cylinder_submerged_volume(&pose(center_z), plane, radius, half_height);
+            let current_capsule =
+                capsule_submerged_volume(&pose(center_z), plane, radius, half_height);
+            assert!(current_cylinder >= 0.0);
+            assert!(current_capsule >= 0.0);
+            assert!(current_cylinder + 1.0e-6 >= previous_cylinder);
+            assert!(current_capsule + 1.0e-6 >= previous_capsule);
+            previous_cylinder = current_cylinder;
+            previous_capsule = current_capsule;
+        }
+    }
+
+    #[test]
+    fn disk_segment_area_stays_nonnegative_near_tangency() {
+        let radius = 0.5;
+        for threshold in [
+            -radius + 1.0e-8,
+            -radius + 1.0e-7,
+            -radius + 1.0e-6,
+            radius - 1.0e-6,
+            radius - 1.0e-7,
+            radius - 1.0e-8,
+        ] {
+            let area = disk_submerged_area(radius, threshold);
+            assert!(
+                (0.0..=PI * radius * radius).contains(&area),
+                "threshold={threshold} area={area}"
+            );
+        }
     }
 }

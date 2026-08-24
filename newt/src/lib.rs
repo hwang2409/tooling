@@ -101,6 +101,8 @@ pub mod tree;
 pub mod world;
 pub mod xml;
 
+pub use world::{ForceField, ForceFieldId, Plane, RadialFalloff};
+
 pub use ragdoll::{
     BodyId, BoneSpec, JointId, RagdollBuildError, RagdollBuilder, RagdollHandles, RagdollJointSpec,
 };
