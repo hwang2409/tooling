@@ -61,6 +61,7 @@ fn build_resting_box_on_plane() -> World {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     // Static ground plane.
@@ -110,6 +111,7 @@ fn solver_two_body_contact_conserves_linear_momentum() {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     // Two overlapping spheres, initial velocity along +X on A, at rest on B.
@@ -155,6 +157,7 @@ fn solver_condim_1_block_slides_regardless_of_angle() {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     // Plane tilted 10° about Y (very shallow — μ=1.0 friction would hold it).

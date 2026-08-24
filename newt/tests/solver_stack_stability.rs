@@ -16,6 +16,7 @@ fn build_stack(solver: bool) -> World {
         w.solver = SolverConfig {
             mode: SolverMode::Pgs,
             iterations: 30,
+            pgs_tolerance: 0.0,
             cone: ConeKind::Pyramidal,
         };
     }

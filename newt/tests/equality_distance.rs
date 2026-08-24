@@ -21,6 +21,7 @@ fn build_pair(with_equality: bool) -> World {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 40,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let ba = w.add_body(Body::solid_sphere(

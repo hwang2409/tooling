@@ -162,9 +162,9 @@ Tests assert monotonicity and exact hand-derived derivatives for inactive,
 boundary, active, interior, and outside zones.
 
 On the live penetrated stack anchor, Newton accepted 1 step before reaching
-the scaled `1e-7` cost threshold. PGS uses its fixed 30-sweep cap because its
-legacy path has no early-exit test. The comparison is therefore PGS: 30
-sweeps versus Newton: 1 accepted step.
+the scaled `1e-7` cost threshold. PGS uses its configured 30-sweep cap by
+default. A positive `pgs_tolerance` can enable deterministic early exit. The
+comparison is therefore PGS: up to 30 sweeps versus Newton: 1 accepted step.
 
 ## Integration and force recovery
 

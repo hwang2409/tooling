@@ -27,6 +27,7 @@ fn connect_pair_scene() -> World {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let solref = SolRef::new(0.01, 1.0);
@@ -96,6 +97,7 @@ fn coupling_scene() -> World {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let ti = w.add_tree(tree);
@@ -117,6 +119,7 @@ fn weld_scene() -> World {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let solref = SolRef::new(0.01, 1.0);
@@ -156,6 +159,7 @@ fn distance_scene() -> World {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 40,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     // Orbiting-pair scene with asymmetric tangential velocities to
@@ -193,6 +197,7 @@ fn condim_rolling_scene() -> World {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let solref = SolRef::new(0.02, 1.0);
@@ -230,6 +235,7 @@ fn condim_torsional_scene() -> World {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let solref = SolRef::new(0.02, 1.0);

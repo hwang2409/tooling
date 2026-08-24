@@ -27,7 +27,7 @@
 //!
 //! PGS remains the established dual sweep. Newton uses the same assembled
 //! rows and minimizes the dense regularized quadratic in `crate::newton`.
-//! Both have fixed iteration caps and deterministic cost convergence.
+//! Both have fixed iteration caps and deterministic convergence behavior.
 //!
 //! # Determinism
 //!
@@ -94,10 +94,11 @@ const NEWTON_ELLIPTIC_ERROR: &str =
 pub struct SolverConfig {
     /// Which model to use. Default `Penalty` keeps the legacy force path.
     pub mode: SolverMode,
-    /// Fixed number of PGS sweeps per step. Higher = tighter convergence,
-    /// same runtime cost per iteration. Determinism outranks early-exit
-    /// convergence sensitivity here: we always run exactly this many.
+    /// Maximum number of PGS sweeps per step.
     pub iterations: u32,
+    /// Stop PGS when the largest impulse change is below this value.
+    /// Zero disables early exit and preserves the fixed-sweep behavior.
+    pub pgs_tolerance: f32,
     /// Cone parameterization. Newton currently accepts pyramidal cones only;
     /// elliptic Newton models are rejected during loading.
     pub cone: ConeKind,
@@ -107,6 +108,7 @@ impl SolverConfig {
     pub const DEFAULT: Self = Self {
         mode: SolverMode::Penalty,
         iterations: 20,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
 }
@@ -127,8 +129,23 @@ impl SolverConfig {
         if self.iterations == 0 {
             return Err("solver iterations must be >= 1".to_string());
         }
+        if !self.pgs_tolerance.is_finite() || self.pgs_tolerance < 0.0 {
+            return Err("pgs tolerance must be finite and >= 0".to_string());
+        }
         Ok(())
     }
+}
+
+fn pgs_should_terminate(max_delta: f32, tolerance: f32) -> bool {
+    tolerance > 0.0 && max_delta < tolerance
+}
+
+fn max_abs_delta(current: &[f32], previous: &[f32]) -> f32 {
+    current
+        .iter()
+        .zip(previous)
+        .map(|(current, previous)| (current - previous).abs())
+        .fold(0.0, f32::max)
 }
 
 // ---------------------------------------------------------------------------
@@ -533,8 +550,37 @@ pub fn solve_free_bodies(
     cone: ConeKind,
     iterations: u32,
 ) -> Vec<(Vec3, Vec3)> {
-    let (wrenches, _) = solve_free_bodies_diag(
-        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations,
+    solve_free_bodies_with_tolerance(
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, 0.0,
+    )
+}
+
+/// PGS free-body solve with an explicit convergence tolerance.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_free_bodies_with_tolerance(
+    bodies: &[Body],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    equalities: &[Equality],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+    pgs_tolerance: f32,
+) -> Vec<(Vec3, Vec3)> {
+    let (wrenches, _, _) = solve_free_bodies_diag_mode(
+        bodies,
+        geoms,
+        contacts,
+        equalities,
+        gravity,
+        dt,
+        cone,
+        iterations,
+        pgs_tolerance,
+        false,
+        None,
+        None,
     );
     wrenches
 }
@@ -577,8 +623,39 @@ pub fn solve_free_bodies_diag(
     cone: ConeKind,
     iterations: u32,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
+    let (wrenches, forces, _) = solve_free_bodies_diag_mode(
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, 0.0, false, None, None,
+    );
+    (wrenches, forces)
+}
+
+/// Diagnostic PGS solve with an explicit convergence tolerance and iteration
+/// count for instrumentation.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_free_bodies_diag_with_tolerance(
+    bodies: &[Body],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    equalities: &[Equality],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+    pgs_tolerance: f32,
+) -> (Vec<(Vec3, Vec3)>, Vec<f32>, u32) {
     solve_free_bodies_diag_mode(
-        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, false, None, None,
+        bodies,
+        geoms,
+        contacts,
+        equalities,
+        gravity,
+        dt,
+        cone,
+        iterations,
+        pgs_tolerance,
+        false,
+        None,
+        None,
     )
 }
 
@@ -596,9 +673,10 @@ pub fn solve_free_bodies_newton_diag(
     cone: ConeKind,
     iterations: u32,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
-    solve_free_bodies_diag_mode(
-        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, true, None, None,
-    )
+    let (wrenches, forces, _) = solve_free_bodies_diag_mode(
+        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, 0.0, true, None, None,
+    );
+    (wrenches, forces)
 }
 
 /// Return the live Newton cost trace for one free-body constraint solve.
@@ -626,6 +704,7 @@ pub fn solve_free_bodies_newton_trace(
         dt,
         cone,
         iterations,
+        0.0,
         true,
         Some(&mut trace),
         None,
@@ -666,6 +745,7 @@ pub fn diagnose_free_body_contact_rows(
         dt,
         cone,
         iterations,
+        0.0,
         false,
         None,
         Some(&mut diagnostics),
@@ -683,10 +763,11 @@ fn solve_free_bodies_diag_mode(
     dt: f32,
     cone: ConeKind,
     iterations: u32,
+    pgs_tolerance: f32,
     use_newton: bool,
     newton_cost_trace: Option<&mut Vec<f32>>,
     mut row_diagnostics: Option<&mut Vec<ConstraintRowDiagnostic>>,
-) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
+) -> (Vec<(Vec3, Vec3)>, Vec<f32>, u32) {
     if use_newton && cone == ConeKind::Elliptic {
         panic!("{NEWTON_ELLIPTIC_ERROR}");
     }
@@ -695,7 +776,7 @@ fn solve_free_bodies_diag_mode(
     let mut contact_normal_forces = vec![0.0f32; contacts.len()];
     let has_free_eq = equalities.iter().any(|e| e.is_free_body());
     if (contacts.is_empty() && !has_free_eq) || dt <= 0.0 {
-        return (wrenches, contact_normal_forces);
+        return (wrenches, contact_normal_forces, 0);
     }
 
     let mut rows: Vec<ConstraintRow> = Vec::new();
@@ -833,7 +914,7 @@ fn solve_free_bodies_diag_mode(
 
     let n_rows = rows.len();
     if n_rows == 0 {
-        return (wrenches, contact_normal_forces);
+        return (wrenches, contact_normal_forces, 0);
     }
 
     // Cache I_world^-1 per body — used by row_body_diagonal /
@@ -959,7 +1040,7 @@ fn solve_free_bodies_diag_mode(
     // Newton and PGS consume the same H = J M⁻¹ Jᵀ + R and bias. This keeps
     // the solver switch a numerical method choice, not a second constraint
     // model.
-    let impulses = if use_newton {
+    let (impulses, pgs_iterations) = if use_newton {
         let result = solve_free_body_newton_impulses(
             &rows,
             &per_contact,
@@ -972,12 +1053,15 @@ fn solve_free_bodies_diag_mode(
         if let Some(trace) = newton_cost_trace {
             *trace = result.costs.clone();
         }
-        result.solution
+        (result.solution, 0)
     } else {
         let mut impulses = vec![0.0f32; n_rows];
+        let mut previous_impulses = vec![0.0f32; n_rows];
         let mut body_delta = vec![BodyDelta::default(); n_bodies];
+        let mut pgs_iterations = 0;
 
-        for _iter in 0..iterations {
+        for iteration in 0..iterations {
+            previous_impulses.copy_from_slice(&impulses);
             // Contact blocks first. Row sweep order within a contact:
             //   normal → t1, t2 (sliding cone cap on impulses[n_row])
             //   → torsion (cone cap: mu_torsion · f_n)
@@ -1074,8 +1158,12 @@ fn solve_free_bodies_diag_mode(
                     );
                 }
             }
+            pgs_iterations = iteration + 1;
+            if pgs_should_terminate(max_abs_delta(&impulses, &previous_impulses), pgs_tolerance) {
+                break;
+            }
         }
-        impulses
+        (impulses, pgs_iterations)
     };
 
     // ---- Extract per-body wrenches ----------------------------------------
@@ -1130,7 +1218,7 @@ fn solve_free_bodies_diag_mode(
         contact_normal_forces[pc.contact_index] = normal_impulse / dt;
     }
 
-    (wrenches, contact_normal_forces)
+    (wrenches, contact_normal_forces, pgs_iterations)
 }
 
 /// Per-contact solver bookkeeping shared across all rows of one contact.
@@ -2349,7 +2437,7 @@ pub fn solve_tree_limits(
         diag[i] = a_ii + r;
     }
 
-    // PGS: fixed iteration count (from `world.solver.iterations`), sweep
+    // PGS: fixed iteration cap (from `world.solver.iterations`), sweep
     // in row order (limits first per tree link, then couplings in
     // declaration order — determinism-preserving).
     let mut f = vec![0.0f32; n_rows];
@@ -2503,6 +2591,8 @@ pub struct TreeContactSolution {
     /// Dense `J M⁻¹ Jᵀ` response for the compact active contact rows.
     /// Rows follow the order assembled from `contacts`.
     pub contact_response: Vec<f32>,
+    /// Number of PGS sweeps completed for this solve. Newton returns zero.
+    pub pgs_iterations: u32,
     /// Source factors for the assembled active contact rows.
     pub row_diagnostics: Vec<ConstraintRowDiagnostic>,
 }
@@ -2568,6 +2658,36 @@ pub fn solve_tree_contacts(
     use_newton: bool,
     tree_implicit: Option<bool>,
 ) -> TreeContactSolution {
+    solve_tree_contacts_with_tolerance(
+        bodies,
+        trees,
+        geoms,
+        contacts,
+        gravity,
+        dt,
+        cone,
+        iterations,
+        0.0,
+        use_newton,
+        tree_implicit,
+    )
+}
+
+/// Solve tree-involved contacts with an explicit PGS convergence tolerance.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_tree_contacts_with_tolerance(
+    bodies: &[Body],
+    trees: &[Tree],
+    geoms: &[Geom],
+    contacts: &[Contact],
+    gravity: Vec3,
+    dt: f32,
+    cone: ConeKind,
+    iterations: u32,
+    pgs_tolerance: f32,
+    use_newton: bool,
+    tree_implicit: Option<bool>,
+) -> TreeContactSolution {
     let mut solution = TreeContactSolution {
         contacts: contacts.to_vec(),
         row_to_contact: Vec::new(),
@@ -2580,6 +2700,7 @@ pub fn solve_tree_contacts(
         contact_normal_forces: vec![0.0; contacts.len()],
         contact_response: Vec::new(),
         row_diagnostics: Vec::new(),
+        pgs_iterations: 0,
     };
     if contacts.is_empty() || dt <= 0.0 || trees.is_empty() {
         return solution;
@@ -2879,7 +3000,10 @@ pub fn solve_tree_contacts(
         .solution
     } else {
         let mut impulses = vec![0.0f32; n_rows];
-        for _ in 0..iterations {
+        let mut previous_impulses = vec![0.0f32; n_rows];
+        let mut pgs_iterations = 0;
+        for iteration in 0..iterations {
+            previous_impulses.copy_from_slice(&impulses);
             for block in &blocks {
                 let normal = block.start_row;
                 world_pgs_non_negative(&rows, &response, normal, &mut impulses);
@@ -2921,7 +3045,12 @@ pub fn solve_tree_contacts(
                     }
                 }
             }
+            pgs_iterations = iteration + 1;
+            if pgs_should_terminate(max_abs_delta(&impulses, &previous_impulses), pgs_tolerance) {
+                break;
+            }
         }
+        solution.pgs_iterations = pgs_iterations;
         impulses
     };
 

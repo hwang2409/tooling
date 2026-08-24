@@ -18,6 +18,7 @@ fn build_world() -> World {
     world.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let hfield = HeightField {

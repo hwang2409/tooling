@@ -315,6 +315,7 @@ changed contact manifold can have a different trajectory under this default.
   "solver": {
     "mode": "pgs",
     "iterations": 30,
+    "pgs_tolerance": 1.0e-6,
     "cone": "pyramidal"
   }
 }
@@ -322,8 +323,9 @@ changed contact manifold can have a different trajectory under this default.
 
 - **mode** — `"penalty"` (default) or `"pgs"`. See
   [`docs/solver.md`](solver.md) for the model derivation.
-- **iterations** — positive integer, number of PGS sweeps per step
-  (no early exit — determinism). Default `20`.
+- **iterations** — positive integer, maximum number of PGS sweeps per step
+- **pgs_tolerance** — non-negative finite maximum impulse change for early
+  exit; `0` keeps the full configured sweep count. Default `0`.
 - **cone** — `"pyramidal"` (default) or `"elliptic"`.
 
 ## equality (root array, optional)

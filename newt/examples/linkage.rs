@@ -81,6 +81,7 @@ fn build_world() -> (World, usize, usize) {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 40,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let solref = SolRef::new(0.01, 1.0);

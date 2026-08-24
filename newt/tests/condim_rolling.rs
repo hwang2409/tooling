@@ -22,6 +22,7 @@ fn build_roller(condim: u8) -> World {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let solref = SolRef::new(0.02, 1.0);

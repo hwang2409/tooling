@@ -1043,6 +1043,7 @@ fn mesh_mesh_stack_keeps_face_manifold_under_pgs() {
     world.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 1.0));
