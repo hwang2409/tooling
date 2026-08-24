@@ -327,6 +327,27 @@ fn cloned_world_rejects_source_handle() {
 }
 
 #[test]
+fn cloned_world_is_logically_equal_but_structural_edits_are_not() {
+    let world = world_with_handle_tree();
+    let mut clone = world.clone();
+
+    assert_eq!(world, clone);
+
+    clone.trees[0].links[1].mass += 1.0;
+    assert_ne!(world, clone);
+}
+
+#[test]
+fn replacing_a_link_with_its_clone_rejects_the_old_handle() {
+    let mut world = world_with_handle_tree();
+    let stale = world.joint_id(0, 1);
+    world.trees[0].links[1] = world.trees[0].links[1].clone();
+
+    let error = world.detach_subtree(stale).unwrap_err();
+    assert!(error.0.contains("stale link handle"));
+}
+
+#[test]
 fn value_edits_preserve_live_handles() {
     let mut world = world_with_handle_tree();
     let mass_handle = world.joint_id(0, 1);

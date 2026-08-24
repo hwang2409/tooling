@@ -526,9 +526,7 @@ impl World {
     pub(crate) fn clone_for_transaction(&self) -> Self {
         let mut clone = self.clone();
         clone.topology.world_id = self.topology.world_id;
-        for (cloned, source) in clone.trees.iter_mut().zip(&self.trees) {
-            cloned.identity = source.identity;
-        }
+        clone.trees = self.trees.iter().map(Tree::clone_with_identity).collect();
         clone
     }
 
@@ -1258,7 +1256,7 @@ impl World {
         }
 
         let child_tree_id = self.trees.len();
-        let mut parent = source.clone();
+        let mut parent = source.clone_with_identity();
         let split = parent.detach_subtree(root);
         validate_split_maps(&split)?;
 

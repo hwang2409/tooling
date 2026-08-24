@@ -93,14 +93,16 @@ static NEXT_TREE_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_LINK_ID: AtomicUsize = AtomicUsize::new(1);
 
 fn fresh_id(counter: &AtomicUsize) -> GenerationalId {
-    GenerationalId {
-        id: counter.fetch_add(1, Ordering::Relaxed),
-        generation: 0,
-    }
+    let id = counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .unwrap_or_else(|_| panic!("generational ID exhausted"));
+    GenerationalId { id, generation: 0 }
 }
 
 /// One link in a kinematic tree.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct Link {
     /// Parent link index in the containing [`Tree`]. Must be strictly less
     /// than this link's own index (topological order). `None` iff this is
@@ -147,6 +149,45 @@ pub struct Link {
     pub mocap: bool,
 
     pub(crate) identity: GenerationalId,
+}
+
+impl Clone for Link {
+    fn clone(&self) -> Self {
+        let mut clone = self.clone_with_identity();
+        clone.identity = fresh_id(&NEXT_LINK_ID);
+        clone
+    }
+}
+
+impl PartialEq for Link {
+    fn eq(&self, other: &Self) -> bool {
+        self.parent == other.parent
+            && self.joint == other.joint
+            && self.free_damping == other.free_damping
+            && self.joint_offset_in_parent == other.joint_offset_in_parent
+            && self.joint_offset_in_child == other.joint_offset_in_child
+            && self.mass == other.mass
+            && self.inertia_body == other.inertia_body
+            && self.inertia_body_inverse == other.inertia_body_inverse
+            && self.mocap == other.mocap
+    }
+}
+
+impl Link {
+    fn clone_with_identity(&self) -> Self {
+        Self {
+            parent: self.parent,
+            joint: self.joint,
+            free_damping: self.free_damping,
+            joint_offset_in_parent: self.joint_offset_in_parent,
+            joint_offset_in_child: self.joint_offset_in_child,
+            mass: self.mass,
+            inertia_body: self.inertia_body,
+            inertia_body_inverse: self.inertia_body_inverse,
+            mocap: self.mocap,
+            identity: self.identity,
+        }
+    }
 }
 
 pub(crate) struct DetachedSubtree {
@@ -215,7 +256,7 @@ impl Link {
 }
 
 /// Kinematic tree.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct Tree {
     /// Links in topological order. `links[0]` is the root.
     pub links: Vec<Link>,
@@ -296,7 +337,32 @@ impl Clone for Tree {
     }
 }
 
+impl PartialEq for Tree {
+    fn eq(&self, other: &Self) -> bool {
+        self.links == other.links
+            && self.q_offset == other.q_offset
+            && self.v_offset == other.v_offset
+            && self.q == other.q
+            && self.qdot == other.qdot
+            && self.qfrc_applied == other.qfrc_applied
+            && self.actuators == other.actuators
+            && self.applied_wrenches == other.applied_wrenches
+            && self.disable_penalty_limits == other.disable_penalty_limits
+            && self.tendons == other.tendons
+            && self.mocap_linear_velocity == other.mocap_linear_velocity
+            && self.mocap_angular_velocity == other.mocap_angular_velocity
+            && self.query_generation == other.query_generation
+    }
+}
+
 impl Tree {
+    pub(crate) fn clone_with_identity(&self) -> Self {
+        let mut clone = self.clone();
+        clone.links = self.links.iter().map(Link::clone_with_identity).collect();
+        clone.identity = self.identity;
+        clone
+    }
+
     /// Empty tree (no links). Add the root first via [`Tree::push_link`].
     pub fn new() -> Self {
         Self {
@@ -459,7 +525,7 @@ impl Tree {
         out.query_generation = self.query_generation;
         let mut map = vec![None; self.links.len()];
         for &old_idx in ids {
-            let mut link = self.links[old_idx].clone();
+            let mut link = self.links[old_idx].clone_with_identity();
             let is_detached_root = detached_root == Some(old_idx);
             if is_detached_root {
                 link.parent = None;
@@ -2140,5 +2206,28 @@ mod tests {
         let round = xdn.motion(xup.motion(m));
         assert!((round.angular - m.angular).length() < 1e-5);
         assert!((round.linear - m.linear).length() < 1e-5);
+    }
+
+    #[test]
+    fn public_link_clone_gets_fresh_identity() {
+        let link = Link::new(
+            None,
+            JointKind::Fixed,
+            (Vec3::ZERO, Quat::IDENTITY),
+            (Vec3::ZERO, Quat::IDENTITY),
+            1.0,
+            Mat3::IDENTITY,
+        );
+        let clone = link.clone();
+
+        assert_eq!(link, clone);
+        assert_ne!(link.identity, clone.identity);
+    }
+
+    #[test]
+    #[should_panic(expected = "generational ID exhausted")]
+    fn fresh_id_rejects_exhaustion() {
+        let counter = AtomicUsize::new(usize::MAX);
+        fresh_id(&counter);
     }
 }
