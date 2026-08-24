@@ -118,6 +118,11 @@ pub fn composition(name: &str) -> Composition {
             Vec3::new(3.0, -0.2, 1.4),
             Vec3::new(0.8, 0.3, 0.75),
         ),
+        "humanoid" => Composition::new(
+            Vec3::new(0.0, 0.0, 1.45),
+            Vec3::new(1.45, -2.05, 1.95),
+            Vec3::new(0.92, 0.32, 0.16),
+        ),
         "features" => Composition::new(
             Vec3::new(0.0, 0.0, 1.0),
             Vec3::new(4.8, -7.5, 3.5),

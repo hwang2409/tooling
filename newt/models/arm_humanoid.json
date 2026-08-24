@@ -1,0 +1,173 @@
+{
+  "version": "1",
+  "gravity": [0.0, 0.0, -9.81],
+  "timestep": 0.005,
+
+  "trees": [
+    {
+      "name": "humanoid_arm",
+      "self_collide": false,
+      "links": [
+        {
+          "name": "torso",
+          "joint": {"kind": "fixed"},
+          "joint_offset_in_parent": {"position": [0.0, 0.0, 1.55]},
+          "mass": 8.0,
+          "inertia": {"kind": "diag", "values": [0.8, 0.8, 0.45]}
+        },
+        {
+          "name": "shoulder_yaw",
+          "parent": "torso",
+          "joint": {"kind": "hinge", "axis": [0.0, 0.0, 1.0], "damping": 0.8, "armature": 0.02},
+          "joint_offset_in_parent": {"position": [0.0, 0.0, 0.0]},
+          "joint_offset_in_child": {"position": [0.0, 0.0, 0.0]},
+          "mass": 0.12,
+          "inertia": {"kind": "diag", "values": [0.002, 0.002, 0.002]}
+        },
+        {
+          "name": "shoulder_pitch",
+          "parent": "shoulder_yaw",
+          "joint": {"kind": "hinge", "axis": [0.0, 1.0, 0.0], "damping": 0.8, "armature": 0.02},
+          "joint_offset_in_parent": {"position": [0.0, 0.0, 0.0]},
+          "joint_offset_in_child": {"position": [0.0, 0.0, 0.0]},
+          "mass": 0.12,
+          "inertia": {"kind": "diag", "values": [0.002, 0.002, 0.002]}
+        },
+        {
+          "name": "upper_arm",
+          "parent": "shoulder_pitch",
+          "joint": {"kind": "hinge", "axis": [1.0, 0.0, 0.0], "damping": 1.2, "armature": 0.03, "range": [-1.4, 1.4]},
+          "joint_offset_in_parent": {"position": [0.0, 0.0, 0.0]},
+          "joint_offset_in_child": {"position": [0.0, 0.0, -0.20]},
+          "mass": 2.1,
+          "inertia": {"kind": "diag", "values": [0.024, 0.024, 0.006]}
+        },
+        {
+          "name": "forearm",
+          "parent": "upper_arm",
+          "joint": {"kind": "hinge", "axis": [1.0, 0.0, 0.0], "damping": 1.0, "armature": 0.025, "range": [-1.8, 0.2]},
+          "joint_offset_in_parent": {"position": [0.0, 0.0, 0.20]},
+          "joint_offset_in_child": {"position": [0.0, 0.0, -0.16]},
+          "mass": 1.2,
+          "inertia": {"kind": "diag", "values": [0.010, 0.010, 0.0025]}
+        },
+        {
+          "name": "wrist_yaw",
+          "parent": "forearm",
+          "joint": {"kind": "hinge", "axis": [0.0, 0.0, 1.0], "damping": 0.35, "armature": 0.01, "range": [-0.9, 0.9]},
+          "joint_offset_in_parent": {"position": [0.0, 0.0, 0.16]},
+          "joint_offset_in_child": {"position": [0.0, 0.0, 0.0]},
+          "mass": 0.10,
+          "inertia": {"kind": "diag", "values": [0.001, 0.001, 0.001]}
+        },
+        {
+          "name": "wrist_pitch",
+          "parent": "wrist_yaw",
+          "joint": {"kind": "hinge", "axis": [0.0, 1.0, 0.0], "damping": 0.35, "armature": 0.01, "range": [-0.7, 0.7]},
+          "joint_offset_in_parent": {"position": [0.0, 0.0, 0.0]},
+          "joint_offset_in_child": {"position": [0.0, 0.0, 0.0]},
+          "mass": 0.10,
+          "inertia": {"kind": "diag", "values": [0.001, 0.001, 0.001]}
+        },
+        {
+          "name": "hand",
+          "parent": "wrist_pitch",
+          "joint": {"kind": "fixed"},
+          "joint_offset_in_parent": {"position": [0.0, 0.0, 0.0]},
+          "joint_offset_in_child": {"position": [0.0, 0.0, 0.0]},
+          "mass": 0.45,
+          "inertia": {"kind": "diag", "values": [0.004, 0.004, 0.002]}
+        }
+      ]
+    }
+  ],
+
+  "actuators": [
+    {
+      "name": "shoulder_yaw_servo",
+      "type": "position",
+      "tree": "humanoid_arm",
+      "link": "shoulder_yaw",
+      "kp": 38.0,
+      "kd": 4.5,
+      "clamp": 18.0,
+      "target": 0.0
+    },
+    {
+      "name": "shoulder_pitch_servo",
+      "type": "position",
+      "tree": "humanoid_arm",
+      "link": "shoulder_pitch",
+      "kp": 42.0,
+      "kd": 5.0,
+      "clamp": 20.0,
+      "target": 0.0
+    },
+    {
+      "name": "shoulder_roll_servo",
+      "type": "position",
+      "tree": "humanoid_arm",
+      "link": "upper_arm",
+      "kp": 30.0,
+      "kd": 4.0,
+      "clamp": 16.0,
+      "target": 0.0
+    },
+    {
+      "name": "biceps",
+      "type": "muscle",
+      "tree": "humanoid_arm",
+      "link": "forearm",
+      "lengthrange": [-1.8, 0.2],
+      "range": [-1.8, 0.2],
+      "force": 28.0,
+      "timeconst": [0.045, 0.090],
+      "ctrlrange": [0.0, 1.0],
+      "forcerange": [-28.0, 28.0],
+      "gear": 1.0,
+      "target": 0.0
+    },
+    {
+      "name": "triceps",
+      "type": "muscle",
+      "tree": "humanoid_arm",
+      "link": "forearm",
+      "lengthrange": [-1.8, 0.2],
+      "range": [-1.8, 0.2],
+      "force": 28.0,
+      "timeconst": [0.045, 0.090],
+      "ctrlrange": [0.0, 1.0],
+      "forcerange": [-28.0, 28.0],
+      "gear": -1.0,
+      "target": 0.0
+    },
+    {
+      "name": "wrist_yaw_servo",
+      "type": "position",
+      "tree": "humanoid_arm",
+      "link": "wrist_yaw",
+      "kp": 18.0,
+      "kd": 2.5,
+      "clamp": 8.0,
+      "target": 0.0
+    },
+    {
+      "name": "wrist_pitch_servo",
+      "type": "position",
+      "tree": "humanoid_arm",
+      "link": "wrist_pitch",
+      "kp": 18.0,
+      "kd": 2.5,
+      "clamp": 8.0,
+      "target": 0.0
+    }
+  ],
+
+  "sites": [
+    {
+      "name": "hand_tip",
+      "attach": {"kind": "link", "tree": "humanoid_arm", "link": "hand"},
+      "local_offset": [0.0, 0.0, 0.16]
+    }
+  ]
+}
