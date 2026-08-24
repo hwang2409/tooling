@@ -55,6 +55,7 @@ fn build_scene(with_coupling: bool) -> (World, usize, usize, usize) {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 40,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let tree_idx = w.add_tree(tree);
@@ -174,6 +175,7 @@ fn coupling_jacobian_probe_matches_chain_rule_at_multiple_q_b() {
         w.solver = SolverConfig {
             mode: SolverMode::Pgs,
             iterations: 20,
+            pgs_tolerance: 0.0,
             cone: ConeKind::Pyramidal,
         };
         let ti = w.add_tree(tree);
@@ -262,6 +264,7 @@ fn coupling_tracks_fast_time_varying_q_b_under_quadratic_polycoef() {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 40,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let ti = w.add_tree(tree);
@@ -342,6 +345,7 @@ fn coupling_polycoef_higher_order_terms_track() {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 40,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let ti = w.add_tree(tree);

@@ -31,6 +31,7 @@ fn stack_scene() -> World {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let solref = SolRef::new(0.05, 1.5);
@@ -59,6 +60,7 @@ fn incline_scene() -> World {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let solref = SolRef::new(0.05, 1.5);
@@ -97,6 +99,7 @@ fn tree_contact_scene(mode: SolverMode) -> World {
     world.solver = SolverConfig {
         mode,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let mut plane = Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.7);

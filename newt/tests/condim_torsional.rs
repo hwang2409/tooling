@@ -26,6 +26,7 @@ fn build_spinner_with_mu(condim: u8, mu_torsion: f32) -> World {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let solref = SolRef::new(0.02, 1.0);

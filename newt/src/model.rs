@@ -1545,6 +1545,7 @@ fn parse_integrator(v: &Value, path: &str) -> Result<Integrator, ModelError> {
 /// {
 ///   "mode": "penalty" | "pgs" | "newton",
 ///   "iterations": 20,
+///   "pgs_tolerance": 0.0,
 ///   "cone": "pyramidal" | "elliptic"
 /// }
 /// ```
@@ -1555,7 +1556,11 @@ fn parse_integrator(v: &Value, path: &str) -> Result<Integrator, ModelError> {
 fn parse_solver_config(v: &Value, path: &str) -> Result<crate::solver::SolverConfig, ModelError> {
     use crate::solver::{ConeKind, SolverConfig, SolverMode};
     let fields = get_object(v, path)?;
-    reject_unknown(fields, &["mode", "iterations", "cone"], path)?;
+    reject_unknown(
+        fields,
+        &["mode", "iterations", "pgs_tolerance", "cone"],
+        path,
+    )?;
     let mut cfg = SolverConfig::DEFAULT;
     if let Some(mv) = optional(fields, "mode") {
         let s = get_str(mv, &format!("{path}.mode"))?;
@@ -1580,6 +1585,10 @@ fn parse_solver_config(v: &Value, path: &str) -> Result<crate::solver::SolverCon
             );
         }
         cfg.iterations = n as u32;
+    }
+    if let Some(tv) = optional(fields, "pgs_tolerance") {
+        let tolerance = get_f32(tv, &format!("{path}.pgs_tolerance"))?;
+        cfg.pgs_tolerance = tolerance;
     }
     if let Some(cv) = optional(fields, "cone") {
         let s = get_str(cv, &format!("{path}.cone"))?;

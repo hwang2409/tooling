@@ -81,6 +81,7 @@ fn build_world() -> World {
     world.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     // Softer solref for RK4-ZOH stability under the coupled multi-body

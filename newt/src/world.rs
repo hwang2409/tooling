@@ -50,9 +50,7 @@ use crate::joint::JointKind;
 use crate::math::{Quat, Vec3};
 pub use crate::scene_query::{RayHit, ShapeDesc, ShapeHit};
 use crate::sensor::{Sensor, SensorBank, SensorError, SensorInputs};
-use crate::solver::{
-    ConstraintRowDiagnostic, SolverConfig, SolverMode, TreeContactSolution, solve_free_bodies,
-};
+use crate::solver::{ConstraintRowDiagnostic, SolverConfig, SolverMode, TreeContactSolution};
 use crate::tree::{
     AbaWorkspace, Tree, euler_step_with_workspace as tree_euler_step_with_workspace,
     forward_kinematics as tree_forward_kinematics,
@@ -1599,16 +1597,20 @@ impl World {
                         .collect();
                     (w, f)
                 }
-                SolverMode::Pgs => crate::solver::solve_free_bodies_diag(
-                    &self.bodies,
-                    &self.geoms,
-                    &free_body_contacts,
-                    &self.equalities,
-                    self.gravity,
-                    self.dt,
-                    self.solver.cone,
-                    self.solver.iterations,
-                ),
+                SolverMode::Pgs => {
+                    let (w, f, _) = crate::solver::solve_free_bodies_diag_with_tolerance(
+                        &self.bodies,
+                        &self.geoms,
+                        &free_body_contacts,
+                        &self.equalities,
+                        self.gravity,
+                        self.dt,
+                        self.solver.cone,
+                        self.solver.iterations,
+                        self.solver.pgs_tolerance,
+                    );
+                    (w, f)
+                }
                 SolverMode::Newton => crate::solver::solve_free_bodies_newton_diag(
                     &self.bodies,
                     &self.geoms,
@@ -2113,7 +2115,7 @@ impl World {
             })
             .collect();
         let mut wrenches = match self.solver.mode {
-            SolverMode::Pgs => solve_free_bodies(
+            SolverMode::Pgs => crate::solver::solve_free_bodies_with_tolerance(
                 state,
                 &self.geoms,
                 &free_contacts,
@@ -2122,6 +2124,7 @@ impl World {
                 self.dt,
                 self.solver.cone,
                 self.solver.iterations,
+                self.solver.pgs_tolerance,
             ),
             SolverMode::Newton => crate::solver::solve_free_bodies_newton(
                 state,
@@ -2258,7 +2261,7 @@ impl World {
             Integrator::Euler => Some(false),
             Integrator::ImplicitFast => Some(true),
         };
-        crate::solver::solve_tree_contacts(
+        crate::solver::solve_tree_contacts_with_tolerance(
             &self.bodies,
             &self.trees,
             &self.geoms,
@@ -2267,6 +2270,7 @@ impl World {
             self.dt,
             self.solver.cone,
             self.solver.iterations,
+            self.solver.pgs_tolerance,
             use_newton,
             tree_implicit,
         )

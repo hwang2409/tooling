@@ -57,6 +57,7 @@ fn solver() -> SolverConfig {
     SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 35,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     }
 }

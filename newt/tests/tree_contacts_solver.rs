@@ -52,6 +52,7 @@ fn resting_tree_world(mode: SolverMode) -> World {
     world.solver = SolverConfig {
         mode,
         iterations: 40,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.0));
@@ -75,6 +76,7 @@ fn asymmetric_tree_world_with_iterations(mode: SolverMode, iterations: u32) -> W
     world.solver = SolverConfig {
         mode,
         iterations,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.7));
@@ -109,6 +111,7 @@ fn tilted_tree_box_box_world(mode: SolverMode) -> World {
     world.solver = SolverConfig {
         mode,
         iterations: 40,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
 
@@ -252,6 +255,7 @@ fn solver_modes_route_mocap_contacts_into_shared_rows() {
         world.solver = SolverConfig {
             mode,
             iterations: 40,
+            pgs_tolerance: 0.0,
             cone: ConeKind::Pyramidal,
         };
 
@@ -368,6 +372,7 @@ fn tree_contact_touch_keeps_force_free_contact_index_alignment() {
     world.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 40,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let tree = world.add_tree(free_sphere_tree(0.45));
@@ -408,6 +413,7 @@ fn tree_body_contact_transfers_equal_and_opposite_impulses() {
         world.solver = SolverConfig {
             mode,
             iterations: 30,
+            pgs_tolerance: 0.0,
             cone: ConeKind::Pyramidal,
         };
         let tree = world.add_tree(free_sphere_tree(0.0));
@@ -454,6 +460,7 @@ fn tree_tree_contact_transfers_equal_and_opposite_impulses() {
         world.solver = SolverConfig {
             mode,
             iterations: 30,
+            pgs_tolerance: 0.0,
             cone: ConeKind::Pyramidal,
         };
         let left = world.add_tree(free_sphere_tree(0.0));

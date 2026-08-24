@@ -20,6 +20,7 @@ fn incline_world(angle_rad: f32, mu: f32, cone: ConeKind) -> World {
     world.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone,
     };
     let g = 9.81;

@@ -43,7 +43,8 @@
 //!   See `docs/dynamics.md`.
 //! - **v1 tier 4** (`solver`) — MuJoCo soft-constraint contact model
 //!   (5-parameter SolImp, SolRef reference acceleration, regularized
-//!   dual) solved with fixed-iteration PGS. Ships condim 1 / 3, both
+//!   dual) solved with deterministic PGS sweeps and optional early exit.
+//!   Ships condim 1 / 3, both
 //!   pyramidal and elliptic friction cones, and constraint-based joint
 //!   limits for hinge/slide. Opt-in via `world.solver.mode = Pgs`;
 //!   penalty is still default; source-manifold changes can alter affected

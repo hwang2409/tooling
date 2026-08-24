@@ -42,6 +42,7 @@ fn pendulum_with_range(range: (f32, f32)) -> World {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     // No contacts — just a tree with one hinge and range limits.
@@ -175,6 +176,7 @@ fn solver_hinge_limit_solref_override_changes_penetration() {
         w.solver = SolverConfig {
             mode: SolverMode::Pgs,
             iterations: 30,
+            pgs_tolerance: 0.0,
             cone: ConeKind::Pyramidal,
         };
         let mut tree = Tree::new();

@@ -168,11 +168,11 @@ contribute zero (infinite mass).
 
 ### PGS solve
 
-Fixed iteration count, no early exit — determinism outranks
-convergence sensitivity in this engine (the same input must produce
-the same trajectory across platforms and runs). Default 20 iterations
-in the shipped `SolverConfig::DEFAULT`; more for scenes with heavy
-mass ratios (the stack demo uses 30).
+PGS runs at most the configured iteration count. With the default zero
+tolerance, it keeps the full count for byte-identical legacy output. With a
+positive tolerance, it exits when the maximum absolute impulse change across
+all rows falls below that tolerance. The fixed row order makes each run
+deterministic. Default maximum: 20 iterations.
 
 Sweep order per iteration:
 1. Enumerate contacts in narrow-phase order (already deterministic).
@@ -278,7 +278,10 @@ this ZOH path.
   `(solref, solimp)`.
 - Per-geom `condim`, `solimp`, `torsional_friction`,
   `rolling_friction` on `Geom`; world-level `SolverConfig` with `mode`,
-  `iterations`, `cone`.
+  `iterations`, `pgs_tolerance`, and `cone`. `pgs_tolerance = 0` keeps the
+  full configured PGS sweep count. A positive value exits when the maximum
+  absolute impulse change across all rows falls below the tolerance. The same
+  deterministic rule applies to free-body and tree PGS.
 - JSON model: root `"solver"` and `"equality"` blocks; per-geom
   `"solimp"`, `"condim"`, `"torsional_friction"`,
   `"rolling_friction"` fields; strict validation.
@@ -396,6 +399,7 @@ use newt::solver::{SolverConfig, SolverMode, ConeKind};
 world.solver = SolverConfig {
     mode: SolverMode::Pgs,          // default: Penalty
     iterations: 30,                 // default: 20
+    pgs_tolerance: 1.0e-6,           // default: 0, disabled
     cone: ConeKind::Pyramidal,      // default: Pyramidal
 };
 ```

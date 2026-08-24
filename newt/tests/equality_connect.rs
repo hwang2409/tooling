@@ -28,6 +28,7 @@ fn build_chain(with_equalities: bool) -> World {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     // Stiffer solref (10 ms time constant, 2 samples per period at
@@ -132,6 +133,7 @@ fn build_hanging_bar(anchor_at_end: bool) -> World {
     w.solver = SolverConfig {
         mode: SolverMode::Pgs,
         iterations: 40,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let bar_half = Vec3::new(0.5, 0.03, 0.03);

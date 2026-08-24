@@ -20,6 +20,7 @@ fn resting_box(mode: SolverMode) -> World {
     world.solver = SolverConfig {
         mode,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.5));
@@ -44,6 +45,7 @@ fn stack(mode: SolverMode) -> World {
     world.solver = SolverConfig {
         mode,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     world.add_geom(Geom::static_plane(Vec3::ZERO, Vec3::Z, 1.0));
@@ -65,6 +67,7 @@ fn incline(mode: SolverMode) -> World {
     world.solver = SolverConfig {
         mode,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let tilt = 22.0f32 * std::f32::consts::PI / 180.0;
@@ -91,6 +94,7 @@ fn equality_linkage(mode: SolverMode) -> World {
     world.solver = SolverConfig {
         mode,
         iterations: 30,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let body = world.add_body(Body::solid_sphere(
@@ -119,6 +123,7 @@ fn condim_four_contact_with_iterations(mode: SolverMode, iterations: u32) -> Wor
     world.solver = SolverConfig {
         mode,
         iterations,
+        pgs_tolerance: 0.0,
         cone: ConeKind::Pyramidal,
     };
     let mut plane = Geom::static_plane(Vec3::ZERO, Vec3::Z, 0.8);
@@ -232,6 +237,7 @@ fn programmatic_newton_elliptic_is_rejected_at_step_time() {
         SolverConfig {
             mode: SolverMode::Newton,
             iterations: 30,
+            pgs_tolerance: 0.0,
             cone: ConeKind::Elliptic,
         }
         .validate()
