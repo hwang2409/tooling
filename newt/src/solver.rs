@@ -490,10 +490,6 @@ struct BodyDelta {
     dw_ang_body: Vec3,
 }
 
-pub(crate) trait FreeBodyFieldForce {
-    fn force(&self, body_index: usize, body: &Body) -> Vec3;
-}
-
 /// PGS solve for the free-body pool.
 ///
 /// Inputs:
@@ -512,7 +508,7 @@ pub(crate) trait FreeBodyFieldForce {
 ///
 /// Returns per-body `(force_world, torque_world_at_com)` to be held constant
 /// (ZOH) across the RK4 stages. Bodies not touched by any constraint receive
-/// `(ZERO, ZERO)` unless a field force callback supplies a force.
+/// `(ZERO, ZERO)` unless the caller supplies a cached field force.
 ///
 /// # Row ordering (deterministic total order)
 ///
@@ -582,11 +578,22 @@ pub fn solve_free_bodies_diag(
     iterations: u32,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     solve_free_bodies_diag_mode(
-        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, false, None, None, None,
+        bodies,
+        geoms,
+        contacts,
+        equalities,
+        gravity,
+        dt,
+        cone,
+        iterations,
+        false,
+        None,
+        None,
+        &[],
     )
 }
 
-/// Diagnostic PGS solve with an additional deterministic force callback.
+/// Diagnostic PGS solve with precomputed per-body field forces.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_free_bodies_diag_with_field(
     bodies: &[Body],
@@ -597,7 +604,7 @@ pub(crate) fn solve_free_bodies_diag_with_field(
     dt: f32,
     cone: ConeKind,
     iterations: u32,
-    field_force: &dyn FreeBodyFieldForce,
+    field_forces: &[Vec3],
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     solve_free_bodies_diag_mode(
         bodies,
@@ -611,7 +618,7 @@ pub(crate) fn solve_free_bodies_diag_with_field(
         false,
         None,
         None,
-        Some(field_force),
+        field_forces,
     )
 }
 
@@ -630,11 +637,22 @@ pub fn solve_free_bodies_newton_diag(
     iterations: u32,
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     solve_free_bodies_diag_mode(
-        bodies, geoms, contacts, equalities, gravity, dt, cone, iterations, true, None, None, None,
+        bodies,
+        geoms,
+        contacts,
+        equalities,
+        gravity,
+        dt,
+        cone,
+        iterations,
+        true,
+        None,
+        None,
+        &[],
     )
 }
 
-/// Diagnostic Newton solve with an additional deterministic force callback.
+/// Diagnostic Newton solve with precomputed per-body field forces.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_free_bodies_newton_diag_with_field(
     bodies: &[Body],
@@ -645,7 +663,7 @@ pub(crate) fn solve_free_bodies_newton_diag_with_field(
     dt: f32,
     cone: ConeKind,
     iterations: u32,
-    field_force: &dyn FreeBodyFieldForce,
+    field_forces: &[Vec3],
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     solve_free_bodies_diag_mode(
         bodies,
@@ -659,7 +677,7 @@ pub(crate) fn solve_free_bodies_newton_diag_with_field(
         true,
         None,
         None,
-        Some(field_force),
+        field_forces,
     )
 }
 
@@ -691,7 +709,7 @@ pub fn solve_free_bodies_newton_trace(
         true,
         Some(&mut trace),
         None,
-        None,
+        &[],
     );
     trace
 }
@@ -732,7 +750,7 @@ pub fn diagnose_free_body_contact_rows(
         false,
         None,
         Some(&mut diagnostics),
-        None,
+        &[],
     );
     diagnostics
 }
@@ -750,22 +768,18 @@ fn solve_free_bodies_diag_mode(
     use_newton: bool,
     newton_cost_trace: Option<&mut Vec<f32>>,
     mut row_diagnostics: Option<&mut Vec<ConstraintRowDiagnostic>>,
-    field_force: Option<&dyn FreeBodyFieldForce>,
+    field_forces: &[Vec3],
 ) -> (Vec<(Vec3, Vec3)>, Vec<f32>) {
     if use_newton && cone == ConeKind::Elliptic {
         panic!("{NEWTON_ELLIPTIC_ERROR}");
     }
     let n_bodies = bodies.len();
-    let field_forces = field_force.map_or_else(
-        || vec![Vec3::ZERO; n_bodies],
-        |force| {
-            bodies
-                .iter()
-                .enumerate()
-                .map(|(index, body)| force.force(index, body))
-                .collect()
-        },
-    );
+    let field_forces = if field_forces.is_empty() {
+        vec![Vec3::ZERO; n_bodies]
+    } else {
+        assert_eq!(field_forces.len(), n_bodies);
+        field_forces.to_vec()
+    };
     let mut wrenches = vec![(Vec3::ZERO, Vec3::ZERO); n_bodies];
     for (wrench, force) in wrenches.iter_mut().zip(&field_forces) {
         wrench.0 = *force;
@@ -2678,11 +2692,11 @@ pub fn solve_tree_contacts(
         iterations,
         use_newton,
         tree_implicit,
-        None,
+        &[],
     )
 }
 
-/// Tree-contact solve with an additional deterministic force callback.
+/// Tree-contact solve with precomputed per-body field forces.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_tree_contacts_with_field(
     bodies: &[Body],
@@ -2695,7 +2709,7 @@ pub(crate) fn solve_tree_contacts_with_field(
     iterations: u32,
     use_newton: bool,
     tree_implicit: Option<bool>,
-    field_force: &dyn FreeBodyFieldForce,
+    field_forces: &[Vec3],
 ) -> TreeContactSolution {
     solve_tree_contacts_mode(
         bodies,
@@ -2708,7 +2722,7 @@ pub(crate) fn solve_tree_contacts_with_field(
         iterations,
         use_newton,
         tree_implicit,
-        Some(field_force),
+        field_forces,
     )
 }
 
@@ -2724,7 +2738,7 @@ fn solve_tree_contacts_mode(
     iterations: u32,
     use_newton: bool,
     tree_implicit: Option<bool>,
-    field_force: Option<&dyn FreeBodyFieldForce>,
+    field_forces: &[Vec3],
 ) -> TreeContactSolution {
     let mut solution = TreeContactSolution {
         contacts: contacts.to_vec(),
@@ -2879,16 +2893,12 @@ fn solve_tree_contacts_mode(
         return solution;
     }
 
-    let field_forces = field_force.map_or_else(
-        || vec![Vec3::ZERO; bodies.len()],
-        |force| {
-            bodies
-                .iter()
-                .enumerate()
-                .map(|(index, body)| force.force(index, body))
-                .collect()
-        },
-    );
+    let field_forces = if field_forces.is_empty() {
+        vec![Vec3::ZERO; bodies.len()]
+    } else {
+        assert_eq!(field_forces.len(), bodies.len());
+        field_forces.to_vec()
+    };
     let n_rows = rows.len();
     for block in &blocks {
         let row_count = contact_block_n_rows(block.condim, cone);

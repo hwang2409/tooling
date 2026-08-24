@@ -159,6 +159,78 @@ fn force_field_buoyancy_uses_geom_offset_for_submersion() {
     assert!((submerged_accel - expected_accel).abs() < 1.0e-5);
 }
 
+fn partial_buoyancy_box(position: Vec3, orientation: Quat) -> World {
+    let mut world = World::new();
+    world.integrator = Integrator::Euler;
+    world.dt = 0.01;
+    let body = world.add_body(Body::solid_box(
+        1.0,
+        Vec3::splat(0.5),
+        position,
+        orientation,
+    ));
+    world.add_geom(Geom::r#box(
+        body,
+        Vec3::splat(0.5),
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        0.0,
+    ));
+    world.add_force_field(ForceField::Buoyancy {
+        plane: Plane::new(Vec3::Z, 0.0),
+        fluid_density: 2.0,
+        gravity: world.gravity,
+    });
+    world
+}
+
+#[test]
+fn force_field_buoyancy_axis_aligned_box_uses_clipped_volume() {
+    let mut world = partial_buoyancy_box(Vec3::new(0.0, 0.0, 0.25), Quat::IDENTITY);
+
+    world.step();
+
+    let actual_accel = world.bodies[0].linear_velocity.z / world.dt;
+    assert!((actual_accel + 4.905).abs() < 1.0e-5);
+}
+
+#[test]
+fn force_field_buoyancy_rotated_box_uses_clipped_volume() {
+    let diagonal = 1.0 / 3.0_f32.sqrt();
+    let local_normal = Vec3::splat(diagonal);
+    let orientation = Quat::new(diagonal, -diagonal, 0.0, 1.0 + diagonal).renormalize();
+    let tetra_leg = 0.9085603;
+    let center_z = (1.5 - tetra_leg) / 3.0_f32.sqrt();
+    let mut world = partial_buoyancy_box(Vec3::new(0.0, 0.0, center_z), orientation);
+    assert!((orientation.rotate(local_normal) - Vec3::Z).length() < 1.0e-5);
+
+    world.step();
+
+    let actual_accel = world.bodies[0].linear_velocity.z / world.dt;
+    assert!((actual_accel + 7.3575).abs() < 2.0e-4);
+}
+
+#[test]
+fn force_field_buoyancy_sphere_uses_spherical_cap() {
+    let mut world = World::new();
+    world.integrator = Integrator::Euler;
+    world.dt = 0.01;
+    let body = world.add_body(Body::solid_sphere(1.0, 0.5, Vec3::ZERO, Quat::IDENTITY));
+    world.add_geom(Geom::sphere(body, 0.5, Vec3::ZERO, 0.0));
+    world.add_force_field(ForceField::Buoyancy {
+        plane: Plane::new(Vec3::Z, 0.0),
+        fluid_density: 2.0,
+        gravity: world.gravity,
+    });
+
+    world.step();
+
+    let submerged_volume = (2.0 / 3.0) * std::f32::consts::PI * 0.5_f32.powi(3);
+    let expected_accel = world.gravity.z * (1.0 - 2.0 * submerged_volume);
+    let actual_accel = world.bodies[0].linear_velocity.z / world.dt;
+    assert!((actual_accel - expected_accel).abs() < 1.0e-5);
+}
+
 #[test]
 fn force_field_remove_stops_effect() {
     let mut world = World::new();
