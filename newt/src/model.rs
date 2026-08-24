@@ -154,8 +154,8 @@ impl Scene {
                 if tree == report.source_tree_id {
                     let mapped = report.remap_link_location(tree, link)?;
                     site.attach = SiteAttach::Link {
-                        tree: mapped.tree_id,
-                        link: mapped.link_id,
+                        tree: mapped.0,
+                        link: mapped.1,
                     };
                 }
             }
@@ -165,7 +165,7 @@ impl Scene {
         for (tree, names) in self.links_by_name.iter().enumerate() {
             for (name, &link) in names {
                 let mapped = report.remap_link_location(tree, link)?;
-                links_by_name[mapped.tree_id].insert(name.clone(), mapped.link_id);
+                links_by_name[mapped.0].insert(name.clone(), mapped.1);
             }
         }
 

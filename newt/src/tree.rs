@@ -73,6 +73,31 @@ use crate::joint::{JointKind, JointLimit};
 use crate::math::{Mat3, Quat, Vec3};
 use crate::spatial::{SpatialForce, SpatialInertia, SpatialMotion, Xform};
 use crate::tendon::{SpatialWrap, Tendon, TendonKind};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GenerationalId {
+    pub(crate) id: usize,
+    pub(crate) generation: usize,
+}
+
+impl PartialEq for GenerationalId {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.generation == other.generation
+    }
+}
+
+impl Eq for GenerationalId {}
+
+static NEXT_TREE_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_LINK_ID: AtomicUsize = AtomicUsize::new(1);
+
+fn fresh_id(counter: &AtomicUsize) -> GenerationalId {
+    GenerationalId {
+        id: counter.fetch_add(1, Ordering::Relaxed),
+        generation: 0,
+    }
+}
 
 /// One link in a kinematic tree.
 #[derive(Clone, Debug, PartialEq)]
@@ -120,6 +145,8 @@ pub struct Link {
     /// A mocap link is posed by the caller and is never integrated by the
     /// dynamics solver. Only root mocap links are supported in this tier.
     pub mocap: bool,
+
+    pub(crate) identity: GenerationalId,
 }
 
 pub(crate) struct DetachedSubtree {
@@ -176,6 +203,7 @@ impl Link {
             inertia_body,
             inertia_body_inverse,
             mocap: false,
+            identity: fresh_id(&NEXT_LINK_ID),
         }
     }
 
@@ -187,7 +215,7 @@ impl Link {
 }
 
 /// Kinematic tree.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Tree {
     /// Links in topological order. `links[0]` is the root.
     pub links: Vec<Link>,
@@ -244,6 +272,28 @@ pub struct Tree {
     pub mocap_angular_velocity: Vec3,
     /// Changes when a public state setter changes this tree's pose state.
     pub(crate) query_generation: u64,
+    pub(crate) identity: GenerationalId,
+}
+
+impl Clone for Tree {
+    fn clone(&self) -> Self {
+        Self {
+            links: self.links.clone(),
+            q_offset: self.q_offset.clone(),
+            v_offset: self.v_offset.clone(),
+            q: self.q.clone(),
+            qdot: self.qdot.clone(),
+            qfrc_applied: self.qfrc_applied.clone(),
+            actuators: self.actuators.clone(),
+            applied_wrenches: self.applied_wrenches.clone(),
+            disable_penalty_limits: self.disable_penalty_limits,
+            tendons: self.tendons.clone(),
+            mocap_linear_velocity: self.mocap_linear_velocity,
+            mocap_angular_velocity: self.mocap_angular_velocity,
+            query_generation: self.query_generation,
+            identity: fresh_id(&NEXT_TREE_ID),
+        }
+    }
 }
 
 impl Tree {
@@ -263,6 +313,7 @@ impl Tree {
             mocap_linear_velocity: Vec3::ZERO,
             mocap_angular_velocity: Vec3::ZERO,
             query_generation: 0,
+            identity: fresh_id(&NEXT_TREE_ID),
         }
     }
 

@@ -333,6 +333,13 @@ fn value_edits_preserve_live_handles() {
     world.trees[0].links[1].mass = 2.0;
     world.detach_subtree(mass_handle).unwrap();
 
+    let mut damping_world = world_with_handle_tree();
+    let damping_handle = damping_world.joint_id(0, 1);
+    if let JointKind::Hinge { damping, .. } = &mut damping_world.trees[0].links[1].joint {
+        *damping = 2.5;
+    }
+    damping_world.detach_subtree(damping_handle).unwrap();
+
     let mut mocap_world = world_with_mocap_handle_tree();
     let pose_handle = mocap_world.joint_id(0, 1);
     mocap_world.set_mocap_pose(0, Vec3::new(3.0, 0.0, 0.0), Quat::IDENTITY);
@@ -340,7 +347,7 @@ fn value_edits_preserve_live_handles() {
 }
 
 #[test]
-fn remapped_unaffected_handle_uses_target_epoch() {
+fn remapped_unaffected_handle_stays_valid() {
     let mut world = world_with_handle_tree();
     let mut other_tree = Tree::new();
     other_tree.push_link(link(None, JointKind::Fixed, 5.0));
@@ -408,25 +415,23 @@ fn stale_handle_cannot_alias_after_interleaved_tree_addition() {
 }
 
 #[test]
-fn direct_link_addition_rejects_stale_handle_tracking() {
-    let mut world = world_with_references();
+fn direct_link_addition_keeps_existing_handle_live() {
+    let mut world = world_with_handle_tree();
     let survivor = world.joint_id(0, 3);
     world.trees[0].push_link(link(Some(0), JointKind::hinge(Vec3::Z), 2.0));
 
-    let error = world.detach_subtree(survivor).unwrap_err();
-    assert!(error.0.contains("stale topology epoch"));
+    world.detach_subtree(survivor).unwrap();
 }
 
 #[test]
-fn direct_tree_addition_rejects_stale_handle_tracking() {
-    let mut world = world_with_references();
+fn direct_tree_addition_keeps_existing_handle_live() {
+    let mut world = world_with_handle_tree();
     let survivor = world.joint_id(0, 3);
     let mut added = Tree::new();
     added.push_link(link(None, JointKind::Fixed, 10.0));
     world.trees.push(added);
 
-    let error = world.detach_subtree(survivor).unwrap_err();
-    assert!(error.0.contains("stale topology epoch"));
+    world.detach_subtree(survivor).unwrap();
 }
 
 #[test]
@@ -441,9 +446,10 @@ fn replacing_equal_length_tree_rejects_old_handle() {
     world.trees[0] = replacement;
 
     let error = world.detach_subtree(stale).unwrap_err();
-    assert!(error.0.contains("stale topology epoch"));
+    assert!(error.0.contains("stale link handle"));
     assert_eq!(world.trees.len(), 1);
     assert_eq!(world.trees[0].links.len(), 4);
+    world.detach_subtree(world.joint_id(0, 1)).unwrap();
 }
 
 #[test]
@@ -461,7 +467,7 @@ fn direct_tree_bootstrap_rejects_old_handle_after_equal_length_replacement() {
     world.trees[0] = replacement;
 
     let error = world.detach_subtree(stale).unwrap_err();
-    assert!(error.0.contains("stale topology epoch"));
+    assert!(error.0.contains("stale link handle"));
 }
 
 #[test]
