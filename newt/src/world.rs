@@ -49,13 +49,16 @@ use crate::geom::{
 use crate::joint::JointKind;
 use crate::math::{Quat, Vec3};
 pub use crate::scene_query::{RayHit, ShapeDesc, ShapeHit};
-use crate::sensor::{Sensor, SensorBank, SensorError, SensorInputs};
+use crate::sensor::{
+    Sensor, SensorAttach, SensorBank, SensorError, SensorInputs, SensorKind, SiteFrame,
+};
 use crate::solver::{
     ConstraintRowDiagnostic, SolverConfig, SolverMode, TreeContactSolution, contact_friction_axes,
     solve_free_bodies,
 };
 use crate::tree::{
-    AbaWorkspace, Tree, euler_step_with_workspace as tree_euler_step_with_workspace,
+    AbaWorkspace, DetachedSubtree, Tree,
+    euler_step_with_workspace as tree_euler_step_with_workspace,
     forward_kinematics as tree_forward_kinematics,
     forward_kinematics_into as tree_forward_kinematics_into,
     rk4_step_with_workspace as tree_rk4_step_with_workspace,
@@ -164,6 +167,9 @@ pub struct World {
     pub sensors: SensorBank,
     /// Named generalized-state snapshots.
     pub keyframes: Vec<Keyframe>,
+    /// Joint ids broken during the most recent step.
+    broken_this_step: Vec<WorldJointId>,
+    manual_breaks_pending: Vec<WorldJointId>,
     /// Cached pair-support fingerprint from the last successful validation.
     /// Encoded as `(geoms.len() << 32) | pair_list_encoded` where
     /// `pair_list_encoded` is `(pair_list.len() as u32) + 1` when
@@ -205,6 +211,13 @@ pub struct World {
 
 /// Stable geom index returned by scene queries.
 pub type GeomId = usize;
+
+/// World-local address of a joint-bearing tree link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorldJointId {
+    pub tree_id: usize,
+    pub link_id: usize,
+}
 
 /// World-space pose used by shape casts.
 pub type Pose = GeomPose;
@@ -343,6 +356,8 @@ impl World {
             equalities: Vec::new(),
             sensors: SensorBank::new(),
             keyframes: Vec::new(),
+            broken_this_step: Vec::new(),
+            manual_breaks_pending: Vec::new(),
             checked_pairs: Cell::new(0),
             contact_detection_count: Cell::new(0),
             solver_phase_capture: false,
@@ -970,6 +985,148 @@ impl World {
         idx
     }
 
+    /// Return the world-local address of a tree joint.
+    pub fn joint_id(&self, tree_id: usize, link_id: usize) -> WorldJointId {
+        assert!(
+            tree_id < self.trees.len(),
+            "tree index {tree_id} is out of range"
+        );
+        assert!(
+            link_id < self.trees[tree_id].links.len(),
+            "joint link index {link_id} is out of range"
+        );
+        WorldJointId { tree_id, link_id }
+    }
+
+    /// Request a joint break. The break is applied after the current step and
+    /// detached before the next step's assembly.
+    pub fn break_joint(&mut self, joint_id: WorldJointId) {
+        let link = &self.trees[joint_id.tree_id].links[joint_id.link_id];
+        assert!(!link.is_broken(), "joint is already broken");
+        if !self.manual_breaks_pending.contains(&joint_id) {
+            self.manual_breaks_pending.push(joint_id);
+        }
+    }
+
+    /// Reset a joint's broken state before its next-step detachment.
+    pub fn reset_joint(&mut self, joint_id: WorldJointId) {
+        let link = &mut self.trees[joint_id.tree_id].links[joint_id.link_id];
+        link.reset_joint();
+        self.manual_breaks_pending.retain(|id| *id != joint_id);
+        self.broken_this_step.retain(|id| *id != joint_id);
+    }
+
+    /// Return the joints that broke during the most recent step.
+    pub fn broken_this_step(&self) -> &[WorldJointId] {
+        &self.broken_this_step
+    }
+
+    fn apply_manual_breaks(&mut self) {
+        let pending = std::mem::take(&mut self.manual_breaks_pending);
+        for joint_id in pending {
+            let link = &mut self.trees[joint_id.tree_id].links[joint_id.link_id];
+            if !link.is_broken() {
+                link.break_joint();
+                self.broken_this_step.push(joint_id);
+            }
+        }
+    }
+
+    fn detach_broken_joints(&mut self) {
+        let mut candidates = Vec::new();
+        for (tree_id, tree) in self.trees.iter().enumerate() {
+            for (link_id, link) in tree.links.iter().enumerate().skip(1) {
+                if link.is_broken() {
+                    candidates.push(WorldJointId { tree_id, link_id });
+                }
+            }
+        }
+        for joint_id in candidates {
+            if joint_id.tree_id >= self.trees.len()
+                || joint_id.link_id >= self.trees[joint_id.tree_id].links.len()
+                || !self.trees[joint_id.tree_id].links[joint_id.link_id].is_broken()
+            {
+                continue;
+            }
+            let split = self.trees[joint_id.tree_id].detach_subtree(joint_id.link_id);
+            let child_tree_id = self.trees.len();
+            self.remap_tree_references(joint_id.tree_id, child_tree_id, &split);
+            self.trees.push(split.tree);
+            self.tree_aba_workspaces
+                .push(AbaWorkspace::new(self.trees[child_tree_id].links.len()));
+        }
+    }
+
+    fn remap_tree_references(
+        &mut self,
+        old_tree_id: usize,
+        child_tree_id: usize,
+        split: &DetachedSubtree,
+    ) {
+        if self.disabled_self_collision.remove(&old_tree_id) {
+            self.disabled_self_collision.insert(old_tree_id);
+            self.disabled_self_collision.insert(child_tree_id);
+        }
+        for geom in &mut self.geoms {
+            let Some((tree_id, link_id)) = geom.link else {
+                continue;
+            };
+            if tree_id != old_tree_id {
+                continue;
+            }
+            let (new_tree, new_link) = remap_link_reference(
+                link_id,
+                old_tree_id,
+                child_tree_id,
+                &split.parent_link_map,
+                &split.child_link_map,
+            );
+            geom.link = Some((new_tree, new_link));
+        }
+        self.equalities.retain_mut(|equality| match equality {
+            Equality::JointCoupling {
+                tree,
+                link_a,
+                link_b,
+                ..
+            } if *tree == old_tree_id => {
+                let (tree_a, link_a_new) = remap_link_reference(
+                    *link_a,
+                    old_tree_id,
+                    child_tree_id,
+                    &split.parent_link_map,
+                    &split.child_link_map,
+                );
+                let (tree_b, link_b_new) = remap_link_reference(
+                    *link_b,
+                    old_tree_id,
+                    child_tree_id,
+                    &split.parent_link_map,
+                    &split.child_link_map,
+                );
+                if tree_a != tree_b {
+                    return false;
+                }
+                *tree = tree_a;
+                *link_a = link_a_new;
+                *link_b = link_b_new;
+                true
+            }
+            _ => true,
+        });
+        self.sensors.sensors.retain_mut(|sensor| {
+            remap_sensor(
+                sensor,
+                old_tree_id,
+                child_tree_id,
+                &split.parent_link_map,
+                &split.child_link_map,
+                &split.parent_tendon_map,
+                &split.child_tendon_map,
+            )
+        });
+    }
+
     /// Adds a geom and returns its stable index.
     pub fn add_geom(&mut self, geom: Geom) -> usize {
         let idx = self.geoms.len();
@@ -1457,6 +1614,8 @@ impl World {
     /// integration. Penalty mode keeps its live per-stage RK4 collision
     /// callback. `detect_contacts` remains an explicit current-state query.
     pub fn step(&mut self) {
+        self.broken_this_step.clear();
+        self.detach_broken_joints();
         #[cfg(feature = "instrumentation")]
         let total_start = Instant::now();
         self.solver
@@ -1520,6 +1679,7 @@ impl World {
                 self.evaluate_sensors(&pairs);
             }
         }
+        self.apply_manual_breaks();
         self.refresh_broadphase_for_query();
         if uses_broadphase_buffer {
             self.broadphase_pairs = pairs;
@@ -1868,6 +2028,7 @@ impl World {
             // borrows, whose lifetime ends before we mutate self.trees
             // again.
             let mut tree = std::mem::take(&mut self.trees[ti]);
+            tree.joint_impulses.fill(0.0);
             // Solver mode: compute per-DOF limit force ONCE at s0 and
             // hold it constant across the RK4 stages via qfrc_applied.
             // Preserves the pre-step qfrc_applied so user-set torques
@@ -1879,26 +2040,38 @@ impl World {
             let mut solver_qfrc_delta: Vec<f32> = Vec::new();
             let prior_disable = tree.disable_penalty_limits;
             if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
-                solver_qfrc_delta = match solver_mode {
-                    SolverMode::Pgs => crate::solver::solve_tree_limits(
+                let mut joint_impulses = std::mem::take(&mut tree.joint_impulses);
+                let limit_qfrc = match solver_mode {
+                    SolverMode::Pgs => crate::solver::solve_tree_limits_with_impulses(
                         &tree,
                         ti,
                         &self.equalities,
                         dt,
                         solver_iterations,
+                        &mut joint_impulses,
                     ),
-                    SolverMode::Newton => crate::solver::solve_tree_limits_newton(
+                    SolverMode::Newton => crate::solver::solve_tree_limits_newton_with_impulses(
                         &tree,
                         ti,
                         &self.equalities,
                         dt,
                         solver_iterations,
+                        &mut joint_impulses,
                     ),
                     SolverMode::Penalty => unreachable!(),
                 };
+                tree.joint_impulses = joint_impulses;
+                solver_qfrc_delta = limit_qfrc;
                 if let Some(solution) = tree_contact_solution {
                     for (slot, delta) in solution.tree_qfrc[ti].iter().enumerate() {
                         solver_qfrc_delta[slot] += delta;
+                    }
+                    if let Some(solution_impulses) = solution.tree_joint_impulses.get(ti) {
+                        for (total, impulse) in
+                            tree.joint_impulses.iter_mut().zip(solution_impulses)
+                        {
+                            *total += impulse;
+                        }
                     }
                 }
                 for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
@@ -1941,6 +2114,14 @@ impl World {
                 tree.qfrc_applied[slot] -= delta;
             }
             tree.disable_penalty_limits = prior_disable;
+            let mut broken_links = Vec::new();
+            tree.break_joints_from_impulses(dt, &mut broken_links);
+            self.broken_this_step
+                .extend(broken_links.into_iter().map(|link_id| WorldJointId {
+                    tree_id: ti,
+                    link_id,
+                }));
+            tree.joint_impulses.fill(0.0);
             self.trees[ti] = tree;
         }
     }
@@ -1985,29 +2166,42 @@ impl World {
                 }
             }
             let mut tree = std::mem::take(&mut self.trees[ti]);
+            tree.joint_impulses.fill(0.0);
             let prior_disable = tree.disable_penalty_limits;
             let mut solver_qfrc_delta = Vec::new();
             if matches!(solver_mode, SolverMode::Pgs | SolverMode::Newton) {
-                solver_qfrc_delta = match solver_mode {
-                    SolverMode::Pgs => crate::solver::solve_tree_limits(
+                let mut joint_impulses = std::mem::take(&mut tree.joint_impulses);
+                let limit_qfrc = match solver_mode {
+                    SolverMode::Pgs => crate::solver::solve_tree_limits_with_impulses(
                         &tree,
                         ti,
                         &self.equalities,
                         dt,
                         solver_iterations,
+                        &mut joint_impulses,
                     ),
-                    SolverMode::Newton => crate::solver::solve_tree_limits_newton(
+                    SolverMode::Newton => crate::solver::solve_tree_limits_newton_with_impulses(
                         &tree,
                         ti,
                         &self.equalities,
                         dt,
                         solver_iterations,
+                        &mut joint_impulses,
                     ),
                     SolverMode::Penalty => unreachable!(),
                 };
+                tree.joint_impulses = joint_impulses;
+                solver_qfrc_delta = limit_qfrc;
                 if let Some(solution) = tree_contact_solution {
                     for (slot, delta) in solution.tree_qfrc[ti].iter().enumerate() {
                         solver_qfrc_delta[slot] += delta;
+                    }
+                    if let Some(solution_impulses) = solution.tree_joint_impulses.get(ti) {
+                        for (total, impulse) in
+                            tree.joint_impulses.iter_mut().zip(solution_impulses)
+                        {
+                            *total += impulse;
+                        }
                     }
                 }
                 for (slot, &delta) in solver_qfrc_delta.iter().enumerate() {
@@ -2046,6 +2240,14 @@ impl World {
                 tree.qfrc_applied[slot] -= delta;
             }
             tree.disable_penalty_limits = prior_disable;
+            let mut broken_links = Vec::new();
+            tree.break_joints_from_impulses(dt, &mut broken_links);
+            self.broken_this_step
+                .extend(broken_links.into_iter().map(|link_id| WorldJointId {
+                    tree_id: ti,
+                    link_id,
+                }));
+            tree.joint_impulses.fill(0.0);
             self.trees[ti] = tree;
         }
     }
@@ -2412,6 +2614,100 @@ impl World {
 // ---------------------------------------------------------------------------
 // contact assembly and force application
 // ---------------------------------------------------------------------------
+
+fn remap_link_reference(
+    link_id: usize,
+    parent_tree_id: usize,
+    child_tree_id: usize,
+    parent_map: &[Option<usize>],
+    child_map: &[Option<usize>],
+) -> (usize, usize) {
+    if let Some(link) = parent_map[link_id] {
+        (parent_tree_id, link)
+    } else {
+        (
+            child_tree_id,
+            child_map[link_id].expect("split link must have an owner"),
+        )
+    }
+}
+
+fn remap_site_frame(
+    site: &mut SiteFrame,
+    parent_tree_id: usize,
+    child_tree_id: usize,
+    parent_map: &[Option<usize>],
+    child_map: &[Option<usize>],
+) {
+    if let SensorAttach::Link(tree_id, link_id) = site.attach {
+        if tree_id == parent_tree_id {
+            let (tree_id, link_id) = remap_link_reference(
+                link_id,
+                parent_tree_id,
+                child_tree_id,
+                parent_map,
+                child_map,
+            );
+            site.attach = SensorAttach::Link(tree_id, link_id);
+        }
+    }
+}
+
+fn remap_sensor(
+    sensor: &mut Sensor,
+    parent_tree_id: usize,
+    child_tree_id: usize,
+    parent_map: &[Option<usize>],
+    child_map: &[Option<usize>],
+    parent_tendon_map: &[Option<usize>],
+    child_tendon_map: &[Option<usize>],
+) -> bool {
+    let remap_joint = |tree: &mut usize, link: &mut usize| {
+        if *tree == parent_tree_id {
+            (*tree, *link) =
+                remap_link_reference(*link, parent_tree_id, child_tree_id, parent_map, child_map);
+        }
+    };
+    let remap_tendon = |tree: &mut usize, tendon: &mut usize| -> bool {
+        if *tree != parent_tree_id {
+            return true;
+        }
+        if let Some(new_tendon) = parent_tendon_map[*tendon] {
+            *tendon = new_tendon;
+        } else if let Some(new_tendon) = child_tendon_map[*tendon] {
+            *tree = child_tree_id;
+            *tendon = new_tendon;
+        } else {
+            return false;
+        }
+        true
+    };
+    match &mut sensor.kind {
+        SensorKind::JointPos { tree, link }
+        | SensorKind::JointVel { tree, link }
+        | SensorKind::BallQuat { tree, link }
+        | SensorKind::BallAngVel { tree, link }
+        | SensorKind::Force { tree, link }
+        | SensorKind::Torque { tree, link }
+        | SensorKind::SubtreeCom { tree, link } => remap_joint(tree, link),
+        SensorKind::TendonPos { tree, tendon } | SensorKind::TendonVel { tree, tendon } => {
+            return remap_tendon(tree, tendon);
+        }
+        SensorKind::FramePos(site)
+        | SensorKind::FrameQuat(site)
+        | SensorKind::Gyro(site)
+        | SensorKind::Accelerometer(site)
+        | SensorKind::Velocimeter(site)
+        | SensorKind::Magnetometer(site)
+        | SensorKind::Rangefinder(site)
+        | SensorKind::FrameLinVel(site)
+        | SensorKind::FrameAngVel(site) => {
+            remap_site_frame(site, parent_tree_id, child_tree_id, parent_map, child_map)
+        }
+        SensorKind::Touch { .. } => {}
+    }
+    true
+}
 
 fn body_id(geom: &Geom) -> Option<usize> {
     match geom.attachment() {

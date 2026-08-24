@@ -72,7 +72,7 @@ use crate::actuator::{Actuator, clamp_symmetric};
 use crate::joint::{JointKind, JointLimit};
 use crate::math::{Mat3, Quat, Vec3};
 use crate::spatial::{SpatialForce, SpatialInertia, SpatialMotion, Xform};
-use crate::tendon::Tendon;
+use crate::tendon::{SpatialWrap, Tendon, TendonKind};
 
 /// One link in a kinematic tree.
 #[derive(Clone, Debug, PartialEq)]
@@ -120,6 +120,20 @@ pub struct Link {
     /// A mocap link is posed by the caller and is never integrated by the
     /// dynamics solver. Only root mocap links are supported in this tier.
     pub mocap: bool,
+
+    /// Per-step impulse threshold for breaking this link's joint. `None`
+    /// keeps the joint unbreakable.
+    pub break_threshold: Option<f32>,
+
+    broken: bool,
+}
+
+pub(crate) struct DetachedSubtree {
+    pub tree: Tree,
+    pub parent_link_map: Vec<Option<usize>>,
+    pub child_link_map: Vec<Option<usize>>,
+    pub parent_tendon_map: Vec<Option<usize>>,
+    pub child_tendon_map: Vec<Option<usize>>,
 }
 
 impl Link {
@@ -166,7 +180,30 @@ impl Link {
             inertia_body,
             inertia_body_inverse,
             mocap: false,
+            break_threshold: None,
+            broken: false,
         }
+    }
+
+    /// Set the per-step impulse threshold for this link's joint.
+    pub fn with_break_threshold(mut self, threshold: Option<f32>) -> Self {
+        self.break_threshold = threshold;
+        self
+    }
+
+    /// Return whether this link's joint has broken.
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+
+    /// Mark this link's joint as broken.
+    pub(crate) fn break_joint(&mut self) {
+        self.broken = true;
+    }
+
+    /// Restore this link's joint after a break.
+    pub(crate) fn reset_joint(&mut self) {
+        self.broken = false;
     }
 
     /// Body-frame spatial inertia at the COM (v0 convention: link origin =
@@ -196,6 +233,10 @@ pub struct Tree {
     /// across steps until the caller changes it — the tier-4 direct-torque
     /// helpers (see [`Tree::set_joint_torque_clamped`]) write here.
     pub qfrc_applied: Vec<f32>,
+
+    /// Final solver-row impulse magnitude accumulated per link for the
+    /// current step. Reused to keep the breakable-joint path allocation-free.
+    pub(crate) joint_impulses: Vec<f32>,
 
     /// Actuators attached to hinge/slide joints (tier 4, generalized in
     /// v2 tier 2 — see [`Actuator`]). Controls settable per step via
@@ -246,6 +287,7 @@ impl Tree {
             q: Vec::new(),
             qdot: Vec::new(),
             qfrc_applied: Vec::new(),
+            joint_impulses: Vec::new(),
             actuators: Vec::new(),
             applied_wrenches: Vec::new(),
             disable_penalty_limits: false,
@@ -325,6 +367,7 @@ impl Tree {
         }
         self.qdot.extend(std::iter::repeat_n(0.0, nv));
         self.qfrc_applied.extend(std::iter::repeat_n(0.0, nv));
+        self.joint_impulses.push(0.0);
         self.applied_wrenches.push((Vec3::ZERO, Vec3::ZERO));
         self.links.push(link);
         idx
@@ -421,6 +464,138 @@ impl Tree {
         for x in &mut self.qfrc_applied {
             *x = 0.0;
         }
+    }
+
+    /// Mark thresholded joints whose applied impulse exceeded its limit.
+    pub(crate) fn break_joints_from_impulses(&mut self, dt: f32, broken: &mut Vec<usize>) {
+        if dt <= 0.0 || !self.links.iter().any(|link| link.break_threshold.is_some()) {
+            return;
+        }
+        for (link_idx, link) in self.links.iter_mut().enumerate() {
+            let Some(threshold) = link.break_threshold else {
+                continue;
+            };
+            if link.broken {
+                continue;
+            }
+            let offset = self.v_offset[link_idx];
+            let mut impulse_magnitude = self.joint_impulses[link_idx];
+            for slot in offset..offset + link.joint.nv() {
+                impulse_magnitude += (self.qfrc_applied[slot] * dt).abs();
+            }
+            if impulse_magnitude > threshold {
+                link.broken = true;
+                broken.push(link_idx);
+            }
+        }
+    }
+
+    pub(crate) fn detach_subtree(&mut self, root: usize) -> DetachedSubtree {
+        assert!(root > 0, "only non-root joints can detach");
+        let poses = forward_kinematics(self);
+        let velocities = link_velocities(self);
+        let mut in_subtree = vec![false; self.links.len()];
+        in_subtree[root] = true;
+        for link in root + 1..self.links.len() {
+            in_subtree[link] = self.links[link]
+                .parent
+                .is_some_and(|parent| in_subtree[parent]);
+        }
+        let child_ids: Vec<usize> = (0..self.links.len())
+            .filter(|&link| in_subtree[link])
+            .collect();
+        let parent_ids: Vec<usize> = (0..self.links.len())
+            .filter(|&link| !in_subtree[link])
+            .collect();
+        let (parent, parent_link_map) =
+            self.rebuild_split_tree(&parent_ids, &in_subtree, None, &poses, &velocities);
+        let (child, child_link_map) =
+            self.rebuild_split_tree(&child_ids, &in_subtree, Some(root), &poses, &velocities);
+        let mut parent = parent;
+        let mut child = child;
+        let parent_tendon_map = remap_tree_tendons(&mut parent, &self.tendons, &parent_link_map);
+        let child_tendon_map = remap_tree_tendons(&mut child, &self.tendons, &child_link_map);
+        remap_tree_actuators(
+            &mut parent,
+            &self.actuators,
+            &parent_link_map,
+            &parent_tendon_map,
+        );
+        remap_tree_actuators(
+            &mut child,
+            &self.actuators,
+            &child_link_map,
+            &child_tendon_map,
+        );
+        *self = parent;
+        DetachedSubtree {
+            tree: child,
+            parent_link_map,
+            child_link_map,
+            parent_tendon_map,
+            child_tendon_map,
+        }
+    }
+
+    fn rebuild_split_tree(
+        &self,
+        ids: &[usize],
+        in_subtree: &[bool],
+        detached_root: Option<usize>,
+        poses: &[(Vec3, Quat)],
+        velocities: &[SpatialMotion],
+    ) -> (Tree, Vec<Option<usize>>) {
+        let mut out = Tree::new();
+        out.disable_penalty_limits = self.disable_penalty_limits;
+        out.mocap_linear_velocity = self.mocap_linear_velocity;
+        out.mocap_angular_velocity = self.mocap_angular_velocity;
+        out.query_generation = self.query_generation;
+        let mut map = vec![None; self.links.len()];
+        for &old_idx in ids {
+            let mut link = self.links[old_idx].clone();
+            let is_detached_root = detached_root == Some(old_idx);
+            if is_detached_root {
+                link.parent = None;
+                link.joint = JointKind::Free;
+                link.joint_offset_in_parent = poses[old_idx];
+                link.joint_offset_in_child = (Vec3::ZERO, Quat::IDENTITY);
+                link.break_threshold = None;
+                link.broken = false;
+            } else {
+                link.parent = link.parent.map(|parent| {
+                    assert!(in_subtree[parent] == in_subtree[old_idx]);
+                    map[parent].expect("split parent must be copied first")
+                });
+            }
+            let new_idx = out.push_link(link);
+            map[old_idx] = Some(new_idx);
+            if is_detached_root {
+                let (position, orientation) = poses[old_idx];
+                out.q[0..7].copy_from_slice(&[
+                    position.x,
+                    position.y,
+                    position.z,
+                    orientation.x,
+                    orientation.y,
+                    orientation.z,
+                    orientation.w,
+                ]);
+                let velocity = velocities[old_idx];
+                out.qdot[0..6].copy_from_slice(&[
+                    velocity.angular.x,
+                    velocity.angular.y,
+                    velocity.angular.z,
+                    velocity.linear.x,
+                    velocity.linear.y,
+                    velocity.linear.z,
+                ]);
+            } else {
+                copy_joint_state(self, &mut out, old_idx, new_idx);
+            }
+            out.applied_wrenches[new_idx] = self.applied_wrenches[old_idx];
+        }
+        out.joint_impulses.fill(0.0);
+        (out, map)
     }
 
     /// Set the user-applied external wrench on a link, expressed in world
@@ -747,6 +922,180 @@ impl Tree {
         state.q.copy_from_slice(q);
         state.qdot.copy_from_slice(qdot);
         state.inverse_dynamics(qddot, gravity, external_wrenches)
+    }
+}
+
+fn copy_joint_state(source: &Tree, target: &mut Tree, old_idx: usize, new_idx: usize) {
+    let nq = source.links[old_idx].joint.nq();
+    let nv = source.links[old_idx].joint.nv();
+    let old_q = source.q_offset[old_idx];
+    let new_q = target.q_offset[new_idx];
+    target.q[new_q..new_q + nq].copy_from_slice(&source.q[old_q..old_q + nq]);
+    let old_v = source.v_offset[old_idx];
+    let new_v = target.v_offset[new_idx];
+    target.qdot[new_v..new_v + nv].copy_from_slice(&source.qdot[old_v..old_v + nv]);
+    target.qfrc_applied[new_v..new_v + nv].copy_from_slice(&source.qfrc_applied[old_v..old_v + nv]);
+}
+
+fn link_velocities(tree: &Tree) -> Vec<SpatialMotion> {
+    let mut velocities = vec![SpatialMotion::ZERO; tree.links.len()];
+    for (index, link) in tree.links.iter().enumerate() {
+        let parent_velocity = link
+            .parent
+            .map_or(SpatialMotion::ZERO, |parent| velocities[parent]);
+        velocities[index] = match link.joint {
+            JointKind::Free => {
+                let offset = tree.v_offset[index];
+                SpatialMotion::new(
+                    Vec3::new(
+                        tree.qdot[offset],
+                        tree.qdot[offset + 1],
+                        tree.qdot[offset + 2],
+                    ),
+                    Vec3::new(
+                        tree.qdot[offset + 3],
+                        tree.qdot[offset + 4],
+                        tree.qdot[offset + 5],
+                    ),
+                )
+            }
+            JointKind::Fixed => xup_for_link(link, 0.0).motion(parent_velocity),
+            JointKind::Hinge { axis, .. } => {
+                let q = tree.q[tree.q_offset[index]];
+                let joint_velocity =
+                    SpatialMotion::new(axis, link.joint_offset_in_child.0.cross(axis))
+                        * tree.qdot[tree.v_offset[index]];
+                xup_for_link_hinge(link, axis, q).motion(parent_velocity) + joint_velocity
+            }
+            JointKind::Slide { axis, .. } => {
+                let q = tree.q[tree.q_offset[index]];
+                let joint_velocity =
+                    SpatialMotion::new(Vec3::ZERO, axis) * tree.qdot[tree.v_offset[index]];
+                xup_for_link_slide(link, axis, q).motion(parent_velocity) + joint_velocity
+            }
+            JointKind::Ball { .. } => {
+                let offset = tree.q_offset[index];
+                let q = Quat::new(
+                    tree.q[offset],
+                    tree.q[offset + 1],
+                    tree.q[offset + 2],
+                    tree.q[offset + 3],
+                );
+                let velocity = Vec3::new(
+                    tree.qdot[tree.v_offset[index]],
+                    tree.qdot[tree.v_offset[index] + 1],
+                    tree.qdot[tree.v_offset[index] + 2],
+                );
+                xup_for_link_ball(link, q).motion(parent_velocity)
+                    + SpatialMotion::new(velocity, link.joint_offset_in_child.0.cross(velocity))
+            }
+        };
+    }
+    velocities
+}
+
+fn remap_tree_tendons(
+    tree: &mut Tree,
+    source: &[Tendon],
+    link_map: &[Option<usize>],
+) -> Vec<Option<usize>> {
+    let mut map = vec![None; source.len()];
+    for (old_idx, tendon) in source.iter().enumerate() {
+        let Some(tendon) = remap_tendon(tendon, link_map, &tree.links) else {
+            continue;
+        };
+        let new_idx = tree.tendons.len();
+        tree.tendons.push(tendon);
+        map[old_idx] = Some(new_idx);
+    }
+    map
+}
+
+fn remap_tendon(tendon: &Tendon, link_map: &[Option<usize>], links: &[Link]) -> Option<Tendon> {
+    let mut tendon = tendon.clone();
+    match &mut tendon.kind {
+        TendonKind::Fixed { joints } => {
+            for joint in joints {
+                joint.link = link_map.get(joint.link).copied().flatten()?;
+                if !matches!(
+                    links[joint.link].joint,
+                    JointKind::Hinge { .. } | JointKind::Slide { .. }
+                ) {
+                    return None;
+                }
+            }
+        }
+        TendonKind::Spatial { branches } => {
+            for branch in branches {
+                for site in &mut branch.sites {
+                    if !remap_link(&mut site.link, link_map) {
+                        return None;
+                    }
+                }
+                for segment in &mut branch.segments {
+                    let Some(wrap) = &mut segment.wrap else {
+                        continue;
+                    };
+                    match wrap {
+                        SpatialWrap::Sphere(wrap) => {
+                            if !remap_link(&mut wrap.link, link_map) {
+                                return None;
+                            }
+                        }
+                        SpatialWrap::Cylinder(wrap) => {
+                            if !remap_link(&mut wrap.link, link_map)
+                                || wrap
+                                    .sidesite
+                                    .as_mut()
+                                    .is_some_and(|site| !remap_link(&mut site.link, link_map))
+                            {
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some(tendon)
+}
+
+fn remap_link(link: &mut Option<usize>, link_map: &[Option<usize>]) -> bool {
+    let Some(old) = *link else {
+        return true;
+    };
+    let Some(new) = link_map.get(old).copied().flatten() else {
+        return false;
+    };
+    *link = Some(new);
+    true
+}
+
+fn remap_tree_actuators(
+    tree: &mut Tree,
+    source: &[Actuator],
+    link_map: &[Option<usize>],
+    tendon_map: &[Option<usize>],
+) {
+    for mut actuator in source.iter().copied() {
+        if let Some(tendon) = actuator.tendon_target {
+            let Some(tendon) = tendon_map.get(tendon).copied().flatten() else {
+                continue;
+            };
+            actuator.tendon_target = Some(tendon);
+        } else {
+            let Some(link) = link_map.get(actuator.link_idx).copied().flatten() else {
+                continue;
+            };
+            if !matches!(
+                tree.links[link].joint,
+                JointKind::Hinge { .. } | JointKind::Slide { .. }
+            ) {
+                continue;
+            }
+            actuator.link_idx = link;
+        }
+        tree.actuators.push(actuator);
     }
 }
 
