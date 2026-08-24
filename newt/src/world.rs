@@ -3608,8 +3608,33 @@ fn disk_submerged_area(radius: f32, threshold: f32) -> f32 {
     if threshold >= radius {
         return PI * radius * radius;
     }
-    let root = (radius * radius - threshold * threshold).max(0.0).sqrt();
-    radius * radius * (asin(threshold / radius) + PI * 0.5) + threshold * root
+    let full_area = PI * radius * radius;
+    let cap_height = threshold + radius;
+    let area = if cap_height <= radius {
+        disk_cap_area(radius, cap_height)
+    } else {
+        full_area - disk_cap_area(radius, 2.0 * radius - cap_height)
+    };
+    area.clamp(0.0, full_area)
+}
+
+fn disk_cap_area(radius: f32, cap_height: f32) -> f32 {
+    if cap_height <= 0.0 {
+        return 0.0;
+    }
+    if cap_height >= 2.0 * radius {
+        return PI * radius * radius;
+    }
+    let x = cap_height / radius;
+    if x <= 0.01 {
+        let series = 4.0 / 3.0 - x / 5.0 - x * x / 56.0;
+        return radius * radius * x * (2.0 * x).sqrt() * series;
+    }
+    let root = (radius * radius - (cap_height - radius) * (cap_height - radius))
+        .max(0.0)
+        .sqrt();
+    radius * radius * asin((cap_height - radius) / radius) + PI * radius * radius * 0.5
+        - (radius - cap_height) * root
 }
 
 fn disk_submerged_area_primitive(radius: f32, threshold: f32) -> f32 {
@@ -3624,6 +3649,8 @@ fn disk_submerged_area_primitive(radius: f32, threshold: f32) -> f32 {
     radius * radius * (threshold * asin(ratio) + root + PI * 0.5 * threshold)
         - root * root * root / 3.0
 }
+
+const CYLINDER_PARALLEL_AXIS_COMPONENT_THRESHOLD: f32 = 1.0e-3;
 
 fn clipped_axial_length(center_distance: f32, axis_component: f32, axial_half: f32) -> f32 {
     if axis_component == 0.0 {
@@ -3653,23 +3680,29 @@ fn cylinder_submerged_volume(pose: &GeomPose, plane: Plane, radius: f32, half_he
     let local_normal = pose.orientation.inverse_rotate(normal);
     let transverse = (local_normal.x * local_normal.x + local_normal.y * local_normal.y).sqrt();
     let center_distance = normal.dot(pose.position) + plane.distance / normal_length;
+    let full_volume = PI * radius * radius * 2.0 * half_height;
     if transverse == 0.0 {
-        return PI
+        return (PI
             * radius
             * radius
-            * clipped_axial_length(center_distance, local_normal.z, half_height);
+            * clipped_axial_length(center_distance, local_normal.z, half_height))
+        .clamp(0.0, full_volume);
     }
 
     let axial_min = -half_height;
     let axial_max = half_height;
+    // The oblique primitive divides by this component and subtracts nearly
+    // equal endpoint values. Switch before that subtraction loses f32 bits.
+    if local_normal.z.abs() <= CYLINDER_PARALLEL_AXIS_COMPONENT_THRESHOLD {
+        let parallel_threshold = -center_distance / transverse;
+        return (disk_submerged_area(radius, parallel_threshold) * (axial_max - axial_min))
+            .clamp(0.0, full_volume);
+    }
     let q_min = -(center_distance + local_normal.z * axial_min) / transverse;
     let q_max = -(center_distance + local_normal.z * axial_max) / transverse;
-    if local_normal.z == 0.0 {
-        return disk_submerged_area(radius, q_min) * (axial_max - axial_min);
-    }
     let primitive_min = disk_submerged_area_primitive(radius, q_min);
     let primitive_max = disk_submerged_area_primitive(radius, q_max);
-    ((primitive_max - primitive_min) * transverse / local_normal.z).abs()
+    (((primitive_max - primitive_min) * transverse / local_normal.z).abs()).clamp(0.0, full_volume)
 }
 
 fn hemisphere_submerged_volume(
@@ -3763,9 +3796,13 @@ fn capsule_submerged_volume(pose: &GeomPose, plane: Plane, radius: f32, half_hei
     let cylinder = cylinder_submerged_volume(pose, plane, radius, half_height);
     let lower_center_distance = center_distance - local_normal.z * half_height;
     let upper_center_distance = center_distance + local_normal.z * half_height;
-    cylinder
+    (cylinder
         + hemisphere_submerged_volume(lower_center_distance, local_normal.z, radius, false)
-        + hemisphere_submerged_volume(upper_center_distance, local_normal.z, radius, true)
+        + hemisphere_submerged_volume(upper_center_distance, local_normal.z, radius, true))
+    .clamp(
+        0.0,
+        PI * radius * radius * (2.0 * half_height + 4.0 * radius / 3.0),
+    )
 }
 
 fn shape_name(s: GeomShape) -> &'static str {
@@ -4149,8 +4186,13 @@ mod tests {
             position: Vec3::new(0.0, 0.0, 1.5 - 2.0e-6),
             orientation: Quat::IDENTITY,
         };
-        assert!(cylinder_submerged_volume(&near_tangent_cylinder, plane, 0.5, 1.0) < 3.0e-6);
-        assert!(capsule_submerged_volume(&near_tangent_capsule, plane, 0.5, 1.0) < 1.0e-8);
+        let near_tangent_cylinder =
+            cylinder_submerged_volume(&near_tangent_cylinder, plane, 0.5, 1.0);
+        let near_tangent_capsule = capsule_submerged_volume(&near_tangent_capsule, plane, 0.5, 1.0);
+        assert!(near_tangent_cylinder >= 0.0);
+        assert!(near_tangent_capsule >= 0.0);
+        assert!(near_tangent_cylinder < 3.0e-6);
+        assert!(near_tangent_capsule < 1.0e-8);
     }
 
     #[test]
@@ -4162,10 +4204,12 @@ mod tests {
         };
         let partial_cylinder = cylinder_submerged_volume(&partial_pose, plane, 0.5, 1.0);
         let expected_cylinder = PI * 0.5 * 0.5 * 0.75;
+        assert!(partial_cylinder >= 0.0);
         assert!((partial_cylinder - expected_cylinder).abs() < 1.0e-6);
 
         let partial_capsule = capsule_submerged_volume(&partial_pose, plane, 0.5, 1.0);
         let expected_capsule = expected_cylinder + (2.0 / 3.0) * PI * 0.5 * 0.5 * 0.5;
+        assert!(partial_capsule >= 0.0);
         assert!((partial_capsule - expected_capsule).abs() < 1.0e-6);
 
         let full_pose = GeomPose {
@@ -4174,10 +4218,12 @@ mod tests {
         };
         let full_cylinder = cylinder_submerged_volume(&full_pose, plane, 0.5, 1.0);
         let expected_full_cylinder = PI * 0.5 * 0.5 * 2.0;
+        assert!(full_cylinder >= 0.0);
         assert!((full_cylinder - expected_full_cylinder).abs() < 1.0e-6);
 
         let full_capsule = capsule_submerged_volume(&full_pose, plane, 0.5, 1.0);
         let expected_full_capsule = expected_full_cylinder + (4.0 / 3.0) * PI * 0.5 * 0.5 * 0.5;
+        assert!(full_capsule >= 0.0);
         assert!((full_capsule - expected_full_capsule).abs() < 1.0e-6);
 
         let tilted_plane = Plane::new(Vec3::new(0.6, 0.0, 0.8), 0.0);
@@ -4190,6 +4236,7 @@ mod tests {
             0.5,
             1.0,
         );
+        assert!(centered_cylinder >= 0.0);
         assert!((centered_cylinder - expected_full_cylinder * 0.5).abs() < 1.0e-6);
         let centered_capsule = capsule_submerged_volume(
             &GeomPose {
@@ -4200,6 +4247,93 @@ mod tests {
             0.5,
             1.0,
         );
+        assert!(centered_capsule >= 0.0);
         assert!((centered_capsule - expected_full_capsule * 0.5).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn analytic_volume_handles_near_parallel_cylinder_axes() {
+        let plane = Plane::new(Vec3::Z, 0.0);
+        let radius = 0.5;
+        let half_height = 1.0;
+        let full_cylinder = PI * radius * radius * 2.0 * half_height;
+        let full_capsule = full_cylinder + (4.0 / 3.0) * PI * radius * radius * radius;
+
+        for axis_component in [0.0_f32, 1.0e-8, 1.0e-7, 1.0e-4] {
+            let half_angle_sin = ((1.0_f32 - axis_component) * 0.5).sqrt();
+            let half_angle_cos = ((1.0_f32 + axis_component) * 0.5).sqrt();
+            let pose = |center_z: f32| GeomPose {
+                position: Vec3::new(0.0, 0.0, center_z),
+                orientation: Quat::new(0.0, half_angle_sin, 0.0, half_angle_cos),
+            };
+            let transverse = (1.0_f32 - axis_component * axis_component).sqrt();
+            let parallel_cylinder = |center_z: f32| {
+                disk_submerged_area(radius, -center_z / transverse) * 2.0 * half_height
+            };
+
+            for center_z in [0.5, 0.25, 0.0, -0.25, -0.5] {
+                let cylinder =
+                    cylinder_submerged_volume(&pose(center_z), plane, radius, half_height);
+                assert!(cylinder >= 0.0);
+                assert!(
+                    (cylinder - parallel_cylinder(center_z)).abs() < 2.0e-6,
+                    "axis={axis_component} center={center_z} cylinder={cylinder} parallel={}",
+                    parallel_cylinder(center_z)
+                );
+            }
+
+            let full_pose = pose(-2.0);
+            let cylinder = cylinder_submerged_volume(&full_pose, plane, radius, half_height);
+            assert!(cylinder >= 0.0);
+            assert!((cylinder - full_cylinder).abs() < 1.0e-6);
+            let capsule = capsule_submerged_volume(&full_pose, plane, radius, half_height);
+            assert!(capsule >= 0.0);
+            assert!((capsule - full_capsule).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn analytic_volume_is_nonnegative_and_monotone_at_boundaries() {
+        let plane = Plane::new(Vec3::Z, 0.0);
+        let radius = 0.5;
+        let half_height = 1.0;
+        let pose = |center_z: f32| GeomPose {
+            position: Vec3::new(0.0, 0.0, center_z),
+            orientation: Quat::new(0.0, 2.0_f32.sqrt() * 0.5, 0.0, 2.0_f32.sqrt() * 0.5),
+        };
+        let mut previous_cylinder = 0.0;
+        let mut previous_capsule = 0.0;
+        for index in 0..=1_000_000 {
+            let center_z = 0.5 - index as f32 * 1.0e-6;
+            let current_cylinder =
+                cylinder_submerged_volume(&pose(center_z), plane, radius, half_height);
+            let current_capsule =
+                capsule_submerged_volume(&pose(center_z), plane, radius, half_height);
+            assert!(current_cylinder >= 0.0);
+            assert!(current_capsule >= 0.0);
+            assert!(current_cylinder + 1.0e-6 >= previous_cylinder);
+            assert!(current_capsule + 1.0e-6 >= previous_capsule);
+            previous_cylinder = current_cylinder;
+            previous_capsule = current_capsule;
+        }
+    }
+
+    #[test]
+    fn disk_segment_area_stays_nonnegative_near_tangency() {
+        let radius = 0.5;
+        for threshold in [
+            -radius + 1.0e-8,
+            -radius + 1.0e-7,
+            -radius + 1.0e-6,
+            radius - 1.0e-6,
+            radius - 1.0e-7,
+            radius - 1.0e-8,
+        ] {
+            let area = disk_submerged_area(radius, threshold);
+            assert!(
+                (0.0..=PI * radius * radius).contains(&area),
+                "threshold={threshold} area={area}"
+            );
+        }
     }
 }
