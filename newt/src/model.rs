@@ -145,14 +145,14 @@ pub struct Scene {
 impl Scene {
     /// Detach a subtree and atomically remap scene metadata with the world.
     pub fn detach_subtree(&mut self, joint_id: WorldJointId) -> Result<DetachReport, DetachError> {
-        let mut world = self.world.clone();
+        let mut world = self.world.clone_for_transaction();
         let report = world.detach_subtree(joint_id)?;
 
         let mut sites = self.sites.clone();
         for site in &mut sites {
             if let SiteAttach::Link { tree, link } = site.attach {
                 if tree == report.source_tree_id {
-                    let mapped = report.remap_link_location(link)?;
+                    let mapped = report.remap_link_location(tree, link)?;
                     site.attach = SiteAttach::Link {
                         tree: mapped.tree_id,
                         link: mapped.link_id,
@@ -164,11 +164,7 @@ impl Scene {
         let mut links_by_name = vec![HashMap::new(); world.trees.len()];
         for (tree, names) in self.links_by_name.iter().enumerate() {
             for (name, &link) in names {
-                let mapped = if tree == report.source_tree_id {
-                    report.remap_link_location(link)?
-                } else {
-                    world.joint_id(tree, link)
-                };
+                let mapped = report.remap_link_location(tree, link)?;
                 links_by_name[mapped.tree_id].insert(name.clone(), mapped.link_id);
             }
         }

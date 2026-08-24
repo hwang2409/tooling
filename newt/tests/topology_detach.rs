@@ -256,26 +256,41 @@ fn scene_detach_remaps_sites_and_name_maps_atomically() {
     tree.push_link(link(None, JointKind::Fixed, 0.0));
     tree.push_link(link(Some(0), JointKind::hinge(Vec3::Z), 1.0));
     world.add_tree(tree);
+    let mut other_tree = Tree::new();
+    other_tree.push_link(link(None, JointKind::Fixed, 5.0));
+    world.add_tree(other_tree);
 
     let mut links = HashMap::new();
     links.insert("root".into(), 0);
     links.insert("arm".into(), 1);
+    let mut other_links = HashMap::new();
+    other_links.insert("other_root".into(), 0);
     let mut trees_by_name = HashMap::new();
     trees_by_name.insert("body".into(), 0);
+    trees_by_name.insert("other_body".into(), 1);
     let mut sites_by_name = HashMap::new();
     sites_by_name.insert("tip".into(), 0);
+    sites_by_name.insert("other_tip".into(), 1);
     let mut scene = Scene {
         world,
         bodies_by_name: HashMap::new(),
         trees_by_name,
-        links_by_name: vec![links],
+        links_by_name: vec![links, other_links],
         geoms_by_name: HashMap::new(),
-        sites: vec![Site {
-            name: "tip".into(),
-            attach: SiteAttach::Link { tree: 0, link: 1 },
-            local_offset: Vec3::ZERO,
-            local_orientation: Quat::IDENTITY,
-        }],
+        sites: vec![
+            Site {
+                name: "tip".into(),
+                attach: SiteAttach::Link { tree: 0, link: 1 },
+                local_offset: Vec3::ZERO,
+                local_orientation: Quat::IDENTITY,
+            },
+            Site {
+                name: "other_tip".into(),
+                attach: SiteAttach::Link { tree: 1, link: 0 },
+                local_offset: Vec3::ZERO,
+                local_orientation: Quat::IDENTITY,
+            },
+        ],
         sites_by_name,
         actuators_by_name: HashMap::new(),
         sensors_by_name: HashMap::new(),
@@ -283,9 +298,37 @@ fn scene_detach_remaps_sites_and_name_maps_atomically() {
     };
 
     scene.detach_subtree(scene.world.joint_id(0, 1)).unwrap();
-    assert_eq!(scene.sites[0].attach, SiteAttach::Link { tree: 1, link: 0 });
-    assert_eq!(scene.links_by_name[1]["arm"], 0);
+    assert_eq!(scene.sites[0].attach, SiteAttach::Link { tree: 2, link: 0 });
+    assert_eq!(scene.links_by_name[2]["arm"], 0);
+    assert_eq!(scene.links_by_name[1]["other_root"], 0);
     assert!(scene.site_pose("tip").is_some());
+    assert!(scene.site_pose("other_tip").is_some());
+}
+
+#[test]
+fn cloned_world_rejects_source_handle() {
+    let source = world_with_handle_tree();
+    let source_handle = source.joint_id(0, 1);
+    let mut clone = source.clone();
+
+    let error = clone.detach_subtree(source_handle).unwrap_err();
+    assert!(error.0.contains("belongs to another world"));
+}
+
+#[test]
+fn remapped_unaffected_handle_uses_target_epoch() {
+    let mut world = world_with_handle_tree();
+    let mut other_tree = Tree::new();
+    other_tree.push_link(link(None, JointKind::Fixed, 5.0));
+    other_tree.push_link(link(Some(0), JointKind::hinge(Vec3::Z), 1.0));
+    world.add_tree(other_tree);
+    let unaffected = world.joint_id(1, 1);
+
+    let report = world.detach_subtree(world.joint_id(0, 1)).unwrap();
+    let remapped = report.remap_link(unaffected).unwrap();
+    assert_eq!(remapped.tree_id, 1);
+    assert_eq!(remapped.link_id, unaffected.link_id);
+    world.detach_subtree(remapped).unwrap();
 }
 
 #[test]
