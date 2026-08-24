@@ -1,14 +1,20 @@
 use newt::body::Body;
-use newt::geom::{AnisotropicFriction, Geom};
+use newt::geom::{AnisotropicFriction, Geom, SolRef};
+use newt::joint::JointKind;
 use newt::math::{Quat, Vec3};
 use newt::solver::{ConeKind, SolverConfig, SolverMode};
+use newt::tree::{Link, Tree};
 use newt::world::World;
 
 fn solver_world(gravity: Vec3) -> World {
+    solver_world_with_mode(gravity, SolverMode::Pgs)
+}
+
+fn solver_world_with_mode(gravity: Vec3, mode: SolverMode) -> World {
     let mut world = World::new();
     world.gravity = gravity;
     world.solver = SolverConfig {
-        mode: SolverMode::Pgs,
+        mode,
         iterations: 30,
         cone: ConeKind::Pyramidal,
     };
@@ -125,6 +131,65 @@ fn spinning_ball(rolling_friction: Option<f32>, height: f32) -> World {
     world
 }
 
+fn newton_spinning_ball() -> World {
+    let mut world = solver_world_with_mode(Vec3::new(0.0, 0.0, -9.81), SolverMode::Newton);
+    let solref = SolRef::new(-400.0, -1200.0);
+    let radius = 0.2;
+    let body = world.add_body(Body::solid_sphere(
+        1.0,
+        radius,
+        Vec3::new(0.0, 0.0, 0.1),
+        Quat::IDENTITY,
+    ));
+    world.bodies[body].rolling_friction = Some(10.0);
+    world.bodies[body].angular_velocity_body = Vec3::new(0.0, 0.1, 0.0);
+    let mut plane = Geom::static_plane(Vec3::ZERO, Vec3::Z, 1.0);
+    plane.solref = solref;
+    world.add_geom(plane);
+    let mut sphere = Geom::sphere(body, radius, Vec3::ZERO, 1.0);
+    sphere.solref = solref;
+    world.add_geom(sphere);
+    world
+}
+
+fn newton_tree_spinning_ball() -> World {
+    let mut world = solver_world_with_mode(Vec3::ZERO, SolverMode::Newton);
+    let solref = SolRef::new(-400.0, -1200.0);
+    let mut tree = Tree::new();
+    tree.push_link(Link::new(
+        None,
+        JointKind::Fixed,
+        (Vec3::ZERO, Quat::IDENTITY),
+        (Vec3::ZERO, Quat::IDENTITY),
+        1.0,
+        newt::math::Mat3::diag(0.1, 0.1, 0.1),
+    ));
+    let tree_index = world.add_tree(tree);
+    let mut ground = Geom::box_on_link(
+        tree_index,
+        0,
+        Vec3::new(1.0, 1.0, 0.05),
+        Vec3::new(0.0, 0.0, -0.05),
+        Quat::IDENTITY,
+        1.0,
+    );
+    ground.solref = solref;
+    world.add_geom(ground);
+    let half = Vec3::splat(0.2);
+    let body = world.add_body(Body::solid_box(
+        1.0,
+        half,
+        Vec3::new(0.0, 0.0, 0.1),
+        Quat::from_axis_angle(Vec3::Y, -0.2),
+    ));
+    world.bodies[body].rolling_friction = Some(10.0);
+    world.bodies[body].angular_velocity_body = Vec3::new(0.0, 0.1, 0.0);
+    let mut geom = Geom::r#box(body, half, Vec3::ZERO, Quat::IDENTITY, 1.0);
+    geom.solref = solref;
+    world.add_geom(geom);
+    world
+}
+
 #[test]
 fn friction_rolling_slows_spinning_ball() {
     let mut with_rolling = spinning_ball(Some(0.5), 0.2);
@@ -175,4 +240,20 @@ fn friction_rolling_clamp_no_reverse() {
         omega.length() < 1.0e-5,
         "angular velocity was not clamped: {omega:?}"
     );
+}
+
+#[test]
+fn friction_rolling_free_body_newton_clamp_no_reverse() {
+    let mut world = newton_spinning_ball();
+    world.step();
+    let omega = world.bodies[0].angular_velocity_world();
+    assert!(omega.y >= -1.0e-5, "angular velocity reversed: {omega:?}");
+}
+
+#[test]
+fn friction_rolling_tree_newton_clamp_no_reverse() {
+    let mut world = newton_tree_spinning_ball();
+    world.step();
+    let omega = world.bodies[0].angular_velocity_world();
+    assert!(omega.y >= -1.0e-5, "angular velocity reversed: {omega:?}");
 }

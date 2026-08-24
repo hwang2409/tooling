@@ -1300,7 +1300,7 @@ fn solve_free_body_newton_impulses(
     cone: ConeKind,
 ) -> crate::newton::NewtonResult {
     let n_rows = rows.len();
-    let mut hessian = vec![0.0f32; n_rows * n_rows];
+    let mut response_matrix = vec![0.0f32; n_rows * n_rows];
     let mut response = vec![BodyDelta::default(); n_bodies];
     for j in 0..n_rows {
         for slot in response.iter_mut() {
@@ -1308,9 +1308,11 @@ fn solve_free_body_newton_impulses(
         }
         apply_impulse_delta(&rows[j], 1.0, &mut response, bodies, inv_i_world);
         for i in 0..n_rows {
-            hessian[i * n_rows + j] = row_residual(&rows[i], &response, bodies, inv_i_world);
+            response_matrix[i * n_rows + j] =
+                row_residual(&rows[i], &response, bodies, inv_i_world);
         }
     }
+    let mut hessian = response_matrix.clone();
     for i in 0..n_rows {
         hessian[i * n_rows + i] += rows[i].reg;
     }
@@ -1372,9 +1374,30 @@ fn solve_free_body_newton_impulses(
         max_iterations: iterations.max(1),
         cost_tolerance: 1e-7,
     };
-    system
+    let mut result = system
         .solve()
-        .unwrap_or_else(|error| panic!("Newton free-body solve failed: {error}"))
+        .unwrap_or_else(|error| panic!("Newton free-body solve failed: {error}"));
+    for contact in per_contact {
+        let normal = contact.start_row as usize;
+        let normal_count = if cone == ConeKind::Pyramidal && contact.condim == 3 {
+            4
+        } else {
+            1
+        };
+        let normal_impulse = (0..normal_count)
+            .map(|offset| result.solution[normal + offset].max(0.0))
+            .sum::<f32>();
+        for rolling in contact.rolling_rows.iter().flatten() {
+            clamp_newton_rolling(
+                row_current_velocity(&rows[rolling.row_index], bodies),
+                &response_matrix,
+                rolling.row_index,
+                rolling.coefficient * normal_impulse,
+                &mut result.solution,
+            );
+        }
+    }
+    result
 }
 
 /// Row count for a contact block by condim.
@@ -3220,13 +3243,11 @@ pub fn solve_tree_contacts(
                 .map(|offset| impulses[normal + offset].max(0.0))
                 .sum::<f32>();
             for rolling in block.rolling_rows.iter().flatten() {
-                world_newton_clamp_rolling(
-                    &rows,
+                clamp_newton_rolling(
+                    world_current_velocity(&rows[rolling.row_index], bodies, trees),
                     &response,
                     rolling.row_index,
                     rolling.coefficient * normal_impulse,
-                    bodies,
-                    trees,
                     &mut impulses,
                 );
             }
@@ -3872,23 +3893,20 @@ fn world_pgs_rolling(
     impulses[index] = unconstrained.max(lower).min(upper);
 }
 
-fn world_newton_clamp_rolling(
-    rows: &[WorldContactRow],
+fn clamp_newton_rolling(
+    current: f32,
     response: &[f32],
     index: usize,
     cap: f32,
-    bodies: &[Body],
-    trees: &[Tree],
     impulses: &mut [f32],
 ) {
     if cap <= 0.0 {
         return;
     }
-    let n_rows = rows.len();
-    let current = world_current_velocity(&rows[index], bodies, trees);
     if current == 0.0 {
         return;
     }
+    let n_rows = impulses.len();
     let a_ii = response[index * n_rows + index];
     if a_ii <= 0.0 {
         return;
