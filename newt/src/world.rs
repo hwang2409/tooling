@@ -49,13 +49,16 @@ use crate::geom::{
 use crate::joint::JointKind;
 use crate::math::{Quat, Vec3};
 pub use crate::scene_query::{RayHit, ShapeDesc, ShapeHit};
-use crate::sensor::{Sensor, SensorBank, SensorError, SensorInputs};
+use crate::sensor::{
+    Sensor, SensorAttach, SensorBank, SensorError, SensorInputs, SensorKind, SiteFrame,
+};
 use crate::solver::{
     ConstraintRowDiagnostic, SolverConfig, SolverMode, TreeContactSolution, contact_friction_axes,
     solve_free_bodies,
 };
 use crate::tree::{
-    AbaWorkspace, Tree, euler_step_with_workspace as tree_euler_step_with_workspace,
+    AbaWorkspace, DetachedSubtree, Tree,
+    euler_step_with_workspace as tree_euler_step_with_workspace,
     forward_kinematics as tree_forward_kinematics,
     forward_kinematics_into as tree_forward_kinematics_into,
     rk4_step_with_workspace as tree_rk4_step_with_workspace,
@@ -205,6 +208,99 @@ pub struct World {
 
 /// Stable geom index returned by scene queries.
 pub type GeomId = usize;
+
+/// World-local address of a link in a kinematic tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorldJointId {
+    pub tree_id: usize,
+    pub link_id: usize,
+}
+
+/// Error returned when a subtree cannot be detached without invalidating
+/// indexed world state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetachError(pub String);
+
+impl std::fmt::Display for DetachError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DetachError {}
+
+/// Maps handles from one tree before a successful subtree detach to their
+/// new tree and index after the detach.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetachReport {
+    pub source_tree_id: usize,
+    pub child_tree_id: usize,
+    pub link_map: Vec<Option<WorldJointId>>,
+    pub tendon_map: Vec<Option<(usize, usize)>>,
+    pub actuator_map: Vec<Option<(usize, usize)>>,
+}
+
+impl DetachReport {
+    pub fn remap_link(&self, id: WorldJointId) -> Result<WorldJointId, DetachError> {
+        if id.tree_id != self.source_tree_id {
+            return Ok(id);
+        }
+        self.link_map
+            .get(id.link_id)
+            .and_then(|mapped| *mapped)
+            .ok_or_else(|| {
+                DetachError(format!(
+                    "link handle {} became invalid during detach",
+                    id.link_id
+                ))
+            })
+    }
+
+    pub fn remap_tendon(
+        &self,
+        tree_id: usize,
+        tendon_id: usize,
+    ) -> Result<(usize, usize), DetachError> {
+        remap_report_pair(
+            tree_id,
+            tendon_id,
+            self.source_tree_id,
+            &self.tendon_map,
+            "tendon",
+        )
+    }
+
+    pub fn remap_actuator(
+        &self,
+        tree_id: usize,
+        actuator_id: usize,
+    ) -> Result<(usize, usize), DetachError> {
+        remap_report_pair(
+            tree_id,
+            actuator_id,
+            self.source_tree_id,
+            &self.actuator_map,
+            "actuator",
+        )
+    }
+}
+
+fn remap_report_pair(
+    tree_id: usize,
+    index: usize,
+    source_tree_id: usize,
+    map: &[Option<(usize, usize)>],
+    kind: &str,
+) -> Result<(usize, usize), DetachError> {
+    if tree_id != source_tree_id {
+        return Ok((tree_id, index));
+    }
+    map.get(index).and_then(|mapped| *mapped).ok_or_else(|| {
+        DetachError(format!(
+            "{kind} handle {index} became invalid during detach"
+        ))
+    })
+}
 
 /// World-space pose used by shape casts.
 pub type Pose = GeomPose;
@@ -491,6 +587,19 @@ impl World {
             .find(|key| key.name == name)
             .cloned()
             .ok_or_else(|| KeyframeError(format!("unknown keyframe {name:?}")))?;
+        let expected = self.keyframe_dimensions();
+        for (label, actual, wanted) in [
+            ("q", key.q.len(), expected.0),
+            ("qdot", key.qdot.len(), expected.1),
+            ("act", key.act.len(), expected.2),
+            ("ctrl", key.ctrl.len(), expected.2),
+        ] {
+            if actual != wanted {
+                return Err(KeyframeError(format!(
+                    "keyframe {name:?} {label} dimension mismatch: expected {wanted}, got {actual}"
+                )));
+            }
+        }
         let mut q = 0;
         let mut qdot = 0;
         let mut actuator = 0;
@@ -968,6 +1077,240 @@ impl World {
             .push(AbaWorkspace::new(tree.links.len()));
         self.trees.push(tree);
         idx
+    }
+
+    /// Return the world-local address of a tree link.
+    pub fn joint_id(&self, tree_id: usize, link_id: usize) -> WorldJointId {
+        assert!(
+            tree_id < self.trees.len(),
+            "tree index {tree_id} is out of range"
+        );
+        assert!(
+            link_id < self.trees[tree_id].links.len(),
+            "link index {link_id} is out of range"
+        );
+        WorldJointId { tree_id, link_id }
+    }
+
+    /// Detach the subtree rooted at a non-root link.
+    ///
+    /// The source tree stays at its index. The detached tree is appended to
+    /// the world. Every internal tree, geom, sensor, equality, tendon,
+    /// actuator, and keyframe reference is remapped before any world state is
+    /// changed. References that cross the split return an error instead of
+    /// being silently dropped.
+    pub fn detach_subtree(&mut self, joint_id: WorldJointId) -> Result<DetachReport, DetachError> {
+        let source = self.trees.get(joint_id.tree_id).ok_or_else(|| {
+            DetachError(format!("tree index {} is out of range", joint_id.tree_id))
+        })?;
+        if joint_id.link_id == 0 {
+            return Err(DetachError("the root link cannot be detached".into()));
+        }
+        if joint_id.link_id >= source.links.len() {
+            return Err(DetachError(format!(
+                "link index {} is out of range for tree {}",
+                joint_id.link_id, joint_id.tree_id
+            )));
+        }
+        let expected = self.keyframe_dimensions();
+        for key in &self.keyframes {
+            for (label, actual, wanted) in [
+                ("q", key.q.len(), expected.0),
+                ("qdot", key.qdot.len(), expected.1),
+                ("act", key.act.len(), expected.2),
+                ("ctrl", key.ctrl.len(), expected.2),
+            ] {
+                if actual != wanted {
+                    return Err(DetachError(format!(
+                        "keyframe {:?} {label} dimension mismatch: expected {wanted}, got {actual}",
+                        key.name
+                    )));
+                }
+            }
+        }
+
+        let child_tree_id = self.trees.len();
+        let mut parent = source.clone();
+        let split = parent.detach_subtree(joint_id.link_id);
+        validate_split_maps(&split)?;
+
+        let mut geoms = self.geoms.clone();
+        for geom in &mut geoms {
+            if let Some((tree_id, link_id)) = geom.link {
+                if tree_id == joint_id.tree_id {
+                    geom.link = Some(remap_link_reference(
+                        link_id,
+                        joint_id.tree_id,
+                        child_tree_id,
+                        &split.parent_link_map,
+                        &split.child_link_map,
+                    )?);
+                }
+            }
+        }
+
+        let mut equalities = self.equalities.clone();
+        for equality in &mut equalities {
+            if let Equality::JointCoupling {
+                tree,
+                link_a,
+                link_b,
+                ..
+            } = equality
+            {
+                if *tree != joint_id.tree_id {
+                    continue;
+                }
+                let new_a = remap_link_reference(
+                    *link_a,
+                    joint_id.tree_id,
+                    child_tree_id,
+                    &split.parent_link_map,
+                    &split.child_link_map,
+                )?;
+                let new_b = remap_link_reference(
+                    *link_b,
+                    joint_id.tree_id,
+                    child_tree_id,
+                    &split.parent_link_map,
+                    &split.child_link_map,
+                )?;
+                if new_a.0 != new_b.0 {
+                    return Err(DetachError(format!(
+                        "joint coupling links {} and {} cross the subtree split",
+                        *link_a, *link_b
+                    )));
+                }
+                *tree = new_a.0;
+                *link_a = new_a.1;
+                *link_b = new_b.1;
+            }
+        }
+
+        let mut sensors = self.sensors.clone();
+        for sensor in &mut sensors.sensors {
+            remap_sensor(
+                sensor,
+                joint_id.tree_id,
+                child_tree_id,
+                &split.parent_link_map,
+                &split.child_link_map,
+                &split.parent_tendon_map,
+                &split.child_tendon_map,
+            )?;
+        }
+
+        let keyframes = self.remap_keyframes(joint_id.tree_id, joint_id.link_id)?;
+        let mut disabled_self_collision = self.disabled_self_collision.clone();
+        if disabled_self_collision.contains(&joint_id.tree_id) {
+            disabled_self_collision.insert(child_tree_id);
+        }
+
+        let report = DetachReport {
+            source_tree_id: joint_id.tree_id,
+            child_tree_id,
+            link_map: split
+                .parent_link_map
+                .iter()
+                .zip(&split.child_link_map)
+                .map(|(&parent, &child)| {
+                    parent
+                        .map(|link_id| WorldJointId {
+                            tree_id: joint_id.tree_id,
+                            link_id,
+                        })
+                        .or_else(|| {
+                            child.map(|link_id| WorldJointId {
+                                tree_id: child_tree_id,
+                                link_id,
+                            })
+                        })
+                })
+                .collect(),
+            tendon_map: split
+                .parent_tendon_map
+                .iter()
+                .zip(&split.child_tendon_map)
+                .map(|(&parent, &child)| {
+                    parent
+                        .map(|tendon_id| (joint_id.tree_id, tendon_id))
+                        .or_else(|| child.map(|tendon_id| (child_tree_id, tendon_id)))
+                })
+                .collect(),
+            actuator_map: split
+                .parent_actuator_map
+                .iter()
+                .zip(&split.child_actuator_map)
+                .map(|(&parent, &child)| {
+                    parent
+                        .map(|actuator_id| (joint_id.tree_id, actuator_id))
+                        .or_else(|| child.map(|actuator_id| (child_tree_id, actuator_id)))
+                })
+                .collect(),
+        };
+
+        self.trees[joint_id.tree_id] = parent;
+        self.trees.push(split.tree);
+        self.tree_aba_workspaces[joint_id.tree_id] =
+            AbaWorkspace::new(self.trees[joint_id.tree_id].links.len());
+        self.tree_aba_workspaces
+            .push(AbaWorkspace::new(self.trees[child_tree_id].links.len()));
+        self.geoms = geoms;
+        self.equalities = equalities;
+        self.sensors = sensors;
+        self.keyframes = keyframes;
+        self.disabled_self_collision = disabled_self_collision;
+        self.checked_pairs.set(0);
+        self.broadphase_pairs.clear();
+        self.refresh_broadphase_for_query();
+        Ok(report)
+    }
+
+    fn remap_keyframes(
+        &self,
+        source_tree_id: usize,
+        root: usize,
+    ) -> Result<Vec<Keyframe>, DetachError> {
+        let mut out = Vec::with_capacity(self.keyframes.len());
+        for key in &self.keyframes {
+            let mut q_cursor = 0;
+            let mut qdot_cursor = 0;
+            let mut act_cursor = 0;
+            let mut q = Vec::new();
+            let mut qdot = Vec::new();
+            let mut act = Vec::new();
+            let mut ctrl = Vec::new();
+            for (tree_id, source_tree) in self.trees.iter().enumerate() {
+                let mut tree = source_tree.clone();
+                let q_len = tree.nq();
+                let qdot_len = tree.nv();
+                tree.q.copy_from_slice(&key.q[q_cursor..q_cursor + q_len]);
+                tree.qdot
+                    .copy_from_slice(&key.qdot[qdot_cursor..qdot_cursor + qdot_len]);
+                for actuator in &mut tree.actuators {
+                    actuator.act = key.act[act_cursor];
+                    actuator.ctrl = key.ctrl[act_cursor];
+                    act_cursor += 1;
+                }
+                q_cursor += q_len;
+                qdot_cursor += qdot_len;
+                if tree_id == source_tree_id {
+                    let split = tree.detach_subtree(root);
+                    append_tree_state(&tree, &mut q, &mut qdot, &mut act, &mut ctrl);
+                    append_tree_state(&split.tree, &mut q, &mut qdot, &mut act, &mut ctrl);
+                } else {
+                    append_tree_state(&tree, &mut q, &mut qdot, &mut act, &mut ctrl);
+                }
+            }
+            out.push(Keyframe {
+                name: key.name.clone(),
+                q,
+                qdot,
+                act,
+                ctrl,
+            });
+        }
+        Ok(out)
     }
 
     /// Adds a geom and returns its stable index.
@@ -2412,6 +2755,151 @@ impl World {
 // ---------------------------------------------------------------------------
 // contact assembly and force application
 // ---------------------------------------------------------------------------
+
+fn validate_split_maps(split: &DetachedSubtree) -> Result<(), DetachError> {
+    for (kind, maps) in [
+        ("link", (&split.parent_link_map, &split.child_link_map)),
+        (
+            "tendon",
+            (&split.parent_tendon_map, &split.child_tendon_map),
+        ),
+        (
+            "actuator",
+            (&split.parent_actuator_map, &split.child_actuator_map),
+        ),
+    ] {
+        for (index, (parent, child)) in maps.0.iter().zip(maps.1).enumerate() {
+            if parent.is_none() && child.is_none() {
+                return Err(DetachError(format!(
+                    "{kind} {index} references both sides of the subtree split"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remap_link_reference(
+    link_id: usize,
+    parent_tree_id: usize,
+    child_tree_id: usize,
+    parent_map: &[Option<usize>],
+    child_map: &[Option<usize>],
+) -> Result<(usize, usize), DetachError> {
+    if let Some(link) = parent_map.get(link_id).copied().flatten() {
+        return Ok((parent_tree_id, link));
+    }
+    if let Some(link) = child_map.get(link_id).copied().flatten() {
+        return Ok((child_tree_id, link));
+    }
+    Err(DetachError(format!(
+        "link {link_id} became invalid during subtree detach"
+    )))
+}
+
+fn remap_site_frame(
+    site: &mut SiteFrame,
+    parent_tree_id: usize,
+    child_tree_id: usize,
+    parent_map: &[Option<usize>],
+    child_map: &[Option<usize>],
+) -> Result<(), DetachError> {
+    if let SensorAttach::Link(tree_id, link_id) = site.attach {
+        if tree_id == parent_tree_id {
+            let (tree_id, link_id) = remap_link_reference(
+                link_id,
+                parent_tree_id,
+                child_tree_id,
+                parent_map,
+                child_map,
+            )?;
+            site.attach = SensorAttach::Link(tree_id, link_id);
+        }
+    }
+    Ok(())
+}
+
+fn remap_sensor(
+    sensor: &mut Sensor,
+    parent_tree_id: usize,
+    child_tree_id: usize,
+    parent_link_map: &[Option<usize>],
+    child_link_map: &[Option<usize>],
+    parent_tendon_map: &[Option<usize>],
+    child_tendon_map: &[Option<usize>],
+) -> Result<(), DetachError> {
+    let remap_joint = |tree: &mut usize, link: &mut usize| -> Result<(), DetachError> {
+        if *tree == parent_tree_id {
+            (*tree, *link) = remap_link_reference(
+                *link,
+                parent_tree_id,
+                child_tree_id,
+                parent_link_map,
+                child_link_map,
+            )?;
+        }
+        Ok(())
+    };
+    let remap_tendon = |tree: &mut usize, tendon: &mut usize| -> Result<(), DetachError> {
+        if *tree != parent_tree_id {
+            return Ok(());
+        }
+        if let Some(new_tendon) = parent_tendon_map.get(*tendon).copied().flatten() {
+            *tendon = new_tendon;
+            return Ok(());
+        }
+        if let Some(new_tendon) = child_tendon_map.get(*tendon).copied().flatten() {
+            *tree = child_tree_id;
+            *tendon = new_tendon;
+            return Ok(());
+        }
+        Err(DetachError(format!(
+            "tendon {tendon} became invalid during subtree detach"
+        )))
+    };
+
+    match &mut sensor.kind {
+        SensorKind::JointPos { tree, link }
+        | SensorKind::JointVel { tree, link }
+        | SensorKind::BallQuat { tree, link }
+        | SensorKind::BallAngVel { tree, link }
+        | SensorKind::Force { tree, link }
+        | SensorKind::Torque { tree, link }
+        | SensorKind::SubtreeCom { tree, link } => remap_joint(tree, link),
+        SensorKind::TendonPos { tree, tendon } | SensorKind::TendonVel { tree, tendon } => {
+            remap_tendon(tree, tendon)
+        }
+        SensorKind::FramePos(site)
+        | SensorKind::FrameQuat(site)
+        | SensorKind::Gyro(site)
+        | SensorKind::Accelerometer(site)
+        | SensorKind::Velocimeter(site)
+        | SensorKind::Magnetometer(site)
+        | SensorKind::Rangefinder(site)
+        | SensorKind::FrameLinVel(site)
+        | SensorKind::FrameAngVel(site) => remap_site_frame(
+            site,
+            parent_tree_id,
+            child_tree_id,
+            parent_link_map,
+            child_link_map,
+        ),
+        SensorKind::Touch { .. } => Ok(()),
+    }
+}
+
+fn append_tree_state(
+    tree: &Tree,
+    q: &mut Vec<f32>,
+    qdot: &mut Vec<f32>,
+    act: &mut Vec<f32>,
+    ctrl: &mut Vec<f32>,
+) {
+    q.extend_from_slice(&tree.q);
+    qdot.extend_from_slice(&tree.qdot);
+    act.extend(tree.actuators.iter().map(|actuator| actuator.act));
+    ctrl.extend(tree.actuators.iter().map(|actuator| actuator.ctrl));
+}
 
 fn body_id(geom: &Geom) -> Option<usize> {
     match geom.attachment() {
