@@ -3,11 +3,13 @@ use newt::equality::Equality;
 use newt::geom::{Geom, SolRef};
 use newt::joint::JointKind;
 use newt::math::{Mat3, Quat, Vec3};
+use newt::model::{Scene, Site, SiteAttach};
 use newt::sensor::{Sensor, SensorAttach, SensorKind, SiteFrame};
 use newt::solver::SolImp;
 use newt::tendon::{FixedTendonJoint, Tendon};
 use newt::tree::{Link, Tree};
 use newt::world::{World, WorldJointId};
+use std::collections::HashMap;
 
 fn link(parent: Option<usize>, joint: JointKind, x: f32) -> Link {
     Link::new(
@@ -99,20 +101,14 @@ fn detach_remaps_all_indexed_world_state_atomically() {
             tree_id: 0,
             link_id: 3
         }),
-        Ok(WorldJointId {
-            tree_id: 0,
-            link_id: 1
-        })
+        Ok(world.joint_id(0, 1))
     );
     assert_eq!(
         report.remap_link(WorldJointId {
             tree_id: 0,
             link_id: 2
         }),
-        Ok(WorldJointId {
-            tree_id: 1,
-            link_id: 1
-        })
+        Ok(world.joint_id(1, 1))
     );
     assert_eq!(report.remap_tendon(0, 0), Ok((1, 0)));
     assert_eq!(report.remap_actuator(0, 0), Ok((0, 0)));
@@ -183,4 +179,138 @@ fn cross_split_references_return_an_error_without_mutation() {
     assert!(error.0.contains("cross the subtree split"));
     assert_eq!(world.trees.len(), 1);
     assert_eq!(world.sensors.sensors.len(), 5);
+}
+
+#[test]
+fn keyframes_append_detached_state_after_later_trees() {
+    let mut source = Tree::new();
+    source.push_link(link(None, JointKind::Fixed, 0.0));
+    source.push_link(link(Some(0), JointKind::hinge(Vec3::Z), 1.0));
+
+    let mut later = Tree::new();
+    later.push_link(link(None, JointKind::Fixed, 0.0));
+    later.push_link(link(Some(0), JointKind::hinge(Vec3::Z), 2.0));
+
+    let mut world = World::new();
+    world.add_tree(source);
+    world.add_tree(later);
+    world
+        .add_keyframe("saved", vec![1.25, 2.5], vec![3.5, 4.5], vec![], vec![])
+        .unwrap();
+
+    world.detach_subtree(world.joint_id(0, 1)).unwrap();
+
+    assert_eq!(world.keyframes[0].q[0], 2.5);
+    assert_eq!(world.keyframes[0].qdot[0], 4.5);
+    assert_eq!(world.keyframes[0].q.len(), 8);
+    assert_eq!(world.keyframes[0].qdot.len(), 7);
+}
+
+#[test]
+fn detached_root_joint_consumers_are_explicitly_invalidated() {
+    let mut world = world_with_references();
+    world
+        .add_sensor(Sensor {
+            name: "detached_root".into(),
+            kind: SensorKind::JointPos { tree: 0, link: 1 },
+        })
+        .unwrap();
+
+    let result = world.detach_subtree(world.joint_id(0, 1));
+    assert!(result.unwrap_err().0.contains("detached root joint"));
+    assert_eq!(world.trees.len(), 1);
+    assert_eq!(world.sensors.sensors.len(), 6);
+
+    let mut world = world_with_references();
+    world.equalities.push(Equality::JointCoupling {
+        tree: 0,
+        link_a: 1,
+        link_b: 2,
+        polycoef: [0.0, 1.0, 0.0],
+        solref: SolRef::DEFAULT,
+        solimp: SolImp::DEFAULT,
+    });
+    let result = world.detach_subtree(world.joint_id(0, 1));
+    assert!(result.unwrap_err().0.contains("detached root joint"));
+    assert_eq!(world.trees.len(), 1);
+}
+
+#[test]
+fn direct_tree_population_has_atomic_workspace_setup() {
+    let mut world = World::new();
+    let mut tree = Tree::new();
+    tree.push_link(link(None, JointKind::Fixed, 0.0));
+    tree.push_link(link(Some(0), JointKind::hinge(Vec3::Z), 1.0));
+    world.trees.push(tree);
+
+    world
+        .detach_subtree(WorldJointId {
+            tree_id: 0,
+            link_id: 1,
+        })
+        .unwrap();
+    assert_eq!(world.trees.len(), 2);
+    assert_eq!(world.trees[0].links.len(), 1);
+    assert_eq!(world.trees[1].links.len(), 1);
+}
+
+#[test]
+fn scene_detach_remaps_sites_and_name_maps_atomically() {
+    let mut world = World::new();
+    let mut tree = Tree::new();
+    tree.push_link(link(None, JointKind::Fixed, 0.0));
+    tree.push_link(link(Some(0), JointKind::hinge(Vec3::Z), 1.0));
+    world.add_tree(tree);
+
+    let mut links = HashMap::new();
+    links.insert("root".into(), 0);
+    links.insert("arm".into(), 1);
+    let mut trees_by_name = HashMap::new();
+    trees_by_name.insert("body".into(), 0);
+    let mut sites_by_name = HashMap::new();
+    sites_by_name.insert("tip".into(), 0);
+    let mut scene = Scene {
+        world,
+        bodies_by_name: HashMap::new(),
+        trees_by_name,
+        links_by_name: vec![links],
+        geoms_by_name: HashMap::new(),
+        sites: vec![Site {
+            name: "tip".into(),
+            attach: SiteAttach::Link { tree: 0, link: 1 },
+            local_offset: Vec3::ZERO,
+            local_orientation: Quat::IDENTITY,
+        }],
+        sites_by_name,
+        actuators_by_name: HashMap::new(),
+        sensors_by_name: HashMap::new(),
+        tendons_by_name: HashMap::new(),
+    };
+
+    scene.detach_subtree(scene.world.joint_id(0, 1)).unwrap();
+    assert_eq!(scene.sites[0].attach, SiteAttach::Link { tree: 1, link: 0 });
+    assert_eq!(scene.links_by_name[1]["arm"], 0);
+    assert!(scene.site_pose("tip").is_some());
+}
+
+#[test]
+fn stale_link_handle_cannot_detach_a_compacted_sibling() {
+    let mut world = world_with_references();
+    let stale = world.joint_id(0, 1);
+    world.detach_subtree(stale).unwrap();
+
+    let result = world.detach_subtree(stale);
+    assert!(result.unwrap_err().0.contains("stale link handle"));
+    assert_eq!(world.trees[0].links.len(), 2);
+}
+
+#[test]
+fn detach_clears_last_solver_phase_diagnostics() {
+    let mut world = world_with_references();
+    world.set_solver_phase_capture(true);
+    world.capture_solver_phase();
+    assert!(world.solver_phase_diagnostics().is_some());
+
+    world.detach_subtree(world.joint_id(0, 1)).unwrap();
+    assert!(world.solver_phase_diagnostics().is_none());
 }

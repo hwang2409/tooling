@@ -188,6 +188,12 @@ pub struct World {
     last_solver_phase: Option<SolverPhaseDiagnostics>,
     #[doc(hidden)]
     tree_aba_workspaces: Vec<AbaWorkspace>,
+    /// Stable link tokens. The public tree/link arrays stay dense, while
+    /// saved handles keep their identity across subtree compaction.
+    #[doc(hidden)]
+    joint_handle_ids: Vec<Vec<usize>>,
+    #[doc(hidden)]
+    next_joint_handle: usize,
     #[doc(hidden)]
     broadphase: RefCell<DynamicAabbTree>,
     #[doc(hidden)]
@@ -213,6 +219,8 @@ pub type GeomId = usize;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorldJointId {
     pub tree_id: usize,
+    /// Opaque link token returned by [`World::joint_id`]. Raw link indices
+    /// remain accepted for worlds built by direct field population.
     pub link_id: usize,
 }
 
@@ -238,6 +246,8 @@ pub struct DetachReport {
     pub link_map: Vec<Option<WorldJointId>>,
     pub tendon_map: Vec<Option<(usize, usize)>>,
     pub actuator_map: Vec<Option<(usize, usize)>>,
+    source_link_handles: Vec<usize>,
+    link_index_map: Vec<Option<WorldJointId>>,
 }
 
 impl DetachReport {
@@ -245,8 +255,13 @@ impl DetachReport {
         if id.tree_id != self.source_tree_id {
             return Ok(id);
         }
+        let link_id = self
+            .source_link_handles
+            .iter()
+            .position(|&handle| handle == id.link_id)
+            .unwrap_or(id.link_id);
         self.link_map
-            .get(id.link_id)
+            .get(link_id)
             .and_then(|mapped| *mapped)
             .ok_or_else(|| {
                 DetachError(format!(
@@ -254,6 +269,13 @@ impl DetachReport {
                     id.link_id
                 ))
             })
+    }
+
+    pub(crate) fn remap_link_location(&self, link_id: usize) -> Result<WorldJointId, DetachError> {
+        self.link_index_map
+            .get(link_id)
+            .and_then(|mapped| *mapped)
+            .ok_or_else(|| DetachError(format!("link {link_id} became invalid during detach")))
     }
 
     pub fn remap_tendon(
@@ -444,6 +466,8 @@ impl World {
             solver_phase_capture: false,
             last_solver_phase: None,
             tree_aba_workspaces: Vec::new(),
+            joint_handle_ids: Vec::new(),
+            next_joint_handle: 0,
             broadphase: RefCell::new(DynamicAabbTree::new()),
             broadphase_pairs: Vec::new(),
             broadphase_tree_poses: RefCell::new(Vec::new()),
@@ -1076,6 +1100,16 @@ impl World {
         self.tree_aba_workspaces
             .push(AbaWorkspace::new(tree.links.len()));
         self.trees.push(tree);
+        let mut handles = self.current_joint_handle_ids();
+        let tree_handles: Vec<usize> = (0..self.trees[idx].links.len())
+            .map(|_| {
+                let handle = self.next_joint_handle;
+                self.next_joint_handle += 1;
+                handle
+            })
+            .collect();
+        handles.push(tree_handles);
+        self.joint_handle_ids = handles;
         idx
     }
 
@@ -1089,7 +1123,48 @@ impl World {
             link_id < self.trees[tree_id].links.len(),
             "link index {link_id} is out of range"
         );
+        let link_id = self
+            .current_joint_handle_ids()
+            .get(tree_id)
+            .and_then(|handles| handles.get(link_id))
+            .copied()
+            .unwrap_or(link_id);
         WorldJointId { tree_id, link_id }
+    }
+
+    fn current_joint_handle_ids(&self) -> Vec<Vec<usize>> {
+        if self.joint_handle_ids.len() == self.trees.len()
+            && self
+                .joint_handle_ids
+                .iter()
+                .zip(&self.trees)
+                .all(|(handles, tree)| handles.len() == tree.links.len())
+        {
+            return self.joint_handle_ids.clone();
+        }
+        self.trees
+            .iter()
+            .map(|tree| (0..tree.links.len()).collect())
+            .collect()
+    }
+
+    fn resolve_joint_id(
+        &self,
+        joint_id: WorldJointId,
+        handles: &[Vec<usize>],
+    ) -> Result<usize, DetachError> {
+        let tree_handles = handles.get(joint_id.tree_id).ok_or_else(|| {
+            DetachError(format!("tree index {} is out of range", joint_id.tree_id))
+        })?;
+        tree_handles
+            .iter()
+            .position(|&handle| handle == joint_id.link_id)
+            .ok_or_else(|| {
+                DetachError(format!(
+                    "stale link handle {} for tree {}",
+                    joint_id.link_id, joint_id.tree_id
+                ))
+            })
     }
 
     /// Detach the subtree rooted at a non-root link.
@@ -1100,16 +1175,16 @@ impl World {
     /// changed. References that cross the split return an error instead of
     /// being silently dropped.
     pub fn detach_subtree(&mut self, joint_id: WorldJointId) -> Result<DetachReport, DetachError> {
-        let source = self.trees.get(joint_id.tree_id).ok_or_else(|| {
-            DetachError(format!("tree index {} is out of range", joint_id.tree_id))
-        })?;
-        if joint_id.link_id == 0 {
+        let handles = self.current_joint_handle_ids();
+        let root = self.resolve_joint_id(joint_id, &handles)?;
+        let source = &self.trees[joint_id.tree_id];
+        if root == 0 {
             return Err(DetachError("the root link cannot be detached".into()));
         }
-        if joint_id.link_id >= source.links.len() {
+        if root >= source.links.len() {
             return Err(DetachError(format!(
                 "link index {} is out of range for tree {}",
-                joint_id.link_id, joint_id.tree_id
+                root, joint_id.tree_id
             )));
         }
         let expected = self.keyframe_dimensions();
@@ -1131,8 +1206,17 @@ impl World {
 
         let child_tree_id = self.trees.len();
         let mut parent = source.clone();
-        let split = parent.detach_subtree(joint_id.link_id);
+        let split = parent.detach_subtree(root);
         validate_split_maps(&split)?;
+
+        for sensor in &self.sensors.sensors {
+            if sensor_targets_detached_root(sensor, joint_id.tree_id, root) {
+                return Err(DetachError(format!(
+                    "sensor {:?} targets the detached root joint and became invalid",
+                    sensor.name
+                )));
+            }
+        }
 
         let mut geoms = self.geoms.clone();
         for geom in &mut geoms {
@@ -1181,6 +1265,11 @@ impl World {
                         *link_a, *link_b
                     )));
                 }
+                if *link_a == root || *link_b == root {
+                    return Err(DetachError(
+                        "joint coupling targets the detached root joint and became invalid".into(),
+                    ));
+                }
                 *tree = new_a.0;
                 *link_a = new_a.1;
                 *link_b = new_b.1;
@@ -1200,33 +1289,76 @@ impl World {
             )?;
         }
 
-        let keyframes = self.remap_keyframes(joint_id.tree_id, joint_id.link_id)?;
+        let keyframes = self.remap_keyframes(joint_id.tree_id, root)?;
         let mut disabled_self_collision = self.disabled_self_collision.clone();
         if disabled_self_collision.contains(&joint_id.tree_id) {
             disabled_self_collision.insert(child_tree_id);
         }
 
+        let parent_handles: Vec<usize> = split
+            .parent_link_map
+            .iter()
+            .enumerate()
+            .filter_map(|(old, mapped)| mapped.map(|new| (new, handles[joint_id.tree_id][old])))
+            .fold(Vec::new(), |mut out, (new, handle)| {
+                if out.len() <= new {
+                    out.resize(new + 1, 0);
+                }
+                out[new] = handle;
+                out
+            });
+        let child_handles: Vec<usize> = split
+            .child_link_map
+            .iter()
+            .enumerate()
+            .filter_map(|(old, mapped)| mapped.map(|new| (new, handles[joint_id.tree_id][old])))
+            .fold(Vec::new(), |mut out, (new, handle)| {
+                if out.len() <= new {
+                    out.resize(new + 1, 0);
+                }
+                out[new] = handle;
+                out
+            });
+        let link_map: Vec<Option<WorldJointId>> = split
+            .parent_link_map
+            .iter()
+            .zip(&split.child_link_map)
+            .map(|(&parent, &child)| {
+                parent
+                    .map(|link| WorldJointId {
+                        tree_id: joint_id.tree_id,
+                        link_id: parent_handles[link],
+                    })
+                    .or_else(|| {
+                        child.map(|link| WorldJointId {
+                            tree_id: child_tree_id,
+                            link_id: child_handles[link],
+                        })
+                    })
+            })
+            .collect();
+        let link_index_map: Vec<Option<WorldJointId>> = split
+            .parent_link_map
+            .iter()
+            .zip(&split.child_link_map)
+            .map(|(&parent, &child)| {
+                parent
+                    .map(|link| WorldJointId {
+                        tree_id: joint_id.tree_id,
+                        link_id: link,
+                    })
+                    .or_else(|| {
+                        child.map(|link| WorldJointId {
+                            tree_id: child_tree_id,
+                            link_id: link,
+                        })
+                    })
+            })
+            .collect();
         let report = DetachReport {
             source_tree_id: joint_id.tree_id,
             child_tree_id,
-            link_map: split
-                .parent_link_map
-                .iter()
-                .zip(&split.child_link_map)
-                .map(|(&parent, &child)| {
-                    parent
-                        .map(|link_id| WorldJointId {
-                            tree_id: joint_id.tree_id,
-                            link_id,
-                        })
-                        .or_else(|| {
-                            child.map(|link_id| WorldJointId {
-                                tree_id: child_tree_id,
-                                link_id,
-                            })
-                        })
-                })
-                .collect(),
+            link_map,
             tendon_map: split
                 .parent_tendon_map
                 .iter()
@@ -1247,22 +1379,32 @@ impl World {
                         .or_else(|| child.map(|actuator_id| (child_tree_id, actuator_id)))
                 })
                 .collect(),
+            source_link_handles: handles[joint_id.tree_id].clone(),
+            link_index_map,
         };
 
-        self.trees[joint_id.tree_id] = parent;
-        self.trees.push(split.tree);
-        self.tree_aba_workspaces[joint_id.tree_id] =
-            AbaWorkspace::new(self.trees[joint_id.tree_id].links.len());
-        self.tree_aba_workspaces
-            .push(AbaWorkspace::new(self.trees[child_tree_id].links.len()));
-        self.geoms = geoms;
-        self.equalities = equalities;
-        self.sensors = sensors;
-        self.keyframes = keyframes;
-        self.disabled_self_collision = disabled_self_collision;
-        self.checked_pairs.set(0);
-        self.broadphase_pairs.clear();
-        self.refresh_broadphase_for_query();
+        let mut staged = self.clone();
+        staged.trees[joint_id.tree_id] = parent;
+        staged.trees.push(split.tree);
+        let mut staged_handles = handles;
+        staged_handles[joint_id.tree_id] = parent_handles;
+        staged_handles.push(child_handles);
+        staged.joint_handle_ids = staged_handles;
+        staged.tree_aba_workspaces = staged
+            .trees
+            .iter()
+            .map(|tree| AbaWorkspace::new(tree.links.len()))
+            .collect();
+        staged.geoms = geoms;
+        staged.equalities = equalities;
+        staged.sensors = sensors;
+        staged.keyframes = keyframes;
+        staged.disabled_self_collision = disabled_self_collision;
+        staged.last_solver_phase = None;
+        staged.checked_pairs.set(0);
+        staged.broadphase_pairs.clear();
+        staged.refresh_broadphase_for_query();
+        *self = staged;
         Ok(report)
     }
 
@@ -1280,6 +1422,7 @@ impl World {
             let mut qdot = Vec::new();
             let mut act = Vec::new();
             let mut ctrl = Vec::new();
+            let mut detached_state = None;
             for (tree_id, source_tree) in self.trees.iter().enumerate() {
                 let mut tree = source_tree.clone();
                 let q_len = tree.nq();
@@ -1297,10 +1440,13 @@ impl World {
                 if tree_id == source_tree_id {
                     let split = tree.detach_subtree(root);
                     append_tree_state(&tree, &mut q, &mut qdot, &mut act, &mut ctrl);
-                    append_tree_state(&split.tree, &mut q, &mut qdot, &mut act, &mut ctrl);
+                    detached_state = Some(split.tree);
                 } else {
                     append_tree_state(&tree, &mut q, &mut qdot, &mut act, &mut ctrl);
                 }
+            }
+            if let Some(tree) = detached_state {
+                append_tree_state(&tree, &mut q, &mut qdot, &mut act, &mut ctrl);
             }
             out.push(Keyframe {
                 name: key.name.clone(),
@@ -2817,6 +2963,18 @@ fn remap_site_frame(
         }
     }
     Ok(())
+}
+
+fn sensor_targets_detached_root(sensor: &Sensor, tree_id: usize, root: usize) -> bool {
+    match &sensor.kind {
+        SensorKind::JointPos { tree, link }
+        | SensorKind::JointVel { tree, link }
+        | SensorKind::BallQuat { tree, link }
+        | SensorKind::BallAngVel { tree, link }
+        | SensorKind::Force { tree, link }
+        | SensorKind::Torque { tree, link } => *tree == tree_id && *link == root,
+        _ => false,
+    }
 }
 
 fn remap_sensor(
