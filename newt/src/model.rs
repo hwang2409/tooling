@@ -167,10 +167,7 @@ impl Scene {
                 let mapped = if tree == report.source_tree_id {
                     report.remap_link_location(link)?
                 } else {
-                    WorldJointId {
-                        tree_id: tree,
-                        link_id: link,
-                    }
+                    world.joint_id(tree, link)
                 };
                 links_by_name[mapped.tree_id].insert(name.clone(), mapped.link_id);
             }

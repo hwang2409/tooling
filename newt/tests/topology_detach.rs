@@ -8,7 +8,7 @@ use newt::sensor::{Sensor, SensorAttach, SensorKind, SiteFrame};
 use newt::solver::SolImp;
 use newt::tendon::{FixedTendonJoint, Tendon};
 use newt::tree::{Link, Tree};
-use newt::world::{World, WorldJointId};
+use newt::world::World;
 use std::collections::HashMap;
 
 fn link(parent: Option<usize>, joint: JointKind, x: f32) -> Link {
@@ -173,10 +173,7 @@ fn cross_split_references_return_an_error_without_mutation() {
         solref: SolRef::DEFAULT,
         solimp: SolImp::DEFAULT,
     });
-    let result = world.detach_subtree(WorldJointId {
-        tree_id: 0,
-        link_id: 1,
-    });
+    let result = world.detach_subtree(world.joint_id(0, 1));
     let error = result.unwrap_err();
     assert!(error.0.contains("cross the subtree split"));
     assert_eq!(world.trees.len(), 1);
@@ -245,12 +242,8 @@ fn direct_tree_population_has_atomic_workspace_setup() {
     tree.push_link(link(Some(0), JointKind::hinge(Vec3::Z), 1.0));
     world.trees.push(tree);
 
-    world
-        .detach_subtree(WorldJointId {
-            tree_id: 0,
-            link_id: 1,
-        })
-        .unwrap();
+    let link = world.joint_id(0, 1);
+    world.detach_subtree(link).unwrap();
     assert_eq!(world.trees.len(), 2);
     assert_eq!(world.trees[0].links.len(), 1);
     assert_eq!(world.trees[1].links.len(), 1);
@@ -337,7 +330,7 @@ fn stale_handle_cannot_alias_after_interleaved_tree_addition() {
     added.push_link(link(None, JointKind::Fixed, 10.0));
     world.add_tree(added);
 
-    assert_eq!(world.joint_id(0, 1), survivor);
+    assert_ne!(world.joint_id(0, 1), survivor);
     assert!(
         world
             .detach_subtree(stale)
@@ -354,11 +347,7 @@ fn direct_link_addition_rejects_stale_handle_tracking() {
     world.trees[0].push_link(link(Some(0), JointKind::hinge(Vec3::Z), 2.0));
 
     let error = world.detach_subtree(survivor).unwrap_err();
-    assert!(
-        error
-            .0
-            .contains("topology changed outside stable-handle tracking")
-    );
+    assert!(error.0.contains("stale topology epoch"));
 }
 
 #[test]
@@ -370,11 +359,53 @@ fn direct_tree_addition_rejects_stale_handle_tracking() {
     world.trees.push(added);
 
     let error = world.detach_subtree(survivor).unwrap_err();
-    assert!(
-        error
-            .0
-            .contains("topology changed outside stable-handle tracking")
-    );
+    assert!(error.0.contains("stale topology epoch"));
+}
+
+#[test]
+fn replacing_equal_length_tree_rejects_old_handle() {
+    let mut world = world_with_handle_tree();
+    let stale = world.joint_id(0, 1);
+    let mut replacement = Tree::new();
+    replacement.push_link(link(None, JointKind::Fixed, 10.0));
+    replacement.push_link(link(Some(0), JointKind::hinge(Vec3::X), 11.0));
+    replacement.push_link(link(Some(1), JointKind::hinge(Vec3::Y), 12.0));
+    replacement.push_link(link(Some(0), JointKind::hinge(Vec3::Z), 13.0));
+    world.trees[0] = replacement;
+
+    let error = world.detach_subtree(stale).unwrap_err();
+    assert!(error.0.contains("stale topology epoch"));
+    assert_eq!(world.trees.len(), 1);
+    assert_eq!(world.trees[0].links.len(), 4);
+}
+
+#[test]
+fn direct_tree_bootstrap_rejects_old_handle_after_equal_length_replacement() {
+    let mut world = World::new();
+    let mut tree = Tree::new();
+    tree.push_link(link(None, JointKind::Fixed, 0.0));
+    tree.push_link(link(Some(0), JointKind::hinge(Vec3::Z), 1.0));
+    world.trees.push(tree);
+    let stale = world.joint_id(0, 1);
+
+    let mut replacement = Tree::new();
+    replacement.push_link(link(None, JointKind::Fixed, 10.0));
+    replacement.push_link(link(Some(0), JointKind::hinge(Vec3::X), 11.0));
+    world.trees[0] = replacement;
+
+    let error = world.detach_subtree(stale).unwrap_err();
+    assert!(error.0.contains("stale topology epoch"));
+}
+
+#[test]
+fn handle_from_another_world_is_rejected() {
+    let first = world_with_handle_tree();
+    let mut second = world_with_handle_tree();
+    let foreign = first.joint_id(0, 1);
+
+    let error = second.detach_subtree(foreign).unwrap_err();
+    assert!(error.0.contains("belongs to another world"));
+    assert_eq!(second.trees.len(), 1);
 }
 
 #[test]

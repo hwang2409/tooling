@@ -65,6 +65,7 @@ use crate::tree::{
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "instrumentation")]
 use std::time::Instant;
@@ -188,6 +189,14 @@ pub struct World {
     last_solver_phase: Option<SolverPhaseDiagnostics>,
     #[doc(hidden)]
     tree_aba_workspaces: Vec<AbaWorkspace>,
+    #[doc(hidden)]
+    world_id: usize,
+    #[doc(hidden)]
+    topology_epoch: Cell<usize>,
+    #[doc(hidden)]
+    handles_epoch: Cell<usize>,
+    #[doc(hidden)]
+    topology_snapshot: RefCell<Vec<Vec<crate::tree::Link>>>,
     /// Stable link tokens. The public tree/link arrays stay dense, while
     /// saved handles keep their identity across subtree compaction.
     #[doc(hidden)]
@@ -218,10 +227,16 @@ pub type GeomId = usize;
 /// World-local address of a link in a kinematic tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorldJointId {
+    /// Opaque namespace of the [`World`] that minted this handle.
+    pub(crate) world_id: usize,
+    /// Topology epoch in which this handle was minted.
+    pub(crate) topology_epoch: usize,
     pub tree_id: usize,
     /// Opaque link token returned by [`World::joint_id`].
     pub link_id: usize,
 }
+
+static NEXT_WORLD_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Error returned when a subtree cannot be detached without invalidating
 /// indexed world state.
@@ -240,6 +255,8 @@ impl std::error::Error for DetachError {}
 /// new tree and index after the detach.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DetachReport {
+    world_id: usize,
+    source_topology_epoch: usize,
     pub source_tree_id: usize,
     pub child_tree_id: usize,
     pub link_map: Vec<Option<WorldJointId>>,
@@ -251,6 +268,15 @@ pub struct DetachReport {
 
 impl DetachReport {
     pub fn remap_link(&self, id: WorldJointId) -> Result<WorldJointId, DetachError> {
+        if id.world_id != self.world_id {
+            return Err(DetachError("joint handle belongs to another world".into()));
+        }
+        if id.topology_epoch != self.source_topology_epoch {
+            return Err(DetachError(format!(
+                "stale topology epoch {} for detach report epoch {}; stale link handle",
+                id.topology_epoch, self.source_topology_epoch
+            )));
+        }
         if id.tree_id != self.source_tree_id {
             return Ok(id);
         }
@@ -470,6 +496,10 @@ impl World {
             solver_phase_capture: false,
             last_solver_phase: None,
             tree_aba_workspaces: Vec::new(),
+            world_id: NEXT_WORLD_ID.fetch_add(1, Ordering::Relaxed),
+            topology_epoch: Cell::new(0),
+            handles_epoch: Cell::new(0),
+            topology_snapshot: RefCell::new(Vec::new()),
             joint_handle_ids: Vec::new(),
             next_joint_handle: 0,
             broadphase: RefCell::new(DynamicAabbTree::new()),
@@ -1106,6 +1136,7 @@ impl World {
 
     fn add_tree_checked(&mut self, tree: Tree) -> Result<usize, DetachError> {
         let handles = self.current_joint_handle_ids()?;
+        let next_topology_epoch = self.next_topology_epoch()?;
         let mut next_joint_handle = next_joint_handle_after(&handles, self.next_joint_handle)?;
         let mut tree_handles = Vec::with_capacity(tree.links.len());
         for _ in 0..tree.links.len() {
@@ -1123,6 +1154,7 @@ impl World {
         self.tree_aba_workspaces.push(workspace);
         self.joint_handle_ids = staged_handles;
         self.next_joint_handle = next_joint_handle;
+        self.commit_topology_epoch(next_topology_epoch);
         Ok(idx)
     }
 
@@ -1143,11 +1175,18 @@ impl World {
             .and_then(|handles| handles.get(link_id))
             .copied()
             .unwrap_or(link_id);
-        WorldJointId { tree_id, link_id }
+        WorldJointId {
+            world_id: self.world_id,
+            topology_epoch: self.topology_epoch.get(),
+            tree_id,
+            link_id,
+        }
     }
 
     fn current_joint_handle_ids(&self) -> Result<Vec<Vec<usize>>, DetachError> {
-        if self.joint_handle_ids.len() == self.trees.len()
+        self.sync_topology()?;
+        if self.handles_epoch.get() == self.topology_epoch.get()
+            && self.joint_handle_ids.len() == self.trees.len()
             && self
                 .joint_handle_ids
                 .iter()
@@ -1156,11 +1195,6 @@ impl World {
         {
             return Ok(self.joint_handle_ids.clone());
         }
-        if !self.joint_handle_ids.is_empty() {
-            return Err(DetachError(
-                "world topology changed outside stable-handle tracking".into(),
-            ));
-        }
         Ok(self
             .trees
             .iter()
@@ -1168,11 +1202,55 @@ impl World {
             .collect())
     }
 
+    fn next_topology_epoch(&self) -> Result<usize, DetachError> {
+        self.topology_epoch
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| DetachError("world topology epoch is exhausted".into()))
+    }
+
+    fn sync_topology(&self) -> Result<(), DetachError> {
+        let changed = {
+            let snapshot = self.topology_snapshot.borrow();
+            snapshot.len() != self.trees.len()
+                || snapshot
+                    .iter()
+                    .zip(&self.trees)
+                    .any(|(links, tree)| links != &tree.links)
+        };
+        if !changed {
+            return Ok(());
+        }
+        let next_epoch = self.next_topology_epoch()?;
+        self.topology_epoch.set(next_epoch);
+        *self.topology_snapshot.borrow_mut() =
+            self.trees.iter().map(|tree| tree.links.clone()).collect();
+        Ok(())
+    }
+
+    fn commit_topology_epoch(&self, epoch: usize) {
+        self.topology_epoch.set(epoch);
+        self.handles_epoch.set(epoch);
+        *self.topology_snapshot.borrow_mut() =
+            self.trees.iter().map(|tree| tree.links.clone()).collect();
+    }
+
     fn resolve_joint_id(
         &self,
         joint_id: WorldJointId,
         handles: &[Vec<usize>],
     ) -> Result<usize, DetachError> {
+        if joint_id.world_id != self.world_id {
+            return Err(DetachError("joint handle belongs to another world".into()));
+        }
+        if joint_id.topology_epoch != self.topology_epoch.get() {
+            return Err(DetachError(format!(
+                "stale topology epoch {} for world topology epoch {}; stale link handle {}",
+                joint_id.topology_epoch,
+                self.topology_epoch.get(),
+                joint_id.link_id
+            )));
+        }
         let tree_handles = handles.get(joint_id.tree_id).ok_or_else(|| {
             DetachError(format!("tree index {} is out of range", joint_id.tree_id))
         })?;
@@ -1196,6 +1274,7 @@ impl World {
     /// being silently dropped.
     pub fn detach_subtree(&mut self, joint_id: WorldJointId) -> Result<DetachReport, DetachError> {
         let handles = self.current_joint_handle_ids()?;
+        let next_topology_epoch = self.next_topology_epoch()?;
         let next_joint_handle = next_joint_handle_after(&handles, self.next_joint_handle)?;
         let root = self.resolve_joint_id(joint_id, &handles)?;
         let source = &self.trees[joint_id.tree_id];
@@ -1347,11 +1426,15 @@ impl World {
             .map(|(&parent, &child)| {
                 parent
                     .map(|link| WorldJointId {
+                        world_id: self.world_id,
+                        topology_epoch: next_topology_epoch,
                         tree_id: joint_id.tree_id,
                         link_id: parent_handles[link],
                     })
                     .or_else(|| {
                         child.map(|link| WorldJointId {
+                            world_id: self.world_id,
+                            topology_epoch: next_topology_epoch,
                             tree_id: child_tree_id,
                             link_id: child_handles[link],
                         })
@@ -1365,11 +1448,15 @@ impl World {
             .map(|(&parent, &child)| {
                 parent
                     .map(|link| WorldJointId {
+                        world_id: self.world_id,
+                        topology_epoch: next_topology_epoch,
                         tree_id: joint_id.tree_id,
                         link_id: link,
                     })
                     .or_else(|| {
                         child.map(|link| WorldJointId {
+                            world_id: self.world_id,
+                            topology_epoch: next_topology_epoch,
                             tree_id: child_tree_id,
                             link_id: link,
                         })
@@ -1377,6 +1464,8 @@ impl World {
             })
             .collect();
         let report = DetachReport {
+            world_id: self.world_id,
+            source_topology_epoch: joint_id.topology_epoch,
             source_tree_id: joint_id.tree_id,
             child_tree_id,
             link_map,
@@ -1412,6 +1501,7 @@ impl World {
         staged_handles.push(child_handles);
         staged.joint_handle_ids = staged_handles;
         staged.next_joint_handle = next_joint_handle;
+        staged.commit_topology_epoch(next_topology_epoch);
         staged.tree_aba_workspaces = staged
             .trees
             .iter()
@@ -4108,5 +4198,33 @@ mod tests {
         let diff = d_new.dangular_velocity_body - dang_ref;
         assert!(diff.length() < 1e-6, "wrench-free path diverged");
         assert_eq!(d_new.dlinear_velocity, Vec3::new(0.0, 0.0, -9.81));
+    }
+
+    #[test]
+    fn stable_link_handle_space_does_not_wrap() {
+        let mut world = World::new();
+        world.next_joint_handle = usize::MAX;
+        let mut tree = Tree::new();
+        tree.push_link(crate::tree::Link::new(
+            None,
+            JointKind::Fixed,
+            (Vec3::ZERO, Quat::IDENTITY),
+            (Vec3::ZERO, Quat::IDENTITY),
+            1.0,
+            crate::math::Mat3::IDENTITY,
+        ));
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            world.add_tree(tree);
+        }))
+        .expect_err("exhausted handle space must fail");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(message.contains("stable link handle space is exhausted"));
+        assert!(world.trees.is_empty());
+        assert_eq!(world.next_joint_handle, usize::MAX);
     }
 }
