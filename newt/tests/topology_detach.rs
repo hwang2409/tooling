@@ -102,6 +102,17 @@ fn world_with_handle_tree() -> World {
     world
 }
 
+fn world_with_mocap_handle_tree() -> World {
+    let mut tree = Tree::new();
+    tree.push_link(link(None, JointKind::Fixed, 0.0));
+    tree.set_mocap(0, true);
+    tree.push_link(link(Some(0), JointKind::Fixed, 1.0));
+
+    let mut world = World::new();
+    world.add_tree(tree);
+    world
+}
+
 #[test]
 fn detach_remaps_all_indexed_world_state_atomically() {
     let mut world = world_with_references();
@@ -313,6 +324,19 @@ fn cloned_world_rejects_source_handle() {
 
     let error = clone.detach_subtree(source_handle).unwrap_err();
     assert!(error.0.contains("belongs to another world"));
+}
+
+#[test]
+fn value_edits_preserve_live_handles() {
+    let mut world = world_with_handle_tree();
+    let mass_handle = world.joint_id(0, 1);
+    world.trees[0].links[1].mass = 2.0;
+    world.detach_subtree(mass_handle).unwrap();
+
+    let mut mocap_world = world_with_mocap_handle_tree();
+    let pose_handle = mocap_world.joint_id(0, 1);
+    mocap_world.set_mocap_pose(0, Vec3::new(3.0, 0.0, 0.0), Quat::IDENTITY);
+    mocap_world.detach_subtree(pose_handle).unwrap();
 }
 
 #[test]

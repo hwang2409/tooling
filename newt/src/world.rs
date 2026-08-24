@@ -107,14 +107,31 @@ pub enum BroadPhaseMode {
     Naive,
 }
 
-#[derive(Clone, Debug)]
+type TopologySnapshot = Vec<Vec<(Option<usize>, JointKind)>>;
+
+#[derive(Debug)]
 struct TopologyIdentity {
     world_id: usize,
     topology_epoch: Cell<usize>,
-    topology_snapshot: RefCell<Vec<Vec<crate::tree::Link>>>,
+    topology_snapshot: RefCell<TopologySnapshot>,
     slot_tokens: RefCell<Vec<Vec<usize>>>,
     slot_tokens_epoch: Cell<usize>,
     next_token: Cell<usize>,
+}
+
+impl Clone for TopologyIdentity {
+    fn clone(&self) -> Self {
+        let mut clone = Self {
+            world_id: self.world_id,
+            topology_epoch: self.topology_epoch.clone(),
+            topology_snapshot: self.topology_snapshot.clone(),
+            slot_tokens: self.slot_tokens.clone(),
+            slot_tokens_epoch: self.slot_tokens_epoch.clone(),
+            next_token: self.next_token.clone(),
+        };
+        clone.world_id = NEXT_WORLD_ID.fetch_add(1, Ordering::Relaxed);
+        clone
+    }
 }
 
 impl TopologyIdentity {
@@ -129,20 +146,11 @@ impl TopologyIdentity {
         }
     }
 
-    fn fresh_clone(&self) -> Self {
-        let mut clone = self.clone();
-        clone.world_id = NEXT_WORLD_ID.fetch_add(1, Ordering::Relaxed);
-        clone
-    }
-
     fn sync(&self, trees: &[Tree]) -> Result<(), DetachError> {
+        let current = topology_snapshot(trees);
         let changed = {
             let snapshot = self.topology_snapshot.borrow();
-            snapshot.len() != trees.len()
-                || snapshot
-                    .iter()
-                    .zip(trees)
-                    .any(|(links, tree)| links != &tree.links)
+            *snapshot != current
         };
         if !changed {
             return Ok(());
@@ -153,8 +161,7 @@ impl TopologyIdentity {
             .checked_add(1)
             .ok_or_else(|| DetachError("world topology epoch is exhausted".into()))?;
         self.topology_epoch.set(next_epoch);
-        *self.topology_snapshot.borrow_mut() =
-            trees.iter().map(|tree| tree.links.clone()).collect();
+        *self.topology_snapshot.borrow_mut() = current;
         Ok(())
     }
 
@@ -194,8 +201,7 @@ impl TopologyIdentity {
         self.slot_tokens_epoch.set(epoch);
         *self.slot_tokens.borrow_mut() = slots;
         self.next_token.set(next_token);
-        *self.topology_snapshot.borrow_mut() =
-            trees.iter().map(|tree| tree.links.clone()).collect();
+        *self.topology_snapshot.borrow_mut() = topology_snapshot(trees);
     }
 
     fn mint(&self, tree_id: usize, link_id: usize, trees: &[Tree]) -> WorldJointId {
@@ -256,8 +262,20 @@ impl TopologyIdentity {
     }
 }
 
+fn topology_snapshot(trees: &[Tree]) -> TopologySnapshot {
+    trees
+        .iter()
+        .map(|tree| {
+            tree.links
+                .iter()
+                .map(|link| (link.parent, link.joint))
+                .collect()
+        })
+        .collect()
+}
+
 /// Simulation world.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct World {
     /// Fixed integration timestep. Default 5 ms (matches biped).
     pub dt: f32,
@@ -356,12 +374,6 @@ pub struct World {
     last_broadphase_mode: BroadPhaseMode,
     #[cfg(feature = "instrumentation")]
     step_timings: StepTimings,
-}
-
-impl Clone for World {
-    fn clone(&self) -> Self {
-        self.clone_with_identity(self.topology.fresh_clone())
-    }
 }
 
 /// Stable geom index returned by scene queries.
@@ -642,46 +654,10 @@ impl Default for World {
 }
 
 impl World {
-    fn clone_with_identity(&self, topology: TopologyIdentity) -> Self {
-        Self {
-            dt: self.dt,
-            integrator: self.integrator,
-            gravity: self.gravity,
-            penetration_slop: self.penetration_slop,
-            magnetic_field: self.magnetic_field,
-            bodies: self.bodies.clone(),
-            trees: self.trees.clone(),
-            geoms: self.geoms.clone(),
-            meshes: self.meshes.clone(),
-            hfields: self.hfields.clone(),
-            pair_list: self.pair_list.clone(),
-            auto_pair_exclusions: self.auto_pair_exclusions.clone(),
-            disabled_self_collision: self.disabled_self_collision.clone(),
-            broadphase_mode: self.broadphase_mode,
-            solver: self.solver,
-            equalities: self.equalities.clone(),
-            sensors: self.sensors.clone(),
-            keyframes: self.keyframes.clone(),
-            checked_pairs: self.checked_pairs.clone(),
-            contact_detection_count: self.contact_detection_count.clone(),
-            solver_phase_capture: self.solver_phase_capture,
-            last_solver_phase: self.last_solver_phase.clone(),
-            tree_aba_workspaces: self.tree_aba_workspaces.clone(),
-            topology,
-            broadphase: self.broadphase.clone(),
-            broadphase_pairs: self.broadphase_pairs.clone(),
-            broadphase_tree_poses: self.broadphase_tree_poses.clone(),
-            broadphase_tree_velocities: self.broadphase_tree_velocities.clone(),
-            query_state_fingerprint: self.query_state_fingerprint.clone(),
-            broadphase_reinsert_count: self.broadphase_reinsert_count.clone(),
-            last_broadphase_mode: self.last_broadphase_mode,
-            #[cfg(feature = "instrumentation")]
-            step_timings: self.step_timings,
-        }
-    }
-
     pub(crate) fn clone_for_transaction(&self) -> Self {
-        self.clone_with_identity(self.topology.clone())
+        let mut clone = self.clone();
+        clone.topology.world_id = self.topology.world_id;
+        clone
     }
 
     pub fn new() -> Self {
@@ -4353,5 +4329,24 @@ mod tests {
         assert!(message.contains("stable link handle space is exhausted"));
         assert!(world.trees.is_empty());
         assert_eq!(world.topology.next_token.get(), usize::MAX);
+    }
+
+    #[test]
+    fn detach_report_rejects_missing_source_link_mapping() {
+        let report = DetachReport {
+            world_id: 1,
+            source_topology_epoch: 1,
+            target_topology_epoch: 2,
+            source_tree_id: 0,
+            child_tree_id: 1,
+            link_map: Vec::new(),
+            tendon_map: Vec::new(),
+            actuator_map: Vec::new(),
+            source_tree_handles: vec![vec![7]],
+            link_index_map: Vec::new(),
+        };
+
+        let error = report.remap_link_location(0, 0).unwrap_err();
+        assert_eq!(error.0, "link 0 became invalid during detach");
     }
 }
