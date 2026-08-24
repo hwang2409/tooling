@@ -90,26 +90,28 @@ fn world_with_references() -> World {
     world
 }
 
+fn world_with_handle_tree() -> World {
+    let mut tree = Tree::new();
+    tree.push_link(link(None, JointKind::Fixed, 0.0));
+    tree.push_link(link(Some(0), JointKind::hinge(Vec3::Z), 1.0));
+    tree.push_link(link(Some(1), JointKind::hinge(Vec3::Z), 1.0));
+    tree.push_link(link(Some(0), JointKind::hinge(Vec3::Z), -1.0));
+
+    let mut world = World::new();
+    world.add_tree(tree);
+    world
+}
+
 #[test]
 fn detach_remaps_all_indexed_world_state_atomically() {
     let mut world = world_with_references();
+    let parent_sibling = world.joint_id(0, 3);
+    let detached_child = world.joint_id(0, 2);
     let saved_sensor_id = 1;
     let report = world.detach_subtree(world.joint_id(0, 1)).unwrap();
 
-    assert_eq!(
-        report.remap_link(WorldJointId {
-            tree_id: 0,
-            link_id: 3
-        }),
-        Ok(world.joint_id(0, 1))
-    );
-    assert_eq!(
-        report.remap_link(WorldJointId {
-            tree_id: 0,
-            link_id: 2
-        }),
-        Ok(world.joint_id(1, 1))
-    );
+    assert_eq!(report.remap_link(parent_sibling), Ok(world.joint_id(0, 1)));
+    assert_eq!(report.remap_link(detached_child), Ok(world.joint_id(1, 1)));
     assert_eq!(report.remap_tendon(0, 0), Ok((1, 0)));
     assert_eq!(report.remap_actuator(0, 0), Ok((0, 0)));
     assert_eq!(report.remap_actuator(0, 1), Ok((1, 0)));
@@ -302,6 +304,77 @@ fn stale_link_handle_cannot_detach_a_compacted_sibling() {
     let result = world.detach_subtree(stale);
     assert!(result.unwrap_err().0.contains("stale link handle"));
     assert_eq!(world.trees[0].links.len(), 2);
+}
+
+#[test]
+fn sequential_detaches_reject_stale_handles_in_reports() {
+    let mut world = world_with_handle_tree();
+    let stale = world.joint_id(0, 1);
+    world.detach_subtree(stale).unwrap();
+
+    let second = world.joint_id(0, 1);
+    let second_report = world.detach_subtree(second).unwrap();
+
+    let error = second_report.remap_link(stale).unwrap_err();
+    assert!(error.0.contains("stale link handle"));
+    assert!(
+        world
+            .detach_subtree(stale)
+            .unwrap_err()
+            .0
+            .contains("stale link handle")
+    );
+}
+
+#[test]
+fn stale_handle_cannot_alias_after_interleaved_tree_addition() {
+    let mut world = world_with_references();
+    let stale = world.joint_id(0, 1);
+    let survivor = world.joint_id(0, 3);
+    world.detach_subtree(stale).unwrap();
+
+    let mut added = Tree::new();
+    added.push_link(link(None, JointKind::Fixed, 10.0));
+    world.add_tree(added);
+
+    assert_eq!(world.joint_id(0, 1), survivor);
+    assert!(
+        world
+            .detach_subtree(stale)
+            .unwrap_err()
+            .0
+            .contains("stale link handle")
+    );
+}
+
+#[test]
+fn direct_link_addition_rejects_stale_handle_tracking() {
+    let mut world = world_with_references();
+    let survivor = world.joint_id(0, 3);
+    world.trees[0].push_link(link(Some(0), JointKind::hinge(Vec3::Z), 2.0));
+
+    let error = world.detach_subtree(survivor).unwrap_err();
+    assert!(
+        error
+            .0
+            .contains("topology changed outside stable-handle tracking")
+    );
+}
+
+#[test]
+fn direct_tree_addition_rejects_stale_handle_tracking() {
+    let mut world = world_with_references();
+    let survivor = world.joint_id(0, 3);
+    let mut added = Tree::new();
+    added.push_link(link(None, JointKind::Fixed, 10.0));
+    world.trees.push(added);
+
+    let error = world.detach_subtree(survivor).unwrap_err();
+    assert!(
+        error
+            .0
+            .contains("topology changed outside stable-handle tracking")
+    );
 }
 
 #[test]

@@ -219,8 +219,7 @@ pub type GeomId = usize;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorldJointId {
     pub tree_id: usize,
-    /// Opaque link token returned by [`World::joint_id`]. Raw link indices
-    /// remain accepted for worlds built by direct field population.
+    /// Opaque link token returned by [`World::joint_id`].
     pub link_id: usize,
 }
 
@@ -259,7 +258,12 @@ impl DetachReport {
             .source_link_handles
             .iter()
             .position(|&handle| handle == id.link_id)
-            .unwrap_or(id.link_id);
+            .ok_or_else(|| {
+                DetachError(format!(
+                    "stale link handle {} for tree {}",
+                    id.link_id, id.tree_id
+                ))
+            })?;
         self.link_map
             .get(link_id)
             .and_then(|mapped| *mapped)
@@ -1096,21 +1100,30 @@ impl World {
 
     /// Adds a tree and returns its stable index.
     pub fn add_tree(&mut self, tree: Tree) -> usize {
+        self.add_tree_checked(tree)
+            .unwrap_or_else(|error| panic!("cannot add tree: {error}"))
+    }
+
+    fn add_tree_checked(&mut self, tree: Tree) -> Result<usize, DetachError> {
+        let handles = self.current_joint_handle_ids()?;
+        let mut next_joint_handle = next_joint_handle_after(&handles, self.next_joint_handle)?;
+        let mut tree_handles = Vec::with_capacity(tree.links.len());
+        for _ in 0..tree.links.len() {
+            let handle = next_joint_handle;
+            next_joint_handle = next_joint_handle
+                .checked_add(1)
+                .ok_or_else(|| DetachError("stable link handle space is exhausted".into()))?;
+            tree_handles.push(handle);
+        }
         let idx = self.trees.len();
-        self.tree_aba_workspaces
-            .push(AbaWorkspace::new(tree.links.len()));
+        let workspace = AbaWorkspace::new(tree.links.len());
+        let mut staged_handles = handles;
+        staged_handles.push(tree_handles);
         self.trees.push(tree);
-        let mut handles = self.current_joint_handle_ids();
-        let tree_handles: Vec<usize> = (0..self.trees[idx].links.len())
-            .map(|_| {
-                let handle = self.next_joint_handle;
-                self.next_joint_handle += 1;
-                handle
-            })
-            .collect();
-        handles.push(tree_handles);
-        self.joint_handle_ids = handles;
-        idx
+        self.tree_aba_workspaces.push(workspace);
+        self.joint_handle_ids = staged_handles;
+        self.next_joint_handle = next_joint_handle;
+        Ok(idx)
     }
 
     /// Return the world-local address of a tree link.
@@ -1125,6 +1138,7 @@ impl World {
         );
         let link_id = self
             .current_joint_handle_ids()
+            .unwrap_or_else(|error| panic!("cannot resolve joint handle: {error}"))
             .get(tree_id)
             .and_then(|handles| handles.get(link_id))
             .copied()
@@ -1132,7 +1146,7 @@ impl World {
         WorldJointId { tree_id, link_id }
     }
 
-    fn current_joint_handle_ids(&self) -> Vec<Vec<usize>> {
+    fn current_joint_handle_ids(&self) -> Result<Vec<Vec<usize>>, DetachError> {
         if self.joint_handle_ids.len() == self.trees.len()
             && self
                 .joint_handle_ids
@@ -1140,12 +1154,18 @@ impl World {
                 .zip(&self.trees)
                 .all(|(handles, tree)| handles.len() == tree.links.len())
         {
-            return self.joint_handle_ids.clone();
+            return Ok(self.joint_handle_ids.clone());
         }
-        self.trees
+        if !self.joint_handle_ids.is_empty() {
+            return Err(DetachError(
+                "world topology changed outside stable-handle tracking".into(),
+            ));
+        }
+        Ok(self
+            .trees
             .iter()
             .map(|tree| (0..tree.links.len()).collect())
-            .collect()
+            .collect())
     }
 
     fn resolve_joint_id(
@@ -1175,7 +1195,8 @@ impl World {
     /// changed. References that cross the split return an error instead of
     /// being silently dropped.
     pub fn detach_subtree(&mut self, joint_id: WorldJointId) -> Result<DetachReport, DetachError> {
-        let handles = self.current_joint_handle_ids();
+        let handles = self.current_joint_handle_ids()?;
+        let next_joint_handle = next_joint_handle_after(&handles, self.next_joint_handle)?;
         let root = self.resolve_joint_id(joint_id, &handles)?;
         let source = &self.trees[joint_id.tree_id];
         if root == 0 {
@@ -1390,6 +1411,7 @@ impl World {
         staged_handles[joint_id.tree_id] = parent_handles;
         staged_handles.push(child_handles);
         staged.joint_handle_ids = staged_handles;
+        staged.next_joint_handle = next_joint_handle;
         staged.tree_aba_workspaces = staged
             .trees
             .iter()
@@ -2923,6 +2945,21 @@ fn validate_split_maps(split: &DetachedSubtree) -> Result<(), DetachError> {
         }
     }
     Ok(())
+}
+
+fn next_joint_handle_after(
+    handles: &[Vec<usize>],
+    next_joint_handle: usize,
+) -> Result<usize, DetachError> {
+    handles
+        .iter()
+        .flatten()
+        .try_fold(next_joint_handle, |next, &handle| {
+            let after = handle
+                .checked_add(1)
+                .ok_or_else(|| DetachError("stable link handle space is exhausted".into()))?;
+            Ok(next.max(after))
+        })
 }
 
 fn remap_link_reference(
