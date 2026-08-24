@@ -159,6 +159,39 @@ fn force_field_buoyancy_uses_geom_offset_for_submersion() {
     assert!((submerged_accel - expected_accel).abs() < 1.0e-5);
 }
 
+#[test]
+fn force_field_buoyancy_offset_geom_applies_torque_at_center_of_buoyancy() {
+    let mut world = World::new();
+    world.integrator = Integrator::Euler;
+    world.dt = 0.01;
+    let body = world.add_body(free_body(Vec3::new(0.0, 0.0, -2.0)));
+    world.add_geom(Geom::r#box(
+        body,
+        Vec3::splat(0.5),
+        Vec3::new(1.0, 0.0, 0.0),
+        Quat::IDENTITY,
+        0.0,
+    ));
+    world.add_force_field(ForceField::Buoyancy {
+        plane: Plane::new(Vec3::Z, 0.0),
+        fluid_density: 2.0,
+        gravity: world.gravity,
+    });
+
+    world.step();
+
+    assert!(world.bodies[body].angular_velocity_world().y < -1.0e-3);
+}
+
+#[test]
+fn force_field_buoyancy_fully_submerged_symmetric_body_has_no_torque() {
+    let mut world = buoyant_box(2.0);
+
+    world.step();
+
+    assert!(world.bodies[0].angular_velocity_world().length() < 1.0e-6);
+}
+
 fn partial_buoyancy_box(position: Vec3, orientation: Quat) -> World {
     let mut world = World::new();
     world.integrator = Integrator::Euler;

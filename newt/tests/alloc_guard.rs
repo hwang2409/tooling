@@ -13,7 +13,7 @@ use newt::math::{Mat3, Quat, Vec3};
 use newt::mjcf::load_mjcf_path;
 use newt::solver::SolverMode;
 use newt::tree::{Link, Tree};
-use newt::world::{BroadPhaseMode, Integrator, ShapeDesc, World};
+use newt::world::{BroadPhaseMode, ForceField, Integrator, ShapeDesc, World};
 
 struct CountingAllocator;
 
@@ -96,6 +96,36 @@ fn optimized_euler_muscle_step_allocations_are_stable() {
             .all(|&count| count == EXPECTED_ALLOCATIONS)
     );
     assert_eq!(allocations[0], EXPECTED_ALLOCATIONS);
+}
+
+#[test]
+fn free_body_field_steps_do_not_add_empty_field_allocation() {
+    let _lock = ALLOCATION_TEST_LOCK.lock().unwrap();
+    let mut world = World::new();
+    world.gravity = Vec3::ZERO;
+    world.integrator = Integrator::Euler;
+    world.add_body(Body::solid_sphere(1.0, 0.25, Vec3::ZERO, Quat::IDENTITY));
+
+    for _ in 0..3 {
+        world.step();
+    }
+    reset_allocations();
+    world.step();
+    let without_field = allocation_count();
+
+    world.add_force_field(ForceField::Uniform {
+        direction: Vec3::Z,
+        magnitude: 1.0,
+    });
+    for _ in 0..3 {
+        world.step();
+    }
+    reset_allocations();
+    world.step();
+    let with_field = allocation_count();
+
+    assert_eq!(without_field, 2);
+    assert_eq!(with_field, 3);
 }
 
 #[test]
