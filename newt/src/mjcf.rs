@@ -2016,6 +2016,7 @@ impl Loader {
             local_offset,
             local_orientation,
             friction,
+            friction_anisotropy: None,
             solref,
             margin,
             gap,

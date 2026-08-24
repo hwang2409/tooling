@@ -216,6 +216,13 @@ pub enum Projection {
         normal: usize,
         mu: f32,
     },
+    /// `|x[index]| <= mu * sum(x[normal_start..normal_end])`.
+    ScalarConeSumBound {
+        index: usize,
+        normal_start: usize,
+        normal_count: usize,
+        mu: f32,
+    },
     /// `x[normal] >= 0` and `|(x[tangent_1], x[tangent_2])|` is bounded by
     /// the pyramidal cone faces.
     PyramidalCone {
@@ -350,6 +357,17 @@ fn validate_projections(projections: &[Projection], n: usize) -> Result<(), Newt
                 check(index)?;
                 check(normal)?;
             }
+            Projection::ScalarConeSumBound {
+                index,
+                normal_start,
+                normal_count,
+                ..
+            } => {
+                check(index)?;
+                for normal in normal_start..normal_start + normal_count {
+                    check(normal)?;
+                }
+            }
             Projection::PyramidalCone {
                 normal,
                 tangent_1,
@@ -377,6 +395,18 @@ fn project(input: &[f32], projections: &[Projection]) -> Vec<f32> {
             }
             Projection::ScalarConeBound { index, normal, mu } => {
                 let cap = mu * output[normal].max(0.0);
+                output[index] = output[index].max(-cap).min(cap);
+            }
+            Projection::ScalarConeSumBound {
+                index,
+                normal_start,
+                normal_count,
+                mu,
+            } => {
+                let normal = (normal_start..normal_start + normal_count)
+                    .map(|normal| output[normal].max(0.0))
+                    .sum::<f32>();
+                let cap = mu * normal;
                 output[index] = output[index].max(-cap).min(cap);
             }
             Projection::PyramidalCone {
@@ -429,6 +459,33 @@ fn exact_pyramidal_line_search(
                     direction[index] + mu * direction[normal],
                 );
                 add_root(&mut breaks, x[normal], direction[normal]);
+            }
+            Projection::ScalarConeSumBound {
+                index,
+                normal_start,
+                normal_count,
+                mu,
+            } => {
+                let normal_end = normal_start + normal_count;
+                let normal = (normal_start..normal_end)
+                    .map(|normal| x[normal])
+                    .sum::<f32>();
+                let normal_direction = (normal_start..normal_end)
+                    .map(|normal| direction[normal])
+                    .sum::<f32>();
+                add_root(
+                    &mut breaks,
+                    x[index] - mu * normal,
+                    direction[index] - mu * normal_direction,
+                );
+                add_root(
+                    &mut breaks,
+                    x[index] + mu * normal,
+                    direction[index] + mu * normal_direction,
+                );
+                for normal in normal_start..normal_end {
+                    add_root(&mut breaks, x[normal], direction[normal]);
+                }
             }
             Projection::PyramidalCone {
                 normal,

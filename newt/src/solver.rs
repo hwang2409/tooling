@@ -410,6 +410,32 @@ pub fn project_elliptic(ft1: f32, ft2: f32, mu: f32, normal_impulse: f32) -> (f3
     (ft1 * scale, ft2 * scale)
 }
 
+fn project_elliptic_axes(
+    ft1: f32,
+    ft2: f32,
+    mu1: f32,
+    mu2: f32,
+    normal_impulse: f32,
+) -> (f32, f32) {
+    if normal_impulse <= 0.0 || (mu1 <= 0.0 && mu2 <= 0.0) {
+        return (0.0, 0.0);
+    }
+    let cap1 = mu1.max(0.0) * normal_impulse;
+    let cap2 = mu2.max(0.0) * normal_impulse;
+    if cap1 == 0.0 {
+        return (0.0, ft2.max(-cap2).min(cap2));
+    }
+    if cap2 == 0.0 {
+        return (ft1.max(-cap1).min(cap1), 0.0);
+    }
+    let normalized = (ft1 / cap1) * (ft1 / cap1) + (ft2 / cap2) * (ft2 / cap2);
+    if normalized <= 1.0 {
+        return (ft1, ft2);
+    }
+    let scale = 1.0 / normalized.sqrt();
+    (ft1 * scale, ft2 * scale)
+}
+
 /// Symmetric pyramidal clamp `|f| ≤ cap` on a single tangent axis. Matches
 /// the `clamp_symmetric` used by the penalty pathway in `crate::world`.
 pub fn project_pyramidal(f: f32, cap: f32) -> f32 {
@@ -429,7 +455,7 @@ pub fn project_pyramidal(f: f32, cap: f32) -> f32 {
 use crate::body::Body;
 use crate::contact::Contact;
 use crate::equality::{DISTANCE_DEGENERATE_EPS, Equality};
-use crate::geom::{Geom, GeomAttach, SolRef, combine_solref};
+use crate::geom::{Geom, GeomAttach, GeomPose, SolRef, combine_solref, geom_world_pose};
 use crate::math::{Quat, Vec3};
 use crate::world::tangent_basis;
 
@@ -844,7 +870,17 @@ fn solve_free_bodies_diag_mode(
         let condim = ga.condim.min(gb.condim);
 
         let n_world = c.normal_world;
-        let (t1_world, t2_world) = tangent_basis(n_world);
+        let pose_a = geom_pose_for_free_body(ga, body_a, bodies);
+        let pose_b = geom_pose_for_free_body(gb, body_b, bodies);
+        let (t1_world, t2_world, mu_t1, mu_t2) = contact_friction_axes(
+            ga,
+            gb,
+            pose_a,
+            pose_b,
+            n_world,
+            tangent_basis(n_world).0,
+            mu,
+        );
         let contact_position = c.position_world;
         let arm_a = match body_a {
             Some(i) => contact_position - bodies[i as usize].position,
@@ -856,7 +892,8 @@ fn solve_free_bodies_diag_mode(
         };
 
         let start_row = rows.len() as u32;
-        let row_directions = contact_row_directions(n_world, t1_world, t2_world, condim, cone, mu);
+        let row_directions =
+            contact_row_directions(n_world, t1_world, t2_world, condim, cone, mu_t1, mu_t2);
         for (dir, geom) in row_directions {
             rows.push(ConstraintRow {
                 dir_world: dir,
@@ -906,6 +943,42 @@ fn solve_free_bodies_diag_mode(
             }
         }
 
+        let mut rolling_rows = [None; 2];
+        for (slot, body_index) in [body_a, body_b].into_iter().enumerate() {
+            let Some(body_index) = body_index else {
+                continue;
+            };
+            let Some(coefficient) = bodies[body_index as usize].rolling_friction else {
+                continue;
+            };
+            if coefficient <= 0.0 {
+                continue;
+            }
+            let direction = bodies[body_index as usize]
+                .angular_velocity_world()
+                .normalize();
+            if direction == Vec3::ZERO {
+                continue;
+            }
+            let row_index = rows.len();
+            rows.push(ConstraintRow {
+                dir_world: direction,
+                body_a: Some(body_index),
+                body_b: None,
+                arm_a: Vec3::ZERO,
+                arm_b: Vec3::ZERO,
+                reg: 0.0,
+                diag: 0.0,
+                bias: 0.0,
+                geom: RowGeom::Angular,
+            });
+            rolling_rows[slot] = Some(RollingRow {
+                row_index,
+                coefficient,
+                body_index: body_index as usize,
+            });
+        }
+
         per_contact.push(PerContact {
             contact_index,
             start_row,
@@ -914,8 +987,11 @@ fn solve_free_bodies_diag_mode(
             solimp,
             pen_active,
             mu_slide: mu,
+            mu_slide_1: mu_t1,
+            mu_slide_2: mu_t2,
             mu_torsion,
             mu_roll,
+            rolling_rows,
             h01_pair01: 0.0,
             h01_pair23: 0.0,
         });
@@ -977,6 +1053,35 @@ fn solve_free_bodies_diag_mode(
                     reference_coefficients(position, solref, pc.solimp);
                 diagnostics.push(ConstraintRowDiagnostic {
                     position,
+                    velocity: v_cur,
+                    stiffness,
+                    damping,
+                    impedance,
+                    regularization: rows[ri].reg,
+                    reference_accel: a_ref,
+                });
+            }
+        }
+        for rolling in pc.rolling_rows.iter().flatten() {
+            let ri = rolling.row_index;
+            let a_ii = row_body_diagonal(&rows[ri], bodies, &inv_i_world);
+            let d = impedance_at_position(0.0, 0.0, pc.solimp);
+            rows[ri].reg = contact_regularization(pc, &rows[ri], bodies, &inv_i_world, d, cone);
+            rows[ri].diag = a_ii + rows[ri].reg;
+            let v_cur = row_current_velocity(&rows[ri], bodies);
+            let dv_free = row_free_step_velocity(
+                &rows[ri],
+                &dv_lin_free_per_body,
+                &dw_body_free_per_body,
+                bodies,
+            );
+            let a_ref = reference_accel(0.0, v_cur, safe_solref(pc.solref, dt), pc.solimp);
+            rows[ri].bias = dv_free - a_ref * dt;
+            if let Some(diagnostics) = row_diagnostics.as_deref_mut() {
+                let (damping, stiffness, impedance) =
+                    reference_coefficients(0.0, safe_solref(pc.solref, dt), pc.solimp);
+                diagnostics.push(ConstraintRowDiagnostic {
+                    position: 0.0,
                     velocity: v_cur,
                     stiffness,
                     damping,
@@ -1118,7 +1223,8 @@ fn solve_free_bodies_diag_mode(
                         t1,
                         t2,
                         cap_normal,
-                        pc.mu_slide,
+                        pc.mu_slide_1,
+                        pc.mu_slide_2,
                         cone,
                         &mut impulses,
                         &mut body_delta,
@@ -1146,6 +1252,7 @@ fn solve_free_bodies_diag_mode(
                             r2,
                             cap_normal,
                             pc.mu_roll,
+                            pc.mu_roll,
                             cone,
                             &mut impulses,
                             &mut body_delta,
@@ -1153,6 +1260,22 @@ fn solve_free_bodies_diag_mode(
                             &inv_i_world,
                         );
                     }
+                }
+                let normal_impulse = if cone == ConeKind::Pyramidal && pc.condim == 3 {
+                    (0..4).map(|offset| impulses[n_row + offset]).sum()
+                } else {
+                    impulses[n_row]
+                };
+                for rolling in pc.rolling_rows.iter().flatten() {
+                    pgs_step_rolling(
+                        &rows,
+                        rolling.row_index,
+                        rolling.coefficient * normal_impulse,
+                        &mut impulses,
+                        &mut body_delta,
+                        bodies,
+                        &inv_i_world,
+                    );
                 }
             }
             // Equality blocks — bilateral update, no clamp.
@@ -1237,8 +1360,11 @@ struct PerContact {
     solimp: SolImp,
     pen_active: f32,
     mu_slide: f32,
+    mu_slide_1: f32,
+    mu_slide_2: f32,
     mu_torsion: f32,
     mu_roll: f32,
+    rolling_rows: [Option<RollingRow>; 2],
     /// Precomputed pyramidal cross-response `A_{i,i+1}` between the first
     /// facet pair (`start_row`, `start_row+1`). Only meaningful for condim=3
     /// under a pyramidal cone; zero otherwise. Cached so
@@ -1249,6 +1375,13 @@ struct PerContact {
     /// Precomputed pyramidal cross-response between the second facet pair
     /// (`start_row+2`, `start_row+3`).
     h01_pair23: f32,
+}
+
+#[derive(Clone, Copy)]
+struct RollingRow {
+    row_index: usize,
+    coefficient: f32,
+    body_index: usize,
 }
 
 /// Assemble and solve the dense free-body Newton system. The response matrix
@@ -1264,7 +1397,7 @@ fn solve_free_body_newton_impulses(
     cone: ConeKind,
 ) -> crate::newton::NewtonResult {
     let n_rows = rows.len();
-    let mut hessian = vec![0.0f32; n_rows * n_rows];
+    let mut response_matrix = vec![0.0f32; n_rows * n_rows];
     let mut response = vec![BodyDelta::default(); n_bodies];
     for j in 0..n_rows {
         for slot in response.iter_mut() {
@@ -1272,9 +1405,11 @@ fn solve_free_body_newton_impulses(
         }
         apply_impulse_delta(&rows[j], 1.0, &mut response, bodies, inv_i_world);
         for i in 0..n_rows {
-            hessian[i * n_rows + j] = row_residual(&rows[i], &response, bodies, inv_i_world);
+            response_matrix[i * n_rows + j] =
+                row_residual(&rows[i], &response, bodies, inv_i_world);
         }
     }
+    let mut hessian = response_matrix.clone();
     for i in 0..n_rows {
         hessian[i * n_rows + i] += rows[i].reg;
     }
@@ -1314,6 +1449,19 @@ fn solve_free_body_newton_impulses(
                 });
             }
         }
+        let normal_count = if cone == ConeKind::Pyramidal && contact.condim == 3 {
+            4
+        } else {
+            1
+        };
+        for rolling in contact.rolling_rows.iter().flatten() {
+            projections.push(crate::newton::Projection::ScalarConeSumBound {
+                index: rolling.row_index,
+                normal_start: normal,
+                normal_count,
+                mu: rolling.coefficient,
+            });
+        }
     }
     if crate::dynamics::cholesky(&hessian, n_rows).is_none()
         && per_contact.iter().any(|contact| {
@@ -1341,9 +1489,34 @@ fn solve_free_body_newton_impulses(
         max_iterations: iterations.max(1),
         cost_tolerance: 1e-7,
     };
-    system
+    let mut result = system
         .solve()
-        .unwrap_or_else(|error| panic!("Newton free-body solve failed: {error}"))
+        .unwrap_or_else(|error| panic!("Newton free-body solve failed: {error}"));
+    let mut rolling_groups = vec![Vec::new(); n_bodies];
+    for contact in per_contact {
+        let normal = contact.start_row as usize;
+        let normal_count = if cone == ConeKind::Pyramidal && contact.condim == 3 {
+            4
+        } else {
+            1
+        };
+        let normal_impulse = (0..normal_count)
+            .map(|offset| result.solution[normal + offset].max(0.0))
+            .sum::<f32>();
+        for rolling in contact.rolling_rows.iter().flatten() {
+            rolling_groups[rolling.body_index]
+                .push((rolling.row_index, rolling.coefficient * normal_impulse));
+        }
+    }
+    for group in rolling_groups.iter().filter(|group| !group.is_empty()) {
+        clamp_newton_rolling(
+            row_current_velocity(&rows[group[0].0], bodies),
+            &response_matrix,
+            group,
+            &mut result.solution,
+        );
+    }
+    result
 }
 
 /// Row count for a contact block by condim.
@@ -1518,6 +1691,40 @@ fn pgs_step_scalar_cap(
     apply_impulse_delta(&rows[ri], delta, body_delta, bodies, inv_i_world);
 }
 
+#[allow(clippy::too_many_arguments)]
+fn pgs_step_rolling(
+    rows: &[ConstraintRow],
+    ri: usize,
+    cap: f32,
+    impulses: &mut [f32],
+    body_delta: &mut [BodyDelta],
+    bodies: &[Body],
+    inv_i_world: &[crate::math::Mat3],
+) {
+    if cap <= 0.0 {
+        return;
+    }
+    let current = row_current_velocity_with_delta(&rows[ri], body_delta, bodies, inv_i_world);
+    if current == 0.0 {
+        return;
+    }
+    let residual = row_residual(&rows[ri], body_delta, bodies, inv_i_world)
+        + rows[ri].reg * impulses[ri]
+        + rows[ri].bias;
+    let unconstrained = impulses[ri] - residual / rows[ri].diag;
+    let a_ii = rows[ri].diag - rows[ri].reg;
+    let zero = -current / a_ii;
+    let (lower, upper) = if current > 0.0 {
+        (zero.max(-cap), cap)
+    } else {
+        (-cap, zero.min(cap))
+    };
+    let projected = unconstrained.max(lower).min(upper);
+    let delta = projected - impulses[ri];
+    impulses[ri] = projected;
+    apply_impulse_delta(&rows[ri], delta, body_delta, bodies, inv_i_world);
+}
+
 /// Paired-row PGS update for a 2-DOF friction block (sliding tangents or
 /// rolling axes). Pyramidal → two independent scalar clamps by `mu · cap`.
 /// Elliptic → Jacobi step on both rows, then a single joint projection
@@ -1528,7 +1735,8 @@ fn pgs_step_pair_cone(
     ri1: usize,
     ri2: usize,
     cap_normal: f32,
-    mu: f32,
+    mu1: f32,
+    mu2: f32,
     cone: ConeKind,
     impulses: &mut [f32],
     body_delta: &mut [BodyDelta],
@@ -1537,9 +1745,24 @@ fn pgs_step_pair_cone(
 ) {
     match cone {
         ConeKind::Pyramidal => {
-            let cap = mu * cap_normal;
-            pgs_step_scalar_cap(rows, ri1, cap, impulses, body_delta, bodies, inv_i_world);
-            pgs_step_scalar_cap(rows, ri2, cap, impulses, body_delta, bodies, inv_i_world);
+            pgs_step_scalar_cap(
+                rows,
+                ri1,
+                mu1 * cap_normal,
+                impulses,
+                body_delta,
+                bodies,
+                inv_i_world,
+            );
+            pgs_step_scalar_cap(
+                rows,
+                ri2,
+                mu2 * cap_normal,
+                impulses,
+                body_delta,
+                bodies,
+                inv_i_world,
+            );
         }
         ConeKind::Elliptic => {
             let residual1 = row_residual(&rows[ri1], body_delta, bodies, inv_i_world)
@@ -1550,7 +1773,11 @@ fn pgs_step_pair_cone(
                 + rows[ri2].bias;
             let new_f1 = impulses[ri1] - residual1 / rows[ri1].diag;
             let new_f2 = impulses[ri2] - residual2 / rows[ri2].diag;
-            let (proj1, proj2) = project_elliptic(new_f1, new_f2, mu, cap_normal);
+            let (proj1, proj2) = if mu1 == mu2 {
+                project_elliptic(new_f1, new_f2, mu1, cap_normal)
+            } else {
+                project_elliptic_axes(new_f1, new_f2, mu1, mu2, cap_normal)
+            };
             let delta1 = proj1 - impulses[ri1];
             let delta2 = proj2 - impulses[ri2];
             impulses[ri1] = proj1;
@@ -1976,6 +2203,15 @@ fn row_current_velocity(row: &ConstraintRow, bodies: &[Body]) -> f32 {
             (w_a - w_b).dot(row.dir_world)
         }
     }
+}
+
+fn row_current_velocity_with_delta(
+    row: &ConstraintRow,
+    body_delta: &[BodyDelta],
+    bodies: &[Body],
+    inv_i_world: &[crate::math::Mat3],
+) -> f32 {
+    row_current_velocity(row, bodies) + row_residual(row, body_delta, bodies, inv_i_world)
 }
 
 /// Free-step (gravity Euler kick) contribution to a row's velocity bias.
@@ -2658,8 +2894,18 @@ struct WorldContactBlock {
     solimp: SolImp,
     penetration: f32,
     mu_slide: f32,
+    mu_slide_1: f32,
+    mu_slide_2: f32,
     mu_torsion: f32,
     mu_roll: f32,
+    rolling_rows: [Option<WorldRollingRow>; 2],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorldRollingRow {
+    row_index: usize,
+    coefficient: f32,
+    body_index: usize,
 }
 
 /// Solve all active contacts that touch a tree in one joint-space system.
@@ -2822,39 +3068,56 @@ fn solve_tree_contacts_mode(
         let solref = combine_solref(ga.solref, gb.solref);
         let solimp = combine_solimp(ga.solimp, gb.solimp);
         let condim = ga.condim.min(gb.condim);
-        let (t1, t2) = tangent_basis(contact.normal_world);
         let mu_slide = crate::contact::combine_friction(ga.friction, gb.friction);
-        let row_components: Vec<Vec<WorldJacobian>> =
-            contact_row_directions(contact.normal_world, t1, t2, condim, cone, mu_slide)
-                .into_iter()
-                .map(|(direction, angular)| {
-                    [
-                        world_jacobian_for_side(
-                            ga.attachment(),
-                            1.0,
-                            contact.position_world,
-                            direction,
-                            angular,
-                            bodies,
-                            trees,
-                            &poses,
-                        ),
-                        world_jacobian_for_side(
-                            gb.attachment(),
-                            -1.0,
-                            contact.position_world,
-                            direction,
-                            angular,
-                            bodies,
-                            trees,
-                            &poses,
-                        ),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect()
-                })
-                .collect();
+        let pose_a = geom_pose_for_tree_contact(ga, &poses, bodies);
+        let pose_b = geom_pose_for_tree_contact(gb, &poses, bodies);
+        let (t1, t2, mu_slide_1, mu_slide_2) = contact_friction_axes(
+            ga,
+            gb,
+            pose_a,
+            pose_b,
+            contact.normal_world,
+            tangent_basis(contact.normal_world).0,
+            mu_slide,
+        );
+        let row_components: Vec<Vec<WorldJacobian>> = contact_row_directions(
+            contact.normal_world,
+            t1,
+            t2,
+            condim,
+            cone,
+            mu_slide_1,
+            mu_slide_2,
+        )
+        .into_iter()
+        .map(|(direction, angular)| {
+            [
+                world_jacobian_for_side(
+                    ga.attachment(),
+                    1.0,
+                    contact.position_world,
+                    direction,
+                    angular,
+                    bodies,
+                    trees,
+                    &poses,
+                ),
+                world_jacobian_for_side(
+                    gb.attachment(),
+                    -1.0,
+                    contact.position_world,
+                    direction,
+                    angular,
+                    bodies,
+                    trees,
+                    &poses,
+                ),
+            ]
+            .into_iter()
+            .flatten()
+            .collect()
+        })
+        .collect();
         if row_components.iter().all(|components| {
             components
                 .iter()
@@ -2871,6 +3134,47 @@ fn solve_tree_contacts_mode(
                 bias: 0.0,
             });
         }
+        let mut rolling_rows = [None; 2];
+        for (slot, attachment) in [ga.attachment(), gb.attachment()].into_iter().enumerate() {
+            let GeomAttach::Body(body_index) = attachment else {
+                continue;
+            };
+            let body = &bodies[body_index];
+            let Some(coefficient) = body.rolling_friction else {
+                continue;
+            };
+            if coefficient <= 0.0 {
+                continue;
+            }
+            let direction = body.angular_velocity_world().normalize();
+            if direction == Vec3::ZERO {
+                continue;
+            }
+            let row_index = rows.len();
+            rows.push(WorldContactRow {
+                components: vec![
+                    world_jacobian_for_side(
+                        attachment,
+                        1.0,
+                        contact.position_world,
+                        direction,
+                        true,
+                        bodies,
+                        trees,
+                        &poses,
+                    )
+                    .expect("body attachment must produce a rolling jacobian"),
+                ],
+                reg: 0.0,
+                diag: 0.0,
+                bias: 0.0,
+            });
+            rolling_rows[slot] = Some(WorldRollingRow {
+                row_index,
+                coefficient,
+                body_index,
+            });
+        }
         blocks.push(WorldContactBlock {
             contact_index,
             start_row,
@@ -2879,6 +3183,8 @@ fn solve_tree_contacts_mode(
             solimp,
             penetration,
             mu_slide,
+            mu_slide_1,
+            mu_slide_2,
             mu_torsion: crate::geom::combine_torsional_friction(
                 ga.torsional_friction,
                 gb.torsional_friction,
@@ -2887,6 +3193,7 @@ fn solve_tree_contacts_mode(
                 ga.rolling_friction,
                 gb.rolling_friction,
             ),
+            rolling_rows,
         });
     }
     if rows.is_empty() {
@@ -2905,6 +3212,13 @@ fn solve_tree_contacts_mode(
         solution
             .row_to_contact
             .extend(std::iter::repeat_n(block.contact_index, row_count));
+        solution.row_to_contact.extend(
+            block
+                .rolling_rows
+                .iter()
+                .flatten()
+                .map(|_| block.contact_index),
+        );
     }
     let mut response = vec![0.0f32; n_rows * n_rows];
     for column in 0..n_rows {
@@ -2985,6 +3299,42 @@ fn solve_tree_contacts_mode(
                 reference_accel: reference,
             });
         }
+        for rolling in block.rolling_rows.iter().flatten() {
+            let row = &mut rows[rolling.row_index];
+            let impedance_value = impedance_at_position(0.0, 0.0, block.solimp);
+            let diag_approx = tree_contact_diag_approx(
+                row,
+                bodies,
+                trees,
+                &inv_i_world,
+                &tree_diag_factors,
+                block.mu_slide,
+                false,
+            );
+            row.reg = contact_regularization_from_diag(
+                diag_approx,
+                impedance_value,
+                block.mu_slide,
+                false,
+            );
+            let diagonal = response[rolling.row_index * n_rows + rolling.row_index];
+            row.diag = diagonal + row.reg;
+            let velocity = world_current_velocity(row, bodies, trees);
+            let reference =
+                reference_accel(0.0, velocity, safe_solref(block.solref, dt), block.solimp);
+            row.bias = -reference * dt;
+            let (damping, stiffness, impedance) =
+                reference_coefficients(0.0, safe_solref(block.solref, dt), block.solimp);
+            solution.row_diagnostics.push(ConstraintRowDiagnostic {
+                position: 0.0,
+                velocity,
+                stiffness,
+                damping,
+                impedance,
+                regularization: row.reg,
+                reference_accel: reference,
+            });
+        }
     }
 
     let impulses = if use_newton {
@@ -3027,6 +3377,19 @@ fn solve_tree_contacts_mode(
                     });
                 }
             }
+            let normal_count = if cone == ConeKind::Pyramidal && block.condim == 3 {
+                4
+            } else {
+                1
+            };
+            for rolling in block.rolling_rows.iter().flatten() {
+                projections.push(crate::newton::Projection::ScalarConeSumBound {
+                    index: rolling.row_index,
+                    normal_start: normal,
+                    normal_count,
+                    mu: rolling.coefficient,
+                });
+            }
         }
         if crate::dynamics::cholesky(&hessian, n_rows).is_none()
             && blocks.iter().any(|block| {
@@ -3046,7 +3409,7 @@ fn solve_tree_contacts_mode(
                 hessian[index * n_rows + index] += pivot;
             }
         }
-        crate::newton::NewtonSystem {
+        let mut impulses = crate::newton::NewtonSystem {
             hessian,
             linear: rows.iter().map(|row| row.bias).collect(),
             projections,
@@ -3055,7 +3418,32 @@ fn solve_tree_contacts_mode(
         }
         .solve()
         .unwrap_or_else(|error| panic!("Newton tree contact solve failed: {error}"))
-        .solution
+        .solution;
+        let mut rolling_groups = vec![Vec::new(); bodies.len()];
+        for block in &blocks {
+            let normal = block.start_row;
+            let normal_count = if cone == ConeKind::Pyramidal && block.condim == 3 {
+                4
+            } else {
+                1
+            };
+            let normal_impulse = (0..normal_count)
+                .map(|offset| impulses[normal + offset].max(0.0))
+                .sum::<f32>();
+            for rolling in block.rolling_rows.iter().flatten() {
+                rolling_groups[rolling.body_index]
+                    .push((rolling.row_index, rolling.coefficient * normal_impulse));
+            }
+        }
+        for group in rolling_groups.iter().filter(|group| !group.is_empty()) {
+            clamp_newton_rolling(
+                world_current_velocity(&rows[group[0].0], bodies, trees),
+                &response,
+                group,
+                &mut impulses,
+            );
+        }
+        impulses
     } else {
         let mut impulses = vec![0.0f32; n_rows];
         for _ in 0..iterations {
@@ -3072,7 +3460,8 @@ fn solve_tree_contacts_mode(
                         &response,
                         normal + 1,
                         normal + 2,
-                        block.mu_slide,
+                        block.mu_slide_1,
+                        block.mu_slide_2,
                         impulses[normal],
                         cone,
                         &mut impulses,
@@ -3093,11 +3482,28 @@ fn solve_tree_contacts_mode(
                             normal + 4,
                             normal + 5,
                             block.mu_roll,
+                            block.mu_roll,
                             impulses[normal],
                             cone,
                             &mut impulses,
                         );
                     }
+                }
+                let normal_impulse = if cone == ConeKind::Pyramidal && block.condim == 3 {
+                    (0..4).map(|offset| impulses[normal + offset]).sum()
+                } else {
+                    impulses[normal]
+                };
+                for rolling in block.rolling_rows.iter().flatten() {
+                    world_pgs_rolling(
+                        &rows,
+                        &response,
+                        rolling.row_index,
+                        rolling.coefficient * normal_impulse,
+                        bodies,
+                        trees,
+                        &mut impulses,
+                    );
                 }
             }
         }
@@ -3177,14 +3583,15 @@ fn contact_row_directions(
     tangent_2: Vec3,
     condim: u8,
     cone: ConeKind,
-    slide_friction: f32,
+    slide_friction_1: f32,
+    slide_friction_2: f32,
 ) -> Vec<(Vec3, bool)> {
     if cone == ConeKind::Pyramidal && condim == 3 {
         return vec![
-            (normal + tangent_1 * slide_friction, false),
-            (normal - tangent_1 * slide_friction, false),
-            (normal + tangent_2 * slide_friction, false),
-            (normal - tangent_2 * slide_friction, false),
+            (normal + tangent_1 * slide_friction_1, false),
+            (normal - tangent_1 * slide_friction_1, false),
+            (normal + tangent_2 * slide_friction_2, false),
+            (normal - tangent_2 * slide_friction_2, false),
         ];
     }
     let mut directions = vec![(normal, false)];
@@ -3198,6 +3605,111 @@ fn contact_row_directions(
         directions.extend([(tangent_1, true), (tangent_2, true)]);
     }
     directions
+}
+
+fn geom_pose_for_free_body(geom: &Geom, body: Option<u32>, bodies: &[Body]) -> GeomPose {
+    match body {
+        Some(index) => {
+            let body = &bodies[index as usize];
+            geom_world_pose(geom, body.position, body.orientation)
+        }
+        None => geom_world_pose(geom, Vec3::ZERO, Quat::IDENTITY),
+    }
+}
+
+pub(crate) fn contact_friction_axes(
+    geom_a: &Geom,
+    geom_b: &Geom,
+    pose_a: GeomPose,
+    pose_b: GeomPose,
+    normal: Vec3,
+    fallback_t1: Vec3,
+    isotropic_mu: f32,
+) -> (Vec3, Vec3, f32, f32) {
+    let Some(axis_local) = geom_a
+        .friction_anisotropy
+        .map(|anisotropy| anisotropy.axis_local)
+        .or_else(|| {
+            geom_b
+                .friction_anisotropy
+                .map(|anisotropy| anisotropy.axis_local)
+        })
+    else {
+        return (
+            fallback_t1,
+            normal.cross(fallback_t1),
+            isotropic_mu,
+            isotropic_mu,
+        );
+    };
+    let axis_world = if geom_a.friction_anisotropy.is_some() {
+        pose_a.rotate(axis_local)
+    } else {
+        pose_b.rotate(axis_local)
+    };
+    let tangent = axis_world - normal * axis_world.dot(normal);
+    let t1 = if tangent.length_squared() > 1.0e-12 {
+        tangent.normalize()
+    } else {
+        fallback_t1
+    };
+    let t2 = normal.cross(t1);
+    let mu_for_direction = |geom: &Geom, pose: GeomPose, direction: Vec3| {
+        let Some(anisotropy) = geom.friction_anisotropy else {
+            return geom.friction;
+        };
+        let axis = pose.rotate(anisotropy.axis_local);
+        let tangent = axis - normal * axis.dot(normal);
+        let axis = if tangent.length_squared() > 1.0e-12 {
+            tangent.normalize()
+        } else {
+            t1
+        };
+        let along = direction.dot(axis);
+        let across = direction.dot(normal.cross(axis));
+        let along_mu = anisotropy.along_axis_mu.max(0.0);
+        let across_mu = anisotropy.across_axis_mu.max(0.0);
+        let along_term = if along_mu > 0.0 {
+            (along / along_mu) * (along / along_mu)
+        } else if along == 0.0 {
+            0.0
+        } else {
+            return 0.0;
+        };
+        let across_term = if across_mu > 0.0 {
+            (across / across_mu) * (across / across_mu)
+        } else if across == 0.0 {
+            0.0
+        } else {
+            return 0.0;
+        };
+        let denominator = (along_term + across_term).sqrt();
+        if denominator > 0.0 {
+            1.0 / denominator
+        } else {
+            0.0
+        }
+    };
+    let mu1 = mu_for_direction(geom_a, pose_a, t1).min(mu_for_direction(geom_b, pose_b, t1));
+    let mu2 = mu_for_direction(geom_a, pose_a, t2).min(mu_for_direction(geom_b, pose_b, t2));
+    (t1, t2, mu1.max(0.0), mu2.max(0.0))
+}
+
+fn geom_pose_for_tree_contact(
+    geom: &Geom,
+    poses: &[Vec<(Vec3, Quat)>],
+    bodies: &[Body],
+) -> GeomPose {
+    match geom.attachment() {
+        GeomAttach::Body(index) => {
+            geom_world_pose(geom, bodies[index].position, bodies[index].orientation)
+        }
+        GeomAttach::Link(tree, link) => {
+            let (position, orientation) = poses[tree][link];
+            geom_world_pose(geom, position, orientation)
+        }
+        GeomAttach::Static => geom_world_pose(geom, Vec3::ZERO, Quat::IDENTITY),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3542,34 +4054,132 @@ fn world_pgs_scalar(
     impulses[index] = project_pyramidal(impulses[index] - residual / rows[index].diag, cap);
 }
 
+fn world_pgs_rolling(
+    rows: &[WorldContactRow],
+    response: &[f32],
+    index: usize,
+    cap: f32,
+    bodies: &[Body],
+    trees: &[Tree],
+    impulses: &mut [f32],
+) {
+    if cap <= 0.0 {
+        return;
+    }
+    let n_rows = rows.len();
+    let current = world_current_velocity(&rows[index], bodies, trees)
+        + (0..n_rows)
+            .map(|column| response[index * n_rows + column] * impulses[column])
+            .sum::<f32>();
+    if current == 0.0 {
+        return;
+    }
+    let residual =
+        world_pgs_residual(rows, response, index, impulses) + rows[index].reg * impulses[index];
+    let unconstrained = impulses[index] - residual / rows[index].diag;
+    let a_ii = rows[index].diag - rows[index].reg;
+    let zero = -current / a_ii;
+    let (lower, upper) = if current > 0.0 {
+        (zero.max(-cap), cap)
+    } else {
+        (-cap, zero.min(cap))
+    };
+    impulses[index] = unconstrained.max(lower).min(upper);
+}
+
+fn clamp_newton_rolling(
+    current: f32,
+    response: &[f32],
+    rolling_rows: &[(usize, f32)],
+    impulses: &mut [f32],
+) {
+    let cap = rolling_rows
+        .iter()
+        .map(|&(_, row_cap)| row_cap)
+        .sum::<f32>();
+    if cap <= 0.0 || rolling_rows.is_empty() {
+        return;
+    }
+    if current == 0.0 {
+        return;
+    }
+    let n_rows = impulses.len();
+    let representative = rolling_rows[0].0;
+    let a_ii = response[representative * n_rows + representative];
+    if a_ii <= 0.0 {
+        return;
+    }
+    // All rolling rows for one body have the same angular Jacobian. Treat
+    // their impulses as one combined scalar so separate contacts cannot
+    // push the body's angular velocity through zero in opposite directions.
+    let coupled_without_rows = current
+        + (0..n_rows)
+            .filter(|column| {
+                !rolling_rows
+                    .iter()
+                    .any(|&(row_index, _)| row_index == *column)
+            })
+            .map(|column| response[representative * n_rows + column] * impulses[column])
+            .sum::<f32>();
+    let zero = -coupled_without_rows / a_ii;
+    let no_change = (current - coupled_without_rows) / a_ii;
+    let (lower, upper) = if current > 0.0 {
+        (zero.max(-cap), no_change.min(cap))
+    } else {
+        (no_change.max(-cap), zero.min(cap))
+    };
+    for &(row_index, row_cap) in rolling_rows {
+        impulses[row_index] = impulses[row_index].clamp(-row_cap, row_cap);
+    }
+    let combined = rolling_rows
+        .iter()
+        .map(|&(row_index, _)| impulses[row_index])
+        .sum::<f32>();
+    let target = combined.max(lower).min(upper);
+    let mut remaining = target - combined;
+    for &(row_index, row_cap) in rolling_rows {
+        if remaining == 0.0 {
+            break;
+        }
+        let adjustment = if remaining > 0.0 {
+            remaining.min(row_cap - impulses[row_index])
+        } else {
+            remaining.max(-row_cap - impulses[row_index])
+        };
+        impulses[row_index] += adjustment;
+        remaining -= adjustment;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn world_pgs_pair(
     rows: &[WorldContactRow],
     response: &[f32],
     index_1: usize,
     index_2: usize,
-    mu: f32,
+    mu1: f32,
+    mu2: f32,
     normal_impulse: f32,
     cone: ConeKind,
     impulses: &mut [f32],
 ) {
     match cone {
         ConeKind::Pyramidal => {
-            let cap = mu * normal_impulse;
-            world_pgs_scalar(rows, response, index_1, cap, impulses);
-            world_pgs_scalar(rows, response, index_2, cap, impulses);
+            world_pgs_scalar(rows, response, index_1, mu1 * normal_impulse, impulses);
+            world_pgs_scalar(rows, response, index_2, mu2 * normal_impulse, impulses);
         }
         ConeKind::Elliptic => {
             let residual_1 = world_pgs_residual(rows, response, index_1, impulses)
                 + rows[index_1].reg * impulses[index_1];
             let residual_2 = world_pgs_residual(rows, response, index_2, impulses)
                 + rows[index_2].reg * impulses[index_2];
-            let (projected_1, projected_2) = project_elliptic(
-                impulses[index_1] - residual_1 / rows[index_1].diag,
-                impulses[index_2] - residual_2 / rows[index_2].diag,
-                mu,
-                normal_impulse,
-            );
+            let new_1 = impulses[index_1] - residual_1 / rows[index_1].diag;
+            let new_2 = impulses[index_2] - residual_2 / rows[index_2].diag;
+            let (projected_1, projected_2) = if mu1 == mu2 {
+                project_elliptic(new_1, new_2, mu1, normal_impulse)
+            } else {
+                project_elliptic_axes(new_1, new_2, mu1, mu2, normal_impulse)
+            };
             impulses[index_1] = projected_1;
             impulses[index_2] = projected_2;
         }

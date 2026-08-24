@@ -51,7 +51,8 @@ use crate::math::{PI, Quat, Vec3, asin, atan2};
 pub use crate::scene_query::{RayHit, ShapeDesc, ShapeHit};
 use crate::sensor::{Sensor, SensorBank, SensorError, SensorInputs};
 use crate::solver::{
-    ConstraintRowDiagnostic, SolverConfig, SolverMode, TreeContactSolution, solve_free_bodies,
+    ConstraintRowDiagnostic, SolverConfig, SolverMode, TreeContactSolution, contact_friction_axes,
+    solve_free_bodies,
 };
 use crate::tree::{
     AbaWorkspace, Tree, euler_step_with_workspace as tree_euler_step_with_workspace,
@@ -2495,7 +2496,7 @@ impl World {
         );
         let mut out = vec![(Vec3::ZERO, Vec3::ZERO); state.len()];
         for contact in &contacts {
-            apply_contact_wrench(&mut out, state, &self.geoms, contact);
+            apply_contact_wrench(&mut out, state, &self.geoms, contact, self.dt);
         }
         self.apply_mocap_wrenches_from_pairs(&mut out, state, pairs);
         self.apply_cached_field_forces(&mut out, field_forces);
@@ -2520,7 +2521,7 @@ impl World {
             if matches!(att_a, GeomAttach::Link(_, _)) || matches!(att_b, GeomAttach::Link(_, _)) {
                 continue;
             }
-            apply_contact_wrench(&mut out, state, &self.geoms, c);
+            apply_contact_wrench(&mut out, state, &self.geoms, c, self.dt);
         }
         self.apply_mocap_wrenches_from_contacts(&mut out, state, contacts);
         self.apply_cached_field_forces(&mut out, field_forces);
@@ -2680,6 +2681,7 @@ impl World {
             apply_one_mocap_wrench(MocapWrenchInput {
                 out,
                 bodies,
+                dt: self.dt,
                 tree: &self.trees[mocap_tree],
                 tree_idx: mocap_tree,
                 link_poses: &poses[mocap_tree],
@@ -2729,6 +2731,7 @@ impl World {
             apply_one_mocap_wrench(MocapWrenchInput {
                 out,
                 bodies,
+                dt: self.dt,
                 tree: &self.trees[mocap_tree],
                 tree_idx: mocap_tree,
                 link_poses: &poses[mocap_tree],
@@ -3038,13 +3041,22 @@ fn apply_tree_contact_wrench(
     if f_n <= 0.0 {
         return;
     }
-    let (t1, t2) = tangent_basis(normal);
+    let pose_a = geom_pose_for_contact(ga, tree_idx, link_poses, bodies);
+    let pose_b = geom_pose_for_contact(gb, tree_idx, link_poses, bodies);
+    let (t1, t2, mu_t1, mu_t2) = contact_friction_axes(
+        ga,
+        gb,
+        pose_a,
+        pose_b,
+        normal,
+        tangent_basis(normal).0,
+        contact.friction,
+    );
     let v_t = v_rel - normal * v_n;
     let v_t1 = v_t.dot(t1);
     let v_t2 = v_t.dot(t2);
-    let cap = contact.friction * f_n;
-    let f_t1 = clamp_symmetric(-c_tangent * v_t1, cap);
-    let f_t2 = clamp_symmetric(-c_tangent * v_t2, cap);
+    let f_t1 = clamp_symmetric(-c_tangent * v_t1, mu_t1 * f_n);
+    let f_t2 = clamp_symmetric(-c_tangent * v_t2, mu_t2 * f_n);
     let force_on_a = normal * f_n + t1 * f_t1 + t2 * f_t2;
 
     if let GeomAttach::Link(t, l) = ga.attachment() {
@@ -3192,6 +3204,7 @@ fn apply_contact_wrench(
     state: &[Body],
     geoms: &[Geom],
     contact: &Contact,
+    dt: f32,
 ) {
     let ga = &geoms[contact.geom_a];
     let gb = &geoms[contact.geom_b];
@@ -3234,14 +3247,23 @@ fn apply_contact_wrench(
     }
 
     // Deterministic tangent basis.
-    let (t1, t2) = tangent_basis(normal);
+    let pose_a = geom_world_pose_for_free_contact(ga, state);
+    let pose_b = geom_world_pose_for_free_contact(gb, state);
+    let (t1, t2, mu_t1, mu_t2) = contact_friction_axes(
+        ga,
+        gb,
+        pose_a,
+        pose_b,
+        normal,
+        tangent_basis(normal).0,
+        contact.friction,
+    );
     let v_t = v_rel - normal * v_n;
     let v_t1 = v_t.dot(t1);
     let v_t2 = v_t.dot(t2);
 
-    let cap = contact.friction * f_n;
-    let f_t1 = clamp_symmetric(-c_tangent * v_t1, cap);
-    let f_t2 = clamp_symmetric(-c_tangent * v_t2, cap);
+    let f_t1 = clamp_symmetric(-c_tangent * v_t1, mu_t1 * f_n);
+    let f_t2 = clamp_symmetric(-c_tangent * v_t2, mu_t2 * f_n);
 
     let force_on_a = normal * f_n + t1 * f_t1 + t2 * f_t2;
 
@@ -3249,18 +3271,21 @@ fn apply_contact_wrench(
         let (f, tau) = &mut ext[ia];
         *f += force_on_a;
         *tau += r_a.cross(force_on_a);
+        *tau += rolling_drag_torque(&state[ia], state[ia].rolling_friction, f_n, dt);
     }
     if let Some(ib) = gb.body {
         let force_on_b = -force_on_a;
         let (f, tau) = &mut ext[ib];
         *f += force_on_b;
         *tau += r_b.cross(force_on_b);
+        *tau += rolling_drag_torque(&state[ib], state[ib].rolling_friction, f_n, dt);
     }
 }
 
 struct MocapWrenchInput<'a> {
     out: &'a mut [(Vec3, Vec3)],
     bodies: &'a [Body],
+    dt: f32,
     tree: &'a Tree,
     tree_idx: usize,
     link_poses: &'a [(Vec3, Quat)],
@@ -3273,6 +3298,7 @@ fn apply_one_mocap_wrench(input: MocapWrenchInput<'_>) {
     let MocapWrenchInput {
         out,
         bodies,
+        dt,
         tree,
         tree_idx,
         link_poses,
@@ -3312,16 +3338,31 @@ fn apply_one_mocap_wrench(input: MocapWrenchInput<'_>) {
     if normal_force <= 0.0 {
         return;
     }
-    let (t1, t2) = tangent_basis(normal);
+    let pose_a = geom_pose_for_contact(ga, tree_idx, link_poses, bodies);
+    let pose_b = geom_pose_for_contact(gb, tree_idx, link_poses, bodies);
+    let (t1, t2, mu_t1, mu_t2) = contact_friction_axes(
+        ga,
+        gb,
+        pose_a,
+        pose_b,
+        normal,
+        tangent_basis(normal).0,
+        contact.friction,
+    );
     let tangent_velocity = v_rel - normal * v_n;
-    let cap = contact.friction * normal_force;
     let force_on_a = normal * normal_force
-        + t1 * clamp_symmetric(-damping * tangent_velocity.dot(t1), cap)
-        + t2 * clamp_symmetric(-damping * tangent_velocity.dot(t2), cap);
+        + t1 * clamp_symmetric(-damping * tangent_velocity.dot(t1), mu_t1 * normal_force)
+        + t2 * clamp_symmetric(-damping * tangent_velocity.dot(t2), mu_t2 * normal_force);
     let force_on_body = if body_is_a { force_on_a } else { -force_on_a };
     let moment_arm = if body_is_a { r_a } else { r_b };
     out[body_idx].0 += force_on_body;
     out[body_idx].1 += moment_arm.cross(force_on_body);
+    out[body_idx].1 += rolling_drag_torque(
+        &bodies[body_idx],
+        bodies[body_idx].rolling_friction,
+        normal_force,
+        dt,
+    );
 }
 
 /// World-frame linear velocity of the contact point on a geom's parent body.
@@ -3338,6 +3379,57 @@ fn point_velocity(state: &[Body], geom: &Geom, contact_pos_world: Vec3) -> (Vec3
         }
         None => (Vec3::ZERO, Vec3::ZERO, Vec3::ZERO),
     }
+}
+
+fn geom_world_pose_for_free_contact(geom: &Geom, bodies: &[Body]) -> GeomPose {
+    match geom.attachment() {
+        GeomAttach::Body(index) => {
+            geom_world_pose(geom, bodies[index].position, bodies[index].orientation)
+        }
+        GeomAttach::Static | GeomAttach::Link(_, _) => {
+            geom_world_pose(geom, Vec3::ZERO, Quat::IDENTITY)
+        }
+    }
+}
+
+fn geom_pose_for_contact(
+    geom: &Geom,
+    tree_idx: usize,
+    link_poses: &[(Vec3, Quat)],
+    bodies: &[Body],
+) -> GeomPose {
+    match geom.attachment() {
+        GeomAttach::Body(index) => {
+            geom_world_pose(geom, bodies[index].position, bodies[index].orientation)
+        }
+        GeomAttach::Link(t, link) if t == tree_idx => {
+            let (position, orientation) = link_poses[link];
+            geom_world_pose(geom, position, orientation)
+        }
+        GeomAttach::Static | GeomAttach::Link(_, _) => {
+            geom_world_pose(geom, Vec3::ZERO, Quat::IDENTITY)
+        }
+    }
+}
+
+fn rolling_drag_torque(body: &Body, coefficient: Option<f32>, normal_force: f32, dt: f32) -> Vec3 {
+    let Some(coefficient) = coefficient else {
+        return Vec3::ZERO;
+    };
+    if coefficient <= 0.0 || normal_force <= 0.0 || dt <= 0.0 {
+        return Vec3::ZERO;
+    }
+    let omega = body.angular_velocity_world();
+    let speed = omega.length();
+    if speed == 0.0 {
+        return Vec3::ZERO;
+    }
+    let direction = omega / speed;
+    let rotation = body.orientation.to_mat3();
+    let inverse_inertia = rotation * body.inertia_body_inverse * rotation.transpose();
+    let response = direction.dot(inverse_inertia * direction);
+    let impulse = (coefficient * normal_force * dt).min(speed / response);
+    -direction * (impulse / dt)
 }
 
 /// Deterministic orthonormal tangent basis `(t1, t2)` perpendicular to a unit
