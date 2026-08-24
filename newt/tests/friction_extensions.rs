@@ -131,7 +131,7 @@ fn spinning_ball(rolling_friction: Option<f32>, height: f32) -> World {
     world
 }
 
-fn newton_spinning_ball() -> World {
+fn newton_spinning_ball(angular_velocity_y: f32) -> World {
     let mut world = solver_world_with_mode(Vec3::new(0.0, 0.0, -9.81), SolverMode::Newton);
     let solref = SolRef::new(-400.0, -1200.0);
     let radius = 0.2;
@@ -142,7 +142,7 @@ fn newton_spinning_ball() -> World {
         Quat::IDENTITY,
     ));
     world.bodies[body].rolling_friction = Some(10.0);
-    world.bodies[body].angular_velocity_body = Vec3::new(0.0, 0.1, 0.0);
+    world.bodies[body].angular_velocity_body = Vec3::new(0.0, angular_velocity_y, 0.0);
     let mut plane = Geom::static_plane(Vec3::ZERO, Vec3::Z, 1.0);
     plane.solref = solref;
     world.add_geom(plane);
@@ -152,7 +152,7 @@ fn newton_spinning_ball() -> World {
     world
 }
 
-fn newton_tree_spinning_ball() -> World {
+fn newton_tree_spinning_ball(angular_velocity_y: f32) -> World {
     let mut world = solver_world_with_mode(Vec3::ZERO, SolverMode::Newton);
     let solref = SolRef::new(-400.0, -1200.0);
     let mut tree = Tree::new();
@@ -180,10 +180,10 @@ fn newton_tree_spinning_ball() -> World {
         1.0,
         half,
         Vec3::new(0.0, 0.0, 0.1),
-        Quat::from_axis_angle(Vec3::Y, -0.2),
+        Quat::IDENTITY,
     ));
     world.bodies[body].rolling_friction = Some(10.0);
-    world.bodies[body].angular_velocity_body = Vec3::new(0.0, 0.1, 0.0);
+    world.bodies[body].angular_velocity_body = Vec3::new(0.0, angular_velocity_y, 0.0);
     let mut geom = Geom::r#box(body, half, Vec3::ZERO, Quat::IDENTITY, 1.0);
     geom.solref = solref;
     world.add_geom(geom);
@@ -244,16 +244,32 @@ fn friction_rolling_clamp_no_reverse() {
 
 #[test]
 fn friction_rolling_free_body_newton_clamp_no_reverse() {
-    let mut world = newton_spinning_ball();
-    world.step();
-    let omega = world.bodies[0].angular_velocity_world();
-    assert!(omega.y >= -1.0e-5, "angular velocity reversed: {omega:?}");
+    for initial_spin in [0.1, -0.1] {
+        let mut world = newton_spinning_ball(initial_spin);
+        world.step();
+        let omega = world.bodies[0].angular_velocity_world();
+        assert!(omega.y.signum() == initial_spin.signum() || omega.y == 0.0);
+        assert!(
+            omega.length() < 2.0e-7,
+            "initial spin {initial_spin}: angular velocity was not clamped: {omega:?}"
+        );
+    }
 }
 
 #[test]
 fn friction_rolling_tree_newton_clamp_no_reverse() {
-    let mut world = newton_tree_spinning_ball();
-    world.step();
-    let omega = world.bodies[0].angular_velocity_world();
-    assert!(omega.y >= -1.0e-5, "angular velocity reversed: {omega:?}");
+    for initial_spin in [0.1, -0.1] {
+        let mut world = newton_tree_spinning_ball(initial_spin);
+        world.step();
+        assert!(
+            world.detect_contacts().len() >= 2,
+            "tree regression fixture must produce multiple contacts"
+        );
+        let omega = world.bodies[0].angular_velocity_world();
+        assert!(omega.y.signum() == initial_spin.signum() || omega.y == 0.0);
+        assert!(
+            omega.length() < 2.0e-7,
+            "initial spin {initial_spin}: angular velocity was not clamped: {omega:?}"
+        );
+    }
 }

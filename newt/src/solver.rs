@@ -880,6 +880,7 @@ fn solve_free_bodies_diag_mode(
             rolling_rows[slot] = Some(RollingRow {
                 row_index,
                 coefficient,
+                body_index: body_index as usize,
             });
         }
 
@@ -1285,6 +1286,7 @@ struct PerContact {
 struct RollingRow {
     row_index: usize,
     coefficient: f32,
+    body_index: usize,
 }
 
 /// Assemble and solve the dense free-body Newton system. The response matrix
@@ -1377,6 +1379,7 @@ fn solve_free_body_newton_impulses(
     let mut result = system
         .solve()
         .unwrap_or_else(|error| panic!("Newton free-body solve failed: {error}"));
+    let mut rolling_groups = vec![Vec::new(); n_bodies];
     for contact in per_contact {
         let normal = contact.start_row as usize;
         let normal_count = if cone == ConeKind::Pyramidal && contact.condim == 3 {
@@ -1388,14 +1391,17 @@ fn solve_free_body_newton_impulses(
             .map(|offset| result.solution[normal + offset].max(0.0))
             .sum::<f32>();
         for rolling in contact.rolling_rows.iter().flatten() {
-            clamp_newton_rolling(
-                row_current_velocity(&rows[rolling.row_index], bodies),
-                &response_matrix,
-                rolling.row_index,
-                rolling.coefficient * normal_impulse,
-                &mut result.solution,
-            );
+            rolling_groups[rolling.body_index]
+                .push((rolling.row_index, rolling.coefficient * normal_impulse));
         }
+    }
+    for group in rolling_groups.iter().filter(|group| !group.is_empty()) {
+        clamp_newton_rolling(
+            row_current_velocity(&rows[group[0].0], bodies),
+            &response_matrix,
+            group,
+            &mut result.solution,
+        );
     }
     result
 }
@@ -2786,6 +2792,7 @@ struct WorldContactBlock {
 struct WorldRollingRow {
     row_index: usize,
     coefficient: f32,
+    body_index: usize,
 }
 
 /// Solve all active contacts that touch a tree in one joint-space system.
@@ -2993,6 +3000,7 @@ pub fn solve_tree_contacts(
             rolling_rows[slot] = Some(WorldRollingRow {
                 row_index,
                 coefficient,
+                body_index,
             });
         }
         blocks.push(WorldContactBlock {
@@ -3232,6 +3240,7 @@ pub fn solve_tree_contacts(
         .solve()
         .unwrap_or_else(|error| panic!("Newton tree contact solve failed: {error}"))
         .solution;
+        let mut rolling_groups = vec![Vec::new(); bodies.len()];
         for block in &blocks {
             let normal = block.start_row;
             let normal_count = if cone == ConeKind::Pyramidal && block.condim == 3 {
@@ -3243,14 +3252,17 @@ pub fn solve_tree_contacts(
                 .map(|offset| impulses[normal + offset].max(0.0))
                 .sum::<f32>();
             for rolling in block.rolling_rows.iter().flatten() {
-                clamp_newton_rolling(
-                    world_current_velocity(&rows[rolling.row_index], bodies, trees),
-                    &response,
-                    rolling.row_index,
-                    rolling.coefficient * normal_impulse,
-                    &mut impulses,
-                );
+                rolling_groups[rolling.body_index]
+                    .push((rolling.row_index, rolling.coefficient * normal_impulse));
             }
+        }
+        for group in rolling_groups.iter().filter(|group| !group.is_empty()) {
+            clamp_newton_rolling(
+                world_current_velocity(&rows[group[0].0], bodies, trees),
+                &response,
+                group,
+                &mut impulses,
+            );
         }
         impulses
     } else {
@@ -3896,33 +3908,65 @@ fn world_pgs_rolling(
 fn clamp_newton_rolling(
     current: f32,
     response: &[f32],
-    index: usize,
-    cap: f32,
+    rolling_rows: &[(usize, f32)],
     impulses: &mut [f32],
 ) {
-    if cap <= 0.0 {
+    let cap = rolling_rows
+        .iter()
+        .map(|&(_, row_cap)| row_cap)
+        .sum::<f32>();
+    if cap <= 0.0 || rolling_rows.is_empty() {
         return;
     }
     if current == 0.0 {
         return;
     }
     let n_rows = impulses.len();
-    let a_ii = response[index * n_rows + index];
+    let representative = rolling_rows[0].0;
+    let a_ii = response[representative * n_rows + representative];
     if a_ii <= 0.0 {
         return;
     }
-    let coupled_without_row = current
+    // All rolling rows for one body have the same angular Jacobian. Treat
+    // their impulses as one combined scalar so separate contacts cannot
+    // push the body's angular velocity through zero in opposite directions.
+    let coupled_without_rows = current
         + (0..n_rows)
-            .filter(|&column| column != index)
-            .map(|column| response[index * n_rows + column] * impulses[column])
+            .filter(|column| {
+                !rolling_rows
+                    .iter()
+                    .any(|&(row_index, _)| row_index == *column)
+            })
+            .map(|column| response[representative * n_rows + column] * impulses[column])
             .sum::<f32>();
-    let zero = -coupled_without_row / a_ii;
+    let zero = -coupled_without_rows / a_ii;
+    let no_change = (current - coupled_without_rows) / a_ii;
     let (lower, upper) = if current > 0.0 {
-        (zero.max(-cap), cap)
+        (zero.max(-cap), no_change.min(cap))
     } else {
-        (-cap, zero.min(cap))
+        (no_change.max(-cap), zero.min(cap))
     };
-    impulses[index] = impulses[index].max(lower).min(upper);
+    for &(row_index, row_cap) in rolling_rows {
+        impulses[row_index] = impulses[row_index].clamp(-row_cap, row_cap);
+    }
+    let combined = rolling_rows
+        .iter()
+        .map(|&(row_index, _)| impulses[row_index])
+        .sum::<f32>();
+    let target = combined.max(lower).min(upper);
+    let mut remaining = target - combined;
+    for &(row_index, row_cap) in rolling_rows {
+        if remaining == 0.0 {
+            break;
+        }
+        let adjustment = if remaining > 0.0 {
+            remaining.min(row_cap - impulses[row_index])
+        } else {
+            remaining.max(-row_cap - impulses[row_index])
+        };
+        impulses[row_index] += adjustment;
+        remaining -= adjustment;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
